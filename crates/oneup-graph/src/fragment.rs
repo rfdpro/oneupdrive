@@ -233,7 +233,7 @@ mod tests {
         let mut speed = 3.0;
         while left > 0 {
             let n = s.next(left);
-            assert!(n % UNIT == 0 || n as u64 == left);
+            assert!(n.is_multiple_of(UNIT) || n as u64 == left);
             assert!(n <= MAX_UNITS * UNIT);
             // A wandering line, including noise that makes bigger look faster.
             speed = if speed > 40.0 { 2.0 } else { speed * 1.7 };

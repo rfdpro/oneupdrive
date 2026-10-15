@@ -63,13 +63,13 @@ impl QuickXorHash {
         }
         debug_assert!(pos == 0 || data.is_empty());
 
-        let mut blocks = data.chunks_exact(WIDTH_BITS);
-        for block in &mut blocks {
+        let (blocks, rest) = data.as_chunks::<WIDTH_BITS>();
+        for block in blocks {
             for (a, b) in self.acc.iter_mut().zip(block) {
                 *a ^= b;
             }
         }
-        for (a, b) in self.acc.iter_mut().zip(blocks.remainder()) {
+        for (a, b) in self.acc.iter_mut().zip(rest) {
             *a ^= b;
         }
     }

@@ -167,7 +167,7 @@ pub fn parse_record(buf: &[u8]) -> Result<(UsnRecord, usize), ParseError> {
     let len = le::<4>(buf, 0).map(u32::from_le_bytes).ok_or(bad_len(0))?;
     let ulen = len as usize;
     // Records are 8-byte aligned and never shorter than a V2 header.
-    if ulen < V2_NAME || ulen % 8 != 0 || ulen > buf.len() {
+    if ulen < V2_NAME || !ulen.is_multiple_of(8) || ulen > buf.len() {
         return Err(bad_len(len));
     }
     let rec = &buf[..ulen];

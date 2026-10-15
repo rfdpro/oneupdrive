@@ -133,10 +133,10 @@ impl Auth {
     /// Returns a valid access token, refreshing it if needed.
     pub async fn access_token(&self) -> Result<String> {
         let mut guard = self.access.lock().await;
-        if let Some(a) = guard.as_ref() {
-            if Instant::now() < a.refresh_at {
-                return Ok(a.token.clone());
-            }
+        if let Some(a) = guard.as_ref()
+            && Instant::now() < a.refresh_at
+        {
+            return Ok(a.token.clone());
         }
         let rt = self.store.load()?.ok_or(Error::NotSignedIn)?;
         let t = self

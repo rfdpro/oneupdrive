@@ -264,10 +264,10 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
             break;
         }
         let dir_rel = parts[..i].join("/");
-        if let Some(f) = store.read(|o| rulefiles::find(o, dir.file_id))? {
-            if let Err(p) = rulefiles::add(&mut set, &mut verifier, &dir_rel, &f) {
-                problems.push(format!("{} ignored: {p}", Path::new(&dir_rel).join(".oneupignore").display()));
-            }
+        if let Some(f) = store.read(|o| rulefiles::find(o, dir.file_id))?
+            && let Err(p) = rulefiles::add(&mut set, &mut verifier, &dir_rel, &f)
+        {
+            problems.push(format!("{} ignored: {p}", Path::new(&dir_rel).join(".oneupignore").display()));
         }
         row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| c.name.eq_ignore_ascii_case(part));
     }
