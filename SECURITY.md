@@ -3,7 +3,7 @@
 OneUpDrive handles account tokens, personal files and vault encryption keys. We take reports seriously.
 
 ## Reporting a vulnerability
-Please **don't open a public issue**. Use GitHub's private vulnerability reporting ("Report a vulnerability" in the Security tab) once the repository is public. Include steps to reproduce and the impact. We aim to acknowledge reports within 72 hours.
+Please **don't open a public issue**. Use GitHub's private vulnerability reporting ("Report a vulnerability" in the Security tab). Include steps to reproduce and the impact. We aim to acknowledge reports within 72 hours.
 
 ## In scope
 * Token handling (storage, logging, transmission)
@@ -17,7 +17,7 @@ Please **don't open a public issue**. Use GitHub's private vulnerability reporti
 * Public client only; no client secrets are shipped.
 * Refresh tokens, and remembered vault keys, are stored encrypted for the current Windows user (DPAPI).
 * Updates are installed only if Authenticode-signed by the same publisher as the running copy.
-* What the agent learns about program usage (the Apps page) stays on the PC: counts and program names, never file names or contents.
+* What the agent learns about program usage (the Apps page) stays on the PC: program names, counts and the paths of recently used files, never contents.
 * Logs never contain tokens, keys or file contents.
 * Crypto uses audited RustCrypto implementations only, with key material zeroized after use.
 * Vaults: masterkey-file vaults only (no remote key-loading endpoints), with the vault config signature verified before any field is trusted. See [vaults.md](docs/architecture/vaults.md).
