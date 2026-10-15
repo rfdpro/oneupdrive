@@ -1,18 +1,50 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<div align="center">
+
+<img src="assets/icon.png" width="96" height="96" alt="OneUpDrive logo">
 
 # OneUpDrive
 
-**Your OneDrive, minus the drama.**
+### One up your OneDrive.
 
-OneUpDrive is a from-scratch OneDrive client for Windows, written in Rust. Same OneDrive account, same files, same onedrive.com and phone apps. Just a sync program on your PC that sips resources instead of gulping them, refuses to lose your data, and does what *you* tell it.
+A OneDrive client for Windows, rebuilt from scratch in Rust.<br>
+Built for speed, privacy and control over your data.<br>
 
-> 🧪 **Status: first release.** Two-way sync and backups, several folders and accounts, Files On-Demand, Explorer integration, encrypted vaults, Office AutoSave, a settings window and signed self-updates all work today. It's young software: expect rough edges, and please report them as issues.
+[![CI](https://github.com/rfdpro/oneupdrive/actions/workflows/ci.yml/badge.svg)](https://github.com/rfdpro/oneupdrive/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/rfdpro/oneupdrive?include_prereleases&label=release)](https://github.com/rfdpro/oneupdrive/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows)](docs/user-guide/getting-started.md#what-youll-need)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
-## Why does this exist?
+[**Download**](https://github.com/rfdpro/oneupdrive/releases/latest) ·
+[User guide](docs/user-guide/README.md) ·
+[How it works](docs/architecture/overview.md) ·
+[Contributing](CONTRIBUTING.md)
 
-Because one developer's OneDrive app was tracking **3.3 million items** in **~6 GB of local databases**, and **89%** of them were `node_modules`, Python virtual environments, `.git` folders and build caches that nobody wanted in the cloud. OneDrive Personal had no way to say "please don't".
+</div>
 
-So we built the client we wanted:
+---
+
+Same OneDrive account, same files, and onedrive.com and the phone apps keep working. Only the program on your PC changes: it's lighter, it's more careful with your data, and it syncs what *you* tell it to.
+
+> [!NOTE]
+> OneUpDrive is in **beta**. Expect rough edges, and please [report them as issues](https://github.com/rfdpro/oneupdrive/issues).
+
+## ✨ Features
+
+- 🪶 **Lightweight.** Uses under 100 MB of RAM and 100 MB of disk, however many files you have.
+- 🔒 **Private.** No tracking, no telemetry, no data collection.
+- 🎯 **You decide what syncs.** Leave things out with familiar `.gitignore` syntax. No more `node_modules`, build caches or other junk filling your OneDrive.
+- ⚡ **Fast sync.** Follows the NTFS change journal, like [Everything](https://www.voidtools.com/), instead of rescanning your folders. When nothing changes, it does nothing.
+- ☁️ **Files On-Demand.** Files download only when you open them, and OneUpDrive can free up files you haven't used lately or when the disk is nearly full.
+- 📝 **Office AutoSave.** Open Word, Excel and PowerPoint files with AutoSave, straight from the right-click menu.
+- 🚀 **Big uploads.** The piece size adapts to your connection speed.
+
+**Also included:**
+
+- 🔐 **Vaults.** Encrypted folders, decrypted on demand and unlocked with Windows Hello if you like, with a recovery key. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
+- 🕓 **Version history.** See what changed in any file, when, and which program changed it.
+
+## ⚖️ How it compares
 
 | | The OneDrive app | OneUpDrive |
 |---|---|---|
@@ -29,37 +61,56 @@ So we built the client we wanted:
 | **Office AutoSave** | ✅ | ✅ **Open with AutoSave** from the right-click menu, or leave chosen folders to the OneDrive app; double-click integration is an experiment |
 | **Big uploads** | Fixed pieces | Piece size adapts to your connection (≈2× faster on our test line), and files OneDrive already has are copied server-side (300 MB in ~2 s) |
 
-## The non-negotiables
+## 📦 Getting started
+
+**You'll need** Windows 10 (1809 or newer) or Windows 11, 64-bit, and a **personal** Microsoft account with OneDrive.
+
+1. Download `OneUpDrive.App-stable-Setup.exe` from the [releases page](https://github.com/rfdpro/oneupdrive/releases/latest).
+2. Run it. It installs for you alone, with no administrator rights.
+3. Sign in, choose your folders and what to leave out. A preview shows what the first sync would do, and nothing changes until you select **Start syncing**.
+
+Switching from the OneDrive app? Read [Moving over from the OneDrive app](docs/user-guide/migrating-from-onedrive.md) first.
+
+> [!IMPORTANT]
+> Releases aren't code-signed yet, so Windows SmartScreen may warn you when you run the installer. Signed releases and updates are coming soon.
+
+Want to build it yourself? See [Development in CONTRIBUTING.md](CONTRIBUTING.md#development).
+
+## 🛡️ Your data comes first
 
 OneUpDrive's data-safety rules are enforced in code, not in good intentions ([details](docs/architecture/data-safety.md)):
 
-* **No deletion without evidence.** A file that's simply *missing* (unplugged drive, failed mount) is never treated as deleted.
-* **Every change re-checked right before it happens.** OneDrive changes carry eTag preconditions, local changes re-check file ID, size and time.
-* **Every transfer verified** by OneDrive's own content hash.
-* **Conflicts keep both copies.** Always.
-* **Circuit breakers.** Too many deletions, overwrites or moves at once, or edited files that look encrypted, and OneUpDrive stops and asks.
-* **Anything it removes from your PC is kept** in a local version store first, unless OneDrive provably has the exact same content.
-* All destructive operations live in one small module, behind tokens only the safety gate can issue.
+- **No deletion without evidence.** A file that's simply *missing* (unplugged drive, failed mount) is never treated as deleted.
+- **Every change re-checked right before it happens.** OneDrive changes carry eTag preconditions; local changes re-check file ID, size and time.
+- **Every transfer verified** by OneDrive's own content hash.
+- **Conflicts keep both copies.** Always.
+- **Circuit breakers.** Too many deletions, overwrites or moves at once, or edited files that look encrypted, and OneUpDrive stops and asks.
+- **Anything it removes from your PC is kept** in a local version store first, unless OneDrive provably has the exact same content.
+- **One gatekeeper.** All destructive operations live in one small module, behind tokens only the safety gate can issue.
 
-## Getting it
+## 📚 Documentation
 
-Download `OneUpDrive.App-stable-Setup.exe` from the [releases page](https://github.com/rfdpro/oneupdrive/releases/latest): per-user, no admin rights, Authenticode-signed, and updating itself from signed releases only. The first launch walks you through setup and shows a preview before anything changes.
+| | |
+|---|---|
+| **Using it** | [User guide](docs/user-guide/README.md) · [FAQ](docs/user-guide/faq.md) · [Troubleshooting](docs/user-guide/troubleshooting.md) |
+| **How it works** | [Architecture overview](docs/architecture/overview.md) · [Data safety](docs/architecture/data-safety.md) |
+| **Contributing** | [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) (for AI coding agents) |
+| **Security** | [SECURITY.md](SECURITY.md) |
 
-Building from source: see [CONTRIBUTING.md](CONTRIBUTING.md#development).
+## 🧭 Scope and known issues
 
-## Documentation
+OneUpDrive supports OneDrive **Personal** on **Windows 10/11 (x64)**. Work and school accounts, ARM64 and other operating systems are out of scope for now.
 
-* **Using it:** [User guide](docs/user-guide/README.md)
-* **How it works:** [Architecture overview](docs/architecture/overview.md) · [Data safety](docs/architecture/data-safety.md)
-* **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) · [AGENTS.md](AGENTS.md) (for AI coding agents)
-* **Security:** [SECURITY.md](SECURITY.md)
+Known issues:
 
-## Scope
+- File Explorer can keep showing the "syncing" status icon after a sync has finished, because of the way Explorer checks sync status.
 
-OneDrive **Personal** on **Windows 10/11 (x64)**. Work and school accounts, ARM64 and other operating systems are out of scope for now.
+## 🤝 Contributing
 
-## License
+Bug reports, ideas and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), and report security problems privately as described in [SECURITY.md](SECURITY.md).
 
-[MIT](LICENSE). Third-party components and their licenses: [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
+## 📄 License
 
-OneUpDrive is an independent project, not affiliated with or endorsed by Microsoft. OneDrive is a trademark of Microsoft Corporation.
+[MIT](LICENSE). Third-party components and their licenses are listed in [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).
+
+<sub>OneUpDrive is an independent project, not affiliated with or endorsed by Microsoft. OneDrive is a trademark of Microsoft Corporation.</sub>
