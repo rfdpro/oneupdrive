@@ -4,7 +4,7 @@
 No. OneUpDrive is an independent open-source project. It stores your files in your normal OneDrive account using Microsoft's official API (Microsoft Graph).
 
 **Can I use it now?**
-Yes. Install it from the project's GitHub releases page ([Getting started](getting-started.md)); it syncs your own OneDrive, all of it or the folders you choose. It's a first release, so expect rough edges and please report them.
+Yes. Install it from the project's [releases page](https://github.com/rfdpro/oneupdrive/releases/latest) ([Getting started](getting-started.md)); it syncs your own OneDrive, all of it or the folders you choose. It's a first release, so expect rough edges and please report them.
 
 **Will it work with my work or school account?**
 Not at first. OneUpDrive is for personal OneDrive accounts.
