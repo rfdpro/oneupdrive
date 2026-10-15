@@ -16,7 +16,7 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-The tests run on temp folders and an in-memory OneDrive; nothing touches a real folder or account. A change in what people see happen to their files comes with an end-to-end `everyday_` test in `crates/oneup-exec/tests/sync.rs`; pure decisions (planner, gate, rules) are unit-tested next to the code.
+The tests run on temp folders and an in-memory OneDrive; nothing touches a real folder or account. A change in what people see happen to their files comes with an end-to-end `everyday_` test in `crates/oneup-exec/tests/sync.rs`; pure decisions (planner, gate, rules) are unit-tested next to the code. CI runs on GitHub's Windows Server runners, one test at a time, and skips a few tests that check how Windows behaves on a desktop PC (listed in `.github/workflows/ci.yml`), so run `cargo test --workspace` locally too.
 
 The repo uses LF line endings (`.gitattributes`); if your editor writes CRLF, run `cargo fmt` and check `git diff`.
 

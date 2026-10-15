@@ -23,8 +23,16 @@ jobs:
       - name: Velopack packer
         run: dotnet tool install -g vpk
 
+      # As in ci.yml: one test at a time, desktop-only checks skipped.
       - name: Test
-        run: cargo test --workspace --release
+        env:
+          RUST_TEST_THREADS: "1"
+        run: >-
+          cargo test --workspace --release --
+          --skip data_access_hydrates_and_holds_refuse_fetches
+          --skip what_downloads_an_online_only_file_from_the_providers_process
+          --skip on_demand_placeholders_follow_both_sides
+          --skip control_pipes_admit_only_the_current_user
 
       - name: Sign in to Azure (for Artifact Signing)
         uses: azure/login@v2
