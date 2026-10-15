@@ -9,7 +9,7 @@ OneUpDrive is a replacement for the OneDrive app on Windows. Your files stay in 
 * Your files on an NTFS drive (most PCs)
 
 ## Installing
-Download `OneUpDrive.App-stable-Setup.exe` from the project's GitHub releases page and run it. It installs for you alone, with no administrator rights, and appears in the Start menu as **OneUpDrive**.
+Download `OneUpDrive.App-stable-Setup.exe` from the project's [releases page](https://github.com/rfdpro/oneupdrive/releases/latest) and run it. It installs for you alone, with no administrator rights, and appears in the Start menu as **OneUpDrive**.
 
 ## Setting up
 When it's installed, OneUpDrive starts and its window opens on **Set up**:

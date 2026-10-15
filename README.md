@@ -43,7 +43,7 @@ OneUpDrive's data-safety rules are enforced in code, not in good intentions ([de
 
 ## Getting it
 
-Download `OneUpDrive.App-stable-Setup.exe` from the GitHub releases page: per-user, no admin rights, Authenticode-signed, and updating itself from signed releases only. The first launch walks you through setup and shows a preview before anything changes.
+Download `OneUpDrive.App-stable-Setup.exe` from the [releases page](https://github.com/rfdpro/oneupdrive/releases/latest): per-user, no admin rights, Authenticode-signed, and updating itself from signed releases only. The first launch walks you through setup and shows a preview before anything changes.
 
 Building from source: see [CONTRIBUTING.md](CONTRIBUTING.md#development).
 
