@@ -21,5 +21,17 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # GitHub's runners are Windows Server in a service session, and the
+      # Cloud Files driver there refuses sync roots registered at the same
+      # time; one test at a time. The skipped tests check what Windows does
+      # on a desktop PC (what downloads a placeholder, which program the
+      # activity log names, a pipe's permissions); run them locally.
       - name: Test
-        run: cargo test --workspace --no-fail-fast
+        env:
+          RUST_TEST_THREADS: "1"
+        run: >-
+          cargo test --workspace --no-fail-fast --
+          --skip data_access_hydrates_and_holds_refuse_fetches
+          --skip what_downloads_an_online_only_file_from_the_providers_process
+          --skip on_demand_placeholders_follow_both_sides
+          --skip control_pipes_admit_only_the_current_user
