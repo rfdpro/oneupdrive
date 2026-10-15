@@ -223,7 +223,7 @@ impl Canvas {
                     SelectObject(self.dc, before);
                     let _ = DeleteObject(font.into());
                     // White on black: any channel is the coverage.
-                    return Some(self.pixels().chunks_exact(4).map(|p| p[1]).collect());
+                    return Some(self.pixels().as_chunks::<4>().0.iter().map(|p| p[1]).collect());
                 }
                 SelectObject(self.dc, before);
                 let _ = DeleteObject(font.into());
@@ -235,7 +235,7 @@ impl Canvas {
     /// Sets every pixel to a colour and an alpha (premultiplied, BGRA).
     fn fill(&mut self, px: &[([u8; 3], u8)]) {
         let pre = |c: u8, a: u8| (u16::from(c) * u16::from(a) / 255) as u8;
-        for (out, ([r, g, b], a)) in self.pixels().chunks_exact_mut(4).zip(px) {
+        for (out, ([r, g, b], a)) in self.pixels().as_chunks_mut::<4>().0.iter_mut().zip(px) {
             out.copy_from_slice(&[pre(*b, *a), pre(*g, *a), pre(*r, *a), *a]);
         }
     }

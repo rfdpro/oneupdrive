@@ -47,7 +47,7 @@ pub(crate) fn le<const N: usize>(buf: &[u8], off: usize) -> Option<[u8; N]> {
 /// replaced, and the caller is told so via the `bool`, so lossy names are
 /// never used to address files.
 pub(crate) fn utf16le_name(bytes: &[u8]) -> (String, bool) {
-    let units = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
+    let units = bytes.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c));
     let mut lossy = false;
     let s = char::decode_utf16(units)
         .map(|r| {

@@ -112,7 +112,7 @@ impl Icon {
         if size == 0 || rgba.len() != n * n * 4 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "icon pixels don't match its size"));
         }
-        let bgra: Vec<u8> = rgba.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+        let bgra: Vec<u8> = rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
         // The 1-bit mask is all zeros: the colour's alpha does the masking.
         let mask = vec![0u8; n.div_ceil(16) * 2 * n];
         let side = i32::try_from(size).map_err(std::io::Error::other)?;

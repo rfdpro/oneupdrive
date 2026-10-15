@@ -92,7 +92,7 @@ pub fn parse_dir_buffer(buf: &[u8]) -> Result<Vec<DirEntry>, DirParseError> {
         let name_len = u32_at(NAME_LEN)? as usize;
         let name_bytes = NAME
             .checked_add(name_len)
-            .filter(|_| name_len % 2 == 0)
+            .filter(|_| name_len.is_multiple_of(2))
             .and_then(|end| entry.get(NAME..end))
             .ok_or_else(err)?;
         if next != 0 && next < NAME + name_len {
@@ -123,10 +123,10 @@ pub fn parse_dir_buffer(buf: &[u8]) -> Result<Vec<DirEntry>, DirParseError> {
 /// The volume root (`\`) yields an empty name.
 pub fn last_name_of_file_name_info(buf: &[u8]) -> Option<(String, bool)> {
     let len = u32::from_le_bytes(le::<4>(buf, 0)?) as usize;
-    let bytes = buf.get(4..4usize.checked_add(len)?).filter(|_| len % 2 == 0)?;
+    let bytes = buf.get(4..4usize.checked_add(len)?).filter(|_| len.is_multiple_of(2))?;
     // Split on the last `\` at a UTF-16 unit boundary, before decoding, so
     // a lossy name elsewhere in the path can't affect this one.
-    let start = bytes.chunks_exact(2).rposition(|c| c == [b'\\', 0]).map_or(0, |i| (i + 1) * 2);
+    let start = bytes.as_chunks::<2>().0.iter().rposition(|c| *c == [b'\\', 0]).map_or(0, |i| (i + 1) * 2);
     Some(utf16le_name(&bytes[start..]))
 }
 
