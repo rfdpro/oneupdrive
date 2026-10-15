@@ -1,0 +1,16 @@
+[package]
+name = "oneup-gate"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive's safety gate: pure review of planned operations (circuit breakers, pause, panic) issuing the only tokens the effects layer accepts"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+oneup-sync = { path = "../oneup-sync" }
+thiserror = "2"
+
+[lints]
+workspace = true

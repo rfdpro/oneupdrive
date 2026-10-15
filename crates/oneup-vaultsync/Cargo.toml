@@ -1,0 +1,30 @@
+[package]
+name = "oneup-vaultsync"
+version = "0.1.0"
+publish = false
+description = "Syncing a Cryptomator vault in OneDrive as a decrypted folder: the decrypted view of the vault's encrypted files, and a cloud that encrypts and decrypts on the way"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+oneup-exec = { path = "../oneup-exec" }
+oneup-hash = { path = "../oneup-hash" }
+oneup-store = { path = "../oneup-store" }
+oneup-sync = { path = "../oneup-sync" }
+oneup-vault = { path = "../oneup-vault" }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+oneup-cfapi = { path = "../oneup-cfapi" }
+oneup-effects = { path = "../oneup-effects" }
+oneup-gate = { path = "../oneup-gate" }
+oneup-local = { path = "../oneup-local" }
+oneup-plan = { path = "../oneup-plan" }
+oneup-rules = { path = "../oneup-rules" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

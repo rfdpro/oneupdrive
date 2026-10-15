@@ -1,0 +1,76 @@
+[package]
+name = "oneup"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive command-line tool"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# The code both executables share (sync rounds, data-folder setup).
+[lib]
+name = "oneup_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "oneup"
+path = "src/main.rs"
+
+[[bin]]
+name = "oneupd"
+path = "src/bin/oneupd.rs"
+
+[[bin]]
+name = "oneupd-start"
+path = "src/bin/oneupd-start.rs"
+
+[[bin]]
+name = "oneup-tray"
+path = "src/bin/oneup-tray.rs"
+
+[[bin]]
+name = "oneup-open"
+path = "src/bin/oneup-open.rs"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+oneup-cfapi = { path = "../../crates/oneup-cfapi" }
+oneup-effects = { path = "../../crates/oneup-effects" }
+oneup-exec = { path = "../../crates/oneup-exec" }
+oneup-gate = { path = "../../crates/oneup-gate" }
+oneup-graph = { path = "../../crates/oneup-graph" }
+oneup-hash = { path = "../../crates/oneup-hash" }
+oneup-ipc = { path = "../../crates/oneup-ipc" }
+oneup-local = { path = "../../crates/oneup-local" }
+oneup-ntfs = { path = "../../crates/oneup-ntfs" }
+oneup-plan = { path = "../../crates/oneup-plan" }
+oneup-remote = { path = "../../crates/oneup-remote" }
+oneup-rules = { path = "../../crates/oneup-rules" }
+oneup-store = { path = "../../crates/oneup-store" }
+oneup-sync = { path = "../../crates/oneup-sync" }
+oneup-sys = { path = "../../crates/oneup-sys" }
+oneup-vault = { path = "../../crates/oneup-vault" }
+oneup-vaultsync = { path = "../../crates/oneup-vaultsync" }
+rpassword = "7"
+# Installing and updating (MIT); rustls for its downloads.
+velopack = "1"
+# One cryptography backend for rustls in the whole process (setup::tls).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+zeroize = "1"
+reqwest = "0.13"
+serde_json = "1"
+sha2 = "0.10"
+toml_edit = "0.22"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints]
+workspace = true

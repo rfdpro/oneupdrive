@@ -1,0 +1,38 @@
+[package]
+name = "oneup-exec"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive's executor: runs gate-approved operations through the effects layer and the cloud, and records the outcome"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+oneup-cfapi = { path = "../oneup-cfapi" }
+oneup-effects = { path = "../oneup-effects" }
+oneup-gate = { path = "../oneup-gate" }
+oneup-graph = { path = "../oneup-graph" }
+oneup-hash = { path = "../oneup-hash" }
+oneup-local = { path = "../oneup-local" }
+oneup-remote = { path = "../oneup-remote" }
+oneup-rules = { path = "../oneup-rules" }
+oneup-store = { path = "../oneup-store" }
+oneup-sync = { path = "../oneup-sync" }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "time"] }
+tracing = "0.1"
+
+[features]
+# Test-only: `Executor::crash_after` stops a round as if the process had
+# been killed (tests/sync.rs turns it on; production builds never do).
+crash-test = []
+
+[dev-dependencies]
+oneup-exec = { path = ".", features = ["crash-test"] }
+oneup-cfapi = { path = "../oneup-cfapi" }
+oneup-plan = { path = "../oneup-plan" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "oneup-effects"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive's effects layer: the only code that changes user content, and only for operations the safety gate approved"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+oneup-cfapi = { path = "../oneup-cfapi" }
+oneup-gate = { path = "../oneup-gate" }
+oneup-hash = { path = "../oneup-hash" }
+oneup-ntfs = { path = "../oneup-ntfs" }
+oneup-rules = { path = "../oneup-rules" }
+oneup-sync = { path = "../oneup-sync" }
+oneup-sys = { path = "../oneup-sys" }
+thiserror = "2"
+tracing = "0.1"
+
+[lints]
+workspace = true

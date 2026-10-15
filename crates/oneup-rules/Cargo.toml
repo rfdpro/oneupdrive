@@ -1,0 +1,15 @@
+[package]
+name = "oneup-rules"
+version = "0.1.0"
+publish = false
+description = "Rules for OneUpDrive: gitignore-style exclusions, presets and explain"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[lints]
+workspace = true

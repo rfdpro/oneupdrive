@@ -1,0 +1,18 @@
+[package]
+name = "oneup-hash"
+version = "0.1.0"
+publish = false
+description = "QuickXorHash, the content hash used by OneDrive"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+base64 = "0.22"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true

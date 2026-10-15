@@ -1,0 +1,79 @@
+//! Which data folders exist on this PC, so a path in a synced folder can be
+//! traced back to the data folder that syncs it (Explorer's context-menu
+//! commands only know the file). Each agent records its data folder when
+//! it starts (`HKCU\Software\OneUpDrive\DataFolders`); the default data
+//! folder and vault pairs are found without that.
+
+use std::path::{Path, PathBuf};
+
+const KEY: &str = r"Software\OneUpDrive\DataFolders";
+
+fn name_of(dir: &Path) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in dir.to_string_lossy().to_lowercase().trim_end_matches('\\').bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Records `dir` as a data folder in use.
+pub fn record(dir: &Path) {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let shown = dir.to_string_lossy();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+    if let Err(e) = oneup_sys::user_registry::set(KEY, &name_of(Path::new(shown)), shown) {
+        tracing::debug!(error = %e, "data folder not recorded");
+    }
+}
+
+/// The data folders agents recorded (main ones and pairs alike).
+pub fn recorded() -> Vec<PathBuf> {
+    oneup_sys::user_registry::values(KEY)
+        .map(|v| v.into_iter().map(|(_, d)| PathBuf::from(d)).collect())
+        .unwrap_or_default()
+}
+
+/// The data folders known on this PC: recorded ones, the default one, and
+/// their vault and extra pairs.
+pub fn all() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = crate::test_account::default_dir() {
+        out.push(d);
+    }
+    if let Ok(values) = oneup_sys::user_registry::values(KEY) {
+        out.extend(values.into_iter().map(|(_, v)| PathBuf::from(v)));
+    }
+    let mains = out.clone();
+    for m in mains {
+        out.extend(crate::launch::children(&m));
+    }
+    out.retain(|d| d.join("state.db").exists());
+    out.dedup_by(|a, b| crate::test_account::same_dir(a, b));
+    out
+}
+
+/// The data folder whose synced folder holds `path`, and `path` relative
+/// to it (`/`-separated, empty for the folder itself).
+pub fn for_path(path: &Path) -> Option<(PathBuf, String)> {
+    for_path_in(path, all())
+}
+
+/// [`for_path`] among the data folders `dirs`.
+pub fn for_path_in(path: &Path, dirs: Vec<PathBuf>) -> Option<(PathBuf, String)> {
+    let path = std::fs::canonicalize(path).ok()?;
+    let mut best: Option<(PathBuf, String, usize)> = None;
+    for d in dirs {
+        let Ok(store) = crate::setup::open_store(&d, 1024) else { continue };
+        let Some(local) = store.read(|o| o.meta_get(crate::sync::KEY_LOCAL)).ok().flatten() else { continue };
+        let local = std::fs::canonicalize(&local).unwrap_or_else(|_| PathBuf::from(&local));
+        if let Ok(rel) = path.strip_prefix(&local) {
+            // The innermost synced folder wins (a vault folder inside another).
+            let depth = local.components().count();
+            if best.as_ref().is_none_or(|b| depth > b.2) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                best = Some((d, rel, depth));
+            }
+        }
+    }
+    best.map(|(d, rel, _)| (d, rel))
+}

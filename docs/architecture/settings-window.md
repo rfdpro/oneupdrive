@@ -1,0 +1,50 @@
+# The settings window and its Files page
+
+The settings window is where every setting can be changed, and its Files page, a tree of each synced folder, is the main way to manage what syncs. User guide: [The settings window](../user-guide/settings-window.md).
+
+## Shape
+`oneup-settings` hosts one page (`bins/oneup/src/settings_ui.html`) in WebView2. The page asks, the program answers (`handle` in `oneup-settings.rs`); every change goes through the same functions as the command line (`settingsapi`, `config`, `filetree`, `vaultpair`, `pairs`), with the same checks. A request with `root` (`main`, `pair:<name>`, `vault:<name>`) works on that root's own data folder (`root_dir`), so the same requests (rules, space, placement, explain, Files On-Demand) apply per folder pair without being written twice.
+
+The window is one per data folder. When it's already open, a new `oneup-settings` process passes the page (and item) to it before exiting: `webview::focus_existing` sends a `WM_COPYDATA` (tagged `OUPG`) with `page\0item`, and the window hands the page `{"event":"goto","page":…,"item":…}`. The page name keeps only ASCII lowercase letters and the item is JSON-escaped (with `<`), so whatever sends one can't put more than that into the page.
+
+## The file tree (`oneup_app::filetree`)
+* **`list(data_dir, rel)`**: a folder's items from the database, on this PC (Local tree) and in OneDrive (Remote tree under the pair's root, found through the root's Synced link), merged by name the way Windows and OneDrive compare names, folders first, at most 2,000. Each item's state comes from the rule set the agent uses (config rules and presets, folders synced on their own, folders left to the OneDrive app, and every `.oneupignore` on the way down, as `oneup explain` builds it) plus whether it has a Synced row; Files On-Demand placement comes from the file's attributes (placeholders exposed first). Never reads content. A left-out folder is one opaque row in both trees, so its contents aren't listed (`untracked`).
+* **`find(data_dir, needle)`**: names containing the text, on this PC and in OneDrive (`Store::local_find` / `remote_find`, a `LIKE` scan of names: fine for a search someone types, not for anything that runs by itself).
+* **Changing what syncs** edits `config.toml`, as `oneup rules` does:
+  * `set_sync(…, on=false)` adds the rule naming exactly that item (`/path` or `/path/`, `[` written `[[]`, since rules have no escapes and Windows names can't hold `*` or `?`);
+  * `set_sync(…, on=true)` removes that rule, or, when a preset or a broader rule of yours leaves it out, adds the exception `!/path`;
+  * a `.oneupignore` rule, a pause, a separate pair or the OneDrive app's folders are reported instead of overridden, and so is an item inside a left-out folder (gitignore semantics: nothing inside an excluded folder can be re-included);
+  * each change is checked against the rebuilt rule set and undone if it didn't have the intended effect;
+  * `set_paused` edits `[pause] folders`, `set_order` the item's own entry in `[priority] first`/`last`.
+* The agent is nudged after each change; it applies rule changes without a rescan ([rules.md](rules.md#changing-rules-without-a-rescan)).
+
+## The page
+* **The agent's status** heads every page as a light and a word; selecting it opens a menu with the detail and the controls (pause, sync now, start/stop). A problem shows as a card with **Retry now**, **Open log** and **Copy details** ([control-api.md § Problems](control-api.md#problems)). The navigation runs Files, Activity, Apps, then the settings: General, Accounts, Office, Safety, Network, About. `main` keeps its scroll-bar gutter, so a page doesn't shift when it needs one.
+* **Tabs** for the roots (from `roots`), and an **Add** menu (a native popover) whose items open dialogs for `pair_add`, `pair_add_known`, `pair_add_shared`, `vault_create` and `vault_add`.
+* **Views**: All files (the tree, loaded a folder at a time, keyboard navigable, selection follows focus, sortable by name, status or size; a folder's size is the total of every file inside it, from `tree_sizes`: `Store::local_folder_totals` / `remote_folder_totals`, one recursive query over the folder's subtree, asked for after the listing), Exclude (presets, your rules and exceptions, paused folders with **Pause a folder…**, rule files, the rules as text, and excluded items still in OneDrive), and search results.
+* **Right-click menu** on tree items (also the menu key and Shift+F10): open, show in Explorer, exclude / sync again, pause / resume, keep / free, sync this first, links, versions, why. **Share** sits beside the item's name and shows its two links on hover or focus.
+* **Details panel**: sections that open and close (`<details>`); Versions, Why and Recent activity load when opened. With nothing selected, the root's own settings: paths, direction, Files On-Demand, free-space policy, start/stop/remove, and for vaults lock/unlock, Windows Hello, recovery key, password.
+* **Kept on this PC** lists the version store with **Restore** (`kept`, `kept_restore`, as `oneup versions`/`restore`; the agent is stopped around a restore).
+* **Stopping a folder's sync** (`remove_preview`, then `pair_remove`, `vault_remove` or `main_unpair`): a dialog says what stays where and how many files would leave because they're online-only (`Store::local_online_only`, from stored attributes), and offers to download them first (`on_demand` off, which checks the space) before removing. `pairs::unpair` releases the main folder and forgets its pairing (its database), keeping the sign-in, settings and other pairs.
+* `--page NAME` opens a page; `--page item --item PATH` selects that file and opens its Versions (Explorer's Version history and Share commands), `itemwhy` and `itemactivity` its Why and Recent activity. Old page names (`folders`, `syncing`, `storage`, `vaults`) open the Files page.
+
+## The Activity page
+Everything the tray and Explorer used to show in a console or Notepad opens here (page id `lists`), one tab each, selected by `launch::start_settings_on(dir, page)` with `--page activity`, `unsynced`, `excluded` or `stops`:
+* **Recent**: `activity_log` (`settingsapi::activity`, up to 20,000 entries, more on request);
+* **Sync failures**: `unsynced` (`unsynced::load`);
+* **Excluded in OneDrive**: `cloud_copies` (`prune::candidates` without the kept ones, then `prune::counted`, as `oneup cloud prune` lists them; read-only, and asked for only when the tab opens, since it calls Graph for unlisted folders);
+* **Safety stops**: `stops` (`stoplist::read`, which parses a stop's text file back into action, path, target and note, filtered and capped where it's read: a stop's list can have 100,000 lines). The text files stay: `oneup approve` names them.
+
+## Setting up and moving over from the OneDrive app
+First run walks through signing in (hidden sign-in that continues by itself, with Microsoft's account picker), a suggested new folder or an existing one, Files On-Demand, start at sign-in, and a preview before anything changes. Setup shows who's signed in, with **Sign out, to use another account**.
+
+**Move over** is offered when `moveover::app()` finds the OneDrive app's folder (the snapshot's `app_folder`: the folder, whether a sync root still manages it, Windows' own folders inside it). The window runs the read-only steps as separate `oneup` runs so it can say which is under way: `move_scan` (`oneup scan <folder> --exclude <preset>`), `move_list` (`oneup mirror`), `move_check` (`oneup migrate check --json`, which also records the app's choices while it manages the folder, `crate::carryover`). Unlinking is the person's; the page polls `move_state` every 3 s and notes if Windows moved Desktop, Documents or Pictures out of the folder meanwhile. When the app's unlinking stalls (`move_state`'s `stalled`), the page shows **Finish unlinking**, which runs `move_fix` once per step (`oneup migrate finish-unlink --step restart|reset|release --yes --json`; the result is the last JSON line printed), the reset skipped while a work or school account is set up in the app. One confirmation covers the three steps; **Finish it now** runs only `release`. Releasing can take many minutes on a big folder, and `move_fix` waits for it. Preview and Start stay disabled until the app is unlinked; then the pairing is the ordinary `oneup sync <folder> --remote / --pair-only`, whose first scan, content matching (`Op::Hash` for same-size files) and carry-over do the adopting ([files-on-demand.md § Moving over](files-on-demand.md#moving-over-from-the-onedrive-app)).
+
+## Parity with the command line
+Every window action has a CLI equivalent (Recent activity = `oneup activity`, Kept on this PC = `oneup versions`/`restore`, Sync this first = `oneup sync-now PATH`, Sign out/Sign in = `oneup logout`/`login`, shared folders = `oneup login --shared-folders`, updates = `oneup updates`, accounts = `oneup accounts`). CLI-only by design: safety-stop answers (`oneup approve`; the tray's dialogs in the GUI), `verify`, `diagnose`, `plan`, `observe` and the developer commands.
+
+## The window in the taskbar
+The settings window sets its own AppUserModelID (`OneUpDrive.Settings`, through the window's property store) and its big and small icons (`WM_SETICON`). With only the package identity, the taskbar would show the package's logo on a grey plate and treat a click on the button as launching the package's app rather than bringing the window forward. The program is a Windows-subsystem program in every build.
+
+## The mark
+The icon is drawn in code (`tray::mark`, `tray::render`): a cloud cut along a chevron, its top lifted a step ("one up"), sky to azure above and azure to indigo below, transparent gap between. `packaging/oneupdrive.ico` (every program's icon, and the settings window's title bar and taskbar button through `LoadIconW`) is generated from it (`ONEUP_WRITE_ICON=1 cargo test -p oneup --lib the_icon_file`); the tray's status icons put their badges on the same mark. The page draws the same geometry as an inline SVG; the identity package's logos are rendered from it at their sizes.

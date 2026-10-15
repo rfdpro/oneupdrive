@@ -1,0 +1,19 @@
+[package]
+name = "oneup-store"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive's local state database (SQLite)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# The store implements the reconciler's read interface (`oneup_sync::Trees`)
+# over its tables; oneup-sync itself has no dependencies.
+oneup-sync = { path = "../oneup-sync" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2"
+
+[lints]
+workspace = true

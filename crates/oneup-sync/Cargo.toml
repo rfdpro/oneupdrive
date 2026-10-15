@@ -1,0 +1,20 @@
+[package]
+name = "oneup-sync"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive's three-tree reconciler: pure planning of sync operations from the Local, Remote and Synced trees"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# The simulation replays every round against a SQLite copy of its world and
+# requires identical plans. Integration tests link the normal library, so
+# the store and the tests share one copy of this crate's types.
+oneup-store = { path = "../oneup-store" }
+
+[lints]
+workspace = true

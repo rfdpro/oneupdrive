@@ -1,0 +1,69 @@
+# Encrypted vaults (Cryptomator format 8)
+
+Folders encrypted in the Cryptomator vault format, so OneDrive only ever holds ciphertext, readable by Cryptomator's own apps too. `crates/oneup-vault` is the format library; `crates/oneup-vaultsync` syncs a vault as a folder pair. User guide: [Encrypted vaults](../user-guide/vaults.md).
+
+## Security model
+* **Primitives**: AES-256-GCM per 32 KiB chunk (chunk number + header nonce as associated data, so chunks can't be reordered or swapped between files); AES-SIV names bound to the parent folder's ID; an scrypt-wrapped masterkey; an HMAC-signed vault configuration (JWT). The format has had a public audit of its core cryptography.
+* **What stays visible** to the storage provider: file sizes (to ~32 KiB granularity), file and folder counts, and timestamps. The directory structure is **not** protected against deletion or rollback by the provider: whole files can be removed or reverted to an older valid version.
+* **Masterkey-file vaults only.** Hub vaults, whose key loading trusts endpoints named in the vault configuration (the subject of published CVEs), are refused. The configuration's signature is verified with the masterkey **before** any field is trusted.
+* **Trade-offs:** no OneDrive web preview, search, sharing or co-authoring for vault contents. Plaintext on this PC still needs BitLocker or similar.
+
+## The format library (`oneup-vault`)
+Implemented from the published specification (docs.cryptomator.org, *Security Architecture* and *Vault Cryptography*, CC BY-SA 4.0; no Cryptomator code was read or used). RustCrypto crates only: `aes-siv`, `aes-gcm`, `aes-kw`, `scrypt`, `hmac`, `sha1`, `sha2`; `zeroize` for key material.
+
+| Part | Module | Notes |
+|---|---|---|
+| Masterkey file (`masterkey.cryptomator`) | `key` | scrypt (N = 2^15, r = 8, p = 1, 8-byte salt; a file asking for more than 1 GiB is refused), AES key wrap (RFC 3394; its integrity check is what says "wrong password"), `versionMac` = HMAC-SHA256 of the big-endian 32-bit version (999), checked. The password is Unicode-NFC-normalised, then UTF-8 |
+| Vault configuration (`vault.cryptomator`) | `config` | JWT. The key's location (`kid`) is read unverified, only `masterkeyfile:NAME` with a plain file name is accepted (no paths); then the signature (HS256/384/512, key = encryption key ‖ MAC key, compared in constant time) is checked **before** any field is trusted; then format 8 and `SIV_GCM` are required. Hub vaults (`hub+…`) and `SIV_CTRMAC` vaults are refused with a clear message |
+| Folder IDs and storage paths | `names::dir_path` | `d/XX/` + 30 chars of Base32(SHA-1(AES-SIV(ID))) |
+| Names | `names` | AES-SIV with the parent folder's ID as associated data, NFC, Base64url with padding, `.c9r`; shortened above the configured threshold (220) to Base64url(SHA-1) + `.c9s` with `name.c9s` |
+| Contents | `content` | 68-byte header (nonce, GCM-encrypted `FF×8` ‖ content key, tag); 32 KiB chunks, each nonce ‖ ciphertext ‖ tag with AAD = chunk number (big-endian u64) ‖ header nonce. Streaming; each chunk is authenticated before it's passed on |
+| Local folder | `folder` | create, open, list (with the entries it couldn't read), find by path (straight from the encrypted name, no listing), read, add new files and folders. Never replaces or removes anything that exists (`create_new`); refuses online-only placeholders |
+| Recovery key | `recovery` | below |
+
+AES-SIV takes its keys in RFC 5297 order (S2V/MAC key, then CTR/encryption key); the specification writes the arguments the other way round. Interoperability with Cryptomator Desktop is confirmed in both directions (vaults made by either open and verify in the other).
+
+**Tests** (`cargo test -p oneup-vault`): RFC 3394 and RFC 5297 known answers (the latter pins the AES-SIV key order); round trips at chunk boundaries; tampering (a flipped bit, swapped chunks, a chunk from another file, a cut file, a changed header, another vault's key, a changed masterkey version, a forged configuration, a name moved to another folder); hostile files (huge scrypt cost, `alg: none`, key paths outside the vault, Hub). The specification's example configuration is read as far as it can be without its key.
+
+**Not built:** `dirid.c9r` backups (optional in the format: they help recover a damaged vault and add no security; listing ignores them), symbolic links (listed, not created or followed), Cryptomator's own recovery-key encoding (it isn't in the specification; OneUpDrive has its own, below).
+
+**Checking interoperability by hand** (needs Cryptomator Desktop, and no real data):
+```powershell
+$env:ONEUP_VAULT_PASSWORD = "a test passphrase"
+$v = "$env:TEMP\vault-interop"
+oneup vault create $v
+oneup vault mkdir $v "Folder"
+oneup vault put $v C:\Windows\win.ini "Folder/win.ini"
+oneup vault put $v C:\Windows\win.ini ("Folder/" + ("long" * 60) + ".ini")
+```
+1. In Cryptomator: *Add vault → Existing vault*, choose `vault.cryptomator` in that folder, unlock with the passphrase. Both files should open and match `C:\Windows\win.ini`.
+2. In the unlocked vault, add a file and a folder with a few files, lock it, then: `oneup vault check $v` and `oneup vault ls $v -r` should list and verify everything.
+3. The other way round: create a new vault **in Cryptomator** (in `%TEMP%`), add files, lock it, and run `oneup vault check` and `oneup vault get` on it.
+
+If step 1 fails to unlock, the configuration or masterkey is the issue. If it unlocks but lists nothing or garbled names, the AES-SIV key order is.
+
+## Vault pairs
+A vault in OneDrive is ordinary encrypted files, so syncing it as-is already works with Cryptomator showing its contents. OneUpDrive also shows it **decrypted**: a vault is synced as a **folder pair whose cloud side is seen through the vault**. The planner, safety gate, effects layer, executor and Files On-Demand provider are unchanged. By default the pair has Files On-Demand on, so files are decrypted when opened and encrypted when saved; `--full-files` keeps every decrypted file on the PC instead.
+
+* **Data folder:** `<data folder>\vaults\<name>` (marked by `vault-pair.txt`, holding the vault's OneDrive path), with its own state database (Local tree of the decrypted folder, Synced tree, and as its Remote tree the vault's decrypted view), `config.toml`, log and lock. It signs in with the main data folder's account (`setup::auth` follows `vaultpair::main_dir`).
+* **The decrypted view** (`oneup-vaultsync`, `project`): from the vault's encrypted items in the **main** data folder's cloud listing (the whole-drive mirror already lists them), the decrypted tree: the top folder's ID is empty, each folder's entries are in `d/XX/…` from its ID, names decrypt with their folder's ID, a folder's ID is in its `dir.c9r` and a long name in `name.c9s` (both read once per version and cached), sizes convert from the encrypted size. The decrypted items' IDs are the encrypted items that get moved and deleted (a file's `.c9r`, a folder's `.c9r` folder, a long name's `.c9s` folder; the vault's folder is the root). Their eTag and hash are those of the encrypted content. **Removals need evidence:** a decrypted item goes only when its encrypted item is gone from the listing (a delta deletion, or our own); one that can't be placed (a `dir.c9r` that can't be read, a name that doesn't decrypt) keeps its row and is reported. Cost: the walk reads the vault's part of the listing each round, fine up to about 100,000 items.
+* **Hashes are the cloud's** (`oneup_exec::cloud`): `Cloud::download`/`upload` return the hash of what they actually received or sent when they transform content, and the executor and hydration use it. So the Remote tree, the Synced tree and placeholder identities all carry the encrypted file's QuickXorHash, checked against what OneDrive reports. `Cloud::can_copy` is false for a vault (equal files encrypt differently), so server-side copies never apply.
+* **`VaultCloud`** (`oneup-vaultsync`, `cloud`): uploads are encrypted as they stream (`oneup_vault::content::Encryptor`), downloads decrypted chunk by chunk, each authenticated before it's written (`Decryptor`), into staging, as every download is. Folders are made as Cryptomator makes them: storage folder, entry folder, `dir.c9r`. Deleting a folder needs its storage to hold nothing but the ID backup; the entry goes first, then the storage (an interruption leaves only an empty storage folder). Every precondition stays (`If-Match`, names that must be free). **It records the encrypted items it changes in the main listing at once**, so the view never lags behind its own changes, and a file just uploaded can never look deleted.
+* **The vault's agent** is its own `oneupd` (one process per data folder, as always): its rounds first bring the main listing up to date (the main pair's own listing rules, `sync::pruning_for`, so the two agents never fight over rules; delta pages are applied idempotently, so both agents catching up the same listing is safe), then the decrypted view, then plan as usual. Push, journal wake-ups, pause, safety stops and `oneup status --data-dir <vault pair>` all work per vault. Its keys: handed over standard input by `oneup vault unlock`/`add` (`--key-stdin`, never written to disk), read from `vault-key.dpapi` when remembered on this PC, or unsealed with Windows Hello (below). `oneup start` also starts the vaults whose keys are remembered. Hydration uses the vault's cloud, so an opened placeholder is decrypted into staging and checked (size, encrypted hash) before a byte reaches it.
+* **Keeping plaintext out of OneDrive:** a vault's folder may not overlap the main pair's folder or another vault's (checked when it's added). A vault inside the main pair's OneDrive folder is excluded from the main pair by a rule of its own (`RuleSet::set_vaults`, source "a vault synced on its own"), applied last so no `!` rule can undo it, and path-anchored, so the mirror keeps listing the vault. Commands that would write a drive listing or a pairing into a vault pair's data folder refuse.
+* **Tests:**
+  * `oneup-vaultsync/tests/vault.rs`: a vault built through `VaultCloud` (long names, nested folders, renames, new versions, deletions) opens and reads with `oneup_vault::folder::Folder`, the format library checked against Cryptomator. Tampered ciphertext is refused, and the view removes only what's gone from the listing.
+  * `oneup-vaultsync/tests/sync.rs`: end to end with the real scanner, observer, planner, gate and executor. Full files: both sides' changes. On demand: files arrive online-only with their decrypted size; opening one from `cmd.exe` decrypts it through the real hydration service and nothing else; a program's edit and a new file go back encrypted.
+  * `oneup-rules`: the vault rule beats a `!` rule and never prunes.
+
+## Creating vaults, the recovery key, passwords, Windows Hello, long names
+* **Creating in OneDrive** (`vaultpair::create`, `oneup vault new`, the settings window): the OneDrive folder must be new or empty; the masterkey file, the signed configuration and `d/XX/…` (the top folder's storage, which Cryptomator expects even when empty) are uploaded with `conflictBehavior=fail`, then the vault is paired as `add` does.
+* **Recovery key** (`oneup_vault::recovery`): OneUpDrive's own text, since Cryptomator's encoding isn't published: `OUD1-` and Base32 of the 64 key bytes plus a 4-byte SHA-256 check, in groups; reading forgives case, spaces, dashes and 0/O, 1/I, 8/B, and the check catches typos. Which vault it belongs to is checked against the vault's signed configuration before anything is written.
+* **Changing the password** (`vaultpair::set_password`): a new `masterkey.cryptomator` wrapping the same keys, uploaded as a new version under `If-Match` (OneDrive's history keeps the old one), after verifying the keys against the configuration. Nothing is re-encrypted. `keys()` lists the vault afresh first, so a password changed elsewhere is read.
+* **Windows Hello** (`oneup_sys::hello`, `oneup_vault::sealed`, `vaultpair::{save,load}_key_hello`): `KeyCredentialManager` keeps a key per vault pair (named by its token); it signs a random 32-byte challenge stored with the sealed keys; SHA-256 of the signature (RSA PKCS #1 v1.5, deterministic) is the 256-bit secret that seals the keys with AES-256-GCM (`vault-key.hello`). Every unlock shows Windows Hello's prompt.
+* **Long names in moves** (`VaultCloud::move_reshaped`): when an entry's stored shape changes (a long name on either side, or a folder's `.c9r` folder), the new entry is built in the destination (a `.c9s` folder with `name.c9s`, or a `.c9r` folder), the part carrying the content (`contents.c9r`, the `.c9r` file, `dir.c9r`) is moved into it under `If-Match`, and the old shell is removed after re-reading its eTag (`Cloud::item`). The decrypted item gets a new ID; the executor's `MoveRemote` records it in the Synced row and renews an online-only file's identity without downloading it (`LocalFs::renew_identity`, which holds the placeholder and keeps its own time). The view treats contents now inside another entry as evidence that the old entry moved (`project::apply`). Interrupted moves leave either the old entry whole and a new shell without content (reused by the retry) or the new one whole and an old shell without content. Tests: every direction against the format library, and end to end (full files and online-only).
+
+## Limits
+* Symbolic links in a vault are listed as a problem, not synced.
+* A vault inside a folder synced by the OneDrive app is refused by the coexistence checks, as for any pair.
+* The tray menu doesn't list vaults; the settings window lists, adds, unlocks, locks and removes them.

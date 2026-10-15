@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  OneUpDrive's identity package (a "sparse" package: it holds no programs,
+  only this manifest and its logos; the programs stay in the install
+  folder, its external location). It gives OneUpDrive the package identity
+  Explorer integration needs (docs/architecture/explorer.md). Publisher must
+  equal the signing certificate's subject exactly; the build fills it in.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop3="http://schemas.microsoft.com/appx/manifest/desktop/windows10/3"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:cloudfiles2="http://schemas.microsoft.com/appx/manifest/cloudfiles/windows10/2"
+  IgnorableNamespaces="uap uap10 rescap desktop3 desktop6 com cloudfiles2">
+  <Identity Name="OneUpDrive.Sync" Publisher="{{PUBLISHER}}" Version="{{VERSION}}" ProcessorArchitecture="neutral"/>
+  <Properties>
+    <DisplayName>OneUpDrive</DisplayName>
+    <PublisherDisplayName>OneUpDrive</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+    <!-- Package identity would otherwise send the programs' registry and
+         AppData writes to a private copy only they see: Office (the
+         SyncEngines key), Explorer (the flyout's status), "start at sign-in"
+         and the data folders must see the real ones. Needs the
+         unvirtualizedResources capability below. -->
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us"/>
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0"/>
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust"/>
+    <rescap:Capability Name="unvirtualizedResources"/>
+  </Capabilities>
+  <Applications>
+    <Application Id="OneUpDrive" Executable="oneupd.exe" uap10:TrustLevel="mediumIL" uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements AppListEntry="none" DisplayName="OneUpDrive" Description="OneUpDrive"
+        BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png"/>
+      <Extensions>
+        <!-- A sync-root provider for the shell (navigation pane, status). -->
+        <desktop3:Extension Category="windows.cloudFiles">
+          <desktop3:CloudFiles>
+            <!-- The custom states (a lock on items in a vault's folder). -->
+            <desktop3:CustomStateHandler Clsid="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a10"/>
+            <!-- Required by the schema; reserved IDs that oneup_shell.dll doesn't
+                 serve, so Windows keeps its own thumbnails and properties. -->
+            <desktop3:ThumbnailProviderHandler Clsid="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a11"/>
+            <desktop3:ExtendedPropertyHandler Clsid="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a12"/>
+            <desktop3:BannersHandler Clsid="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a13"/>
+            <!-- Explorer's sync-status flyout (Windows 11 23H2 and later). -->
+            <cloudfiles2:StorageProviderStatusUISourceFactory Clsid="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a20"/>
+            <!-- OneUpDrive's commands for items in its folders (crates/oneup-shellext). -->
+            <desktop3:CloudFilesContextMenus>
+              <desktop3:Verb Id="OneUpDrive" Clsid="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a00"/>
+            </desktop3:CloudFilesContextMenus>
+          </desktop3:CloudFiles>
+        </desktop3:Extension>
+        <!-- Loaded in a surrogate process, never in Explorer itself. -->
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="OneUpDrive commands">
+              <com:Class Id="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a00" Path="oneup_shell.dll" ThreadingModel="STA"/>
+              <com:Class Id="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a10" Path="oneup_shell.dll" ThreadingModel="Both"/>
+              <com:Class Id="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a20" Path="oneup_shell.dll" ThreadingModel="Both"/>
+              <!-- Experimental: what Office asks a sync program (oneup office-integration). -->
+              <com:Class Id="7d3e5c1a-0b5e-4f6b-9a41-6f2c1d8e9a30" Path="oneup_shell.dll" ThreadingModel="Both"/>
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

@@ -1,0 +1,627 @@
+//! What the user controls and sees of the running agent, through its control
+//! pipe (`oneup_ipc`): pause and resume, answers to what it waits for, and
+//! its status. Shared by the agent's loop and the pipe's handler, which
+//! only reads and changes this in-memory state; the loop acts on it.
+//!
+//! The pause is saved to [`PAUSE_FILE`] in the data folder the moment it
+//! changes, so a paused agent stays paused when it restarts, however it
+//! ended. Answers are not saved: a code answers for one batch the agent is
+//! showing right now, and only such codes are accepted.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use oneup_gate::{Breaker, Overflow, OverflowOutcome, Side};
+use oneup_ipc::{
+    Activity, Answer, Call, Direction, INVALID_PARAMS, LastRun, NO_SUCH_BATCH, PauseState, RpcError, SafetyStop, Status,
+};
+use tokio::sync::Notify;
+
+use crate::sync::{Answers, Controls, Offer};
+
+/// In the data folder: the agent's pause (JSON), while there is one.
+pub const PAUSE_FILE: &str = "agent-pause.json";
+
+pub fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// The agent's shared control state.
+pub struct Control {
+    state: Mutex<Shared>,
+    /// Where the pause is saved (`None`: nowhere, in tests).
+    pause_file: Option<PathBuf>,
+    /// Pinged when a call changed something the loop must act on.
+    pub wake: Notify,
+    /// Whether the push channel is live (set by the push task).
+    pub push_up: Arc<AtomicBool>,
+    /// Pinged once when a `stop` call arrives.
+    pub stop: Notify,
+    stopping: AtomicBool,
+    /// The status revision, for clients that watch it (`Call::Watch`).
+    rev: tokio::sync::watch::Sender<u64>,
+}
+
+struct Shared {
+    pause: PauseState,
+    answers: Answers,
+    local: String,
+    remote: String,
+    activity: Activity,
+    checked_ms: Option<i64>,
+    last: Option<LastRun>,
+    stops: Vec<SafetyStop>,
+    overflow: Option<oneup_ipc::Overflow>,
+    /// Codes of the stops and the batch answered since: no longer shown as
+    /// waiting. The rounds that carry them out can take long (12,711
+    /// deletions once ran 40 minutes under Graph's throttling), and until
+    /// they end, [`Control::record`] still has them.
+    answered: Vec<String>,
+    /// Not shown once accepted (it's being carried out).
+    prune_offer: Option<oneup_ipc::PruneOffer>,
+    /// The problem being retried, and the last one that cleared (until
+    /// [`Control::take_resolved`] collects it for the activity log).
+    problem: Option<oneup_ipc::Problem>,
+    resolved: Option<oneup_ipc::Problem>,
+    auto_pause: Option<String>,
+    /// Paths to transfer first (`oneup sync-now PATH`), until a round settles.
+    first: Vec<String>,
+    /// The round being carried out, while one is.
+    progress: Option<oneup_ipc::Progress>,
+    /// What can't sync until the user acts (`crate::unsynced`).
+    unsynced: Option<oneup_ipc::Unsynced>,
+    /// The status as watchers last saw it (its `rev` left at 0).
+    shown: Option<Status>,
+}
+
+fn code(f: u64) -> String {
+    format!("{f:016x}")
+}
+
+/// Reads a saved pause; anything unreadable counts as "not paused" (it's
+/// our own file, and not pausing loses nothing).
+fn load_pause(file: &Path) -> PauseState {
+    std::fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Saves the pause (our own file: written whole, then renamed into place),
+/// or removes the file when nothing is paused.
+fn save_pause(file: &Path, p: &PauseState) -> std::io::Result<()> {
+    if !p.local && !p.remote {
+        return match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(p).map_err(std::io::Error::other)?)?;
+    std::fs::rename(&tmp, file)
+}
+
+impl Control {
+    /// `data_dir`: where the pause is kept (`None`: not kept). `answers`:
+    /// those given on the command line.
+    pub fn new(data_dir: Option<&Path>, local: String, remote: String, answers: Answers) -> Self {
+        let pause_file = data_dir.map(|d| d.join(PAUSE_FILE));
+        let pause = pause_file.as_deref().map(load_pause).unwrap_or_default();
+        Self {
+            state: Mutex::new(Shared {
+                pause,
+                answers,
+                local,
+                remote,
+                activity: Activity::Starting,
+                checked_ms: None,
+                last: None,
+                stops: Vec::new(),
+                overflow: None,
+                answered: Vec::new(),
+                prune_offer: None,
+                problem: None,
+                resolved: None,
+                auto_pause: None,
+                first: Vec::new(),
+                progress: None,
+                unsynced: None,
+                shown: None,
+            }),
+            pause_file,
+            wake: Notify::new(),
+            push_up: Arc::new(AtomicBool::new(false)),
+            stop: Notify::new(),
+            stopping: AtomicBool::new(false),
+            rev: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    /// Moves the revision on if the status changed. Called with the state
+    /// locked, after each change to it.
+    fn publish(&self, s: &mut Shared) {
+        let now = Status { rev: 0, ..self.status(s) };
+        if s.shown.as_ref() != Some(&now) {
+            s.shown = Some(now);
+            self.rev.send_modify(|r| *r += 1);
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Shared> {
+        // Nothing in here can be left half-changed by a panic that matters.
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn save(&self, p: &PauseState) {
+        if let Some(f) = &self.pause_file
+            && let Err(e) = save_pause(f, p)
+        {
+            tracing::warn!(error = %e, "can't save the pause; it lasts until oneupd stops");
+        }
+    }
+
+    /// Ends a timed pause that is over (at `now`). Returns the pause in
+    /// effect.
+    pub fn settle_pause(&self, now: i64) -> PauseState {
+        let mut s = self.lock();
+        if s.pause.until_ms.is_some_and(|u| u <= now) {
+            s.pause = PauseState::default();
+            self.save(&s.pause);
+            tracing::info!("the timed pause is over");
+            println!("oneupd: the pause is over; syncing again");
+        }
+        self.publish(&mut s);
+        s.pause
+    }
+
+    /// The controls for the next rounds.
+    pub fn controls(&self) -> Controls {
+        let s = self.lock();
+        Controls {
+            answers: s.answers.clone(),
+            pause_local: s.pause.local,
+            pause_remote: s.pause.remote,
+            first: s.first.clone(),
+        }
+    }
+
+    /// The paths asked to go first have been dealt with (a round settled).
+    pub fn clear_first(&self) {
+        self.lock().first.clear();
+    }
+
+    pub fn set_activity(&self, a: Activity) {
+        let mut s = self.lock();
+        s.activity = a;
+        self.publish(&mut s);
+    }
+
+    /// How far the round being carried out is (`None`: no round runs).
+    /// The engine reports about once a second, which is how often watchers
+    /// are woken for it.
+    pub fn set_progress(&self, p: Option<oneup_ipc::Progress>) {
+        let mut s = self.lock();
+        s.progress = p;
+        self.publish(&mut s);
+    }
+
+    /// What can't sync until the user acts (`crate::unsynced`).
+    pub fn set_unsynced(&self, u: Option<oneup_ipc::Unsynced>) {
+        let mut s = self.lock();
+        s.unsynced = u;
+        self.publish(&mut s);
+    }
+
+    /// Why the agent paused by itself, or `None` when it didn't.
+    pub fn set_auto_pause(&self, why: Option<String>) {
+        let mut s = self.lock();
+        s.auto_pause = why;
+        self.publish(&mut s);
+    }
+
+    /// The problem the agent is retrying (`crate::problem`).
+    pub fn set_problem(&self, p: Option<oneup_ipc::Problem>) {
+        let mut s = self.lock();
+        if p.is_some() {
+            s.activity = Activity::Retrying;
+        }
+        s.problem = p;
+        self.publish(&mut s);
+    }
+
+    /// The problem being retried, if any.
+    pub fn problem(&self) -> Option<oneup_ipc::Problem> {
+        self.lock().problem.clone()
+    }
+
+    /// The problem that cleared since this was last asked, if one did.
+    pub fn take_resolved(&self) -> Option<oneup_ipc::Problem> {
+        self.lock().resolved.take()
+    }
+
+    /// Records a sequence of rounds that finished at `at_ms`: what it did
+    /// (`None` if nothing; the last changes are kept then), the tripped
+    /// safety stops (empty if none), the overflow batch (if any) and the
+    /// offer to remove excluded items from OneDrive (if any). Returns
+    /// whether the stops, the batch or the offer differ from what was shown
+    /// before, so the caller prints them once.
+    pub fn record(
+        &self,
+        at_ms: i64,
+        last: Option<LastRun>,
+        breakers: &[Breaker],
+        overflow: Option<&Overflow>,
+        offer: Option<&Offer>,
+    ) -> Recorded {
+        let stops: Vec<SafetyStop> = breakers
+            .iter()
+            .map(|b| SafetyStop {
+                kind: match b.kind {
+                    oneup_gate::BreakerKind::Mass => "mass".into(),
+                    oneup_gate::BreakerKind::Suspicious => "content".into(),
+                },
+                side: match b.side {
+                    Side::Local => "local".into(),
+                    Side::Remote => "remote".into(),
+                },
+                count: b.count,
+                recent: b.recent,
+                synced_items: b.synced_items,
+                code: code(b.fingerprint.0),
+            })
+            .collect();
+        let overflow = overflow.map(|o| oneup_ipc::Overflow {
+            count: o.count,
+            bytes: o.bytes,
+            room: o.room,
+            code: code(o.fingerprint.0),
+            waiting: o.outcome == OverflowOutcome::Held,
+        });
+        let offer = offer.filter(|o| !o.accepted).map(|o| oneup_ipc::PruneOffer {
+            entries: o.entries,
+            items: o.items,
+            bytes: o.bytes,
+            code: code(o.fingerprint),
+        });
+        let mut s = self.lock();
+        let new_stops = !stops.is_empty() && stops != s.stops;
+        let new_offer = offer.is_some() && offer != s.prune_offer;
+        // A batch is shown again when its outcome changes (held, then kept
+        // or discarded as the user chose).
+        let key = |o: &Option<oneup_ipc::Overflow>| o.as_ref().map(|o| (o.code.clone(), o.waiting));
+        let new_overflow = overflow.is_some() && key(&overflow) != key(&s.overflow);
+        s.checked_ms = Some(at_ms);
+        if last.is_some() {
+            s.last = last;
+        }
+        s.stops = stops;
+        s.overflow = overflow;
+        // Kept while the agent still reports them: a round already under
+        // way when the answer came can trip the same stop once more.
+        s.prune_offer = offer;
+        let Shared { answered, stops, overflow, prune_offer, .. } = &mut *s;
+        answered.retain(|c| {
+            stops.iter().any(|st| &st.code == c)
+                || overflow.as_ref().is_some_and(|o| o.waiting && &o.code == c)
+                || prune_offer.as_ref().is_some_and(|o| &o.code == c)
+        });
+        if let Some(p) = s.problem.take() {
+            s.resolved = Some(p);
+        }
+        self.publish(&mut s);
+        Recorded { new_stops, new_overflow, new_offer }
+    }
+
+    /// The status now (as `oneup status` gets it).
+    pub fn snapshot(&self) -> Status {
+        let s = self.lock();
+        self.status(&s)
+    }
+
+    /// Changes whenever the status does (for in-process watchers).
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.rev.subscribe()
+    }
+
+    fn status(&self, s: &Shared) -> Status {
+        Status {
+            version: env!("CARGO_PKG_VERSION").into(),
+            rev: *self.rev.borrow(),
+            local: s.local.clone(),
+            remote: s.remote.clone(),
+            activity: if self.stopping.load(Relaxed) {
+                Activity::Stopping
+            } else if s.pause.local && s.pause.remote {
+                Activity::Paused
+            } else {
+                s.activity
+            },
+            paused: s.pause,
+            push: self.push_up.load(Relaxed),
+            checked_ms: s.checked_ms,
+            last: s.last.clone(),
+            safety_stops: s.stops.iter().filter(|st| !s.answered.contains(&st.code)).cloned().collect(),
+            overflow: s.overflow.clone().map(|mut o| {
+                o.waiting &= !s.answered.contains(&o.code);
+                o
+            }),
+            problem: s.problem.clone(),
+            auto_pause: s.auto_pause.clone(),
+            prune_offer: s.prune_offer.clone().filter(|o| !s.answered.contains(&o.code)),
+            progress: s.progress.clone(),
+            unsynced: s.unsynced.clone(),
+        }
+    }
+
+    fn call(&self, call: Call, now: i64) -> Result<Status, RpcError> {
+        let mut s = self.lock();
+        let mut wake = true;
+        match call {
+            // `serve` answers a watch itself; here it is a status.
+            Call::Status | Call::Watch { .. } => wake = false,
+            Call::SyncNow => {}
+            Call::SyncFirst { path } => {
+                // Bounded: a client can't grow the agent's memory.
+                if !s.first.contains(&path) && s.first.len() < 32 {
+                    s.first.push(path);
+                }
+            }
+            Call::Stop => {
+                wake = false;
+                if !self.stopping.swap(true, Relaxed) {
+                    tracing::info!("stop requested");
+                    self.stop.notify_one();
+                }
+            }
+            Call::Pause { direction, minutes } => {
+                if minutes == Some(0) {
+                    return Err(RpcError::new(INVALID_PARAMS, "a timed pause needs at least one minute"));
+                }
+                let (l, r) = sides(direction);
+                s.pause.local |= l;
+                s.pause.remote |= r;
+                // One timer for the whole pause: the latest call sets it.
+                s.pause.until_ms = minutes
+                    .map(|m| now.saturating_add(i64::try_from(m).unwrap_or(i64::MAX / 2).saturating_mul(60_000)));
+                self.save(&s.pause);
+            }
+            Call::Resume { direction } => {
+                let (l, r) = sides(direction);
+                s.pause.local &= !l;
+                s.pause.remote &= !r;
+                if !s.pause.local && !s.pause.remote {
+                    s.pause.until_ms = None;
+                }
+                if s.activity == Activity::Paused {
+                    // The loop wakes and runs now.
+                    s.activity = Activity::Syncing;
+                }
+                self.save(&s.pause);
+            }
+            Call::Answer { code: given, answer } => {
+                let given = given.trim().to_ascii_lowercase();
+                let Ok(f) = u64::from_str_radix(&given, 16) else {
+                    return Err(RpcError::new(INVALID_PARAMS, "expected the 16-character code oneupd showed"));
+                };
+                let matches = match answer {
+                    Answer::Approve => s.stops.iter().any(|st| st.code == code(f)),
+                    Answer::Prune | Answer::KeepInCloud => s.prune_offer.as_ref().is_some_and(|o| o.code == code(f)),
+                    Answer::Keep | Answer::Discard => {
+                        s.overflow.as_ref().is_some_and(|o| o.waiting && o.code == code(f))
+                    }
+                };
+                if !matches {
+                    return Err(RpcError::new(
+                        NO_SUCH_BATCH,
+                        "oneupd isn't waiting for that code (it may have changed meanwhile; see `oneup status`)",
+                    ));
+                }
+                let list = match answer {
+                    Answer::Approve => &mut s.answers.approve,
+                    Answer::Keep => &mut s.answers.keep,
+                    Answer::Discard => &mut s.answers.discard,
+                    Answer::Prune => &mut s.answers.prune,
+                    Answer::KeepInCloud => &mut s.answers.keep_in_cloud,
+                };
+                if !list.contains(&f) {
+                    list.push(f);
+                }
+                if answer != Answer::Prune && !s.answered.contains(&code(f)) {
+                    s.answered.push(code(f));
+                }
+                if s.activity == Activity::WaitingForYou {
+                    // The loop wakes and carries it out now.
+                    s.activity = Activity::Syncing;
+                }
+                tracing::info!(?answer, "answer received");
+            }
+        }
+        self.publish(&mut s);
+        let status = self.status(&s);
+        drop(s);
+        if wake {
+            self.wake.notify_one();
+        }
+        Ok(status)
+    }
+}
+
+/// What [`Control::record`] found new, to print once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    pub new_stops: bool,
+    pub new_overflow: bool,
+    pub new_offer: bool,
+}
+
+fn sides(d: Direction) -> (bool, bool) {
+    match d {
+        Direction::Both => (true, true),
+        Direction::Local => (true, false),
+        Direction::Remote => (false, true),
+    }
+}
+
+impl oneup_ipc::Handler for Control {
+    fn handle(&self, call: Call) -> Result<Status, RpcError> {
+        self.call(call, now_ms())
+    }
+
+    fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.rev.subscribe())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use oneup_gate::Fingerprint;
+
+    fn control(dir: Option<&Path>) -> Control {
+        Control::new(dir, "L".into(), "/R".into(), Answers::default())
+    }
+
+    fn rec(new_stops: bool, new_overflow: bool) -> Recorded {
+        Recorded { new_stops, new_overflow, new_offer: false }
+    }
+
+    #[test]
+    fn an_offer_to_prune_is_accepted_by_its_code_and_hidden_once_accepted() {
+        let c = control(None);
+        let offer = Offer { fingerprint: 0xef, entries: 2, items: 30, bytes: 5, accepted: false, covered: Vec::new() };
+        assert!(c.record(1, None, &[], None, Some(&offer)).new_offer);
+        assert!(!c.record(2, None, &[], None, Some(&offer)).new_offer);
+        let answer = |code: &str, answer| c.call(Call::Answer { code: code.into(), answer }, 0);
+        assert_eq!(answer("00000000000000ef", Answer::Approve).unwrap_err().code, NO_SUCH_BATCH);
+        assert_eq!(answer("00000000000000ee", Answer::Prune).unwrap_err().code, NO_SUCH_BATCH);
+        let s = answer("00000000000000ef", Answer::Prune).unwrap();
+        assert_eq!(s.prune_offer.unwrap().items, 30);
+        assert_eq!(c.controls().answers.prune, vec![0xef]);
+        // Being carried out: no longer offered.
+        let s = c.call(Call::Status, 0).unwrap();
+        assert!(s.prune_offer.is_some());
+        c.record(3, None, &[], None, Some(&Offer { accepted: true, ..offer }));
+        assert!(c.call(Call::Status, 0).unwrap().prune_offer.is_none());
+    }
+
+    #[test]
+    fn keeping_offered_items_in_onedrive_settles_the_offer_at_once() {
+        let c = control(None);
+        let offer = Offer { fingerprint: 0xef, entries: 2, items: 30, bytes: 5, accepted: false, covered: Vec::new() };
+        c.record(1, None, &[], None, Some(&offer));
+        let s = c.call(Call::Answer { code: "00000000000000ef".into(), answer: Answer::KeepInCloud }, 0).unwrap();
+        assert!(s.prune_offer.is_none());
+        assert_eq!(c.controls().answers.keep_in_cloud, vec![0xef]);
+        // Not shown again while the agent still has it, before a round
+        // saves the answer.
+        assert!(!c.record(2, None, &[], None, Some(&offer)).new_offer);
+        assert!(c.snapshot().prune_offer.is_none());
+    }
+
+    fn last() -> Option<LastRun> {
+        Some(LastRun { at_ms: 1, done: 3, skipped: 0, failed: 0, held: 0 })
+    }
+
+    #[test]
+    fn pauses_are_kept_timed_and_saved_at_once() {
+        let dir = std::env::temp_dir().join(format!("oneup-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = control(Some(&dir));
+        let s = c.call(Call::Pause { direction: Direction::Local, minutes: None }, 0).unwrap();
+        assert_eq!((s.paused.local, s.paused.remote, s.activity), (true, false, Activity::Starting));
+        // Saved by the call itself: an agent started now is paused too.
+        assert!(control(Some(&dir)).controls().pause_local);
+        let s = c.call(Call::Pause { direction: Direction::Remote, minutes: Some(2) }, 1000).unwrap();
+        assert_eq!((s.activity, s.paused.until_ms), (Activity::Paused, Some(121_000)));
+        assert!(c.controls().pause_local && c.controls().pause_remote);
+        assert!(c.call(Call::Pause { direction: Direction::Both, minutes: Some(0) }, 0).is_err());
+
+        // The timer ends it, for both directions, and that is saved too.
+        assert!(c.settle_pause(2000).remote);
+        assert_eq!(c.settle_pause(121_000), PauseState::default());
+        let again = control(Some(&dir));
+        assert!(!again.controls().pause_local && !again.controls().pause_remote);
+        assert!(!dir.join(PAUSE_FILE).exists());
+
+        // Resuming one direction leaves the other paused.
+        c.call(Call::Pause { direction: Direction::Both, minutes: None }, 0).unwrap();
+        let s = c.call(Call::Resume { direction: Direction::Remote }, 0).unwrap();
+        assert_eq!((s.paused.local, s.paused.remote), (true, false));
+        // A damaged file reads as "not paused".
+        std::fs::write(dir.join(PAUSE_FILE), b"{garbage").unwrap();
+        assert!(!control(Some(&dir)).controls().pause_local);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_revision_moves_only_when_the_status_changes() {
+        let c = control(None);
+        let rev = |c: &Control| c.call(Call::Status, 0).unwrap().rev;
+        let r0 = rev(&c);
+        assert_eq!(rev(&c), r0);
+        c.set_activity(Activity::Idle);
+        let r1 = rev(&c);
+        assert!(r1 > r0);
+        c.set_activity(Activity::Idle);
+        c.call(Call::SyncNow, 0).unwrap();
+        assert_eq!(rev(&c), r1);
+        c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
+        assert!(rev(&c) > r1);
+    }
+
+    #[test]
+    fn only_codes_the_agent_is_waiting_for_are_accepted() {
+        let c = control(None);
+        let answer = |code: &str, answer| c.call(Call::Answer { code: code.into(), answer }, 0);
+        // Nothing waiting: refused.
+        let e = answer("00000000000000ab", Answer::Approve).unwrap_err();
+        assert_eq!(e.code, NO_SUCH_BATCH);
+        assert_eq!(answer("not hex", Answer::Approve).unwrap_err().code, INVALID_PARAMS);
+
+        let breaker = Breaker {
+            side: Side::Local,
+            count: 30,
+            recent: 0,
+            synced_items: 100,
+            fingerprint: Fingerprint(0xab),
+            kind: oneup_gate::BreakerKind::Mass,
+        };
+        let overflow = Overflow {
+            count: 2,
+            bytes: 200,
+            room: 100,
+            fingerprint: Fingerprint(0xcd),
+            outcome: OverflowOutcome::Held,
+        };
+        assert_eq!(c.record(5, last(), std::slice::from_ref(&breaker), Some(&overflow), None), rec(true, true));
+        // The same again: nothing new to print; a quiet check keeps the
+        // last changes.
+        assert_eq!(c.record(9, None, std::slice::from_ref(&breaker), Some(&overflow), None), rec(false, false));
+        c.set_activity(Activity::WaitingForYou);
+        let s = answer("00000000000000AB", Answer::Approve).unwrap();
+        assert_eq!((s.checked_ms, s.last.unwrap().done), (Some(9), 3));
+        assert_eq!(c.controls().answers.approve, vec![0xab]);
+        // Answered: no longer waiting, though the rounds carrying it out
+        // haven't ended (nor when one under way trips it once more).
+        assert!(s.safety_stops.is_empty());
+        assert_eq!(s.activity, Activity::Syncing);
+        c.record(9, None, std::slice::from_ref(&breaker), Some(&overflow), None);
+        assert!(c.snapshot().safety_stops.is_empty());
+        // A stop's code doesn't answer the overflow, nor the reverse.
+        assert_eq!(answer("00000000000000ab", Answer::Discard).unwrap_err().code, NO_SUCH_BATCH);
+        assert_eq!(answer("00000000000000cd", Answer::Approve).unwrap_err().code, NO_SUCH_BATCH);
+        let s = answer("00000000000000cd", Answer::Discard).unwrap();
+        assert_eq!(c.controls().answers.discard, vec![0xcd]);
+        assert!(!s.overflow.unwrap().waiting);
+
+        // Handled: shown once more (the outcome changed), and its code is
+        // no longer accepted.
+        let done = Overflow { outcome: OverflowOutcome::Decided(oneup_gate::Choice::Discard), ..overflow };
+        assert_eq!(c.record(10, last(), &[], Some(&done), None), rec(false, true));
+        assert_eq!(answer("00000000000000cd", Answer::Keep).unwrap_err().code, NO_SUCH_BATCH);
+        // The same stop tripping again later is a new question.
+        assert_eq!(c.record(11, None, &[breaker], None, None), rec(true, false));
+        assert_eq!(c.snapshot().safety_stops.len(), 1);
+    }
+}

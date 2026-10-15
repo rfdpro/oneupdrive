@@ -1,0 +1,18 @@
+[package]
+name = "oneup-plan"
+version = "0.1.0"
+publish = false
+description = "OneUpDrive's planner: compares the Local and Remote trees (observe mode: report only)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+oneup-rules = { path = "../oneup-rules" }
+oneup-store = { path = "../oneup-store" }
+oneup-sync = { path = "../oneup-sync" }
+thiserror = "2"
+
+[lints]
+workspace = true

@@ -1,0 +1,75 @@
+name: Release
+
+# Pushing a tag v1.2.3 (or v1.2.3-beta.1 for the preview channel) builds,
+# signs and publishes a release; installed copies update from it.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the release
+  id-token: write   # sign in to Azure for code signing (no stored password)
+
+jobs:
+  release:
+    runs-on: windows-latest
+    environment: release   # holds the signing settings; can require approval
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - name: Velopack packer
+        run: dotnet tool install -g vpk
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Sign in to Azure (for Artifact Signing)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Signing settings
+        shell: pwsh
+        run: |
+          @{
+            Endpoint = "${{ vars.SIGNING_ENDPOINT }}"
+            CodeSigningAccountName = "${{ vars.SIGNING_ACCOUNT }}"
+            CertificateProfileName = "${{ vars.SIGNING_PROFILE }}"
+          } | ConvertTo-Json | Set-Content signing.json
+
+      - name: Build and stage
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          ./packaging/build-release.ps1 -Version $version -StageOnly `
+            -Repo "${{ github.server_url }}/${{ github.repository }}" `
+            -Publisher "${{ vars.SIGNING_SUBJECT }}" `
+            -ClientId "${{ vars.ONEUP_CLIENT_ID }}"
+
+      # Our programs and the identity package; vpk signs the installer
+      # pieces it makes itself.
+      - name: Sign the programs and the identity package
+        uses: Azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\target\package\app
+          files-folder-filter: exe,dll,msix
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Pack and publish
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $channel = if ($version.Contains("-")) { "preview" } else { "stable" }
+          ./packaging/build-release.ps1 -Version $version -Channel $channel -SkipBuild `
+            -Repo "${{ github.server_url }}/${{ github.repository }}" `
+            -AzureSignFile signing.json -Publish -Token "${{ secrets.GITHUB_TOKEN }}"

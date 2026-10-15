@@ -1,0 +1,30 @@
+[package]
+name = "oneup-vault"
+version = "0.1.0"
+publish = false
+description = "Cryptomator vault format 8 (masterkey-file vaults, SIV_GCM), implemented from the published specification"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+aes-kw = { version = "0.2", features = ["alloc"] }
+aes-siv = "0.7"
+base64 = "0.22"
+data-encoding = "2"
+getrandom = "0.3"
+hmac = "0.12"
+scrypt = { version = "0.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+unicode-normalization = "0.1"
+zeroize = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

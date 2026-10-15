@@ -1,0 +1,259 @@
+//! Hydration: serving `FETCH_DATA` for OneUpDrive's placeholders
+//! (`docs/architecture/files-on-demand.md` § Hydration, `data-safety.md`
+//! invariant 13). For each request, on a tokio task (never on Windows'
+//! callback thread):
+//!
+//! 1. the identity must parse, match the placeholder's size, and name the
+//!    Remote tree's current version of the item; otherwise the request is
+//!    refused and the agent woken, so a round updates the placeholder;
+//! 2. the content is downloaded into staging in the data folder (outside
+//!    the sync folder: nothing is written there but by transfers);
+//! 3. its size and QuickXorHash must equal the identity's;
+//! 4. it is transferred from staging, with progress, and the request
+//!    completed; the staging file is removed.
+//!
+//! Anything else fails the request: the reader gets an error, and the
+//! placeholder stays dehydrated.
+
+use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+
+use oneup_cfapi::identity::Identity;
+use oneup_cfapi::provider::{self, Cancel, Fetch, Provider};
+use oneup_store::{ActivityEntry, ActivityOutcome, AppFile, AppUse, Store, UseKind};
+use oneup_sync::{RemoteId, RemotePre};
+
+use crate::cloud::{Cloud, Hashing};
+
+/// Transfer chunks: a multiple of 4 KiB, as Cloud Files requires.
+const CHUNK: usize = 1 << 20;
+
+/// What a refused request reports to the caller (for tests and logs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    BadIdentity,
+    NotCurrent,
+    Download,
+    Mismatch,
+}
+
+pub struct Hydrator<C> {
+    cloud: C,
+    /// A connection of its own to the state database (the agent's is busy
+    /// with rounds); read for the Remote tree, written for the activity log.
+    store: Mutex<Store>,
+    /// In the data folder, never in the sync folder.
+    staging: PathBuf,
+    /// The sync folder as Windows names it in callbacks (`\Users\…`,
+    /// without the drive), to log paths relative to it.
+    root: String,
+    rt: tokio::runtime::Handle,
+    /// Called when a placeholder turned out to be out of date: wakes the
+    /// agent so a round updates it.
+    on_stale: Box<dyn Fn() + Send + Sync>,
+    running: Mutex<HashMap<i64, tokio::task::AbortHandle>>,
+    seq: AtomicU64,
+    /// Refusals so far (for tests).
+    pub refused: Mutex<Vec<Refusal>>,
+}
+
+impl<C: Cloud + 'static> Hydrator<C> {
+    pub fn new(
+        cloud: C,
+        store: Store,
+        staging: PathBuf,
+        sync_root: &std::path::Path,
+        rt: tokio::runtime::Handle,
+        on_stale: Box<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Arc<Self>> {
+        std::fs::create_dir_all(&staging)?;
+        // Leftovers of an interrupted run are ours (only our extension).
+        for e in std::fs::read_dir(&staging)?.flatten() {
+            if e.path().extension().is_some_and(|x| x == "hydrating") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        Ok(Arc::new(Self {
+            cloud,
+            store: Mutex::new(store),
+            staging,
+            root: volume_relative(sync_root),
+            rt,
+            on_stale,
+            running: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(0),
+            refused: Mutex::new(Vec::new()),
+        }))
+    }
+
+    async fn serve(self: &Arc<Self>, fetch: Fetch) {
+        let key = fetch_key(&fetch);
+        let path = fetch.path.clone();
+        // The content arrives by writes the program tracker would otherwise
+        // count as a program's (`oneup_cfapi::ours`).
+        oneup_cfapi::ours::note(u128::from(fetch.file_id as u64));
+        match self.hydrate(&fetch).await {
+            Ok(n) => {
+                let who = fetch.process.as_ref().map(|p| image_name(&p.image)).unwrap_or_default();
+                let file_id = fetch.file_id;
+                // Asked for by OneUpDrive itself (a file set to always keep on
+                // this device): no program used it.
+                let ours = fetch.process.as_ref().is_some_and(|p| p.pid == std::process::id());
+                fetch.complete();
+                if ours {
+                    self.log(ActivityOutcome::Done, &path, format!("{n} bytes, kept on this device"));
+                } else {
+                    self.log(ActivityOutcome::Done, &path, format!("{n} bytes, opened by {who}"));
+                    self.note_use(file_id, who, n, &path);
+                }
+            }
+            Err(why) => {
+                tracing::debug!(?why, "a hydration was refused");
+                if why == Refusal::NotCurrent {
+                    (self.on_stale)();
+                }
+                self.refused.lock().unwrap_or_else(|p| p.into_inner()).push(why);
+                fetch.fail(provider::NOT_IN_SYNC);
+                self.log(ActivityOutcome::Failed, &path, format!("{why:?}"));
+            }
+        }
+        self.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+    }
+
+    async fn hydrate(&self, fetch: &Fetch) -> Result<u64, Refusal> {
+        let id = Identity::decode(&fetch.identity).ok_or(Refusal::BadIdentity)?;
+        if id.size != fetch.file_size {
+            return Err(Refusal::NotCurrent);
+        }
+        let current = {
+            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            store.read(|o| o.get_item(&id.item)).map_err(|_| Refusal::NotCurrent)?
+        };
+        let current = current.ok_or(Refusal::NotCurrent)?;
+        if current.etag.as_deref() != Some(id.etag.as_str()) || current.size != id.size || current.qxh != Some(id.hash)
+        {
+            return Err(Refusal::NotCurrent);
+        }
+
+        let path = self.staging.join(format!("{}-{}.hydrating", std::process::id(), self.seq.fetch_add(1, Relaxed)));
+        let result = self.download_and_transfer(fetch, &id, &path).await;
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    async fn download_and_transfer(&self, fetch: &Fetch, id: &Identity, path: &PathBuf) -> Result<u64, Refusal> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|_| Refusal::Download)?;
+        let pre = RemotePre { id: RemoteId(id.item.clone()), etag: id.etag.clone() };
+        let (len, hash) = {
+            let mut w = Hashing::new(&mut file);
+            let received = self.cloud.download(&pre, &mut w).await.map_err(|_| Refusal::Download)?;
+            // The identity's hash is the cloud's (see `cloud`).
+            (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
+        };
+        if i64::try_from(len).ok() != Some(id.size) || hash != id.hash {
+            return Err(Refusal::Mismatch);
+        }
+        file.flush().map_err(|_| Refusal::Download)?;
+        file.seek(SeekFrom::Start(0)).map_err(|_| Refusal::Download)?;
+        let mut buf = vec![0u8; CHUNK];
+        let mut offset = 0i64;
+        while offset < id.size {
+            let n = file.read(&mut buf).map_err(|_| Refusal::Download)?;
+            if n == 0 {
+                return Err(Refusal::Mismatch);
+            }
+            fetch.transfer(offset, &buf[..n]).map_err(|_| Refusal::Download)?;
+            offset += n as i64;
+            fetch.progress(id.size, offset);
+        }
+        Ok(len)
+    }
+
+    /// Remembers that a program used this file (at `path`) now, for the
+    /// space policies, and counts it for that program (`app_use`, and the
+    /// file in `app_file`).
+    fn note_use(&self, file_id: i64, app: String, bytes: u64, path: &str) {
+        let now = now_ms();
+        // NTFS's 64-bit file reference, as the Local tree stores it (128-bit).
+        let id = u128::from(file_id as u64);
+        let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+        let file = AppFile { at_ms: now, app: app.clone(), kind: UseKind::Opened, path: self.relative(path), bytes };
+        let use_ = AppUse { hour: now / 3_600_000, app, kind: UseKind::Opened, files: 1, bytes };
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = store.write(|o| {
+            o.local_used_set(id, now)?;
+            o.app_use_add(&[use_])?;
+            o.app_files_add(&[file])
+        }) {
+            tracing::debug!(error = %e, "a file's use wasn't recorded");
+        }
+    }
+
+    /// A request's path as the log keeps it: relative to the synced
+    /// folder, `/`-separated.
+    fn relative(&self, path: &str) -> String {
+        let rel = path.strip_prefix(self.root.as_str()).unwrap_or(path);
+        format!("/{}", rel.trim_start_matches(['\\', '/']).replace('\\', "/"))
+    }
+
+    fn log(&self, outcome: ActivityOutcome, path: &str, detail: String) {
+        let path = self.relative(path);
+        let e = ActivityEntry { seq: 0, at_ms: now_ms(), outcome, action: "open".into(), path, detail };
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = store.write(|o| o.activity_add(&[e])) {
+            tracing::debug!(error = %e, "a hydration wasn't logged");
+        }
+    }
+}
+
+/// The wrapper Cloud Files calls (an `Arc` so tasks can keep it).
+pub struct Serve<C>(pub Arc<Hydrator<C>>);
+
+impl<C: Cloud + 'static> Provider for Serve<C> {
+    fn fetch_data(&self, fetch: Fetch) {
+        let me = Arc::clone(&self.0);
+        let key = fetch_key(&fetch);
+        let task = self.0.rt.spawn(async move { me.serve(fetch).await });
+        self.0.running.lock().unwrap_or_else(|p| p.into_inner()).insert(key, task.abort_handle());
+    }
+
+    fn cancel_fetch(&self, cancel: Cancel) {
+        // The aborted task drops its `Fetch`, which fails the request.
+        if let Some(t) = self.0.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&cancel.transfer_key) {
+            t.abort();
+        }
+    }
+}
+
+fn fetch_key(f: &Fetch) -> i64 {
+    f.transfer_key()
+}
+
+/// `\\?\C:\Users\x` → `\Users\x` (how Cloud Files names paths).
+fn volume_relative(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
+    let s = match s.get(1..2) {
+        Some(":") => &s[2..],
+        _ => s,
+    };
+    s.trim_end_matches('\\').to_string()
+}
+
+fn image_name(image: &str) -> String {
+    image.rsplit(['\\', '/']).next().unwrap_or(image).to_string()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+}

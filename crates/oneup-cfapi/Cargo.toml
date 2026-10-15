@@ -1,0 +1,37 @@
+[package]
+name = "oneup-cfapi"
+version = "0.1.0"
+publish = false
+description = "Thin Cloud Files API (Files On-Demand) wrappers for OneUpDrive"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Security_Cryptography",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Storage_Streams",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+]
+
+[dev-dependencies]
+oneup-hash = { path = "../oneup-hash" }
+oneup-sys = { path = "../oneup-sys" }
+
+[lints]
+workspace = true
