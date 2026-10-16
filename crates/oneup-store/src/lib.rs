@@ -467,9 +467,6 @@ impl Store {
         Ok(out)
     }
 
-    /// Folds the write-ahead log into the database and empties it, as far
-    /// as other connections' reads allow (they keep what they still read).
-    /// Returns whether it all went (`false`: a reader held some back).
     /// Reads this connection's pages through a memory map of up to `bytes`
     /// of the file, instead of one system call per 4 KiB page: a walk of a
     /// large tree measured no read calls and a fifth less time this way.
@@ -513,6 +510,9 @@ impl Store {
         len(path) + len(&format!("{path}-wal"))
     }
 
+    /// Folds the write-ahead log into the database and empties it, as far
+    /// as other connections' reads allow (they keep what they still read).
+    /// Returns whether it all went (`false`: a reader held some back).
     pub fn checkpoint(&self) -> Result<bool> {
         let busy: i64 = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
         Ok(busy == 0)
