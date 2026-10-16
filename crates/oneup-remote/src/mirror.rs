@@ -231,9 +231,25 @@ impl<A: RemoteApi> Mirror<A> {
         .map_err(|e| Error::Task(e.to_string()))?
     }
 
-    /// Brings the mirror up to date. Safe to interrupt and re-run at any point.
+    /// Brings the mirror up to date and checks the whole store's invariants.
+    /// Safe to interrupt and re-run at any point.
     pub async fn run(&self) -> Result<Summary> {
         let started = Instant::now();
+        let fresh = self.update().await?;
+        self.progress.set_phase(Phase::Verifying);
+        let (problems, stats) = Self::db(&self.store, |s| s.read(|o| Ok((o.check_invariants()?, o.stats()?)))).await?;
+        if !problems.is_empty() {
+            return Err(Error::Inconsistent(problems.join("; ")));
+        }
+        self.progress.set_phase(Phase::Done);
+        Ok(Summary { stats, elapsed: started.elapsed(), fresh })
+    }
+
+    /// Brings the mirror up to date without the checks [`Mirror::run`]
+    /// ends with, which read every row of all three trees (hundreds of
+    /// megabytes on a large drive). For the agent's rounds, whose cost must
+    /// follow the changes. Returns whether it listed OneDrive from scratch.
+    pub async fn update(&self) -> Result<bool> {
         self.progress.set_phase(Phase::Starting);
 
         // Rules changed since the last run? Re-evaluate stored folders first.
@@ -279,14 +295,8 @@ impl<A: RemoteApi> Mirror<A> {
 
         self.enumerate_until_settled().await?;
         self.catch_up().await?;
-
-        self.progress.set_phase(Phase::Verifying);
-        let (problems, stats) = Self::db(&self.store, |s| s.read(|o| Ok((o.check_invariants()?, o.stats()?)))).await?;
-        if !problems.is_empty() {
-            return Err(Error::Inconsistent(problems.join("; ")));
-        }
         self.progress.set_phase(Phase::Done);
-        Ok(Summary { stats, elapsed: started.elapsed(), fresh })
+        Ok(fresh)
     }
 
     /// Runs pending units and resolves orphans until neither produces new work.
