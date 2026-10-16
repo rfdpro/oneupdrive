@@ -231,7 +231,7 @@ async fn run(args: Args) -> Result<()> {
     let graph = Arc::new(oneup_app::pairs::scoped(dir, Graph::new(http, auth, Aimd::new(4, 8)))?);
     // How it uses the PC (config.toml [agent]): memory and priority are
     // read once here; the bandwidth caps every round.
-    let settings = oneup_app::config::load_agent(dir)?;
+    let settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
     let priority_set = match oneup_sys::priority::set_background(settings.background) {
         Ok(()) => true,
         Err(e) => {
@@ -480,7 +480,7 @@ async fn agent(
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
     let journal = Arc::new(Notify::new());
     let tracker = oneup_app::apps::Tracker::start(dir, Path::new(&root.path));
-    let busy = Arc::new(Busy::new(oneup_app::config::load_agent(dir)?.busy));
+    let busy = Arc::new(Busy::new(oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?.busy));
     engine.hold_busy(Arc::clone(&busy));
     watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy));
     let remote = Arc::new(Notify::new());
@@ -516,7 +516,7 @@ async fn agent(
     // `start_scope`); otherwise what changed, including while nothing ran.
     let mut scope = sync::start_scope(&store)?;
     let mut retry = RETRY_FIRST;
-    let mut settings = oneup_app::config::load_agent(dir)?;
+    let mut settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
     let mut auto_was: Option<String> = None;
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every

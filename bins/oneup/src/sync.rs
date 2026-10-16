@@ -807,7 +807,7 @@ impl Engine {
     /// for at most hourly; a low disk, at every pass.
     fn space_policy(&self, store: &mut Store, root: &Path, ops: &mut Vec<Op>) -> Result<Option<String>> {
         const KEY_LAST: &str = "space.last_ms";
-        let space = crate::config::load_space(&self.data_dir)?;
+        let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
         if space.free_unused_days == 0 && !space.free_when_low {
             return Ok(None);
         }
@@ -997,7 +997,7 @@ impl Engine {
             }
             // Bandwidth caps (config.toml [agent]) can change any time, and
             // may apply only in some hours.
-            let settings = crate::config::load_agent(&self.data_dir)?;
+            let settings = crate::config::kept(&self.data_dir, crate::config::load_agent(&self.data_dir))?;
             let capped = crate::autopause::caps_apply(&settings, crate::autopause::local_minute_of_day());
             let cap = |kib: u64| if capped { kib.saturating_mul(1024) } else { 0 };
             self.graph.upload.set(cap(settings.upload_kib));
@@ -1123,7 +1123,7 @@ impl Engine {
                 }
             }
             // What the user wants first goes first ([priority]; transfers only).
-            let (mut first, last) = crate::config::load_priority(&self.data_dir)?;
+            let (mut first, last) = crate::config::kept(&self.data_dir, crate::config::load_priority(&self.data_dir))?;
             for p in &controls.first {
                 first.extend(oneup_rules::literal_path_rules(p));
             }

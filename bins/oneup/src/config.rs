@@ -527,6 +527,39 @@ pub fn save_updates(data_dir: &Path, u: &Updates) -> Result<()> {
     )
 }
 
+/// For settings the agent reads again at every round (`[agent]`, `[space]`,
+/// `[priority]`): `loaded` if it read, else the last good value this
+/// process read for `data_dir`, so a mistake made while editing
+/// config.toml doesn't stop syncing. An error only when there's none (a
+/// one-off command, or an agent that started with the mistake). Not for
+/// `[rules]`: syncing with rules other than the user's could send or
+/// remove the wrong items.
+pub fn kept<T: Clone + Send + 'static>(data_dir: &Path, loaded: Result<T>) -> Result<T> {
+    use std::any::{Any, TypeId};
+    // A handful of entries: one per data folder and kind of settings.
+    type Last = Vec<(PathBuf, TypeId, Box<dyn Any + Send>)>;
+    static LAST: std::sync::Mutex<Last> = std::sync::Mutex::new(Vec::new());
+    let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = last.iter().position(|(d, t, _)| d == data_dir && *t == TypeId::of::<T>());
+    match loaded {
+        Ok(v) => {
+            let entry = (data_dir.to_path_buf(), TypeId::of::<T>(), Box::new(v.clone()) as Box<dyn Any + Send>);
+            match at {
+                Some(i) => last[i] = entry,
+                None => last.push(entry),
+            }
+            Ok(v)
+        }
+        Err(e) => match at.and_then(|i| last[i].2.downcast_ref::<T>()) {
+            Some(v) => {
+                tracing::debug!(error = %format!("{e:#}"), "config.toml: keeping the previous settings");
+                Ok(v.clone())
+            }
+            None => Err(e),
+        },
+    }
+}
+
 /// The `[priority]` section: rules for what to transfer first and last.
 pub fn load_priority(data_dir: &Path) -> Result<(Vec<String>, Vec<String>)> {
     let Some(doc) = read_doc(data_dir)? else { return Ok(Default::default()) };
@@ -586,6 +619,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The agent reads [agent], [space] and [priority] every round: a
+    /// mistake made while editing config.toml keeps the last good settings
+    /// instead of failing the rounds. With nothing read before, it's an
+    /// error, as for a one-off command.
+    #[test]
+    fn a_broken_file_keeps_the_last_good_settings() {
+        let d = tmp("kept");
+        std::fs::write(path(&d), "[agent]\nupload_kib_per_s = 300\n").unwrap();
+        assert_eq!(kept(&d, load_agent(&d)).unwrap().upload_kib, 300);
+        std::fs::write(path(&d), "[agent]\nupload_kib_per_s = -1\n").unwrap();
+        assert_eq!(kept(&d, load_agent(&d)).unwrap().upload_kib, 300, "the last good");
+        std::fs::write(path(&d), "[agent\n").unwrap();
+        assert_eq!(kept(&d, load_agent(&d)).unwrap().upload_kib, 300, "unreadable");
+        assert!(kept(&d, load_space(&d)).is_err(), "no good [space] read yet");
+        std::fs::write(path(&d), "[agent]\nupload_kib_per_s = 5\n").unwrap();
+        assert_eq!(kept(&d, load_agent(&d)).unwrap().upload_kib, 5, "a good file again");
+        let other = tmp("kept-other");
+        std::fs::write(path(&other), "[agent\n").unwrap();
+        assert!(kept(&other, load_agent(&other)).is_err(), "kept per data folder");
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&other);
     }
 
     #[test]
