@@ -235,6 +235,9 @@ async fn run(args: Args) -> Result<()> {
         tracing::warn!(error = %e, "couldn't set the agent's priority");
     }
     let cache_kib = settings.cache_kib();
+    // Before the hydration service and the program tracker open their own
+    // connections.
+    sync::compact(&mut setup::open_store(dir, cache_kib)?);
     let control = {
         let store = setup::open_store(dir, cache_kib)?;
         let pair = sync::pairing(&store)?;

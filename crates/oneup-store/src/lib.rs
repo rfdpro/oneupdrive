@@ -321,6 +321,17 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Free pages [`Store::compact_if_sparse`] leaves alone: compacting costs a
+/// full copy, worth it only for a lot of space.
+pub const COMPACT_MIN_FREE: u64 = 64 << 20;
+
+/// What [`Store::compact_if_sparse`] did: the file's size before and after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compacted {
+    pub before: u64,
+    pub after: u64,
+}
+
 impl Store {
     /// Opens (creating if needed) the database. `cache_kib` bounds SQLite's
     /// page cache, which is how the memory profile reaches the store.
@@ -334,6 +345,12 @@ impl Store {
 
     fn init(conn: Connection, cache_kib: u32) -> Result<Self> {
         conn.busy_timeout(BUSY_WAIT)?;
+        // Reads through a memory map instead of one system call per 4 KiB
+        // page: a walk of a large tree measured no read calls and a fifth
+        // less time this way. Sized by the memory profile like the cache
+        // (four times it); the mapped pages are the file's own, which
+        // Windows can drop at any time.
+        let mmap_bytes = u64::from(cache_kib) * 4 * 1024;
         // The mirror is rebuildable from the cloud, so NORMAL durability (WAL)
         // is sufficient here. The future op journal will use FULL.
         conn.execute_batch(&format!(
@@ -341,6 +358,7 @@ impl Store {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = OFF;
              PRAGMA cache_size = -{cache_kib};
+             PRAGMA mmap_size = {mmap_bytes};
              PRAGMA temp_store = FILE;"
         ))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -431,6 +449,30 @@ impl Store {
     /// Folds the write-ahead log into the database and empties it, as far
     /// as other connections' reads allow (they keep what they still read).
     /// Returns whether it all went (`false`: a reader held some back).
+    /// Rewrites the database without its free pages when they're most of
+    /// it: deleting rows leaves their pages free inside the file, which then
+    /// keeps its largest size for good (one was 80% free pages). Only when
+    /// at least [`COMPACT_MIN_FREE`] and a quarter of the file are free, so
+    /// it runs rarely; it writes a full copy of what's left. `None` when
+    /// nothing was done.
+    pub fn compact_if_sparse(&self) -> Result<Option<Compacted>> {
+        self.compact_if_free(COMPACT_MIN_FREE)
+    }
+
+    fn compact_if_free(&self, min_free: u64) -> Result<Option<Compacted>> {
+        let pages = |sql: &str| -> Result<u64> {
+            Ok(u64::try_from(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))?).unwrap_or(0))
+        };
+        let size = pages("PRAGMA page_size")?;
+        let (total, free) = (pages("PRAGMA page_count")?, pages("PRAGMA freelist_count")?);
+        if free * size < min_free || free * 4 < total {
+            return Ok(None);
+        }
+        self.conn.execute_batch("VACUUM")?;
+        self.checkpoint()?;
+        Ok(Some(Compacted { before: total * size, after: pages("PRAGMA page_count")? * size }))
+    }
+
     pub fn checkpoint(&self) -> Result<bool> {
         let busy: i64 = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
         Ok(busy == 0)
@@ -1013,6 +1055,39 @@ fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_mostly_free_database_is_compacted_and_a_full_one_left_alone() {
+        let path = std::env::temp_dir().join(format!("oneup-store-compact-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        let fill = |s: &mut Store, from: u32| {
+            s.write(|o| {
+                for i in from..from + 2_000 {
+                    o.meta_set(&format!("k{i}"), &"x".repeat(1_000))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        };
+        fill(&mut s, 0);
+        fill(&mut s, 2_000);
+        assert_eq!(s.compact_if_free(1).unwrap(), None, "nothing free yet");
+        s.write(|o| Ok(o.c.execute("DELETE FROM meta WHERE key >= 'k1'", [])?)).unwrap();
+        let free_pages =
+            |s: &Store| s.read(|o| Ok(o.c.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))?));
+        assert!(free_pages(&s).unwrap() > 0);
+        assert_eq!(s.compact_if_free(u64::MAX).unwrap(), None, "too little to be worth a copy");
+        let c = s.compact_if_free(1).unwrap().expect("most of it is free");
+        assert!(c.after * 2 < c.before, "{c:?}");
+        assert_eq!(free_pages(&s).unwrap(), 0);
+        assert_eq!(s.read(|o| o.meta_get("k0")).unwrap().map(|v| v.len()), Some(1_000), "what's left is kept");
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
 
     /// Two connections that each read and then write, at the same time (the
     /// agent and its hydration service, say): every write waits its turn.

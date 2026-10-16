@@ -2037,6 +2037,28 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Compacts the database if it's mostly free pages
+/// (`Store::compact_if_sparse`), saying so in the activity log. For the
+/// agent's start, before its other connections open. Best effort: a
+/// failure leaves the database as it was, and the next start tries again.
+pub fn compact(store: &mut Store) {
+    match store.compact_if_sparse() {
+        Ok(Some(c)) => {
+            let detail = format!(
+                "database compacted from {} to {}",
+                crate::versions::size(c.before),
+                crate::versions::size(c.after)
+            );
+            println!("oneupd: {detail}");
+            if let Err(e) = log_activity(store, vec![notice(ActivityOutcome::Note, "compacted", detail)]) {
+                tracing::warn!(error = %e, "the compaction wasn't logged");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "couldn't compact the database; tried again at the next start"),
+    }
+}
+
 /// An activity-log entry about sync itself (no item).
 fn notice(outcome: ActivityOutcome, action: &str, detail: String) -> ActivityEntry {
     ActivityEntry { seq: 0, at_ms: now_ms(), outcome, action: action.into(), path: String::new(), detail }
