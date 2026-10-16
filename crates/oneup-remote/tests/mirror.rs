@@ -485,6 +485,34 @@ async fn update_brings_changes_without_checking_the_whole_store() {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
+/// What the agent runs at every round reads no table that grows with the
+/// tree: whole-table counts here once cost every push notification
+/// hundreds of megabytes of reads on a large drive.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_reads_no_whole_table() {
+    let fake = Arc::new(Fake::new(4, false));
+    populate(&fake);
+    let path = temp_db("no-scans");
+    let rules = ExcludeSet::dev();
+    mirror(&fake, Store::open(&path, 1024).unwrap(), rules.clone()).run().await.unwrap();
+    fake.with(|i| {
+        let docs = i.nodes.iter().find(|(_, n)| n.name == "Documents").map(|(k, _)| k.clone()).unwrap();
+        i.add(&docs, "after.txt", Kind::File);
+    });
+
+    let mut store = Store::open(&path, 1024).unwrap();
+    store.log_statements();
+    let m = mirror(&fake, store, rules);
+    m.update().await.unwrap();
+    let statements = Store::take_statements();
+    let store = m.into_store().unwrap();
+    assert!(statements.iter().any(|s| s.contains("remote_item")), "the change was stored: {statements:#?}");
+    let scans = store.tree_scans(&statements);
+    assert!(scans.is_empty(), "{scans:#?}");
+    drop(store);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rule_change_reincludes_and_reexcludes() {
     let fake = Arc::new(Fake::new(4, false));

@@ -321,6 +321,76 @@ pub struct Store {
     conn: Connection,
 }
 
+/// What connections with [`Store::log_statements`] on have run.
+#[cfg(feature = "statement-log")]
+static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Tables small enough to read whole at every round: what a round may
+/// scan ([`Store::tree_scans`]). Everything else grows with the tree.
+#[cfg(feature = "statement-log")]
+const SMALL_TABLES: &[&str] = &["meta", "cursor", "enum_unit", "local_root", "remote_orphan", "dirty", "t_sub"];
+
+#[cfg(feature = "statement-log")]
+impl Store {
+    /// Test support: records every statement this connection runs from now
+    /// on (as written, parameters unbound), until [`Store::take_statements`].
+    pub fn log_statements(&mut self) {
+        self.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|e| {
+                if let rusqlite::trace::TraceEvent::Stmt(_, sql) = e {
+                    let mut all = STATEMENTS.lock().unwrap_or_else(|p| p.into_inner());
+                    if !all.iter().any(|s| s == sql) {
+                        all.push(sql.to_string());
+                    }
+                }
+            }),
+        );
+    }
+
+    /// The statements recorded so far (by every logging connection),
+    /// clearing the record.
+    pub fn take_statements() -> Vec<String> {
+        std::mem::take(&mut *STATEMENTS.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// The steps of `statements`' query plans that read a whole table other
+    /// than the [`SMALL_TABLES`], each with its statement: what makes a
+    /// query's cost follow the size of the tree instead of the changes.
+    pub fn tree_scans(&self, statements: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in statements.iter().filter(|s| !s.trim_start().starts_with("--")) {
+            let Ok(mut st) = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")) else { continue };
+            let Ok(steps) = st.query_map([], |r| r.get::<_, String>(3)) else { continue };
+            for step in steps.flatten() {
+                let Some(name) = step.strip_prefix("SCAN ").and_then(|t| t.split(' ').next()) else { continue };
+                if !SMALL_TABLES.contains(&table_of(sql, name)) && !step.contains("CONSTANT ROW") {
+                    out.push(format!("{step}  <-  {sql}"));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The table `name` stands for in `sql`: itself, or the table it's an alias
+/// of (`FROM remote_orphan o`, `JOIN remote_item AS r`).
+#[cfg(feature = "statement-log")]
+fn table_of<'a>(sql: &'a str, name: &'a str) -> &'a str {
+    let words: Vec<&str> =
+        sql.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')').filter(|w| !w.is_empty()).collect();
+    for i in 0..words.len().saturating_sub(2) {
+        if !(words[i].eq_ignore_ascii_case("FROM") || words[i].eq_ignore_ascii_case("JOIN")) {
+            continue;
+        }
+        let alias = if words[i + 2].eq_ignore_ascii_case("AS") { words.get(i + 3) } else { words.get(i + 2) };
+        if alias == Some(&name) {
+            return words[i + 1];
+        }
+    }
+    name
+}
+
 impl Store {
     /// Opens (creating if needed) the database. `cache_kib` bounds SQLite's
     /// page cache, which is how the memory profile reaches the store.
@@ -960,6 +1030,12 @@ impl Ops<'_> {
         )?;
         let v = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
+    }
+
+    /// Whether enumeration units are still waiting: one indexed probe, for
+    /// every round (unlike [`Ops::stats`], which counts whole tables).
+    pub fn units_pending(&self) -> Result<bool> {
+        Ok(self.c.query_row("SELECT EXISTS (SELECT 1 FROM enum_unit WHERE state = 0)", [], |r| r.get(0))?)
     }
 
     pub fn stats(&self) -> Result<Stats> {

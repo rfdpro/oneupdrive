@@ -235,7 +235,7 @@ impl<A: RemoteApi> Mirror<A> {
     /// Safe to interrupt and re-run at any point.
     pub async fn run(&self) -> Result<Summary> {
         let started = Instant::now();
-        let fresh = self.update().await?;
+        let fresh = self.bring().await?;
         self.progress.set_phase(Phase::Verifying);
         let (problems, stats) = Self::db(&self.store, |s| s.read(|o| Ok((o.check_invariants()?, o.stats()?)))).await?;
         if !problems.is_empty() {
@@ -250,6 +250,14 @@ impl<A: RemoteApi> Mirror<A> {
     /// megabytes on a large drive). For the agent's rounds, whose cost must
     /// follow the changes. Returns whether it listed OneDrive from scratch.
     pub async fn update(&self) -> Result<bool> {
+        let fresh = self.bring().await?;
+        self.progress.set_phase(Phase::Done);
+        Ok(fresh)
+    }
+
+    /// What [`Mirror::run`] and [`Mirror::update`] share: everything but
+    /// the end.
+    async fn bring(&self) -> Result<bool> {
         self.progress.set_phase(Phase::Starting);
 
         // Rules changed since the last run? Re-evaluate stored folders first.
@@ -295,7 +303,6 @@ impl<A: RemoteApi> Mirror<A> {
 
         self.enumerate_until_settled().await?;
         self.catch_up().await?;
-        self.progress.set_phase(Phase::Done);
         Ok(fresh)
     }
 
@@ -304,8 +311,7 @@ impl<A: RemoteApi> Mirror<A> {
         loop {
             self.run_units().await?;
             self.resolve_orphans().await?;
-            let pending = Self::db(&self.store, |s| s.read(|o| o.stats())).await?.units_pending;
-            if pending == 0 {
+            if !Self::db(&self.store, |s| s.read(|o| o.units_pending())).await? {
                 return Ok(());
             }
         }

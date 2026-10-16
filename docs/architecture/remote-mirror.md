@@ -34,7 +34,7 @@ One sequential `/delta` over a whole 4.7M-entry drive takes about **3.6 hours**.
 3. nothing is both stored and pruned;
 4. only folders are excluded.
 
-`Mirror::run` (`oneup mirror`, one-off commands) ends by checking them, together with the Local and Synced trees' own invariants. The check reads every row of all three trees: about 670 MB of page reads on a 340k-item drive, more than the 64 MB page cache holds. So the agent checks them in its first round only, and every later round uses `Mirror::update`, which brings the changes without the check. A listing from scratch (an expired delta cursor) is always checked.
+`Mirror::run` (`oneup mirror`, one-off commands) ends by checking them, together with the Local and Synced trees' own invariants. The check reads every row of all three trees: about 670 MB of page reads on a 340k-item drive, more than the 64 MB page cache holds. So the agent checks them in its first round only, and every later round uses `Mirror::update`, which brings the changes without the check and reads no table that grows with the tree (`an_update_reads_no_whole_table` checks the query plan of every statement it runs). A listing from scratch (an expired delta cursor) is always checked.
 
 ## Ingestion rules (`oneup-remote/src/ingest.rs`)
 The only code that decides how an entry changes the mirror. It is pure (store transaction in, no network), so it's tested exhaustively.
