@@ -15,5 +15,10 @@ oneup-sync = { path = "../oneup-sync" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 
+[features]
+# Test support: `Store::log_statements` records what a connection runs, so
+# a test can check that none of it scans a table that grows with the tree.
+statement-log = ["rusqlite/trace"]
+
 [lints]
 workspace = true

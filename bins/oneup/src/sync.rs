@@ -461,6 +461,8 @@ pub struct Engine {
     /// Converting synced files already here into placeholders, in the
     /// background ([`Engine::convert_leftovers`]).
     converting: std::sync::Mutex<Converting>,
+    /// The store's invariants were checked once this run ([`Engine::remote`]).
+    verified: std::sync::atomic::AtomicBool,
 }
 
 /// Excluded folders looked at per pass ([`Engine::clear_excluded_marks`]);
@@ -516,6 +518,7 @@ impl Engine {
             logged: std::sync::Mutex::new(Vec::new()),
             offer: std::sync::Mutex::new(None),
             converting: std::sync::Mutex::new(Converting::default()),
+            verified: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -530,11 +533,19 @@ impl Engine {
     }
 
     /// The cloud side brought up to date: the mirror, or for a vault pair
-    /// its decrypted view.
+    /// its decrypted view. The store's invariants are checked in the first
+    /// round only: the check reads every row of all three trees, so at every
+    /// round it made each push notification cost hundreds of megabytes.
     async fn remote(&self, store: Store, pruning: &ExcludeSet) -> Result<Store> {
+        use std::sync::atomic::Ordering::Relaxed;
         match &self.vault {
             Some(v) => v.refresh(store).await,
-            None => mirror(&self.graph, store, pruning).await,
+            None => {
+                let verify = !self.verified.load(Relaxed);
+                let store = mirror_with(&self.graph, store, pruning, verify).await?;
+                self.verified.store(true, Relaxed);
+                Ok(store)
+            }
         }
     }
 
@@ -1510,6 +1521,12 @@ pub(crate) fn pruning_for(data_dir: &Path, store: &Store, cache: &mut crate::rul
 }
 
 pub(crate) async fn mirror(graph: &Arc<Graph>, store: Store, rules: &ExcludeSet) -> Result<Store> {
+    mirror_with(graph, store, rules, true).await
+}
+
+/// [`mirror`], checking the store's invariants only if `verify` (see
+/// `Mirror::update`). A listing from scratch is always checked.
+pub(crate) async fn mirror_with(graph: &Arc<Graph>, store: Store, rules: &ExcludeSet, verify: bool) -> Result<Store> {
     let cfg = MirrorConfig {
         list_depth: 2,
         max_list_depth: 6,
@@ -1519,8 +1536,9 @@ pub(crate) async fn mirror(graph: &Arc<Graph>, store: Store, rules: &ExcludeSet)
         hint: None,
     };
     let m = Mirror::new(Arc::clone(graph), store, cfg.clone());
-    match m.run().await {
-        Ok(_) => Ok(m.into_store()?),
+    let done = if verify { m.run().await.map(drop) } else { m.update().await.map(drop) };
+    match done {
+        Ok(()) => Ok(m.into_store()?),
         // The change position expired (OneDrive keeps them for a limited
         // time): list OneDrive again, as `oneup mirror --rebuild` does. An
         // item missing from the new listing is "missing without evidence",
