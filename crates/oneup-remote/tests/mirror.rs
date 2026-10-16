@@ -507,7 +507,7 @@ async fn an_update_reads_no_whole_table() {
     let statements = Store::take_statements();
     let store = m.into_store().unwrap();
     assert!(statements.iter().any(|s| s.contains("remote_item")), "the change was stored: {statements:#?}");
-    let scans = store.tree_scans(&statements);
+    let scans = store.tree_scans(&statements).unwrap();
     assert!(scans.is_empty(), "{scans:#?}");
     drop(store);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());

@@ -357,19 +357,24 @@ impl Store {
     /// The steps of `statements`' query plans that read a whole table other
     /// than the [`SMALL_TABLES`], each with its statement: what makes a
     /// query's cost follow the size of the tree instead of the changes.
-    pub fn tree_scans(&self, statements: &[String]) -> Vec<String> {
+    /// Parameters are bound to NULL, which doesn't change a plan's shape. A
+    /// statement that can't be explained is an error, not skipped.
+    pub fn tree_scans(&self, statements: &[String]) -> Result<Vec<String>> {
         let mut out = Vec::new();
+        // Trigger bodies are logged as comments; their plans aren't shown.
         for sql in statements.iter().filter(|s| !s.trim_start().starts_with("--")) {
-            let Ok(mut st) = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")) else { continue };
-            let Ok(steps) = st.query_map([], |r| r.get::<_, String>(3)) else { continue };
-            for step in steps.flatten() {
+            let mut st = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let nulls = std::iter::repeat_n(rusqlite::types::Null, st.parameter_count());
+            let steps: Vec<String> =
+                st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?;
+            for step in steps {
                 let Some(name) = step.strip_prefix("SCAN ").and_then(|t| t.split(' ').next()) else { continue };
                 if !SMALL_TABLES.contains(&table_of(sql, name)) && !step.contains("CONSTANT ROW") {
                     out.push(format!("{step}  <-  {sql}"));
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -1032,8 +1037,9 @@ impl Ops<'_> {
         Ok(v)
     }
 
-    /// Whether enumeration units are still waiting: one indexed probe, for
-    /// every round (unlike [`Ops::stats`], which counts whole tables).
+    /// Whether enumeration units are still waiting, for every round: it reads
+    /// only the small `enum_unit` table (unlike [`Ops::stats`], which counts
+    /// whole trees).
     pub fn units_pending(&self) -> Result<bool> {
         Ok(self.c.query_row("SELECT EXISTS (SELECT 1 FROM enum_unit WHERE state = 0)", [], |r| r.get(0))?)
     }
@@ -1089,6 +1095,25 @@ fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard behind `an_update_reads_no_whole_table` (oneup-remote)
+    /// sees through parameters and aliases, and leaves small tables and
+    /// indexed lookups alone.
+    #[cfg(feature = "statement-log")]
+    #[test]
+    fn tree_scans_are_found_with_parameters_and_aliases() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.log_statements();
+        let scans = |sql: &str| s.tree_scans(&[sql.to_string()]).unwrap();
+        assert_eq!(scans("SELECT count(*) FROM remote_item WHERE size > ?1").len(), 1);
+        assert_eq!(scans("SELECT 1 FROM remote_item r WHERE r.size = ?1 AND r.kind = ?2").len(), 1);
+        assert_eq!(scans("SELECT * FROM synced_item AS s JOIN meta m ON m.key = s.name").len(), 1);
+        assert!(scans("SELECT * FROM remote_item WHERE id = ?1").is_empty(), "indexed");
+        assert!(scans("SELECT * FROM remote_item WHERE parent_id = ?1").is_empty(), "indexed");
+        assert!(scans("SELECT * FROM enum_unit WHERE state = ?1").is_empty(), "small table");
+        assert!(s.tree_scans(&["SELECT * FROM no_such_table".to_string()]).is_err(), "not skipped");
+        assert!(scans("-- TRIGGER t").is_empty());
+    }
 
     /// Two connections that each read and then write, at the same time (the
     /// agent and its hydration service, say): every write waits its turn.
