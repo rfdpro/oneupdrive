@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Files remembered at most. The watcher sees writes anywhere on the
 /// volume, most of them outside the synced folder; past this, the files
@@ -26,6 +26,22 @@ pub const MAX_FILES: usize = 4096;
 /// Journal records closer together than this are one change: a single save
 /// leaves several (data written, size changed, file closed).
 const ONE_SAVE: Duration = Duration::from_secs(1);
+
+/// The most changes a setting may ask for (each file keeps that many times).
+pub const MAX_CHANGES: u32 = 100;
+
+/// The longest any of the durations may be.
+pub const MAX_DURATION: Duration = Duration::from_secs(24 * 3600);
+
+/// When a journal record's FILETIME `filetime` happened, as an `Instant`
+/// (given `now` both ways): a backlog read at once keeps its records'
+/// spacing. A time in the future (a clock change) counts as now.
+pub fn instant_of(filetime: i64, now: Instant, now_wall: SystemTime) -> Instant {
+    const UNIX_AT: i64 = 116_444_736_000_000_000;
+    let unix_100ns = filetime.saturating_sub(UNIX_AT).max(0);
+    let at = SystemTime::UNIX_EPOCH + Duration::from_nanos(u64::try_from(unix_100ns).unwrap_or(0).saturating_mul(100));
+    now_wall.duration_since(at).ok().and_then(|ago| now.checked_sub(ago)).unwrap_or(now)
+}
 
 /// When a file counts as busy, and for how long its uploads wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +124,7 @@ impl Busy {
         f.last = now;
         f.recent.retain(|t| now.saturating_duration_since(*t) <= s.window);
         f.recent.push(now);
-        let keep = s.changes.max(2) as usize;
+        let keep = s.changes.clamp(2, MAX_CHANGES) as usize;
         if f.recent.len() > keep {
             f.recent.remove(0);
         }
@@ -128,7 +144,7 @@ impl Busy {
         }
         let f = g.files.get_mut(&id)?;
         let since = f.since?;
-        let until = (f.last + s.quiet).min(since + s.max);
+        let until = f.last.checked_add(s.quiet)?.min(since.checked_add(s.max)?);
         if until <= now {
             // Sent now. Its next change starts a new wait (its recent
             // changes still count), so a file that never stops is sent
@@ -232,6 +248,23 @@ mod tests {
         assert_eq!(b.held_until(2, at(t, 2_100)), None);
         b.set_settings(Settings { on: false, ..Settings::default() });
         assert_eq!(b.held_until(1, at(t, 2_200)), None);
+    }
+
+    #[test]
+    fn records_read_late_keep_their_own_times() {
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let filetime = |ago_s: u64| {
+            let unix = wall.duration_since(SystemTime::UNIX_EPOCH).unwrap() - Duration::from_secs(ago_s);
+            116_444_736_000_000_000 + i64::try_from(unix.as_nanos() / 100).unwrap()
+        };
+        let t = instant_of(filetime(30), now, wall);
+        assert!(now.duration_since(t).as_secs() == 30 || now.duration_since(t).as_secs() == 29);
+        assert_eq!(instant_of(filetime(0) + 10_000_000_000, now, wall), now, "the future is now");
+        // Two saves 3 s apart, read in one batch 20 s later: still busy.
+        let b = Busy::new(Settings::default());
+        b.changed(1, instant_of(filetime(23), now, wall));
+        b.changed(1, instant_of(filetime(20), now, wall));
+        assert!(b.held_until(1, instant_of(filetime(19), now, wall)).is_some());
     }
 
     #[test]

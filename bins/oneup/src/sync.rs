@@ -1121,18 +1121,9 @@ impl Engine {
             // Files that keep changing wait (`crate::busy`); their folders
             // stay marked, so a later round plans them again.
             let now = std::time::Instant::now();
-            let mut waiting: Vec<(Op, Line)> = Vec::new();
-            let planned: Vec<(Approved, Line)> = planned
-                .into_iter()
-                .filter_map(|(a, l)| match self.held_until(a.op(), now) {
-                    Some(until) => {
-                        out.held_until = Some(out.held_until.map_or(until, |u| u.min(until)));
-                        waiting.push((a.op().clone(), l));
-                        None
-                    }
-                    None => Some((a, l)),
-                })
-                .collect();
+            let (planned, busy, until) = hold_back(planned, |(a, _)| self.held_until(a.op(), now));
+            out.held_until = until;
+            let waiting: Vec<(Op, Line)> = busy.into_iter().map(|(a, l)| (a.op().clone(), l)).collect();
             let wait = waiting.iter().filter(|(op, _)| matches!(op, Op::Upload { .. })).map(|(_, l)| {
                 let detail = "changing often; sent once it's left alone for a moment".to_string();
                 ActivityEntry {
@@ -2086,6 +2077,25 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Splits `items` into those that go now and those `until` holds back,
+/// keeping their order, with the earliest time a held one may go.
+fn hold_back<T>(
+    items: Vec<T>,
+    until: impl Fn(&T) -> Option<std::time::Instant>,
+) -> (Vec<T>, Vec<T>, Option<std::time::Instant>) {
+    let (mut now, mut held, mut first) = (Vec::new(), Vec::new(), None::<std::time::Instant>);
+    for item in items {
+        match until(&item) {
+            Some(u) => {
+                first = Some(first.map_or(u, |f| f.min(u)));
+                held.push(item);
+            }
+            None => now.push(item),
+        }
+    }
+    (now, held, first)
+}
+
 /// The local file `op` reads to send it: an upload, or the hashing that
 /// comes before one. What waits while the file keeps changing.
 fn sent_file(op: &Op) -> Option<u128> {
@@ -2353,6 +2363,19 @@ mod tests {
         let busy = Report { done: vec![op()], ..skipped(&[Skip::NameTaken]) };
         assert_eq!(settle(&busy), (true, None));
         assert_eq!(settle(&Report::default()), (true, Some(End::Settled)));
+    }
+
+    #[test]
+    fn held_items_wait_in_order_and_the_earliest_time_is_kept() {
+        let t = std::time::Instant::now();
+        let at = |s: u64| Some(t + std::time::Duration::from_secs(s));
+        let (now, held, first) = hold_back(vec![1, 2, 3, 4, 5], |n| match n {
+            2 => at(30),
+            4 => at(15),
+            _ => None,
+        });
+        assert_eq!((now, held, first), (vec![1, 3, 5], vec![2, 4], at(15)));
+        assert_eq!(hold_back(vec![1], |_| None), (vec![1], vec![], None));
     }
 
     #[test]

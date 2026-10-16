@@ -708,7 +708,7 @@ fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::a
             loop {
                 let next = {
                     let (next, records) = volume.read_journal(j.journal_id, cursor, true, &mut buf)?;
-                    let now = std::time::Instant::now();
+                    let (now, wall) = (Instant::now(), std::time::SystemTime::now());
                     for r in records.flatten() {
                         // An online-only file wasn't written by a program:
                         // that's OneUpDrive making or freeing a
@@ -723,7 +723,7 @@ fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::a
                             }
                             // Our own downloads don't make a file busy.
                             if !oneup_cfapi::ours::wrote(r.file_id.0) {
-                                busy.changed(r.file_id.0, now);
+                                busy.changed(r.file_id.0, oneup_app::busy::instant_of(r.timestamp, now, wall));
                             }
                         }
                     }

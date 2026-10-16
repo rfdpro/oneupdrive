@@ -376,12 +376,13 @@ pub fn load_agent(data_dir: &Path) -> Result<Agent> {
 /// Whether the settings for files that keep changing make sense (the same
 /// checks for `config.toml`, `oneup settings` and the settings window).
 pub fn check_busy(b: &crate::busy::Settings) -> Result<()> {
-    if b.changes < 2 {
-        bail!("busy_changes must be at least 2");
+    use crate::busy::{MAX_CHANGES, MAX_DURATION};
+    if !(2..=MAX_CHANGES).contains(&b.changes) {
+        bail!("busy_changes must be from 2 to {MAX_CHANGES}");
     }
     for (key, d) in [("busy_window_s", b.window), ("busy_quiet_s", b.quiet), ("busy_max_s", b.max)] {
-        if d.as_secs() == 0 {
-            bail!("{key} must be at least 1 second");
+        if d.as_secs() == 0 || d > MAX_DURATION {
+            bail!("{key} must be from 1 to {} seconds", MAX_DURATION.as_secs());
         }
     }
     if b.max < b.quiet {
@@ -665,8 +666,14 @@ mod tests {
         let a = Agent { busy, ..Agent::default() };
         save_agent(&d, &a).unwrap();
         assert_eq!(load_agent(&d).unwrap(), a);
-        for bad in ["busy_changes = 1", "busy_quiet_s = 0", "busy_quiet_s = 60\nbusy_max_s = 30", "hold_busy_files = 1"]
-        {
+        for bad in [
+            "busy_changes = 1",
+            "busy_changes = 101",
+            "busy_quiet_s = 0",
+            "busy_max_s = 86401",
+            "busy_quiet_s = 60\nbusy_max_s = 30",
+            "hold_busy_files = 1",
+        ] {
             std::fs::write(path(&d), format!("[agent]\n{bad}\n")).unwrap();
             assert!(load_agent(&d).is_err(), "{bad}");
         }
