@@ -554,6 +554,17 @@ impl<C: Cloud> Executor<C> {
         if now.kind != Kind::Folder {
             return Err(CloudError::TooManyItems.into());
         }
+        // OneDrive compares names ignoring case, so the new folder can't be
+        // made next to the original under the same name in other case. A
+        // temporary name doesn't help: renaming the rebuilt folder to the
+        // right one is refused for the same reason the move was.
+        if now.parent_id.as_deref() == Some(to.0.as_str()) && fold(&now.name) == fold(name) {
+            return Err(Fail::Failed(
+                "OneDrive won't change only the case of a name on a folder this large: \
+                 rename it to another name first, then to the one you want"
+                    .into(),
+            ));
+        }
         let mut page = self.cloud.children(&pre.id).await?;
         let made = self.cloud.mkdir(to, name).await?;
         self.crash_point()?;
@@ -574,13 +585,15 @@ impl<C: Cloud> Executor<C> {
                         Err(CloudError::TooManyItems) => {
                             Box::pin(self.rebuild(store, &pre_of(c), &into, &c.name)).await?
                         }
-                        // A listing that still showed something already moved.
-                        Err(CloudError::Changed)
-                            if self.cloud.item(&RemoteId(c.id.clone())).await?.and_then(|r| r.parent_id)
-                                == Some(made.id.clone()) =>
-                        {
-                            continue;
-                        }
+                        // Already moved: a listing that still showed it, or
+                        // a move OneDrive made whose answer was lost, sent
+                        // again on the eTag it had before. Recorded all the
+                        // same: left stored below the original, it would be
+                        // removed with it.
+                        Err(CloudError::Changed) => match self.cloud.item(&RemoteId(c.id.clone())).await? {
+                            Some(row) if row.parent_id.as_deref() == Some(made.id.as_str()) => row,
+                            _ => return Err(CloudError::Changed.into()),
+                        },
                         Err(e) => return Err(e.into()),
                         Ok(MetaDone::Deleted) => return Err(odd()),
                     };
@@ -598,8 +611,16 @@ impl<C: Cloud> Executor<C> {
         self.cloud.delete(&pre_of(&emptied)).await?;
         self.crash_point()?;
         // Nothing points at it any more: the Synced row follows the new
-        // folder, and its contents were recorded as moved.
-        store.try_write(|o| o.delete_subtree(&pre.id.0).map(|_| ()))?;
+        // folder, and its contents were recorded as moved. Anything still
+        // stored below it went elsewhere in OneDrive meanwhile (moved on the
+        // web, say), not away, so its rows go without deletion evidence
+        // (invariant 3): it reads as missing until the next listing brings
+        // it where it is now. Unpruning drops the tombstones pruning leaves.
+        store.try_write(|o| {
+            o.prune_subtree(&pre.id.0, true)?;
+            o.unprune_subtree(&pre.id.0)?;
+            Ok::<_, Fail>(())
+        })?;
         self.cloud.item(&into).await?.ok_or(Fail::Skip(Skip::Changed))
     }
 

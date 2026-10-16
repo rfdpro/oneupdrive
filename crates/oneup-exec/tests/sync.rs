@@ -50,6 +50,12 @@ struct State {
     /// OneDrive's list view threshold: a folder with more items than this
     /// below it can't be moved or renamed in one request.
     threshold: Option<usize>,
+    /// The next batched move of this item is made, but its answer is lost
+    /// and the request sent again on the old eTag (412).
+    lost_move: Option<String>,
+    /// The next folder listing first moves this item into that folder (a
+    /// user on the web, while a large folder is being moved).
+    wander: Option<(String, String)>,
 }
 
 impl State {
@@ -339,7 +345,13 @@ impl Cloud for Fake {
 
     /// Three at a time, so a folder takes several listings.
     async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
-        let s = self.0.lock().unwrap();
+        let mut s = self.0.lock().unwrap();
+        if let Some((item, to)) = s.wander.take() {
+            let etag = s.bump();
+            let it = s.items.get_mut(&item).unwrap();
+            it.parent = Some(to);
+            it.etag = etag;
+        }
         let ids = s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&id.0)).map(|(id, _)| id).take(3);
         Ok(ids.map(|id| s.row(id)).collect())
     }
@@ -387,7 +399,16 @@ impl Cloud for Fake {
             out.push(match (m, ok) {
                 (_, Err(e)) => Err(e),
                 (Meta::Mkdir { parent, name }, Ok(())) => self.mkdir(parent, name).await.map(MetaDone::Item),
-                (Meta::Move { pre, to, name }, Ok(())) => self.move_item(pre, to, name).await.map(MetaDone::Item),
+                (Meta::Move { pre, to, name }, Ok(())) => {
+                    let done = self.move_item(pre, to, name).await.map(MetaDone::Item);
+                    let mut s = self.0.lock().unwrap();
+                    if done.is_ok() && s.lost_move.as_deref() == Some(pre.id.0.as_str()) {
+                        s.lost_move = None;
+                        Err(CloudError::Changed)
+                    } else {
+                        done
+                    }
+                }
                 (Meta::Delete { pre }, Ok(())) => Cloud::delete(self, pre).await.map(|()| MetaDone::Deleted),
             });
         }
@@ -1831,6 +1852,117 @@ async fn everyday_moving_into_a_new_folder_follows_both_ways() {
     assert!(!t.contains_key("/projects/alpha") && !t.contains_key("/notes.txt") && !t.contains_key("/photos"));
     assert_eq!(cloud.uploaded(), sent, "moves sent no content");
     assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// Moves `Projects/Bookmarks` (from [`large_folder`]) to
+/// `Projects/Bookmarks 2025` here and runs rounds until OneDrive no longer
+/// has the original: the move in parts is done, and the store is as it
+/// left it (no listing since).
+async fn move_large_folder_in_parts(s: &mut Sync) {
+    std::fs::rename(s.p("Projects/Bookmarks"), s.p("Projects/Bookmarks 2025")).unwrap();
+    for _ in 0..20 {
+        s.round().await;
+        if !s.cloud.tree().contains_key("/Projects/Bookmarks") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the large folder wasn't moved: {:?}", names(&s.cloud.tree()));
+}
+
+/// Whether the store holds deletion evidence for cloud item `id`.
+fn noted_deleted(s: &Sync, id: &str) -> bool {
+    use oneup_sync::{Seen, Trees};
+    let seen = s.obs.store().read(|o| o.remote(&RemoteId(id.into()))).unwrap();
+    matches!(seen, Seen::Deleted)
+}
+
+/// A move in parts whose answer is lost (Graph sends it again, on an eTag
+/// that moved on: 412) is recorded where the item now is, so removing the
+/// emptied original records no deletion of it.
+#[tokio::test]
+async fn a_lost_answer_while_moving_a_large_folder_in_parts_is_recorded_as_moved() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-lost", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    let before = cloud.tree();
+    let child = resolve(&cloud.0.lock().unwrap(), "Projects/Bookmarks/b0.html");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        st.threshold = Some(5);
+        st.lost_move = Some(child.clone());
+    }
+
+    move_large_folder_in_parts(&mut s).await;
+    assert!(cloud.0.lock().unwrap().lost_move.is_none(), "the answer was lost");
+    let made = resolve(&cloud.0.lock().unwrap(), "Projects/Bookmarks 2025");
+    let row = s.obs.store().read(|o| o.get_item(&child)).unwrap();
+    assert_eq!(row.and_then(|r| r.parent_id), Some(made), "recorded in the new folder");
+    assert!(!noted_deleted(&s, &child), "no deletion recorded for an item OneDrive still has");
+
+    s.settle().await;
+    let t = cloud.tree();
+    for (path, content) in before.iter().filter(|(p, _)| p.starts_with("/Projects/Bookmarks")) {
+        let moved = path.replacen("/Projects/Bookmarks", "/Projects/Bookmarks 2025", 1);
+        assert_eq!(t.get(&moved), Some(content), "{moved}: {:?}", names(&t));
+    }
+    assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// An item moved elsewhere on the web while its large folder is being
+/// moved in parts is still stored below the emptied original when that is
+/// removed: no deletion is recorded for it, and it follows its move here.
+#[tokio::test]
+async fn an_item_moved_away_while_a_large_folder_is_moved_in_parts_is_not_deleted() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-wander", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    let child = resolve(&cloud.0.lock().unwrap(), "Projects/Bookmarks/b0.html");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        let projects = resolve(&st, "Projects");
+        st.threshold = Some(5);
+        st.wander = Some((child.clone(), projects));
+    }
+
+    move_large_folder_in_parts(&mut s).await;
+    assert!(cloud.0.lock().unwrap().wander.is_none(), "it was moved away");
+    assert!(!noted_deleted(&s, &child), "no deletion recorded for an item OneDrive still has");
+
+    s.settle().await;
+    let here = local_tree(&s.dir.0);
+    assert_eq!(here.get("/Projects/b0.html"), Some(&Some(b"bookmark 0".to_vec())), "{:?}", names(&here));
+    assert!(here.contains_key("/Projects/Bookmarks 2025/deep/deeper/x.txt"), "{:?}", names(&here));
+    assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// Changing only the case of a large folder's name can't be done in parts
+/// (the new folder can't sit next to the original under the same name):
+/// it is reported as failed, and nothing changes in OneDrive.
+#[tokio::test]
+async fn a_case_only_rename_of_a_large_folder_is_reported() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-case", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    let before = cloud.tree();
+    cloud.0.lock().unwrap().threshold = Some(5);
+
+    std::fs::rename(s.p("Projects/Bookmarks"), s.p("Projects/bookmarks")).unwrap();
+    let mut failed = Vec::new();
+    for _ in 0..20 {
+        let r = s.attempt().await;
+        assert!(r.halted.is_none() && r.skipped.is_empty(), "{r:?}");
+        failed = r.failed;
+        if !failed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(failed.iter().any(|(_, why)| why.contains("case")), "{failed:?}");
+    assert_eq!(cloud.tree(), before, "nothing changed in OneDrive");
 }
 
 /// Changing only the case of a name, on either side, renames it on the

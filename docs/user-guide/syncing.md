@@ -6,7 +6,7 @@ Day to day you won't need any of the commands on this page: the [settings window
 `oneup sync` keeps one folder on your PC and one folder in your OneDrive the same, in both directions:
 * new files and folders are copied to the other side;
 * edits are sent across (in OneDrive, as a new version of the same file, so its version history continues);
-* renames and moves are repeated on the other side, without copying the file again. OneDrive won't move or rename a folder with more than 5,000 items inside it in one step, so OneUpDrive does it for you: it makes the folder at its new place, moves everything into it, then deletes the old, now empty folder (into OneDrive's recycle bin). A sharing link to that folder stops working (links to the files inside keep working);
+* renames and moves are repeated on the other side, without copying the file again. OneDrive won't move or rename a folder with more than 5,000 items inside it in one step, so OneUpDrive does it for you: it makes the folder at its new place, moves everything into it, then deletes the old, now empty folder (into OneDrive's recycle bin). A sharing link to that folder stops working (links to the files inside keep working). Changing only the capitals in such a folder's name ("bookmarks" to "Bookmarks") can't be done this way and is reported as failed: rename it to another name first, then to the one you want;
 * deletions are repeated on the other side, but always recoverably (see below).
 
 ```powershell
