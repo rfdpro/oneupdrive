@@ -749,6 +749,9 @@ fn a_folder_held_open_is_left_orphaned_until_released_again() {
     assert!(!root.join("top.txt").exists(), "outside the held folder: done");
     assert!(placeholder(&docs) && placeholder(&docs.join("h.txt")), "inside it: still placeholders");
     assert!(docs.join("online.txt").exists(), "and still online-only");
+    // Windows doesn't describe it: that's an error, never "an ordinary file"
+    // (which would mean all its content is here).
+    assert!(provider::info(&provider::open(&docs.join("online.txt")).unwrap()).is_err());
 
     // Released again, with nothing holding it.
     provider::register_as(&root, "Cleanup", 0x0dd0_0dd0_0dd0_0dd0_0dd0_0dd0_0dd0_0dd4, b"cleanup", false).unwrap();

@@ -256,11 +256,14 @@ impl LocalFs {
     }
 
     /// Whether the open placeholder has all its content on disk (reading it
-    /// then never asks the cloud). Not a placeholder: true.
+    /// then never asks the cloud). Not a placeholder: true, unless its
+    /// attributes or reparse tag say it is one after all (then nothing
+    /// vouches for its content). Removing the OneDrive copy relies on this
+    /// ([`LocalFs::has_content`]), so any doubt answers false.
     pub(crate) fn fully_on_disk(&self, h: &win::Handle, size: i64) -> bool {
         match provider::info(&h.as_file()) {
             Ok(Some(i)) => i.on_disk >= size,
-            Ok(None) => true,
+            Ok(None) => win::attribute_tag(h).is_ok_and(|(attributes, tag)| !looks_like_placeholder(attributes, tag)),
             Err(_) => false,
         }
     }
@@ -392,6 +395,16 @@ impl LocalFs {
         let path = long(&win::final_path(&probe)?);
         Ok(self.is_inside_pub(&path).then_some(path))
     }
+}
+
+/// Whether a file's attributes or reparse tag mark a cloud placeholder or
+/// content that isn't here (offline, recalled on open or data access).
+fn looks_like_placeholder(attributes: u32, reparse_tag: u32) -> bool {
+    use oneup_ntfs::dirent::{
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    };
+    attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0
+        || oneup_cfapi::placeholder_state(attributes, reparse_tag).is_placeholder()
 }
 
 fn placeholder_error(e: provider::Error) -> Error {

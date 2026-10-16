@@ -602,7 +602,11 @@ pub fn open(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
-/// The placeholder state of an open file; `None` if it isn't a placeholder.
+/// The placeholder state of an open file; `None` only if Windows says it
+/// isn't a cloud file at all. Any other failure is an error, never "not a
+/// placeholder": an online-only placeholder no sync root holds any more
+/// isn't described (`ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT`, measured), and
+/// taking it for an ordinary file would take it for all its content.
 pub fn info(f: &File) -> Result<Option<Info>> {
     let mut buf = vec![0u8; size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096];
     let mut got = 0u32;
@@ -616,8 +620,9 @@ pub fn info(f: &File) -> Result<Option<Info>> {
             Some(&mut got),
         )
     };
-    if r.is_err() {
-        return Ok(None);
+    match r {
+        Err(e) if is_not_a_cloud_file(e.code()) => return Ok(None),
+        r => win("CfGetPlaceholderInfo", r)?,
     }
     // SAFETY: the buffer begins with the structure, which may be unaligned.
     let s: CF_PLACEHOLDER_STANDARD_INFO = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast()) };
@@ -630,6 +635,13 @@ pub fn info(f: &File) -> Result<Option<Info>> {
         modified: s.ModifiedDataSize,
         identity,
     }))
+}
+
+/// What `CfGetPlaceholderInfo` reports for an ordinary file or folder, in a
+/// sync root or not (measured): the one failure that means "not a
+/// placeholder".
+fn is_not_a_cloud_file(code: windows::core::HRESULT) -> bool {
+    code == windows::Win32::Foundation::ERROR_NOT_A_CLOUD_FILE.to_hresult()
 }
 
 /// Gives a **dehydrated** placeholder a new identity, size and time (a cloud
@@ -805,5 +817,24 @@ impl Exclusive {
             )
         };
         win("CfConvertToPlaceholder", r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_not_a_cloud_file_means_not_a_placeholder() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING,
+            ERROR_NOT_A_CLOUD_FILE,
+        };
+        assert_eq!(ERROR_NOT_A_CLOUD_FILE.to_hresult().0 as u32, 0x8007_0178);
+        assert!(is_not_a_cloud_file(ERROR_NOT_A_CLOUD_FILE.to_hresult()));
+        // An orphaned online-only placeholder, and any other failure.
+        for e in [ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING, ERROR_ACCESS_DENIED] {
+            assert!(!is_not_a_cloud_file(e.to_hresult()), "{e:?}");
+        }
     }
 }
