@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use oneup_app::autopause;
+use oneup_app::busy::Busy;
 use oneup_app::control::{Control, now_ms};
 use oneup_app::problem;
 use oneup_app::setup::{self, DirLock, KEY_PRESET};
@@ -436,7 +437,9 @@ async fn agent(
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
     let journal = Arc::new(Notify::new());
     let tracker = oneup_app::apps::Tracker::start(dir, Path::new(&root.path));
-    watch_journal(PathBuf::from(&root.path), &journal, tracker);
+    let busy = Arc::new(Busy::new(oneup_app::config::load_agent(dir)?.busy));
+    engine.hold_busy(Arc::clone(&busy));
+    watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy));
     let remote = Arc::new(Notify::new());
     // Files On-Demand: serve the placeholders' content while this attempt
     // runs (files-on-demand.md § Hydration).
@@ -480,6 +483,7 @@ async fn agent(
             Ok(s) => settings = s,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "config.toml: keeping the previous settings"),
         }
+        busy.set_settings(settings.busy);
         let minute = autopause::local_minute_of_day();
         let conditions = autopause::Conditions {
             metered: oneup_sys::conditions::metered(),
@@ -499,6 +503,7 @@ async fn agent(
 
         // ---- a timed pause may be over; a changed pause is saved
         let paused = control.settle_pause(now_ms());
+        let mut held_until = None;
         let next = if auto.is_some() {
             control.set_activity(Activity::Paused);
             // Looked at again at the next wake-up or check, or when the
@@ -516,6 +521,7 @@ async fn agent(
                 .rounds(store, scope, &|| control.controls(), window.recent(), MAX_ROUNDS, &|p| control.set_progress(p))
                 .await?;
             store = s;
+            held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
             window.add(out.executed);
             if !out.totals.is_quiet() {
@@ -593,6 +599,8 @@ async fn agent(
                 }
             }
         };
+        // A held upload goes once its file has been left alone.
+        let next = held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now())));
         // A timed pause ends the wait when it's over.
         let next = match paused.until_ms {
             Some(u) if paused.local || paused.remote => {
@@ -669,7 +677,7 @@ async fn wait(
 /// (`oneup_app::apps`), if there is one. When it falls far behind (a burst
 /// of activity on the disk), it skips ahead: the observer reads everything
 /// anyway; only those writes go uncounted.
-fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::apps::Tracker>) {
+fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::apps::Tracker>, busy: Arc<Busy>) {
     // The thread can't be interrupted while blocked in the kernel. It holds
     // only a weak reference, so once the agent is done with `wake` (a stop
     // or a restart) the thread ends at its next wake-up.
@@ -707,17 +715,22 @@ fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::a
             loop {
                 let next = {
                     let (next, records) = volume.read_journal(j.journal_id, cursor, true, &mut buf)?;
-                    if let Some(t) = &tracker {
-                        for r in records.flatten() {
-                            // An online-only file wasn't written by a program:
-                            // that's OneUpDrive making or freeing a
-                            // placeholder. Asking who has it open downloaded
-                            // it (thousands of files on a large folder).
-                            if r.has(oneup_ntfs::record::reason::CONTENT)
-                                && !r.is_directory()
-                                && !oneup_ntfs::dirent::recalls(r.attributes)
-                            {
+                    let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+                    for r in records.flatten() {
+                        // An online-only file wasn't written by a program:
+                        // that's OneUpDrive making or freeing a
+                        // placeholder. Asking who has it open downloaded
+                        // it (thousands of files on a large folder).
+                        if r.has(oneup_ntfs::record::reason::CONTENT)
+                            && !r.is_directory()
+                            && !oneup_ntfs::dirent::recalls(r.attributes)
+                        {
+                            if let Some(t) = &tracker {
                                 t.saw(r.file_id.0);
+                            }
+                            // Our own downloads don't make a file busy.
+                            if !oneup_cfapi::ours::wrote(r.file_id.0) {
+                                busy.changed(r.file_id.0, oneup_app::busy::instant_of(r.timestamp, now, wall));
                             }
                         }
                     }
@@ -728,7 +741,9 @@ fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::a
                 }
                 let _ = ping.try_send(());
                 let end = volume.query_journal()?.next_usn;
-                cursor = if tracker.is_none() || end - next > SKIP_AHEAD { end } else { next };
+                // Every record is read (for the program tracker and for
+                // files that keep changing) unless far behind.
+                cursor = if end - next > SKIP_AHEAD { end } else { next };
                 std::thread::sleep(if tracker.is_some() { TRACK_GAP } else { MIN_WAKE_GAP });
             }
         };

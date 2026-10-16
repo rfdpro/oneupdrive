@@ -438,6 +438,9 @@ pub struct Outcome {
     /// The tripped safety stops, when `end` is [`End::Stopped`] (see
     /// [`print_breakers`]).
     pub breakers: Vec<Breaker>,
+    /// When the earliest upload the last round held for a file that keeps
+    /// changing may go ([`crate::busy`]): the caller runs a round then.
+    pub held_until: Option<std::time::Instant>,
 }
 
 /// Everything a round needs besides the database: the executor (with the
@@ -461,6 +464,9 @@ pub struct Engine {
     /// Converting synced files already here into placeholders, in the
     /// background ([`Engine::convert_leftovers`]).
     converting: std::sync::Mutex<Converting>,
+    /// Files that keep changing, whose uploads wait (the agent's; none for
+    /// `oneup sync`).
+    busy: std::sync::OnceLock<Arc<crate::busy::Busy>>,
     /// The store's invariants were checked once this run ([`Engine::remote`]).
     verified: std::sync::atomic::AtomicBool,
 }
@@ -518,8 +524,19 @@ impl Engine {
             logged: std::sync::Mutex::new(Vec::new()),
             offer: std::sync::Mutex::new(None),
             converting: std::sync::Mutex::new(Converting::default()),
+            busy: std::sync::OnceLock::new(),
             verified: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Holds the uploads of the files `busy` says keep changing.
+    pub fn hold_busy(&self, busy: Arc<crate::busy::Busy>) {
+        let _ = self.busy.set(busy);
+    }
+
+    /// Until when `op` waits because its file keeps changing, if it does.
+    fn held_until(&self, op: &Op, now: std::time::Instant) -> Option<std::time::Instant> {
+        self.busy.get()?.held_until(sent_file(op)?, now)
     }
 
     /// The cloud for serving Files On-Demand downloads: the same view of
@@ -954,10 +971,12 @@ impl Engine {
             executed: Recent::default(),
             overflow: None,
             breakers: Vec::new(),
+            held_until: None,
         };
         let mut scope = first;
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
+            out.held_until = None;
             let controls = &controls();
             if controls.pause_local && controls.pause_remote && n > 1 {
                 // Paused meanwhile: nothing more now; the caller sees why.
@@ -1110,6 +1129,24 @@ impl Engine {
                     .collect())
             })?;
             let planned = crate::priority::apply(&order, planned, |(a, l)| (a.op(), l.path.as_str()));
+            // Files that keep changing wait (`crate::busy`); their folders
+            // stay marked, so a later round plans them again.
+            let now = std::time::Instant::now();
+            let (planned, busy, until) = hold_back(planned, |(a, _)| self.held_until(a.op(), now));
+            out.held_until = until;
+            let waiting: Vec<(Op, Line)> = busy.into_iter().map(|(a, l)| (a.op().clone(), l)).collect();
+            let wait = waiting.iter().filter(|(op, _)| matches!(op, Op::Upload { .. })).map(|(_, l)| {
+                let detail = "changing often; sent once it's left alone for a moment".to_string();
+                ActivityEntry {
+                    seq: 0,
+                    at_ms: now_ms(),
+                    outcome: ActivityOutcome::Waiting,
+                    action: l.action.into(),
+                    path: l.path.clone(),
+                    detail,
+                }
+            });
+            log_activity(&mut store, wait.collect())?;
             let (approved, planned): (Vec<Approved>, Vec<(Op, Line)>) = planned
                 .into_iter()
                 .map(|(a, l)| {
@@ -1157,6 +1194,9 @@ impl Engine {
                     for op in report.skipped.iter().map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)) {
                         retried.add(op);
                     }
+                }
+                for (op, _) in &waiting {
+                    retried.add(op);
                 }
                 store.write(|o| {
                     o.dirty_clear_except(upto, &retried.local, &retried.remote, &retried.synced)?;
@@ -2055,6 +2095,34 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Splits `items` into those that go now and those `until` holds back,
+/// keeping their order, with the earliest time a held one may go.
+fn hold_back<T>(
+    items: Vec<T>,
+    until: impl Fn(&T) -> Option<std::time::Instant>,
+) -> (Vec<T>, Vec<T>, Option<std::time::Instant>) {
+    let (mut now, mut held, mut first) = (Vec::new(), Vec::new(), None::<std::time::Instant>);
+    for item in items {
+        match until(&item) {
+            Some(u) => {
+                first = Some(first.map_or(u, |f| f.min(u)));
+                held.push(item);
+            }
+            None => now.push(item),
+        }
+    }
+    (now, held, first)
+}
+
+/// The local file `op` reads to send it: an upload, or the hashing that
+/// comes before one. What waits while the file keeps changing.
+fn sent_file(op: &Op) -> Option<u128> {
+    match op {
+        Op::Upload { local, .. } | Op::Hash(local) => Some(local.id.0),
+        _ => None,
+    }
+}
+
 /// Compacts the database at the agent's start (`[agent] compact_database`)
 /// if free pages are most of it (`Space::worth_compacting`) and the disk
 /// has room for the copy, saying so in the activity log. Before the agent's
@@ -2106,7 +2174,9 @@ fn log_activity(store: &mut Store, entries: Vec<ActivityEntry>) -> Result<()> {
     store.write(|o| {
         let mut keep = Vec::with_capacity(entries.len());
         for e in entries {
-            if matches!(e.outcome, ActivityOutcome::Skipped | ActivityOutcome::Failed) && !e.path.is_empty() {
+            if matches!(e.outcome, ActivityOutcome::Skipped | ActivityOutcome::Failed | ActivityOutcome::Waiting)
+                && !e.path.is_empty()
+            {
                 let last = o.activity_recent(Some(&e.path), 1)?;
                 if last.first().is_some_and(|l| l.path == e.path && l.action == e.action && l.detail == e.detail) {
                     continue;
@@ -2347,6 +2417,115 @@ mod tests {
         let busy = Report { done: vec![op()], ..skipped(&[Skip::NameTaken]) };
         assert_eq!(settle(&busy), (true, None));
         assert_eq!(settle(&Report::default()), (true, Some(End::Settled)));
+    }
+
+    /// A held upload's folder keeps its mark through the end of the round
+    /// (`Touched`, `dirty_clear_except`), so the next round plans it again.
+    #[test]
+    fn a_held_upload_is_planned_again_in_the_next_round() {
+        use oneup_store::{Kind, LocalKind, LocalRow, RemoteRow, Skip};
+        use oneup_sync::{Base, Link, LocalPre, NodeKind, ROOT, RemoteId};
+        let local = |id: u128, parent: Option<u128>, name: &str, kind: LocalKind, size: i64| LocalRow {
+            file_id: id,
+            parent_id: parent,
+            name: name.into(),
+            name_lossy: false,
+            kind,
+            size,
+            mtime: 9,
+            attributes: 0,
+            reparse_tag: 0,
+            skip: Skip::None,
+        };
+        let remote = |id: &str, parent: Option<&str>, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: id.into(),
+            kind,
+            size: 0,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        let base = |sid, parent, name: &str, local: u128, remote: &str| Base {
+            sid,
+            parent,
+            name: name.into(),
+            kind: NodeKind::Folder,
+            size: 0,
+            hash: None,
+            local: Some(LocalId(local)),
+            local_mtime: 0,
+            remote: Some(RemoteId(remote.into())),
+            remote_etag: "e".into(),
+        };
+        let mut s = Store::open_in_memory().unwrap();
+        let d = s
+            .write(|o| {
+                o.local_put(&local(1, None, "", LocalKind::Root, 0))?;
+                o.local_put(&local(3, Some(1), "d", LocalKind::Folder, 0))?;
+                o.upsert_item(&remote("root", None, Kind::Root), false)?;
+                o.upsert_item(&remote("d", Some("root"), Kind::Folder), false)?;
+                o.synced_put(&base(ROOT, None, "", 1, "root"))?;
+                o.synced_insert(&base(0, Some(ROOT), "d", 3, "d"))
+            })
+            .unwrap();
+        s.write(|o| o.dirty_clear(i64::MAX).map(drop)).unwrap();
+        // A program saves a new file in d, again and again.
+        s.write(|o| o.local_put(&local(4, Some(3), "a.db", LocalKind::File, 7)).map(drop)).unwrap();
+        let round = |s: &mut Store, held: &[Op]| {
+            s.write(|o| {
+                let scope = o.dirty_scope()?;
+                let mut retried = Touched::default();
+                for op in held {
+                    retried.add(op);
+                }
+                o.dirty_clear_except(scope.upto, &retried.local, &retried.remote, &retried.synced)?;
+                Ok(scope.folders)
+            })
+            .unwrap()
+        };
+        let upload = Op::Upload {
+            local: LocalPre { id: LocalId(4), stamp: Some((7, 9)) },
+            to: RemoteId("d".into()),
+            parent: d,
+            name: "a.db".into(),
+            replace: None,
+            link: Link::New,
+        };
+        assert!(round(&mut s, &[upload]).contains(&d), "the round plans d and holds the upload");
+        assert!(round(&mut s, &[]).contains(&d), "so the next round plans d again, and sends it");
+        assert!(!round(&mut s, &[]).contains(&d), "after which d is done");
+    }
+
+    #[test]
+    fn held_items_wait_in_order_and_the_earliest_time_is_kept() {
+        let t = std::time::Instant::now();
+        let at = |s: u64| Some(t + std::time::Duration::from_secs(s));
+        let (now, held, first) = hold_back(vec![1, 2, 3, 4, 5], |n| match n {
+            2 => at(30),
+            4 => at(15),
+            _ => None,
+        });
+        assert_eq!((now, held, first), (vec![1, 3, 5], vec![2, 4], at(15)));
+        assert_eq!(hold_back(vec![1], |_| None), (vec![1], vec![], None));
+    }
+
+    #[test]
+    fn only_what_reads_a_local_file_to_send_it_waits_for_it() {
+        use oneup_sync::{Link, LocalPre, RemoteId};
+        let local = LocalPre { id: LocalId(7), stamp: Some((1, 2)) };
+        let upload = Op::Upload {
+            local: local.clone(),
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a.db".into(),
+            replace: None,
+            link: Link::New,
+        };
+        assert_eq!(sent_file(&upload), Some(7));
+        assert_eq!(sent_file(&Op::Hash(local)), Some(7));
+        assert_eq!(sent_file(&Op::Forget(3)), None);
     }
 
     #[test]

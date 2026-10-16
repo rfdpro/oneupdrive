@@ -8,6 +8,7 @@
 pub mod accounts;
 pub mod apps;
 pub mod autopause;
+pub mod busy;
 pub mod carryover;
 pub mod config;
 pub mod control;
