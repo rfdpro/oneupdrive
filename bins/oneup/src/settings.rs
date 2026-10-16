@@ -22,6 +22,12 @@ pub struct Changes {
     /// `HH:MM-HH:MM`, or `always`.
     pub cap_hours: Option<String>,
     pub tray_icon: Option<bool>,
+    /// Files that keep changing (`oneup_app::busy`).
+    pub hold_busy_files: Option<bool>,
+    pub busy_changes: Option<u32>,
+    pub busy_window_s: Option<u64>,
+    pub busy_quiet_s: Option<u64>,
+    pub busy_max_s: Option<u64>,
     /// `[dev] experimental` (`config::load_experimental`).
     pub experimental: Option<bool>,
 }
@@ -62,6 +68,23 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
     if let Some(b) = c.tray_icon {
         a.tray_icon = b;
     }
+    if let Some(b) = c.hold_busy_files {
+        a.busy.on = b;
+    }
+    if let Some(n) = c.busy_changes {
+        a.busy.changes = n;
+    }
+    let secs = std::time::Duration::from_secs;
+    if let Some(n) = c.busy_window_s {
+        a.busy.window = secs(n);
+    }
+    if let Some(n) = c.busy_quiet_s {
+        a.busy.quiet = secs(n);
+    }
+    if let Some(n) = c.busy_max_s {
+        a.busy.max = secs(n);
+    }
+    config::check_busy(&a.busy)?;
     match c.cap_hours.as_deref() {
         Some("always" | "off" | "") => a.cap_hours = None,
         Some(q) => {
@@ -117,4 +140,17 @@ fn show(a: &Agent) {
     println!("  pause during full-screen video     {}", yes(a.pause_on_full_screen_video));
     println!("  quiet hours (no syncing)        {}", a.quiet_hours.as_deref().unwrap_or("none"));
     println!("  icon in the notification area   {}", yes(a.tray_icon));
+    let b = &a.busy;
+    if b.on {
+        println!(
+            "  files that keep changing        sent once left alone for {} s ({} changes within {} s make a file busy; \
+             sent at least every {} s)",
+            b.quiet.as_secs(),
+            b.changes,
+            b.window.as_secs(),
+            b.max.as_secs()
+        );
+    } else {
+        println!("  files that keep changing        sent after every change");
+    }
 }

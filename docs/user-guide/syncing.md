@@ -85,6 +85,8 @@ oneup --data-dir … settings --pause-on-metered off        # sync on metered co
 oneup --data-dir … settings --pause-on-battery-saver off  # and with battery saver on
 oneup --data-dir … settings --pause-on-full-screen off    # and during games and presentations
 oneup --data-dir … settings --pause-on-full-screen-video off  # and while a video plays full screen
+oneup --data-dir … settings --busy-quiet-s 30             # send a file that keeps changing after 30 s of quiet
+oneup --data-dir … settings --hold-busy-files off         # send every change right away
 ```
 
 * **Pausing by itself:** by default `oneupd` pauses while the internet connection is metered (a phone hotspot, a data plan Windows knows is limited), while battery saver is on, while a game, a presentation or another full-screen program has the screen, and while a video plays full screen (in a browser or a video player), and resumes when that ends. Games and videos are separate settings, so you can pause for one and not the other. Windows reports a full-screen video and a game that runs in a borderless window the same way, so OneUpDrive goes by the program: a browser or a video player is a video, anything else a game. Quiet hours (none by default) pause it every day between those times. `oneup status` shows when and why it paused by itself. It checks whenever it would wake up anyway, so it may take up to 10 minutes to notice that the connection or battery saver changed.
@@ -93,6 +95,7 @@ oneup --data-dir … settings --pause-on-full-screen-video off  # and while a vi
 * **Background priority** is on by default: `oneupd` gives way to your programs for processor, disk and memory, and Windows may run it on power-efficient cores. Syncing a large batch can take a little longer.
 * **Memory profile** sets how much memory the database may use for caching (4, 16 or 64 MiB), and how large the pieces are that big files are uploaded in (up to 10, 40 or 60 MiB). Larger pieces upload faster on a good connection: OneUpDrive measures the connection as it goes and picks the size, within the profile's limit.
 * **Copies of files already in OneDrive aren't uploaded again.** If you copy a large file (1 MiB or more) that's already in your OneDrive, for example a video into a second folder, OneUpDrive checks that the contents are identical and asks OneDrive to make the copy itself. That takes a couple of seconds whatever the size. `oneup activity` shows it as copied in OneDrive.
+* **Files that keep changing wait until they're left alone.** A file saved twice within 5 seconds (a database, an app that saves its settings every few seconds) isn't sent after every save: OneUpDrive waits until it has gone 15 seconds without a change, then sends it once. A file that never stops changing is still sent at least every 10 minutes. `oneup activity` shows such a file as waiting. In the settings window it's under **General**, **Files that keep changing**; `--busy-changes`, `--busy-window-s` and `--busy-max-s` set how many changes in how many seconds make a file busy and the longest it waits. Downloads never wait.
 * Priority and memory profile apply the next time `oneupd` starts (`oneup stop`, then `oneup start`).
 
 These settings are in the `[agent]` section of `config.toml` in the data folder, which you can also edit by hand.

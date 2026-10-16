@@ -189,6 +189,21 @@ enum Cmd {
         /// Show OneUpDrive's icon in the notification area when the agent starts (on by default)
         #[arg(long, value_enum)]
         tray_icon: Option<Toggle>,
+        /// Hold the uploads of files that keep changing until they're left alone (on by default)
+        #[arg(long, value_enum)]
+        hold_busy_files: Option<Toggle>,
+        /// Changes within --busy-window-s that make a file busy (default 2)
+        #[arg(long, value_name = "N")]
+        busy_changes: Option<u32>,
+        /// The window those changes must fall in, in seconds (default 5)
+        #[arg(long, value_name = "SECONDS")]
+        busy_window_s: Option<u64>,
+        /// How long a busy file must go unchanged before it's sent, in seconds (default 15)
+        #[arg(long, value_name = "SECONDS")]
+        busy_quiet_s: Option<u64>,
+        /// The longest a busy file's upload waits, in seconds (default 600)
+        #[arg(long, value_name = "SECONDS")]
+        busy_max_s: Option<u64>,
         /// Developers only: show and allow experimental options (off by default)
         #[arg(long, value_enum, hide = true)]
         experimental: Option<Toggle>,
@@ -1221,6 +1236,11 @@ async fn run() -> Result<()> {
             quiet_hours,
             cap_hours,
             tray_icon,
+            hold_busy_files,
+            busy_changes,
+            busy_window_s,
+            busy_quiet_s,
+            busy_max_s,
             experimental,
         } => {
             let changes = settings::Changes {
@@ -1235,6 +1255,11 @@ async fn run() -> Result<()> {
                 quiet_hours: quiet_hours.clone(),
                 cap_hours: cap_hours.clone(),
                 tray_icon: tray_icon.map(Toggle::on),
+                hold_busy_files: hold_busy_files.map(Toggle::on),
+                busy_changes: *busy_changes,
+                busy_window_s: *busy_window_s,
+                busy_quiet_s: *busy_quiet_s,
+                busy_max_s: *busy_max_s,
                 experimental: experimental.map(Toggle::on),
             };
             settings::run(&data_dir(&cli)?, &changes).await

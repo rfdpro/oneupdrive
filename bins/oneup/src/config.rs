@@ -139,6 +139,8 @@ pub struct Agent {
     /// Note which programs change and open files in the synced folder
     /// (counts only, kept on this PC; `crate::apps`).
     pub track_apps: bool,
+    /// Hold the uploads of files that keep changing (`crate::busy`).
+    pub busy: crate::busy::Settings,
 }
 
 impl Default for Agent {
@@ -156,6 +158,7 @@ impl Default for Agent {
             cap_hours: None,
             tray_icon: true,
             track_apps: true,
+            busy: crate::busy::Settings::default(),
         }
     }
 }
@@ -335,6 +338,24 @@ pub fn load_agent(data_dir: &Path) -> Result<Agent> {
     if let Some(b) = flag("track_apps")? {
         a.track_apps = b;
     }
+    if let Some(b) = flag("hold_busy_files")? {
+        a.busy.on = b;
+    }
+    if let Some(n) = number(t, "busy_changes")? {
+        a.busy.changes = u32::try_from(n).unwrap_or(u32::MAX);
+    }
+    let seconds =
+        |key: &str| -> Result<Option<std::time::Duration>> { Ok(number(t, key)?.map(std::time::Duration::from_secs)) };
+    if let Some(d) = seconds("busy_window_s")? {
+        a.busy.window = d;
+    }
+    if let Some(d) = seconds("busy_quiet_s")? {
+        a.busy.quiet = d;
+    }
+    if let Some(d) = seconds("busy_max_s")? {
+        a.busy.max = d;
+    }
+    check_busy(&a.busy).with_context(|| format!("{FILE}: [agent]"))?;
     if let Some(q) = t.get("cap_hours") {
         let q = q.as_str().with_context(|| format!("{FILE}: cap_hours must be a string like \"09:00-18:00\""))?;
         if !q.is_empty() {
@@ -350,6 +371,23 @@ pub fn load_agent(data_dir: &Path) -> Result<Agent> {
         }
     }
     Ok(a)
+}
+
+/// Whether the settings for files that keep changing make sense (the same
+/// checks for `config.toml`, `oneup settings` and the settings window).
+pub fn check_busy(b: &crate::busy::Settings) -> Result<()> {
+    if b.changes < 2 {
+        bail!("busy_changes must be at least 2");
+    }
+    for (key, d) in [("busy_window_s", b.window), ("busy_quiet_s", b.quiet), ("busy_max_s", b.max)] {
+        if d.as_secs() == 0 {
+            bail!("{key} must be at least 1 second");
+        }
+    }
+    if b.max < b.quiet {
+        bail!("busy_max_s can't be less than busy_quiet_s");
+    }
+    Ok(())
 }
 
 pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
@@ -371,6 +409,11 @@ pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
             ("cap_hours", value(a.cap_hours.as_deref().unwrap_or(""))),
             ("tray_icon", value(a.tray_icon)),
             ("track_apps", value(a.track_apps)),
+            ("hold_busy_files", value(a.busy.on)),
+            ("busy_changes", value(i64::from(a.busy.changes))),
+            ("busy_window_s", n(a.busy.window.as_secs())),
+            ("busy_quiet_s", n(a.busy.quiet.as_secs())),
+            ("busy_max_s", n(a.busy.max.as_secs())),
         ],
     )
 }
@@ -606,6 +649,27 @@ mod tests {
         assert!(load_agent(&d).is_err());
         std::fs::write(path(&d), "[agent]\nmemory_profile = \"huge\"\n").unwrap();
         assert!(load_agent(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn busy_file_settings_round_trip_and_are_checked() {
+        let d = tmp("busy");
+        let busy = crate::busy::Settings {
+            on: false,
+            changes: 3,
+            window: std::time::Duration::from_secs(10),
+            quiet: std::time::Duration::from_secs(30),
+            max: std::time::Duration::from_secs(120),
+        };
+        let a = Agent { busy, ..Agent::default() };
+        save_agent(&d, &a).unwrap();
+        assert_eq!(load_agent(&d).unwrap(), a);
+        for bad in ["busy_changes = 1", "busy_quiet_s = 0", "busy_quiet_s = 60\nbusy_max_s = 30", "hold_busy_files = 1"]
+        {
+            std::fs::write(path(&d), format!("[agent]\n{bad}\n")).unwrap();
+            assert!(load_agent(&d).is_err(), "{bad}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

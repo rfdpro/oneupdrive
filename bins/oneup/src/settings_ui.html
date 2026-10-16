@@ -1990,6 +1990,14 @@
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
             <p class="note">Memory and priority apply after a restart.</p>
+            <h3>Files that keep changing</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Wait until they're left alone</b><small>A file saved again and again is sent once it stops changing, not after every save</small></div>
+                    <label class="toggle"><input type="checkbox" data-agent="hold_busy_files" aria-label="Wait until files that keep changing are left alone"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Quiet for</b><small>Seconds without a change before it's sent</small></div><input type="number" min="1" data-agent="busy_quiet_s"></div>
+            </div>
             <h3>Updates</h3>
             <div class="card">
                 <div class="row">

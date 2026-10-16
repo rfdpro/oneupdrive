@@ -92,6 +92,8 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "cap_hours": a.cap_hours,
             "tray_icon": a.tray_icon,
             "track_apps": a.track_apps,
+            "hold_busy_files": a.busy.on,
+            "busy_quiet_s": a.busy.quiet.as_secs(),
         },
         "autostart": autostart,
         "rules": {
@@ -358,11 +360,18 @@ pub fn agent_with(mut a: Agent, v: &Value) -> Result<Agent> {
         ("pause_on_full_screen_video", &mut a.pause_on_full_screen_video),
         ("tray_icon", &mut a.tray_icon),
         ("track_apps", &mut a.track_apps),
+        ("hold_busy_files", &mut a.busy.on),
     ] {
         if let Some(b) = flag(k)? {
             *f = b;
         }
     }
+    if let Some(n) = num("busy_quiet_s")? {
+        a.busy.quiet = std::time::Duration::from_secs(n);
+        // Raising the wait past the longest one raises that too.
+        a.busy.max = a.busy.max.max(a.busy.quiet);
+    }
+    config::check_busy(&a.busy)?;
     if let Some(q) = hours(v, "quiet_hours")? {
         a.quiet_hours = q;
     }
@@ -755,6 +764,11 @@ mod tests {
         assert!(agent_with(Agent::default(), &json!({ "memory": "huge" })).is_err());
         assert!(agent_with(Agent::default(), &json!({ "cap_hours": "25:00-26:00" })).is_err());
         assert!(agent_with(Agent::default(), &json!({ "upload_kib": -3 })).is_err());
+        let a = agent_with(Agent::default(), &json!({ "hold_busy_files": false, "busy_quiet_s": 900 })).unwrap();
+        assert!(!a.busy.on);
+        assert_eq!(a.busy.quiet.as_secs(), 900);
+        assert_eq!(a.busy.max.as_secs(), 900, "the longest wait follows a longer quiet time");
+        assert!(agent_with(Agent::default(), &json!({ "busy_quiet_s": 0 })).is_err());
     }
 
     #[test]
