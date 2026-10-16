@@ -14,7 +14,7 @@ OneUpDrive tells you about a problem in plain words, says whether it deals with 
 * **The activity log** (settings window, **Activity**) notes when a problem began and when it cleared.
 * `oneup status` prints the same, with the technical text last.
 
-OneUpDrive tries again by itself after a minute, then waits twice as long each time, up to 30 minutes. Fixing the cause and selecting **Retry now** is quicker.
+OneUpDrive tries again by itself after a minute, then waits twice as long each time, up to 30 minutes. Once it has synced again, the next problem starts over at a minute. Fixing the cause and selecting **Retry now** is quicker.
 
 ## The problems
 

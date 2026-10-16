@@ -181,8 +181,17 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
         return Ok(());
     }
     let controls = Controls { answers: opts.answers.clone(), ..Controls::default() };
-    let (mut store, out) =
-        engine.rounds(store, Scope::All, &|| controls.clone(), Recent::default(), opts.max_rounds, &|_| {}).await?;
+    let (mut store, out) = engine
+        .rounds(
+            store,
+            Scope::All,
+            &|| controls.clone(),
+            Recent::default(),
+            &mut Recent::default(),
+            opts.max_rounds,
+            &|_| {},
+        )
+        .await?;
     if let Some(o) = &out.overflow {
         print_overflow(o, &store, Asker::Sync)?;
     }
@@ -430,9 +439,6 @@ pub struct Outcome {
     pub end: End,
     pub rounds: usize,
     pub totals: Totals,
-    /// Mass-sensitive operations carried out, per side (for the agent's
-    /// safety-stop window, see [`oneup_gate::Recent`]).
-    pub executed: Recent,
     /// The last version-store overflow batch the rounds saw, if any (see
     /// [`print_overflow`]).
     pub overflow: Option<Overflow>,
@@ -953,15 +959,20 @@ impl Engine {
     /// marked dirty, which is everything they could have left behind.
     ///
     /// `recent`: mass-sensitive operations already carried out in the
-    /// caller's safety window; this call's own are added as it goes.
+    /// caller's safety window. This call's own (per side, see
+    /// [`oneup_gate::Recent`]) are added to `executed` as each round runs
+    /// them, so they reach the caller's window even when a later round
+    /// ends the call in an error.
     /// `controls` is asked again before every round, so a pause or a
     /// `sync-now PATH` that arrives meanwhile counts from the next round.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rounds(
         &self,
         mut store: Store,
         first: Scope,
         controls: &(dyn Fn() -> Controls + Send + Sync),
         recent: Recent,
+        executed: &mut Recent,
         max_rounds: usize,
         progress: &(dyn Fn(Option<Progress>) + Send + Sync),
     ) -> Result<(Store, Outcome)> {
@@ -969,7 +980,6 @@ impl Engine {
             end: End::Unsettled,
             rounds: 0,
             totals: Totals::default(),
-            executed: Recent::default(),
             overflow: None,
             breakers: Vec::new(),
             held_until: None,
@@ -1003,7 +1013,7 @@ impl Engine {
             if rules_changed {
                 scope = Scope::All;
             }
-            let window = recent.plus(out.executed);
+            let window = recent.plus(*executed);
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;
             let extra = match mode {
@@ -1158,6 +1168,16 @@ impl Engine {
                 .unzip();
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
             let report = self.run_reported(&mut store, approved, n, bytes_total, progress).await;
+            // Counted before anything below can fail: what ran must reach
+            // the caller's safety window even if this call ends in an error.
+            executed.suspicious += report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
+            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
+                match Side::changed_by(op) {
+                    Some(Side::Local) => executed.local += 1,
+                    Some(Side::Remote) => executed.remote += 1,
+                    None => {}
+                }
+            }
             let mut log = print_round(n, &planned, &report);
             if let Some(why) = &report.halted {
                 log.push(notice(ActivityOutcome::Failed, "stopped", why.clone()));
@@ -1170,15 +1190,6 @@ impl Engine {
             }
             logged?;
             out.totals.add(&report);
-            out.executed.suspicious +=
-                report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
-            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
-                match Side::changed_by(op) {
-                    Some(Side::Local) => out.executed.local += 1,
-                    Some(Side::Remote) => out.executed.remote += 1,
-                    None => {}
-                }
-            }
             let (clean, mut end) = settle(&report, &mut changed_rounds);
             if recycled > 0 && matches!(end, Some(End::Settled)) {
                 end = None; // another round, to carry the deletions out

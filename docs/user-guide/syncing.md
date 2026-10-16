@@ -214,7 +214,7 @@ Restoring never replaces anything. If the name is taken, you get `name (restored
 Files deleted from OneDrive are in OneDrive's own recycle bin (on the website). Older versions of a file are in its version history there.
 
 ## Making room
-The version store is trimmed automatically at the end of each `oneup sync`, and by `oneupd` whenever it has caught up. It is careful:
+The version store is trimmed automatically at the end of each `oneup sync`, and by `oneupd` whenever it has caught up (not while changes to this PC are paused). It is careful:
 * anything kept **less than 30 days ago is never removed**, however big the store gets;
 * older items are removed, oldest first, **only while the store is bigger than 5 GiB or 2% of the disk**, whichever is smaller. While it's under that, old items stay.
 

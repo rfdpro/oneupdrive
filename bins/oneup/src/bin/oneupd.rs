@@ -332,8 +332,12 @@ async fn run(args: Args) -> Result<()> {
 
     // ---- run; on an error, start over after a growing pause
     let mut pause = ERROR_FIRST;
+    // Outlives each attempt: a mass deletion trickling in must still trip
+    // the stops when an error restarts the rounds in between.
+    let mut window = Window::default();
     loop {
-        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref()).await {
+        let started = Instant::now();
+        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window).await {
             Ok(()) => {
                 println!("oneupd: stopped.");
                 end_flyout(dir, flyout);
@@ -358,6 +362,7 @@ async fn run(args: Args) -> Result<()> {
             Err(e) => {
                 tracing::error!("{e:#}");
                 let before = control.problem();
+                pause = error_pause(pause, before.is_none(), started.elapsed());
                 let retry_ms = now_ms() + i64::try_from(pause.as_millis()).unwrap_or(i64::MAX);
                 let p = problem::describe(&e, before.as_ref(), now_ms(), Some(retry_ms));
                 // Once per spell, not at every retry.
@@ -380,6 +385,15 @@ async fn run(args: Args) -> Result<()> {
             }
         }
     }
+}
+
+/// The pause before retrying after an error, given the last one (`pause`):
+/// back to the first when the failed attempt got going first (a sequence of
+/// rounds finished, which clears the standing problem, so `recovered`), or
+/// ran longer than the longest pause. Otherwise one blip after days of
+/// syncing would cost the longest pause left over from earlier ones.
+fn error_pause(pause: Duration, recovered: bool, ran: Duration) -> Duration {
+    if recovered || ran >= ERROR_MAX { ERROR_FIRST } else { pause }
 }
 
 /// Notes a problem beginning or clearing in the activity log; best effort.
@@ -415,8 +429,6 @@ fn is_permanent(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
-/// database each time, so a retry starts from a clean state.
 /// How much memory the agent's database connection uses: its page cache,
 /// and how much of the file it maps (0: none).
 #[derive(Clone, Copy)]
@@ -437,6 +449,10 @@ impl Memory {
     }
 }
 
+/// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
+/// database each time, so a retry starts from a clean state, except the
+/// safety window (`window`), which the caller keeps across retries.
+#[allow(clippy::too_many_arguments)]
 async fn agent(
     dir: &Path,
     graph: &Arc<Graph>,
@@ -445,6 +461,7 @@ async fn agent(
     control: &Control,
     memory: Memory,
     key: Option<&oneup_vault::key::Masterkey>,
+    window: &mut Window,
 ) -> Result<()> {
     let mut store = setup::open_store(dir, memory.cache_kib)?;
     if memory.map_bytes > 0 {
@@ -495,7 +512,6 @@ async fn agent(
         .then(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
 
     let poll = Duration::from_secs(args.poll_seconds.max(15));
-    let mut window = Window::default();
     // Every folder only when the marks may not cover everything (see
     // `start_scope`); otherwise what changed, including while nothing ran.
     let mut scope = sync::start_scope(&store)?;
@@ -543,13 +559,19 @@ async fn agent(
         } else {
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
-            let (s, out) = engine
-                .rounds(store, scope, &|| control.controls(), window.recent(), MAX_ROUNDS, &|p| control.set_progress(p))
-                .await?;
+            let mut executed = Recent::default();
+            let recent = window.recent();
+            let rounds = engine
+                .rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
+                    control.set_progress(p)
+                })
+                .await;
+            // Before the error, if any: the retry must still count them.
+            window.add(executed);
+            let (s, out) = rounds?;
             store = s;
             held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
-            window.add(out.executed);
             if !out.totals.is_quiet() {
                 out.totals.print(out.rounds);
             }
@@ -594,7 +616,11 @@ async fn agent(
                 End::Settled => {
                     control.clear_first();
                     store = engine.placement(store, &control.controls()).await?;
-                    engine.trim(&mut store)?;
+                    // Removes kept copies on this PC: not while changes
+                    // to it are paused.
+                    if !control.controls().pause_local {
+                        engine.trim(&mut store)?;
+                    }
                     retry = RETRY_FIRST;
                     control.set_activity(Activity::Idle);
                     // Files already here becoming placeholders, a slice at a
@@ -938,7 +964,32 @@ impl Window {
 
 #[cfg(test)]
 mod tests {
-    use super::Memory;
+    use super::*;
+
+    #[test]
+    fn the_error_pause_starts_over_once_the_agent_got_going() {
+        let mut pause = ERROR_FIRST;
+        // Errors in a row: it grows (doubled after each wait) to the most.
+        for _ in 0..10 {
+            pause = (error_pause(pause, false, Duration::from_secs(1)) * 2).min(ERROR_MAX);
+        }
+        assert_eq!(pause, ERROR_MAX);
+        assert_eq!(error_pause(pause, false, Duration::from_secs(1)), ERROR_MAX, "still failing at once");
+        assert_eq!(error_pause(pause, true, Duration::from_secs(1)), ERROR_FIRST, "rounds finished meanwhile");
+        assert_eq!(error_pause(pause, false, ERROR_MAX), ERROR_FIRST, "ran a long while");
+    }
+
+    /// What the stops count adds up across calls of the rounds (the agent
+    /// keeps one window across retries, `run`).
+    #[test]
+    fn the_safety_window_adds_up_what_ran() {
+        let mut w = Window::default();
+        w.add(Recent { local: 190, remote: 0, suspicious: 0 });
+        w.add(Recent::default());
+        w.add(Recent { local: 5, remote: 2, suspicious: 1 });
+        assert_eq!(w.recent(), Recent { local: 195, remote: 2, suspicious: 1 });
+        assert_eq!(w.done.len(), 2, "nothing done, nothing kept");
+    }
 
     #[test]
     fn the_database_is_mapped_only_at_normal_priority() {
