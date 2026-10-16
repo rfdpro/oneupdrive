@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 
 use oneup_graph::model::{Facet, FileFacet, FolderFacet, ParentReference};
 use oneup_graph::{DriveItem, Page};
@@ -146,13 +146,25 @@ struct Fake {
     /// Fail every request once this many pages have been served (`-1` = never).
     fail_after: AtomicI64,
     served: AtomicI64,
+    /// Refuse id-addressed folder delta (400), so the path form is used.
+    refuse_id_delta: AtomicBool,
+    /// Links that have expired (410).
+    expired: Mutex<BTreeSet<String>>,
 }
 
 impl Fake {
     fn new(page_size: usize, shuffle: bool) -> Self {
         let mut inner = Inner::default();
         inner.nodes.insert("ROOT".into(), Node { parent: None, name: "root".into(), kind: Kind::Root });
-        Self { inner: Mutex::new(inner), page_size, shuffle, fail_after: AtomicI64::new(-1), served: AtomicI64::new(0) }
+        Self {
+            inner: Mutex::new(inner),
+            page_size,
+            shuffle,
+            fail_after: AtomicI64::new(-1),
+            served: AtomicI64::new(0),
+            refuse_id_delta: AtomicBool::new(false),
+            expired: Mutex::new(BTreeSet::new()),
+        }
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
@@ -209,10 +221,28 @@ impl RemoteApi for Fake {
             return Err(oneup_graph::Error::Status { status: 500, what: "fake".into(), body: "injected".into() });
         }
         self.served.fetch_add(1, SeqCst);
+        if self.expired.lock().unwrap().contains(url) {
+            return Err(oneup_graph::Error::Status { status: 410, what: "link".into(), body: String::new() });
+        }
         let (kind, arg, skip) = parse(url);
         let mut inner = self.inner.lock().unwrap();
         let base = url.split("&skip=").next().unwrap().to_string();
         match kind.as_str() {
+            "delta" if skip == 0 && self.refuse_id_delta.load(SeqCst) => {
+                Err(oneup_graph::Error::Status { status: 400, what: arg, body: String::new() })
+            }
+            "path" => {
+                // Resolved at request time, like Graph: a stale path finds nothing.
+                let mut at = Some("ROOT".to_string());
+                for seg in arg.split('/').filter(|s| !s.is_empty()) {
+                    at = at.and_then(|p| inner.children(&p).into_iter().find(|c| inner.nodes[c].name == seg));
+                }
+                let Some(top) = at else {
+                    return Err(oneup_graph::Error::Status { status: 404, what: arg, body: String::new() });
+                };
+                let entries = self.delta_entries(&inner, &top);
+                Ok(self.paged(entries, skip, &base, Some("fake://unused/x?".into())))
+            }
             "children" => {
                 if !inner.nodes.contains_key(&arg) {
                     return Err(oneup_graph::Error::Status { status: 404, what: arg, body: String::new() });
@@ -268,8 +298,8 @@ impl RemoteApi for Fake {
         format!("fake://delta/{folder_id}?")
     }
 
-    fn delta_by_path_url(&self, _path: &str) -> String {
-        unreachable!("the fake accepts id-addressed delta")
+    fn delta_by_path_url(&self, path: &str) -> String {
+        format!("fake://path/{path}?")
     }
 }
 
@@ -549,6 +579,91 @@ async fn interrupted_run_resumes_to_the_same_result() {
     let s = m.run().await.unwrap();
     assert!(!s.fresh, "second run resumes rather than starting over");
     assert_eq!(actual(&m), expected(&fake, &rules));
+    drop(m);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// After a full run: forgets what the mirror stored below `/Code/proj0/src`
+/// and queues it as a delta unit again, as if its enumeration were still to
+/// come. Returns the folder's id.
+async fn unenumerate_src(fake: &Arc<Fake>, path: &std::path::Path, rules: &ExcludeSet) -> String {
+    mirror(fake, Store::open(path, 1024).unwrap(), rules.clone()).run().await.unwrap();
+    let src = fake.with(|i| {
+        let proj0 = i.nodes.iter().find(|(_, n)| n.name == "proj0").map(|(k, _)| k.clone()).unwrap();
+        i.children(&proj0).into_iter().find(|c| i.nodes[c].name == "src").unwrap()
+    });
+    let id = src.clone();
+    Store::open(path, 1024)
+        .unwrap()
+        .write(|o| {
+            for (c, _) in o.remote_children(&id)? {
+                o.delete_subtree(&c.id)?;
+            }
+            o.requeue_unit(&oneup_store::Unit {
+                folder_id: id.clone(),
+                path: "/Code/proj0/src".into(),
+                kind: oneup_store::UnitKind::Delta,
+                depth: 3,
+                next_link: None,
+                items: 0,
+            })
+        })
+        .unwrap();
+    src
+}
+
+/// A unit resumed from a saved link that has expired since (410) starts
+/// over, instead of failing the same way every round.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_saved_link_starts_the_unit_over() {
+    let fake = Arc::new(Fake::new(2, false));
+    populate(&fake);
+    let path = temp_db("expired-link");
+    let rules = ExcludeSet::dev();
+    let src = unenumerate_src(&fake, &path, &rules).await;
+    // Graph's links carry a token: a fresh start gets a different one.
+    let link = format!("fake://delta/{src}?&token=old&skip=2");
+    fake.expired.lock().unwrap().insert(link.clone());
+    Store::open(&path, 1024).unwrap().write(|o| o.set_unit_progress(&src, &link, 2)).unwrap();
+
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), rules.clone());
+    m.run().await.unwrap();
+    assert_eq!(actual(&m), expected(&fake, &rules));
+    drop(m);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Where id-addressed delta is refused, a unit lists its folder by the path
+/// it was queued with. Renamed since, the folder isn't found there, but it
+/// still exists: its contents are listed from where it is now (catch-up
+/// reports only the rename). A folder gone by its id is done with.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_renamed_before_its_unit_runs_is_listed_where_it_is_now() {
+    let fake = Arc::new(Fake::new(2, false));
+    populate(&fake);
+    let path = temp_db("renamed-unit");
+    let rules = ExcludeSet::dev();
+    let src = unenumerate_src(&fake, &path, &rules).await;
+    fake.with(|i| i.rename(&src, "lib"));
+    fake.refuse_id_delta.store(true, SeqCst);
+    Store::open(&path, 1024)
+        .unwrap()
+        .write(|o| {
+            o.put_unit(&oneup_store::Unit {
+                folder_id: "gone".into(),
+                path: "/Code/gone".into(),
+                kind: oneup_store::UnitKind::Delta,
+                depth: 2,
+                next_link: None,
+                items: 0,
+            })
+        })
+        .unwrap();
+
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), rules.clone());
+    m.run().await.unwrap();
+    assert_eq!(actual(&m), expected(&fake, &rules));
+    assert!(!m.read(|o| o.units_pending()).unwrap(), "both units are done");
     drop(m);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

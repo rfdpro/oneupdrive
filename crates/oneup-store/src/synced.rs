@@ -107,6 +107,27 @@ DELETE FROM synced_item WHERE EXISTS (SELECT 1 FROM reach) AND sid NOT IN reach;
 DROP TABLE reach;
 ";
 
+/// v15 -> v16: [`MIGRATE_V12`] for the cloud side. An item written to the
+/// Remote tree is there, so its deletion evidence goes. A folder's
+/// deletion is evidence for everything stored below it, but delta may
+/// report the folder deleted before a child it moved out, and an item
+/// restored from the OneDrive recycle bin keeps its id. Kept, that evidence
+/// turned the item's later disappearance without evidence (a rule prunes
+/// it) into a deletion to bring to this PC. Evidence is noted for items
+/// already gone from the Remote tree, or by [`Ops::delete_subtree`] as it
+/// removes their rows, so no writer's own sequence is undone.
+pub(crate) const MIGRATE_V16: &str = "
+DELETE FROM remote_gone WHERE id IN (SELECT id FROM remote_item);
+CREATE TRIGGER remote_back_ins AFTER INSERT ON remote_item
+BEGIN
+    DELETE FROM remote_gone WHERE id = NEW.id;
+END;
+CREATE TRIGGER remote_back_upd AFTER UPDATE ON remote_item
+BEGIN
+    DELETE FROM remote_gone WHERE id = NEW.id;
+END;
+";
+
 /// Summary counts of the Synced tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncedStats {
@@ -517,6 +538,10 @@ impl Ops<'_> {
         if stale > 0 {
             problems.push(format!("synced: {stale} local items both present and noted deleted"));
         }
+        let stale = one("SELECT count(*) FROM remote_gone g JOIN remote_item r ON r.id = g.id")?;
+        if stale > 0 {
+            problems.push(format!("synced: {stale} cloud items both present and noted deleted"));
+        }
         Ok(problems)
     }
 }
@@ -676,6 +701,72 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// A child delta reports moved out of a folder only after the folder's
+    /// deletion (or an item restored from the OneDrive recycle bin): back in
+    /// the Remote tree, it's no longer deleted, and leaving it again without
+    /// evidence (a rule prunes it) reads as Missing.
+    #[test]
+    fn a_cloud_item_back_in_the_tree_loses_its_deletion_evidence() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.upsert_item(&rrow("g", Some("d"), "g", Kind::File), false)?;
+            o.local_put(&lrow(4, Some(3), "g", LocalKind::File))?;
+            o.synced_insert(&base(0, Some(2), "g", NodeKind::File, 4, "g"))?;
+            o.delete_subtree("d")?;
+            assert_eq!(o.remote(&RemoteId("g".into()))?, Seen::Deleted);
+            o.upsert_item(&rrow("g", Some("root"), "g", Kind::File), false)?;
+            assert!(matches!(o.remote(&RemoteId("g".into()))?, Seen::Present(_)));
+            assert!(o.check_invariants()?.is_empty(), "{:?}", o.check_invariants()?);
+            o.prune_subtree("g", true)?;
+            assert_eq!(o.remote(&RemoteId("g".into()))?, Seen::Missing);
+            assert_eq!(o.remote(&RemoteId("d".into()))?, Seen::Deleted, "the folder's own evidence stays");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Upgrading a v15 database drops the evidence older builds left for
+    /// items still stored (which the consistency check reports), and keeps
+    /// the rest.
+    #[test]
+    fn v16_drops_cloud_evidence_for_stored_items() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-v16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            synced(&mut s);
+            s.write(|o| {
+                // What a v15 database looks like.
+                o.c.execute_batch(
+                    "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
+                     DROP INDEX enum_unit_pending; DROP INDEX remote_item_root;
+                     INSERT INTO remote_gone(id) VALUES ('f'), ('gone');
+                     INSERT INTO synced_item(sid, parent_sid, name, kind, remote_id) VALUES (9, 0, 'gone', 0, 'gone');
+                     PRAGMA user_version = 15;",
+                )?;
+                let problems = o.check_invariants()?;
+                assert!(
+                    problems.iter().any(|p| p.contains("cloud items both present and noted deleted")),
+                    "{problems:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+        let s = Store::open(&path, 1024).unwrap();
+        s.read(|o| {
+            assert!(o.check_invariants()?.is_empty(), "{:?}", o.check_invariants()?);
+            assert!(matches!(o.remote(&RemoteId("f".into()))?, Seen::Present(_)));
+            assert_eq!(o.remote(&RemoteId("gone".into()))?, Seen::Deleted, "evidence for an absent item stays");
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Forgetting a folder's record takes the records below it, and their

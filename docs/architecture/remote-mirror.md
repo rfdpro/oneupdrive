@@ -16,7 +16,9 @@ One sequential `/delta` over a whole 4.7M-entry drive takes about **3.6 hours**.
 | **`$top=1000`** | 5× fewer requests, 2.6× faster per unit |
 | **Minimal `$select`** | ~22% lower page latency |
 | **Pruning** | Excluded folders found while listing are **never requested at all**. Excluded items found inside a unit are dropped as they stream by and never stored |
-| **Resumable** | Progress commits per page (unit `nextLink` + entries in one transaction); Ctrl-C or a crash loses at most one page |
+| **Resumable** | Progress commits per page (unit `nextLink` + entries in one transaction); Ctrl-C or a crash loses at most one page. A saved link that has expired since (HTTP 410) starts its unit over; storing entries again changes nothing |
+
+A unit is finished without its contents only when its folder is gone by its ID. Where OneDrive refuses an ID-addressed folder delta, the unit uses the folder's path from when it was queued; renamed or moved since, the folder is then looked up by ID and listed where it is now, because catch-up reports only the rename, not the unchanged contents. The scheduler reads the next units from an index (`state, depth, path`), so finished units cost nothing.
 
 ## Data model (`oneup-store`)
 | Table | Contents |

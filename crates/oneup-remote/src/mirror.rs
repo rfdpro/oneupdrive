@@ -324,9 +324,14 @@ impl<A: RemoteApi> Mirror<A> {
         let mut first_error: Option<Error> = None;
         loop {
             if first_error.is_none() && !self.cancel.load(Relaxed) && running.len() < self.cfg.max_tasks {
-                let pending = Self::db(&self.store, |s| s.read(|o| o.pending_units())).await?;
+                // The running units are still pending, so the first
+                // `max_tasks` hold every unit there's room to start.
+                let max = self.cfg.max_tasks;
+                let (pending, waiting) =
+                    Self::db(&self.store, move |s| s.read(|o| Ok((o.pending_units(max)?, o.pending_unit_count()?))))
+                        .await?;
                 let done = self.progress.units_done.load(Relaxed);
-                self.progress.units_known.store(done + pending.len() as u64, Relaxed);
+                self.progress.units_known.store(done + waiting, Relaxed);
                 for unit in pending {
                     if running.len() >= self.cfg.max_tasks {
                         break;
@@ -465,6 +470,30 @@ impl<A: RemoteApi> Mirror<A> {
     }
 }
 
+/// Where folder `id` is now ("/a/b"), from its parents in OneDrive up to
+/// the mirrored root. `None` if it or a folder above it no longer exists,
+/// or it has left the mirrored root.
+async fn current_path<A: RemoteApi>(api: &A, store: &Arc<Mutex<Store>>, id: &str) -> Result<Option<String>> {
+    let root = Mirror::<A>::db(store, |s| s.read(|o| o.remote_root())).await?.map(|r| r.id);
+    let mut names = Vec::new();
+    let mut cur = id.to_string();
+    for _ in 0..4096 {
+        let Some(item) = api.item(&cur).await? else { return Ok(None) };
+        if item.is_root() {
+            if root.as_deref() != Some(item.id.as_str()) {
+                return Ok(None);
+            }
+            names.reverse();
+            return Ok(Some(format!("/{}", names.join("/"))));
+        }
+        let parent = item.parent_id().map(str::to_string);
+        let (Some(name), Some(parent)) = (item.name, parent) else { return Ok(None) };
+        names.push(name);
+        cur = parent;
+    }
+    Err(Error::Inconsistent(format!("parent chain of {id} in OneDrive too deep or cyclic")))
+}
+
 async fn run_unit<A: RemoteApi>(
     api: Arc<A>,
     store: Arc<Mutex<Store>>,
@@ -474,38 +503,68 @@ async fn run_unit<A: RemoteApi>(
     unit: Unit,
 ) -> Result<()> {
     let id = unit.folder_id.clone();
-    let mut url = unit.next_link.clone().unwrap_or_else(|| match unit.kind {
+    let start = match unit.kind {
         UnitKind::List => api.children_url(&id),
         UnitKind::Delta => api.delta_by_id_url(&id),
-    });
+    };
+    let mut url = unit.next_link.clone().unwrap_or_else(|| start.clone());
     let mut first_page = unit.next_link.is_none();
-    let mut tried_path = false;
+    // Whether `url` is a link OneDrive gave us (saved or from the last page)
+    // rather than a first page we built.
+    let mut given_link = unit.next_link.is_some();
+    let mut restarted = false;
+    let mut tried_path = None;
+    let mut repathed = false;
     loop {
         if cancel.load(Relaxed) {
             return Err(Error::Cancelled);
         }
         let page = match api.page(&url).await {
             Ok(p) => p,
+            // The link expired (OneDrive documents 410 for that, and a unit
+            // resumed days later meets it): start the unit over. Entries
+            // already stored are stored again, which changes nothing.
+            Err(e) if e.status() == Some(410) && given_link && !restarted => {
+                restarted = true;
+                let u = unit.clone();
+                Mirror::<A>::db(&store, move |s| s.write(|o| o.requeue_unit(&u))).await?;
+                (url, first_page, given_link, tried_path) = (start.clone(), true, false, None);
+                continue;
+            }
             // Id-addressed folder delta not accepted: use the path form (verified against OneDrive Personal).
             Err(e)
                 if unit.kind == UnitKind::Delta
                     && first_page
-                    && !tried_path
+                    && tried_path.is_none()
                     && matches!(e.status(), Some(400 | 501)) =>
             {
-                tried_path = true;
                 url = api.delta_by_path_url(&unit.path);
+                tried_path = Some(unit.path.clone());
                 continue;
             }
-            // The folder disappeared; catch-up will record the deletion.
-            Err(e) if e.status() == Some(404) => {
-                let fid = id.clone();
-                Mirror::<A>::db(&store, move |s| s.write(|o| o.finish_unit(&fid, 0))).await?;
-                return Ok(());
-            }
+            // Not found. Only a folder gone by its id is done with (catch-up
+            // records the deletion). The path form uses the path the unit
+            // was queued with, and the folder may have been renamed or moved
+            // since: catch-up wouldn't bring its contents (they didn't
+            // change), so the unit lists them from where the folder is now.
+            Err(e) if e.status() == Some(404) => match current_path(&*api, &store, &id).await? {
+                None => {
+                    let fid = id.clone();
+                    Mirror::<A>::db(&store, move |s| s.write(|o| o.finish_unit(&fid, 0))).await?;
+                    return Ok(());
+                }
+                Some(path) if unit.kind == UnitKind::Delta && !repathed && tried_path.as_ref() != Some(&path) => {
+                    repathed = true;
+                    url = api.delta_by_path_url(&path);
+                    (first_page, given_link, tried_path) = (true, false, Some(path));
+                    continue;
+                }
+                Some(_) => return Err(e.into()),
+            },
             Err(e) => return Err(e.into()),
         };
         first_page = false;
+        given_link = true;
         let next = page.next_link.clone();
         let n = page.value.len();
         let (cfg2, fid, unit2) = (Arc::clone(&cfg), id.clone(), unit.clone());
