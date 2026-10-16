@@ -84,11 +84,21 @@ impl LocalFs {
         Some(hold)
     }
 
-    /// After one of our own moves: the placeholder moved through `h`, now at
-    /// `at`, is in sync again. `h` stays open meanwhile: share-none with data
-    /// access for one with content (so no one changed it), attribute access
-    /// for a dehydrated one (no content to change). The bit is set through
-    /// a second, attribute-only handle, which has the access it needs.
+    /// Whether the open item is a placeholder in sync: read before one of
+    /// our moves, which may clear the bit, so [`LocalFs::resync_moved`]
+    /// restores only what the move cleared.
+    pub(crate) fn is_in_sync(&self, h: &win::Handle) -> bool {
+        matches!(provider::info(&h.as_file()), Ok(Some(i)) if i.in_sync)
+    }
+
+    /// After one of our own moves of a placeholder that was in sync
+    /// ([`LocalFs::is_in_sync`] before it; never one a program edited, whose
+    /// edit isn't sent yet: invariant 12): the placeholder moved through
+    /// `h`, now at `at`, is in sync again. `h` stays open meanwhile:
+    /// share-none with data access for one with content (so no one changed
+    /// it), attribute access for a dehydrated one (no content to change).
+    /// The bit is set through a second, attribute-only handle, which has
+    /// the access it needs.
     pub(crate) fn resync_moved(&self, h: &win::Handle, at: &std::path::Path) {
         if !matches!(provider::info(&h.as_file()), Ok(Some(i)) if !i.in_sync) {
             return;

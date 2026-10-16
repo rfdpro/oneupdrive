@@ -543,8 +543,9 @@ impl LocalFs {
         if in_place && path.parent() != Some(dir.as_path()) {
             return Err(Error::Changed);
         }
+        let was_in_sync = self.on_demand && self.is_in_sync(&h);
         win::rename_handle(&h, &target)?;
-        if self.on_demand {
+        if was_in_sync {
             self.resync_moved(&h, &target);
         }
         let entry = win::stat_handle(&h, FileId(pre.id.0))?.ok_or(Error::Changed)?;

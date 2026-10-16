@@ -168,6 +168,39 @@ fn losing_the_on_demand_registration_halts() {
     fs.check_root().unwrap();
 }
 
+/// Our rename of a placeholder (which can clear its in-sync bit) leaves it
+/// in sync only if it was in sync before: one a user edited, not yet sent,
+/// stays "not in sync", so nothing frees it and loses the edit
+/// (invariant 12).
+#[test]
+fn renaming_a_placeholder_keeps_an_edit_not_in_sync() {
+    use oneup_cfapi::provider;
+    let r = Root::new("rename-in-sync");
+    drop(r.fs());
+    provider::register(&r.dir, b"token-1").unwrap();
+    let fs = r.fs();
+    assert!(fs.on_demand());
+    let root = fs.root_id();
+    let in_sync = |p: &Path| provider::info(&provider::open(p).unwrap()).unwrap().unwrap().in_sync;
+    for n in ["synced.txt", "edited.txt"] {
+        std::fs::write(r.p(n), b"synced content").unwrap();
+        provider::Exclusive::open(&r.p(n)).unwrap().convert(b"OD!x").unwrap();
+        assert!(in_sync(&r.p(n)), "{n}");
+    }
+    edit(&r.p("edited.txt"), "edited here");
+    assert!(!in_sync(&r.p("edited.txt")), "a program's edit clears the bit");
+
+    let rename = |from: &str, to: &str| {
+        fs.apply(&approve(Op::ConflictCopy { sid: 1, local: pre(&r.p(from)), dir: root, name: to.into() })).unwrap();
+    };
+    rename("synced.txt", "synced2.txt");
+    rename("edited.txt", "edited2.txt");
+    let result = (in_sync(&r.p("synced2.txt")), in_sync(&r.p("edited2.txt")));
+    drop(fs);
+    let _ = provider::unregister(&r.dir);
+    assert_eq!(result, (true, false), "(was in sync, edited)");
+}
+
 #[test]
 fn mkdir_never_reuses_a_name_and_checks_names() {
     let r = Root::new("mkdir");
