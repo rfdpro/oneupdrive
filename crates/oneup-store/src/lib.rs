@@ -321,6 +321,81 @@ pub struct Store {
     conn: Connection,
 }
 
+/// What connections with [`Store::log_statements`] on have run.
+#[cfg(feature = "statement-log")]
+static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Tables small enough to read whole at every round: what a round may
+/// scan ([`Store::tree_scans`]). Everything else grows with the tree.
+#[cfg(feature = "statement-log")]
+const SMALL_TABLES: &[&str] = &["meta", "cursor", "enum_unit", "local_root", "remote_orphan", "dirty", "t_sub"];
+
+#[cfg(feature = "statement-log")]
+impl Store {
+    /// Test support: records every statement this connection runs from now
+    /// on (as written, parameters unbound), until [`Store::take_statements`].
+    pub fn log_statements(&mut self) {
+        self.conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(|e| {
+                if let rusqlite::trace::TraceEvent::Stmt(_, sql) = e {
+                    let mut all = STATEMENTS.lock().unwrap_or_else(|p| p.into_inner());
+                    if !all.iter().any(|s| s == sql) {
+                        all.push(sql.to_string());
+                    }
+                }
+            }),
+        );
+    }
+
+    /// The statements recorded so far (by every logging connection),
+    /// clearing the record.
+    pub fn take_statements() -> Vec<String> {
+        std::mem::take(&mut *STATEMENTS.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// The steps of `statements`' query plans that read a whole table other
+    /// than the [`SMALL_TABLES`], each with its statement: what makes a
+    /// query's cost follow the size of the tree instead of the changes.
+    /// Parameters are bound to NULL, which doesn't change a plan's shape. A
+    /// statement that can't be explained is an error, not skipped.
+    pub fn tree_scans(&self, statements: &[String]) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        // Trigger bodies are logged as comments; their plans aren't shown.
+        for sql in statements.iter().filter(|s| !s.trim_start().starts_with("--")) {
+            let mut st = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let nulls = std::iter::repeat_n(rusqlite::types::Null, st.parameter_count());
+            let steps: Vec<String> =
+                st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?;
+            for step in steps {
+                let Some(name) = step.strip_prefix("SCAN ").and_then(|t| t.split(' ').next()) else { continue };
+                if !SMALL_TABLES.contains(&table_of(sql, name)) && !step.contains("CONSTANT ROW") {
+                    out.push(format!("{step}  <-  {sql}"));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The table `name` stands for in `sql`: itself, or the table it's an alias
+/// of (`FROM remote_orphan o`, `JOIN remote_item AS r`).
+#[cfg(feature = "statement-log")]
+fn table_of<'a>(sql: &'a str, name: &'a str) -> &'a str {
+    let words: Vec<&str> =
+        sql.split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')').filter(|w| !w.is_empty()).collect();
+    for i in 0..words.len().saturating_sub(2) {
+        if !(words[i].eq_ignore_ascii_case("FROM") || words[i].eq_ignore_ascii_case("JOIN")) {
+            continue;
+        }
+        let alias = if words[i + 2].eq_ignore_ascii_case("AS") { words.get(i + 3) } else { words.get(i + 2) };
+        if alias == Some(&name) {
+            return words[i + 1];
+        }
+    }
+    name
+}
+
 impl Store {
     /// Opens (creating if needed) the database. `cache_kib` bounds SQLite's
     /// page cache, which is how the memory profile reaches the store.
@@ -962,6 +1037,13 @@ impl Ops<'_> {
         Ok(v)
     }
 
+    /// Whether enumeration units are still waiting, for every round: it reads
+    /// only the small `enum_unit` table (unlike [`Ops::stats`], which counts
+    /// whole trees).
+    pub fn units_pending(&self) -> Result<bool> {
+        Ok(self.c.query_row("SELECT EXISTS (SELECT 1 FROM enum_unit WHERE state = 0)", [], |r| r.get(0))?)
+    }
+
     pub fn stats(&self) -> Result<Stats> {
         let one = |sql: &str| -> Result<i64> { Ok(self.c.query_row(sql, [], |r| r.get(0))?) };
         Ok(Stats {
@@ -1013,6 +1095,25 @@ fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The guard behind `an_update_reads_no_whole_table` (oneup-remote)
+    /// sees through parameters and aliases, and leaves small tables and
+    /// indexed lookups alone.
+    #[cfg(feature = "statement-log")]
+    #[test]
+    fn tree_scans_are_found_with_parameters_and_aliases() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.log_statements();
+        let scans = |sql: &str| s.tree_scans(&[sql.to_string()]).unwrap();
+        assert_eq!(scans("SELECT count(*) FROM remote_item WHERE size > ?1").len(), 1);
+        assert_eq!(scans("SELECT 1 FROM remote_item r WHERE r.size = ?1 AND r.kind = ?2").len(), 1);
+        assert_eq!(scans("SELECT * FROM synced_item AS s JOIN meta m ON m.key = s.name").len(), 1);
+        assert!(scans("SELECT * FROM remote_item WHERE id = ?1").is_empty(), "indexed");
+        assert!(scans("SELECT * FROM remote_item WHERE parent_id = ?1").is_empty(), "indexed");
+        assert!(scans("SELECT * FROM enum_unit WHERE state = ?1").is_empty(), "small table");
+        assert!(s.tree_scans(&["SELECT * FROM no_such_table".to_string()]).is_err(), "not skipped");
+        assert!(scans("-- TRIGGER t").is_empty());
+    }
 
     /// Two connections that each read and then write, at the same time (the
     /// agent and its hydration service, say): every write waits its turn.

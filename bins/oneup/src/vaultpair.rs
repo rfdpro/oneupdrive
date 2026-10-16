@@ -266,6 +266,9 @@ pub struct VaultRemote {
     rule_files: Mutex<crate::rulefiles::Cache>,
     /// Problems already reported, so each is said once.
     reported: Mutex<Vec<String>>,
+    /// The main listing's invariants were checked once this run (see
+    /// `Engine::remote`).
+    verified: std::sync::atomic::AtomicBool,
 }
 
 impl VaultRemote {
@@ -287,6 +290,7 @@ impl VaultRemote {
             cache: tokio::sync::Mutex::new(oneup_vaultsync::project::Cache::default()),
             rule_files: Mutex::new(crate::rulefiles::Cache::default()),
             reported: Mutex::new(Vec::new()),
+            verified: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -303,7 +307,9 @@ impl VaultRemote {
             let mut c = self.rule_files.lock().unwrap_or_else(|p| p.into_inner());
             crate::sync::pruning_for(&self.main, &main, &mut c)?
         };
-        drop(crate::sync::mirror(&self.graph, main, &pruning).await?);
+        let verify = !self.verified.load(std::sync::atomic::Ordering::Relaxed);
+        drop(crate::sync::mirror_with(&self.graph, main, &pruning, verify).await?);
+        self.verified.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut cache = self.cache.lock().await;
         let p = oneup_vaultsync::project(&self.listing, &self.vault, &mut cache).await?;
         drop(cache);
