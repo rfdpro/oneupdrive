@@ -415,6 +415,13 @@ impl Cloud for PairCloud {
         }
     }
 
+    async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.children(id).await,
+            PairCloud::Vault(c) => c.children(id).await,
+        }
+    }
+
     async fn batch(&self, ops: &[Meta]) -> Vec<Result<MetaDone, CloudError>> {
         match self {
             PairCloud::Plain(c) => c.batch(ops).await,
