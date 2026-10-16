@@ -39,7 +39,9 @@ pub fn looks_wrong(name: &str, head: &[u8]) -> bool {
         "tif" | "tiff" => starts(b"II*\0") || starts(b"MM\0*"),
         "psd" => starts(b"8BPS"),
         "webp" | "wav" | "avi" => starts(b"RIFF"),
-        "mp4" | "m4a" | "m4v" | "mov" | "heic" | "heif" | "3gp" => &head[4..8] == b"ftyp",
+        "mp4" | "m4a" | "m4v" | "heic" | "heif" | "3gp" => &head[4..8] == b"ftyp",
+        // Older QuickTime files start with whatever atom came first.
+        "mov" => matches!(&head[4..8], b"ftyp" | b"wide" | b"mdat" | b"moov" | b"free" | b"skip"),
         "mp3" => starts(b"ID3") || (head[0] == 0xFF && head[1] & 0xE0 == 0xE0),
         "flac" => starts(b"fLaC"),
         "ogg" => starts(b"OggS"),
@@ -48,9 +50,12 @@ pub fn looks_wrong(name: &str, head: &[u8]) -> bool {
         "gz" | "tgz" => starts(&[0x1F, 0x8B]),
         "exe" | "dll" => starts(b"MZ"),
         "sqlite" | "sqlite3" => starts(b"SQLite format 3\0"),
-        "txt" | "md" | "csv" | "tsv" | "json" | "xml" | "html" | "htm" | "css" | "js" | "ts" | "py" | "rs" | "c"
-        | "h" | "cpp" | "hpp" | "cs" | "java" | "go" | "rb" | "php" | "sh" | "ps1" | "bat" | "cmd" | "ini" | "cfg"
+        "txt" | "md" | "csv" | "tsv" | "json" | "xml" | "html" | "htm" | "css" | "js" | "py" | "rs" | "c" | "h"
+        | "cpp" | "hpp" | "cs" | "java" | "go" | "rb" | "php" | "sh" | "ps1" | "bat" | "cmd" | "ini" | "cfg"
         | "yaml" | "yml" | "toml" | "log" | "sql" | "svg" | "tex" | "srt" | "vtt" => is_text(head),
+        // TypeScript, or an MPEG transport stream (video): 188-byte packets,
+        // each starting with the sync byte 0x47.
+        "ts" => is_text(head) || head.iter().step_by(188).all(|&b| b == 0x47),
         _ => return false,
     };
     !ok
@@ -107,10 +112,38 @@ mod tests {
         assert!(!looks_wrong("export.reg.txt", &utf16));
     }
 
+    /// A QuickTime file needn't start with `ftyp`, and `.ts` is also MPEG
+    /// transport stream video, not only TypeScript.
+    #[test]
+    fn older_quicktime_and_transport_streams_pass() {
+        for atom in [b"wide", b"mdat", b"moov", b"free", b"skip"] {
+            let mut v = b"\0\0\0\x08".to_vec();
+            v.extend(atom);
+            assert!(!looks_wrong("old.mov", &with(&v)), "{}", String::from_utf8_lossy(atom));
+        }
+        let mut stream = noise(188 * 22);
+        for packet in stream.chunks_mut(188) {
+            packet[0] = 0x47;
+        }
+        assert!(!looks_wrong("clip.ts", &stream[..4096]));
+        assert!(!looks_wrong("app.ts", b"export const answer: number = 42;\n"));
+    }
+
     #[test]
     fn encrypted_content_is_caught() {
         let n = noise(4096);
-        for name in ["Report.docx", "a.pdf", "p.jpg", "notes.txt", "sheet.xlsx", "v.mp4", "old.xls", "page.html"] {
+        for name in [
+            "Report.docx",
+            "a.pdf",
+            "p.jpg",
+            "notes.txt",
+            "sheet.xlsx",
+            "v.mp4",
+            "v.mov",
+            "old.xls",
+            "page.html",
+            "clip.ts",
+        ] {
             assert!(looks_wrong(name, &n), "{name}");
         }
     }
