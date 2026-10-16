@@ -2365,6 +2365,85 @@ mod tests {
         assert_eq!(settle(&Report::default()), (true, Some(End::Settled)));
     }
 
+    /// A held upload's folder keeps its mark through the end of the round
+    /// (`Touched`, `dirty_clear_except`), so the next round plans it again.
+    #[test]
+    fn a_held_upload_is_planned_again_in_the_next_round() {
+        use oneup_store::{Kind, LocalKind, LocalRow, RemoteRow, Skip};
+        use oneup_sync::{Base, Link, LocalPre, NodeKind, ROOT, RemoteId};
+        let local = |id: u128, parent: Option<u128>, name: &str, kind: LocalKind, size: i64| LocalRow {
+            file_id: id,
+            parent_id: parent,
+            name: name.into(),
+            name_lossy: false,
+            kind,
+            size,
+            mtime: 9,
+            attributes: 0,
+            reparse_tag: 0,
+            skip: Skip::None,
+        };
+        let remote = |id: &str, parent: Option<&str>, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: id.into(),
+            kind,
+            size: 0,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        let base = |sid, parent, name: &str, local: u128, remote: &str| Base {
+            sid,
+            parent,
+            name: name.into(),
+            kind: NodeKind::Folder,
+            size: 0,
+            hash: None,
+            local: Some(LocalId(local)),
+            local_mtime: 0,
+            remote: Some(RemoteId(remote.into())),
+            remote_etag: "e".into(),
+        };
+        let mut s = Store::open_in_memory().unwrap();
+        let d = s
+            .write(|o| {
+                o.local_put(&local(1, None, "", LocalKind::Root, 0))?;
+                o.local_put(&local(3, Some(1), "d", LocalKind::Folder, 0))?;
+                o.upsert_item(&remote("root", None, Kind::Root), false)?;
+                o.upsert_item(&remote("d", Some("root"), Kind::Folder), false)?;
+                o.synced_put(&base(ROOT, None, "", 1, "root"))?;
+                o.synced_insert(&base(0, Some(ROOT), "d", 3, "d"))
+            })
+            .unwrap();
+        s.write(|o| o.dirty_clear(i64::MAX).map(drop)).unwrap();
+        // A program saves a new file in d, again and again.
+        s.write(|o| o.local_put(&local(4, Some(3), "a.db", LocalKind::File, 7)).map(drop)).unwrap();
+        let round = |s: &mut Store, held: &[Op]| {
+            s.write(|o| {
+                let scope = o.dirty_scope()?;
+                let mut retried = Touched::default();
+                for op in held {
+                    retried.add(op);
+                }
+                o.dirty_clear_except(scope.upto, &retried.local, &retried.remote, &retried.synced)?;
+                Ok(scope.folders)
+            })
+            .unwrap()
+        };
+        let upload = Op::Upload {
+            local: LocalPre { id: LocalId(4), stamp: Some((7, 9)) },
+            to: RemoteId("d".into()),
+            parent: d,
+            name: "a.db".into(),
+            replace: None,
+            link: Link::New,
+        };
+        assert!(round(&mut s, &[upload]).contains(&d), "the round plans d and holds the upload");
+        assert!(round(&mut s, &[]).contains(&d), "so the next round plans d again, and sends it");
+        assert!(!round(&mut s, &[]).contains(&d), "after which d is done");
+    }
+
     #[test]
     fn held_items_wait_in_order_and_the_earliest_time_is_kept() {
         let t = std::time::Instant::now();

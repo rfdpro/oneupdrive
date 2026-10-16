@@ -95,9 +95,26 @@ impl Busy {
         Self { inner: Mutex::new(Inner { settings, files: HashMap::new() }) }
     }
 
-    /// The settings changed (`config.toml` is read again at every wake-up).
+    /// The settings changed (`config.toml` is read again at every wake-up):
+    /// every file is judged again by the new ones, from the changes it had.
     pub fn set_settings(&self, s: Settings) {
-        self.lock().settings = s;
+        let mut g = self.lock();
+        if g.settings == s {
+            return;
+        }
+        g.settings = s;
+        let keep = s.changes.clamp(2, MAX_CHANGES) as usize;
+        for f in g.files.values_mut() {
+            let last = f.last;
+            f.recent.retain(|t| last.saturating_duration_since(*t) <= s.window);
+            let drop = f.recent.len().saturating_sub(keep);
+            f.recent.drain(..drop);
+            if f.recent.len() < keep {
+                f.since = None;
+            } else if f.since.is_none() {
+                f.since = Some(last);
+            }
+        }
     }
 
     /// The file with ID `id` was written at `now`.
@@ -248,6 +265,21 @@ mod tests {
         assert_eq!(b.held_until(2, at(t, 2_100)), None);
         b.set_settings(Settings { on: false, ..Settings::default() });
         assert_eq!(b.held_until(1, at(t, 2_200)), None);
+    }
+
+    #[test]
+    fn new_settings_judge_every_file_again() {
+        let b = Busy::new(Settings::default());
+        let t = Instant::now();
+        b.changed(1, t);
+        b.changed(1, at(t, 2_000));
+        assert!(b.held_until(1, at(t, 2_100)).is_some());
+        b.set_settings(Settings { changes: 3, ..Settings::default() });
+        assert_eq!(b.held_until(1, at(t, 2_200)), None, "two changes no longer make it busy");
+        b.set_settings(Settings::default());
+        assert!(b.held_until(1, at(t, 2_300)).is_some(), "and do again");
+        b.set_settings(Settings { window: Duration::from_secs(1), ..Settings::default() });
+        assert_eq!(b.held_until(1, at(t, 2_400)), None, "2 s apart is outside a 1 s window");
     }
 
     #[test]
