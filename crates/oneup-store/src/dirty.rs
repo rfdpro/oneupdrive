@@ -182,6 +182,42 @@ pub(crate) fn migrate_v5() -> String {
     sql
 }
 
+/// The marked Synced folders (`?1`..`?3`: the side codes; `?4`: the last
+/// mark read), and the folders where their children are decided, when that
+/// is elsewhere.
+///
+/// An item is decided under its Synced parent, not the folder it is in now.
+/// They differ while a move waits: moved into a folder that isn't synced
+/// yet, an item waits under its old folder with nothing to plan. A change
+/// in the new folder marks only that folder: its creation on the other
+/// side and linking (then the move can go ahead), or a change to the
+/// waiting item itself, such as a rename. Planning the new folder passes
+/// over children that belong to other Synced folders, so without the second
+/// part the move waited for the next full pass.
+pub(crate) const SCOPE: &str = "
+    WITH marked(sid) AS (
+        SELECT s.sid FROM dirty d JOIN synced_item s ON s.local_id = d.id
+            WHERE d.side = ?1 AND d.seq <= ?4 AND s.kind = 1
+        UNION
+        SELECT s.sid FROM dirty d JOIN synced_item s ON s.remote_id = d.id
+            WHERE d.side = ?2 AND d.seq <= ?4 AND s.kind = 1
+        UNION
+        SELECT s.sid FROM dirty d JOIN synced_item s ON s.sid = d.id
+            WHERE d.side = ?3 AND d.seq <= ?4 AND s.kind = 1
+    )
+    SELECT sid FROM marked
+    UNION
+    SELECT s.parent_sid FROM marked m CROSS JOIN synced_item f ON f.sid = m.sid
+        CROSS JOIN local_item l ON l.parent_id = f.local_id
+        CROSS JOIN synced_item s ON s.local_id = l.file_id
+        WHERE s.parent_sid IS NOT f.sid AND s.parent_sid IS NOT NULL
+    UNION
+    SELECT s.parent_sid FROM marked m CROSS JOIN synced_item f ON f.sid = m.sid
+        CROSS JOIN remote_item r ON r.parent_id = f.remote_id
+        CROSS JOIN synced_item s ON s.remote_id = r.id
+        WHERE s.parent_sid IS NOT f.sid AND s.parent_sid IS NOT NULL
+    ORDER BY 1";
+
 /// The folders to plan in one round, and how far to clear afterwards.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DirtyScope {
@@ -194,24 +230,17 @@ pub struct DirtyScope {
 }
 
 impl Ops<'_> {
-    /// Maps the current marks to Synced folders (see the module docs).
-    /// Reads only; nothing is cleared.
+    /// Maps the current marks to Synced folders (see the module docs), and
+    /// adds the Synced parents of what sits in those folders but is decided
+    /// elsewhere ([`SCOPE`]). Reads only; nothing is cleared.
     ///
-    /// Cost: one indexed lookup per mark. A mark whose ID no Synced folder
-    /// links is skipped (see the module docs for why that's complete).
+    /// Cost: one indexed lookup per mark, and one per child of a marked
+    /// folder (which planning that folder reads anyway). A mark whose ID no
+    /// Synced folder links is skipped (see the module docs for why that's
+    /// complete).
     pub fn dirty_scope(&self) -> Result<DirtyScope> {
         let upto: i64 = self.c.query_row("SELECT coalesce(max(seq), 0) FROM dirty", [], |r| r.get(0))?;
-        let mut st = self.c.prepare_cached(
-            "SELECT s.sid FROM dirty d JOIN synced_item s ON s.local_id = d.id
-                 WHERE d.side = ?1 AND d.seq <= ?4 AND s.kind = 1
-             UNION
-             SELECT s.sid FROM dirty d JOIN synced_item s ON s.remote_id = d.id
-                 WHERE d.side = ?2 AND d.seq <= ?4 AND s.kind = 1
-             UNION
-             SELECT s.sid FROM dirty d JOIN synced_item s ON s.sid = d.id
-                 WHERE d.side = ?3 AND d.seq <= ?4 AND s.kind = 1
-             ORDER BY 1",
-        )?;
+        let mut st = self.c.prepare_cached(SCOPE)?;
         let folders = st
             .query_map([LOCAL, REMOTE, SYNCED, upto], |r| r.get::<_, i64>(0))?
             .map(|r| r.map(|v| v as Sid))
@@ -425,16 +454,22 @@ mod tests {
         // A local move from the top into d: both.
         s.write(|o| o.local_update(&lrow(2, Some(3), "f", LocalKind::File))).unwrap();
         assert_eq!(take(&mut s), [ROOT, D]);
-        // A cloud deletion inside d: d.
+        // A cloud deletion inside d: d, and the root too while f, moved
+        // into d here, is still decided there.
         s.write(|o| {
             o.upsert_item(&rrow("h", Some("d"), "h", Kind::File), false)?;
             o.dirty_clear(i64::MAX)?;
             o.delete_subtree("h").map(drop)
         })
         .unwrap();
-        assert_eq!(take(&mut s), [D]);
+        assert_eq!(take(&mut s), [ROOT, D]);
         // A new hash for a file in d lets d's plan compare contents: d.
-        s.write(|o| o.local_hash_put(4, 3, 9, &[1; 20])).unwrap();
+        s.write(|o| {
+            o.local_update(&lrow(2, Some(1), "f", LocalKind::File))?;
+            o.dirty_clear(i64::MAX)?;
+            o.local_hash_put(4, 3, 9, &[1; 20])
+        })
+        .unwrap();
         assert_eq!(take(&mut s), [D]);
     }
 
@@ -450,6 +485,77 @@ mod tests {
         // The executor links it; now its own contents get planned.
         let sid = s.write(|o| o.synced_insert(&base(0, Some(ROOT), "n", NodeKind::Folder, 5, "n"))).unwrap();
         assert_eq!(take(&mut s), [ROOT, sid]);
+    }
+
+    /// Something moved into a new folder waits for it under its old
+    /// folder; changes in the new folder plan that old folder too.
+    #[test]
+    fn linking_a_new_folder_marks_where_what_was_moved_into_it_is_decided() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        // A file of d (local 4, cloud "g", sid 3), and a synced subfolder
+        // e of d (local 5, cloud "e", sid 4).
+        s.write(|o| {
+            o.local_put(&lrow(4, Some(3), "g", LocalKind::File))?;
+            o.local_put(&lrow(5, Some(3), "e", LocalKind::Folder))?;
+            o.upsert_item(&rrow("g", Some("d"), "g", Kind::File), false)?;
+            o.upsert_item(&rrow("e", Some("d"), "e", Kind::Folder), false)?;
+            assert_eq!(o.synced_insert(&base(0, Some(D), "g", NodeKind::File, 4, "g"))?, 3);
+            assert_eq!(o.synced_insert(&base(0, Some(D), "e", NodeKind::Folder, 5, "e"))?, 4);
+            Ok(())
+        })
+        .unwrap();
+        // Here, g goes into a new folder n at the top; in the cloud, e goes
+        // into a new folder m at the top.
+        s.write(|o| {
+            o.local_put(&lrow(6, Some(1), "n", LocalKind::Folder))?;
+            o.local_update(&lrow(4, Some(6), "g", LocalKind::File))?;
+            o.upsert_item(&rrow("m", Some("root"), "m", Kind::Folder), false)?;
+            o.upsert_item(&rrow("e", Some("m"), "e", Kind::Folder), false)
+        })
+        .unwrap();
+        take(&mut s);
+        // n is created in the cloud and linked: d, where g is decided.
+        let n = s.write(|o| o.synced_insert(&base(0, Some(ROOT), "n", NodeKind::Folder, 6, "n"))).unwrap();
+        let mut marked = take(&mut s);
+        marked.sort_unstable();
+        assert_eq!(marked, [ROOT, D, n]);
+        // m is created here and linked: d again, where e is decided.
+        let m = s
+            .write(|o| {
+                o.local_put(&lrow(7, Some(1), "m", LocalKind::Folder))?;
+                o.dirty_clear(i64::MAX)?;
+                o.synced_insert(&base(0, Some(ROOT), "m", NodeKind::Folder, 7, "m"))
+            })
+            .unwrap();
+        let mut marked = take(&mut s);
+        marked.sort_unstable();
+        assert_eq!(marked, [ROOT, D, m]);
+        // The waiting file renamed (here, in n): d again.
+        s.write(|o| o.local_update(&lrow(4, Some(6), "g2", LocalKind::File))).unwrap();
+        let mut marked = take(&mut s);
+        marked.sort_unstable();
+        assert_eq!(marked, [D, n]);
+        // A folder whose children are all its own adds nothing.
+        s.write(|o| o.local_put(&lrow(8, Some(3), "k", LocalKind::File)).map(drop)).unwrap();
+        assert_eq!(take(&mut s), [D]);
+    }
+
+    /// The scope costs what the marks and the marked folders' children
+    /// hold: every step looks rows up by index, none walks a whole tree.
+    #[test]
+    fn the_scope_never_scans_a_tree() {
+        let s = Store::open_in_memory().unwrap();
+        s.read(|o| {
+            let mut st = o.c.prepare(&format!("EXPLAIN QUERY PLAN {}", super::SCOPE))?;
+            let plan: Vec<String> = st.query_map([0, 1, 2, 9], |r| r.get(3))?.collect::<rusqlite::Result<_>>()?;
+            let scans = |t: &str| plan.iter().any(|step| step.starts_with(&format!("SCAN {t}")));
+            for t in ["local_item", "remote_item", "synced_item", "s ", "f ", "l ", "r "] {
+                assert!(!scans(t), "{plan:#?}");
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

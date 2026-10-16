@@ -148,6 +148,16 @@ impl Fake {
         it.name = name.into();
         it.etag = etag;
     }
+    /// Moves `path` into folder `dir`.
+    fn mv(&self, path: &str, dir: &str) {
+        let mut s = self.0.lock().unwrap();
+        let id = resolve(&s, path);
+        let to = resolve(&s, dir);
+        let etag = s.bump();
+        let it = s.items.get_mut(&id).unwrap();
+        it.parent = Some(to);
+        it.etag = etag;
+    }
     fn delete(&self, path: &str) {
         let mut s = self.0.lock().unwrap();
         let id = resolve(&s, path);
@@ -1705,7 +1715,6 @@ fn large_folder(s: &Sync) {
     }
     write(&s.p("Projects/Bookmarks/deep/deeper/x.txt"), b"deepest");
     write(&s.p("Projects/Bookmarks/small/s.txt"), b"small");
-    std::fs::create_dir_all(s.p("Archive")).unwrap();
 }
 
 /// A folder OneDrive won't move in one request (more items below it than
@@ -1726,6 +1735,8 @@ async fn a_folder_too_large_to_move_at_once_is_moved_in_parts() {
     cloud.0.lock().unwrap().threshold = Some(5);
 
     // Two at once: the moves go to OneDrive in one batch, which refuses both.
+    // One goes into a new folder.
+    std::fs::create_dir_all(s.p("Archive")).unwrap();
     std::fs::rename(s.p("Projects/Bookmarks"), s.p("Archive/Bookmarks 2025")).unwrap();
     std::fs::rename(s.p("Projects/Photos"), s.p("Projects/Photos 2025")).unwrap();
     let batches = cloud.0.lock().unwrap().batches.len();
@@ -1758,6 +1769,7 @@ async fn a_crash_while_moving_a_large_folder_in_parts_loses_nothing() {
         s.settle().await;
         let contents: Vec<Vec<u8>> = cloud.tree().into_values().flatten().collect();
         cloud.0.lock().unwrap().threshold = Some(5);
+        std::fs::create_dir_all(s.p("Archive")).unwrap();
         std::fs::rename(s.p("Projects/Bookmarks"), s.p("Archive/Bookmarks 2025")).unwrap();
 
         s.exec.crash_after(Some(n));
@@ -1778,15 +1790,7 @@ async fn a_crash_while_moving_a_large_folder_in_parts_loses_nothing() {
             return;
         }
         let mut s = s.restart();
-        // Every folder planned each round: a crash right after the new
-        // folder is made leaves a move waiting for a folder to be synced,
-        // which planning from the dirty marks alone doesn't come back to.
-        for _ in 0..40 {
-            s.planned_rules.clear();
-            if s.round().await.is_idle() {
-                break;
-            }
-        }
+        s.settle().await;
         let here = local_tree(&s.dir.0);
         assert_eq!(s.synced_part(here.clone()), s.synced_part(cloud.tree()), "crash point {n}");
         let here: Vec<Vec<u8>> = here.into_values().flatten().collect();
@@ -1796,6 +1800,37 @@ async fn a_crash_while_moving_a_large_folder_in_parts_loses_nothing() {
         let problems = s.obs.store().read(|o| o.check_invariants()).unwrap();
         assert!(problems.is_empty(), "crash point {n}: {problems:?}");
     }
+}
+
+/// Moving things into a folder just made, here or on the web: the new
+/// folder is created on the other side first, and then the moves follow
+/// (without waiting for a full pass).
+#[tokio::test]
+async fn everyday_moving_into_a_new_folder_follows_both_ways() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-new-folder", cloud.clone());
+    write(&s.p("projects/alpha/plan.md"), b"alpha plan");
+    write(&s.p("notes.txt"), b"notes");
+    cloud.add("photos", None);
+    cloud.add("photos/a.jpg", Some(b"photo a"));
+    s.settle().await;
+    let sent = cloud.uploaded();
+
+    std::fs::create_dir_all(s.p("archive/2025")).unwrap();
+    std::fs::rename(s.p("projects/alpha"), s.p("archive/2025/alpha")).unwrap();
+    std::fs::rename(s.p("notes.txt"), s.p("archive/notes.txt")).unwrap();
+    cloud.add("albums", None);
+    cloud.mv("photos", "albums");
+    s.settle().await;
+
+    let t = cloud.tree();
+    for p in ["/archive/2025/alpha/plan.md", "/archive/notes.txt", "/albums/photos/a.jpg"] {
+        assert!(t.contains_key(p), "{p} missing in the cloud: {:?}", names(&t));
+    }
+    assert!(local_tree(&s.dir.0).contains_key("/albums/photos/a.jpg"));
+    assert!(!t.contains_key("/projects/alpha") && !t.contains_key("/notes.txt") && !t.contains_key("/photos"));
+    assert_eq!(cloud.uploaded(), sent, "moves sent no content");
+    assert!(s.versions().is_empty(), "nothing was removed here");
 }
 
 /// Changing only the case of a name, on either side, renames it on the
