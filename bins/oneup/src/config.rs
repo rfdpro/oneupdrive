@@ -213,7 +213,7 @@ fn number(t: &Table, key: &str) -> Result<Option<u64>> {
 
 /// Sets `entries` in section `name` (created with comment `intro` if
 /// missing), in place where a key exists so the comments around it stay,
-/// and writes the file: whole, then renamed into place.
+/// and writes the file: whole, flushed, then renamed into place.
 fn save(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Item)>) -> Result<()> {
     let existing = read_doc(data_dir)?;
     let fresh = existing.is_none();
@@ -231,9 +231,7 @@ fn save(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Item)>) ->
         }
     }
     let p = path(data_dir);
-    let tmp = data_dir.join(format!("{FILE}.tmp"));
-    std::fs::write(&tmp, doc.to_string()).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &p).with_context(|| format!("writing {}", p.display()))?;
+    crate::ownfile::write(&p, doc.to_string().as_bytes()).with_context(|| format!("writing {}", p.display()))?;
     Ok(())
 }
 

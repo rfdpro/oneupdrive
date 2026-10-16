@@ -86,8 +86,9 @@ fn load_pause(file: &Path) -> PauseState {
     std::fs::read_to_string(file).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-/// Saves the pause (our own file: written whole, then renamed into place),
-/// or removes the file when nothing is paused.
+/// Saves the pause (our own file, written through `crate::ownfile`: an
+/// empty file after a power cut would read as "not paused"), or removes
+/// the file when nothing is paused.
 fn save_pause(file: &Path, p: &PauseState) -> std::io::Result<()> {
     if !p.local && !p.remote {
         return match std::fs::remove_file(file) {
@@ -95,9 +96,7 @@ fn save_pause(file: &Path, p: &PauseState) -> std::io::Result<()> {
             _ => Ok(()),
         };
     }
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(p).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, file)
+    crate::ownfile::write(file, &serde_json::to_vec(p).map_err(std::io::Error::other)?)
 }
 
 impl Control {

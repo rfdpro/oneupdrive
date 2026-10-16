@@ -129,9 +129,7 @@ pub fn new_name(main: &Path, remote: &str) -> String {
 
 pub fn save_key(dir: &Path, key: &Masterkey) -> Result<()> {
     let sealed = oneup_sys::dpapi::protect(key.export().as_ref()).context("protecting the vault's keys")?;
-    let tmp = dir.join(format!("{KEY_FILE}.tmp"));
-    std::fs::write(&tmp, sealed)?;
-    std::fs::rename(&tmp, dir.join(KEY_FILE))?;
+    crate::ownfile::write(&dir.join(KEY_FILE), &sealed)?;
     Ok(())
 }
 
@@ -170,9 +168,7 @@ pub fn save_key_hello(dir: &Path, key: &Masterkey) -> Result<()> {
     let challenge = oneup_vault::sealed::new_challenge()?;
     let secret = Zeroizing::new(oneup_sys::hello::secret(&hello_name(dir)?, &challenge, true)?);
     let blob = oneup_vault::sealed::seal(key, &secret, &challenge)?;
-    let tmp = dir.join(format!("{HELLO_FILE}.tmp"));
-    std::fs::write(&tmp, blob)?;
-    std::fs::rename(&tmp, dir.join(HELLO_FILE))?;
+    crate::ownfile::write(&dir.join(HELLO_FILE), &blob)?;
     Ok(())
 }
 
