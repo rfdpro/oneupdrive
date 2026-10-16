@@ -170,6 +170,11 @@ impl BatchResp {
         self.body.pointer("/error/code")?.as_str().map(str::to_string)
     }
 
+    /// Refused for touching too many items at once ([`crate::too_many_items`]).
+    pub fn is_too_many_items(&self) -> bool {
+        crate::too_many_items(&self.body)
+    }
+
     pub fn error(&self, what: &str) -> Error {
         Error::Status { status: self.status, what: what.into(), body: self.body.to_string() }
     }

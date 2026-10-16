@@ -33,6 +33,11 @@ pub enum CloudError {
     /// or items the rules leave out, which the Remote tree doesn't list.
     #[error("the cloud folder isn't empty")]
     NotEmpty,
+    /// OneDrive won't move or rename this folder in one request: too many
+    /// items below it (its "list view threshold"). Nothing was changed; the
+    /// executor moves it in parts instead.
+    #[error("OneDrive won't move a folder with this many items in one go")]
+    TooManyItems,
     /// Writing the downloaded content locally failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -133,6 +138,15 @@ pub trait Cloud: Send + Sync {
     fn item(&self, id: &RemoteId) -> impl Future<Output = Result<Option<RemoteRow>, CloudError>> + Send {
         let _ = id;
         async { Err(CloudError::Other("this cloud can't re-read items".into())) }
+    }
+
+    /// Some of folder `id`'s children as the cloud has them now (one page
+    /// of a listing; empty: it has none). Read-only; for moving a folder
+    /// in parts ([`CloudError::TooManyItems`]), which moves what it gets
+    /// and asks again.
+    fn children(&self, id: &RemoteId) -> impl Future<Output = Result<Vec<RemoteRow>, CloudError>> + Send {
+        let _ = id;
+        async { Err(CloudError::Other("this cloud can't list folders".into())) }
     }
 
     /// Several independent metadata changes (the caller makes sure none
