@@ -975,6 +975,7 @@ impl Engine {
             held_until: None,
         };
         let mut scope = first;
+        let mut changed_rounds = 0;
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
             out.held_until = None;
@@ -1178,7 +1179,7 @@ impl Engine {
                     None => {}
                 }
             }
-            let (clean, mut end) = settle(&report);
+            let (clean, mut end) = settle(&report, &mut changed_rounds);
             if recycled > 0 && matches!(end, Some(End::Settled)) {
                 end = None; // another round, to carry the deletions out
             }
@@ -1984,8 +1985,9 @@ impl Touched {
 
 /// What a round's report means: whether the marks it was planned from are
 /// used up, and how the rounds end if that was the last thing to do
-/// (`None`: another round, at once).
-fn settle(report: &Report) -> (bool, Option<End>) {
+/// (`None`: another round, at once). `changed_rounds`: rounds in a row,
+/// up to this one, that did nothing but skip items changed meanwhile.
+fn settle(report: &Report, changed_rounds: &mut usize) -> (bool, Option<End>) {
     // Every operation planned from the marks ran: they're used up. A
     // skipped or failed one may have nothing that would mark its folder
     // again (a file open elsewhere changes nothing), so then the marks stay
@@ -1993,18 +1995,30 @@ fn settle(report: &Report) -> (bool, Option<End>) {
     // done: the change marks it again.
     let clean = report.skipped.iter().all(|(_, s)| waits_for_a_change(*s)) && report.failed.is_empty();
     if !report.is_idle() {
+        *changed_rounds = 0;
         return (clean, None);
     }
     if clean {
         return (true, Some(End::Settled));
     }
     // A skip because something changed meanwhile is worth an immediate new
-    // round (the change is seen now); anything else waits for the caller's
-    // retry.
+    // round (the change is seen now), a few times; anything else, or one
+    // that keeps coming back (a stale row a new round doesn't clear), waits
+    // for the caller's retry, which backs off.
     let only_changed =
         report.failed.is_empty() && report.skipped.iter().all(|(_, s)| *s == Skip::Changed || waits_for_a_change(*s));
-    (false, (!only_changed).then_some(End::Retry))
+    if only_changed {
+        *changed_rounds += 1;
+        if *changed_rounds < CHANGED_ROUNDS {
+            return (false, None);
+        }
+    }
+    (false, Some(End::Retry))
 }
+
+/// Idle rounds in a row that only skipped items changed meanwhile, before
+/// the rounds end in a retry ([`settle`]).
+const CHANGED_ROUNDS: usize = 3;
 
 /// Skips that trying again can't end, only a change to the item (which
 /// marks its folder, so it's planned again then): an item that can't be
@@ -2403,21 +2417,44 @@ mod tests {
             |skips: &[Skip]| Report { skipped: skips.iter().map(|s| (op(), *s)).collect(), ..Report::default() };
         // Hard links refused, a name held by a
         // symbolic link. Up to date; their folders wait for a change.
-        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::NameTaken])), (true, Some(End::Settled)));
+        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::NameTaken]), &mut 0), (true, Some(End::Settled)));
         // A OneDrive folder holding only excluded items: retried at once,
         // it spun through 20 rounds at a time.
-        assert_eq!(settle(&skipped(&[Skip::NotEmpty])), (true, Some(End::Settled)));
+        assert_eq!(settle(&skipped(&[Skip::NotEmpty]), &mut 0), (true, Some(End::Settled)));
         // A file open elsewhere: nothing would mark it again, so retried.
-        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::Busy])), (false, Some(End::Retry)));
-        assert_eq!(settle(&skipped(&[Skip::ContentMismatch])), (false, Some(End::Retry)));
+        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::Busy]), &mut 0), (false, Some(End::Retry)));
+        assert_eq!(settle(&skipped(&[Skip::ContentMismatch]), &mut 0), (false, Some(End::Retry)));
         // Changed meanwhile: another round at once.
-        assert_eq!(settle(&skipped(&[Skip::Changed, Skip::Refused])), (false, None));
+        assert_eq!(settle(&skipped(&[Skip::Changed, Skip::Refused]), &mut 0), (false, None));
         let failed = Report { failed: vec![(op(), "411".into())], ..skipped(&[Skip::Refused]) };
-        assert_eq!(settle(&failed), (false, Some(End::Retry)));
+        assert_eq!(settle(&failed, &mut 0), (false, Some(End::Retry)));
         // Work done: another round, marks used up unless something waits.
         let busy = Report { done: vec![op()], ..skipped(&[Skip::NameTaken]) };
-        assert_eq!(settle(&busy), (true, None));
-        assert_eq!(settle(&Report::default()), (true, Some(End::Settled)));
+        assert_eq!(settle(&busy, &mut 0), (true, None));
+        assert_eq!(settle(&Report::default(), &mut 0), (true, Some(End::Settled)));
+    }
+
+    /// A "changed meanwhile" that a new round doesn't clear (a stale row)
+    /// gets a few immediate rounds, then the ordinary retry pause: it spun
+    /// through every round of a sequence, a OneDrive request each, and
+    /// started over 5 s later, for as long as the row stayed.
+    #[test]
+    fn a_changed_skip_that_doesnt_clear_ends_in_a_retry() {
+        let changed = Report { skipped: vec![(Op::Forget(1), Skip::Changed)], ..Report::default() };
+        let mut streak = 0;
+        for _ in 1..CHANGED_ROUNDS {
+            assert_eq!(settle(&changed, &mut streak), (false, None), "another round at once");
+        }
+        assert_eq!(settle(&changed, &mut streak), (false, Some(End::Retry)));
+        // Work done in between starts the count again.
+        let mut streak = 0;
+        assert_eq!(settle(&changed, &mut streak), (false, None));
+        let busy =
+            Report { done: vec![Op::Forget(2)], skipped: vec![(Op::Forget(1), Skip::Changed)], ..Report::default() };
+        assert_eq!(settle(&busy, &mut streak), (false, None));
+        for _ in 1..CHANGED_ROUNDS {
+            assert_eq!(settle(&changed, &mut streak), (false, None));
+        }
     }
 
     /// A held upload's folder keeps its mark through the end of the round
