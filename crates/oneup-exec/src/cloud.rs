@@ -143,11 +143,9 @@ pub trait Cloud: Send + Sync {
     /// Some of folder `id`'s children as the cloud has them now (one page
     /// of a listing; empty: it has none). Read-only; for moving a folder
     /// in parts ([`CloudError::TooManyItems`]), which moves what it gets
-    /// and asks again.
-    fn children(&self, id: &RemoteId) -> impl Future<Output = Result<Vec<RemoteRow>, CloudError>> + Send {
-        let _ = id;
-        async { Err(CloudError::Other("this cloud can't list folders".into())) }
-    }
+    /// and asks again. No default: a wrapper that didn't pass it on left
+    /// such moves failing in the agent while every test passed.
+    fn children(&self, id: &RemoteId) -> impl Future<Output = Result<Vec<RemoteRow>, CloudError>> + Send;
 
     /// Several independent metadata changes (the caller makes sure none
     /// depends on another), each with its own precondition and outcome, in

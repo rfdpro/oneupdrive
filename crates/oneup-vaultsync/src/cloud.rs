@@ -408,6 +408,13 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
     async fn prune(&self, _: &RemotePre) -> Result<(), CloudError> {
         Err(CloudError::Other("rules don't remove items from a vault".into()))
     }
+
+    /// Not offered: an encrypted folder's entries aren't the vault's items,
+    /// so a folder too large for OneDrive to move at once can't be moved in
+    /// parts here (the move is reported as failed).
+    async fn children(&self, _: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
+        Err(CloudError::Other("a vault folder can't be moved in parts".into()))
+    }
 }
 
 impl<C: Cloud> VaultCloud<C> {

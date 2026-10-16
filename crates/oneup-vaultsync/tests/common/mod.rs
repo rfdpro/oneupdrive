@@ -117,6 +117,12 @@ impl Cloud for Fake {
         };
         Ok((s.row(&id), None))
     }
+    async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
+        let s = self.0.lock().unwrap();
+        let ids: Vec<&String> =
+            s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&id.0)).map(|(id, _)| id).collect();
+        Ok(ids.into_iter().map(|id| s.row(id)).collect())
+    }
     async fn copy(&self, _: &RemotePre, _: &[u8; 20], _: &RemoteId, _: &str) -> Result<RemoteRow, CloudError> {
         Err(CloudError::Other("no".into()))
     }
