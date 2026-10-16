@@ -321,6 +321,45 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Free pages [`Space::worth_compacting`] leaves alone: compacting costs a
+/// full copy, worth it only for a lot of space.
+pub const COMPACT_MIN_FREE: u64 = 64 << 20;
+
+/// How the database file's pages are used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    /// All pages, in bytes.
+    pub total: u64,
+    /// Pages deleted rows left free, in bytes.
+    pub free: u64,
+}
+
+impl Space {
+    /// Free pages are kept inside the file, which then stays at its largest
+    /// size for good (one was 80% free). Compacting is worth its full copy
+    /// when at least [`COMPACT_MIN_FREE`] and a quarter of the file are
+    /// free.
+    pub fn worth_compacting(self) -> bool {
+        self.free >= COMPACT_MIN_FREE && self.free * 4 >= self.total
+    }
+
+    /// What a compacted copy holds.
+    pub fn used(self) -> u64 {
+        self.total - self.free
+    }
+}
+
+/// What [`Store::compact`] did: the file's size on disk before and after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compacted {
+    pub before: u64,
+    pub after: u64,
+    /// Another connection was reading, so the rewrite is still in the WAL:
+    /// the file shrinks at a later checkpoint, once nobody reads the old
+    /// pages.
+    pub pending: bool,
+}
+
 /// What connections with [`Store::log_statements`] on have run.
 #[cfg(feature = "statement-log")]
 static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -501,6 +540,49 @@ impl Store {
         let out = f(&Ops { c: &tx })?;
         tx.commit().map_err(Error::from)?;
         Ok(out)
+    }
+
+    /// Reads this connection's pages through a memory map of up to `bytes`
+    /// of the file, instead of one system call per 4 KiB page: a walk of a
+    /// large tree measured no read calls and a fifth less time this way.
+    /// For the agent's own connection only. Windows can't shrink a file
+    /// another process has mapped, so the other connections (the tray, the
+    /// settings window, the CLI) don't map, and [`Store::compact`] can
+    /// return the space. A disk error in a mapped page ends the process
+    /// instead of failing a query.
+    pub fn map_memory(&self, bytes: u64) -> Result<()> {
+        self.conn.execute_batch(&format!("PRAGMA mmap_size = {bytes};"))?;
+        Ok(())
+    }
+
+    /// How the file's pages are used.
+    pub fn space(&self) -> Result<Space> {
+        let pages = |sql: &str| -> Result<u64> {
+            Ok(u64::try_from(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))?).unwrap_or(0))
+        };
+        let size = pages("PRAGMA page_size")?;
+        Ok(Space { total: pages("PRAGMA page_count")? * size, free: pages("PRAGMA freelist_count")? * size })
+    }
+
+    /// Rewrites the database without its free pages, and returns the file's
+    /// size on disk before and after. The file shrinks only once the rewrite
+    /// is checkpointed ([`Compacted::pending`] otherwise) and no other
+    /// process has the file mapped; until then `after` is no smaller
+    /// (nothing is lost either way: SQLite reuses the space). Needs room on
+    /// the disk for up to twice the file ([`Store::files_size`]).
+    pub fn compact(&self) -> Result<Compacted> {
+        let on_disk = || self.conn.path().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+        let before = on_disk();
+        self.conn.execute_batch("PRAGMA mmap_size = 0; VACUUM;")?;
+        let pending = !self.checkpoint()?;
+        Ok(Compacted { before, after: on_disk(), pending })
+    }
+
+    /// The database's files on disk: the database and its WAL.
+    pub fn files_size(&self) -> u64 {
+        let Some(path) = self.conn.path() else { return 0 };
+        let len = |p: &str| std::fs::metadata(p).map_or(0, |m| m.len());
+        len(path) + len(&format!("{path}-wal"))
     }
 
     /// Folds the write-ahead log into the database and empties it, as far
@@ -1095,6 +1177,90 @@ fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn compacting_is_worth_it_for_a_lot_of_space_that_is_a_quarter_of_the_file() {
+        let mib = 1 << 20;
+        let worth = |total: u64, free: u64| Space { total: total * mib, free: free * mib }.worth_compacting();
+        assert!(worth(1_400, 1_100));
+        assert!(worth(256, 64), "exactly a quarter and the minimum");
+        assert!(!worth(257, 64), "just under a quarter");
+        assert!(!worth(200, 63), "a quarter, but too little to be worth a copy");
+        assert!(!worth(0, 0));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn compacting_returns_the_free_space_to_the_disk_and_keeps_the_rest() {
+        let path = std::env::temp_dir().join(format!("oneup-store-compact-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        // The agent's connection maps the file; compacting still shrinks it
+        // (it unmaps first).
+        s.map_memory(64 << 20).unwrap();
+        s.write(|o| {
+            for i in 0..4_000 {
+                o.meta_set(&format!("k{i}"), &"x".repeat(1_000))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(s.checkpoint().unwrap());
+        assert_eq!(s.space().unwrap().free, 0);
+        s.write(|o| Ok(o.c.execute("DELETE FROM meta WHERE key >= 'k1'", [])?)).unwrap();
+        assert!(s.checkpoint().unwrap());
+        let space = s.space().unwrap();
+        assert!(space.free * 2 > space.total, "{space:?}");
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(s.files_size() >= on_disk);
+        let c = s.compact().unwrap();
+        assert_eq!(c.before, on_disk, "measured on disk");
+        assert!(!c.pending);
+        assert!(c.after * 2 < c.before, "{c:?}");
+        assert_eq!(c.after, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(s.space().unwrap().free, 0);
+        assert_eq!(s.read(|o| o.meta_get("k0")).unwrap().map(|v| v.len()), Some(1_000), "what's left is kept");
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// Another connection in the middle of a read keeps the rewrite in the
+    /// WAL: the compaction says so, and the file shrinks at the next
+    /// checkpoint once the read is over.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_reader_leaves_the_compaction_pending_until_it_is_done() {
+        let path = std::env::temp_dir().join(format!("oneup-store-compact-read-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        s.write(|o| {
+            for i in 0..4_000 {
+                o.meta_set(&format!("k{i}"), &"x".repeat(1_000))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        s.write(|o| Ok(o.c.execute("DELETE FROM meta WHERE key >= 'k1'", [])?)).unwrap();
+        assert!(s.checkpoint().unwrap());
+        let reader = Store::open(&path, 1024).unwrap();
+        reader.conn.execute_batch("BEGIN; SELECT count(*) FROM meta;").unwrap();
+        s.conn.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
+        let c = s.compact().unwrap();
+        assert!(c.pending, "{c:?}");
+        assert!(c.after >= c.before, "not shrunk yet: {c:?}");
+        reader.conn.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert!(s.checkpoint().unwrap());
+        assert!(std::fs::metadata(&path).unwrap().len() * 2 < c.before, "shrunk at the next checkpoint");
+        assert_eq!(s.read(|o| o.meta_get("k0")).unwrap().map(|v| v.len()), Some(1_000));
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
 
     /// The guard behind `an_update_reads_no_whole_table` (oneup-remote)
     /// sees through parameters and aliases, and leaves small tables and

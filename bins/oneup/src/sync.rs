@@ -2055,6 +2055,42 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Compacts the database at the agent's start (`[agent] compact_database`)
+/// if free pages are most of it (`Space::worth_compacting`) and the disk
+/// has room for the copy, saying so in the activity log. Before the agent's
+/// other connections open. Best effort: a failure leaves the database as
+/// it was, and the next start tries again.
+pub fn compact(store: &mut Store, data_dir: &Path) {
+    let space = match store.space() {
+        Ok(s) if s.worth_compacting() => s,
+        Ok(_) => return,
+        Err(e) => return tracing::warn!(error = %e, "couldn't read the database's size"),
+    };
+    // SQLite documents that VACUUM may need up to twice the database's size
+    // (a temporary copy, then the rewrite in the WAL).
+    let room = oneup_sys::disk::free_bytes(data_dir).unwrap_or(0);
+    let need = store.files_size().max(space.total).saturating_mul(2);
+    if room < need {
+        return tracing::info!(room, need, "not enough free disk to compact the database");
+    }
+    let size = crate::versions::size;
+    let detail = match store.compact() {
+        Ok(c) if c.after < c.before => format!("database compacted from {} to {}", size(c.before), size(c.after)),
+        Ok(c) if c.pending => {
+            format!("database compacted; its file ({}) shrinks once another program stops reading it", size(c.before))
+        }
+        Ok(c) => format!(
+            "database compacted, but its file stayed at {} (another program has it open); the space is reused",
+            size(c.before)
+        ),
+        Err(e) => return tracing::warn!(error = %e, "couldn't compact the database; tried again at the next start"),
+    };
+    println!("oneupd: {detail}");
+    if let Err(e) = log_activity(store, vec![notice(ActivityOutcome::Note, "compacted", detail)]) {
+        tracing::warn!(error = %e, "the compaction wasn't logged");
+    }
+}
+
 /// An activity-log entry about sync itself (no item).
 fn notice(outcome: ActivityOutcome, action: &str, detail: String) -> ActivityEntry {
     ActivityEntry { seq: 0, at_ms: now_ms(), outcome, action: action.into(), path: String::new(), detail }

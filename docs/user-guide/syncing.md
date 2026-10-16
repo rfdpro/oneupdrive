@@ -91,8 +91,9 @@ oneup --data-dir … settings --pause-on-full-screen-video off  # and while a vi
 
 * **Bandwidth caps** apply to file contents, at once, even while `oneupd` runs. With `--cap-hours 09:00-18:00` they apply only in those hours (`--cap-hours always` to undo).
 * **Background priority** is on by default: `oneupd` gives way to your programs for processor, disk and memory, and Windows may run it on power-efficient cores. Syncing a large batch can take a little longer.
-* **Memory profile** sets how much memory the database may use for caching (4, 16 or 64 MiB), and how large the pieces are that big files are uploaded in (up to 10, 40 or 60 MiB). Larger pieces upload faster on a good connection: OneUpDrive measures the connection as it goes and picks the size, within the profile's limit.
+* **Memory profile** sets how much memory the database may use for caching (4, 16 or 64 MiB, plus up to four times that of the database file read straight from Windows' disk cache by `oneupd`), and how large the pieces are that big files are uploaded in (up to 10, 40 or 60 MiB). Larger pieces upload faster on a good connection: OneUpDrive measures the connection as it goes and picks the size, within the profile's limit.
 * **Copies of files already in OneDrive aren't uploaded again.** If you copy a large file (1 MiB or more) that's already in your OneDrive, for example a video into a second folder, OneUpDrive checks that the contents are identical and asks OneDrive to make the copy itself. That takes a couple of seconds whatever the size. `oneup activity` shows it as copied in OneDrive.
+* **The database is compacted** when `oneupd` starts, if deleted entries left most of it empty (it can otherwise stay at its largest size). It takes a few seconds and shows in `oneup activity`. `oneup settings --compact-database off` turns it off.
 * Priority and memory profile apply the next time `oneupd` starts (`oneup stop`, then `oneup start`).
 
 These settings are in the `[agent]` section of `config.toml` in the data folder, which you can also edit by hand.

@@ -139,6 +139,9 @@ pub struct Agent {
     /// Note which programs change and open files in the synced folder
     /// (counts only, kept on this PC; `crate::apps`).
     pub track_apps: bool,
+    /// Compact the database at the agent's start when free pages are most
+    /// of it (`crate::sync::compact`).
+    pub compact_database: bool,
 }
 
 impl Default for Agent {
@@ -156,6 +159,7 @@ impl Default for Agent {
             cap_hours: None,
             tray_icon: true,
             track_apps: true,
+            compact_database: true,
         }
     }
 }
@@ -335,6 +339,9 @@ pub fn load_agent(data_dir: &Path) -> Result<Agent> {
     if let Some(b) = flag("track_apps")? {
         a.track_apps = b;
     }
+    if let Some(b) = flag("compact_database")? {
+        a.compact_database = b;
+    }
     if let Some(q) = t.get("cap_hours") {
         let q = q.as_str().with_context(|| format!("{FILE}: cap_hours must be a string like \"09:00-18:00\""))?;
         if !q.is_empty() {
@@ -371,6 +378,7 @@ pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
             ("cap_hours", value(a.cap_hours.as_deref().unwrap_or(""))),
             ("tray_icon", value(a.tray_icon)),
             ("track_apps", value(a.track_apps)),
+            ("compact_database", value(a.compact_database)),
         ],
     )
 }
@@ -595,6 +603,7 @@ mod tests {
             background: false,
             pause_on_metered: false,
             quiet_hours: Some("22:00-07:00".into()),
+            compact_database: false,
             ..Agent::default()
         };
         save_agent(&d, &a).unwrap();

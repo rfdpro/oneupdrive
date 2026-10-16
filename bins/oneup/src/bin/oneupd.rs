@@ -235,6 +235,11 @@ async fn run(args: Args) -> Result<()> {
         tracing::warn!(error = %e, "couldn't set the agent's priority");
     }
     let cache_kib = settings.cache_kib();
+    // Before the hydration service and the program tracker open their own
+    // connections.
+    if settings.compact_database {
+        sync::compact(&mut setup::open_store(dir, cache_kib)?, dir);
+    }
     let control = {
         let store = setup::open_store(dir, cache_kib)?;
         let pair = sync::pairing(&store)?;
@@ -416,6 +421,8 @@ async fn agent(
     key: Option<&oneup_vault::key::Masterkey>,
 ) -> Result<()> {
     let mut store = setup::open_store(dir, cache_kib)?;
+    // Four times its cache, by the memory profile (`Store::map_memory`).
+    store.map_memory(u64::from(cache_kib) * 4 * 1024)?;
     if store.read(|o| o.meta_get(KEY_PRESET))?.is_none() {
         anyhow::bail!("no exclusion choice recorded; run `oneup sync` once first");
     }
