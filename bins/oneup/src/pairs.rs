@@ -476,7 +476,12 @@ pub async fn add(main: &Path, http: reqwest::Client, auth: Arc<oneup_graph::Auth
 /// synced and the pair's data folder goes. Both folders keep what they
 /// hold; online-only files leave the folder (Windows removes them; they're
 /// in OneDrive).
+///
+/// Refuses while another OneUpDrive process holds the data folder's lock:
+/// callers check that the agent stopped, but one whose control pipe
+/// didn't open, or that didn't stop in time, would still be syncing.
 pub fn remove(e: &Entry) -> Result<Described> {
+    let lock = crate::setup::DirLock::acquire(&e.dir)?;
     let d = describe(e)?;
     if d.on_demand {
         let token = crate::setup::open_store(&e.dir, 1024)?
@@ -484,6 +489,8 @@ pub fn remove(e: &Entry) -> Result<Described> {
             .context("pairing token missing")?;
         crate::syncroot::unregister(&d.local, &token).context("releasing the folder")?;
     }
+    // The lock file goes with the folder, so it can't stay open.
+    drop(lock);
     std::fs::remove_dir_all(&e.dir).with_context(|| format!("removing {}", e.dir.display()))?;
     Ok(d)
 }
@@ -494,8 +501,10 @@ pub fn remove(e: &Entry) -> Result<Described> {
 /// an ordinary one), then the pairing is forgotten (OneUpDrive's own
 /// database for it). The sign-in, settings, vaults and extra pairs stay;
 /// the settings window offers setting up again. Run with the agent stopped.
-/// Returns the folder that was synced.
+/// Returns the folder that was synced. Refuses, as [`remove`] does, while
+/// another OneUpDrive process holds the data folder's lock.
 pub fn unpair(dir: &Path) -> Result<PathBuf> {
+    let _lock = crate::setup::DirLock::acquire(dir)?;
     let store = crate::setup::open_store(dir, 1024)?;
     let (local, token) = (
         store.read(|o| o.meta_get(crate::sync::KEY_LOCAL))?.context("this folder doesn't sync anything")?,
@@ -537,6 +546,24 @@ mod tests {
             assert_eq!(Kind::decode(&k.encode(), drive), k);
         }
         assert_eq!(Kind::decode("shared:Sam", None), Kind::Folder, "a shared folder needs its drive");
+    }
+
+    /// An agent still running (its control pipe didn't answer, or the
+    /// settings window gave up waiting for it to stop) holds the data
+    /// folder's lock: removing or unpairing then refuses, and the data
+    /// folder stays.
+    #[test]
+    fn removing_or_unpairing_refuses_while_the_folder_is_in_use() {
+        let dir = std::env::temp_dir().join(format!("oneup-pairs-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let held = crate::setup::DirLock::acquire(&dir).unwrap();
+        let e = Entry { name: "p".into(), dir: dir.clone(), remote: "/p".into() };
+        let busy = |r: Result<_>| r.err().is_some_and(|e| format!("{e:#}").contains("using this data folder"));
+        assert!(busy(remove(&e).map(|_| ())), "remove takes the lock");
+        assert!(busy(unpair(&dir).map(|_| ())), "unpair takes the lock");
+        assert!(dir.exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
