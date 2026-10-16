@@ -232,16 +232,15 @@ async fn run(args: Args) -> Result<()> {
     // How it uses the PC (config.toml [agent]): memory and priority are
     // read once here; the bandwidth caps every round.
     let settings = oneup_app::config::load_agent(dir)?;
-    if let Err(e) = oneup_sys::priority::set_background(settings.background) {
-        tracing::warn!(error = %e, "couldn't set the agent's priority");
-    }
+    let priority_set = match oneup_sys::priority::set_background(settings.background) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "couldn't set the agent's priority");
+            false
+        }
+    };
     let cache_kib = settings.cache_kib();
-    // A memory map of the database (`Store::map_memory`), four times the
-    // cache, only at normal priority: background priority keeps the agent's
-    // working set small, so mapped pages were trimmed and faulted back in
-    // one by one (a full pass of a 340k-item tree took 372 s instead of 47 s,
-    // with 220 million page faults).
-    let memory = Memory { cache_kib, map_bytes: if settings.background { 0 } else { u64::from(cache_kib) * 4 * 1024 } };
+    let memory = Memory { cache_kib, map_bytes: Memory::map_bytes(cache_kib, !settings.background && priority_set) };
     // Before the hydration service and the program tracker open their own
     // connections.
     if settings.compact_database {
@@ -424,6 +423,18 @@ fn is_permanent(e: &anyhow::Error) -> bool {
 struct Memory {
     cache_kib: u32,
     map_bytes: u64,
+}
+
+impl Memory {
+    /// How much of the database the agent maps (`Store::map_memory`): four
+    /// times its cache, and only when it's known to run at normal priority.
+    /// Background priority keeps the agent's working set small, so mapped
+    /// pages were trimmed and faulted back in one by one: a full pass of a
+    /// 340k-item tree took 372 s instead of 47 s, with 220 million page
+    /// faults.
+    fn map_bytes(cache_kib: u32, normal_priority: bool) -> u64 {
+        if normal_priority { u64::from(cache_kib) * 4 * 1024 } else { 0 }
+    }
 }
 
 async fn agent(
@@ -922,5 +933,16 @@ impl Window {
             self.done.pop_front();
         }
         self.done.iter().fold(Recent::default(), |a, (_, r)| a.plus(*r))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Memory;
+
+    #[test]
+    fn the_database_is_mapped_only_at_normal_priority() {
+        assert_eq!(Memory::map_bytes(64 * 1024, true), 256 << 20, "four times the cache");
+        assert_eq!(Memory::map_bytes(64 * 1024, false), 0, "background priority, or not known to be normal");
     }
 }
