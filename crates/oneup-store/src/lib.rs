@@ -354,6 +354,10 @@ impl Space {
 pub struct Compacted {
     pub before: u64,
     pub after: u64,
+    /// Another connection was reading, so the rewrite is still in the WAL:
+    /// the file shrinks at a later checkpoint, once nobody reads the old
+    /// pages.
+    pub pending: bool,
 }
 
 impl Store {
@@ -490,15 +494,23 @@ impl Store {
 
     /// Rewrites the database without its free pages, and returns the file's
     /// size on disk before and after. The file shrinks only once the rewrite
-    /// is checkpointed and no other process has the file mapped; until then
-    /// `after` is no smaller (nothing is lost either way: SQLite reuses the
-    /// space). Needs room on the disk for a copy of what's in use.
+    /// is checkpointed ([`Compacted::pending`] otherwise) and no other
+    /// process has the file mapped; until then `after` is no smaller
+    /// (nothing is lost either way: SQLite reuses the space). Needs room on
+    /// the disk for up to twice the file ([`Store::files_size`]).
     pub fn compact(&self) -> Result<Compacted> {
         let on_disk = || self.conn.path().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
         let before = on_disk();
         self.conn.execute_batch("PRAGMA mmap_size = 0; VACUUM;")?;
-        self.checkpoint()?;
-        Ok(Compacted { before, after: on_disk() })
+        let pending = !self.checkpoint()?;
+        Ok(Compacted { before, after: on_disk(), pending })
+    }
+
+    /// The database's files on disk: the database and its WAL.
+    pub fn files_size(&self) -> u64 {
+        let Some(path) = self.conn.path() else { return 0 };
+        let len = |p: &str| std::fs::metadata(p).map_or(0, |m| m.len());
+        len(path) + len(&format!("{path}-wal"))
     }
 
     pub fn checkpoint(&self) -> Result<bool> {
@@ -1119,12 +1131,49 @@ mod tests {
         let space = s.space().unwrap();
         assert!(space.free * 2 > space.total, "{space:?}");
         let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(s.files_size() >= on_disk);
         let c = s.compact().unwrap();
         assert_eq!(c.before, on_disk, "measured on disk");
+        assert!(!c.pending);
         assert!(c.after * 2 < c.before, "{c:?}");
         assert_eq!(c.after, std::fs::metadata(&path).unwrap().len());
         assert_eq!(s.space().unwrap().free, 0);
         assert_eq!(s.read(|o| o.meta_get("k0")).unwrap().map(|v| v.len()), Some(1_000), "what's left is kept");
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// Another connection in the middle of a read keeps the rewrite in the
+    /// WAL: the compaction says so, and the file shrinks at the next
+    /// checkpoint once the read is over.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_reader_leaves_the_compaction_pending_until_it_is_done() {
+        let path = std::env::temp_dir().join(format!("oneup-store-compact-read-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        s.write(|o| {
+            for i in 0..4_000 {
+                o.meta_set(&format!("k{i}"), &"x".repeat(1_000))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        s.write(|o| Ok(o.c.execute("DELETE FROM meta WHERE key >= 'k1'", [])?)).unwrap();
+        assert!(s.checkpoint().unwrap());
+        let reader = Store::open(&path, 1024).unwrap();
+        reader.conn.execute_batch("BEGIN; SELECT count(*) FROM meta;").unwrap();
+        s.conn.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
+        let c = s.compact().unwrap();
+        assert!(c.pending, "{c:?}");
+        assert!(c.after >= c.before, "not shrunk yet: {c:?}");
+        reader.conn.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert!(s.checkpoint().unwrap());
+        assert!(std::fs::metadata(&path).unwrap().len() * 2 < c.before, "shrunk at the next checkpoint");
+        assert_eq!(s.read(|o| o.meta_get("k0")).unwrap().map(|v| v.len()), Some(1_000));
         drop(s);
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));

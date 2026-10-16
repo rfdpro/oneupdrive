@@ -2048,14 +2048,19 @@ pub fn compact(store: &mut Store, data_dir: &Path) {
         Ok(_) => return,
         Err(e) => return tracing::warn!(error = %e, "couldn't read the database's size"),
     };
-    // The copy goes to the WAL first, and SQLite may sort into a temp file.
+    // SQLite documents that VACUUM may need up to twice the database's size
+    // (a temporary copy, then the rewrite in the WAL).
     let room = oneup_sys::disk::free_bytes(data_dir).unwrap_or(0);
-    if room < space.used().saturating_mul(2) {
-        return tracing::info!(room, used = space.used(), "not enough free disk to compact the database");
+    let need = store.files_size().max(space.total).saturating_mul(2);
+    if room < need {
+        return tracing::info!(room, need, "not enough free disk to compact the database");
     }
     let size = crate::versions::size;
     let detail = match store.compact() {
         Ok(c) if c.after < c.before => format!("database compacted from {} to {}", size(c.before), size(c.after)),
+        Ok(c) if c.pending => {
+            format!("database compacted; its file ({}) shrinks once another program stops reading it", size(c.before))
+        }
         Ok(c) => format!(
             "database compacted, but its file stayed at {} (another program has it open); the space is reused",
             size(c.before)
