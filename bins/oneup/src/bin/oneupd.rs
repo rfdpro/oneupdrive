@@ -236,6 +236,12 @@ async fn run(args: Args) -> Result<()> {
         tracing::warn!(error = %e, "couldn't set the agent's priority");
     }
     let cache_kib = settings.cache_kib();
+    // A memory map of the database (`Store::map_memory`), four times the
+    // cache, only at normal priority: background priority keeps the agent's
+    // working set small, so mapped pages were trimmed and faulted back in
+    // one by one (a full pass of a 340k-item tree took 372 s instead of 47 s,
+    // with 220 million page faults).
+    let memory = Memory { cache_kib, map_bytes: if settings.background { 0 } else { u64::from(cache_kib) * 4 * 1024 } };
     // Before the hydration service and the program tracker open their own
     // connections.
     if settings.compact_database {
@@ -328,7 +334,7 @@ async fn run(args: Args) -> Result<()> {
     // ---- run; on an error, start over after a growing pause
     let mut pause = ERROR_FIRST;
     loop {
-        match agent(dir, &graph, &args, &stop, &control, cache_kib, key.as_ref()).await {
+        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref()).await {
             Ok(()) => {
                 println!("oneupd: stopped.");
                 end_flyout(dir, flyout);
@@ -412,18 +418,27 @@ fn is_permanent(e: &anyhow::Error) -> bool {
 
 /// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
 /// database each time, so a retry starts from a clean state.
+/// How much memory the agent's database connection uses: its page cache,
+/// and how much of the file it maps (0: none).
+#[derive(Clone, Copy)]
+struct Memory {
+    cache_kib: u32,
+    map_bytes: u64,
+}
+
 async fn agent(
     dir: &Path,
     graph: &Arc<Graph>,
     args: &Args,
     stop: &Stop,
     control: &Control,
-    cache_kib: u32,
+    memory: Memory,
     key: Option<&oneup_vault::key::Masterkey>,
 ) -> Result<()> {
-    let mut store = setup::open_store(dir, cache_kib)?;
-    // Four times its cache, by the memory profile (`Store::map_memory`).
-    store.map_memory(u64::from(cache_kib) * 4 * 1024)?;
+    let mut store = setup::open_store(dir, memory.cache_kib)?;
+    if memory.map_bytes > 0 {
+        store.map_memory(memory.map_bytes)?;
+    }
     if store.read(|o| o.meta_get(KEY_PRESET))?.is_none() {
         anyhow::bail!("no exclusion choice recorded; run `oneup sync` once first");
     }
