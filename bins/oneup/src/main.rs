@@ -204,6 +204,9 @@ enum Cmd {
         /// The longest a busy file's upload waits, in seconds (default 600)
         #[arg(long, value_name = "SECONDS")]
         busy_max_s: Option<u64>,
+        /// Compact the database when the agent starts, if deleted rows left most of it empty (on by default)
+        #[arg(long, value_enum)]
+        compact_database: Option<Toggle>,
         /// Developers only: show and allow experimental options (off by default)
         #[arg(long, value_enum, hide = true)]
         experimental: Option<Toggle>,
@@ -1241,6 +1244,7 @@ async fn run() -> Result<()> {
             busy_window_s,
             busy_quiet_s,
             busy_max_s,
+            compact_database,
             experimental,
         } => {
             let changes = settings::Changes {
@@ -1260,6 +1264,7 @@ async fn run() -> Result<()> {
                 busy_window_s: *busy_window_s,
                 busy_quiet_s: *busy_quiet_s,
                 busy_max_s: *busy_max_s,
+                compact_database: compact_database.map(Toggle::on),
                 experimental: experimental.map(Toggle::on),
             };
             settings::run(&data_dir(&cli)?, &changes).await

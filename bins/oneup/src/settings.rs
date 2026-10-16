@@ -28,6 +28,7 @@ pub struct Changes {
     pub busy_window_s: Option<u64>,
     pub busy_quiet_s: Option<u64>,
     pub busy_max_s: Option<u64>,
+    pub compact_database: Option<bool>,
     /// `[dev] experimental` (`config::load_experimental`).
     pub experimental: Option<bool>,
 }
@@ -85,6 +86,9 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
         a.busy.max = secs(n);
     }
     config::check_busy(&a.busy)?;
+    if let Some(b) = c.compact_database {
+        a.compact_database = b;
+    }
     match c.cap_hours.as_deref() {
         Some("always" | "off" | "") => a.cap_hours = None,
         Some(q) => {
@@ -104,11 +108,15 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
     if a != before {
         config::save_agent(data_dir, &a)?;
         println!("Saved in {}.", config::path(data_dir).display());
-        let restart = a.memory != before.memory || a.background != before.background;
+        let restart = a.memory != before.memory
+            || a.background != before.background
+            || a.compact_database != before.compact_database;
         if crate::agent::nudge(data_dir).await {
             println!("The background agent applies the caps and automatic pauses now.");
             if restart {
-                println!("The memory profile and priority apply when it next starts (`oneup stop`, `oneup start`).");
+                println!(
+                    "The memory profile, priority and compacting the database apply when it next starts                      (`oneup stop`, `oneup start`)."
+                );
             }
         }
     }
@@ -153,4 +161,5 @@ fn show(a: &Agent) {
     } else {
         println!("  files that keep changing        sent after every change");
     }
+    println!("  compact the database at start   {}", yes(a.compact_database));
 }

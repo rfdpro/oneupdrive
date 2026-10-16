@@ -141,6 +141,9 @@ pub struct Agent {
     pub track_apps: bool,
     /// Hold the uploads of files that keep changing (`crate::busy`).
     pub busy: crate::busy::Settings,
+    /// Compact the database at the agent's start when free pages are most
+    /// of it (`crate::sync::compact`).
+    pub compact_database: bool,
 }
 
 impl Default for Agent {
@@ -159,6 +162,7 @@ impl Default for Agent {
             tray_icon: true,
             track_apps: true,
             busy: crate::busy::Settings::default(),
+            compact_database: true,
         }
     }
 }
@@ -356,6 +360,9 @@ pub fn load_agent(data_dir: &Path) -> Result<Agent> {
         a.busy.max = d;
     }
     check_busy(&a.busy).with_context(|| format!("{FILE}: [agent]"))?;
+    if let Some(b) = flag("compact_database")? {
+        a.compact_database = b;
+    }
     if let Some(q) = t.get("cap_hours") {
         let q = q.as_str().with_context(|| format!("{FILE}: cap_hours must be a string like \"09:00-18:00\""))?;
         if !q.is_empty() {
@@ -415,6 +422,7 @@ pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
             ("busy_window_s", n(a.busy.window.as_secs())),
             ("busy_quiet_s", n(a.busy.quiet.as_secs())),
             ("busy_max_s", n(a.busy.max.as_secs())),
+            ("compact_database", value(a.compact_database)),
         ],
     )
 }
@@ -639,6 +647,7 @@ mod tests {
             background: false,
             pause_on_metered: false,
             quiet_hours: Some("22:00-07:00".into()),
+            compact_database: false,
             ..Agent::default()
         };
         save_agent(&d, &a).unwrap();
