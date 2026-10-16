@@ -137,7 +137,7 @@ pub fn save_key(dir: &Path, key: &Masterkey) -> Result<()> {
 
 pub fn load_key(dir: &Path) -> Result<Option<Masterkey>> {
     let Ok(sealed) = std::fs::read(dir.join(KEY_FILE)) else { return Ok(None) };
-    let raw = Zeroizing::new(oneup_sys::dpapi::unprotect(&sealed).context("reading the remembered vault keys")?);
+    let raw = oneup_sys::dpapi::unprotect(&sealed).context("reading the remembered vault keys")?;
     let raw: &[u8; 64] = raw.as_slice().try_into().context("the remembered vault keys are damaged")?;
     Ok(Some(Masterkey::import(raw)))
 }

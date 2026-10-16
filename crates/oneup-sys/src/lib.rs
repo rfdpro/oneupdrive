@@ -45,6 +45,7 @@ pub mod webview;
 /// (on this machine) can decrypt it.
 pub mod dpapi {
     use super::Result;
+    use zeroize::Zeroizing;
 
     #[cfg(windows)]
     fn call(
@@ -54,17 +55,21 @@ pub mod dpapi {
             &windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
             &mut windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB,
         ) -> windows::core::Result<()>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Zeroizing<Vec<u8>>> {
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::Security::Cryptography::CRYPT_INTEGER_BLOB;
+        use zeroize::Zeroize as _;
         let len = u32::try_from(data.len()).map_err(|_| super::Error::Unsupported)?;
         let input = CRYPT_INTEGER_BLOB { cbData: len, pbData: data.as_ptr().cast_mut() };
         let mut out = CRYPT_INTEGER_BLOB::default();
         f(&input, &mut out).map_err(|source| super::Error::Win32 { op, source })?;
         // SAFETY: on success DPAPI returns a LocalAlloc'd buffer of `cbData`
-        // bytes, which we copy and then free exactly once.
+        // bytes that only we hold, which we copy, wipe (it may be a decrypted
+        // secret) and then free exactly once.
         unsafe {
-            let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+            let buf = std::slice::from_raw_parts_mut(out.pbData, out.cbData as usize);
+            let v = Zeroizing::new(buf.to_vec());
+            buf.zeroize();
             let _ = LocalFree(Some(HLOCAL(out.pbData.cast())));
             Ok(v)
         }
@@ -73,14 +78,17 @@ pub mod dpapi {
     #[cfg(windows)]
     pub fn protect(data: &[u8]) -> Result<Vec<u8>> {
         use windows::Win32::Security::Cryptography::CryptProtectData;
-        call(data, "CryptProtectData", |i, o| {
+        let mut sealed = call(data, "CryptProtectData", |i, o| {
             // SAFETY: the input blob points at live data that DPAPI only reads.
             unsafe { CryptProtectData(i, None, None, None, None, 0, o) }
-        })
+        })?;
+        // Encrypted, so it needn't be wiped.
+        Ok(std::mem::take(&mut *sealed))
     }
 
+    /// The decrypted data, wiped from memory when dropped.
     #[cfg(windows)]
-    pub fn unprotect(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn unprotect(data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         use windows::Win32::Security::Cryptography::CryptUnprotectData;
         call(data, "CryptUnprotectData", |i, o| {
             // SAFETY: as above.
@@ -94,7 +102,7 @@ pub mod dpapi {
     }
 
     #[cfg(not(windows))]
-    pub fn unprotect(_: &[u8]) -> Result<Vec<u8>> {
+    pub fn unprotect(_: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         Err(super::Error::Unsupported)
     }
 }
@@ -774,7 +782,8 @@ mod tests {
         let secret = b"not a real token";
         let sealed = super::dpapi::protect(secret).unwrap();
         assert_ne!(sealed.as_slice(), secret);
-        assert_eq!(super::dpapi::unprotect(&sealed).unwrap(), secret);
+        let plain: zeroize::Zeroizing<Vec<u8>> = super::dpapi::unprotect(&sealed).unwrap();
+        assert_eq!(plain.as_slice(), secret);
     }
 
     #[test]

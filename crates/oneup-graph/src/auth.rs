@@ -53,8 +53,14 @@ impl TokenStore for DpapiFileStore {
     fn load(&self) -> Result<Option<String>> {
         match std::fs::read(&self.path) {
             Ok(sealed) => {
-                let plain = oneup_sys::dpapi::unprotect(&sealed)?;
-                Ok(Some(String::from_utf8(plain).map_err(|_| Error::Auth("stored token is not UTF-8".into()))?))
+                let mut plain = oneup_sys::dpapi::unprotect(&sealed)?;
+                // The buffer moves into the returned token; on a decoding
+                // error the wiped copy in `plain` is dropped.
+                let token = String::from_utf8(std::mem::take(&mut *plain)).map_err(|e| {
+                    *plain = e.into_bytes();
+                    Error::Auth("stored token is not UTF-8".into())
+                })?;
+                Ok(Some(token))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
