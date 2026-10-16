@@ -321,11 +321,35 @@ pub struct Store {
     conn: Connection,
 }
 
-/// Free pages [`Store::compact_if_sparse`] leaves alone: compacting costs a
+/// Free pages [`Space::worth_compacting`] leaves alone: compacting costs a
 /// full copy, worth it only for a lot of space.
 pub const COMPACT_MIN_FREE: u64 = 64 << 20;
 
-/// What [`Store::compact_if_sparse`] did: the file's size before and after.
+/// How the database file's pages are used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    /// All pages, in bytes.
+    pub total: u64,
+    /// Pages deleted rows left free, in bytes.
+    pub free: u64,
+}
+
+impl Space {
+    /// Free pages are kept inside the file, which then stays at its largest
+    /// size for good (one was 80% free). Compacting is worth its full copy
+    /// when at least [`COMPACT_MIN_FREE`] and a quarter of the file are
+    /// free.
+    pub fn worth_compacting(self) -> bool {
+        self.free >= COMPACT_MIN_FREE && self.free * 4 >= self.total
+    }
+
+    /// What a compacted copy holds.
+    pub fn used(self) -> u64 {
+        self.total - self.free
+    }
+}
+
+/// What [`Store::compact`] did: the file's size on disk before and after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Compacted {
     pub before: u64,
@@ -345,12 +369,6 @@ impl Store {
 
     fn init(conn: Connection, cache_kib: u32) -> Result<Self> {
         conn.busy_timeout(BUSY_WAIT)?;
-        // Reads through a memory map instead of one system call per 4 KiB
-        // page: a walk of a large tree measured no read calls and a fifth
-        // less time this way. Sized by the memory profile like the cache
-        // (four times it); the mapped pages are the file's own, which
-        // Windows can drop at any time.
-        let mmap_bytes = u64::from(cache_kib) * 4 * 1024;
         // The mirror is rebuildable from the cloud, so NORMAL durability (WAL)
         // is sufficient here. The future op journal will use FULL.
         conn.execute_batch(&format!(
@@ -358,7 +376,6 @@ impl Store {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = OFF;
              PRAGMA cache_size = -{cache_kib};
-             PRAGMA mmap_size = {mmap_bytes};
              PRAGMA temp_store = FILE;"
         ))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -449,28 +466,39 @@ impl Store {
     /// Folds the write-ahead log into the database and empties it, as far
     /// as other connections' reads allow (they keep what they still read).
     /// Returns whether it all went (`false`: a reader held some back).
-    /// Rewrites the database without its free pages when they're most of
-    /// it: deleting rows leaves their pages free inside the file, which then
-    /// keeps its largest size for good (one was 80% free pages). Only when
-    /// at least [`COMPACT_MIN_FREE`] and a quarter of the file are free, so
-    /// it runs rarely; it writes a full copy of what's left. `None` when
-    /// nothing was done.
-    pub fn compact_if_sparse(&self) -> Result<Option<Compacted>> {
-        self.compact_if_free(COMPACT_MIN_FREE)
+    /// Reads this connection's pages through a memory map of up to `bytes`
+    /// of the file, instead of one system call per 4 KiB page: a walk of a
+    /// large tree measured no read calls and a fifth less time this way.
+    /// For the agent's own connection only. Windows can't shrink a file
+    /// another process has mapped, so the other connections (the tray, the
+    /// settings window, the CLI) don't map, and [`Store::compact`] can
+    /// return the space. A disk error in a mapped page ends the process
+    /// instead of failing a query.
+    pub fn map_memory(&self, bytes: u64) -> Result<()> {
+        self.conn.execute_batch(&format!("PRAGMA mmap_size = {bytes};"))?;
+        Ok(())
     }
 
-    fn compact_if_free(&self, min_free: u64) -> Result<Option<Compacted>> {
+    /// How the file's pages are used.
+    pub fn space(&self) -> Result<Space> {
         let pages = |sql: &str| -> Result<u64> {
             Ok(u64::try_from(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))?).unwrap_or(0))
         };
         let size = pages("PRAGMA page_size")?;
-        let (total, free) = (pages("PRAGMA page_count")?, pages("PRAGMA freelist_count")?);
-        if free * size < min_free || free * 4 < total {
-            return Ok(None);
-        }
-        self.conn.execute_batch("VACUUM")?;
+        Ok(Space { total: pages("PRAGMA page_count")? * size, free: pages("PRAGMA freelist_count")? * size })
+    }
+
+    /// Rewrites the database without its free pages, and returns the file's
+    /// size on disk before and after. The file shrinks only once the rewrite
+    /// is checkpointed and no other process has the file mapped; until then
+    /// `after` is no smaller (nothing is lost either way: SQLite reuses the
+    /// space). Needs room on the disk for a copy of what's in use.
+    pub fn compact(&self) -> Result<Compacted> {
+        let on_disk = || self.conn.path().and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+        let before = on_disk();
+        self.conn.execute_batch("PRAGMA mmap_size = 0; VACUUM;")?;
         self.checkpoint()?;
-        Ok(Some(Compacted { before: total * size, after: pages("PRAGMA page_count")? * size }))
+        Ok(Compacted { before, after: on_disk() })
     }
 
     pub fn checkpoint(&self) -> Result<bool> {
@@ -1058,30 +1086,44 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn a_mostly_free_database_is_compacted_and_a_full_one_left_alone() {
+    fn compacting_is_worth_it_for_a_lot_of_space_that_is_a_quarter_of_the_file() {
+        let mib = 1 << 20;
+        let worth = |total: u64, free: u64| Space { total: total * mib, free: free * mib }.worth_compacting();
+        assert!(worth(1_400, 1_100));
+        assert!(worth(256, 64), "exactly a quarter and the minimum");
+        assert!(!worth(257, 64), "just under a quarter");
+        assert!(!worth(200, 63), "a quarter, but too little to be worth a copy");
+        assert!(!worth(0, 0));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn compacting_returns_the_free_space_to_the_disk_and_keeps_the_rest() {
         let path = std::env::temp_dir().join(format!("oneup-store-compact-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut s = Store::open(&path, 1024).unwrap();
-        let fill = |s: &mut Store, from: u32| {
-            s.write(|o| {
-                for i in from..from + 2_000 {
-                    o.meta_set(&format!("k{i}"), &"x".repeat(1_000))?;
-                }
-                Ok(())
-            })
-            .unwrap();
-        };
-        fill(&mut s, 0);
-        fill(&mut s, 2_000);
-        assert_eq!(s.compact_if_free(1).unwrap(), None, "nothing free yet");
+        // The agent's connection maps the file; compacting still shrinks it
+        // (it unmaps first).
+        s.map_memory(64 << 20).unwrap();
+        s.write(|o| {
+            for i in 0..4_000 {
+                o.meta_set(&format!("k{i}"), &"x".repeat(1_000))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(s.checkpoint().unwrap());
+        assert_eq!(s.space().unwrap().free, 0);
         s.write(|o| Ok(o.c.execute("DELETE FROM meta WHERE key >= 'k1'", [])?)).unwrap();
-        let free_pages =
-            |s: &Store| s.read(|o| Ok(o.c.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))?));
-        assert!(free_pages(&s).unwrap() > 0);
-        assert_eq!(s.compact_if_free(u64::MAX).unwrap(), None, "too little to be worth a copy");
-        let c = s.compact_if_free(1).unwrap().expect("most of it is free");
+        assert!(s.checkpoint().unwrap());
+        let space = s.space().unwrap();
+        assert!(space.free * 2 > space.total, "{space:?}");
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        let c = s.compact().unwrap();
+        assert_eq!(c.before, on_disk, "measured on disk");
         assert!(c.after * 2 < c.before, "{c:?}");
-        assert_eq!(free_pages(&s).unwrap(), 0);
+        assert_eq!(c.after, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(s.space().unwrap().free, 0);
         assert_eq!(s.read(|o| o.meta_get("k0")).unwrap().map(|v| v.len()), Some(1_000), "what's left is kept");
         drop(s);
         for ext in ["", "-wal", "-shm"] {

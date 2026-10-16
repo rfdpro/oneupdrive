@@ -22,6 +22,7 @@ pub struct Changes {
     /// `HH:MM-HH:MM`, or `always`.
     pub cap_hours: Option<String>,
     pub tray_icon: Option<bool>,
+    pub compact_database: Option<bool>,
     /// `[dev] experimental` (`config::load_experimental`).
     pub experimental: Option<bool>,
 }
@@ -61,6 +62,9 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
     }
     if let Some(b) = c.tray_icon {
         a.tray_icon = b;
+    }
+    if let Some(b) = c.compact_database {
+        a.compact_database = b;
     }
     match c.cap_hours.as_deref() {
         Some("always" | "off" | "") => a.cap_hours = None,
@@ -117,4 +121,5 @@ fn show(a: &Agent) {
     println!("  pause during full-screen video     {}", yes(a.pause_on_full_screen_video));
     println!("  quiet hours (no syncing)        {}", a.quiet_hours.as_deref().unwrap_or("none"));
     println!("  icon in the notification area   {}", yes(a.tray_icon));
+    println!("  compact the database at start   {}", yes(a.compact_database));
 }

@@ -189,6 +189,9 @@ enum Cmd {
         /// Show OneUpDrive's icon in the notification area when the agent starts (on by default)
         #[arg(long, value_enum)]
         tray_icon: Option<Toggle>,
+        /// Compact the database when the agent starts, if deleted rows left most of it empty (on by default)
+        #[arg(long, value_enum)]
+        compact_database: Option<Toggle>,
         /// Developers only: show and allow experimental options (off by default)
         #[arg(long, value_enum, hide = true)]
         experimental: Option<Toggle>,
@@ -1221,6 +1224,7 @@ async fn run() -> Result<()> {
             quiet_hours,
             cap_hours,
             tray_icon,
+            compact_database,
             experimental,
         } => {
             let changes = settings::Changes {
@@ -1235,6 +1239,7 @@ async fn run() -> Result<()> {
                 quiet_hours: quiet_hours.clone(),
                 cap_hours: cap_hours.clone(),
                 tray_icon: tray_icon.map(Toggle::on),
+                compact_database: compact_database.map(Toggle::on),
                 experimental: experimental.map(Toggle::on),
             };
             settings::run(&data_dir(&cli)?, &changes).await
