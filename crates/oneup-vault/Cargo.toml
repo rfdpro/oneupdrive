@@ -9,9 +9,17 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-aes-gcm = "0.10"
+# `aes`, `ghash` and `polyval` are here only for their `zeroize` features,
+# which wipe the AES key schedules (AES-256's first round keys are the raw
+# key) and the GHASH/POLYVAL keys when a cipher is dropped. The AEAD crates
+# don't forward the feature, so it's enabled on each underlying crate; feature
+# unification then covers the AES inside aes-gcm, aes-kw and aes-siv.
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 aes-kw = { version = "0.2", features = ["alloc"] }
 aes-siv = "0.7"
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
 base64 = "0.22"
 data-encoding = "2"
 getrandom = "0.3"

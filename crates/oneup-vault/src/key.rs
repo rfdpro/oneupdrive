@@ -99,11 +99,12 @@ impl Masterkey {
 
     /// The keys [`Masterkey::export`] gave.
     pub fn import(raw: &[u8; 64]) -> Self {
-        let mut enc = [0u8; 32];
-        let mut mac = [0u8; 32];
-        enc.copy_from_slice(&raw[..32]);
-        mac.copy_from_slice(&raw[32..]);
-        Self { enc, mac }
+        // Copied straight into the zeroed-on-drop key, not through
+        // temporaries that would linger on the stack.
+        let mut key = Self { enc: [0u8; 32], mac: [0u8; 32] };
+        key.enc.copy_from_slice(&raw[..32]);
+        key.mac.copy_from_slice(&raw[32..]);
+        key
     }
 
     pub(crate) fn enc(&self) -> &[u8; 32] {
@@ -139,7 +140,9 @@ impl Masterkey {
         let salt: [u8; SALT_LEN] = random()?;
         let kek = kek(password, &salt, cost, block_size)?;
         let wrap = |k: &[u8; 32]| -> Result<Vec<u8>> {
-            aes_kw::KekAes256::from(*kek).wrap_vec(k).map_err(|e| Error::Malformed(format!("key wrap: {e}")))
+            aes_kw::KekAes256::new(kek.as_ref().into())
+                .wrap_vec(k)
+                .map_err(|e| Error::Malformed(format!("key wrap: {e}")))
         };
         let f = File {
             version: LEGACY_VERSION,
@@ -158,24 +161,21 @@ impl Masterkey {
         let f: File = serde_json::from_slice(json).map_err(|e| Error::Malformed(format!("{FILE}: {e}")))?;
         let salt = b64("scryptSalt", &f.scrypt_salt)?;
         let kek = kek(password, &salt, f.scrypt_cost_param, f.scrypt_block_size)?;
-        let unwrap = |field: &str, s: &str| -> Result<[u8; 32]> {
+        // Unwraps into `out`, a field of the zeroed-on-drop key, so no copy
+        // of the plain key is left behind.
+        let unwrap = |field: &str, s: &str, out: &mut [u8; 32]| -> Result<()> {
             let wrapped = b64(field, s)?;
             if wrapped.len() != 40 {
                 return Err(Error::Malformed(format!("{field} isn't a wrapped 256-bit key")));
             }
             // The key wrap's integrity check fails for a wrong KEK, that is
             // a wrong password.
-            let mut k =
-                Zeroizing::new(aes_kw::KekAes256::from(*kek).unwrap_vec(&wrapped).map_err(|_| Error::WrongPassword)?);
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&k);
-            k.zeroize();
-            Ok(out)
+            aes_kw::KekAes256::new(kek.as_ref().into()).unwrap(&wrapped, out).map_err(|_| Error::WrongPassword)?;
+            Ok(())
         };
-        let key = Self {
-            enc: unwrap("primaryMasterKey", &f.primary_master_key)?,
-            mac: unwrap("hmacMasterKey", &f.hmac_master_key)?,
-        };
+        let mut key = Self { enc: [0u8; 32], mac: [0u8; 32] };
+        unwrap("primaryMasterKey", &f.primary_master_key, &mut key.enc)?;
+        unwrap("hmacMasterKey", &f.hmac_master_key, &mut key.mac)?;
         let given = b64("versionMac", &f.version_mac)?;
         version_mac(&key.mac, f.version)
             .verify_slice(&given)
@@ -227,6 +227,16 @@ mod tests {
         json["scryptCostParam"] = 1000.into();
         let odd = serde_json::to_vec(&json).unwrap();
         assert!(matches!(Masterkey::from_file(&odd, "pw"), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn aes_key_schedules_are_wiped_on_drop() {
+        // Compiles only with the `aes` crate's `zeroize` feature, which every
+        // AES user here (aes-gcm, aes-kw, aes-siv) shares.
+        fn wiped<T: ZeroizeOnDrop>() {}
+        wiped::<aes::Aes256>();
+        wiped::<aes::Aes256Enc>();
+        wiped::<aes::Aes256Dec>();
     }
 
     #[test]
