@@ -68,6 +68,15 @@ impl Error {
             _ => None,
         }
     }
+
+    /// Whether OneDrive refused the request because it would touch too
+    /// many items at once (see [`too_many_items`]).
+    pub fn is_too_many_items(&self) -> bool {
+        match self {
+            Error::Status { body, .. } => serde_json::from_str(body).is_ok_and(|v| too_many_items(&v)),
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -75,4 +84,26 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The `error.code` of a Graph error body.
 pub fn error_code(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body).ok()?.pointer("/error/code")?.as_str().map(str::to_string)
+}
+
+/// Whether a Graph error body is OneDrive's refusal to change a folder
+/// with too many items below it in one request: moving or renaming one
+/// with more than its "list view threshold" (5,000) of descendants answers
+/// 422 `notSupported`, inner code `tooManyResources`.
+pub fn too_many_items(body: &serde_json::Value) -> bool {
+    body.pointer("/error/innerError/code").and_then(|c| c.as_str()) == Some("tooManyResources")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_list_view_threshold_refusal_is_recognised() {
+        let body = r#"{"error":{"code":"notSupported","message":"The attempted operation is prohibited because it exceeds the list view threshold.","innerError":{"code":"tooManyResources","date":"2026-10-16T14:49:19"}}}"#;
+        let e = super::Error::Status { status: 422, what: "x".into(), body: body.into() };
+        assert!(e.is_too_many_items());
+        let other =
+            super::Error::Status { status: 422, what: "x".into(), body: r#"{"error":{"code":"notSupported"}}"#.into() };
+        assert!(!other.is_too_many_items());
+        assert!(!super::Error::Exhausted(8).is_too_many_items());
+    }
 }

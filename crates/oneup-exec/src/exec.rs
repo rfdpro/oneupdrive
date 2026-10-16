@@ -85,7 +85,7 @@ impl From<CloudError> for Fail {
             CloudError::Changed => Fail::Skip(Skip::Changed),
             CloudError::NameTaken => Fail::Skip(Skip::NameTaken),
             CloudError::NotEmpty => Fail::Skip(Skip::NotEmpty),
-            CloudError::Io(_) | CloudError::Other(_) => Fail::Failed(e.to_string()),
+            CloudError::Io(_) | CloudError::Other(_) | CloudError::TooManyItems => Fail::Failed(e.to_string()),
         }
     }
 }
@@ -405,11 +405,12 @@ impl<C: Cloud> Executor<C> {
         }
         let results = self.cloud.batch(&metas).await;
         let mut halted = false;
-        for (k, r) in sent.into_iter().zip(results) {
+        for ((k, r), m) in sent.into_iter().zip(results).zip(&metas) {
             if halted {
                 break;
             }
             let res = match r {
+                Err(CloudError::TooManyItems) => self.move_in_parts(store, group[k].op(), m).await,
                 Err(e) => Err(e.into()),
                 Ok(done) => self.crash_point().and_then(|()| self.meta_post(store, group[k].op(), done)),
             };
@@ -511,7 +512,10 @@ impl<C: Cloud> Executor<C> {
         let m = self.meta_pre(store, op)?;
         let done = match &m {
             Meta::Mkdir { parent, name } => MetaDone::Item(self.cloud.mkdir(parent, name).await?),
-            Meta::Move { pre, to, name } => MetaDone::Item(self.cloud.move_item(pre, to, name).await?),
+            Meta::Move { pre, to, name } => match self.cloud.move_item(pre, to, name).await {
+                Err(CloudError::TooManyItems) => return self.move_in_parts(store, op, &m).await,
+                r => MetaDone::Item(r?),
+            },
             Meta::Delete { pre } => {
                 self.cloud.delete(pre).await?;
                 MetaDone::Deleted
@@ -519,6 +523,84 @@ impl<C: Cloud> Executor<C> {
         };
         self.crash_point()?;
         self.meta_post(store, op, done)
+    }
+
+    /// A move OneDrive refused because the folder has too many items below
+    /// it ([`CloudError::TooManyItems`]), done in parts ([`Self::rebuild`])
+    /// and then recorded as the move it stands for.
+    async fn move_in_parts(&self, store: &mut Store, op: &Op, m: &Meta) -> Res {
+        let Meta::Move { pre, to, name } = m else { return Err(CloudError::TooManyItems.into()) };
+        tracing::info!("OneDrive won't move a folder this large in one request; moving its contents item by item");
+        let row = self.rebuild(store, pre, to, name).await?;
+        self.meta_post(store, op, MetaDone::Item(row))
+    }
+
+    /// Moves folder `pre` to `to/name` without moving it as a whole, which
+    /// OneDrive refuses above its list view threshold: makes a new folder
+    /// there, moves the contents into it a batch at a time (a subfolder that
+    /// is itself too large the same way), then removes the emptied original
+    /// into OneDrive's recycle bin. Returns the new folder, which stands for
+    /// the old one from then on: a new ID, everything inside it unchanged.
+    ///
+    /// Nothing is deleted but a folder OneDrive confirms empty, on its
+    /// current eTag. Each step is recorded as it happens, so the store
+    /// always matches the cloud: the Synced row follows the new folder as
+    /// soon as it exists, and an interruption leaves what wasn't moved yet
+    /// in the original folder, which the next round sees as a folder of its
+    /// own (the user's move, done in part).
+    async fn rebuild(&self, store: &mut Store, pre: &RemotePre, to: &RemoteId, name: &str) -> Res<RemoteRow> {
+        let now = self.cloud.item(&pre.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
+        need(now.etag.as_deref() == Some(pre.etag.as_str()))?;
+        if now.kind != Kind::Folder {
+            return Err(CloudError::TooManyItems.into());
+        }
+        let mut page = self.cloud.children(&pre.id).await?;
+        let made = self.cloud.mkdir(to, name).await?;
+        self.crash_point()?;
+        store.try_write(|o| record_moved(o, &pre.id.0, &made))?;
+        let into = RemoteId(made.id.clone());
+        while !page.is_empty() {
+            let mut moved = 0usize;
+            for chunk in page.chunks(oneup_graph::client::BATCH_MAX) {
+                let metas: Vec<Meta> = chunk
+                    .iter()
+                    .map(|c| Meta::Move { pre: pre_of(c), to: into.clone(), name: c.name.clone() })
+                    .collect();
+                let results = self.cloud.batch(&metas).await;
+                self.crash_point()?;
+                for (c, r) in chunk.iter().zip(results) {
+                    let row = match r {
+                        Ok(MetaDone::Item(row)) => row,
+                        Err(CloudError::TooManyItems) => {
+                            Box::pin(self.rebuild(store, &pre_of(c), &into, &c.name)).await?
+                        }
+                        // A listing that still showed something already moved.
+                        Err(CloudError::Changed)
+                            if self.cloud.item(&RemoteId(c.id.clone())).await?.and_then(|r| r.parent_id)
+                                == Some(made.id.clone()) =>
+                        {
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                        Ok(MetaDone::Deleted) => return Err(odd()),
+                    };
+                    store.try_write(|o| record_moved(o, &c.id, &row))?;
+                    moved += 1;
+                }
+            }
+            if moved == 0 {
+                return Err(Fail::Failed("OneDrive still lists items already moved out of a folder".into()));
+            }
+            page = self.cloud.children(&pre.id).await?;
+        }
+        // Its eTag moved on with every item taken out.
+        let emptied = self.cloud.item(&pre.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
+        self.cloud.delete(&pre_of(&emptied)).await?;
+        self.crash_point()?;
+        // Nothing points at it any more: the Synced row follows the new
+        // folder, and its contents were recorded as moved.
+        store.try_write(|o| o.delete_subtree(&pre.id.0).map(|_| ()))?;
+        self.cloud.item(&into).await?.ok_or(Fail::Skip(Skip::Changed))
     }
 
     /// Runs one operation. `kept_instead` is set if an old copy the gate
@@ -970,6 +1052,33 @@ fn local_ok(o: &Ops<'_>, pre: &LocalPre) -> oneup_store::Result<bool> {
         None => matches!(row.kind, LocalKind::Folder | LocalKind::Root),
         Some((size, mtime)) => row.kind == LocalKind::File && row.size == size && row.mtime == mtime,
     })
+}
+
+/// The precondition for changing cloud item `r`: its current eTag.
+fn pre_of(r: &RemoteRow) -> RemotePre {
+    RemotePre { id: RemoteId(r.id.clone()), etag: r.etag.clone().unwrap_or_default() }
+}
+
+/// Records that cloud item `old` is now `row` (moved, or rebuilt under a
+/// new ID by [`Executor::rebuild`]): in the Remote tree if it is stored
+/// there (keeping whether it is excluded), and in the Synced row that
+/// stands for it.
+fn record_moved(o: &Ops<'_>, old: &str, row: &RemoteRow) -> Res {
+    use oneup_store::ItemState;
+    let excluded = match (o.item_state(old)?, o.item_state(&row.id)?) {
+        (ItemState::Included, _) | (_, ItemState::Included) => false,
+        (ItemState::Excluded, _) | (_, ItemState::Excluded) => true,
+        // Not stored (inside an excluded folder, or new since the last
+        // listing): the next listing brings it.
+        _ => return Ok(()),
+    };
+    o.upsert_item(row, excluded)?;
+    if let Some(mut b) = o.synced_by_remote(old)?.or(o.synced_by_remote(&row.id)?) {
+        b.remote = Some(RemoteId(row.id.clone()));
+        b.remote_etag = row.etag.clone().unwrap_or_default();
+        o.synced_put(&b)?;
+    }
+    Ok(())
 }
 
 fn remote_ok(o: &Ops<'_>, pre: &RemotePre) -> oneup_store::Result<bool> {

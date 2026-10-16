@@ -94,10 +94,16 @@ fn classify(status: u16, code: Option<String>) -> Option<CloudError> {
 
 /// A batched answer's status as the executor's outcome.
 fn map_status(a: &oneup_graph::client::BatchResp, what: String) -> CloudError {
+    if a.is_too_many_items() {
+        return CloudError::TooManyItems;
+    }
     classify(a.status, a.code()).unwrap_or_else(|| CloudError::Other(format!("{what}: HTTP {}", a.status)))
 }
 
 fn map(e: oneup_graph::Error) -> CloudError {
+    if e.is_too_many_items() {
+        return CloudError::TooManyItems;
+    }
     let classified = e.status().and_then(|s| classify(s, e.code()));
     classified.unwrap_or_else(|| CloudError::Other(e.to_string()))
 }
@@ -366,6 +372,11 @@ impl Cloud for GraphCloud {
             Some(it) => Ok(oneup_remote::ingest::to_row(&it)),
             None => Ok(None),
         }
+    }
+
+    async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
+        let page = self.graph.page(&self.graph.children_url(&id.0)).await.map_err(map)?;
+        Ok(page.value.iter().filter(|it| !it.is_deleted()).filter_map(oneup_remote::ingest::to_row).collect())
     }
 
     async fn prune(&self, pre: &RemotePre) -> Result<(), CloudError> {

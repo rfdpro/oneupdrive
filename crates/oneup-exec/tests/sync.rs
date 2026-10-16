@@ -47,6 +47,9 @@ struct State {
     copy_fails: bool,
     /// Sizes of the metadata batches sent.
     batches: Vec<usize>,
+    /// OneDrive's list view threshold: a folder with more items than this
+    /// below it can't be moved or renamed in one request.
+    threshold: Option<usize>,
 }
 
 impl State {
@@ -85,6 +88,17 @@ impl State {
             qxh: (!it.folder).then(|| qxh(&it.content)),
             mtime_ms: None,
         }
+    }
+    fn descendants(&self, id: &str) -> usize {
+        let mut todo = vec![id.to_string()];
+        let mut n = 0;
+        while let Some(p) = todo.pop() {
+            for (cid, _) in self.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)) {
+                n += 1;
+                todo.push(cid.clone());
+            }
+        }
+        n
     }
     fn create(&mut self, parent: &str, name: &str, folder: bool, content: Vec<u8>) -> String {
         let id = format!("r{}", self.bump());
@@ -297,12 +311,27 @@ impl Cloud for Fake {
         if s.child(&to.0, name).is_some_and(|c| c != pre.id.0) {
             return Err(CloudError::NameTaken);
         }
+        if s.threshold.is_some_and(|t| s.descendants(&pre.id.0) > t) {
+            return Err(CloudError::TooManyItems);
+        }
         let etag = s.bump();
         let it = s.items.get_mut(&pre.id.0).unwrap();
         it.parent = Some(to.0.clone());
         it.name = name.into();
         it.etag = etag;
         Ok(s.row(&pre.id.0))
+    }
+
+    async fn item(&self, id: &RemoteId) -> Result<Option<RemoteRow>, CloudError> {
+        let s = self.0.lock().unwrap();
+        Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
+    }
+
+    /// Three at a time, so a folder takes several listings.
+    async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
+        let s = self.0.lock().unwrap();
+        let ids = s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&id.0)).map(|(id, _)| id).take(3);
+        Ok(ids.map(|id| s.row(id)).collect())
     }
 
     async fn prune(&self, pre: &RemotePre) -> Result<(), CloudError> {
@@ -1665,6 +1694,108 @@ async fn everyday_renaming_and_moving_here_moves_in_onedrive_without_uploading_a
     assert!(!t.contains_key("/report.docx") && !t.contains_key("/projects/alpha") && !t.contains_key("/archive"));
     assert_eq!(cloud.uploaded(), sent, "moves and renames sent no content");
     assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// A folder with a large tree inside: more than the threshold the
+/// tests give OneDrive, and so is one of its subfolders.
+fn large_folder(s: &Sync) {
+    for i in 0..4 {
+        write(&s.p(&format!("Projects/Bookmarks/b{i}.html")), format!("bookmark {i}").as_bytes());
+        write(&s.p(&format!("Projects/Bookmarks/deep/d{i}.html")), format!("deep {i}").as_bytes());
+    }
+    write(&s.p("Projects/Bookmarks/deep/deeper/x.txt"), b"deepest");
+    write(&s.p("Projects/Bookmarks/small/s.txt"), b"small");
+    std::fs::create_dir_all(s.p("Archive")).unwrap();
+}
+
+/// A folder OneDrive won't move in one request (more items below it than
+/// its list view threshold) is moved anyway, item by item: everything
+/// arrives, nothing is uploaded again, and only the emptied folders are
+/// removed from OneDrive.
+#[tokio::test]
+async fn a_folder_too_large_to_move_at_once_is_moved_in_parts() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-move", cloud.clone());
+    large_folder(&s);
+    for i in 0..6 {
+        write(&s.p(&format!("Projects/Photos/p{i}.jpg")), format!("photo {i}").as_bytes());
+    }
+    s.settle().await;
+    let sent = cloud.uploaded();
+    let before = cloud.tree();
+    cloud.0.lock().unwrap().threshold = Some(5);
+
+    // Two at once: the moves go to OneDrive in one batch, which refuses both.
+    std::fs::rename(s.p("Projects/Bookmarks"), s.p("Archive/Bookmarks 2025")).unwrap();
+    std::fs::rename(s.p("Projects/Photos"), s.p("Projects/Photos 2025")).unwrap();
+    let batches = cloud.0.lock().unwrap().batches.len();
+    s.settle().await;
+    assert!(cloud.0.lock().unwrap().batches.len() > batches);
+
+    let t = cloud.tree();
+    for (from, to) in
+        [("/Projects/Bookmarks", "/Archive/Bookmarks 2025"), ("/Projects/Photos", "/Projects/Photos 2025")]
+    {
+        for (path, content) in before.iter().filter(|(p, _)| p.starts_with(from)) {
+            let moved = path.replacen(from, to, 1);
+            assert_eq!(t.get(&moved), Some(content), "{moved}: {:?}", names(&t));
+        }
+        assert!(!t.contains_key(from), "{:?}", names(&t));
+    }
+    assert_eq!(cloud.uploaded(), sent, "moves sent no content");
+    assert!(s.versions().is_empty(), "nothing was removed here");
+    assert_eq!(s.synced_part(local_tree(&s.dir.0)), s.synced_part(t));
+}
+
+/// The same move, with the process killed at every point of it: nothing is
+/// lost, and sync converges.
+#[tokio::test]
+async fn a_crash_while_moving_a_large_folder_in_parts_loses_nothing() {
+    for n in 0.. {
+        let cloud = Fake::new();
+        let mut s = Sync::on_disk(&format!("large-crash{n}"), cloud.clone());
+        large_folder(&s);
+        s.settle().await;
+        let contents: Vec<Vec<u8>> = cloud.tree().into_values().flatten().collect();
+        cloud.0.lock().unwrap().threshold = Some(5);
+        std::fs::rename(s.p("Projects/Bookmarks"), s.p("Archive/Bookmarks 2025")).unwrap();
+
+        s.exec.crash_after(Some(n));
+        let mut crashed = false;
+        for _ in 0..40 {
+            let r = s.attempt().await;
+            if r.halted.as_deref() == Some(CRASHED) {
+                crashed = true;
+                break;
+            }
+            assert!(r.halted.is_none() && r.failed.is_empty(), "crash point {n}: {r:?}");
+            if r.is_idle() && r.skipped.is_empty() {
+                break;
+            }
+        }
+        if !crashed {
+            assert!(n > 5, "only {n} crash points");
+            return;
+        }
+        let mut s = s.restart();
+        // Every folder planned each round: a crash right after the new
+        // folder is made leaves a move waiting for a folder to be synced,
+        // which planning from the dirty marks alone doesn't come back to.
+        for _ in 0..40 {
+            s.planned_rules.clear();
+            if s.round().await.is_idle() {
+                break;
+            }
+        }
+        let here = local_tree(&s.dir.0);
+        assert_eq!(s.synced_part(here.clone()), s.synced_part(cloud.tree()), "crash point {n}");
+        let here: Vec<Vec<u8>> = here.into_values().flatten().collect();
+        for c in &contents {
+            assert!(here.contains(c), "crash point {n}: {:?} isn't in the folder", String::from_utf8_lossy(c));
+        }
+        let problems = s.obs.store().read(|o| o.check_invariants()).unwrap();
+        assert!(problems.is_empty(), "crash point {n}: {problems:?}");
+    }
 }
 
 /// Changing only the case of a name, on either side, renames it on the
