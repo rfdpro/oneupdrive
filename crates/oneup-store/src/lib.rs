@@ -33,6 +33,7 @@
 
 use std::path::Path;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 pub mod local;
@@ -451,6 +452,16 @@ impl Store {
 
     fn init(mut conn: Connection, cache_kib: u32) -> Result<Self> {
         conn.busy_timeout(BUSY_WAIT)?;
+        // Names compared the way the rest of the engine compares them
+        // (`oneup_sync::fold`); SQLite's own `lower()` folds ASCII only. For
+        // queries only: the schema (triggers, indexes) must stay usable by
+        // every program that opens the file, which won't have it.
+        conn.create_scalar_function(
+            "oneup_fold",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|s| oneup_sync::fold(&s))),
+        )?;
         // The mirror is rebuildable from the cloud, so NORMAL durability (WAL)
         // is sufficient here. The future op journal will use FULL.
         conn.execute_batch(&format!(

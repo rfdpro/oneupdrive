@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn conflict_names_keep_the_extension_and_skip_taken_ones() {
-        let mut taken: BTreeSet<String> = ["report (conflict 1).docx".to_owned()].into();
+        let mut taken: BTreeSet<String> = [fold("report (conflict 1).docx")].into();
         assert_eq!(conflict_name("Report.docx", NodeKind::File, &mut taken), "Report (conflict 2).docx");
         assert_eq!(conflict_name(".gitignore", NodeKind::File, &mut taken), ".gitignore (conflict 1)");
         assert_eq!(
@@ -696,7 +696,7 @@ mod tests {
             "v1.2 (conflict 1)",
             "folders have no extension"
         );
-        assert!(taken.contains("report (conflict 2).docx"), "handed-out names are reserved");
+        assert!(taken.contains(&fold("report (conflict 2).docx")), "handed-out names are reserved");
     }
 
     #[test]

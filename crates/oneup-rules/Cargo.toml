@@ -9,6 +9,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# For `fold`: rules compare names as the rest of the engine does.
+oneup-sync = { path = "../oneup-sync" }
 thiserror = "2"
 
 [lints]

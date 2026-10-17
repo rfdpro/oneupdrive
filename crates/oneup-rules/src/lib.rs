@@ -8,7 +8,7 @@
 //!
 //! Pure: callers read the rule files.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 mod glob;
 mod pattern;
@@ -38,10 +38,11 @@ pub fn is_engine_dir(name: &str) -> bool {
 /// wherever such a folder is.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExcludeSet {
-    /// Lower-cased plain names.
-    folder_names: BTreeSet<String>,
-    /// Lower-cased wildcard patterns and their compiled form.
-    globs: Vec<(String, NameGlob)>,
+    /// Plain names, folded ([`oneup_sync::fold`]), each with the name as
+    /// shown (lower-cased).
+    folder_names: BTreeMap<String, String>,
+    /// Wildcard patterns: folded, as shown, and compiled.
+    globs: Vec<(String, String, NameGlob)>,
 }
 
 impl ExcludeSet {
@@ -56,7 +57,11 @@ impl ExcludeSet {
     }
 
     pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
-        Self { folder_names: names.into_iter().map(str::to_lowercase).collect(), globs: Vec::new() }
+        let mut set = Self::default();
+        for n in names {
+            set.folder_names.entry(oneup_sync::fold(n)).or_insert_with(|| n.to_lowercase());
+        }
+        set
     }
 
     /// Names, some of which may be wildcards (`*.egg-info`).
@@ -64,10 +69,10 @@ impl ExcludeSet {
         let mut set = Self::default();
         for p in patterns {
             let g = NameGlob::new(p);
-            let text = p.to_lowercase();
+            let key = oneup_sync::fold(p);
             match g.literal() {
-                Some(name) => _ = set.folder_names.insert(name),
-                None if !set.globs.iter().any(|(t, _)| *t == text) => set.globs.push((text, g)),
+                Some(name) => _ = set.folder_names.entry(name).or_insert_with(|| p.to_lowercase()),
+                None if !set.globs.iter().any(|(k, ..)| *k == key) => set.globs.push((key, p.to_lowercase(), g)),
                 None => {}
             }
         }
@@ -80,14 +85,14 @@ impl ExcludeSet {
         if self.is_empty() {
             return false;
         }
-        if self.folder_names.contains(&name.to_lowercase()) {
+        if self.folder_names.contains_key(&oneup_sync::fold(name)) {
             return true;
         }
         if self.globs.is_empty() {
             return false;
         }
         let name = glob::folded(name);
-        self.globs.iter().any(|(_, g)| g.matches_folded(&name))
+        self.globs.iter().any(|(.., g)| g.matches_folded(&name))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -96,8 +101,8 @@ impl ExcludeSet {
 
     /// The names and wildcards, lower-cased and sorted.
     pub fn patterns(&self) -> Vec<String> {
-        let mut all: Vec<String> = self.folder_names.iter().cloned().collect();
-        all.extend(self.globs.iter().map(|(t, _)| t.clone()));
+        let mut all: Vec<String> = self.folder_names.values().cloned().collect();
+        all.extend(self.globs.iter().map(|(_, shown, _)| shown.clone()));
         all.sort_unstable();
         all
     }
@@ -105,10 +110,16 @@ impl ExcludeSet {
     /// Stable description of the rules. When it changes between runs, stored
     /// state must be re-evaluated.
     pub fn fingerprint(&self) -> String {
-        let all = self.patterns();
+        let mut all: Vec<&str> = self.folder_names.keys().map(String::as_str).collect();
+        all.extend(self.globs.iter().map(|(k, ..)| k.as_str()));
+        all.sort_unstable();
         // v2: the engine folder (`ENGINE_DIR`) became excluded at the top
-        // level; stored trees made under v1 must be re-evaluated.
-        format!("v2:folders={}", all.join("/"))
+        // level; stored trees made under v1 must be re-evaluated. v3: names
+        // fold as Windows compares them (`oneup_sync::fold`), so a folder
+        // skipped under v2 may now be listed, or the reverse. An empty set
+        // matches nothing either way, so it keeps its v2 fingerprint: a data
+        // folder without folder rules has nothing to re-evaluate.
+        if all.is_empty() { "v2:folders=".into() } else { format!("v3:folders={}", all.join("/")) }
     }
 }
 
@@ -130,7 +141,9 @@ mod tests {
     fn wildcard_folder_names() {
         let r = ExcludeSet::from_patterns(["*.egg-info", "build"]);
         assert!(r.excludes_folder("Pkg.Egg-Info") && r.excludes_folder("BUILD") && !r.excludes_folder("src"));
-        assert_eq!(r.fingerprint(), "v2:folders=*.egg-info/build");
+        assert_eq!(r.fingerprint(), "v3:folders=*.EGG-INFO/BUILD");
+        assert_eq!(r.patterns(), ["*.egg-info", "build"]);
+        assert_eq!(ExcludeSet::none().fingerprint(), "v2:folders=", "unchanged: nothing to re-evaluate");
     }
 
     #[test]

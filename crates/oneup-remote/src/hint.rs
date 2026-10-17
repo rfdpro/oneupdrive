@@ -45,11 +45,12 @@ impl std::fmt::Debug for SplitHint {
     }
 }
 
-/// Lower-cases and normalizes a drive-relative path: always a leading `/`,
-/// never a trailing one (except the root itself, `/`), backslashes treated as
-/// separators. OneDrive and Windows compare names case-insensitively.
+/// Folds and normalizes a drive-relative path: always a leading `/`, never a
+/// trailing one (except the root itself, `/`), backslashes treated as
+/// separators. Names fold as OneDrive and Windows compare them
+/// ([`oneup_sync::fold`]).
 fn normalize(path: &str) -> String {
-    let parts: Vec<String> = path.split(['/', '\\']).filter(|p| !p.is_empty()).map(str::to_lowercase).collect();
+    let parts: Vec<String> = path.split(['/', '\\']).filter(|p| !p.is_empty()).map(oneup_sync::fold).collect();
     format!("/{}", parts.join("/"))
 }
 
@@ -125,6 +126,13 @@ mod tests {
         }
         assert_eq!((h.excluded_count(), h.folders_to_list()), (3, 6));
         assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn names_fold_as_windows_compares_them() {
+        let h = SplitHint::from_excluded_paths(["/Λογος/node_modules", "/\u{212A}it/node_modules"]);
+        assert!(h.leads_to_excluded("/ΛΟΓΟΣ") && h.leads_to_excluded("/λογοσ"));
+        assert!(!h.leads_to_excluded("/kit"), "Kelvin sign");
     }
 
     #[test]

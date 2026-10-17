@@ -210,10 +210,11 @@ const LOCAL_SYNCABLE: &str = "i.skip = 0 AND i.name_lossy = 0";
 /// matching cloud folder: `<notebook>.url` for a OneNote notebook,
 /// `<vault>.lnk` for the Personal Vault. Packages never sync, so their
 /// stand-ins don't either (they'd upload as stray files after moving over).
+/// Names compare as the planner compares them (`oneup_fold`, see `Store::init`).
 const STAND_IN: &str = "(i.kind = 0 AND (i.name LIKE '%.url' OR i.name LIKE '%.lnk') AND EXISTS (
        SELECT 1 FROM synced_item s JOIN remote_item r ON r.parent_id = s.remote_id
        WHERE s.local_id = i.parent_id AND r.kind = 3
-         AND lower(r.name) = lower(substr(i.name, 1, length(i.name) - 4))))";
+         AND oneup_fold(r.name) = oneup_fold(substr(i.name, 1, length(i.name) - 4))))";
 
 fn local_node(r: &Row<'_>) -> rusqlite::Result<LocalNode> {
     let id: Vec<u8> = r.get(0)?;
@@ -990,12 +991,15 @@ pub(crate) mod tests {
             // A notebook's shortcut stands in only beside its own notebook.
             o.local_put(&lrow(6, Some(1), "notes.URL", LocalKind::File))?;
             o.local_put(&lrow(7, Some(3), "notes.URL", LocalKind::File))?;
+            // Case beyond ASCII folds too, as Windows folds it.
+            o.upsert_item(&rrow("g", Some("d"), "Σημειώσεις", Kind::Package), false)?;
+            o.local_put(&lrow(8, Some(3), "ΣΗΜΕΙΏΣΕΙΣ.url", LocalKind::File))?;
             let names = |id| -> Result<Vec<String>> {
                 Ok(Trees::local_children(o, LocalId(id))?.into_iter().map(|n| n.name).collect())
             };
             assert_eq!(names(1)?.len(), 4, "f, d, Other.lnk and notes.URL: {:?}", names(1)?);
             assert!(!names(1)?.contains(&"Personal Vault.lnk".to_string()));
-            assert!(names(3)?.is_empty());
+            assert!(names(3)?.is_empty(), "{:?}", names(3)?);
             Ok(())
         })
         .unwrap();

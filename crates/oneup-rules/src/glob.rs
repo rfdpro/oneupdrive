@@ -1,8 +1,9 @@
 //! Wildcards within one name: `*` (any run of characters), `?` (one
 //! character) and `[...]` (one of a set: `[abc]`, ranges `[a-z]`, negated
 //! `[!a-z]` or `[^a-z]`). Compared case-insensitively, as Windows and
-//! OneDrive compare names. A name never contains a folder separator, so
-//! none of these cross one.
+//! OneDrive compare names ([`oneup_sync::fold`]; ranges apply to the folded
+//! characters). A name never contains a folder separator, so none of these
+//! cross one.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
@@ -18,9 +19,9 @@ pub struct NameGlob {
     toks: Vec<Tok>,
 }
 
-/// Lower-cases the way names are compared (Unicode simple lower case).
+/// Folds one character the way names are compared ([`oneup_sync::fold`]).
 pub(crate) fn fold(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
+    oneup_sync::fold_char(c)
 }
 
 /// `name` as patterns compare it ([`NameGlob::matches_folded`]).
@@ -178,8 +179,18 @@ mod tests {
 
     #[test]
     fn literal_patterns_are_recognised() {
-        assert_eq!(NameGlob::new("Node_Modules").literal().as_deref(), Some("node_modules"));
+        assert_eq!(NameGlob::new("Node_Modules").literal().as_deref(), Some("NODE_MODULES"));
         assert_eq!(NameGlob::new("*.tmp").literal(), None);
+    }
+
+    #[test]
+    fn names_compare_as_windows_compares_them() {
+        assert!(m("λογος", "ΛΟΓΟΣ") && m("λογοσ", "ΛΟΓΟΣ") && m("*ς", "ΟΔΟΣ"));
+        assert!(m("[σ]", "ς") && m("[α-ω]", "Σ"));
+        assert!(!m("kit", "\u{212A}it"), "Kelvin sign");
+        assert!(!m("ωmega", "\u{2126}mega"), "Ohm sign");
+        assert!(!m("i*", "İx") && !m("İ*", "ix"));
+        assert!(!m("strasse", "straße") && m("STRAßE", "straße"));
     }
 
     #[test]

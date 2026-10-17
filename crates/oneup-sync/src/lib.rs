@@ -23,7 +23,9 @@ pub mod op;
 mod resolve;
 
 pub use merge::conflict_name;
-pub use model::{Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold};
+pub use model::{
+    Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold, fold_char,
+};
 pub use op::{Dir, HoldReason, Link, LocalPre, Op, RemotePre, Vacates};
 
 /// Plans one round over the given Synced folders (each folder's *children*

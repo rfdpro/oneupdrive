@@ -186,10 +186,30 @@ pub trait Trees {
     }
 }
 
-/// Names are compared the way Windows and OneDrive do: case-insensitively.
+/// Names are compared the way Windows and OneDrive do: case-insensitively,
+/// one character at a time, each through its simple upper case, as NTFS's
+/// upcase table maps one character to one. A character whose upper case is
+/// more than one character (`ß` → `SS`) stays as it is. So "ΟΔΟΣ" and
+/// "οδος" are one name (whole-string lower-casing makes a word-final `Σ`
+/// into `ς`), while the Kelvin sign and `k`, or `İ` and `i`, are two. Every
+/// comparison of names or paths that stands for Windows' or OneDrive's
+/// should use this one, so no two parts disagree about whether names are
+/// the same.
 /// (Unicode normalisation is not folded; see `planner.md`.)
 pub fn fold(name: &str) -> String {
-    name.to_lowercase()
+    if name.is_ascii() {
+        return name.to_ascii_uppercase();
+    }
+    name.chars().map(fold_char).collect()
+}
+
+/// [`fold`] for one character.
+pub fn fold_char(c: char) -> char {
+    let mut up = c.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
 }
 
 /// A Synced row's local side as it is now. A detached row is "deleted":
@@ -206,5 +226,41 @@ pub fn remote_of<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Seen<RemoteNode>,
     match &b.remote {
         Some(id) => t.remote(id),
         None => Ok(Seen::Deleted),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_fold_as_windows_compares_them() {
+        let same =
+            [("ΟΔΟΣ.txt", "οδοσ.txt"), ("ΟΔΟΣ.txt", "οδος.txt"), ("Report.TXT", "report.txt"), ("Ärger", "ärger")];
+        for (a, b) in same {
+            assert_eq!(fold(a), fold(b), "{a} and {b}");
+        }
+        let different = [
+            ("\u{212A}it", "kit"),     // Kelvin sign
+            ("\u{2126}mega", "ωmega"), // Ohm sign
+            ("\u{2126}mega", "Ωmega"),
+            ("İ", "i"),
+            ("İ", "I"),
+            ("straße", "STRASSE"),
+            ("straße", "strasse"),
+        ];
+        for (a, b) in different {
+            assert_ne!(fold(a), fold(b), "{a} and {b}");
+        }
+        assert_eq!(fold("ß"), "ß");
+    }
+
+    #[test]
+    fn folding_maps_each_character_to_one_and_is_stable() {
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            let f = fold_char(c);
+            assert_eq!(fold_char(f), f, "{c:?}");
+            assert_eq!(fold(c.encode_utf8(&mut [0; 4])), f.to_string(), "{c:?}");
+        }
     }
 }

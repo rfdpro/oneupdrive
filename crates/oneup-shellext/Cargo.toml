@@ -12,6 +12,10 @@ authors.workspace = true
 name = "oneup_shell"
 crate-type = ["cdylib", "rlib"]
 
+[dependencies]
+# For `fold`: paths compare as the engine compares names. Pure, no I/O.
+oneup-sync = { path = "../oneup-sync" }
+
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [

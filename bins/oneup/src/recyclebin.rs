@@ -15,7 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// The original paths (lowercase, without `\\?\`) of what this Windows
+/// The original paths (folded as Windows compares names,
+/// `oneup_sync::fold`, and without `\\?\`) of what this Windows
 /// user sent to the Recycle Bin on the drive holding `root`. Empty if the
 /// bin can't be read.
 pub fn originals(root: &Path) -> Vec<String> {
@@ -38,7 +39,7 @@ pub fn originals(root: &Path) -> Vec<String> {
         if let Ok(bytes) = std::fs::read(e.path())
             && let Some(p) = parse(&bytes)
         {
-            out.push(p.to_lowercase());
+            out.push(oneup_sync::fold(&p));
         }
     }
     out
@@ -77,7 +78,7 @@ fn parse(b: &[u8]) -> Option<String> {
 /// Whether `path` (full, any case) is one of `originals` or inside one.
 pub fn sent(path: &Path, originals: &[String]) -> bool {
     let s = path.to_string_lossy();
-    let p = s.strip_prefix(r"\\?\").unwrap_or(&s).to_lowercase();
+    let p = oneup_sync::fold(s.strip_prefix(r"\\?\").unwrap_or(&s));
     originals.iter().any(|o| p == *o || (p.starts_with(o.as_str()) && p.as_bytes().get(o.len()) == Some(&b'\\')))
 }
 
@@ -114,10 +115,20 @@ mod tests {
 
     #[test]
     fn an_item_counts_as_sent_with_the_folder_it_was_in() {
-        let bin = vec![r"c:\users\x\onedrive\project".to_string()];
+        let bin = vec![oneup_sync::fold(r"c:\users\x\onedrive\project")];
         assert!(sent(Path::new(r"\\?\C:\Users\x\OneDrive\Project"), &bin));
         assert!(sent(Path::new(r"C:\Users\x\OneDrive\Project\apps\a.js"), &bin));
         assert!(!sent(Path::new(r"C:\Users\x\OneDrive\Project-2"), &bin), "a sibling sharing the prefix");
         assert!(!sent(Path::new(r"C:\Users\x\OneDrive"), &bin));
+    }
+
+    #[test]
+    fn paths_compare_as_windows_compares_them() {
+        // Deletion evidence: a recycled item must be the same name to
+        // Windows, never a look-alike.
+        let bin = vec![oneup_sync::fold(r"C:\Sync\οδος")];
+        assert!(sent(Path::new(r"C:\Sync\ΟΔΟΣ\a.txt"), &bin));
+        let bin = vec![oneup_sync::fold("C:\\Sync\\\u{212A}it.txt")];
+        assert!(!sent(Path::new(r"C:\Sync\kit.txt"), &bin), "Kelvin sign");
     }
 }

@@ -12,7 +12,7 @@ authors.workspace = true
 # The store implements the reconciler's read interface (`oneup_sync::Trees`)
 # over its tables; oneup-sync itself has no dependencies.
 oneup-sync = { path = "../oneup-sync" }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 thiserror = "2"
 
 [features]
