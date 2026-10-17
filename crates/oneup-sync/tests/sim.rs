@@ -1256,3 +1256,79 @@ fn folders_moved_into_each_other_dont_loop() {
     settle(&mut w, false);
     assert_converged(&w, &BTreeSet::new());
 }
+
+/// How a scenario takes an item away from one side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gone {
+    /// With evidence (a USN delete record, a delta `deleted` facet).
+    Deleted,
+    /// Without (hidden, or not found by a rescan or a mirror rebuild).
+    Missing,
+}
+
+fn take_local(w: &mut World, name: &str, how: Gone) {
+    let id = lid(w, name);
+    w.local.remove(&id);
+    if how == Gone::Deleted {
+        w.local_gone.insert(id);
+    }
+}
+
+fn take_remote(w: &mut World, name: &str, how: Gone) {
+    let id = rid(w, name);
+    w.remote.remove(&id);
+    if how == Gone::Deleted {
+        w.remote_gone.insert(id);
+    }
+}
+
+/// The plan for every folder, checked to be the same from the store.
+fn plan_both(w: &World) -> Vec<Op> {
+    let ops = plan(w, all_folders(w).unwrap_or_default()).unwrap_or_default();
+    assert_eq!(plan_from_store(w, Flow::TwoWay), ops, "the SQLite store planned differently");
+    ops
+}
+
+#[test]
+fn a_record_is_forgotten_only_when_both_sides_are_deleted() {
+    use Gone::{Deleted, Missing};
+    for (local, remote) in [(Deleted, Deleted), (Deleted, Missing), (Missing, Deleted), (Missing, Missing)] {
+        let mut w = synced();
+        let sid = w.bases.values().find(|b| b.name == "doc.txt").map(|b| b.sid);
+        take_local(&mut w, "doc.txt", local);
+        take_remote(&mut w, "doc.txt", remote);
+        let ops = plan_both(&w);
+        if (local, remote) == (Deleted, Deleted) {
+            assert!(sid.is_some_and(|s| ops == [Op::Forget(s)]), "{ops:?}");
+        } else {
+            assert!(ops.is_empty(), "{local:?}/{remote:?}: the record stays and nothing is held: {ops:?}");
+        }
+    }
+}
+
+#[test]
+fn a_folder_keeps_its_record_while_a_child_keeps_its_own() {
+    let mut w = synced();
+    take_local(&mut w, "inner.txt", Gone::Deleted);
+    take_remote(&mut w, "inner.txt", Gone::Missing);
+    take_local(&mut w, "Docs", Gone::Deleted);
+    take_remote(&mut w, "Docs", Gone::Deleted);
+    let ops = plan_both(&w);
+    assert!(ops.is_empty(), "{ops:?}");
+}
+
+/// Both sides hidden at once (moved into excluded folders, say), then back:
+/// the kept record still links them, so nothing is hashed, paired or copied.
+#[test]
+fn items_missing_on_both_sides_come_back_with_their_history() {
+    let before = synced();
+    let mut w = before.clone();
+    take_local(&mut w, "doc.txt", Gone::Missing);
+    take_remote(&mut w, "doc.txt", Gone::Missing);
+    settle(&mut w, false);
+    w.local.clone_from(&before.local);
+    w.remote.clone_from(&before.remote);
+    let ops = plan_both(&w);
+    assert!(ops.is_empty(), "{ops:?}");
+    assert_eq!(w.bases, before.bases);
+}

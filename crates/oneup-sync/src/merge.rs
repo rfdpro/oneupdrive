@@ -228,14 +228,18 @@ fn decide_synced<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: Base, adopted: Optio
             cx.out.push(hold(&b, HoldReason::MissingWithoutEvidence));
             Ok(())
         }
-        // Gone from both sides: nothing left to act on, only the record. A
+        // Deleted on both sides: nothing left to act on, only the record. A
         // folder's record goes last, once its children's records are gone.
-        _ => {
+        (Seen::Deleted, Seen::Deleted) => {
             if b.kind == NodeKind::File || !t.has_base_children(b.sid)? {
                 cx.out.push(Op::Forget(b.sid));
             }
             Ok(())
         }
+        // Missing on a side (hidden, or not found by a rescan or a mirror
+        // rebuild): the record is kept, so an item that reappears is matched
+        // with its history instead of looking new. Nothing to act on or hold.
+        (Seen::Missing, _) | (_, Seen::Missing) => Ok(()),
     }
 }
 

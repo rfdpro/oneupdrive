@@ -26,9 +26,9 @@ Changes are found per side by comparing against the Synced row. *Moved* means a 
 | **unchanged** | — | download (replace) | move locally | recycle locally (folders: once empty) |
 | **changed** | upload (replace) | equal hash → record; unknown → hash first; else **conflict: keep both** | move first, content next round | **re-create in the cloud** |
 | **moved** | move in the cloud | move first, content next round | same place → record; else the cloud's location wins (a move, not a loss) | **re-create in the cloud** |
-| **deleted** | delete in the cloud (to its recycle bin; folders: once empty) | **re-create locally** | **re-create locally** | forget |
+| **deleted** | delete in the cloud (to its recycle bin; folders: once empty) | **re-create locally** | **re-create locally** | forget the record (folders: once the records below are gone) |
 
-Missing on either side, with the other side present, means **hold**: report it, don't act.
+Missing on either side, with the other side present, means **hold**: report it, don't act. Missing on one side with the other deleted or missing too means **keep the record** and plan nothing: there is nothing to act on, and an item that reappears is matched with its history instead of looking new (a deletion on the other side then follows the table, so a change or a move made meanwhile still wins). Only deleted on both sides forgets a record.
 
 Principles behind the table:
 * **A change beats a deletion.** Deleting is only propagated for content the deleting side had last seen.
@@ -210,7 +210,7 @@ An in-memory model of a local disk (file IDs, atomic saves, recycle bin, version
 
 Seeds: `SIM_SEEDS=N` (default 200), `SIM_SEED=n` to replay one, `SIM_DEBUG=1` to print every round's operations and the final state, `SIM_STORE=0` to skip check 4 on long runs (building a database every round makes runs about 80× slower). Each seed is 25 rounds of random edits on both sides, using a small set of names with case variants so that collisions are frequent, followed by settling. Hundreds of thousands of seeds pass (300,000 in about 90 s in a release build without check 4; 20,000 with it). The same simulation covers one-way backups (`backups_send_this_pc_and_never_change_it`).
 
-Scenario tests pin the headline behaviours: first-sync adoption (identical files paired, different ones both kept); an atomic save updates the same cloud item (version history continues); a swap of two names renames rather than re-uploads; an edit beats a deletion; "missing without evidence" is held, never deleted; a missing sync folder halts everything; a folder deleted in the cloud survives for a new local file; folders moved into each other don't loop.
+Scenario tests pin the headline behaviours: first-sync adoption (identical files paired, different ones both kept); an atomic save updates the same cloud item (version history continues); a swap of two names renames rather than re-uploads; an edit beats a deletion; "missing without evidence" is held, never deleted; a record is forgotten only when both sides are deleted; a missing sync folder halts everything; a folder deleted in the cloud survives for a new local file; folders moved into each other don't loop.
 
 ## End-to-end tests (`crates/oneup-exec/tests/sync.rs`)
 A real temp folder goes through the real scanner, observer, planner, gate, effects and executor, with a fake cloud that enforces eTags and name conflicts. Rounds run until both sides are identical and a round changes nothing, and the store's invariants must hold. Besides the first sync, edits, deletions, renames, conflicts, the version store, busy files and parking, the `everyday_` tests take one scenario per thing people do in File Explorer and on the web.
