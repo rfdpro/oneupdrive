@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oneup_effects::LocalFs;
-use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, link_roots};
+use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, VersionMark, link_roots};
 use oneup_gate::{Choice, Context, Decision, Overflow, OverflowOutcome, Policy, review_in};
 use oneup_local::observe::Observer;
 use oneup_local::{Config, Scan};
@@ -50,6 +50,26 @@ struct State {
     /// OneDrive's list view threshold: a folder with more items than this
     /// below it can't be moved or renamed in one request.
     threshold: Option<usize>,
+    /// The next batched move of this item is made, but its answer is lost
+    /// and the request sent again on the old eTag (412).
+    lost_move: Option<String>,
+    /// The next folder listing first moves this item into that folder (a
+    /// user on the web, while a large folder is being moved).
+    wander: Option<(String, String)>,
+    /// The next replacing upload commits over this edit, made in OneDrive
+    /// after the upload's last check (Graph checks an upload session's
+    /// If-Match only when it starts).
+    race: Option<Vec<u8>>,
+    /// The version history: content by eTag, and the version each file's
+    /// last replacing upload went over.
+    old: BTreeMap<u64, Vec<u8>>,
+    replaced: BTreeMap<String, u64>,
+    /// Versions in the history can't be downloaded (a service error).
+    versions_fail: bool,
+    /// No room left: uploads and new folders are refused (as with HTTP
+    /// 507), and the requests refused counted (a batch counts once).
+    full: bool,
+    refused: u64,
 }
 
 impl State {
@@ -132,10 +152,13 @@ impl Fake {
         s.create(&parent, &name, content.is_none(), content.unwrap_or_default().to_vec())
     }
     fn edit(&self, path: &str, content: &[u8]) {
+        let id = resolve(&self.0.lock().unwrap(), path);
+        self.edit_id(&id, content);
+    }
+    fn edit_id(&self, id: &str, content: &[u8]) {
         let mut s = self.0.lock().unwrap();
-        let id = resolve(&s, path);
         let etag = s.bump();
-        let it = s.items.get_mut(&id).unwrap();
+        let it = s.items.get_mut(id).unwrap();
         let old = std::mem::replace(&mut it.content, content.to_vec());
         it.etag = etag;
         s.kept.push(old);
@@ -214,6 +237,24 @@ impl Fake {
     }
 }
 
+impl Fake {
+    /// [`Cloud::mkdir`], alone or in a batch.
+    fn make_dir(&self, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        let mut s = self.0.lock().unwrap();
+        if s.full {
+            return Err(CloudError::Full);
+        }
+        if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
+            return Err(CloudError::Changed);
+        }
+        if s.child(&parent.0, name).is_some() {
+            return Err(CloudError::NameTaken);
+        }
+        let id = s.create(&parent.0, name, true, vec![]);
+        Ok(s.row(&id))
+    }
+}
+
 fn resolve(s: &State, path: &str) -> String {
     let mut cur = "root".to_string();
     for part in path.split('/').filter(|p| !p.is_empty()) {
@@ -237,7 +278,10 @@ impl Cloud for Fake {
             }
             it.content.clone()
         };
-        out.write_all(&content)?;
+        // In pieces, as data arrives over the network.
+        for piece in content.chunks(4096) {
+            out.write_all(piece)?;
+        }
         Ok(None)
     }
 
@@ -253,15 +297,27 @@ impl Cloud for Fake {
         src.read_to_end(&mut content).map_err(|e| CloudError::Other(e.to_string()))?;
         assert_eq!(content.len() as i64, size);
         let mut s = self.0.lock().unwrap();
+        if s.full {
+            s.refused += 1;
+            return Err(CloudError::Full);
+        }
         s.uploaded += content.len() as u64;
         let id = match replace {
             Some(pre) => {
                 s.check(pre)?;
+                if let Some(theirs) = s.race.take() {
+                    drop(s);
+                    self.edit_id(&pre.id.0, &theirs);
+                    s = self.0.lock().unwrap();
+                }
                 let etag = s.bump();
                 let it = s.items.get_mut(&pre.id.0).unwrap();
+                let over = it.etag;
                 let old = std::mem::replace(&mut it.content, content);
                 it.etag = etag;
-                s.kept.push(old);
+                s.kept.push(old.clone());
+                s.old.insert(over, old);
+                s.replaced.insert(pre.id.0.clone(), over);
                 pre.id.0.clone()
             }
             None => {
@@ -304,15 +360,11 @@ impl Cloud for Fake {
     }
 
     async fn mkdir(&self, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
-        let mut s = self.0.lock().unwrap();
-        if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
-            return Err(CloudError::Changed);
+        let made = self.make_dir(parent, name);
+        if matches!(made, Err(CloudError::Full)) {
+            self.0.lock().unwrap().refused += 1;
         }
-        if s.child(&parent.0, name).is_some() {
-            return Err(CloudError::NameTaken);
-        }
-        let id = s.create(&parent.0, name, true, vec![]);
-        Ok(s.row(&id))
+        made
     }
 
     async fn move_item(&self, pre: &RemotePre, to: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
@@ -337,9 +389,45 @@ impl Cloud for Fake {
         Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
     }
 
+    /// Every replacement is checked afterwards, as a large one over Graph.
+    async fn version_mark(&self, pre: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
+        let s = self.0.lock().unwrap();
+        let it = s.check(pre)?;
+        Ok(Some(VersionMark { id: it.etag.to_string(), modified_ms: None, size: Some(it.content.len() as i64) }))
+    }
+
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+        let s = self.0.lock().unwrap();
+        let over = s.replaced.get(&id.0).filter(|e| e.to_string() != mark.id);
+        Ok(over.map(|e| VersionMark { id: e.to_string(), modified_ms: None, size: Some(s.old[e].len() as i64) }))
+    }
+
+    async fn download_version(
+        &self,
+        _: &RemoteId,
+        version: &str,
+        out: &mut (dyn Write + Send),
+    ) -> Result<u64, CloudError> {
+        let s = self.0.lock().unwrap();
+        if s.versions_fail {
+            return Err(CloudError::Other("HTTP 500".into()));
+        }
+        let content = s.old.get(&version.parse().unwrap()).cloned();
+        drop(s);
+        let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
+        out.write_all(&content)?;
+        Ok(content.len() as u64)
+    }
+
     /// Three at a time, so a folder takes several listings.
     async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
-        let s = self.0.lock().unwrap();
+        let mut s = self.0.lock().unwrap();
+        if let Some((item, to)) = s.wander.take() {
+            let etag = s.bump();
+            let it = s.items.get_mut(&item).unwrap();
+            it.parent = Some(to);
+            it.etag = etag;
+        }
         let ids = s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&id.0)).map(|(id, _)| id).take(3);
         Ok(ids.map(|id| s.row(id)).collect())
     }
@@ -386,10 +474,22 @@ impl Cloud for Fake {
         for (m, ok) in ops.iter().zip(before) {
             out.push(match (m, ok) {
                 (_, Err(e)) => Err(e),
-                (Meta::Mkdir { parent, name }, Ok(())) => self.mkdir(parent, name).await.map(MetaDone::Item),
-                (Meta::Move { pre, to, name }, Ok(())) => self.move_item(pre, to, name).await.map(MetaDone::Item),
+                (Meta::Mkdir { parent, name }, Ok(())) => self.make_dir(parent, name).map(MetaDone::Item),
+                (Meta::Move { pre, to, name }, Ok(())) => {
+                    let done = self.move_item(pre, to, name).await.map(MetaDone::Item);
+                    let mut s = self.0.lock().unwrap();
+                    if done.is_ok() && s.lost_move.as_deref() == Some(pre.id.0.as_str()) {
+                        s.lost_move = None;
+                        Err(CloudError::Changed)
+                    } else {
+                        done
+                    }
+                }
                 (Meta::Delete { pre }, Ok(())) => Cloud::delete(self, pre).await.map(|()| MetaDone::Deleted),
             });
+        }
+        if out.iter().any(|r| matches!(r, Err(CloudError::Full))) {
+            self.0.lock().unwrap().refused += 1;
         }
         out
     }
@@ -559,6 +659,12 @@ impl Sync {
 
     /// A round that may halt (an injected crash).
     async fn attempt(&mut self) -> Report {
+        self.attempt_checked(&|_| true).await
+    }
+
+    /// [`Sync::attempt`], the executor asking `may_run` before each
+    /// operation (as the agent's pause does).
+    async fn attempt_checked(&mut self, may_run: &(dyn Fn(&Op) -> bool + std::marker::Sync)) -> Report {
         self.obs.catch_up().unwrap();
         let store = self.obs.store_mut();
         self.cloud.pull(store);
@@ -600,18 +706,20 @@ impl Sync {
         let count = |n: usize| {
             counted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         };
-        let report = self.exec.run_counted(store, r.approved, &count).await;
+        let report = self.exec.run_checked(store, r.approved, &count, may_run).await;
         // Progress counts every operation once, batched or not.
         if report.halted.is_none() {
             let counted = counted.into_inner();
             assert_eq!(counted, planned, "progress count");
-            assert_eq!(counted, report.done.len() + report.skipped.len() + report.failed.len());
+            let ended = report.done.len() + report.skipped.len() + report.failed.len() + report.not_run.len();
+            assert_eq!(counted, ended);
         }
         // A halted round (a crash) leaves its marks, as a killed process
         // would. A skipped operation (say, a file held open) left nothing behind to
-        // mark its folder again, so its marks stay for the retry; so does a
-        // batch waiting for the user's decision (as `oneup sync` does).
-        if report.halted.is_none() && report.skipped.is_empty() && !awaiting {
+        // mark its folder again, so its marks stay for the retry; so do a
+        // batch waiting for the user's decision and what wasn't run (as
+        // `oneup sync` does).
+        if report.halted.is_none() && report.skipped.is_empty() && report.not_run.is_empty() && !awaiting {
             store.write(|o| o.dirty_clear(scope.upto)).unwrap();
             self.planned_rules = fingerprint;
         }
@@ -791,6 +899,105 @@ async fn changes_on_both_sides_propagate_and_removals_are_recoverable() {
     assert!(s.versions().contains(&b"cloud c".to_vec()));
     // The cloud kept the old version of the edited file.
     assert!(cloud.holds(b"v1"));
+}
+
+/// Graph checks a large upload's If-Match only when its session starts,
+/// and the upload re-checks the eTag just before it commits. An edit that
+/// lands in OneDrive between the two is gone over: it is kept as a
+/// conflict copy, not only in the file's version history.
+#[tokio::test]
+async fn an_edit_in_onedrive_that_an_upload_went_over_is_kept_as_a_copy() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    let mut kept = Vec::new();
+    for _ in 0..5 {
+        kept.extend(s.round().await.kept_theirs.into_iter().map(|(_, name)| name));
+        if !kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(kept, ["notes (conflict 1).txt"]);
+    s.settle().await;
+    for t in [local_tree(&s.dir.0), cloud.tree()] {
+        assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]));
+        assert_eq!(t["/notes (conflict 1).txt"].as_deref(), Some(&b"theirs"[..]));
+        assert_eq!(t.len(), 2, "{:?}", names(&t));
+    }
+    // Without a race, a replacement keeps nothing extra.
+    write(&s.p("notes.txt"), b"mine, again");
+    s.settle().await;
+    assert_eq!(cloud.tree().len(), 2);
+}
+
+/// The kept edit takes the first conflict name free, names compared as
+/// Windows compares them.
+#[tokio::test]
+async fn a_kept_edit_takes_the_first_conflict_name_not_taken() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-names", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    write(&s.p("notes (conflict 1).txt"), b"one");
+    write(&s.p("NOTES (CONFLICT 2).TXT"), b"two");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    let mut kept = Vec::new();
+    for _ in 0..5 {
+        kept.extend(s.round().await.kept_theirs.into_iter().map(|(_, name)| name));
+        if !kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(kept, ["notes (conflict 3).txt"]);
+    s.settle().await;
+    assert_eq!(cloud.tree()["/notes (conflict 3).txt"].as_deref(), Some(&b"theirs"[..]));
+}
+
+/// An edit an upload went over that can't be kept as a new file (its
+/// version won't download): the upload is still done, counted as such and
+/// not as a failure, and the edit is reported as not kept. It stays in the
+/// file's version history.
+#[tokio::test]
+async fn an_upload_over_an_edit_that_cant_be_kept_is_still_done() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-unkept", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        st.race = Some(b"theirs".to_vec());
+        st.versions_fail = true;
+    }
+    let mut not_kept = Vec::new();
+    for _ in 0..5 {
+        // `round` also checks nothing failed.
+        let r = s.round().await;
+        for (op, why) in &r.theirs_not_kept {
+            assert!(matches!(op, Op::Upload { replace: Some(_), .. }), "{op:?}");
+            assert!(r.done.contains(op), "the upload counts as done: {r:?}");
+            assert!(why.contains("the file's version history in OneDrive has that edit"), "{why}");
+        }
+        assert!(r.kept_theirs.is_empty(), "{r:?}");
+        not_kept.extend(r.theirs_not_kept);
+        if !not_kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(not_kept.len(), 1);
+    s.settle().await;
+    for t in [local_tree(&s.dir.0), cloud.tree()] {
+        assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]));
+        assert_eq!(t.len(), 1, "{:?}", names(&t));
+    }
+    assert!(cloud.0.lock().unwrap().old.values().any(|v| v == b"theirs"), "in the version history");
 }
 
 /// Server-side copy: a new local file whose content OneDrive
@@ -977,6 +1184,143 @@ async fn a_file_held_open_is_retried_not_forced() {
     drop(held);
     s.settle().await;
     assert_eq!(std::fs::read(s.p("locked.txt")).unwrap(), b"two");
+}
+
+/// A pause of changes to OneDrive that comes while a round runs stops the
+/// round's OneDrive changes before the next one, batched or not: the rest
+/// aren't run (neither skipped nor failed), changes to this PC go on, and
+/// resuming plans the rest again from the marks.
+#[tokio::test]
+async fn a_pause_mid_round_stops_that_sides_operations_and_resuming_finishes_them() {
+    use oneup_gate::Side;
+    let cloud = Fake::new();
+    cloud.add("from-cloud.txt", Some(b"cloud"));
+    let mut s = Sync::new("pause", cloud.clone());
+    for d in ["a", "b", "c", "d"] {
+        std::fs::create_dir_all(s.p(d)).unwrap();
+    }
+    for f in ["1.txt", "2.txt", "3.txt"] {
+        write(&s.p(f), f.as_bytes());
+    }
+    // Paused once five of the seven OneDrive changes were let through, in
+    // the middle of the four new folders, which would go in one batch
+    // (asked again, those let through still may: the executor can ask twice).
+    let allowed = Mutex::new(Vec::<Op>::new());
+    let may_run = |op: &Op| {
+        let mut a = allowed.lock().unwrap();
+        if Side::changed_by(op) != Some(Side::Remote) || a.contains(op) {
+            return true;
+        }
+        if a.len() < 5 {
+            a.push(op.clone());
+            return true;
+        }
+        false
+    };
+    let r = s.attempt_checked(&may_run).await;
+    assert!(r.halted.is_none() && r.failed.is_empty() && r.skipped.is_empty(), "{r:?}");
+    assert_eq!(r.not_run.len(), 2, "{r:?}");
+    assert!(r.not_run.iter().all(|op| Side::changed_by(op) == Some(Side::Remote)));
+    let made = |t: &Tree| {
+        let all = ["/a", "/b", "/c", "/d", "/1.txt", "/2.txt", "/3.txt"];
+        all.iter().filter(|p| t.contains_key(**p)).count()
+    };
+    assert_eq!(made(&cloud.tree()), 5, "only what went before the pause");
+    assert_eq!(std::fs::read(s.p("from-cloud.txt")).unwrap(), b"cloud", "this PC's side went on");
+
+    s.settle().await;
+    assert_eq!(made(&cloud.tree()), 7);
+}
+
+/// A download under way when changes to this PC are paused stops as its
+/// next data arrives: nothing is placed, its staging file goes, and it's
+/// done again once resumed.
+#[tokio::test]
+async fn a_pause_stops_a_download_under_way_without_placing_anything() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let big: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let cloud = Fake::new();
+    cloud.add("big.bin", Some(&big));
+    let mut s = Sync::new("pause-download", cloud.clone());
+    // Asked before it starts, then at each piece: paused after the first.
+    let asked = AtomicUsize::new(0);
+    let may_run = |op: &Op| !matches!(op, Op::Download { .. }) || asked.fetch_add(1, Relaxed) < 2;
+    let r = s.attempt_checked(&may_run).await;
+    assert!(r.halted.is_none() && r.failed.is_empty() && r.skipped.is_empty(), "{r:?}");
+    assert!(matches!(r.not_run.as_slice(), [Op::Download { .. }]), "{r:?}");
+    assert_eq!(asked.load(Relaxed), 3, "stopped at the second of 16 pieces");
+    assert!(!s.p("big.bin").exists());
+    assert_eq!(std::fs::read_dir(s.p(".oneup/staging")).unwrap().count(), 0, "no partial download left");
+
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("big.bin")).unwrap(), big);
+}
+
+/// A full OneDrive refuses an upload: the round sends no other upload
+/// (each is skipped, not failed, so it's tried again once there's room),
+/// and downloads go on.
+#[tokio::test]
+async fn a_full_onedrive_stops_the_rounds_uploads_while_downloads_go_on() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("full", cloud.clone());
+    write(&s.p("old.txt"), b"synced before");
+    s.settle().await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(&s.p(name), name.as_bytes());
+    }
+    cloud.add("d.txt", Some(b"from the cloud"));
+    cloud.0.lock().unwrap().full = true;
+    let refused = |c: &Fake| c.0.lock().unwrap().refused;
+    let r = s.round().await;
+    let full = r.skipped.iter().filter(|(op, k)| *k == oneup_exec::Skip::CloudFull && matches!(op, Op::Upload { .. }));
+    assert_eq!(full.count(), 3, "{r:?}");
+    assert_eq!(refused(&cloud), 1, "only the first upload was sent");
+    assert!(r.done.iter().any(|op| matches!(op, Op::Download { .. })), "{r:?}");
+    assert_eq!(std::fs::read(s.p("d.txt")).unwrap(), b"from the cloud");
+
+    // Room again: they go.
+    cloud.0.lock().unwrap().full = false;
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(t["/b.txt"].as_deref(), Some(&b"b.txt"[..]));
+    assert_eq!(refused(&cloud), 1);
+}
+
+/// A full OneDrive refuses new folders too, also in a batch: after the
+/// first refused request, batched or not, the round sends no other folder
+/// creation or upload (each is skipped as CloudFull, to be tried again
+/// once there's room), and downloads go on.
+#[tokio::test]
+async fn a_full_onedrive_stops_the_rounds_new_folders_and_uploads_batched_or_not() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("full-batch", cloud.clone());
+    write(&s.p("old.txt"), b"synced before");
+    s.settle().await;
+    // More new folders than one batch takes, and new files.
+    let folders: Vec<String> = (0..oneup_graph::client::BATCH_MAX + 5).map(|k| format!("d{k:02}")).collect();
+    for d in &folders {
+        std::fs::create_dir_all(s.p(d)).unwrap();
+    }
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(&s.p(name), name.as_bytes());
+    }
+    cloud.add("e.txt", Some(b"from the cloud"));
+    cloud.0.lock().unwrap().full = true;
+    let r = s.round().await;
+    assert_eq!(cloud.0.lock().unwrap().refused, 1, "one refused request, then none: {r:?}");
+    let held = |op: &Op| matches!(op, Op::Upload { .. } | Op::MkdirRemote { .. });
+    let full = r.skipped.iter().filter(|(op, k)| *k == oneup_exec::Skip::CloudFull && held(op));
+    assert_eq!(full.count(), folders.len() + 3, "{r:?}");
+    assert!(!r.done.iter().any(held), "{r:?}");
+    assert!(r.done.iter().any(|op| matches!(op, Op::Download { .. })), "{r:?}");
+    assert_eq!(std::fs::read(s.p("e.txt")).unwrap(), b"from the cloud");
+
+    // Room again: they go.
+    cloud.0.lock().unwrap().full = false;
+    s.settle().await;
+    let t = cloud.tree();
+    assert!(folders.iter().all(|d| t.get(&format!("/{d}")) == Some(&None)), "{:?}", names(&t));
+    assert_eq!(t["/c.txt"].as_deref(), Some(&b"c.txt"[..]));
 }
 
 /// Every content the crash scenario ever writes, on either side.
@@ -1831,6 +2175,117 @@ async fn everyday_moving_into_a_new_folder_follows_both_ways() {
     assert!(!t.contains_key("/projects/alpha") && !t.contains_key("/notes.txt") && !t.contains_key("/photos"));
     assert_eq!(cloud.uploaded(), sent, "moves sent no content");
     assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// Moves `Projects/Bookmarks` (from [`large_folder`]) to
+/// `Projects/Bookmarks 2025` here and runs rounds until OneDrive no longer
+/// has the original: the move in parts is done, and the store is as it
+/// left it (no listing since).
+async fn move_large_folder_in_parts(s: &mut Sync) {
+    std::fs::rename(s.p("Projects/Bookmarks"), s.p("Projects/Bookmarks 2025")).unwrap();
+    for _ in 0..20 {
+        s.round().await;
+        if !s.cloud.tree().contains_key("/Projects/Bookmarks") {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the large folder wasn't moved: {:?}", names(&s.cloud.tree()));
+}
+
+/// Whether the store holds deletion evidence for cloud item `id`.
+fn noted_deleted(s: &Sync, id: &str) -> bool {
+    use oneup_sync::{Seen, Trees};
+    let seen = s.obs.store().read(|o| o.remote(&RemoteId(id.into()))).unwrap();
+    matches!(seen, Seen::Deleted)
+}
+
+/// A move in parts whose answer is lost (Graph sends it again, on an eTag
+/// that moved on: 412) is recorded where the item now is, so removing the
+/// emptied original records no deletion of it.
+#[tokio::test]
+async fn a_lost_answer_while_moving_a_large_folder_in_parts_is_recorded_as_moved() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-lost", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    let before = cloud.tree();
+    let child = resolve(&cloud.0.lock().unwrap(), "Projects/Bookmarks/b0.html");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        st.threshold = Some(5);
+        st.lost_move = Some(child.clone());
+    }
+
+    move_large_folder_in_parts(&mut s).await;
+    assert!(cloud.0.lock().unwrap().lost_move.is_none(), "the answer was lost");
+    let made = resolve(&cloud.0.lock().unwrap(), "Projects/Bookmarks 2025");
+    let row = s.obs.store().read(|o| o.get_item(&child)).unwrap();
+    assert_eq!(row.and_then(|r| r.parent_id), Some(made), "recorded in the new folder");
+    assert!(!noted_deleted(&s, &child), "no deletion recorded for an item OneDrive still has");
+
+    s.settle().await;
+    let t = cloud.tree();
+    for (path, content) in before.iter().filter(|(p, _)| p.starts_with("/Projects/Bookmarks")) {
+        let moved = path.replacen("/Projects/Bookmarks", "/Projects/Bookmarks 2025", 1);
+        assert_eq!(t.get(&moved), Some(content), "{moved}: {:?}", names(&t));
+    }
+    assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// An item moved elsewhere on the web while its large folder is being
+/// moved in parts is still stored below the emptied original when that is
+/// removed: no deletion is recorded for it, and it follows its move here.
+#[tokio::test]
+async fn an_item_moved_away_while_a_large_folder_is_moved_in_parts_is_not_deleted() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-wander", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    let child = resolve(&cloud.0.lock().unwrap(), "Projects/Bookmarks/b0.html");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        let projects = resolve(&st, "Projects");
+        st.threshold = Some(5);
+        st.wander = Some((child.clone(), projects));
+    }
+
+    move_large_folder_in_parts(&mut s).await;
+    assert!(cloud.0.lock().unwrap().wander.is_none(), "it was moved away");
+    assert!(!noted_deleted(&s, &child), "no deletion recorded for an item OneDrive still has");
+
+    s.settle().await;
+    let here = local_tree(&s.dir.0);
+    assert_eq!(here.get("/Projects/b0.html"), Some(&Some(b"bookmark 0".to_vec())), "{:?}", names(&here));
+    assert!(here.contains_key("/Projects/Bookmarks 2025/deep/deeper/x.txt"), "{:?}", names(&here));
+    assert!(s.versions().is_empty(), "nothing was removed here");
+}
+
+/// Changing only the case of a large folder's name can't be done in parts
+/// (the new folder can't sit next to the original under the same name):
+/// it is reported as failed, and nothing changes in OneDrive.
+#[tokio::test]
+async fn a_case_only_rename_of_a_large_folder_is_reported() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-case", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    let before = cloud.tree();
+    cloud.0.lock().unwrap().threshold = Some(5);
+
+    std::fs::rename(s.p("Projects/Bookmarks"), s.p("Projects/bookmarks")).unwrap();
+    let mut failed = Vec::new();
+    for _ in 0..20 {
+        let r = s.attempt().await;
+        assert!(r.halted.is_none() && r.skipped.is_empty(), "{r:?}");
+        failed = r.failed;
+        if !failed.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(failed.iter().any(|(_, why)| why.contains("case")), "{failed:?}");
+    assert_eq!(cloud.tree(), before, "nothing changed in OneDrive");
 }
 
 /// Changing only the case of a name, on either side, renames it on the

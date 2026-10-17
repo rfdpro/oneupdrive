@@ -38,7 +38,7 @@ pub fn set(store: &mut Store, flow: Flow) -> Result<usize> {
             for sid in o.synced_gone_locally()? {
                 // A folder whose rows below it stay (something in it is
                 // still here) keeps its own row too.
-                if sid != oneup_sync::ROOT && o.synced_children(sid)?.is_empty() && o.synced_remove(sid)? {
+                if sid != oneup_sync::ROOT && !o.synced_has_children(sid)? && o.synced_remove(sid)? {
                     n += 1;
                 }
             }

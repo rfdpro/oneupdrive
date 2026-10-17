@@ -9,7 +9,7 @@ use oneup_app::config::{self, Rules};
 use oneup_app::rulefiles;
 use oneup_plan::names;
 use oneup_rules::{ENGINE_DIR, PRESETS, Source, Verdict, preset};
-use oneup_store::{LocalKind, LocalRow, Skip, Store};
+use oneup_store::{LocalKind, LocalRow, RetryItem, Skip, Store};
 
 /// The changes asked for on the command line.
 #[derive(Debug, Default)]
@@ -346,6 +346,28 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
             };
             println!("  {state}");
         }
+    }
+    // A failed operation waiting its turn (`oneup_app::backoff`), on this
+    // PC's item or OneDrive's.
+    let remote = match &row {
+        Some(r) => store.read(|o| o.synced_by_local(r.file_id))?.and_then(|b| b.remote),
+        None if listed => oneup_app::sync::find_remote(store, &format!("{}/{rel}", pair.remote.trim_end_matches('/')))?
+            .map(oneup_sync::RemoteId),
+        None => None,
+    };
+    let failed = store.read(|o| {
+        let mut v = Vec::new();
+        if let Some(r) = &row {
+            v.extend(o.retry_get(RetryItem::Local(oneup_sync::LocalId(r.file_id)))?);
+        }
+        if let Some(id) = &remote {
+            v.extend(o.retry_get(RetryItem::Remote(id))?);
+        }
+        Ok(v)
+    })?;
+    let now = oneup_app::control::now_ms();
+    for r in failed {
+        println!("  {}", oneup_app::backoff::describe(&r, now));
     }
     let last = store.read(|o| o.activity_recent(Some(&format!("/{rel}")), 1))?;
     if let Some(e) = last.first() {

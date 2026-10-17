@@ -117,20 +117,27 @@ fn unstaged(name: &str) -> Option<&str> {
 
 /// `name (conflict N).ext`, with N chosen so the folded result isn't in
 /// `taken` (which it then joins).
-pub(crate) fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -> String {
-    let (stem, ext) = match (kind, name.rfind('.')) {
-        // A leading dot (".gitignore") is part of the stem, not an extension.
-        (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
-        _ => (name, ""),
-    };
+pub fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -> String {
     let mut n = 1u32;
     loop {
-        let candidate = format!("{stem} (conflict {n}){ext}");
+        let candidate = conflict_candidate(name, kind, n);
         if taken.insert(fold(&candidate)) {
             return candidate;
         }
         n += 1;
     }
+}
+
+/// The `n`th name [`conflict_name`] tries: `name (conflict N).ext`. For a
+/// caller that asks whether each is taken instead of listing every name
+/// in the folder first.
+pub fn conflict_candidate(name: &str, kind: NodeKind, n: u32) -> String {
+    let (stem, ext) = match (kind, name.rfind('.')) {
+        // A leading dot (".gitignore") is part of the stem, not an extension.
+        (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    format!("{stem} (conflict {n}){ext}")
 }
 
 struct Ctx<'t, T: Trees + ?Sized> {
@@ -228,14 +235,18 @@ fn decide_synced<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: Base, adopted: Optio
             cx.out.push(hold(&b, HoldReason::MissingWithoutEvidence));
             Ok(())
         }
-        // Gone from both sides: nothing left to act on, only the record. A
+        // Deleted on both sides: nothing left to act on, only the record. A
         // folder's record goes last, once its children's records are gone.
-        _ => {
-            if b.kind == NodeKind::File || t.base_children(b.sid)?.is_empty() {
+        (Seen::Deleted, Seen::Deleted) => {
+            if b.kind == NodeKind::File || !t.has_base_children(b.sid)? {
                 cx.out.push(Op::Forget(b.sid));
             }
             Ok(())
         }
+        // Missing on a side (hidden, or not found by a rescan or a mirror
+        // rebuild): the record is kept, so an item that reappears is matched
+        // with its history instead of looking new. Nothing to act on or hold.
+        (Seen::Missing, _) | (_, Seen::Missing) => Ok(()),
     }
 }
 
@@ -465,7 +476,7 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
     // first, each under its own preconditions. Their Synced rows must be
     // settled first too: deleting the folder drops its row, and a child row
     // left pointing at it would never be planned again.
-    if b.kind == NodeKind::File || (t.remote_children(&r.id)?.is_empty() && t.base_children(b.sid)?.is_empty()) {
+    if b.kind == NodeKind::File || (!t.has_remote_children(&r.id)? && !t.has_base_children(b.sid)?) {
         cx.out.push(Op::DeleteRemote { sid: b.sid, remote: rpre(&r) });
     }
     Ok(())
@@ -490,7 +501,7 @@ fn remote_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode) -
         });
         return Ok(());
     }
-    if b.kind == NodeKind::File || (t.local_children(l.id)?.is_empty() && t.base_children(b.sid)?.is_empty()) {
+    if b.kind == NodeKind::File || (!t.has_local_children(l.id)? && !t.has_base_children(b.sid)?) {
         cx.out.push(Op::RecycleLocal { sid: b.sid, local: lpre(&l) });
     }
     Ok(())
@@ -684,7 +695,7 @@ mod tests {
 
     #[test]
     fn conflict_names_keep_the_extension_and_skip_taken_ones() {
-        let mut taken: BTreeSet<String> = ["report (conflict 1).docx".to_owned()].into();
+        let mut taken: BTreeSet<String> = [fold("report (conflict 1).docx")].into();
         assert_eq!(conflict_name("Report.docx", NodeKind::File, &mut taken), "Report (conflict 2).docx");
         assert_eq!(conflict_name(".gitignore", NodeKind::File, &mut taken), ".gitignore (conflict 1)");
         assert_eq!(
@@ -692,7 +703,7 @@ mod tests {
             "v1.2 (conflict 1)",
             "folders have no extension"
         );
-        assert!(taken.contains("report (conflict 2).docx"), "handed-out names are reserved");
+        assert!(taken.contains(&fold("report (conflict 2).docx")), "handed-out names are reserved");
     }
 
     #[test]

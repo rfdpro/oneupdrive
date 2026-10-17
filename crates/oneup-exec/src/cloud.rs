@@ -38,6 +38,10 @@ pub enum CloudError {
     /// executor moves it in parts instead.
     #[error("OneDrive won't move a folder with this many items in one go")]
     TooManyItems,
+    /// The OneDrive has no room left (HTTP 507, `quotaLimitReached`,
+    /// `insufficientStorage`). Nothing was changed; uploads wait for room.
+    #[error("OneDrive is full")]
+    Full,
     /// Writing the downloaded content locally failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -65,6 +69,16 @@ pub enum MetaDone {
 /// A content hash (QuickXorHash).
 pub type Hash = [u8; 20];
 
+/// One version of a file in OneDrive's version history, as the history
+/// lists it ([`Cloud::version_mark`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionMark {
+    pub id: String,
+    /// When it was saved (Unix milliseconds).
+    pub modified_ms: Option<i64>,
+    pub size: Option<i64>,
+}
+
 pub trait Cloud: Send + Sync {
     /// Streams the content of file `pre.id` into `out`, provided its eTag
     /// is still `pre.etag`. `Some(hash)`: the content was transformed on
@@ -90,6 +104,40 @@ pub trait Cloud: Send + Sync {
         size: i64,
         src: &mut (dyn Read + Send),
     ) -> impl Future<Output = Result<(RemoteRow, Option<Hash>), CloudError>> + Send;
+
+    /// Before replacing file `pre` with `size` bytes: the version it holds
+    /// now, if the replacement can commit without its precondition being
+    /// checked then. Graph checks an upload session's `If-Match` only when
+    /// the session starts; [`Cloud::upload`] re-checks the eTag before the
+    /// last fragment, which leaves a moment for an edit in OneDrive to land
+    /// first. `None`: nothing to check afterwards (a one-request upload
+    /// commits under its `If-Match`). No default, like
+    /// [`Cloud::children`]: a wrapper that didn't pass it on would lose the
+    /// check without any test noticing.
+    fn version_mark(
+        &self,
+        pre: &RemotePre,
+        size: i64,
+    ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
+
+    /// After replacing file `id`, which held `mark`'s version: the version
+    /// the replacement went over, if it was another one (an edit that
+    /// reached OneDrive while the upload committed). `None`: it went over
+    /// `mark`'s, as planned, or the history can't tell. Read-only.
+    fn replaced_other(
+        &self,
+        id: &RemoteId,
+        mark: &VersionMark,
+    ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
+
+    /// Streams the content of version `version` of file `id` into `out`;
+    /// returns its size. Read-only.
+    fn download_version(
+        &self,
+        id: &RemoteId,
+        version: &str,
+        out: &mut (dyn Write + Send),
+    ) -> impl Future<Output = Result<u64, CloudError>> + Send;
 
     /// Whether [`Cloud::copy`] can stand in for an upload of the same
     /// content (not for a vault: equal files encrypt differently).

@@ -246,8 +246,10 @@ fn print_status(s: &Status) {
         Activity::Idle if s.overflow.as_ref().is_some_and(|o| o.waiting) => {
             "up to date, apart from files waiting for your decision (see below)"
         }
+        Activity::Idle if s.problem.is_some() => "has a problem (see below)",
         Activity::Idle if s.paused.local || s.paused.remote => "running, with one direction paused (see below)",
         Activity::Idle if s.unsynced.is_some() => "up to date, apart from items that can't sync (see below)",
+        Activity::Idle if s.retrying.is_some() => "up to date, apart from failed items (see below)",
         Activity::Idle => "up to date, waiting for changes",
         Activity::Paused => "paused",
         Activity::WaitingForYou => "waiting for you (see below); nothing changes until then",
@@ -289,6 +291,13 @@ fn print_status(s: &Status) {
     if let Some(u) = &s.unsynced {
         let more = if u.more { " or more" } else { "" };
         println!("  can't sync        {} items{more} until you change them  (`oneup unsynced` lists them)", u.count);
+    }
+    if let Some(r) = &s.retrying {
+        println!(
+            "  failed            {} items; the next is tried again in {}  (`oneup activity` says why)",
+            r.count,
+            remaining(r.next_ms)
+        );
     }
     for st in &s.safety_stops {
         let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };

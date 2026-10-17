@@ -120,8 +120,10 @@ pub fn is_pairs_root(root: &Path, token: &str) -> bool {
     our_roots().iter().any(|(id, r)| id.ends_with(&suffix) && norm(r) == target)
 }
 
+/// `p` without `\\?\` or a trailing `\`, names folded as Windows compares
+/// them (`oneup_sync::fold`).
 fn norm(p: &str) -> String {
-    p.strip_prefix(r"\\?\").unwrap_or(p).trim_end_matches('\\').to_lowercase()
+    oneup_sync::fold(p.strip_prefix(r"\\?\").unwrap_or(p).trim_end_matches('\\'))
 }
 
 /// The shell IDs registered under our provider name (`OneUpDrive!...`)
@@ -199,4 +201,15 @@ fn our_roots() -> Vec<(String, String)> {
         let _ = RegCloseKey(h);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_compare_as_windows_compares_them() {
+        assert_eq!(norm(r"\\?\C:\Users\Me\ΟΔΟΣ\"), norm(r"c:\users\me\οδος"));
+        assert_ne!(norm("C:\\\u{212A}it"), norm(r"C:\kit"), "Kelvin sign");
+    }
 }

@@ -9,6 +9,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# For `fold`: paths compare as the engine compares names. Pure, no I/O.
+oneup-sync = { path = "../oneup-sync" }
 thiserror = "2"
 
 [target.'cfg(windows)'.dependencies.windows]

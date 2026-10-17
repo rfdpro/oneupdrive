@@ -27,6 +27,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -41,6 +42,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -709,6 +711,7 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
+ "zeroize",
 ]
 
 [[package]]
@@ -1284,6 +1287,7 @@ name = "oneup-cfapi"
 version = "0.1.0"
 dependencies = [
  "oneup-hash",
+ "oneup-sync",
  "oneup-sys",
  "thiserror",
  "windows",
@@ -1415,6 +1419,7 @@ dependencies = [
  "oneup-graph",
  "oneup-rules",
  "oneup-store",
+ "oneup-sync",
  "serde_json",
  "thiserror",
  "tokio",
@@ -1425,6 +1430,7 @@ dependencies = [
 name = "oneup-rules"
 version = "0.1.0"
 dependencies = [
+ "oneup-sync",
  "thiserror",
 ]
 
@@ -1432,6 +1438,7 @@ dependencies = [
 name = "oneup-shellext"
 version = "0.1.0"
 dependencies = [
+ "oneup-sync",
  "windows",
  "windows-collections",
  "windows-core",
@@ -1462,19 +1469,23 @@ dependencies = [
  "tokio",
  "webview2-com",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
 name = "oneup-vault"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "aes-kw",
  "aes-siv",
  "base64 0.22.1",
  "data-encoding",
  "getrandom 0.3.4",
+ "ghash",
  "hmac",
+ "polyval",
  "scrypt",
  "serde",
  "serde_json",
@@ -1556,6 +1567,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

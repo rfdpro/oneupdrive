@@ -107,6 +107,27 @@ DELETE FROM synced_item WHERE EXISTS (SELECT 1 FROM reach) AND sid NOT IN reach;
 DROP TABLE reach;
 ";
 
+/// v15 -> v16: [`MIGRATE_V12`] for the cloud side. An item written to the
+/// Remote tree is there, so its deletion evidence goes. A folder's
+/// deletion is evidence for everything stored below it, but delta may
+/// report the folder deleted before a child it moved out, and an item
+/// restored from the OneDrive recycle bin keeps its id. Kept, that evidence
+/// turned the item's later disappearance without evidence (a rule prunes
+/// it) into a deletion to bring to this PC. Evidence is noted for items
+/// already gone from the Remote tree, or by [`Ops::delete_subtree`] as it
+/// removes their rows, so no writer's own sequence is undone.
+pub(crate) const MIGRATE_V16: &str = "
+DELETE FROM remote_gone WHERE id IN (SELECT id FROM remote_item);
+CREATE TRIGGER remote_back_ins AFTER INSERT ON remote_item
+BEGIN
+    DELETE FROM remote_gone WHERE id = NEW.id;
+END;
+CREATE TRIGGER remote_back_upd AFTER UPDATE ON remote_item
+BEGIN
+    DELETE FROM remote_gone WHERE id = NEW.id;
+END;
+";
+
 /// Summary counts of the Synced tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncedStats {
@@ -189,10 +210,11 @@ const LOCAL_SYNCABLE: &str = "i.skip = 0 AND i.name_lossy = 0";
 /// matching cloud folder: `<notebook>.url` for a OneNote notebook,
 /// `<vault>.lnk` for the Personal Vault. Packages never sync, so their
 /// stand-ins don't either (they'd upload as stray files after moving over).
+/// Names compare as the planner compares them (`oneup_fold`, see `Store::init`).
 const STAND_IN: &str = "(i.kind = 0 AND (i.name LIKE '%.url' OR i.name LIKE '%.lnk') AND EXISTS (
        SELECT 1 FROM synced_item s JOIN remote_item r ON r.parent_id = s.remote_id
        WHERE s.local_id = i.parent_id AND r.kind = 3
-         AND lower(r.name) = lower(substr(i.name, 1, length(i.name) - 4))))";
+         AND oneup_fold(r.name) = oneup_fold(substr(i.name, 1, length(i.name) - 4))))";
 
 fn local_node(r: &Row<'_>) -> rusqlite::Result<LocalNode> {
     let id: Vec<u8> = r.get(0)?;
@@ -215,6 +237,19 @@ fn local_node(r: &Row<'_>) -> rusqlite::Result<LocalNode> {
 /// Excluded folders and packages (OneNote notebooks) are filtered out.
 const REMOTE_NODE: &str = "SELECT id, parent_id, name, kind, size, etag, qxh FROM remote_item";
 const REMOTE_SYNCABLE: &str = "is_excluded = 0";
+
+/// The children lists the reconciler reads ([`Trees`]), each from a parent
+/// index.
+fn base_children_sql() -> String {
+    format!("SELECT {BASE_COLS} FROM synced_item WHERE parent_sid = ?1")
+}
+fn local_children_sql() -> String {
+    format!("{LOCAL_NODE} WHERE i.parent_id = ?1 AND i.kind IN (0, 1) AND {LOCAL_SYNCABLE} AND NOT {STAND_IN}")
+}
+fn remote_children_sql() -> String {
+    format!("{REMOTE_NODE} WHERE parent_id = ?1 AND kind IN (0, 1) AND {REMOTE_SYNCABLE}")
+}
+const SYNCED_HAS_CHILDREN: &str = "SELECT 1 FROM synced_item WHERE parent_sid = ?1 LIMIT 1";
 
 /// Evidence for every Synced item in the subtree in `t_sub`.
 pub(crate) const NOTE_SUBTREE_GONE: &str = "
@@ -247,9 +282,14 @@ impl Ops<'_> {
 
     /// Rows whose agreed parent is `sid` (unordered).
     pub fn synced_children(&self, sid: Sid) -> Result<Vec<Base>> {
-        let mut st = self.c.prepare_cached(&format!("SELECT {BASE_COLS} FROM synced_item WHERE parent_sid = ?1"))?;
+        let mut st = self.c.prepare_cached(&base_children_sql())?;
         let rows = st.query_map([sid_in(sid)], base_from_row)?;
         rows.map(|r| fix_base(r?)).collect()
+    }
+
+    /// Whether any row's agreed parent is `sid`: one probe of the parent index.
+    pub fn synced_has_children(&self, sid: Sid) -> Result<bool> {
+        Ok(self.c.prepare_cached(SYNCED_HAS_CHILDREN)?.exists([sid_in(sid)])?)
     }
 
     /// Up to `limit` Synced rows after `after` (by sid) on both sides whose
@@ -517,6 +557,10 @@ impl Ops<'_> {
         if stale > 0 {
             problems.push(format!("synced: {stale} local items both present and noted deleted"));
         }
+        let stale = one("SELECT count(*) FROM remote_gone g JOIN remote_item r ON r.id = g.id")?;
+        if stale > 0 {
+            problems.push(format!("synced: {stale} cloud items both present and noted deleted"));
+        }
         Ok(problems)
     }
 }
@@ -576,19 +620,55 @@ impl Trees for Ops<'_> {
     }
 
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>> {
-        let mut st = self.c.prepare_cached(&format!(
-            "{LOCAL_NODE} WHERE i.parent_id = ?1 AND i.kind IN (0, 1) AND {LOCAL_SYNCABLE} AND NOT {STAND_IN}"
-        ))?;
+        let mut st = self.c.prepare_cached(&local_children_sql())?;
         let v = st.query_map([blob(id.0)], local_node)?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
     }
 
     fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>> {
-        let mut st = self
-            .c
-            .prepare_cached(&format!("{REMOTE_NODE} WHERE parent_id = ?1 AND kind IN (0, 1) AND {REMOTE_SYNCABLE}"))?;
+        let mut st = self.c.prepare_cached(&remote_children_sql())?;
         let v = st.query_map([id.0.as_str()], remote_node)?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
+    }
+
+    // The same queries, stepped a row at a time: SQLite reads no further
+    // than the first child `f` accepts.
+
+    fn any_base_child(&self, sid: Sid, f: &mut dyn FnMut(&Base) -> Result<bool>) -> Result<bool> {
+        let mut st = self.c.prepare_cached(&base_children_sql())?;
+        let mut rows = st.query([sid_in(sid)])?;
+        while let Some(r) = rows.next()? {
+            if f(&fix_base(base_from_row(r)?)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn any_local_child(&self, id: LocalId, f: &mut dyn FnMut(&LocalNode) -> Result<bool>) -> Result<bool> {
+        let mut st = self.c.prepare_cached(&local_children_sql())?;
+        let mut rows = st.query([blob(id.0)])?;
+        while let Some(r) = rows.next()? {
+            if f(&local_node(r)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn any_remote_child(&self, id: &RemoteId, f: &mut dyn FnMut(&RemoteNode) -> Result<bool>) -> Result<bool> {
+        let mut st = self.c.prepare_cached(&remote_children_sql())?;
+        let mut rows = st.query([id.0.as_str()])?;
+        while let Some(r) = rows.next()? {
+            if f(&remote_node(r)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn has_base_children(&self, sid: Sid) -> Result<bool> {
+        self.synced_has_children(sid)
     }
 }
 
@@ -676,6 +756,72 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// A child delta reports moved out of a folder only after the folder's
+    /// deletion (or an item restored from the OneDrive recycle bin): back in
+    /// the Remote tree, it's no longer deleted, and leaving it again without
+    /// evidence (a rule prunes it) reads as Missing.
+    #[test]
+    fn a_cloud_item_back_in_the_tree_loses_its_deletion_evidence() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.upsert_item(&rrow("g", Some("d"), "g", Kind::File), false)?;
+            o.local_put(&lrow(4, Some(3), "g", LocalKind::File))?;
+            o.synced_insert(&base(0, Some(2), "g", NodeKind::File, 4, "g"))?;
+            o.delete_subtree("d")?;
+            assert_eq!(o.remote(&RemoteId("g".into()))?, Seen::Deleted);
+            o.upsert_item(&rrow("g", Some("root"), "g", Kind::File), false)?;
+            assert!(matches!(o.remote(&RemoteId("g".into()))?, Seen::Present(_)));
+            assert!(o.check_invariants()?.is_empty(), "{:?}", o.check_invariants()?);
+            o.prune_subtree("g", true)?;
+            assert_eq!(o.remote(&RemoteId("g".into()))?, Seen::Missing);
+            assert_eq!(o.remote(&RemoteId("d".into()))?, Seen::Deleted, "the folder's own evidence stays");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Upgrading a v15 database drops the evidence older builds left for
+    /// items still stored (which the consistency check reports), and keeps
+    /// the rest.
+    #[test]
+    fn v16_drops_cloud_evidence_for_stored_items() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-v16-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            synced(&mut s);
+            s.write(|o| {
+                // What a v15 database looks like.
+                o.c.execute_batch(
+                    "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
+                     DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;
+                     INSERT INTO remote_gone(id) VALUES ('f'), ('gone');
+                     INSERT INTO synced_item(sid, parent_sid, name, kind, remote_id) VALUES (9, 0, 'gone', 0, 'gone');
+                     PRAGMA user_version = 15;",
+                )?;
+                let problems = o.check_invariants()?;
+                assert!(
+                    problems.iter().any(|p| p.contains("cloud items both present and noted deleted")),
+                    "{problems:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+        let s = Store::open(&path, 1024).unwrap();
+        s.read(|o| {
+            assert!(o.check_invariants()?.is_empty(), "{:?}", o.check_invariants()?);
+            assert!(matches!(o.remote(&RemoteId("f".into()))?, Seen::Present(_)));
+            assert_eq!(o.remote(&RemoteId("gone".into()))?, Seen::Deleted, "evidence for an absent item stays");
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Forgetting a folder's record takes the records below it, and their
@@ -845,14 +991,53 @@ pub(crate) mod tests {
             // A notebook's shortcut stands in only beside its own notebook.
             o.local_put(&lrow(6, Some(1), "notes.URL", LocalKind::File))?;
             o.local_put(&lrow(7, Some(3), "notes.URL", LocalKind::File))?;
+            // Case beyond ASCII folds too, as Windows folds it.
+            o.upsert_item(&rrow("g", Some("d"), "Σημειώσεις", Kind::Package), false)?;
+            o.local_put(&lrow(8, Some(3), "ΣΗΜΕΙΏΣΕΙΣ.url", LocalKind::File))?;
             let names = |id| -> Result<Vec<String>> {
                 Ok(Trees::local_children(o, LocalId(id))?.into_iter().map(|n| n.name).collect())
             };
             assert_eq!(names(1)?.len(), 4, "f, d, Other.lnk and notes.URL: {:?}", names(1)?);
             assert!(!names(1)?.contains(&"Personal Vault.lnk".to_string()));
-            assert!(names(3)?.is_empty());
+            assert!(names(3)?.is_empty(), "{:?}", names(3)?);
             Ok(())
         })
         .unwrap();
+    }
+
+    /// The reconciler checks a deleted folder for children every round its
+    /// parent is planned; the folder may hold hundreds of thousands.
+    #[test]
+    fn emptiness_checks_agree_with_the_lists_and_stop_at_the_first_child() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            let (root, d) = (RemoteId("root".into()), RemoteId("d".into()));
+            assert!(o.has_base_children(ROOT)? && !o.has_base_children(2)?);
+            assert!(o.has_local_children(LocalId(1))? && !o.has_local_children(LocalId(3))?);
+            assert!(o.has_remote_children(&root)? && !o.has_remote_children(&d)?);
+            // Children the lists filter out don't count.
+            o.local_put(&lrow(4, Some(3), "x", LocalKind::File))?;
+            o.local_set_skip(4, Skip::Excluded)?;
+            o.upsert_item(&rrow("x", Some("d"), "x", Kind::Package), false)?;
+            assert!(!o.has_local_children(LocalId(3))? && !o.has_remote_children(&d)?);
+            // A row after the first is never read: this one would fail to.
+            o.c.execute("INSERT INTO synced_item(sid, parent_sid, name, kind) VALUES (99, 0, 'bad', 7)", [])?;
+            assert!(o.synced_children(ROOT).is_err());
+            assert!(o.any_base_child(ROOT, &mut |_| Ok(true))?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn children_queries_use_the_parent_indexes() {
+        let s = Store::open_in_memory().unwrap();
+        for sql in [base_children_sql(), local_children_sql(), remote_children_sql(), SYNCED_HAS_CHILDREN.into()] {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> =
+                st.query_map([rusqlite::types::Null], |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+            assert!(!plan.iter().any(|step| step.starts_with("SCAN")), "{sql}\n{plan:#?}");
+        }
     }
 }

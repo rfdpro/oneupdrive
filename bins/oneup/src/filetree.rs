@@ -62,7 +62,7 @@ fn rules_at(data_dir: &Path, store: &Store, parts: &[&str]) -> Result<(RuleSet, 
             let _ = crate::rulefiles::add(&mut set, &mut verifier, &parts[..i].join("/"), &f);
         }
         let Some(part) = parts.get(i) else { break };
-        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| c.name.eq_ignore_ascii_case(part));
+        row = pick(store.read(|o| o.local_children(dir.file_id))?, |c| &c.name, part);
     }
     Ok((set, row))
 }
@@ -74,11 +74,13 @@ fn remote_at(store: &Store, parts: &[&str]) -> Result<Option<String>> {
         return Ok(None);
     };
     for part in parts {
-        let next = store.read(|o| o.remote_children(&cur.0))?.into_iter().find_map(|(r, excluded)| {
-            (r.kind == Kind::Folder && !excluded && r.name.eq_ignore_ascii_case(part)).then_some(r.id)
-        });
-        match next {
-            Some(id) => cur = oneup_sync::RemoteId(id),
+        let folders: Vec<RemoteRow> = store
+            .read(|o| o.remote_children(&cur.0))?
+            .into_iter()
+            .filter_map(|(r, excluded)| (r.kind == Kind::Folder && !excluded).then_some(r))
+            .collect();
+        match pick(folders, |r| &r.name, part) {
+            Some(r) => cur = oneup_sync::RemoteId(r.id),
             None => return Ok(None),
         }
     }
@@ -133,8 +135,54 @@ fn placement(path: &Path) -> Option<&'static str> {
     })
 }
 
-/// An item on this PC, in OneDrive (with its excluded flag), or both.
-type Both = (Option<LocalRow>, Option<(RemoteRow, bool)>);
+/// The item named `part` among `items`: the one spelled exactly so, else
+/// the only one whose name folds alike (as Windows compares names). Two
+/// that fold alike and neither spelled so: none, rather than a guess.
+fn pick<T>(items: Vec<T>, name: impl Fn(&T) -> &str, part: &str) -> Option<T> {
+    let folded = oneup_sync::fold(part);
+    let mut alike = Vec::new();
+    for item in items {
+        if name(&item) == part {
+            return Some(item);
+        }
+        if oneup_sync::fold(name(&item)) == folded {
+            alike.push(item);
+        }
+    }
+    if alike.len() == 1 { alike.pop() } else { None }
+}
+
+/// Rows merged by folded name, as Windows and OneDrive compare names; the
+/// number tells apart names on one side that fold alike (OneDrive may keep
+/// both), each getting a row.
+struct Merged<L, R> {
+    rows: BTreeMap<(String, usize), (Option<L>, Option<R>)>,
+    // Rows taken so far per folded name, on each side.
+    taken: std::collections::HashMap<String, (usize, usize)>,
+}
+
+impl<L, R> Merged<L, R> {
+    fn new() -> Self {
+        Self { rows: BTreeMap::new(), taken: std::collections::HashMap::new() }
+    }
+
+    fn slot(&mut self, name: &str, local: bool) -> &mut (Option<L>, Option<R>) {
+        let key = oneup_sync::fold(name);
+        let n = self.taken.entry(key.clone()).or_default();
+        let side = if local { &mut n.0 } else { &mut n.1 };
+        let at = *side;
+        *side += 1;
+        self.rows.entry((key, at)).or_insert((None, None))
+    }
+
+    fn local(&mut self, name: &str, l: L) {
+        self.slot(name, true).0 = Some(l);
+    }
+
+    fn remote(&mut self, name: &str, r: R) {
+        self.slot(name, false).1 = Some(r);
+    }
+}
 
 /// The pair's folders and modes.
 pub fn pair_info(store: &Store) -> Result<(PathBuf, String, bool)> {
@@ -170,19 +218,17 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
         Some(id) => store.read(|o| o.remote_children(&id))?,
         None => Vec::new(),
     };
-    // Merged by name, as Windows and OneDrive compare names.
-    let mut by_name: BTreeMap<String, Both> = BTreeMap::new();
+    let mut merged: Merged<LocalRow, (RemoteRow, bool)> = Merged::new();
     for l in locals {
         if parts.is_empty() && l.name.eq_ignore_ascii_case(ENGINE_DIR) {
             continue;
         }
-        let key = l.name.to_lowercase();
-        by_name.entry(key).or_default().0 = Some(l);
+        merged.local(&l.name.clone(), l);
     }
     for r in remotes {
-        let key = r.0.name.to_lowercase();
-        by_name.entry(key).or_default().1 = Some(r);
+        merged.remote(&r.0.name.clone(), r);
     }
+    let by_name = merged.rows;
     let total = by_name.len();
     let mut items = Vec::new();
     for (_, (l, r)) in by_name {
@@ -476,5 +522,33 @@ mod tests {
         assert!(r.verdict("x/[draft].docx", false).is_excluded());
         assert!(!r.verdict("x/d.docx", false).is_excluded());
         assert_eq!(super::clean("/a//b/./"), "a/b");
+    }
+
+    #[test]
+    fn names_that_fold_alike_on_one_side_each_get_a_row() {
+        let mut m: super::Merged<&str, &str> = super::Merged::new();
+        for name in ["λογος", "ΛΟΓΟΣ"] {
+            m.local(name, name);
+        }
+        for name in ["λογοσ", "λογος"] {
+            m.remote(name, name);
+        }
+        let got: Vec<_> = m.rows.into_values().collect();
+        assert_eq!(got, [(Some("λογος"), Some("λογοσ")), (Some("ΛΟΓΟΣ"), Some("λογος"))]);
+    }
+
+    #[test]
+    fn a_path_step_prefers_the_exact_name_and_refuses_a_guess() {
+        let pick = |names: &[&'static str], part| super::pick(names.to_vec(), |n| n, part);
+        // Exact spelling first, among names that fold alike.
+        assert_eq!(pick(&["λογος", "λογοσ"], "λογοσ"), Some("λογοσ"));
+        assert_eq!(pick(&["λογοσ", "λογος"], "λογος"), Some("λογος"));
+        // Otherwise the one that folds alike, as Windows compares names.
+        assert_eq!(pick(&["ΟΔΟΣ", "other"], "οδος"), Some("ΟΔΟΣ"));
+        assert_eq!(pick(&["Kit"], "KIT"), Some("Kit"));
+        // Not one that only lower-cases alike: the Kelvin sign isn't k.
+        assert_eq!(pick(&["\u{212A}it"], "kit"), None);
+        // Two alike and neither spelled so: no guess.
+        assert_eq!(pick(&["λογος", "λογοσ"], "ΛΟΓΟΣ"), None);
     }
 }

@@ -351,14 +351,10 @@ pub struct States;
 
 impl IStorageProviderItemPropertySource_Impl for States_Impl {
     fn GetItemProperties(&self, path: &HSTRING) -> Result<IIterable<StorageProviderItemProperty>> {
-        let path = path.to_string().to_lowercase();
-        let in_vault = all_published().iter().any(|p| {
-            p.get("kind").is_some_and(|k| k == "vault")
-                && p.get("local").is_some_and(|l| {
-                    let l = l.to_lowercase();
-                    path.starts_with(&l) && path[l.len()..].starts_with('\\')
-                })
-        });
+        let path = path.to_string();
+        let in_vault = all_published()
+            .iter()
+            .any(|p| p.get("kind").is_some_and(|k| k == "vault") && p.get("local").is_some_and(|l| below(&path, l)));
         let mut out = Vec::new();
         if in_vault {
             let p = StorageProviderItemProperty::new()?;
@@ -371,10 +367,24 @@ impl IStorageProviderItemPropertySource_Impl for States_Impl {
     }
 }
 
+/// Whether `path` is inside `folder`, names compared as Windows compares
+/// them (`oneup_sync::fold`).
+fn below(path: &str, folder: &str) -> bool {
+    oneup_sync::fold(path).strip_prefix(&oneup_sync::fold(folder)).is_some_and(|rest| rest.starts_with('\\'))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn paths_compare_as_windows_compares_them() {
+        assert!(below(r"C:\Users\Me\ΟΔΟΣ\x.txt", r"c:\users\me\οδος"));
+        assert!(!below(r"C:\Users\Me\ΟΔΟΣ", r"C:\Users\Me\ΟΔΟΣ"), "the folder itself");
+        assert!(!below(r"C:\Users\Me\ΟΔΟΣ2\x", r"C:\Users\Me\ΟΔΟΣ"));
+        assert!(!below("C:\\\u{212A}it\\x", r"C:\kit"), "Kelvin sign");
+    }
 
     #[test]
     fn an_unpublished_root_shows_as_not_running_and_items_have_no_state() {

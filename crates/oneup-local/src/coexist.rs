@@ -110,19 +110,19 @@ pub fn plain(p: &Path) -> std::path::PathBuf {
 }
 
 /// Whether `child` is `parent` or below it, comparing path components
-/// case-insensitively (as Windows does) and ignoring `\\?\` prefixes and
-/// trailing separators.
+/// case-insensitively (as Windows does, `oneup_sync::fold`) and ignoring
+/// `\\?\` prefixes and trailing separators.
 pub fn is_within(child: &Path, parent: &Path) -> bool {
     let norm = |p: &Path| -> Vec<String> {
         p.components()
             .filter_map(|c| match c {
                 Component::Prefix(px) => {
                     // `\\?\C:` and `C:` are the same volume.
-                    let s = px.as_os_str().to_string_lossy().to_lowercase();
+                    let s = oneup_sync::fold(&px.as_os_str().to_string_lossy());
                     Some(s.trim_start_matches(r"\\?\").trim_start_matches(r"\\.\").to_string())
                 }
                 Component::RootDir | Component::CurDir => None,
-                other => Some(other.as_os_str().to_string_lossy().to_lowercase()),
+                other => Some(oneup_sync::fold(&other.as_os_str().to_string_lossy())),
             })
             .collect()
     };
@@ -149,6 +149,8 @@ mod tests {
         assert!(!is_within(Path::new(r"C:\Users\Me\OneDriveBackup"), Path::new(r"C:\Users\Me\OneDrive")));
         assert!(!is_within(Path::new(r"D:\Users\Me\OneDrive"), Path::new(r"C:\Users\Me\OneDrive")));
         assert!(!is_within(Path::new(r"C:\Users"), Path::new(r"C:\Users\Me")));
+        assert!(is_within(Path::new(r"C:\Users\ΟΔΟΣ\x"), Path::new(r"c:\users\οδος")));
+        assert!(!is_within(Path::new("C:\\\u{212A}it\\x"), Path::new(r"C:\kit")), "Kelvin sign");
     }
 
     #[test]

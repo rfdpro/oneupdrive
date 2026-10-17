@@ -265,14 +265,8 @@ pub fn largest(dir: &Path, n: usize) -> Result<Vec<Large>> {
         .map(|(path, size)| {
             let inside = match (&local, &remote) {
                 (Some(l), Some(r)) => {
-                    let lower = path.to_lowercase();
-                    let base = r.to_lowercase();
-                    lower.strip_prefix(&base).filter(|rest| rest.starts_with('/')).map(|_| {
-                        path.get(r.len()..)
-                            .unwrap_or_default()
-                            .split('/')
-                            .filter(|p| !p.is_empty())
-                            .fold(std::path::PathBuf::from(l), |p, x| p.join(x))
+                    oneup_sync::strip_folded_prefix(&path, r).filter(|rest| rest.starts_with('/')).map(|rest| {
+                        rest.split('/').filter(|p| !p.is_empty()).fold(std::path::PathBuf::from(l), |p, x| p.join(x))
                     })
                 }
                 _ => None,

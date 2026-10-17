@@ -5,7 +5,6 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use oneup_graph::auth::{READ_ONLY_SCOPE, READ_WRITE_ALL_SCOPE, READ_WRITE_SCOPE};
@@ -74,11 +73,7 @@ pub fn auth(dir: &Path, client_id: Option<&str>, http: &reqwest::Client) -> Resu
 
 pub fn http() -> Result<reqwest::Client> {
     tls();
-    Ok(reqwest::Client::builder()
-        .user_agent(concat!("OneUpDrive/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(120))
-        .build()?)
+    Ok(oneup_graph::client::http_builder().user_agent(concat!("OneUpDrive/", env!("CARGO_PKG_VERSION"))).build()?)
 }
 
 /// Chooses rustls' cryptography for the whole process. Two backends are

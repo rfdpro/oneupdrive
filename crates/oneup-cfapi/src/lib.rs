@@ -15,6 +15,7 @@ pub mod identity;
 pub mod ours;
 #[cfg(windows)]
 pub mod provider;
+mod recent;
 #[cfg(windows)]
 pub mod shell;
 
@@ -107,17 +108,30 @@ pub const PROVIDER_NAME: &str = "OneUpDrive";
 
 /// The provider of the sync root containing `path`, unless it is
 /// OneUpDrive's own (Files On-Demand): what the coexistence checks refuse.
-/// Ours by the registered provider name or, failing that, by the shell's
-/// record of our sync roots: Windows can leave a shell-registered root's
-/// Cloud Files registration without its name and identity (seen after
-/// re-registering the identity package with the agent stopped), and our
-/// own folder must not then pass for another program's.
+/// See [`is_other_provider`].
 pub fn other_sync_root(path: &std::path::Path) -> Option<SyncRootInfo> {
     #[cfg(windows)]
     let ours_by_shell = || shell::is_ours(path);
     #[cfg(not(windows))]
     let ours_by_shell = || false;
-    sync_root_containing(path).filter(|i| i.provider_name != PROVIDER_NAME && !ours_by_shell())
+    sync_root_containing(path).filter(|i| is_other_provider(&i.provider_name, ours_by_shell))
+}
+
+/// Whether a sync root registered under `provider_name` is another
+/// program's. Ours by that name or, when the registration has no name, by
+/// the shell's record of our sync roots (`ours_by_shell`): Windows can leave
+/// a shell-registered root's Cloud Files registration without its name and
+/// identity (seen after re-registering the identity package with the agent
+/// stopped), and our own folder must not then pass for another program's.
+/// A named registration is never ours by that record: the record can
+/// outlive our registration (unregistered with Cloud Files alone), and
+/// another program may since have registered the folder.
+pub fn is_other_provider(provider_name: &str, ours_by_shell: impl FnOnce() -> bool) -> bool {
+    match provider_name {
+        PROVIDER_NAME => false,
+        "" => !ours_by_shell(),
+        _ => true,
+    }
 }
 
 /// The cloud provider that owns a sync root.
@@ -196,6 +210,18 @@ mod tests {
     fn placeholders_can_be_exposed() {
         assert_eq!(expose_placeholders(), Ok(()));
         assert_eq!(expose_placeholders(), Ok(()), "idempotent");
+    }
+
+    #[test]
+    fn only_a_nameless_registration_is_ours_by_the_shells_record() {
+        let shell_says = |ours: bool| move || ours;
+        assert!(!is_other_provider(PROVIDER_NAME, shell_says(false)));
+        assert!(!is_other_provider("", shell_says(true)), "our root that lost its name");
+        assert!(is_other_provider("", shell_says(false)));
+        // A leftover shell record of ours doesn't make another program's
+        // registration of the folder ours.
+        assert!(is_other_provider("Dropbox", shell_says(true)));
+        assert!(is_other_provider("Dropbox", shell_says(false)));
     }
 
     #[test]

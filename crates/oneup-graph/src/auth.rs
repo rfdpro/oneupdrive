@@ -53,8 +53,14 @@ impl TokenStore for DpapiFileStore {
     fn load(&self) -> Result<Option<String>> {
         match std::fs::read(&self.path) {
             Ok(sealed) => {
-                let plain = oneup_sys::dpapi::unprotect(&sealed)?;
-                Ok(Some(String::from_utf8(plain).map_err(|_| Error::Auth("stored token is not UTF-8".into()))?))
+                let mut plain = oneup_sys::dpapi::unprotect(&sealed)?;
+                // The buffer moves into the returned token; on a decoding
+                // error the wiped copy in `plain` is dropped.
+                let token = String::from_utf8(std::mem::take(&mut *plain)).map_err(|e| {
+                    *plain = e.into_bytes();
+                    Error::Auth("stored token is not UTF-8".into())
+                })?;
+                Ok(Some(token))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
@@ -108,6 +114,27 @@ pub struct Auth {
     store: Box<dyn TokenStore>,
     /// Serialises refreshes so concurrent requests don't stampede the token endpoint.
     access: Mutex<Option<Access>>,
+    /// Until when the token endpoint asked us to wait ([`Auth::retry_after`]).
+    retry_at: std::sync::Mutex<Option<Instant>>,
+}
+
+/// The error for a refused token request. Only a real OAuth refusal means
+/// signing in again; the endpoint being busy or failing (429, 5xx), or
+/// answering with something that isn't an OAuth error at all (a proxy's
+/// page), is a [`Error::Status`] that the caller retries like any request.
+fn refusal(status: u16, body: &[u8]) -> Error {
+    let busy = status == 429 || (500..600).contains(&status);
+    match serde_json::from_slice::<OAuthError>(body) {
+        Ok(e) if !busy => {
+            if e.error == "invalid_grant" {
+                // Refresh token revoked or expired: the user must sign in again.
+                Error::NotSignedIn
+            } else {
+                Error::Auth(format!("{} {}", e.error, e.error_description.unwrap_or_default()))
+            }
+        }
+        _ => Error::refused(status, "the sign-in service", String::from_utf8_lossy(body).into_owned()),
+    }
 }
 
 impl std::fmt::Debug for Auth {
@@ -118,7 +145,14 @@ impl std::fmt::Debug for Auth {
 
 impl Auth {
     pub fn new(http: reqwest::Client, client_id: String, scope: &str, store: Box<dyn TokenStore>) -> Self {
-        Self { http, client_id, scope: scope.to_string(), store, access: Mutex::new(None) }
+        Self {
+            http,
+            client_id,
+            scope: scope.to_string(),
+            store,
+            access: Mutex::new(None),
+            retry_at: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn is_signed_in(&self) -> Result<bool> {
@@ -139,6 +173,17 @@ impl Auth {
             return Ok(a.token.clone());
         }
         let rt = self.store.load()?.ok_or(Error::NotSignedIn)?;
+        // The requests queued on this lock behind one the endpoint asked to
+        // wait would each ask it again at once; they get the same answer
+        // without a request, and the caller backs off for `retry_after`.
+        let wait = self.retry_after();
+        if !wait.is_zero() {
+            return Err(Error::refused(
+                429,
+                "the sign-in service",
+                format!("asked to wait {} s before the next request", wait.as_secs()),
+            ));
+        }
         let t = self
             .token_request(&[
                 ("grant_type", "refresh_token"),
@@ -152,9 +197,14 @@ impl Auth {
         Ok(token)
     }
 
-    /// Forces the next request to refresh (after a 401).
-    pub async fn invalidate(&self) {
-        *self.access.lock().await = None;
+    /// Forces the next request to refresh, after `stale` got a 401. Only
+    /// if it's still the cached token: when a burst of requests all get a
+    /// 401, the first one's refresh mustn't be thrown away by the rest.
+    pub async fn invalidate(&self, stale: &str) {
+        let mut guard = self.access.lock().await;
+        if guard.as_ref().is_some_and(|a| a.token == stale) {
+            *guard = None;
+        }
     }
 
     fn accept(&self, t: TokenResponse) -> Result<Access> {
@@ -167,19 +217,28 @@ impl Auth {
         })
     }
 
+    /// How long the token endpoint asked to be left alone (`Retry-After`
+    /// on its last 429/503); zero if it didn't.
+    pub fn retry_after(&self) -> Duration {
+        let until = *self.retry_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        until.map_or(Duration::ZERO, |t| t.saturating_duration_since(Instant::now()))
+    }
+
     async fn token_request(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
+        // A transport failure stays `Error::Http`: offline, not signed out.
         let resp = self.http.post(format!("{AUTHORITY}/token")).form(form).send().await?;
         if resp.status().is_success() {
+            *self.retry_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             return Ok(resp.json().await?);
         }
         let status = resp.status().as_u16();
-        let e: OAuthError =
-            resp.json().await.unwrap_or(OAuthError { error: format!("HTTP {status}"), error_description: None });
-        if e.error == "invalid_grant" {
-            // Refresh token revoked or expired: the user must sign in again.
-            return Err(Error::NotSignedIn);
-        }
-        Err(Error::Auth(format!("{} {}", e.error, e.error_description.unwrap_or_default())))
+        let after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok())
+            .map(|s| Instant::now() + Duration::from_secs(s));
+        *self.retry_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = after;
+        Err(refusal(status, &crate::error_body(resp).await?))
     }
 
     /// Interactive sign-in in the default browser. `open_browser` receives
@@ -275,10 +334,98 @@ async fn accept_redirect(listener: &tokio::net::TcpListener, state: &str) -> Res
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
+    #[test]
+    fn only_a_real_oauth_refusal_asks_to_sign_in_again() {
+        let oauth = |error: &str| format!(r#"{{"error":"{error}","error_description":"AADSTS70000: ..."}}"#);
+        assert!(matches!(refusal(400, oauth("invalid_grant").as_bytes()), Error::NotSignedIn));
+        assert!(matches!(refusal(400, oauth("interaction_required").as_bytes()), Error::Auth(_)));
+        assert!(matches!(refusal(401, oauth("invalid_client").as_bytes()), Error::Auth(_)));
+        // The service busy or failing: retried, never "sign in again".
+        for status in [429, 500, 502, 503, 504] {
+            let e = refusal(status, b"<html>Service Unavailable</html>");
+            assert!(e.is_transient() && e.status() == Some(status), "{status}: {e}");
+            let e = refusal(status, oauth("temporarily_unavailable").as_bytes());
+            assert!(e.is_transient(), "{status}: {e}");
+        }
+        // A proxy's or captive portal's page isn't a refused sign-in either.
+        let portal = refusal(403, b"<html>Please log in to the hotel Wi-Fi</html>");
+        assert!(matches!(portal, Error::Status { status: 403, .. }));
+    }
+
+    struct NoStore;
+    impl TokenStore for NoStore {
+        fn load(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn save(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_401_drops_only_the_token_that_got_it() {
+        let auth = Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(NoStore));
+        // Another request already refreshed after its own 401 on "old".
+        *auth.access.lock().await =
+            Some(Access { token: "new".into(), refresh_at: Instant::now() + Duration::from_secs(3600) });
+        auth.invalidate("old").await;
+        assert_eq!(auth.access_token().await.unwrap(), "new", "the newer token is kept");
+        auth.invalidate("new").await;
+        assert!(auth.access.lock().await.is_none());
+    }
+
+    struct SignedIn;
+    impl TokenStore for SignedIn {
+        fn load(&self) -> Result<Option<String>> {
+            Ok(Some("rt".into()))
+        }
+        fn save(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn no_token_request_goes_out_while_the_endpoint_asked_to_wait() {
+        // The token endpoint resolves to a local listener that counts
+        // connections (any attempt fails its TLS handshake there).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+        let http = reqwest::Client::builder().resolve("login.microsoftonline.com", addr).build().unwrap();
+        let auth = Auth::new(http, "x".into(), "s", Box::new(SignedIn));
+        *auth.retry_at.lock().unwrap() = Some(Instant::now() + Duration::from_secs(60));
+        for _ in 0..3 {
+            let e = auth.access_token().await.unwrap_err();
+            assert!(e.is_transient() && e.status() == Some(429), "{e}");
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(auth.retry_after() > Duration::from_secs(50), "the wait isn't consumed");
+
+        // Once the wait is over, the endpoint is asked again.
+        *auth.retry_at.lock().unwrap() = Some(Instant::now());
+        assert!(auth.access_token().await.is_err());
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn dpapi_store_roundtrip() {
         let dir = std::env::temp_dir().join(format!("oneup-auth-test-{}", std::process::id()));

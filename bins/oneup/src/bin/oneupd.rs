@@ -23,7 +23,10 @@
 //! status`, `pause`/`resume` (both directions or one, optionally timed; kept
 //! across restarts), `approve`/`keep`/`discard`, and `sync-now`, all while
 //! the agent keeps running. While both directions are paused, no rounds run
-//! at all; the journal is still read, so nothing is missed.
+//! at all; the journal is still read, so nothing is missed. A pause that
+//! comes during a round (the user's, or the agent's own on a metered
+//! connection and the like) stops that side's operations from the next one
+//! on, and a download under way; what didn't run waits for the resume.
 //!
 //! **Safety.** Everything `oneup sync` guarantees holds (same gate, same
 //! effects layer). In addition, the safety stops count what the agent did
@@ -34,7 +37,9 @@
 //! the version store are not a stop: they wait for `oneup keep`/`discard`
 //! while everything else syncs. Each is shown once. A sync folder that
 //! fails its identity check ends the agent. Network and service errors are
-//! retried with a growing pause.
+//! retried with a growing pause; so is each failed operation, item by item
+//! (`oneup_app::backoff`). While OneDrive is full, uploads wait and the rest
+//! goes on.
 //!
 //! While [`oneup::setup::PRE_RELEASE`] is on, test-account data folders
 //! only, like `oneup sync`. One process per data folder (`sync.lock`). Ctrl+C stops after the current
@@ -100,6 +105,9 @@ const PUSH_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 /// While fully paused: how long a wait may be at most (a timed pause ends
 /// earlier). Nothing is checked meanwhile; this only bounds the wait.
 const PAUSED_WAIT: Duration = Duration::from_secs(60 * 60);
+/// While rounds run: how often the automatic pauses are looked at again,
+/// so a metered connection or battery saver stops a long round too.
+const AUTO_PAUSE_CHECK: Duration = Duration::from_secs(30);
 /// SQLite page cache (the "balanced" memory profile).
 
 #[derive(Parser)]
@@ -231,7 +239,7 @@ async fn run(args: Args) -> Result<()> {
     let graph = Arc::new(oneup_app::pairs::scoped(dir, Graph::new(http, auth, Aimd::new(4, 8)))?);
     // How it uses the PC (config.toml [agent]): memory and priority are
     // read once here; the bandwidth caps every round.
-    let settings = oneup_app::config::load_agent(dir)?;
+    let settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
     let priority_set = match oneup_sys::priority::set_background(settings.background) {
         Ok(()) => true,
         Err(e) => {
@@ -332,8 +340,12 @@ async fn run(args: Args) -> Result<()> {
 
     // ---- run; on an error, start over after a growing pause
     let mut pause = ERROR_FIRST;
+    // Outlives each attempt: a mass deletion trickling in must still trip
+    // the stops when an error restarts the rounds in between.
+    let mut window = Window::default();
     loop {
-        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref()).await {
+        let started = Instant::now();
+        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window).await {
             Ok(()) => {
                 println!("oneupd: stopped.");
                 end_flyout(dir, flyout);
@@ -358,6 +370,7 @@ async fn run(args: Args) -> Result<()> {
             Err(e) => {
                 tracing::error!("{e:#}");
                 let before = control.problem();
+                pause = error_pause(pause, before.is_none(), started.elapsed());
                 let retry_ms = now_ms() + i64::try_from(pause.as_millis()).unwrap_or(i64::MAX);
                 let p = problem::describe(&e, before.as_ref(), now_ms(), Some(retry_ms));
                 // Once per spell, not at every retry.
@@ -380,6 +393,15 @@ async fn run(args: Args) -> Result<()> {
             }
         }
     }
+}
+
+/// The pause before retrying after an error, given the last one (`pause`):
+/// back to the first when the failed attempt got going first (a sequence of
+/// rounds finished, which clears the standing problem, so `recovered`), or
+/// ran longer than the longest pause. Otherwise one blip after days of
+/// syncing would cost the longest pause left over from earlier ones.
+fn error_pause(pause: Duration, recovered: bool, ran: Duration) -> Duration {
+    if recovered || ran >= ERROR_MAX { ERROR_FIRST } else { pause }
 }
 
 /// Notes a problem beginning or clearing in the activity log; best effort.
@@ -415,8 +437,6 @@ fn is_permanent(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
-/// database each time, so a retry starts from a clean state.
 /// How much memory the agent's database connection uses: its page cache,
 /// and how much of the file it maps (0: none).
 #[derive(Clone, Copy)]
@@ -437,6 +457,10 @@ impl Memory {
     }
 }
 
+/// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
+/// database each time, so a retry starts from a clean state, except the
+/// safety window (`window`), which the caller keeps across retries.
+#[allow(clippy::too_many_arguments)]
 async fn agent(
     dir: &Path,
     graph: &Arc<Graph>,
@@ -445,6 +469,7 @@ async fn agent(
     control: &Control,
     memory: Memory,
     key: Option<&oneup_vault::key::Masterkey>,
+    window: &mut Window,
 ) -> Result<()> {
     let mut store = setup::open_store(dir, memory.cache_kib)?;
     if memory.map_bytes > 0 {
@@ -463,8 +488,9 @@ async fn agent(
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
     let journal = Arc::new(Notify::new());
     let tracker = oneup_app::apps::Tracker::start(dir, Path::new(&root.path));
-    let busy = Arc::new(Busy::new(oneup_app::config::load_agent(dir)?.busy));
+    let busy = Arc::new(Busy::new(oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?.busy));
     engine.hold_busy(Arc::clone(&busy));
+    engine.back_off();
     watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy));
     let remote = Arc::new(Notify::new());
     // Files On-Demand: serve the placeholders' content while this attempt
@@ -495,12 +521,11 @@ async fn agent(
         .then(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
 
     let poll = Duration::from_secs(args.poll_seconds.max(15));
-    let mut window = Window::default();
     // Every folder only when the marks may not cover everything (see
     // `start_scope`); otherwise what changed, including while nothing ran.
     let mut scope = sync::start_scope(&store)?;
     let mut retry = RETRY_FIRST;
-    let mut settings = oneup_app::config::load_agent(dir)?;
+    let mut settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
     let mut auto_was: Option<String> = None;
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
@@ -511,13 +536,7 @@ async fn agent(
         }
         busy.set_settings(settings.busy);
         let minute = autopause::local_minute_of_day();
-        let conditions = autopause::Conditions {
-            metered: oneup_sys::conditions::metered(),
-            battery_saver: oneup_sys::conditions::battery_saver(),
-            full_screen: oneup_sys::conditions::full_screen(),
-            minute_of_day: minute,
-        };
-        let auto = autopause::reason(&settings, &conditions);
+        let auto = auto_pause(&settings, minute);
         if auto != auto_was {
             match &auto {
                 Some(why) => println!("oneupd: pausing by itself: {why}"),
@@ -543,13 +562,26 @@ async fn agent(
         } else {
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
-            let (s, out) = engine
-                .rounds(store, scope, &|| control.controls(), window.recent(), MAX_ROUNDS, &|p| control.set_progress(p))
-                .await?;
+            let mut executed = Recent::default();
+            let recent = window.recent();
+            let rounds = watching_auto_pause(
+                engine.rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
+                    control.set_progress(p)
+                }),
+                &settings,
+                control,
+            )
+            .await;
+            // Before the error, if any: the retry must still count them.
+            window.add(executed);
+            let (s, out) = rounds?;
             store = s;
             held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
-            window.add(out.executed);
+            // Failed items waiting their turn (`oneup_app::backoff`); the
+            // wait below ends when the first one's comes (`held_until`).
+            let (count, next_ms) = store.read(|o| o.retry_waiting(now_ms()))?;
+            control.set_retrying(next_ms.filter(|_| count > 0).map(|next_ms| oneup_ipc::Retrying { count, next_ms }));
             if !out.totals.is_quiet() {
                 out.totals.print(out.rounds);
             }
@@ -590,11 +622,19 @@ async fn agent(
             // dropped channel pings `remote` itself, so a check follows at
             // once, and later waits use `poll` again.
             let check = if push_up.load(Relaxed) { PUSH_POLL.max(poll) } else { poll };
+            // Uploads wait while OneDrive is full; its room is looked at
+            // again at the next wake-up, at the latest the timed check.
+            let room_ms = now + i64::try_from(check.as_millis()).unwrap_or(i64::MAX / 2);
+            control.set_cloud_full(engine.cloud_full().map(|f| problem::cloud_full(f.since_ms, f.remaining, room_ms)));
             match out.end {
                 End::Settled => {
                     control.clear_first();
                     store = engine.placement(store, &control.controls()).await?;
-                    engine.trim(&mut store)?;
+                    // Removes kept copies on this PC: not while changes
+                    // to it are paused.
+                    if !control.controls().pause_local {
+                        engine.trim(&mut store)?;
+                    }
                     retry = RETRY_FIRST;
                     control.set_activity(Activity::Idle);
                     // Files already here becoming placeholders, a slice at a
@@ -625,7 +665,8 @@ async fn agent(
                 }
             }
         };
-        // A held upload goes once its file has been left alone.
+        // A held upload goes once its file has been left alone, a failed
+        // operation once its wait is over.
         let next = held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now())));
         // A timed pause ends the wait when it's over.
         let next = match paused.until_ms {
@@ -639,6 +680,40 @@ async fn agent(
         store = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next).await?;
         if stop.requested() {
             return Ok(());
+        }
+    }
+}
+
+/// Why the agent pauses by itself now (config.toml [agent]), if it does.
+fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<String> {
+    let conditions = autopause::Conditions {
+        metered: oneup_sys::conditions::metered(),
+        battery_saver: oneup_sys::conditions::battery_saver(),
+        full_screen: oneup_sys::conditions::full_screen(),
+        minute_of_day: minute,
+    };
+    autopause::reason(settings, &conditions)
+}
+
+/// Runs `rounds`, looking at the automatic pauses again meanwhile: one that
+/// begins pauses the round under way at its next operation (through
+/// `control`). Ending one waits for the rounds to end.
+async fn watching_auto_pause<T>(
+    rounds: impl Future<Output = T>,
+    settings: &oneup_app::config::Agent,
+    control: &Control,
+) -> T {
+    tokio::pin!(rounds);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + AUTO_PAUSE_CHECK, AUTO_PAUSE_CHECK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            r = &mut rounds => return r,
+            _ = tick.tick() => {
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day()) {
+                    control.set_auto_pause(Some(why));
+                }
+            }
         }
     }
 }
@@ -938,7 +1013,32 @@ impl Window {
 
 #[cfg(test)]
 mod tests {
-    use super::Memory;
+    use super::*;
+
+    #[test]
+    fn the_error_pause_starts_over_once_the_agent_got_going() {
+        let mut pause = ERROR_FIRST;
+        // Errors in a row: it grows (doubled after each wait) to the most.
+        for _ in 0..10 {
+            pause = (error_pause(pause, false, Duration::from_secs(1)) * 2).min(ERROR_MAX);
+        }
+        assert_eq!(pause, ERROR_MAX);
+        assert_eq!(error_pause(pause, false, Duration::from_secs(1)), ERROR_MAX, "still failing at once");
+        assert_eq!(error_pause(pause, true, Duration::from_secs(1)), ERROR_FIRST, "rounds finished meanwhile");
+        assert_eq!(error_pause(pause, false, ERROR_MAX), ERROR_FIRST, "ran a long while");
+    }
+
+    /// What the stops count adds up across calls of the rounds (the agent
+    /// keeps one window across retries, `run`).
+    #[test]
+    fn the_safety_window_adds_up_what_ran() {
+        let mut w = Window::default();
+        w.add(Recent { local: 190, remote: 0, suspicious: 0 });
+        w.add(Recent::default());
+        w.add(Recent { local: 5, remote: 2, suspicious: 1 });
+        assert_eq!(w.recent(), Recent { local: 195, remote: 2, suspicious: 1 });
+        assert_eq!(w.done.len(), 2, "nothing done, nothing kept");
+    }
 
     #[test]
     fn the_database_is_mapped_only_at_normal_priority() {

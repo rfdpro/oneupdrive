@@ -1,13 +1,17 @@
 //! The executor proper (see the crate docs).
 
+use std::io::Seek as _;
+
 use oneup_cfapi::identity::Identity;
 use oneup_effects::{Done, Error as FxError, LocalFs, Version};
 use oneup_gate::{Approved, OldCopy};
 use oneup_rules::ExcludeSet;
 use oneup_store::{Kind, LocalKind, LocalRow, Ops, RemoteRow, Store};
-use oneup_sync::{Base, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, fold};
+use oneup_sync::{
+    Base, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, conflict_candidate, fold,
+};
 
-use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone};
+use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, VersionMark};
 
 /// Why an operation was skipped. Nothing was changed; the next round plans
 /// again from fresh state.
@@ -26,6 +30,9 @@ pub enum Skip {
     /// Can't be done as planned: a name Windows can't use, a special item
     /// (placeholder, link), or something outside the sync folder.
     Refused,
+    /// The OneDrive has no room left: an upload or a new folder refused
+    /// for it, or one not tried after OneDrive said so in the same round.
+    CloudFull,
 }
 
 /// What one round did.
@@ -44,6 +51,20 @@ pub struct Report {
     /// Uploads done as a copy, in OneDrive, of a file with the same content
     /// (nothing was sent).
     pub copied: Vec<Op>,
+    /// Not run: the caller's check refused them when their turn came
+    /// ([`Executor::run_checked`]), or stopped a download of theirs under
+    /// way. Nothing was changed, and they're neither skipped nor failed:
+    /// the next round plans them again.
+    pub not_run: Vec<Op>,
+    /// Uploads that went over an edit made in OneDrive while they were
+    /// committing (see [`Cloud::version_mark`]), and the name of the new
+    /// file in OneDrive that keeps the edited version.
+    pub kept_theirs: Vec<(Op, String)>,
+    /// Uploads that went over such an edit whose version couldn't be kept
+    /// as a new file, and why. The upload itself is done (they're in
+    /// [`Report::done`] too), and the edit is in the file's version
+    /// history in OneDrive.
+    pub theirs_not_kept: Vec<(Op, String)>,
 }
 
 impl Report {
@@ -57,6 +78,8 @@ enum Fail {
     Skip(Skip),
     Failed(String),
     Halt(String),
+    /// The caller's check refused it (see [`Report::not_run`]).
+    NotNow,
 }
 
 impl From<FxError> for Fail {
@@ -85,6 +108,7 @@ impl From<CloudError> for Fail {
             CloudError::Changed => Fail::Skip(Skip::Changed),
             CloudError::NameTaken => Fail::Skip(Skip::NameTaken),
             CloudError::NotEmpty => Fail::Skip(Skip::NotEmpty),
+            CloudError::Full => Fail::Skip(Skip::CloudFull),
             CloudError::Io(_) | CloudError::Other(_) | CloudError::TooManyItems => Fail::Failed(e.to_string()),
         }
     }
@@ -96,21 +120,61 @@ type Res<T = ()> = Result<T, Fail>;
 #[cfg(feature = "crash-test")]
 pub const CRASHED: &str = "injected crash";
 
+/// What a failed copy of a version an upload went over reports.
+const THEIRS_NOT_KEPT: &str =
+    "uploaded, over an edit made in OneDrive meanwhile; the file's version history in OneDrive has that edit";
+
+/// Names tried for a kept version before giving up.
+const NAME_TRIES: usize = 5;
+
 /// What a halt reports for operations of a batch not recorded after it.
 const NOT_RUN: &str = "not run: the round stopped";
 
+/// What an operation that was done reports besides being done (see
+/// [`Executor::one`]).
+#[derive(Default)]
+struct Notes {
+    /// [`Report::kept_instead`].
+    kept_instead: bool,
+    /// [`Report::copied`].
+    copied: bool,
+    /// [`Report::kept_theirs`].
+    theirs: Option<String>,
+    /// [`Report::theirs_not_kept`].
+    theirs_not_kept: Option<String>,
+    /// Done, but the round stops after it (the store failed, or the sync
+    /// folder its identity check, while keeping such a version).
+    halt: Option<String>,
+}
+
 /// Adds one operation's outcome to the report; true if the round halts.
-fn record(report: &mut Report, op: Op, outcome: Res, kept_instead: bool, copied: bool) -> bool {
+fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) -> bool {
     match outcome {
         Ok(()) => {
-            if kept_instead {
+            if notes.kept_instead {
                 report.kept_instead.push(op.clone());
             }
-            if copied {
+            if notes.copied {
                 report.copied.push(op.clone());
             }
+            if let Some(name) = notes.theirs {
+                report.kept_theirs.push((op.clone(), name));
+            }
+            if let Some(why) = notes.theirs_not_kept {
+                tracing::warn!(error = %why, "an edit an upload went over wasn't kept as a new file");
+                report.theirs_not_kept.push((op.clone(), why));
+            }
             report.done.push(op);
-            false
+            match notes.halt {
+                Some(m) => {
+                    if report.halted.is_none() {
+                        tracing::warn!(reason = %m, "round halted");
+                        report.halted = Some(m);
+                    }
+                    true
+                }
+                None => false,
+            }
         }
         Err(Fail::Skip(s)) => {
             tracing::debug!(reason = ?s, "operation skipped");
@@ -120,6 +184,10 @@ fn record(report: &mut Report, op: Op, outcome: Res, kept_instead: bool, copied:
         Err(Fail::Failed(m)) => {
             tracing::warn!(error = %m, "operation failed");
             report.failed.push((op, m));
+            false
+        }
+        Err(Fail::NotNow) => {
+            report.not_run.push(op);
             false
         }
         Err(Fail::Halt(m)) => {
@@ -185,6 +253,12 @@ fn batchable(store: &Store, ops: &[Approved]) -> usize {
         n += 1;
     }
     n
+}
+
+/// Whether a full OneDrive refuses `op`: new content and new folders. The
+/// agent holds the same while it stays full, in later rounds.
+fn needs_room(op: &Op) -> bool {
+    matches!(op, Op::Upload { .. } | Op::MkdirRemote { .. })
 }
 
 /// Skip unless `ok`.
@@ -270,6 +344,82 @@ impl<C: Cloud> Executor<C> {
         &self.fs
     }
 
+    /// After an upload replaced file `id` in OneDrive folder `to` (Synced
+    /// folder `parent`): if it went over a version other than `mark`'s (an
+    /// edit that reached OneDrive while the upload committed), keeps that
+    /// version as a new file next to it, named as conflict copies are, and
+    /// returns its name. Only a free name is taken; nothing is replaced. The
+    /// next round brings it here like any new file in OneDrive.
+    async fn keep_replaced(
+        &self,
+        store: &mut Store,
+        id: &RemoteId,
+        parent: Sid,
+        to: &RemoteId,
+        name: &str,
+        mark: &VersionMark,
+    ) -> Res<Option<String>> {
+        let theirs = match self.cloud.replaced_other(id, mark).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(None),
+            // The upload is done; an edit it may have gone over is in the
+            // file's version history either way.
+            Err(e) => {
+                tracing::warn!(error = %e, "an upload's replaced version couldn't be checked");
+                return Ok(None);
+            }
+        };
+        let lost = |e: String| Fail::Failed(format!("{THEIRS_NOT_KEPT}: {e}"));
+        let mut staged = self.fs.stage()?;
+        let Some(file) = staged.file() else { return Err(odd()) };
+        let len = self.cloud.download_version(id, &theirs.id, &mut *file).await.map_err(|e| lost(e.to_string()))?;
+        if theirs.size.is_some_and(|s| u64::try_from(s).ok() != Some(len)) {
+            return Err(lost("its content didn't match its size".into()));
+        }
+        let size = i64::try_from(len).map_err(|e| lost(e.to_string()))?;
+        // Free on both sides, so the copy comes here under the same name.
+        // Each name is looked up on its own: listing the folder would load
+        // every item in it, and a folder can hold millions.
+        let local = store.read(|o| Ok(o.synced_get(parent)?.and_then(|b| b.local)))?;
+        let free = |o: &Ops<'_>, copy: &str| -> oneup_store::Result<bool> {
+            if !o.remote_named(&to.0, copy)?.is_empty() {
+                return Ok(false);
+            }
+            Ok(match local {
+                Some(l) => o.local_named(l.0, copy)?.is_empty(),
+                None => true,
+            })
+        };
+        let mut n = 0;
+        let mut tries = 0;
+        // A name OneDrive has that the Remote tree doesn't yet: another.
+        while tries < NAME_TRIES {
+            n += 1;
+            let copy = conflict_candidate(name, NodeKind::File, n);
+            if !store.read(|o| free(o, &copy))? {
+                continue;
+            }
+            tries += 1;
+            file.rewind().map_err(|e| lost(e.to_string()))?;
+            let mut reader = Hashing::new(&mut *file);
+            match self.cloud.upload(to, &copy, None, size, &mut reader).await {
+                Ok((row, sent)) => {
+                    let sent = sent.unwrap_or_else(|| reader.hash.finalize());
+                    let read = reader.hash.len();
+                    store.try_write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?))?;
+                    if row.qxh != Some(sent) || read != len || row.size != size {
+                        return Err(lost("OneDrive's copy didn't match what was sent".into()));
+                    }
+                    tracing::info!("a file changed in OneDrive while its upload committed; that version was kept");
+                    return Ok(Some(copy));
+                }
+                Err(CloudError::NameTaken) => continue,
+                Err(e) => return Err(lost(e.to_string())),
+            }
+        }
+        Err(lost("no free name".into()))
+    }
+
     /// For a new file (`new`) of at least `COPY_MIN` bytes: if OneDrive
     /// already has a file with the same size and content, has OneDrive copy
     /// it to `to/name` instead of uploading (server-side copy).
@@ -337,6 +487,23 @@ impl<C: Cloud> Executor<C> {
         approved: Vec<Approved>,
         done: &(dyn Fn(usize) + Sync),
     ) -> Report {
+        self.run_checked(store, approved, done, &|_| true).await
+    }
+
+    /// [`Self::run_counted`], asking `may_run` before each operation
+    /// whether it may run now (a pause that came meanwhile, say). One it
+    /// refuses isn't started ([`Report::not_run`]). A download under way is
+    /// asked again as its data arrives, and stopped once refused: nothing
+    /// was placed yet, so it's simply done again later. Anything else that
+    /// started runs to its end (an upload commits, a batch is answered).
+    /// `may_run` is called often: it must be cheap.
+    pub async fn run_checked(
+        &self,
+        store: &mut Store,
+        approved: Vec<Approved>,
+        done: &(dyn Fn(usize) + Sync),
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> Report {
         let mut report = Report::default();
         if let Err(e) = self.fs.check_root() {
             report.halted = Some(e.to_string());
@@ -347,18 +514,26 @@ impl<C: Cloud> Executor<C> {
             report.halted = Some(m);
             return report;
         }
+        // Once OneDrive says it's full (to one operation or in a batch),
+        // the round's other uploads and new folders aren't sent only to be
+        // refused; everything else goes on.
+        let mut full = false;
         let mut i = 0;
         while i < approved.len() {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
             let n = batchable(store, &approved[i..]);
+            // Up to the first the caller refuses, or a full OneDrive would,
+            // which goes on its own.
+            let n = approved[i..i + n].iter().take_while(|a| may_run(a.op()) && !(full && needs_room(a.op()))).count();
             if n >= 2 {
                 tracing::debug!(n, "cloud changes sent in one batch");
                 let outcomes = self.run_batch(store, &approved[i..i + n]).await;
+                full |= outcomes.iter().any(|o| matches!(o, Err(Fail::Skip(Skip::CloudFull))));
                 let halted = approved[i..i + n]
                     .iter()
                     .zip(outcomes)
-                    .any(|(a, outcome)| record(&mut report, a.op().clone(), outcome, false, false));
+                    .any(|(a, outcome)| record(&mut report, a.op().clone(), outcome, Notes::default()));
                 done(n);
                 if halted {
                     break;
@@ -368,16 +543,26 @@ impl<C: Cloud> Executor<C> {
             }
             let a = &approved[i];
             i += 1;
-            let mut kept_instead = false;
-            let mut copied = false;
-            let mut outcome = self.one(store, a, &mut kept_instead, &mut copied).await;
+            if !may_run(a.op()) {
+                record(&mut report, a.op().clone(), Err(Fail::NotNow), Notes::default());
+                done(1);
+                continue;
+            }
+            if full && needs_room(a.op()) {
+                record(&mut report, a.op().clone(), Err(Fail::Skip(Skip::CloudFull)), Notes::default());
+                done(1);
+                continue;
+            }
+            let mut notes = Notes::default();
+            let mut outcome = self.one(store, a, &mut notes, may_run).await;
             if writes_ahead(a.op())
                 && !matches!(outcome, Err(Fail::Halt(_)))
                 && let Err(e) = self.recover(store)
             {
                 outcome = Err(e);
             }
-            let halted = record(&mut report, a.op().clone(), outcome, kept_instead, copied);
+            full |= matches!(outcome, Err(Fail::Skip(Skip::CloudFull)));
+            let halted = record(&mut report, a.op().clone(), outcome, notes);
             done(1);
             if halted {
                 break;
@@ -554,6 +739,17 @@ impl<C: Cloud> Executor<C> {
         if now.kind != Kind::Folder {
             return Err(CloudError::TooManyItems.into());
         }
+        // OneDrive compares names ignoring case, so the new folder can't be
+        // made next to the original under the same name in other case. A
+        // temporary name doesn't help: renaming the rebuilt folder to the
+        // right one is refused for the same reason the move was.
+        if now.parent_id.as_deref() == Some(to.0.as_str()) && fold(&now.name) == fold(name) {
+            return Err(Fail::Failed(
+                "OneDrive won't change only the case of a name on a folder this large: \
+                 rename it to another name first, then to the one you want"
+                    .into(),
+            ));
+        }
         let mut page = self.cloud.children(&pre.id).await?;
         let made = self.cloud.mkdir(to, name).await?;
         self.crash_point()?;
@@ -574,13 +770,15 @@ impl<C: Cloud> Executor<C> {
                         Err(CloudError::TooManyItems) => {
                             Box::pin(self.rebuild(store, &pre_of(c), &into, &c.name)).await?
                         }
-                        // A listing that still showed something already moved.
-                        Err(CloudError::Changed)
-                            if self.cloud.item(&RemoteId(c.id.clone())).await?.and_then(|r| r.parent_id)
-                                == Some(made.id.clone()) =>
-                        {
-                            continue;
-                        }
+                        // Already moved: a listing that still showed it, or
+                        // a move OneDrive made whose answer was lost, sent
+                        // again on the eTag it had before. Recorded all the
+                        // same: left stored below the original, it would be
+                        // removed with it.
+                        Err(CloudError::Changed) => match self.cloud.item(&RemoteId(c.id.clone())).await? {
+                            Some(row) if row.parent_id.as_deref() == Some(made.id.as_str()) => row,
+                            _ => return Err(CloudError::Changed.into()),
+                        },
                         Err(e) => return Err(e.into()),
                         Ok(MetaDone::Deleted) => return Err(odd()),
                     };
@@ -598,15 +796,28 @@ impl<C: Cloud> Executor<C> {
         self.cloud.delete(&pre_of(&emptied)).await?;
         self.crash_point()?;
         // Nothing points at it any more: the Synced row follows the new
-        // folder, and its contents were recorded as moved.
-        store.try_write(|o| o.delete_subtree(&pre.id.0).map(|_| ()))?;
+        // folder, and its contents were recorded as moved. Anything still
+        // stored below it went elsewhere in OneDrive meanwhile (moved on the
+        // web, say), not away, so its rows go without deletion evidence
+        // (invariant 3): it reads as missing until the next listing brings
+        // it where it is now. Unpruning drops the tombstones pruning leaves.
+        store.try_write(|o| {
+            o.prune_subtree(&pre.id.0, true)?;
+            o.unprune_subtree(&pre.id.0)?;
+            Ok::<_, Fail>(())
+        })?;
         self.cloud.item(&into).await?.ok_or(Fail::Skip(Skip::Changed))
     }
 
-    /// Runs one operation. `kept_instead` is set if an old copy the gate
-    /// allowed to drop was kept (see [`Report::kept_instead`]); `copied` if
-    /// an upload was done as a copy in OneDrive ([`Report::copied`]).
-    async fn one(&self, store: &mut Store, a: &Approved, kept_instead: &mut bool, copied: &mut bool) -> Res {
+    /// Runs one operation, noting in `notes` what else a done one reports
+    /// (see [`Notes`]). `may_run`: see [`Self::run_checked`].
+    async fn one(
+        &self,
+        store: &mut Store,
+        a: &Approved,
+        notes: &mut Notes,
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> Res {
         match a.op() {
             // ------------------------------------------------ bookkeeping
             Op::Pair { local, remote, parent, name, kind, size, hash } => {
@@ -672,19 +883,35 @@ impl<C: Cloud> Executor<C> {
                 let mut src = self.fs.open_upload(a)?;
                 let (size, mtime) = (src.size, src.mtime);
                 // The file stays open (no writers) from here until recorded.
-                let (row, sent, sent_len) =
-                    match self.copy_instead(store, &mut src, to, name, replace.is_none()).await? {
-                        Some((row, hash)) => {
-                            *copied = true;
-                            (row, hash, u64::try_from(size).unwrap_or(0))
-                        }
-                        None => {
-                            let mut reader = Hashing::new(&mut src.file);
-                            let (row, sent) = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await?;
-                            // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
-                            (row, sent.unwrap_or_else(|| reader.hash.finalize()), reader.hash.len())
-                        }
-                    };
+                let (row, sent, sent_len, mark) = match self
+                    .copy_instead(store, &mut src, to, name, replace.is_none())
+                    .await?
+                {
+                    Some((row, hash)) => {
+                        notes.copied = true;
+                        (row, hash, u64::try_from(size).unwrap_or(0), None)
+                    }
+                    None => {
+                        // What the replacement goes over, to check afterwards.
+                        let mark = match replace {
+                            Some(pre) => match self.cloud.version_mark(pre, size).await {
+                                Ok(mark) => mark,
+                                Err(CloudError::Changed) => return Err(Fail::Skip(Skip::Changed)),
+                                // Not a reason to hold the upload: the eTag is
+                                // still checked before it commits.
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "a file's version history couldn't be read before its upload");
+                                    None
+                                }
+                            },
+                            None => None,
+                        };
+                        let mut reader = Hashing::new(&mut src.file);
+                        let (row, sent) = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await?;
+                        // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
+                        (row, sent.unwrap_or_else(|| reader.hash.finalize()), reader.hash.len(), mark)
+                    }
+                };
                 self.crash_point()?;
                 drop(src);
                 store.try_write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?))?;
@@ -706,6 +933,23 @@ impl<C: Cloud> Executor<C> {
                     let pre = LocalPre { id: local.id, stamp: Some((size, mtime)) };
                     if let Err(e) = self.fs.mark_uploaded(&pre, &v) {
                         tracing::debug!(error = %e, "an uploaded file wasn't marked in sync");
+                    }
+                }
+                // The upload is done and recorded from here on, whatever
+                // happens to the version it may have gone over: one that
+                // isn't kept is reported on its own (it's still in the
+                // file's version history), not as the upload failing, which
+                // would leave it out of what the round did.
+                if let (Some(pre), Some(mark)) = (replace, mark) {
+                    match self.keep_replaced(store, &pre.id, *parent, to, name, &mark).await {
+                        Ok(kept) => notes.theirs = kept,
+                        Err(Fail::Failed(why)) => notes.theirs_not_kept = Some(why),
+                        Err(Fail::Skip(s)) => notes.theirs_not_kept = Some(format!("{THEIRS_NOT_KEPT}: {s:?}")),
+                        Err(Fail::NotNow) => notes.theirs_not_kept = Some(THEIRS_NOT_KEPT.into()),
+                        Err(Fail::Halt(m)) => {
+                            notes.theirs_not_kept = Some(format!("{THEIRS_NOT_KEPT}: {m}"));
+                            notes.halt = Some(m);
+                        }
                     }
                 }
                 Ok(())
@@ -730,7 +974,7 @@ impl<C: Cloud> Executor<C> {
                     Some(_) => self.fs.replace_placeholder(a, &v, synced.as_ref())?,
                 };
                 let Done::Placed { entry, kept, .. } = placed else { return Err(odd()) };
-                *kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
+                notes.kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                 self.crash_point()?;
                 store.try_write(|o| {
                     let row = self.local_row(&entry, *to);
@@ -754,8 +998,13 @@ impl<C: Cloud> Executor<C> {
                 let mut staged = self.fs.stage()?;
                 let (len, digest) = {
                     let Some(file) = staged.file() else { return Err(odd()) };
-                    let mut w = Hashing::new(file);
-                    let received = self.cloud.download(remote, &mut w).await?;
+                    let go = || may_run(a.op());
+                    let mut w = Hashing::new(Stoppable { inner: file, go: &go, stopped: false });
+                    let received = match self.cloud.download(remote, &mut w).await {
+                        // Only staged so far, which goes with `staged`.
+                        Err(_) if w.inner.stopped => return Err(Fail::NotNow),
+                        r => r?,
+                    };
                     // In the cloud's terms (see `cloud`): what it received, if it transformed it.
                     (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
                 };
@@ -773,7 +1022,8 @@ impl<C: Cloud> Executor<C> {
                 }
                 let entry = match self.fs.place_download(a, staged, synced.as_ref()) {
                     Ok(Done::Placed { entry, kept, .. }) => {
-                        *kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
+                        notes.kept_instead =
+                            replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                         entry
                     }
                     Ok(_) => return Err(odd()),
@@ -866,7 +1116,7 @@ impl<C: Cloud> Executor<C> {
                 self.crash_point()?;
                 match self.fs.recycle(a, synced.as_ref()) {
                     Ok(Done::Recycled { kept }) => {
-                        *kept_instead = kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
+                        notes.kept_instead = kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                     }
                     Ok(_) => return Err(odd()),
                     Err(e) => return Err(e.into()),
@@ -1006,6 +1256,30 @@ impl Pending {
             }
             _ => None,
         }
+    }
+}
+
+/// Passes a download's bytes on while `go` says it may go on; once it says
+/// no, refuses them (and notes it in `stopped`), which ends the download.
+/// Asked at every write, as data arrives: a stalled connection writes
+/// nothing, and uses nothing either.
+struct Stoppable<'a, W> {
+    inner: W,
+    go: &'a (dyn Fn() -> bool + Sync),
+    stopped: bool,
+}
+
+impl<W: std::io::Write> std::io::Write for Stoppable<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.stopped || !(self.go)() {
+            self.stopped = true;
+            // Not `Interrupted`: `write_all` would try again.
+            return Err(std::io::Error::other("stopped: not to run now"));
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 

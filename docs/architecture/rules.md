@@ -16,7 +16,7 @@ One rule per line, **gitignore syntax**, so the many people who know `.gitignore
 | `!pattern` | re-include what an earlier rule excluded |
 
 Differences from git, on purpose:
-* **Case-insensitive**, like Windows and OneDrive names.
+* **Case-insensitive**, like Windows and OneDrive names, through the engine's one fold (`oneup_sync::fold`, [planner.md § Matching rules](planner.md#matching-rules)). Planning and listing fold alike, so listing never skips a folder that planning includes. Ranges such as `[a-z]` apply to the folded characters.
 * **`\` is a folder separator**, like `/`, because that's how Windows users write paths. (Git uses `\` to escape; a name can't contain `\` on Windows or in OneDrive, so nothing is lost. A name starting with `#` is written `[#]…`; one starting with `!` gets a `/` or `**/` in front, so the line doesn't start with `!`. Wildcard characters in a name are written `[*]`, `[?]`, `[[]`.)
 
 Semantics are git's:
@@ -49,7 +49,7 @@ What that means for the user:
 
 ## Changing rules without a rescan
 The rule set has two fingerprints:
-* **Pruning fingerprint:** the name-only folder rules (`RuleSet::pruning()`), stored with the local scan and the mirror.
+* **Pruning fingerprint:** the name-only folder rules (`RuleSet::pruning()`), folded, behind a version for how names fold, stored with the local scan and the mirror. A change in the fold changes the version, so stored listings are brought in line once, as for any rule change (below). An empty set keeps its fingerprint: it matches nothing under any fold.
 * **Planning fingerprint:** everything (presets, `config.toml`, the `.oneupignore` contents; `RuleSet::fingerprint`), stored in `meta` `rules.fingerprint`. When it differs at the start of a round, every folder is planned: a full pass over the database, not over the disk. The new value is stored only when a round ends clean, so a round cut short plans everything again.
 
 Every round, `oneup_app::sync::Engine` loads the rules (`rulefiles::load`: `config.toml`, then every `.oneupignore` the Local tree has, shallowest first, skipping one inside an excluded folder). Rule files are found through `local_rule_file` (kept by triggers on `local_item`), and an unchanged one (same size and last-write time) comes from a cache, not the disk. An ignored rule file (too large, not text, not an ordinary file) is reported and logged once. `oneup rules` nudges a running agent; a `.oneupignore` edit is a change in the synced folder and wakes it anyway.

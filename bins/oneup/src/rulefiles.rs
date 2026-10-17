@@ -111,17 +111,13 @@ pub fn add_separate(data_dir: &std::path::Path, store: &oneup_store::Store, set:
         return Ok(());
     }
     if let Some(remote) = store.read(|o| o.meta_get(crate::sync::KEY_REMOTE))? {
-        let top = remote.trim_end_matches('/').to_lowercase();
+        let top = format!("{}/", remote.trim_end_matches('/'));
         let separate = crate::vaultpair::list(data_dir)
             .into_iter()
             .map(|v| v.remote)
             .chain(crate::pairs::own_drive_folders(data_dir));
-        let inside: Vec<String> = separate
-            .filter_map(|r| {
-                let rel_len = r.to_lowercase().strip_prefix(&format!("{top}/"))?.len();
-                Some(r[r.len() - rel_len..].to_string())
-            })
-            .collect();
+        let inside: Vec<String> =
+            separate.filter_map(|r| Some(oneup_sync::strip_folded_prefix(&r, &top)?.to_string())).collect();
         set.set_vaults(&inside);
     }
     Ok(())
@@ -139,7 +135,7 @@ pub fn add_onedrive_app(
         return Ok(());
     }
     let remote = store.read(|o| o.meta_get(crate::sync::KEY_REMOTE))?.unwrap_or_default();
-    let top = remote.trim_end_matches('/').to_lowercase();
+    let top = remote.trim_end_matches('/');
     let inside: Vec<String> = app
         .folders
         .iter()
@@ -148,8 +144,7 @@ pub fn add_onedrive_app(
             if top.is_empty() {
                 return Some(f);
             }
-            let rel_len = f.to_lowercase().strip_prefix(&format!("{top}/"))?.len();
-            Some(f[f.len() - rel_len..].to_string())
+            Some(oneup_sync::strip_folded_prefix(&f, &format!("{top}/"))?.to_string())
         })
         .collect();
     // The drive's top files are only this pair's when it syncs the whole drive.

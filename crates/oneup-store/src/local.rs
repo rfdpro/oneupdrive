@@ -207,6 +207,12 @@ pub struct LocalStats {
 pub const LOCAL_SCAN_FORMAT: &str = "2";
 const LOCAL_SCAN_FORMAT_KEY: &str = "local_scan_format";
 
+/// Children of `?1` named `?3` (folded), `?2` characters long (see
+/// `remote_named_sql`).
+pub(crate) fn local_named_sql() -> String {
+    format!("SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3")
+}
+
 const LOCAL_COLS: &str = "file_id, parent_id, name, name_lossy, kind, size, mtime, attributes, reparse_tag, skip";
 
 /// `%needle%` for `LIKE … ESCAPE '\'`, with the needle's own `%`, `_` and
@@ -471,6 +477,16 @@ impl Ops<'_> {
         rows.map(|r| fix_local(r?)).collect()
     }
 
+    /// The stored children of folder `parent_id` whose name is `name` as
+    /// Windows compares names ([`oneup_sync::fold`]). Read through the
+    /// parent index, loading only the matches (see `Ops::remote_named`).
+    pub fn local_named(&self, parent_id: u128, name: &str) -> Result<Vec<LocalRow>> {
+        let mut st = self.c.prepare_cached(&local_named_sql())?;
+        let params = rusqlite::params![blob(parent_id), crate::char_count(name), oneup_sync::fold(name)];
+        let rows = st.query_map(params, LocalRow::from_row)?;
+        rows.map(|r| fix_local(r?)).collect()
+    }
+
     /// Up to `limit` entries whose name contains `needle` (any case), for
     /// the settings window's search. A scan of the names: fine for a search
     /// someone typed, not for anything that runs by itself.
@@ -693,6 +709,24 @@ mod tests {
             o.local_finish(9)
         })
         .unwrap();
+    }
+
+    #[test]
+    fn children_are_found_by_name_as_windows_compares_names() {
+        let mut s = Store::open_in_memory().unwrap();
+        scanned(&mut s);
+        s.write(|o| {
+            o.local_put(&row(6, Some(2), "ΟΔΟΣ", LocalKind::Folder))?;
+            Ok(())
+        })
+        .unwrap();
+        let ids = |parent: u128, name: &str| -> Vec<u128> {
+            s.read(|o| o.local_named(parent, name)).unwrap().into_iter().map(|r| r.file_id).collect()
+        };
+        assert_eq!(ids(2, "F.TXT"), [u128::MAX - 3]);
+        assert_eq!(ids(2, "οδοσ"), [6]);
+        assert!(ids(1, "f.txt").is_empty(), "only in that folder");
+        assert!(ids(2, "\u{212A}").is_empty());
     }
 
     #[test]

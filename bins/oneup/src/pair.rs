@@ -156,8 +156,8 @@ pub async fn unpair(dir: &Path, yes: bool) -> Result<()> {
         println!("Run again with --yes to do it.");
         return Ok(());
     }
-    let _lock = oneup_app::setup::DirLock::acquire(dir).context("stop the background agent first (`oneup stop`)")?;
-    let local = pairs::unpair(dir)?;
+    // Takes the data folder's lock itself.
+    let local = pairs::unpair(dir).context("stop the background agent first (`oneup stop`)")?;
     println!("{} is no longer synced; it stays as it is now.", local.display());
     Ok(())
 }

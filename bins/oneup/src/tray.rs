@@ -100,6 +100,10 @@ fn headline(v: &View, failures: bool) -> String {
             Some(p) => format!("Problem: {}", p.title),
             None => "Retrying soon".into(),
         },
+        // OneDrive full: up to date otherwise, but uploads wait.
+        Activity::Idle if s.problem.is_some() => {
+            format!("Problem: {}", s.problem.as_ref().map_or("", |p| p.title.as_str()))
+        }
         Activity::Idle => match (s.paused.local, s.paused.remote) {
             (true, false) => "Paused: changes to this PC".into(),
             (false, true) => "Paused: changes to OneDrive".into(),
@@ -701,6 +705,7 @@ mod tests {
             prune_offer: None,
             progress: None,
             unsynced: None,
+            retrying: None,
         }
     }
 
@@ -869,6 +874,10 @@ mod tests {
         assert_eq!(look(&stopped), Look::Problem);
         let m = ids(&menu_of(&stopped));
         assert!(m.contains(&id::PROBLEM) && m.contains(&id::START));
+        // OneDrive full: the rest is up to date, but that's what to know.
+        let mut s = status(Activity::Idle);
+        s.problem = Some(crate::problem::cloud_full(0, None, 0));
+        assert_eq!(summary(&up(s)), "Problem: OneDrive is full");
     }
 
     /// Problems that need the user are notified at once, once a spell;

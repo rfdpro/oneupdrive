@@ -4,7 +4,8 @@
 //! Pure: rows in, decisions out, so every rule is unit-tested here and the
 //! driver ([`crate::observe`]) only has to walk the store.
 //!
-//! Matching is by name, **case-insensitively**, like OneDrive and Windows. Two
+//! Matching is by name, **case-insensitively**, like OneDrive and Windows
+//! ([`oneup_sync::fold`]). Two
 //! local names that differ only in case (possible in case-sensitive folders)
 //! are a [`Conflict::NameClash`]: OneDrive could hold only one of them.
 //! Unicode normalisation is *not* folded: "é" precomposed and "e + ́" are
@@ -13,6 +14,7 @@
 use std::collections::BTreeMap;
 
 use oneup_store::{Kind, LocalKind, LocalRow, RemoteRow, Skip};
+use oneup_sync::fold;
 
 use crate::names;
 use crate::report::{Category, Conflict, Entry, NotSynced, Park, Unchecked};
@@ -105,16 +107,16 @@ pub fn plan_folder(
     }
     let mut pairs: BTreeMap<String, Pair> = BTreeMap::new();
     for l in local {
-        pairs.entry(l.name.to_lowercase()).or_default().local.push(l);
+        pairs.entry(fold(&l.name)).or_default().local.push(l);
     }
     // OneNote notebooks: the official client represents each as a
     // "<name>.url" shortcut file on disk.
     let mut notebook_shortcuts = Vec::new();
     for r in remote {
         if r.0.kind == Kind::Package {
-            notebook_shortcuts.push(format!("{}.url", r.0.name.to_lowercase()));
+            notebook_shortcuts.push(fold(&format!("{}.url", r.0.name)));
         }
-        pairs.entry(r.0.name.to_lowercase()).or_default().remote.push(r);
+        pairs.entry(fold(&r.0.name)).or_default().remote.push(r);
     }
 
     // Personal Vault: in the top folder, the OneDrive app represents the
@@ -130,7 +132,7 @@ pub fn plan_folder(
         for (key, pair) in &pairs {
             let cloud_only = pair.local.is_empty()
                 && matches!(pair.remote.as_slice(), [(r, _)] if matches!(r.kind, Kind::Folder | Kind::File));
-            let shortcut = format!("{key}.lnk");
+            let shortcut = fold(&format!("{key}.lnk"));
             let has_shortcut = pairs.get(&shortcut).is_some_and(|p| {
                 p.remote.is_empty()
                     && matches!(p.local.as_slice(), [l] if matches!(l.kind, LocalKind::File | LocalKind::Link))
@@ -552,6 +554,29 @@ mod tests {
         assert_eq!(cats(&p).len(), 2);
         assert!(cats(&p).iter().all(|(_, c)| *c == Category::Conflict(Conflict::NameClash)));
         assert!(p.verify.is_empty() && p.next.is_empty());
+    }
+
+    #[test]
+    fn names_pair_as_windows_compares_them() {
+        let p = plan_folder(
+            "",
+            None,
+            vec![l(2, "ΟΔΟΣ.txt", L::File, 1), l(3, "\u{212A}it.txt", L::File, 1), l(4, "İ.txt", L::File, 1)],
+            vec![r("a", "οδοσ.txt", R::File, 2), r("b", "kit.txt", R::File, 1), r("c", "i.txt", R::File, 1)],
+        );
+        let mut got = cats(&p);
+        got.sort();
+        // Final sigma pairs (one name, sizes differ); the look-alikes don't.
+        assert_eq!(
+            got,
+            [
+                ("/i.txt", Category::Download),
+                ("/kit.txt", Category::Download),
+                ("/İ.txt", Category::Upload),
+                ("/ΟΔΟΣ.txt", Category::Conflict(Conflict::SizeDiffers)),
+                ("/\u{212A}it.txt", Category::Upload),
+            ]
+        );
     }
 
     #[test]

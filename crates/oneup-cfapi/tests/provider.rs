@@ -24,12 +24,19 @@ struct Cloud {
     refused: AtomicU32,
     /// The file ID of the latest fetch.
     last_id: Mutex<i64>,
+    /// Fetches go to the test instead, which ends them when it chooses (a
+    /// download under way).
+    park: Mutex<Option<std::sync::mpsc::Sender<Fetch>>>,
 }
 
 struct Serve(Arc<Cloud>);
 
 impl Provider for Serve {
     fn fetch_data(&self, fetch: Fetch) {
+        if let Some(to) = self.0.park.lock().unwrap().as_ref() {
+            let _ = to.send(fetch);
+            return;
+        }
         let me = Arc::clone(&self.0);
         std::thread::spawn(move || {
             me.fetches.fetch_add(1, Relaxed);
@@ -414,11 +421,42 @@ fn data_access_hydrates_and_holds_refuse_fetches() {
     drop(std::fs::File::open(&px).unwrap());
     assert_eq!(info(&px).on_disk, a.len() as i64, "data access alone downloads it");
 
-    let hold = provider::hold(&id);
+    let hold = provider::hold(&id).expect("no fetch under way");
     assert_eq!(app_read(&r.base, &py), None, "refused while held");
     assert_eq!(info(&py).on_disk, 0);
     drop(hold);
     assert_eq!(app_read(&r.base, &py).as_deref(), Some(&a[..]));
+}
+
+/// The hydration downloads a whole file before its first byte arrives, so
+/// a placeholder being opened shows nothing on disk meanwhile. A hold (what
+/// precedes giving it a new version) is refused until that fetch is over:
+/// its old version's bytes must never land in a placeholder that already
+/// stands for the new one (invariant 13).
+#[test]
+fn a_fetch_under_way_refuses_a_hold_until_it_ends() {
+    let cloud = Arc::new(Cloud::default());
+    let r = root("in-flight", &cloud);
+    let (to, parked) = std::sync::mpsc::channel();
+    *cloud.park.lock().unwrap() = Some(to);
+    let a = b"the old version".to_vec();
+    let id = identity("F", &a);
+    let new = NewPlaceholder { name: "f.txt", identity: &id, size: a.len() as i64, modified: 0, folder: false };
+    provider::create(&r.root, &[new]).unwrap();
+    let p = r.root.join("f.txt");
+    let reader = {
+        let (base, p) = (r.base.clone(), p.clone());
+        std::thread::spawn(move || app_read(&base, &p))
+    };
+    let fetch = parked.recv_timeout(std::time::Duration::from_secs(30)).expect("the program's fetch");
+    assert_eq!(fetch.identity, id);
+    assert_eq!(info(&p).on_disk, 0, "nothing shows while it downloads");
+    assert!(provider::hold(&id).is_none(), "refused while its fetch is under way");
+
+    fetch.transfer(0, &a).unwrap();
+    fetch.complete();
+    assert_eq!(reader.join().unwrap().as_deref(), Some(&a[..]));
+    assert!(provider::hold(&id).is_some(), "given once it's over");
 }
 
 /// What Windows does with pin states, which the agent
@@ -749,6 +787,9 @@ fn a_folder_held_open_is_left_orphaned_until_released_again() {
     assert!(!root.join("top.txt").exists(), "outside the held folder: done");
     assert!(placeholder(&docs) && placeholder(&docs.join("h.txt")), "inside it: still placeholders");
     assert!(docs.join("online.txt").exists(), "and still online-only");
+    // Windows doesn't describe it: that's an error, never "an ordinary file"
+    // (which would mean all its content is here).
+    assert!(provider::info(&provider::open(&docs.join("online.txt")).unwrap()).is_err());
 
     // Released again, with nothing holding it.
     provider::register_as(&root, "Cleanup", 0x0dd0_0dd0_0dd0_0dd0_0dd0_0dd0_0dd0_0dd4, b"cleanup", false).unwrap();

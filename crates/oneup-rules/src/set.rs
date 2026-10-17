@@ -624,6 +624,21 @@ mod tests {
     }
 
     #[test]
+    fn listing_and_planning_fold_names_alike() {
+        // Listing never skips more than planning excludes: both decide the
+        // same for every name, Greek final sigma and look-alike signs too.
+        let s = set(&[], &["λογος/", "kit/", "ωmega/", "i*/", "straße/"]);
+        let pruning = s.pruning();
+        for name in
+            ["ΛΟΓΟΣ", "λογοσ", "Λογος", "\u{212A}it", "KIT", "\u{2126}mega", "Ωmega", "İx", "Ix", "STRASSE", "STRAßE"]
+        {
+            assert_eq!(pruning.excludes_folder(name), s.excludes_child("", name, true), "{name}");
+        }
+        assert!(pruning.excludes_folder("ΛΟΓΟΣ") && !pruning.excludes_folder("\u{212A}it"));
+        assert!(!pruning.excludes_folder("İx") && !pruning.excludes_folder("STRASSE"));
+    }
+
+    #[test]
     fn fingerprints_change_with_any_rule() {
         let a = set(&["dev"], &["*.iso"]);
         let mut b = a.clone();

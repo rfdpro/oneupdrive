@@ -6,7 +6,7 @@ Day to day you won't need any of the commands on this page: the [settings window
 `oneup sync` keeps one folder on your PC and one folder in your OneDrive the same, in both directions:
 * new files and folders are copied to the other side;
 * edits are sent across (in OneDrive, as a new version of the same file, so its version history continues);
-* renames and moves are repeated on the other side, without copying the file again. OneDrive won't move or rename a folder with more than 5,000 items inside it in one step, so OneUpDrive does it for you: it makes the folder at its new place, moves everything into it, then deletes the old, now empty folder (into OneDrive's recycle bin). A sharing link to that folder stops working (links to the files inside keep working);
+* renames and moves are repeated on the other side, without copying the file again. OneDrive won't move or rename a folder with more than 5,000 items inside it in one step, so OneUpDrive does it for you: it makes the folder at its new place, moves everything into it, then deletes the old, now empty folder (into OneDrive's recycle bin). A sharing link to that folder stops working (links to the files inside keep working). Changing only the capitals in such a folder's name ("bookmarks" to "Bookmarks") can't be done this way and is reported as failed: rename it to another name first, then to the one you want;
 * deletions are repeated on the other side, but always recoverably (see below).
 
 ```powershell
@@ -71,6 +71,8 @@ oneup --data-dir … resume --folder Videos
 
 A pause is remembered: if `oneupd` restarts, it's still paused. While paused, changes are noted but not acted on. Nothing is missed, and they sync once you resume.
 
+A pause takes effect at once, even in the middle of a long sync: nothing more starts on the paused side, and a download under way stops (it starts over when you resume). An upload that's already sending finishes. Opening an online-only file still downloads it: you asked for it.
+
 A paused folder is saved in the data folder's `config.toml`, so it stays paused until you resume it, even if `oneupd` isn't running when you pause it. Both copies stay as they are meanwhile; nothing is deleted. `oneup explain` shows a file as paused.
 
 ### How it uses your PC
@@ -89,12 +91,14 @@ oneup --data-dir … settings --busy-quiet-s 30             # send a file that k
 oneup --data-dir … settings --hold-busy-files off         # send every change right away
 ```
 
-* **Pausing by itself:** by default `oneupd` pauses while the internet connection is metered (a phone hotspot, a data plan Windows knows is limited), while battery saver is on, while a game, a presentation or another full-screen program has the screen, and while a video plays full screen (in a browser or a video player), and resumes when that ends. Games and videos are separate settings, so you can pause for one and not the other. Windows reports a full-screen video and a game that runs in a borderless window the same way, so OneUpDrive goes by the program: a browser or a video player is a video, anything else a game. Quiet hours (none by default) pause it every day between those times. `oneup status` shows when and why it paused by itself. It checks whenever it would wake up anyway, so it may take up to 10 minutes to notice that the connection or battery saver changed.
+* **Pausing by itself:** by default `oneupd` pauses while the internet connection is metered (a phone hotspot, a data plan Windows knows is limited), while battery saver is on, while a game, a presentation or another full-screen program has the screen, and while a video plays full screen (in a browser or a video player), and resumes when that ends. Games and videos are separate settings, so you can pause for one and not the other. Windows reports a full-screen video and a game that runs in a borderless window the same way, so OneUpDrive goes by the program: a browser or a video player is a video, anything else a game. Quiet hours (none by default) pause it every day between those times. `oneup status` shows when and why it paused by itself. It checks whenever it would wake up anyway, and every 30 seconds while it syncs, so it may take up to 10 minutes to notice, while idle, that the connection or battery saver changed. A pause it notices while syncing stops that sync as `oneup pause` does.
 
 * **Bandwidth caps** apply to file contents, at once, even while `oneupd` runs. With `--cap-hours 09:00-18:00` they apply only in those hours (`--cap-hours always` to undo).
 * **Background priority** is on by default: `oneupd` gives way to your programs for processor, disk and memory, and Windows may run it on power-efficient cores. Syncing a large batch can take a little longer.
 * **Memory profile** sets how much memory the database may use for caching (4, 16 or 64 MiB, plus, with background priority off, up to four times that of the database file read straight from Windows' disk cache by `oneupd`), and how large the pieces are that big files are uploaded in (up to 10, 40 or 60 MiB). Larger pieces upload faster on a good connection: OneUpDrive measures the connection as it goes and picks the size, within the profile's limit.
 * **Copies of files already in OneDrive aren't uploaded again.** If you copy a large file (1 MiB or more) that's already in your OneDrive, for example a video into a second folder, OneUpDrive checks that the contents are identical and asks OneDrive to make the copy itself. That takes a couple of seconds whatever the size. `oneup activity` shows it as copied in OneDrive.
+* **An item that fails waits before it's tried again:** a minute, then twice as long after each failure in a row, up to an hour. Other files keep syncing, and a change to the item (here or in OneDrive) ends the wait. See [When something goes wrong](troubleshooting.md#a-file-that-fails-again-and-again).
+* **While OneDrive is full, uploads and new folders wait.** Downloads go on, and what waited is sent once OneDrive has more room. The icon and `oneup status` say "OneDrive is full" meanwhile ([details](troubleshooting.md#cloud-full)).
 * **Files that keep changing wait until they're left alone.** A file saved twice within 5 seconds (a database, an app that saves its settings every few seconds) isn't sent after every save: OneUpDrive waits until it has gone 15 seconds without a change, then sends it once. A file that never stops changing is still sent at least every 10 minutes. `oneup activity` shows such a file as waiting. In the settings window: **General → File changes**; `--busy-changes`, `--busy-window-s` and `--busy-max-s` set how many changes in how many seconds make a file busy and the longest it waits. Downloads never wait.
 * **The database is compacted** when `oneupd` starts, if deleted entries left most of it empty (it can otherwise stay at its largest size). It takes a few seconds and shows in `oneup activity`. `oneup settings --compact-database off` turns it off.
 * Priority and memory profile apply the next time `oneupd` starts (`oneup stop`, then `oneup start`).
@@ -128,6 +132,7 @@ A **safety stop** (see below) doesn't end `oneupd`: it changes nothing and waits
 
 ## Nothing is lost
 * **Edited on both sides?** You get both. Your PC's copy is renamed to `name (conflict 1).ext` and uploaded, and the OneDrive version keeps the original name.
+  * If the OneDrive edit lands in the last moment of a large upload from your PC, your PC's version keeps the original name instead and the OneDrive version arrives as `name (conflict 1).ext`. The activity log says so.
 * **Deleted on your PC?** The OneDrive copy goes to OneDrive's recycle bin, where you can restore it from the website.
 * **Deleted in OneDrive?** Your PC's copy is moved into the hidden `.oneup\versions` folder inside your synced folder, with a note of where it came from. (If that would make the folder too big, you're asked first: see [When the version store is full](#when-the-version-store-is-full).)
 * **Replaced by a newer version from OneDrive?** Your PC gets the new version. The old one isn't kept on your PC, because OneDrive keeps it in the file's **version history** (on the website: right-click the file, *Version history*). This only happens when you hadn't changed the file on your PC; if you had, you get both copies (see above). Before the old copy is removed, OneUpDrive reads it to make sure it really is the version OneDrive has. If it isn't, it's kept in `.oneup\versions` instead. To keep old versions on your PC as well, run `oneup versions --set-keep-replaced on`.
@@ -214,7 +219,7 @@ Restoring never replaces anything. If the name is taken, you get `name (restored
 Files deleted from OneDrive are in OneDrive's own recycle bin (on the website). Older versions of a file are in its version history there.
 
 ## Making room
-The version store is trimmed automatically at the end of each `oneup sync`, and by `oneupd` whenever it has caught up. It is careful:
+The version store is trimmed automatically at the end of each `oneup sync`, and by `oneupd` whenever it has caught up (not while changes to this PC are paused). It is careful:
 * anything kept **less than 30 days ago is never removed**, however big the store gets;
 * older items are removed, oldest first, **only while the store is bigger than 5 GiB or 2% of the disk**, whichever is smaller. While it's under that, old items stay.
 

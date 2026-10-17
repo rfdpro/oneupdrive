@@ -16,7 +16,8 @@
 //! Since schema v3 it also holds the **Local tree**, a read-only scan of a
 //! local folder (see [`local`]), and since v4 the **Synced tree** with the
 //! deletion evidence the reconciler relies on (see [`synced`]), and since v5
-//! the marks of folders that need planning again (see [`dirty`]).
+//! the marks of folders that need planning again (see [`dirty`]), and since
+//! v17 when failed operations are tried again (see [`retry`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -32,6 +33,7 @@
 
 use std::path::Path;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 pub mod local;
@@ -41,9 +43,11 @@ pub use synced::SyncedStats;
 pub mod dirty;
 pub use dirty::DirtyScope;
 pub mod activity;
+pub mod retry;
 mod rulefile;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
+pub use retry::{Item as RetryItem, Retry};
 pub use usage::{AppFile, AppUse, UseKind};
 
 #[derive(Debug, thiserror::Error)]
@@ -93,7 +97,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 17;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -446,8 +450,18 @@ impl Store {
         Self::init(Connection::open_in_memory()?, 2048)
     }
 
-    fn init(conn: Connection, cache_kib: u32) -> Result<Self> {
+    fn init(mut conn: Connection, cache_kib: u32) -> Result<Self> {
         conn.busy_timeout(BUSY_WAIT)?;
+        // Names compared the way the rest of the engine compares them
+        // (`oneup_sync::fold`); SQLite's own `lower()` folds ASCII only. For
+        // queries only: the schema (triggers, indexes) must stay usable by
+        // every program that opens the file, which won't have it.
+        conn.create_scalar_function(
+            "oneup_fold",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|s| oneup_sync::fold(&s))),
+        )?;
         // The mirror is rebuildable from the cloud, so NORMAL durability (WAL)
         // is sufficient here. The future op journal will use FULL.
         conn.execute_batch(&format!(
@@ -457,56 +471,12 @@ impl Store {
              PRAGMA cache_size = -{cache_kib};
              PRAGMA temp_store = FILE;"
         ))?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let version = user_version(&conn)?;
         if version > SCHEMA_VERSION {
             return Err(Error::TooNew { found: version, supported: SCHEMA_VERSION });
         }
-        // Each step runs in its own transaction, so an interrupted upgrade
-        // resumes from the last completed version.
-        if version < 1 {
-            conn.execute_batch(&format!("BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"))?;
-        }
-        if version < 2 {
-            conn.execute_batch(&format!("BEGIN; {MIGRATE_V2} PRAGMA user_version = 2; COMMIT;"))?;
-        }
-        if version < 3 {
-            conn.execute_batch(&format!("BEGIN; {MIGRATE_V3} PRAGMA user_version = 3; COMMIT;"))?;
-        }
-        if version < 4 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 4; COMMIT;", synced::MIGRATE_V4))?;
-        }
-        if version < 5 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 5; COMMIT;", dirty::migrate_v5()))?;
-        }
-        if version < 6 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 6; COMMIT;", activity::MIGRATE_V6))?;
-        }
-        if version < 7 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 7; COMMIT;", rulefile::MIGRATE_V7))?;
-        }
-        if version < 8 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 8; COMMIT;", rulefile::MIGRATE_V8))?;
-        }
-        if version < 9 {
-            conn.execute_batch(&format!("BEGIN; {MIGRATE_V9} PRAGMA user_version = 9; COMMIT;"))?;
-        }
-        if version < 10 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 10; COMMIT;", usage::MIGRATE_V10))?;
-        }
-        if version < 11 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 11; COMMIT;", usage::MIGRATE_V11))?;
-        }
-        if version < 12 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 12; COMMIT;", synced::MIGRATE_V12))?;
-        }
-        if version < 13 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 13; COMMIT;", dirty::migrate_v13()))?;
-        }
-        if version < 14 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 14; COMMIT;", rulefile::MIGRATE_V14))?;
-        }
-        if version < 15 {
-            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version = 15; COMMIT;", synced::MIGRATE_V15))?;
+        if version < SCHEMA_VERSION {
+            migrate(&mut conn)?;
         }
         conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS t_sub (id TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -599,6 +569,52 @@ impl Store {
     }
 }
 
+fn user_version(c: &Connection) -> Result<i64> {
+    Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+/// Brings the schema up to [`SCHEMA_VERSION`]. Each step runs in its own
+/// transaction, so an interrupted upgrade resumes from the last completed
+/// version. A step takes the write lock first and reads the version again
+/// under it: another process opening the same old database at the same
+/// moment (the agent and the settings window, say) has then either applied
+/// the step, which is skipped, or waits for this one to finish. A version
+/// read outside the lock can be stale, and replaying a step fails ("table
+/// already exists").
+fn migrate(conn: &mut Connection) -> Result<()> {
+    let steps: [(i64, String); 17] = [
+        (1, SCHEMA_V1.into()),
+        (2, MIGRATE_V2.into()),
+        (3, MIGRATE_V3.into()),
+        (4, synced::MIGRATE_V4.into()),
+        (5, dirty::migrate_v5()),
+        (6, activity::MIGRATE_V6.into()),
+        (7, rulefile::MIGRATE_V7.into()),
+        (8, rulefile::MIGRATE_V8.into()),
+        (9, MIGRATE_V9.into()),
+        (10, usage::MIGRATE_V10.into()),
+        (11, usage::MIGRATE_V11.into()),
+        (12, synced::MIGRATE_V12.into()),
+        (13, dirty::migrate_v13()),
+        (14, rulefile::MIGRATE_V14.into()),
+        (15, synced::MIGRATE_V15.into()),
+        (16, format!("{} {MIGRATE_V16}", synced::MIGRATE_V16)),
+        (17, retry::MIGRATE_V17.into()),
+    ];
+    for (to, sql) in steps {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let at = user_version(&tx)?;
+        if at > SCHEMA_VERSION {
+            return Err(Error::TooNew { found: at, supported: SCHEMA_VERSION });
+        }
+        if at < to {
+            tx.execute_batch(&format!("{sql} PRAGMA user_version = {to};"))?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 /// Operations on an open connection or transaction.
 pub struct Ops<'a> {
     c: &'a Connection,
@@ -618,6 +634,33 @@ const MIGRATE_V9: &str = "
 CREATE INDEX remote_item_copyable ON remote_item(size)
     WHERE kind = 0 AND size >= 1048576 AND qxh IS NOT NULL;
 ";
+
+/// v16 (with [`synced::MIGRATE_V16`]): the enumeration's next units
+/// without reading every unit (finished ones stay, and a large drive has
+/// many), and the drive's root without reading the whole Remote tree.
+const MIGRATE_V16: &str = "
+CREATE INDEX enum_unit_pending ON enum_unit(state, depth, path);
+CREATE INDEX remote_item_root ON remote_item(kind) WHERE kind = 2;
+";
+
+const PENDING_UNITS: &str = "SELECT folder_id, path, kind, depth, next_link, items FROM enum_unit
+     WHERE state = 0 ORDER BY depth, path LIMIT ?1";
+const PENDING_COUNT: &str = "SELECT count(*) FROM enum_unit WHERE state = 0";
+
+/// Children of `?1` named `?3` (folded), whose names are `?2` characters
+/// long. The fold maps each character to one, so a name of another length
+/// can't match: that cheap check spares folding most names.
+fn remote_named_sql() -> String {
+    format!("SELECT {ITEM_COLS} FROM remote_item WHERE parent_id = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3")
+}
+
+/// A name's length as SQLite's `length()` counts it: in characters.
+pub(crate) fn char_count(name: &str) -> i64 {
+    i64::try_from(name.chars().count()).unwrap_or(i64::MAX)
+}
+
+const REMOTE_ROOT: &str =
+    "SELECT id, parent_id, name, kind, size, etag, qxh, mtime FROM remote_item WHERE kind = 2 LIMIT 1";
 
 /// The folders of the subtree in `t_sub` become tombstones.
 const PRUNE_TOMBSTONES: &str = "
@@ -811,11 +854,7 @@ impl Ops<'_> {
 
     /// The drive's root row, if the mirror has one.
     pub fn remote_root(&self) -> Result<Option<RemoteRow>> {
-        let row = self
-            .c
-            .prepare_cached(&format!("SELECT {ITEM_COLS} FROM remote_item WHERE kind = 2 LIMIT 1"))?
-            .query_row([], RemoteRow::from_row)
-            .optional()?;
+        let row = self.c.prepare_cached(REMOTE_ROOT)?.query_row([], RemoteRow::from_row).optional()?;
         row.map(fix_kind).transpose()
     }
 
@@ -857,6 +896,18 @@ impl Ops<'_> {
             Ok((fix_kind(row)?, x))
         })
         .collect()
+    }
+
+    /// The stored children of cloud folder `parent_id` whose name is `name`
+    /// as Windows and OneDrive compare names ([`oneup_sync::fold`]): one, or
+    /// several where names that fold alike coexist in OneDrive. Read through
+    /// the parent index, and only the matches are loaded, however many
+    /// children the folder has.
+    pub fn remote_named(&self, parent_id: &str, name: &str) -> Result<Vec<RemoteRow>> {
+        let mut st = self.c.prepare_cached(&remote_named_sql())?;
+        let params = rusqlite::params![parent_id, char_count(name), oneup_sync::fold(name)];
+        let rows = st.query_map(params, RemoteRow::from_row)?;
+        rows.map(|r| fix_kind(r?)).collect()
     }
 
     /// Calls `f(id, name, is_excluded)` for every stored folder.
@@ -1011,12 +1062,13 @@ impl Ops<'_> {
         )?)
     }
 
-    pub fn pending_units(&self) -> Result<Vec<Unit>> {
-        let mut st = self.c.prepare(
-            "SELECT folder_id, path, kind, depth, next_link, items FROM enum_unit WHERE state = 0 ORDER BY depth, path",
-        )?;
+    /// The first `limit` unfinished units, shallowest first (then by path).
+    /// Read in that order from an index, so it costs `limit` rows however
+    /// many units the enumeration has finished.
+    pub fn pending_units(&self, limit: usize) -> Result<Vec<Unit>> {
+        let mut st = self.c.prepare_cached(PENDING_UNITS)?;
         let v = st
-            .query_map([], |r| {
+            .query_map([limit as i64], |r| {
                 let kind: i64 = r.get(2)?;
                 Ok(Unit {
                     folder_id: r.get(0)?,
@@ -1029,6 +1081,12 @@ impl Ops<'_> {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(v)
+    }
+
+    /// How many units are unfinished (counted in the pending units' index).
+    pub fn pending_unit_count(&self) -> Result<u64> {
+        let n: i64 = self.c.query_row(PENDING_COUNT, [], |r| r.get(0))?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     pub fn clear_units(&self) -> Result<()> {
@@ -1331,6 +1389,95 @@ mod tests {
         }
     }
 
+    /// Finding a child by name reads the folder's rows from the parent
+    /// index, never the whole table: a conflict name is chosen this way in
+    /// folders that can hold millions of items.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn by_name_queries_use_the_parent_indexes() {
+        let s = Store::open_in_memory().unwrap();
+        for sql in [remote_named_sql(), local::local_named_sql()] {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let nulls = std::iter::repeat_n(rusqlite::types::Null, st.parameter_count());
+            let plan: Vec<String> =
+                st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+            assert!(!plan.iter().any(|step| step.starts_with("SCAN")), "{sql}\n{plan:#?}");
+            assert!(plan.iter().any(|step| step.contains("_parent")), "{sql}\n{plan:#?}");
+        }
+    }
+
+    /// Names match as the planner compares them: per character, through
+    /// its simple upper case.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn children_are_found_by_name_as_windows_compares_names() {
+        let mut s = Store::open_in_memory().unwrap();
+        let item = |id: &str, parent: &str, name: &str| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind: Kind::File,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| {
+            o.upsert_item(&item("a", "p", "ΟΔΟΣ.txt"), false)?;
+            o.upsert_item(&item("b", "p", "\u{212A}.txt"), false)?;
+            o.upsert_item(&item("c", "q", "οδοσ.txt"), false)?;
+            Ok(())
+        })
+        .unwrap();
+        let ids = |name: &str| -> Vec<String> {
+            s.read(|o| o.remote_named("p", name)).unwrap().into_iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids("οδοσ.TXT"), ["a"]);
+        assert_eq!(ids("\u{212A}.TXT"), ["b"]);
+        assert!(ids("k.txt").is_empty(), "the Kelvin sign isn't k");
+        assert!(ids("ΟΔΟ.txt").is_empty());
+    }
+
+    /// Picking the next enumeration units and finding the drive's root read
+    /// only what they return: the enumeration keeps every unit it finished,
+    /// and the Remote tree holds millions of rows.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn unit_scheduling_and_the_root_are_read_from_indexes() {
+        let s = Store::open_in_memory().unwrap();
+        for sql in [PENDING_UNITS, PENDING_COUNT, REMOTE_ROOT] {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let nulls = std::iter::repeat_n(rusqlite::types::Null, st.parameter_count());
+            let plan: Vec<String> =
+                st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+            let full = |step: &String| step.starts_with("SCAN") || step.contains("TEMP B-TREE");
+            assert!(!plan.iter().any(full), "{sql}\n{plan:#?}");
+        }
+    }
+
+    #[test]
+    fn pending_units_come_shallowest_first_up_to_the_limit() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            for (id, depth) in [("c", 2), ("a", 1), ("b", 1), ("d", 3)] {
+                o.put_unit(&Unit {
+                    folder_id: id.into(),
+                    path: format!("/{id}"),
+                    kind: UnitKind::Delta,
+                    depth,
+                    next_link: None,
+                    items: 0,
+                })?;
+            }
+            o.finish_unit("a", 0)?;
+            let ids: Vec<String> = o.pending_units(2)?.into_iter().map(|u| u.folder_id).collect();
+            assert_eq!(ids, ["b", "c"]);
+            assert_eq!(o.pending_unit_count()?, 3);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     fn row(id: &str, parent: Option<&str>, name: &str, kind: Kind) -> RemoteRow {
         RemoteRow {
             id: id.into(),
@@ -1530,9 +1677,9 @@ mod tests {
             o.put_unit(&u)?;
             o.put_unit(&u)?;
             o.set_unit_progress("a", "next", 10)?;
-            assert_eq!(o.pending_units()?[0].next_link.as_deref(), Some("next"));
+            assert_eq!(o.pending_units(10)?[0].next_link.as_deref(), Some("next"));
             o.finish_unit("a", 5)?;
-            assert!(o.pending_units()?.is_empty());
+            assert!(o.pending_units(10)?.is_empty());
             o.set_cursor(&Cursor { delta_link: "dl".into(), taken_at_ms: 7, state: CursorState::Pending })?;
             o.set_cursor(&Cursor { delta_link: "dl2".into(), taken_at_ms: 8, state: CursorState::Current })?;
             assert_eq!(o.cursor()?.unwrap().state, CursorState::Current);
@@ -1568,6 +1715,45 @@ mod tests {
         assert_eq!(s.read(|o| o.local_stats()).unwrap(), LocalStats::default());
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Processes opening an old database at the same moment (the agent and
+    /// the settings window, say) all get the upgraded schema: a step another
+    /// one applied in the meantime is skipped, not replayed ("trigger
+    /// already exists") or refused as busy.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn concurrent_opens_of_an_old_database_all_upgrade_it() {
+        for round in 0..10 {
+            let path = std::env::temp_dir().join(format!("oneup-store-race-{}-{round}.db", std::process::id()));
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+            }
+            {
+                let c = Connection::open(&path).unwrap();
+                c.execute_batch(&format!("PRAGMA journal_mode = WAL; {SCHEMA_V1} PRAGMA user_version = 1;")).unwrap();
+            }
+            let go = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let opens: Vec<_> = (0..4)
+                .map(|_| {
+                    let (path, go) = (path.clone(), std::sync::Arc::clone(&go));
+                    std::thread::spawn(move || {
+                        go.wait();
+                        Store::open(&path, 1024).map(drop)
+                    })
+                })
+                .collect();
+            for o in opens {
+                o.join().unwrap().unwrap();
+            }
+            let s = Store::open(&path, 1024).unwrap();
+            let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            drop(s);
+            for ext in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+            }
+        }
     }
 
     #[test]

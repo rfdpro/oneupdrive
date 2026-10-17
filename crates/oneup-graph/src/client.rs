@@ -10,6 +10,8 @@ use crate::model::{DriveItem, ITEM_SELECT, Page};
 use crate::{Aimd, Auth, Error, Result};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
+/// What OneUpDrive's HTTP clients call themselves.
+pub const USER_AGENT: &str = concat!("OneUpDrive/", env!("CARGO_PKG_VERSION"));
 /// Largest page size Graph honours for drive collections (measured 2.6× faster than the default).
 pub const PAGE_SIZE: u32 = 1000;
 const MAX_ATTEMPTS: u32 = 8;
@@ -43,6 +45,28 @@ pub struct Graph {
     /// Bandwidth caps for file content (`rules.md` § User controls).
     pub upload: crate::throttle::Throttle,
     pub download: crate::throttle::Throttle,
+    /// How long a download may receive nothing before it's abandoned.
+    stall: Duration,
+    /// For [`Graph::download_version`], which must see the redirect.
+    no_redirect: std::sync::OnceLock<reqwest::Client>,
+}
+
+/// The settings every OneUpDrive HTTP client starts from: a bounded
+/// connect, a total timeout for metadata requests (transfers set their own)
+/// and TCP keepalive, so a connection that died without closing (sleep and
+/// resume, a NAT dropping it) fails instead of hanging. There's deliberately
+/// no client-wide read timeout: reqwest's also bounds the wait for the
+/// response headers, which for an upload includes sending its whole body, so
+/// it would fail slow-but-moving uploads. Downloads detect a stall per read
+/// instead ([`Graph::download_to`]).
+pub fn http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(120))
+        // reqwest's default, stated: probes every 15 s once idle for 15 s.
+        .tcp_keepalive(Duration::from_secs(15))
+        .tcp_keepalive_interval(Duration::from_secs(15))
 }
 
 /// Percent-encodes a drive path for `root:/path:` addressing. Always uses
@@ -81,6 +105,11 @@ struct Req<'a> {
     /// Shown in errors instead of the URL (pre-authenticated URLs carry a
     /// session token and must never be logged).
     label: Option<&'static str>,
+    /// Sent again after a network error or a server error. Off for an
+    /// upload fragment: its upload session owns those retries, asking the
+    /// session where it is first, and counts them per fragment. Throttling
+    /// (429, 503) is waited out either way, and isn't a retry.
+    retry: bool,
 }
 
 impl<'a> Req<'a> {
@@ -95,6 +124,7 @@ impl<'a> Req<'a> {
             content_range: None,
             timeout: None,
             label: None,
+            retry: true,
         }
     }
 }
@@ -112,14 +142,15 @@ pub const FRAGMENT: usize = crate::fragment::START_UNITS * crate::fragment::UNIT
 /// (120 s) is for metadata; a fragment or a large download legitimately
 /// takes longer on a slow line.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+/// How long a download may go without receiving a byte. Each read restarts
+/// it, so a slow line that keeps moving is never cut off.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What [`Graph::upload_fragment`] reports.
 #[derive(Debug)]
 pub struct Fragment {
     /// The uploaded item, once the last fragment completed it.
     pub item: Option<DriveItem>,
-    /// It took more than one attempt (a network error or a server error).
-    pub retried: bool,
     /// Time spent waiting because the service asked for it (throttling).
     pub paused: Duration,
     /// Time spent waiting for the user's bandwidth cap.
@@ -176,7 +207,7 @@ impl BatchResp {
     }
 
     pub fn error(&self, what: &str) -> Error {
-        Error::Status { status: self.status, what: what.into(), body: self.body.to_string() }
+        Error::refused(self.status, what, self.body.to_string())
     }
 }
 
@@ -229,7 +260,11 @@ impl Graph {
     pub async fn download_to(&self, url: &str, out: &mut (dyn std::io::Write + Send)) -> Result<u64> {
         let _permit = self.limiter.acquire().await;
         self.stats.requests.fetch_add(1, Relaxed);
-        let mut resp = self.http.get(url).timeout(TRANSFER_TIMEOUT).send().await?;
+        // A dead connection holds the limiter's permit while it hangs, so
+        // waiting for the answer and for each read is bounded.
+        let stalled = |_| Error::Stalled("download", self.stall.as_secs());
+        let sent = self.http.get(url).timeout(TRANSFER_TIMEOUT).send();
+        let mut resp = tokio::time::timeout(self.stall, sent).await.map_err(stalled)??;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             if status == 429 || status == 503 {
@@ -240,7 +275,7 @@ impl Graph {
             return Err(Error::Status { status, what: "download".into(), body: String::new() });
         }
         let mut n = 0u64;
-        while let Some(chunk) = resp.chunk().await? {
+        while let Some(chunk) = tokio::time::timeout(self.stall, resp.chunk()).await.map_err(stalled)?? {
             out.write_all(&chunk).map_err(Error::Local)?;
             n += chunk.len() as u64;
             // Not reading meanwhile slows the sender down (TCP flow control).
@@ -288,7 +323,9 @@ impl Graph {
     }
 
     /// Starts an upload session (see [`Graph::upload_small`] for the
-    /// conditions) and returns its pre-authenticated upload URL.
+    /// conditions) and returns its pre-authenticated upload URL. Graph
+    /// checks `If-Match` here only, not when the last fragment commits the
+    /// upload: a replacing upload re-checks the eTag itself before then.
     pub async fn upload_session(&self, parent: &str, name: &str, replace: Option<(&str, &str)>) -> Result<String> {
         let (url, behavior) = match replace {
             Some((id, _)) => (format!("{}/items/{}/createUploadSession", self.drive_url(), encode_id(id)), "replace"),
@@ -310,7 +347,10 @@ impl Graph {
     }
 
     /// Sends bytes `start..start + bytes.len()` of a `total`-byte upload.
-    /// The item comes back once the last fragment completes it.
+    /// The item comes back once the last fragment completes it. Sent once:
+    /// after a network or server error the caller asks the session where
+    /// it is ([`Graph::upload_status`]) and goes on from there. Throttling
+    /// is still waited out here.
     pub async fn upload_fragment(&self, upload_url: &str, start: u64, total: u64, bytes: &[u8]) -> Result<Fragment> {
         let capped = std::time::Instant::now();
         self.upload.take(bytes.len() as u64).await;
@@ -322,11 +362,12 @@ impl Graph {
             content_range: Some(format!("bytes {start}-{end}/{total}")),
             timeout: Some(TRANSFER_TIMEOUT),
             label: Some("upload session fragment"),
+            retry: false,
             ..Req::new(reqwest::Method::PUT, upload_url)
         };
         let (status, body, m) = self.send_measured(&req).await?;
         let item = if status == 202 { None } else { Some(serde_json::from_slice(&body)?) };
-        Ok(Fragment { item, retried: m.attempts > 1, paused: m.paused, capped })
+        Ok(Fragment { item, paused: m.paused, capped })
     }
 
     /// Asks OneDrive to copy file `source` into folder `parent` as `name`
@@ -414,7 +455,7 @@ impl Graph {
                 }
                 let status = r.get("status").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
                 let resp = BatchResp { status, body: r.get("body").cloned().unwrap_or(serde_json::Value::Null) };
-                let retry = status == 429 || (500..600).contains(&status);
+                let retry = status == 429 || retried(status);
                 if retry && attempt < MAX_ATTEMPTS {
                     if status == 429 || status == 503 {
                         let after = r
@@ -494,6 +535,18 @@ impl Graph {
         }
     }
 
+    /// Where an upload session stands: the first byte it still expects.
+    /// `None` if it takes no more (it expired, was cancelled or completed):
+    /// Graph answers 404 for a session that is gone.
+    pub async fn upload_status(&self, upload_url: &str) -> Result<Option<u64>> {
+        let req = Req { auth: false, label: Some("upload session"), ..Req::new(reqwest::Method::GET, upload_url) };
+        match self.send(&req).await {
+            Ok((_, body)) => Ok(next_expected(&serde_json::from_slice(&body)?)),
+            Err(e) if e.status() == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Abandons an upload session (best effort; sessions also expire).
     pub async fn cancel_upload(&self, upload_url: &str) {
         let req = Req { auth: false, label: Some("upload session"), ..Req::new(reqwest::Method::DELETE, upload_url) };
@@ -533,6 +586,8 @@ impl Graph {
             stats: NetStats::default(),
             upload: crate::throttle::Throttle::default(),
             download: crate::throttle::Throttle::default(),
+            stall: STALL_TIMEOUT,
+            no_redirect: std::sync::OnceLock::new(),
             drive: "/me/drive".into(),
             scope: None,
         }
@@ -617,8 +672,21 @@ impl Graph {
                 return Err(Error::Exhausted(attempt));
             }
             let mut rb = self.http.request(req.method.clone(), url);
+            let mut token = None;
             if req.auth {
-                rb = rb.bearer_auth(self.auth.access_token().await?);
+                match self.auth.access_token().await {
+                    Ok(t) => rb = rb.bearer_auth(token.insert(t)),
+                    // The token endpoint unreachable, busy or failing isn't a
+                    // refused sign-in: try again like a failed request.
+                    Err(e) if e.is_transient() => {
+                        self.stats.retries.fetch_add(1, Relaxed);
+                        let wait = backoff(attempt).max(self.auth.retry_after());
+                        tracing::warn!(error = %e, attempt, wait_s = wait.as_secs(), "token refresh failed; retrying");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             if let Some(tag) = req.if_match {
                 rb = rb.header(reqwest::header::IF_MATCH, tag);
@@ -647,6 +715,7 @@ impl Graph {
             let sent = rb.send().await;
             let resp = match sent {
                 Ok(r) => r,
+                Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
                     drop(permit);
                     self.stats.retries.fetch_add(1, Relaxed);
@@ -675,19 +744,28 @@ impl Graph {
                 measure.attempts -= 1;
                 continue;
             }
-            if status == 401 && req.auth && attempt <= 2 {
+            if status == 401
+                && let Some(t) = &token
+                && attempt <= 2
+            {
                 drop(permit);
-                self.auth.invalidate().await;
+                self.auth.invalidate(t).await;
                 continue;
             }
-            if (500..600).contains(&status) {
+            if retried(status) && req.retry {
                 drop(permit);
                 self.stats.retries.fetch_add(1, Relaxed);
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
-            let body = match resp.bytes().await {
+            let body = if (200..300).contains(&status) {
+                resp.bytes().await.map(Vec::from)
+            } else {
+                crate::error_body(resp).await
+            };
+            let body = match body {
                 Ok(b) => b,
+                Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
                     drop(permit);
                     self.stats.retries.fetch_add(1, Relaxed);
@@ -704,10 +782,10 @@ impl Graph {
                     Some(l) => l.to_string(),
                     None => url.split('?').next().unwrap_or(url).to_string(),
                 };
-                return Err(Error::Status { status, what, body: String::from_utf8_lossy(&body).into_owned() });
+                return Err(Error::refused(status, what, String::from_utf8_lossy(&body).into_owned()));
             }
             self.limiter.on_success();
-            return Ok((status, body.to_vec(), measure));
+            return Ok((status, body, measure));
         }
     }
 
@@ -766,6 +844,13 @@ impl Graph {
         let v: serde_json::Value = self.get(&format!("{GRAPH}/me/drive?$select=quota")).await?;
         let n = |k: &str| v.pointer(&format!("/quota/{k}")).and_then(serde_json::Value::as_i64);
         Ok(n("used").zip(n("total")))
+    }
+
+    /// The room left in the drive requests address, in bytes (`None`: not
+    /// told, as for a drive someone else owns). One small request.
+    pub async fn remaining(&self) -> Result<Option<i64>> {
+        let v: serde_json::Value = self.get(&format!("{}?$select=quota", self.drive_url())).await?;
+        Ok(v.pointer("/quota/remaining").and_then(serde_json::Value::as_i64))
     }
 
     /// `None` if the item no longer exists.
@@ -834,8 +919,15 @@ impl Graph {
         out: &mut (dyn std::io::Write + Send),
     ) -> Result<u64> {
         let url = format!("{}/items/{}/versions/{}/content", self.drive_url(), encode_id(id), encode_id(version));
-        let http =
-            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(TRANSFER_TIMEOUT).build()?;
+        // Only the redirect is read here; the content comes through
+        // `download_to`, with its transfer timeout and stall detection.
+        let http = match self.no_redirect.get() {
+            Some(c) => c,
+            None => {
+                let c = http_builder().redirect(reqwest::redirect::Policy::none()).build()?;
+                self.no_redirect.get_or_init(|| c)
+            }
+        };
         let _permit = self.limiter.acquire().await;
         let resp = http.get(&url).bearer_auth(self.auth.access_token().await?).send().await?;
         let status = resp.status().as_u16();
@@ -929,9 +1021,24 @@ impl Graph {
     }
 }
 
+/// The first byte an upload session's status still expects: the start of
+/// its first `nextExpectedRanges` entry (`"start-end"` or `"start-"`).
+/// `None` if it expects nothing more.
+fn next_expected(status: &serde_json::Value) -> Option<u64> {
+    let ranges = status.get("nextExpectedRanges")?.as_array()?;
+    ranges.iter().filter_map(|r| r.as_str()?.split('-').next()?.trim().parse().ok()).min()
+}
+
 /// An integer header value (e.g. `Retry-After: 30`, `RateLimit-Remaining: 12`).
 fn header_u64(h: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
     h.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
+/// Server errors worth sending again. Not 507: the drive has no room
+/// left, which another try a moment later won't change, and retried, it
+/// reached the caller only as "gave up", without its code.
+fn retried(status: u16) -> bool {
+    (500..600).contains(&status) && status != 507
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -985,6 +1092,179 @@ mod tests {
         assert!(r.is_root() && r.parent_id().is_none(), "the scope's folder stands in for the root");
         let other = g.rooted(item("ABC!8"));
         assert!(!other.is_root() && other.parent_id() == Some("P"));
+    }
+
+    /// A one-connection HTTP server on loopback: answers the request with
+    /// `head`, then sends each of `drips` `gap` apart, then holds the
+    /// connection open without sending more (a connection gone dead).
+    async fn serve(head: Vec<u8>, drips: Vec<&'static [u8]>, gap: Duration) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = s.read(&mut buf).await;
+            s.write_all(&head).await.unwrap();
+            for d in drips {
+                tokio::time::sleep(gap).await;
+                s.write_all(d).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        url
+    }
+
+    /// A loopback HTTP server answering each request (one per connection,
+    /// read whole first) with the next of `answers`, the last one again
+    /// after that; returns its URL and how many requests it got.
+    async fn serve_each(answers: Vec<&'static str>) -> (String, Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/up", l.local_addr().unwrap());
+        let count = Arc::new(AtomicU64::new(0));
+        let n = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let k = s.read(&mut buf).await.unwrap_or(0);
+                    if k == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..k]);
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let i = n.fetch_add(1, Relaxed) as usize;
+                let _ = s.write_all(answers[i.min(answers.len() - 1)].as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (url, count)
+    }
+
+    /// The client sends an upload fragment once: after a server or network
+    /// error its upload session decides what to send again (asking the
+    /// session first), within one budget per fragment. Throttling is still
+    /// waited out here, and isn't a send of its own for that budget.
+    #[tokio::test]
+    async fn an_upload_fragment_is_sent_once_and_throttling_waited_out() {
+        let fragment = |url: String| async move {
+            let g = graph();
+            let r = tokio::time::timeout(Duration::from_secs(20), g.upload_fragment(&url, 0, 10, b"0123456789")).await;
+            r.expect("not retried with back-off")
+        };
+        let failed = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, count) = serve_each(vec![failed]).await;
+        let r = fragment(url).await;
+        assert!(matches!(r, Err(Error::Status { status: 500, .. })), "{r:?}");
+        assert_eq!(count.load(Relaxed), 1);
+
+        // The connection closed without an answer.
+        let (url, count) = serve_each(vec![""]).await;
+        let r = fragment(url).await;
+        assert!(r.as_ref().is_err_and(Error::is_transient), "{r:?}");
+        assert_eq!(count.load(Relaxed), 1);
+
+        let throttled =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let accepted = "HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (url, count) = serve_each(vec![throttled, accepted]).await;
+        let f = fragment(url).await.unwrap();
+        assert!(f.item.is_none());
+        assert_eq!(count.load(Relaxed), 2, "the throttled send was waited out and sent again");
+    }
+
+    #[tokio::test]
+    async fn a_download_that_stops_receiving_fails_instead_of_hanging() {
+        let mut g = graph();
+        g.stall = Duration::from_millis(300);
+        let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_vec(), vec![], Duration::ZERO).await;
+        let mut out = Vec::new();
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await;
+        assert!(matches!(r, Ok(Err(Error::Stalled(..)))), "{r:?}");
+        assert_eq!(out, b"abc");
+    }
+
+    #[tokio::test]
+    async fn a_slow_download_that_keeps_moving_completes() {
+        let mut g = graph();
+        g.stall = Duration::from_millis(300);
+        // Ten bytes, 100 ms apart: much longer in total than the stall limit.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".to_vec();
+        let url = serve(head, vec![b"x"; 10], Duration::from_millis(100)).await;
+        let mut out = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap().unwrap();
+        assert_eq!((n, out.as_slice()), (10, b"xxxxxxxxxx".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn a_huge_refusal_body_is_cut_before_it_becomes_an_error() {
+        let page = "<p>".repeat(100_000);
+        let head = format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{page}", page.len()).into_bytes();
+        let url = serve(head, vec![], Duration::ZERO).await;
+        let req = Req { auth: false, ..Req::new(reqwest::Method::GET, &url) };
+        match graph().send(&req).await {
+            Err(Error::Status { status: 403, body, .. }) => {
+                assert!(body.len() <= crate::MAX_ERROR_BODY + 16, "kept {} bytes", body.len());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_body_is_not_read_past_what_the_error_keeps() {
+        // Declares 50 MB but sends only the start, then nothing: reading the
+        // whole body would never finish.
+        let head = b"HTTP/1.1 403 Forbidden
+Content-Length: 50000000
+
+"
+        .to_vec();
+        let url = serve(head, vec![&[b'x'; 16 * 1024]], Duration::ZERO).await;
+        let req = Req { auth: false, ..Req::new(reqwest::Method::GET, &url) };
+        match tokio::time::timeout(Duration::from_secs(10), graph().send(&req)).await {
+            Ok(Err(Error::Status { status: 403, body, .. })) => {
+                assert!(body.starts_with("xxxx") && body.ends_with("(cut)"), "{body}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_drive_is_answered_at_once_with_its_code() {
+        let body = r#"{"error":{"code":"quotaLimitReached","message":"Insufficient Space Available"}}"#;
+        let head = format!("HTTP/1.1 507 Insufficient Storage\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        // One connection only: a second try would wait for good.
+        let url = serve(head.into_bytes(), vec![], Duration::ZERO).await;
+        let req = Req { auth: false, ..Req::new(reqwest::Method::PUT, &url) };
+        match tokio::time::timeout(Duration::from_secs(10), graph().send(&req)).await {
+            Ok(Err(e @ Error::Status { status: 507, .. })) => {
+                assert_eq!(e.code().as_deref(), Some("quotaLimitReached"))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_upload_sessions_status_says_where_to_go_on() {
+        let s = |v: serde_json::Value| next_expected(&v);
+        assert_eq!(s(serde_json::json!({ "nextExpectedRanges": ["655360-"] })), Some(655_360));
+        assert_eq!(s(serde_json::json!({ "nextExpectedRanges": ["12345-55232", "77829-99375"] })), Some(12_345));
+        assert_eq!(s(serde_json::json!({ "nextExpectedRanges": [] })), None);
+        assert_eq!(s(serde_json::json!({ "expirationDateTime": "2026-10-16T00:00:00Z" })), None);
     }
 
     #[test]

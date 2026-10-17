@@ -240,3 +240,63 @@ fn changed_folder_rules_are_reapplied_without_a_rescan() {
     let problems = store.read(|o| o.check_invariants()).unwrap();
     assert!(problems.is_empty(), "{problems:?}");
 }
+
+/// Unregisters a test sync root, before [`Tmp`] deletes the folder.
+struct Registered<'a>(&'a Path);
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        let _ = oneup_cfapi::provider::unregister(self.0);
+    }
+}
+
+/// Another provider's folder whose contents are still in the cloud, created
+/// after the scan: a journal record must not get it listed, which would make
+/// the provider download its file list.
+#[test]
+fn an_unpopulated_placeholder_folder_from_the_journal_is_not_listed() {
+    // RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS | OFFLINE
+    const RECALL: u32 = 0x0004_0000 | 0x0040_0000 | 0x1000;
+    let t = Tmp::new("unpop");
+    t.file("keep.txt", b"k");
+    oneup_cfapi::provider::register_as(
+        &t.0,
+        "FakeOneDrive",
+        0x0dd0_0dd0_0dd0_0dd0_0dd0_0dd0_0dd0_0dd7,
+        b"theirs",
+        false,
+    )
+    .unwrap();
+    let _registered = Registered(&t.0);
+    let store = scan(&t.0);
+    oneup_cfapi::provider::create_unpopulated_folder(&t.0, "unpop", b"OD!u").unwrap();
+    // A placeholder folder that is populated is listed as usual.
+    let ph = |name, folder| oneup_cfapi::provider::NewPlaceholder {
+        name,
+        identity: b"OD!f",
+        size: if folder { 0 } else { 3 },
+        modified: 133_000_000_000_000_000,
+        folder,
+    };
+    oneup_cfapi::provider::create(&t.0, &[ph("full", true)]).unwrap();
+    oneup_cfapi::provider::create(&t.at("full"), &[ph("a.txt", false)]).unwrap();
+
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+    let mut queued = 0;
+    let mut observed = View::new();
+    for _ in 0..50 {
+        queued += obs.catch_up().unwrap().folders_queued;
+        observed = view(obs.store());
+        if observed.contains_key("/unpop") && observed.contains_key("/full/a.txt") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observed.get("/unpop").map(|e| (e.0, e.1)), Some((LocalKind::Folder, Skip::Unpopulated)));
+    assert_eq!(observed.get("/full").map(|e| e.1), Some(Skip::None));
+    assert_eq!(queued, 1, "only the populated folder is queued for listing");
+    assert_eq!(observed, view(&scan(&t.0)), "as a fresh scan sees it");
+    let listed = std::fs::read_dir(&t.0).unwrap().map(Result::unwrap).find(|e| e.file_name() == "unpop").unwrap();
+    use std::os::windows::fs::MetadataExt;
+    assert_ne!(listed.metadata().unwrap().file_attributes() & RECALL, 0, "still unpopulated");
+}

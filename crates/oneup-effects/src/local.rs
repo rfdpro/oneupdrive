@@ -41,6 +41,14 @@ const PART_EXT: &str = "oneup-part";
 /// Inside a version slot: the item's former path relative to the sync
 /// folder, for `oneup restore`.
 const ORIGIN: &str = "origin.txt";
+/// Inside [`ENGINE_DIR`]: what [`LocalFs::versions`] measured of each slot,
+/// with the slot folder's creation time. Only a cache: a slot is filled
+/// once (its item moved or copied in, then its [`ORIGIN`] written) and
+/// never changed after, so what was measured stays true while a slot of
+/// that creation time is there. The listing of `versions` decides which
+/// slots exist; a slot missing here, or of another creation time, is
+/// measured again.
+const VERSIONS_CACHE: &str = "versions.cache";
 
 /// Attributes that make an item something other than an ordinary file or
 /// folder whose data is on disk. Such items are never changed.
@@ -543,8 +551,9 @@ impl LocalFs {
         if in_place && path.parent() != Some(dir.as_path()) {
             return Err(Error::Changed);
         }
+        let was_in_sync = self.on_demand && self.is_in_sync(&h);
         win::rename_handle(&h, &target)?;
-        if self.on_demand {
+        if was_in_sync {
             self.resync_moved(&h, &target);
         }
         let entry = win::stat_handle(&h, FileId(pre.id.0))?.ok_or(Error::Changed)?;
@@ -571,6 +580,18 @@ impl LocalFs {
             let _hold = self.hold_dehydrated(&h).ok_or(Error::Changed)?;
             win::delete_handle(&h)?;
             tracing::debug!("removed a dehydrated placeholder (no local content)");
+            return Ok(Done::Recycled { kept: None });
+        }
+        if self.on_demand && !entry.is_dir() && pre.stamp.is_some_and(|(size, _)| self.is_partial(&h, size)) {
+            // Partly here (a download cut short): only bytes of the cloud
+            // version, now in OneDrive's recycle bin, and reading the rest
+            // would ask for that removed version. Proved and removed under
+            // a share-none handle, never read.
+            let (x, hold) = self.open_partial(h, pre, &path)?;
+            win::delete_handle(&x)?;
+            drop(x);
+            drop(hold);
+            tracing::debug!("removed a partly downloaded placeholder (no local content)");
             return Ok(Done::Recycled { kept: None });
         }
         if old == OldCopy::DropIfSynced && !entry.is_dir() && self.is_synced(&h, pre, synced)? {
@@ -617,31 +638,67 @@ impl LocalFs {
 
     // ------------------------------------------------------- version store
 
-    /// Everything in the version store, oldest first. Read-only.
+    /// Everything in the version store, oldest first. Changes only our own
+    /// [`VERSIONS_CACHE`]: each round that keeps or trims anything lists the
+    /// store, and measuring every kept folder again each time would cost
+    /// what the store holds, not what changed.
     pub fn versions(&self) -> Result<Vec<Slot>> {
-        let mut out = Vec::new();
+        use std::os::windows::fs::MetadataExt as _;
+        let cache = self.engine.join(VERSIONS_CACHE);
+        let cached = read_versions_cache(&cache);
+        let (mut out, mut keep, mut measured) = (Vec::new(), Vec::new(), false);
         for e in std::fs::read_dir(self.engine.join(VERSIONS))?.flatten() {
             let Some(id) = e.file_name().to_str().map(str::to_string) else { continue };
             let Some(at_ms) = id.split_once('-').and_then(|(ms, _)| ms.parse::<i64>().ok()) else { continue };
             if !e.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
-            let slot = e.path();
-            let origin = std::fs::read_to_string(slot.join(ORIGIN)).ok().map(|s| s.trim().to_string());
-            let mut items = std::fs::read_dir(&slot)?.flatten().filter(|i| i.file_name() != ORIGIN);
-            let Some(item) = items.next() else { continue };
-            let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
-            out.push(Slot {
-                id,
-                at_ms,
-                name: item.file_name().to_string_lossy().into_owned(),
-                origin,
-                is_dir,
-                bytes: size_of(&item.path()),
-            });
+            // From the listing itself: no open per slot.
+            let Ok(created) = e.metadata().map(|m| m.creation_time()) else { continue };
+            if let Some((c, s)) = cached.get(&id)
+                && *c == created
+            {
+                keep.push((created, s.clone()));
+                out.push(s.clone());
+                continue;
+            }
+            let Some(slot) = measure_slot(&e.path(), id, at_ms)? else { continue };
+            // A slot gets its origin last; one without it may still be
+            // filling, so it's measured again next time.
+            if slot.origin.is_some() {
+                keep.push((created, slot.clone()));
+                measured = true;
+            }
+            out.push(slot);
+        }
+        if measured || keep.len() != cached.len() {
+            self.write_versions_cache(&cache, &keep);
         }
         out.sort_by(|a, b| (a.at_ms, &a.id).cmp(&(b.at_ms, &b.id)));
         Ok(out)
+    }
+
+    /// Replaces [`VERSIONS_CACHE`] atomically (a unique temp file, flushed,
+    /// renamed over it). Best effort: without it, the store is measured.
+    fn write_versions_cache(&self, path: &Path, slots: &[(u64, Slot)]) {
+        let mut text = String::new();
+        for (created, s) in slots {
+            let origin = s.origin.as_deref().map(|o| format!("\t{o}")).unwrap_or_default();
+            let line = format!("{}\t{created}\t{}\t{}\t{}{origin}\n", s.id, s.bytes, u8::from(s.is_dir), s.name);
+            text.push_str(&line);
+        }
+        let tmp = path.with_extension(format!("{}-{}.tmp", std::process::id(), self.seq.fetch_add(1, Relaxed)));
+        let written = (|| {
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::debug!(error = %e, "the version store's size cache wasn't written");
+        }
     }
 
     /// Moves a kept item back into the sync folder: to `to` (a path relative
@@ -723,10 +780,10 @@ impl LocalFs {
             if !(too_old || too_big) {
                 continue;
             }
-            if !dry_run {
-                std::fs::remove_dir_all(self.engine.join(VERSIONS).join(&s.id))?;
-            }
             total = total.saturating_sub(s.bytes);
+            if !dry_run && !remove_slot(&self.engine.join(VERSIONS).join(&s.id))? {
+                continue;
+            }
             out.push(s);
         }
         Ok(out)
@@ -760,8 +817,9 @@ impl LocalFs {
     fn remove_slots(&self, slots: impl Iterator<Item = Slot>) -> Result<Vec<Slot>> {
         let mut removed = Vec::new();
         for s in slots {
-            std::fs::remove_dir_all(self.engine.join(VERSIONS).join(&s.id))?;
-            removed.push(s);
+            if remove_slot(&self.engine.join(VERSIONS).join(&s.id))? {
+                removed.push(s);
+            }
         }
         Ok(removed)
     }
@@ -964,6 +1022,60 @@ fn restored_name(name: &str, n: u32, is_dir: bool) -> String {
     }
 }
 
+/// Removes a whole version slot (`remove_dir_all` doesn't follow links).
+/// `false`: it was gone already (another `oneup` removed or restored it).
+fn remove_slot(path: &Path) -> Result<bool> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The version slot at `path` (`None`: empty, or gone meanwhile, as when
+/// `oneup restore` or a trim from the command line removed it).
+fn measure_slot(path: &Path, id: String, at_ms: i64) -> Result<Option<Slot>> {
+    let items = match std::fs::read_dir(path) {
+        Ok(items) => items,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let origin = std::fs::read_to_string(path.join(ORIGIN)).ok().map(|s| s.trim().to_string());
+    let Some(item) = items.flatten().find(|i| i.file_name() != ORIGIN) else { return Ok(None) };
+    Ok(Some(Slot {
+        id,
+        at_ms,
+        name: item.file_name().to_string_lossy().into_owned(),
+        origin,
+        is_dir: item.file_type().is_ok_and(|t| t.is_dir()),
+        bytes: size_of(&item.path()),
+    }))
+}
+
+/// What [`VERSIONS_CACHE`] says, by slot ID: the slot folder's creation
+/// time and what was measured. Missing or unreadable lines are left out
+/// (measured again).
+fn read_versions_cache(path: &Path) -> std::collections::HashMap<String, (u64, Slot)> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Default::default() };
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split('\t');
+            let id = f.next()?.to_string();
+            let created = f.next()?.parse().ok()?;
+            let bytes = f.next()?.parse().ok()?;
+            let is_dir = match f.next()? {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            };
+            let name = f.next()?.to_string();
+            let origin = f.next().map(str::to_string);
+            let at_ms = id.split_once('-').and_then(|(ms, _)| ms.parse().ok())?;
+            Some((id.clone(), (created, Slot { id, at_ms, name, origin, is_dir, bytes })))
+        })
+        .collect()
+}
+
 /// Bytes in a file or folder tree, without following links.
 fn size_of(p: &Path) -> u64 {
     let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
@@ -986,4 +1098,20 @@ fn size_of(p: &Path) -> u64 {
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// `oneup restore` or a trim from the command line can remove a slot
+    /// while the agent lists or trims the store: that slot is skipped, and
+    /// the round goes on.
+    #[test]
+    fn a_slot_gone_meanwhile_is_skipped() {
+        let gone = std::env::temp_dir().join(format!("oneup-effects-gone-slot-{}", std::process::id()));
+        assert!(measure_slot(&gone, "1-0".into(), 1).unwrap().is_none());
+        assert!(!remove_slot(&gone).unwrap());
+    }
 }

@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWri
 
 pub use protocol::{
     Activity, Answer, Call, Direction, INVALID_PARAMS, INVALID_REQUEST, LastRun, METHOD_NOT_FOUND, NO_SUCH_BATCH,
-    Overflow, PARSE_ERROR, PauseState, Problem, Progress, PruneOffer, RpcError, SafetyStop, Status, Unsynced,
+    Overflow, PARSE_ERROR, PauseState, Problem, Progress, PruneOffer, Retrying, RpcError, SafetyStop, Status, Unsynced,
 };
 
 /// In the data folder: the name of the running agent's pipe.
@@ -317,6 +317,7 @@ mod tests {
             prune_offer: None,
             progress: None,
             unsynced: None,
+            retrying: None,
         }
     }
 

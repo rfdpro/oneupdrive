@@ -76,8 +76,8 @@ impl Kind {
                 "Open Settings > Accounts and select Sign in.",
             ),
             Kind::CloudFull => (
-                "OneDrive storage is full",
-                "Uploads can't go through until there's room in OneDrive.",
+                "OneDrive is full",
+                "Uploads wait until there's room in OneDrive. Downloads go on.",
                 "Free up space in OneDrive (its recycle bin counts too), or get more storage.",
             ),
             Kind::DiskFull => (
@@ -159,6 +159,7 @@ fn graph_kind(g: &oneup_graph::Error) -> Option<Kind> {
         G::Http(r) => {
             Some(if r.is_connect() || r.is_timeout() || r.is_request() { Kind::Offline } else { Kind::OneDrive })
         }
+        G::Stalled(..) => Some(Kind::Offline),
         G::Auth(_) | G::NotSignedIn => Some(Kind::SignIn),
         G::Status { status: 401, .. } => Some(Kind::SignIn),
         G::Status { status: 507, .. } => Some(Kind::CloudFull),
@@ -207,6 +208,25 @@ pub fn describe(e: &anyhow::Error, prev: Option<&Problem>, now_ms: i64, retry_ms
     }
 }
 
+/// OneDrive refused an upload for want of room (since `since_ms`; `remaining`:
+/// the room it said it had left). Not an error the agent stops for: uploads
+/// wait (`crate::sync`) and the room is looked at again by `retry_ms`.
+pub fn cloud_full(since_ms: i64, remaining: Option<i64>, retry_ms: i64) -> Problem {
+    let kind = Kind::CloudFull;
+    let (title, detail, action) = kind.words();
+    let left = remaining.map_or_else(|| "not told".to_string(), |r| format!("{r} bytes"));
+    Problem {
+        kind: kind.code().into(),
+        title: title.into(),
+        detail: detail.into(),
+        action: action.into(),
+        technical: format!("OneDrive refused an upload for want of room (HTTP 507); room left: {left}"),
+        since_ms,
+        attempts: 1,
+        retry_ms: Some(retry_ms),
+    }
+}
+
 /// Notes in the activity log that `p` began (`resolved` false) or cleared,
 /// so what happened, and when, can be seen later.
 pub fn log(store: &mut oneup_store::Store, p: &Problem, resolved: bool) -> oneup_store::Result<()> {
@@ -221,12 +241,10 @@ pub fn log(store: &mut oneup_store::Store, p: &Problem, resolved: bool) -> oneup
     store.write(|o| o.activity_add(&[entry]))
 }
 
-/// Saves why the agent stopped (our own file: written whole, then renamed).
+/// Saves why the agent stopped (our own file, written atomically).
 pub fn save_stopped(data_dir: &Path, p: &Problem) -> std::io::Result<()> {
-    let file = data_dir.join(STOPPED_FILE);
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(p).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, file)
+    let bytes = serde_json::to_vec(p).map_err(std::io::Error::other)?;
+    crate::ownfile::write(&data_dir.join(STOPPED_FILE), &bytes)
 }
 
 /// Why the agent last stopped, if an error stopped it (and it hasn't
@@ -263,6 +281,12 @@ mod tests {
         assert_eq!(classify(&err(status(403, r#"{"error":{"code":"quotaLimitReached"}}"#))), Kind::CloudFull);
         assert_eq!(classify(&err(status(503, ""))), Kind::OneDrive);
         assert_eq!(classify(&err(oneup_graph::Error::Exhausted(5))), Kind::OneDrive);
+        assert_eq!(classify(&err(oneup_graph::Error::Stalled("download", 60))), Kind::Offline);
+        // The sign-in service busy is not "sign in again".
+        assert_eq!(
+            classify(&err(oneup_graph::Error::refused(503, "the sign-in service", String::new()))),
+            Kind::OneDrive
+        );
         assert_eq!(classify(&err(std::io::Error::from_raw_os_error(112))), Kind::DiskFull);
         assert_eq!(classify(&err(oneup_effects::Error::RootChanged("moved"))), Kind::Folder);
         assert_eq!(
@@ -275,6 +299,16 @@ mod tests {
             classify(&anyhow::anyhow!("writing: There is not enough space on the disk. (os error 112)")),
             Kind::DiskFull
         );
+    }
+
+    #[test]
+    fn a_full_onedrive_reads_the_same_whether_an_error_or_an_upload_found_it() {
+        let status = |status, body: &str| oneup_graph::Error::Status { status, what: "x".into(), body: body.into() };
+        let from_error = describe(&err(status(507, "")), None, 5, Some(9));
+        let from_upload = cloud_full(5, Some(0), 9);
+        assert_eq!((from_upload.title.as_str(), from_upload.kind.as_str()), ("OneDrive is full", "cloud-full"));
+        assert_eq!((from_error.title, from_error.detail), (from_upload.title, from_upload.detail));
+        assert_eq!(from_upload.retry_ms, Some(9));
     }
 
     #[test]

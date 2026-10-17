@@ -39,7 +39,7 @@ pub mod hydrate;
 #[cfg(windows)]
 pub mod placement;
 
-pub use cloud::{Cloud, CloudError, Meta, MetaDone};
+pub use cloud::{Cloud, CloudError, Meta, MetaDone, VersionMark};
 #[cfg(all(windows, feature = "crash-test"))]
 pub use exec::CRASHED;
 #[cfg(windows)]

@@ -227,10 +227,11 @@ pub fn check_local(main: &Path, folder: &Path, except: Option<&Path>) -> Result<
     Ok(())
 }
 
-/// `a` is `b` or inside it, as OneDrive paths (case-insensitive).
+/// `a` is `b` or inside it, as OneDrive paths (names compared as
+/// `oneup_sync::fold` does).
 fn remote_within(a: &str, b: &str) -> bool {
-    let (a, b) = (a.trim_end_matches('/').to_lowercase(), b.trim_end_matches('/').to_lowercase());
-    a == b || b.is_empty() || a.starts_with(&format!("{b}/"))
+    let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+    b.is_empty() || oneup_sync::strip_folded_prefix(a, b).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Refuses OneDrive folder `remote` (in the account's own drive) if it
@@ -476,7 +477,12 @@ pub async fn add(main: &Path, http: reqwest::Client, auth: Arc<oneup_graph::Auth
 /// synced and the pair's data folder goes. Both folders keep what they
 /// hold; online-only files leave the folder (Windows removes them; they're
 /// in OneDrive).
+///
+/// Refuses while another OneUpDrive process holds the data folder's lock:
+/// callers check that the agent stopped, but one whose control pipe
+/// didn't open, or that didn't stop in time, would still be syncing.
 pub fn remove(e: &Entry) -> Result<Described> {
+    let lock = crate::setup::DirLock::acquire(&e.dir)?;
     let d = describe(e)?;
     if d.on_demand {
         let token = crate::setup::open_store(&e.dir, 1024)?
@@ -484,8 +490,34 @@ pub fn remove(e: &Entry) -> Result<Described> {
             .context("pairing token missing")?;
         crate::syncroot::unregister(&d.local, &token).context("releasing the folder")?;
     }
+    // An agent started for this folder once the lock is free would find a
+    // live database and sync it again, so the folder is emptied under the
+    // lock first; only the lock file, which can't go while it's open, is
+    // left for after.
+    empty_but_lock(&e.dir, &lock)?;
+    drop(lock);
     std::fs::remove_dir_all(&e.dir).with_context(|| format!("removing {}", e.dir.display()))?;
     Ok(d)
+}
+
+/// Removes everything in the data folder `dir` (ours, not user content)
+/// but the file `lock` holds open. The pair marker goes last: if anything
+/// else can't be removed, the folder is still a pair that removing again
+/// can finish.
+fn empty_but_lock(dir: &Path, lock: &crate::setup::DirLock) -> Result<()> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let entry = entry?;
+        if entry.path() != lock.path() {
+            entries.push((entry.file_name() == MARKER, entry.path(), entry.file_type()?.is_dir()));
+        }
+    }
+    entries.sort_by_key(|(marker, ..)| *marker);
+    for (_, path, is_dir) in entries {
+        let removed = if is_dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        removed.with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Stops the main data folder `dir` syncing its folder, as [`remove`] does
@@ -494,8 +526,10 @@ pub fn remove(e: &Entry) -> Result<Described> {
 /// an ordinary one), then the pairing is forgotten (OneUpDrive's own
 /// database for it). The sign-in, settings, vaults and extra pairs stay;
 /// the settings window offers setting up again. Run with the agent stopped.
-/// Returns the folder that was synced.
+/// Returns the folder that was synced. Refuses, as [`remove`] does, while
+/// another OneUpDrive process holds the data folder's lock.
 pub fn unpair(dir: &Path) -> Result<PathBuf> {
+    let _lock = crate::setup::DirLock::acquire(dir)?;
     let store = crate::setup::open_store(dir, 1024)?;
     let (local, token) = (
         store.read(|o| o.meta_get(crate::sync::KEY_LOCAL))?.context("this folder doesn't sync anything")?,
@@ -539,11 +573,54 @@ mod tests {
         assert_eq!(Kind::decode("shared:Sam", None), Kind::Folder, "a shared folder needs its drive");
     }
 
+    /// An agent still running (its control pipe didn't answer, or the
+    /// settings window gave up waiting for it to stop) holds the data
+    /// folder's lock: removing or unpairing then refuses, and the data
+    /// folder stays.
+    #[test]
+    fn removing_or_unpairing_refuses_while_the_folder_is_in_use() {
+        let dir = std::env::temp_dir().join(format!("oneup-pairs-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let held = crate::setup::DirLock::acquire(&dir).unwrap();
+        let e = Entry { name: "p".into(), dir: dir.clone(), remote: "/p".into() };
+        let busy = |r: Result<_>| r.err().is_some_and(|e| format!("{e:#}").contains("using this data folder"));
+        assert!(busy(remove(&e).map(|_| ())), "remove takes the lock");
+        assert!(busy(unpair(&dir).map(|_| ())), "unpair takes the lock");
+        assert!(dir.exists());
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_empties_the_data_folder_before_letting_go_of_its_lock() {
+        let dir = std::env::temp_dir().join(format!("oneup-pairs-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::setup::open_store(&dir, 1024).unwrap());
+        std::fs::write(dir.join(MARKER), "/p").unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join("logs").join("a.log"), "x").unwrap();
+
+        let lock = crate::setup::DirLock::acquire(&dir).unwrap();
+        empty_but_lock(&dir, &lock).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["sync.lock"], "only the held lock file is left");
+        drop(lock);
+
+        std::fs::write(dir.join(MARKER), "/p").unwrap();
+        drop(crate::setup::open_store(&dir, 1024).unwrap());
+        let e = Entry { name: "p".into(), dir: dir.clone(), remote: "/p".into() };
+        remove(&e).unwrap();
+        assert!(!dir.exists(), "no data folder is left behind");
+    }
+
     #[test]
     fn remote_folders_nest_case_insensitively() {
         assert!(remote_within("/Photos/2024", "/photos"));
         assert!(remote_within("/Photos", "/Photos/"));
         assert!(!remote_within("/Photos2", "/Photos"));
         assert!(remote_within("/anything", ""), "the whole drive holds everything");
+        // As Windows compares names: per character, not whole-string lower case.
+        assert!(remote_within("/ΟΔΟΣ/a", "/οδοσ"));
+        assert!(!remote_within("/\u{212A}/a", "/k"), "the Kelvin sign isn't k");
     }
 }

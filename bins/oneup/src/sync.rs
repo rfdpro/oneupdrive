@@ -96,6 +96,9 @@ pub struct Controls {
     /// Paths (relative to the synced folder) to transfer before anything
     /// else (`oneup sync-now PATH`).
     pub first: Vec<String>,
+    /// The pause as it changes while a round runs (the agent's; `None`:
+    /// nothing pauses mid-round).
+    pub live: Option<Arc<crate::control::LivePause>>,
 }
 
 /// Who the messages are for: `oneup sync` takes answers on its next run,
@@ -181,8 +184,17 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
         return Ok(());
     }
     let controls = Controls { answers: opts.answers.clone(), ..Controls::default() };
-    let (mut store, out) =
-        engine.rounds(store, Scope::All, &|| controls.clone(), Recent::default(), opts.max_rounds, &|_| {}).await?;
+    let (mut store, out) = engine
+        .rounds(
+            store,
+            Scope::All,
+            &|| controls.clone(),
+            Recent::default(),
+            &mut Recent::default(),
+            opts.max_rounds,
+            &|_| {},
+        )
+        .await?;
     if let Some(o) = &out.overflow {
         print_overflow(o, &store, Asker::Sync)?;
     }
@@ -225,7 +237,9 @@ async fn prepare(
     let paired_remote = store.read(|o| o.meta_get(KEY_REMOTE))?;
     let first = match (&paired_local, &paired_remote) {
         (Some(l), Some(r)) => {
-            if !crate::test_account::same_dir(Path::new(l), &local) || !r.eq_ignore_ascii_case(&remote_path) {
+            if !crate::test_account::same_dir(Path::new(l), &local)
+                || oneup_sync::fold(r) != oneup_sync::fold(&remote_path)
+            {
                 bail!(
                     "this data folder already syncs {l} with OneDrive {r}; \
                      use another --data-dir for another pair"
@@ -430,17 +444,15 @@ pub struct Outcome {
     pub end: End,
     pub rounds: usize,
     pub totals: Totals,
-    /// Mass-sensitive operations carried out, per side (for the agent's
-    /// safety-stop window, see [`oneup_gate::Recent`]).
-    pub executed: Recent,
     /// The last version-store overflow batch the rounds saw, if any (see
     /// [`print_overflow`]).
     pub overflow: Option<Overflow>,
     /// The tripped safety stops, when `end` is [`End::Stopped`] (see
     /// [`print_breakers`]).
     pub breakers: Vec<Breaker>,
-    /// When the earliest upload the last round held for a file that keeps
-    /// changing may go ([`crate::busy`]): the caller runs a round then.
+    /// When the earliest operation the last round held may go: an upload
+    /// of a file that keeps changing ([`crate::busy`]), or one that failed
+    /// ([`crate::backoff`]). The caller runs a round then.
     pub held_until: Option<std::time::Instant>,
 }
 
@@ -468,8 +480,57 @@ pub struct Engine {
     /// Files that keep changing, whose uploads wait (the agent's; none for
     /// `oneup sync`).
     busy: std::sync::OnceLock<Arc<crate::busy::Busy>>,
+    /// Failed operations wait their turn (`crate::backoff`; the agent's).
+    backoff: std::sync::atomic::AtomicBool,
+    /// Set while OneDrive is full: uploads wait ([`Engine::cloud_full`]).
+    full: std::sync::Mutex<Option<Full>>,
     /// The store's invariants were checked once this run ([`Engine::remote`]).
     verified: std::sync::atomic::AtomicBool,
+}
+
+/// OneDrive refused an upload for want of room: uploads wait until it has
+/// more. Read again at most every [`ROOM_CHECK`], at a round (a wake-up of
+/// the agent's: a change, a notification, its timed check), never on a timer
+/// of its own.
+#[derive(Debug, Clone, Copy)]
+struct Full {
+    /// When it was found full (Unix ms).
+    since_ms: i64,
+    /// The room it had left then, in bytes (`None`: not told).
+    remaining: Option<i64>,
+    /// When an upload was last refused, and the room last read.
+    tried: std::time::Instant,
+    checked: std::time::Instant,
+}
+
+/// The least time between two reads of the room left while OneDrive is full.
+const ROOM_CHECK: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long uploads wait while the room left reads the same (or isn't told,
+/// as for a folder someone else shares) before one is tried again anyway.
+const FULL_RETRY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+impl Full {
+    /// A new reading of the room left (`None`: not told, or unreadable) at
+    /// `now`: whether uploads go again. They do once it grew, or
+    /// [`FULL_RETRY`] after the last refusal, whatever it reads.
+    fn room_again(&mut self, remaining: Option<i64>, now: std::time::Instant) -> bool {
+        self.checked = now;
+        match (self.remaining, remaining) {
+            (Some(before), Some(n)) if n > before => return true,
+            (None, Some(n)) => self.remaining = Some(n),
+            _ => {}
+        }
+        now.saturating_duration_since(self.tried) >= FULL_RETRY
+    }
+}
+
+/// OneDrive is full ([`Engine::cloud_full`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudFull {
+    /// Since when (Unix ms).
+    pub since_ms: i64,
+    /// The room it said it had left, in bytes.
+    pub remaining: Option<i64>,
 }
 
 /// Excluded folders looked at per pass ([`Engine::clear_excluded_marks`]);
@@ -526,6 +587,8 @@ impl Engine {
             offer: std::sync::Mutex::new(None),
             converting: std::sync::Mutex::new(Converting::default()),
             busy: std::sync::OnceLock::new(),
+            backoff: std::sync::atomic::AtomicBool::new(false),
+            full: std::sync::Mutex::new(None),
             verified: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -538,6 +601,90 @@ impl Engine {
     /// Until when `op` waits because its file keeps changing, if it does.
     fn held_until(&self, op: &Op, now: std::time::Instant) -> Option<std::time::Instant> {
         self.busy.get()?.held_until(sent_file(op)?, now)
+    }
+
+    /// Failed operations wait before they're tried again (`crate::backoff`).
+    pub fn back_off(&self) {
+        self.backoff.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn backs_off(&self) -> bool {
+        self.backoff.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Leaves out the operations that failed and whose time hasn't come
+    /// (`crate::backoff`), keeping the order, with when the first may go.
+    /// Lookups by key, and none while nothing is on record.
+    #[allow(clippy::type_complexity)]
+    fn hold_failed(
+        &self,
+        store: &Store,
+        planned: Vec<(Approved, Line)>,
+    ) -> Result<(Vec<(Approved, Line)>, Vec<(Approved, Line)>, Option<std::time::Instant>)> {
+        if !self.backs_off() || !store.read(|o| o.retry_any())? {
+            return Ok((planned, Vec::new(), None));
+        }
+        let at = now_ms();
+        let waits = store.read(|o| {
+            planned.iter().map(|(a, _)| crate::backoff::until(o, a.op(), at)).collect::<oneup_store::Result<Vec<_>>>()
+        })?;
+        let (now, mut waits) = (std::time::Instant::now(), waits.into_iter());
+        Ok(hold_back(planned, |_| waits.next().flatten().map(|u| after_ms(now, u - at))))
+    }
+
+    /// Whether OneDrive is full, so uploads wait, and since when.
+    pub fn cloud_full(&self) -> Option<CloudFull> {
+        self.full_lock().map(|f| CloudFull { since_ms: f.since_ms, remaining: f.remaining })
+    }
+
+    fn full_lock(&self) -> std::sync::MutexGuard<'_, Option<Full>> {
+        self.full.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// While OneDrive is full: reads the room it has left (at most every
+    /// [`ROOM_CHECK`]), and lets uploads go again once it grew.
+    async fn check_room(&self, store: &mut Store) -> Result<()> {
+        if !self.full_lock().is_some_and(|f| f.checked.elapsed() >= ROOM_CHECK) {
+            return Ok(());
+        }
+        let remaining = match self.graph.remaining().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "couldn't read the room left in OneDrive");
+                None
+            }
+        };
+        let again = {
+            let mut g = self.full_lock();
+            let again = g.as_mut().is_some_and(|f| f.room_again(remaining, std::time::Instant::now()));
+            if again {
+                *g = None;
+            }
+            again
+        };
+        if again {
+            println!("Uploads resume.");
+            log_activity(store, vec![notice(ActivityOutcome::Note, "uploads", "uploads resume".into())])?;
+        }
+        Ok(())
+    }
+
+    /// OneDrive refused an upload for want of room: uploads wait from now
+    /// on, until it has more ([`Engine::check_room`]).
+    async fn found_full(&self, store: &mut Store) -> Result<()> {
+        let remaining = self.graph.remaining().await.ok().flatten();
+        let now = std::time::Instant::now();
+        let was = {
+            let mut g = self.full_lock();
+            let since_ms = g.map_or_else(now_ms, |f| f.since_ms);
+            g.replace(Full { since_ms, remaining, tried: now, checked: now }).is_some()
+        };
+        if !was {
+            println!("OneDrive is full: uploads wait until there's room. Downloads go on.");
+            let detail = "OneDrive is full; uploads wait until there's room".to_string();
+            log_activity(store, vec![notice(ActivityOutcome::Waiting, "uploads", detail)])?;
+        }
+        Ok(())
     }
 
     /// The cloud for serving Files On-Demand downloads: the same view of
@@ -801,7 +948,7 @@ impl Engine {
     /// for at most hourly; a low disk, at every pass.
     fn space_policy(&self, store: &mut Store, root: &Path, ops: &mut Vec<Op>) -> Result<Option<String>> {
         const KEY_LAST: &str = "space.last_ms";
-        let space = crate::config::load_space(&self.data_dir)?;
+        let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
         if space.free_unused_days == 0 && !space.free_when_low {
             return Ok(None);
         }
@@ -953,15 +1100,20 @@ impl Engine {
     /// marked dirty, which is everything they could have left behind.
     ///
     /// `recent`: mass-sensitive operations already carried out in the
-    /// caller's safety window; this call's own are added as it goes.
+    /// caller's safety window. This call's own (per side, see
+    /// [`oneup_gate::Recent`]) are added to `executed` as each round runs
+    /// them, so they reach the caller's window even when a later round
+    /// ends the call in an error.
     /// `controls` is asked again before every round, so a pause or a
     /// `sync-now PATH` that arrives meanwhile counts from the next round.
+    #[allow(clippy::too_many_arguments)]
     pub async fn rounds(
         &self,
         mut store: Store,
         first: Scope,
         controls: &(dyn Fn() -> Controls + Send + Sync),
         recent: Recent,
+        executed: &mut Recent,
         max_rounds: usize,
         progress: &(dyn Fn(Option<Progress>) + Send + Sync),
     ) -> Result<(Store, Outcome)> {
@@ -969,12 +1121,13 @@ impl Engine {
             end: End::Unsettled,
             rounds: 0,
             totals: Totals::default(),
-            executed: Recent::default(),
             overflow: None,
             breakers: Vec::new(),
             held_until: None,
         };
         let mut scope = first;
+        let mut changed_rounds = 0;
+        self.check_room(&mut store).await?;
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
             out.held_until = None;
@@ -986,7 +1139,7 @@ impl Engine {
             }
             // Bandwidth caps (config.toml [agent]) can change any time, and
             // may apply only in some hours.
-            let settings = crate::config::load_agent(&self.data_dir)?;
+            let settings = crate::config::kept(&self.data_dir, crate::config::load_agent(&self.data_dir))?;
             let capped = crate::autopause::caps_apply(&settings, crate::autopause::local_minute_of_day());
             let cap = |kib: u64| if capped { kib.saturating_mul(1024) } else { 0 };
             self.graph.upload.set(cap(settings.upload_kib));
@@ -1002,7 +1155,7 @@ impl Engine {
             if rules_changed {
                 scope = Scope::All;
             }
-            let window = recent.plus(out.executed);
+            let window = recent.plus(*executed);
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;
             let extra = match mode {
@@ -1112,7 +1265,7 @@ impl Engine {
                 }
             }
             // What the user wants first goes first ([priority]; transfers only).
-            let (mut first, last) = crate::config::load_priority(&self.data_dir)?;
+            let (mut first, last) = crate::config::kept(&self.data_dir, crate::config::load_priority(&self.data_dir))?;
             for p in &controls.first {
                 first.extend(oneup_rules::literal_path_rules(p));
             }
@@ -1134,8 +1287,20 @@ impl Engine {
             // stay marked, so a later round plans them again.
             let now = std::time::Instant::now();
             let (planned, busy, until) = hold_back(planned, |(a, _)| self.held_until(a.op(), now));
-            out.held_until = until;
             let waiting: Vec<(Op, Line)> = busy.into_iter().map(|(a, l)| (a.op().clone(), l)).collect();
+            // While OneDrive is full, nothing new goes there (uploads, and
+            // new folders, which it may refuse as well); failed operations
+            // wait until their time (`crate::backoff`). Their folders stay
+            // marked too, and everything else goes.
+            let (planned, no_room): (Vec<_>, Vec<_>) = if self.full_lock().is_some() {
+                planned.into_iter().partition(|(a, _)| !matches!(a.op(), Op::Upload { .. } | Op::MkdirRemote { .. }))
+            } else {
+                (planned, Vec::new())
+            };
+            let (planned, failing, retry_at) = self.hold_failed(&store, planned)?;
+            out.held_until = earliest(until, retry_at);
+            let mut later: Vec<Op> = waiting.iter().map(|(op, _)| op.clone()).collect();
+            later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
             let wait = waiting.iter().filter(|(op, _)| matches!(op, Op::Upload { .. })).map(|(_, l)| {
                 let detail = "changing often; sent once it's left alone for a moment".to_string();
                 ActivityEntry {
@@ -1156,8 +1321,27 @@ impl Engine {
                 })
                 .unzip();
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
-            let report = self.run_reported(&mut store, approved, n, bytes_total, progress).await;
+            let report =
+                self.run_reported(&mut store, approved, n, bytes_total, progress, controls.live.as_deref()).await;
+            // Paused meanwhile: what didn't run is planned again from the
+            // marks, which stay, as for work the gate put off.
+            let deferred = deferred || !report.not_run.is_empty();
+            // Counted before anything below can fail: what ran must reach
+            // the caller's safety window even if this call ends in an error.
+            executed.suspicious += report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
+            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
+                match Side::changed_by(op) {
+                    Some(Side::Local) => executed.local += 1,
+                    Some(Side::Remote) => executed.remote += 1,
+                    None => {}
+                }
+            }
             let mut log = print_round(n, &planned, &report);
+            if !report.not_run.is_empty() {
+                let detail = format!("{} operations wait until sync resumes", report.not_run.len());
+                println!("  {detail}");
+                log.push(notice(ActivityOutcome::Waiting, "paused", detail));
+            }
             if let Some(why) = &report.halted {
                 log.push(notice(ActivityOutcome::Failed, "stopped", why.clone()));
             }
@@ -1168,17 +1352,20 @@ impl Engine {
                 return Err(Halted(why).into());
             }
             logged?;
-            out.totals.add(&report);
-            out.executed.suspicious +=
-                report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
-            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
-                match Side::changed_by(op) {
-                    Some(Side::Local) => out.executed.local += 1,
-                    Some(Side::Remote) => out.executed.remote += 1,
-                    None => {}
-                }
+            // Failures wait their turn; what was done is through with them.
+            let failures = if self.backs_off() {
+                store.write(|o| crate::backoff::record(o, &report, now_ms()))?
+            } else {
+                crate::backoff::Recorded::default()
+            };
+            if let Some(first) = failures.first_ms {
+                out.held_until = earliest(out.held_until, Some(after_ms(std::time::Instant::now(), first - now_ms())));
             }
-            let (clean, mut end) = settle(&report);
+            if report.skipped.iter().any(|(_, s)| *s == Skip::CloudFull) {
+                self.found_full(&mut store).await?;
+            }
+            out.totals.add(&report);
+            let (clean, mut end) = settle(&report, failures.waiting, &mut changed_rounds);
             if recycled > 0 && matches!(end, Some(End::Settled)) {
                 end = None; // another round, to carry the deletions out
             }
@@ -1190,13 +1377,12 @@ impl Engine {
             // next round needn't plan every folder. Keeping every mark for
             // one skipped file made every later round plan the whole tree.
             if !deferred {
+                // Kept for what's tried again later: skips unless only a
+                // change can end them, failures, uploads OneDrive had no
+                // room for, and what waited.
                 let mut retried = Touched::default();
-                if !clean {
-                    for op in report.skipped.iter().map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)) {
-                        retried.add(op);
-                    }
-                }
-                for (op, _) in &waiting {
+                let skipped = report.skipped.iter().filter(|(_, s)| !clean || *s == Skip::CloudFull);
+                for op in skipped.map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)).chain(&later) {
                     retried.add(op);
                 }
                 store.write(|o| {
@@ -1317,7 +1503,8 @@ impl Engine {
     /// Carries out round `round`'s operations, telling `progress` how far
     /// it is about once a second (and `None` once it's over). Bytes are
     /// counted where every transfer passes, the bandwidth caps, so a large
-    /// file moves them while it's on its way.
+    /// file moves them while it's on its way. With `live`, a pause that
+    /// comes meanwhile stops the paused side's operations from then on.
     async fn run_reported(
         &self,
         store: &mut Store,
@@ -1325,6 +1512,7 @@ impl Engine {
         round: usize,
         bytes_total: u64,
         progress: &(dyn Fn(Option<Progress>) + Send + Sync),
+        live: Option<&crate::control::LivePause>,
     ) -> Report {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let items_total = approved.len() as u64;
@@ -1345,7 +1533,9 @@ impl Engine {
         let count = |n: usize| {
             items_done.fetch_add(n as u64, Relaxed);
         };
-        let run = self.exec.run_counted(store, approved, &count);
+        let paused = live.map(crate::control::LivePause::round_check);
+        let may_run = |op: &Op| paused.as_ref().is_none_or(|p| p(op));
+        let run = self.exec.run_checked(store, approved, &count, &may_run);
         tokio::pin!(run);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1681,24 +1871,28 @@ pub(crate) fn normalize_remote(p: &str) -> Result<String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-/// The ID of the OneDrive folder at `path`, from the mirror (names compared
-/// case-insensitively, as OneDrive does).
+/// The ID of the OneDrive folder at `path`, from the mirror, each name
+/// compared as Windows and OneDrive compare names (`oneup_sync::fold`).
+/// Refused if a part matches more than one folder (names that fold alike
+/// can coexist in OneDrive): picking one could pair the wrong folder.
 pub fn find_remote(store: &Store, path: &str) -> Result<Option<String>> {
-    Ok(store.read(|o| {
-        let Some(mut cur) = o.remote_root()? else { return Ok(None) };
-        for part in path.split('/').filter(|s| !s.is_empty()) {
-            let next = o
-                .remote_children(&cur.id)?
-                .into_iter()
-                .map(|(row, _)| row)
-                .find(|row| row.kind == Kind::Folder && row.name.to_lowercase() == part.to_lowercase());
-            match next {
-                Some(row) => cur = row,
-                None => return Ok(None),
-            }
+    let Some(root) = store.read(|o| o.remote_root())? else { return Ok(None) };
+    let mut cur = root.id;
+    let mut so_far = String::new();
+    for part in path.split('/').filter(|s| !s.is_empty()) {
+        so_far = format!("{so_far}/{part}");
+        let mut found = store.read(|o| o.remote_named(&cur, part))?.into_iter().filter(|r| r.kind == Kind::Folder);
+        let Some(row) = found.next() else { return Ok(None) };
+        if let Some(other) = found.next() {
+            bail!(
+                "{so_far} matches more than one OneDrive folder ({} and {}); rename one of them",
+                row.name,
+                other.name
+            );
         }
-        Ok(Some(cur.id))
-    })?)
+        cur = row.id;
+    }
+    Ok(Some(cur))
 }
 
 /// Creates the missing folders of `path` (with `conflictBehavior=fail`, so
@@ -1984,27 +2178,44 @@ impl Touched {
 
 /// What a round's report means: whether the marks it was planned from are
 /// used up, and how the rounds end if that was the last thing to do
-/// (`None`: another round, at once).
-fn settle(report: &Report) -> (bool, Option<End>) {
+/// (`None`: another round, at once). `waiting`: of the failures, how many
+/// wait their turn (`crate::backoff`). `changed_rounds`: rounds in a row, up
+/// to this one, that did nothing but skip items changed meanwhile.
+fn settle(report: &Report, waiting: usize, changed_rounds: &mut usize) -> (bool, Option<End>) {
     // Every operation planned from the marks ran: they're used up. A
     // skipped or failed one may have nothing that would mark its folder
     // again (a file open elsewhere changes nothing), so then the marks stay
     // for the retry. A skip that only a change to the item can end counts as
-    // done: the change marks it again.
-    let clean = report.skipped.iter().all(|(_, s)| waits_for_a_change(*s)) && report.failed.is_empty();
+    // done: the change marks it again. Failures that wait their turn, and
+    // uploads OneDrive had no room for, are left to later rounds, which hold
+    // them (the caller keeps their marks): nothing to retry now.
+    let failed = report.failed.len() > waiting;
+    let clean = report.skipped.iter().all(|(_, s)| waits_for_a_change(*s) || *s == Skip::CloudFull) && !failed;
     if !report.is_idle() {
+        *changed_rounds = 0;
         return (clean, None);
     }
     if clean {
         return (true, Some(End::Settled));
     }
     // A skip because something changed meanwhile is worth an immediate new
-    // round (the change is seen now); anything else waits for the caller's
-    // retry.
-    let only_changed =
-        report.failed.is_empty() && report.skipped.iter().all(|(_, s)| *s == Skip::Changed || waits_for_a_change(*s));
-    (false, (!only_changed).then_some(End::Retry))
+    // round (the change is seen now), a few times; anything else, or one
+    // that keeps coming back (a stale row a new round doesn't clear), waits
+    // for the caller's retry, which backs off.
+    let only_changed = !failed
+        && report.skipped.iter().all(|(_, s)| matches!(s, Skip::Changed | Skip::CloudFull) || waits_for_a_change(*s));
+    if only_changed {
+        *changed_rounds += 1;
+        if *changed_rounds < CHANGED_ROUNDS {
+            return (false, None);
+        }
+    }
+    (false, Some(End::Retry))
 }
+
+/// Idle rounds in a row that only skipped items changed meanwhile, before
+/// the rounds end in a retry ([`settle`]).
+const CHANGED_ROUNDS: usize = 3;
 
 /// Skips that trying again can't end, only a change to the item (which
 /// marks its folder, so it's planned again then): an item that can't be
@@ -2028,6 +2239,7 @@ fn skip_label(s: Skip) -> &'static str {
         Skip::NotEmpty => "folder not empty (may hold excluded items)",
         Skip::ContentMismatch => "content didn't match; retrying",
         Skip::Refused => "special item or invalid name; retried when it changes",
+        Skip::CloudFull => "OneDrive is full; sent once there's room",
     }
 }
 
@@ -2070,6 +2282,17 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
             } else if r.copied.contains(op) {
                 println!("  ok    {line}  ({COPIED})");
                 entry(line, ActivityOutcome::Done, Some(COPIED.into()));
+            } else if let Some((_, copy)) = r.kept_theirs.iter().find(|(o, _)| o == op) {
+                let why = format!("it changed in OneDrive during the upload; that version is kept as {copy}");
+                println!("  ok    {line}  ({why})");
+                entry(line, ActivityOutcome::Done, Some(why));
+            } else if let Some((_, why)) = r.theirs_not_kept.iter().find(|(o, _)| o == op) {
+                // Done, and a failure of its own: the edit it went over
+                // wasn't kept next to it.
+                println!("  ok    {line}");
+                println!("  FAIL  {line}  ({why})");
+                entry(line, ActivityOutcome::Done, None);
+                entry(line, ActivityOutcome::Failed, Some(why.clone()));
             } else if !matches!(op, Op::Record(_) | Op::Forget(_)) {
                 println!("  ok    {line}");
                 if !quiet(op) {
@@ -2100,7 +2323,7 @@ pub fn now_ms() -> i64 {
 /// keeping their order, with the earliest time a held one may go.
 fn hold_back<T>(
     items: Vec<T>,
-    until: impl Fn(&T) -> Option<std::time::Instant>,
+    mut until: impl FnMut(&T) -> Option<std::time::Instant>,
 ) -> (Vec<T>, Vec<T>, Option<std::time::Instant>) {
     let (mut now, mut held, mut first) = (Vec::new(), Vec::new(), None::<std::time::Instant>);
     for item in items {
@@ -2113,6 +2336,19 @@ fn hold_back<T>(
         }
     }
     (now, held, first)
+}
+
+/// The earlier of two times, if either.
+fn earliest(a: Option<std::time::Instant>, b: Option<std::time::Instant>) -> Option<std::time::Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// `ms` milliseconds after `now` (`now` itself if not after).
+fn after_ms(now: std::time::Instant, ms: i64) -> std::time::Instant {
+    now + std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0))
 }
 
 /// The local file `op` reads to send it: an upload, or the hashing that
@@ -2403,21 +2639,172 @@ mod tests {
             |skips: &[Skip]| Report { skipped: skips.iter().map(|s| (op(), *s)).collect(), ..Report::default() };
         // Hard links refused, a name held by a
         // symbolic link. Up to date; their folders wait for a change.
-        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::NameTaken])), (true, Some(End::Settled)));
+        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::NameTaken]), 0, &mut 0), (true, Some(End::Settled)));
         // A OneDrive folder holding only excluded items: retried at once,
         // it spun through 20 rounds at a time.
-        assert_eq!(settle(&skipped(&[Skip::NotEmpty])), (true, Some(End::Settled)));
+        assert_eq!(settle(&skipped(&[Skip::NotEmpty]), 0, &mut 0), (true, Some(End::Settled)));
         // A file open elsewhere: nothing would mark it again, so retried.
-        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::Busy])), (false, Some(End::Retry)));
-        assert_eq!(settle(&skipped(&[Skip::ContentMismatch])), (false, Some(End::Retry)));
+        assert_eq!(settle(&skipped(&[Skip::Refused, Skip::Busy]), 0, &mut 0), (false, Some(End::Retry)));
+        assert_eq!(settle(&skipped(&[Skip::ContentMismatch]), 0, &mut 0), (false, Some(End::Retry)));
         // Changed meanwhile: another round at once.
-        assert_eq!(settle(&skipped(&[Skip::Changed, Skip::Refused])), (false, None));
+        assert_eq!(settle(&skipped(&[Skip::Changed, Skip::Refused]), 0, &mut 0), (false, None));
         let failed = Report { failed: vec![(op(), "411".into())], ..skipped(&[Skip::Refused]) };
-        assert_eq!(settle(&failed), (false, Some(End::Retry)));
+        assert_eq!(settle(&failed, 0, &mut 0), (false, Some(End::Retry)));
         // Work done: another round, marks used up unless something waits.
         let busy = Report { done: vec![op()], ..skipped(&[Skip::NameTaken]) };
-        assert_eq!(settle(&busy), (true, None));
-        assert_eq!(settle(&Report::default()), (true, Some(End::Settled)));
+        assert_eq!(settle(&busy, 0, &mut 0), (true, None));
+        assert_eq!(settle(&Report::default(), 0, &mut 0), (true, Some(End::Settled)));
+        // Not run (paused meanwhile): neither a failure nor a retry, which
+        // would back off; the marks stay all the same (`rounds`).
+        let paused = Report { not_run: vec![op()], ..Report::default() };
+        assert_eq!(settle(&paused, 0, &mut 0), (true, Some(End::Settled)));
+    }
+
+    /// A pair's OneDrive folder is found with names compared as Windows
+    /// compares them, part by part, and two folders that match one part
+    /// are refused rather than one picked.
+    #[test]
+    fn a_pairs_onedrive_folder_is_found_by_name_as_windows_compares_names() {
+        let mut s = Store::open_in_memory().unwrap();
+        let row = |id: &str, parent: Option<&str>, name: &str, kind| oneup_store::RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: name.into(),
+            kind,
+            size: 0,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| {
+            o.upsert_item(&row("root", None, "root", Kind::Root), false)?;
+            o.upsert_item(&row("g", Some("root"), "ΟΔΟΣ", Kind::Folder), false)?;
+            o.upsert_item(&row("d", Some("g"), "Docs", Kind::Folder), false)?;
+            o.upsert_item(&row("k", Some("root"), "\u{212A}", Kind::Folder), false)?;
+            o.upsert_item(&row("f", Some("root"), "file", Kind::File), false)?;
+            // Two names OneDrive tells apart that fold alike (final ς and σ).
+            o.upsert_item(&row("l1", Some("root"), "λογος", Kind::Folder), false)?;
+            o.upsert_item(&row("l2", Some("root"), "λογοσ", Kind::Folder), false)?;
+            Ok(())
+        })
+        .unwrap();
+        let find = |p: &str| find_remote(&s, p).unwrap();
+        assert_eq!(find("/οδοσ/DOCS").as_deref(), Some("d"));
+        assert_eq!(find("/\u{212A}").as_deref(), Some("k"));
+        assert_eq!(find("/k"), None, "the Kelvin sign isn't k");
+        assert_eq!(find("/file"), None, "not a folder");
+        assert_eq!(find("/").as_deref(), Some("root"));
+        let err = find_remote(&s, "/ΛΟΓΟΣ/x").unwrap_err().to_string();
+        assert!(err.contains("/ΛΟΓΟΣ") && err.contains("λογος") && err.contains("λογοσ"), "{err}");
+    }
+
+    /// An upload done over an edit it couldn't keep is logged as done, and
+    /// the edit not kept as a failure of its own, naming the file; it isn't
+    /// a failed operation (which would be retried and backed off).
+    #[test]
+    fn an_edit_not_kept_is_logged_as_a_failure_next_to_its_done_upload() {
+        use oneup_sync::{Link, LocalId, LocalPre, RemoteId, RemotePre};
+        let op = Op::Upload {
+            local: LocalPre { id: LocalId(4), stamp: Some((1, 2)) },
+            to: RemoteId("d".into()),
+            parent: 1,
+            name: "a.txt".into(),
+            replace: Some(RemotePre { id: RemoteId("r".into()), etag: "e".into() }),
+            link: Link::Existing(2),
+        };
+        let planned = [(op.clone(), Line::new("upload", "/docs/a.txt".into(), ""))];
+        let why = "uploaded, over an edit made in OneDrive meanwhile; the file's version history in OneDrive has that edit: HTTP 500";
+        let report = Report { done: vec![op.clone()], theirs_not_kept: vec![(op, why.into())], ..Report::default() };
+        let log = print_round(1, &planned, &report);
+        let got: Vec<_> = log.iter().map(|e| (e.outcome, e.path.as_str(), e.detail.as_str())).collect();
+        assert_eq!(got, [(ActivityOutcome::Done, "/docs/a.txt", ""), (ActivityOutcome::Failed, "/docs/a.txt", why)]);
+        assert_eq!(settle(&report, 0, &mut 0), (true, None), "not a failure to retry");
+    }
+
+    /// A failure that waits its turn (`crate::backoff`) and uploads OneDrive
+    /// had no room for are left to later rounds, which hold them: the rounds
+    /// settle instead of retrying them at the next wake-up, whatever woke it.
+    #[test]
+    fn failures_that_wait_their_turn_and_full_uploads_settle_the_rounds() {
+        let failed = Report { failed: vec![(Op::Forget(1), "HTTP 500".into())], ..Report::default() };
+        assert_eq!(settle(&failed, 1, &mut 0), (true, Some(End::Settled)));
+        assert_eq!(settle(&failed, 0, &mut 0), (false, Some(End::Retry)), "one that doesn't wait is retried");
+        let full = Report { skipped: vec![(Op::Forget(1), Skip::CloudFull)], ..Report::default() };
+        assert_eq!(settle(&full, 0, &mut 0), (true, Some(End::Settled)));
+        let both = Report { skipped: vec![(Op::Forget(2), Skip::Busy)], ..full };
+        assert_eq!(settle(&both, 0, &mut 0), (false, Some(End::Retry)));
+    }
+
+    /// While OneDrive is full, uploads go again once it has more room, or
+    /// after an hour whatever it says (it may never say).
+    #[test]
+    fn uploads_go_again_once_onedrive_has_more_room() {
+        let t = std::time::Instant::now();
+        let full = |remaining| Full { since_ms: 0, remaining, tried: t, checked: t };
+        let at = |s| t + std::time::Duration::from_secs(s);
+        let mut f = full(Some(100));
+        assert!(!f.room_again(Some(100), at(60)), "the same");
+        assert!(!f.room_again(Some(40), at(120)), "less (another device uploaded)");
+        assert!(!f.room_again(None, at(180)), "unreadable");
+        assert!(f.room_again(Some(101), at(240)), "more");
+        let mut f = full(None);
+        assert!(!f.room_again(Some(5), at(60)), "the first reading is the baseline");
+        assert!(f.room_again(Some(6), at(120)));
+        let mut f = full(None);
+        assert!(!f.room_again(None, at(3599)));
+        assert!(f.room_again(None, at(3600)), "never told: tried again after an hour");
+    }
+
+    /// A failed operation waits (`crate::backoff`) while the rest of its
+    /// folder goes; its folder stays marked like a held upload's (see
+    /// `a_held_upload_is_planned_again_in_the_next_round`).
+    #[test]
+    fn a_failed_operation_waits_while_the_rest_go() {
+        use oneup_sync::{Link, LocalPre};
+        let op = |id: u128| Op::Upload {
+            local: LocalPre { id: LocalId(id), stamp: Some((1, 2)) },
+            to: RemoteId("d".into()),
+            parent: 1,
+            name: format!("{id}.txt"),
+            replace: None,
+            link: Link::New,
+        };
+        let mut s = Store::open_in_memory().unwrap();
+        let report = Report { failed: vec![(op(1), "HTTP 500".into())], done: vec![op(2)], ..Report::default() };
+        let r = s.write(|o| crate::backoff::record(o, &report, now_ms())).unwrap();
+        assert_eq!(r.waiting, 1);
+        let at = now_ms();
+        let waits: Vec<Option<i64>> =
+            s.read(|o| [op(1), op(2), op(3)].iter().map(|op| crate::backoff::until(o, op, at)).collect()).unwrap();
+        let mut waits = waits.into_iter();
+        let now = std::time::Instant::now();
+        let (go, held, first) = hold_back(vec![1, 2, 3], |_| waits.next().flatten().map(|u| after_ms(now, u - at)));
+        assert_eq!((go, held), (vec![2, 3], vec![1]));
+        let first = first.unwrap().saturating_duration_since(now).as_secs();
+        assert!((58..=60).contains(&first), "a minute: {first} s");
+    }
+
+    /// A "changed meanwhile" that a new round doesn't clear (a stale row)
+    /// gets a few immediate rounds, then the ordinary retry pause: it spun
+    /// through every round of a sequence, a OneDrive request each, and
+    /// started over 5 s later, for as long as the row stayed.
+    #[test]
+    fn a_changed_skip_that_doesnt_clear_ends_in_a_retry() {
+        let changed = Report { skipped: vec![(Op::Forget(1), Skip::Changed)], ..Report::default() };
+        let mut streak = 0;
+        for _ in 1..CHANGED_ROUNDS {
+            assert_eq!(settle(&changed, 0, &mut streak), (false, None), "another round at once");
+        }
+        assert_eq!(settle(&changed, 0, &mut streak), (false, Some(End::Retry)));
+        // Work done in between starts the count again.
+        let mut streak = 0;
+        assert_eq!(settle(&changed, 0, &mut streak), (false, None));
+        let busy =
+            Report { done: vec![Op::Forget(2)], skipped: vec![(Op::Forget(1), Skip::Changed)], ..Report::default() };
+        assert_eq!(settle(&busy, 0, &mut streak), (false, None));
+        for _ in 1..CHANGED_ROUNDS {
+            assert_eq!(settle(&changed, 0, &mut streak), (false, None));
+        }
     }
 
     /// A held upload's folder keeps its mark through the end of the round

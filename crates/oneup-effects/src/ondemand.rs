@@ -69,11 +69,13 @@ impl LocalFs {
     /// While the returned hold lives, the open placeholder's content can't
     /// arrive (every fetch of it fails). `None` unless, under that hold, it
     /// is still dehydrated with the same identity: then it has no content
-    /// here to lose. It is then marked in sync (a rename may have cleared
+    /// here to lose. Also `None` while a program's fetch of it is under way:
+    /// its old version's content is on its way, though none shows yet
+    /// (invariant 13). It is then marked in sync (a rename may have cleared
     /// the bit; with no content, that bit protects nothing).
     pub(crate) fn hold_dehydrated(&self, h: &win::Handle) -> Option<provider::Hold> {
         let before = provider::info(&h.as_file()).ok()??;
-        let hold = provider::hold(&before.identity);
+        let hold = provider::hold(&before.identity)?;
         let now = provider::info(&h.as_file()).ok()??;
         if now.on_disk != 0 || now.identity != before.identity {
             return None;
@@ -84,11 +86,21 @@ impl LocalFs {
         Some(hold)
     }
 
-    /// After one of our own moves: the placeholder moved through `h`, now at
-    /// `at`, is in sync again. `h` stays open meanwhile: share-none with data
-    /// access for one with content (so no one changed it), attribute access
-    /// for a dehydrated one (no content to change). The bit is set through
-    /// a second, attribute-only handle, which has the access it needs.
+    /// Whether the open item is a placeholder in sync: read before one of
+    /// our moves, which may clear the bit, so [`LocalFs::resync_moved`]
+    /// restores only what the move cleared.
+    pub(crate) fn is_in_sync(&self, h: &win::Handle) -> bool {
+        matches!(provider::info(&h.as_file()), Ok(Some(i)) if i.in_sync)
+    }
+
+    /// After one of our own moves of a placeholder that was in sync
+    /// ([`LocalFs::is_in_sync`] before it; never one a program edited, whose
+    /// edit isn't sent yet: invariant 12): the placeholder moved through
+    /// `h`, now at `at`, is in sync again. `h` stays open meanwhile:
+    /// share-none with data access for one with content (so no one changed
+    /// it), attribute access for a dehydrated one (no content to change).
+    /// The bit is set through a second, attribute-only handle, which has
+    /// the access it needs.
     pub(crate) fn resync_moved(&self, h: &win::Handle, at: &std::path::Path) {
         if !matches!(provider::info(&h.as_file()), Ok(Some(i)) if !i.in_sync) {
             return;
@@ -157,9 +169,66 @@ impl LocalFs {
         Ok(Done::Placed { parent: to, entry, kept: None })
     }
 
+    /// Whether the open placeholder has some but not all of its `size`
+    /// bytes here: a download cut short (see [`LocalFs::open_partial`]).
+    pub(crate) fn is_partial(&self, h: &win::Handle, size: i64) -> bool {
+        matches!(provider::info(&h.as_file()), Ok(Some(i)) if i.on_disk > 0 && i.on_disk < size)
+    }
+
+    /// Reopens the planned placeholder `pre` at `path`, which has only part
+    /// of its content here (a download cut short), share-none, for a change
+    /// that needs none of that content: reading the rest would ask for a
+    /// version the cloud may no longer have. With whole-file hydration a
+    /// program can't write to a placeholder until all of it is here
+    /// (measured: writes fail and leave nothing modified), so its bytes are
+    /// only what OneUpDrive transferred of its identity's version, verified
+    /// before the transfer, which OneDrive keeps. Proved under the new
+    /// handle: still `pre`, in sync, nothing written here, still partial,
+    /// and an identity of ours for the planned size. The returned hold
+    /// keeps the rest from arriving: opening with data access asks for it,
+    /// and the hold refuses that at once, before the hydration service sees
+    /// it. `h`, the attribute handle it was found through, is closed first
+    /// (it would make the share-none open fail).
+    pub(crate) fn open_partial(
+        &self,
+        h: win::Handle,
+        pre: &LocalPre,
+        path: &std::path::Path,
+    ) -> Result<(win::Handle, provider::Hold)> {
+        let Some((size, _)) = pre.stamp else { return Err(Error::WrongOp) };
+        let before = provider::info(&h.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
+        drop(h);
+        // None while a fetch of it is under way: left for a later round.
+        let hold = provider::hold(&before.identity).ok_or(Error::Changed)?;
+        let x = win::open_path_for_placeholder(path, false)?;
+        let id = FileId(pre.id.0);
+        if win::file_id(&x)?.1 != id {
+            return Err(Error::Changed);
+        }
+        let entry = win::stat_handle(&x, id)?.ok_or(Error::Changed)?;
+        check_placeholder(&entry, pre.stamp, true)?;
+        if !self.is_inside_pub(path) {
+            return Err(Error::Outside);
+        }
+        let now = provider::info(&x.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
+        let only_ours = now.identity == before.identity
+            && now.in_sync
+            && now.modified == 0
+            && now.on_disk > 0
+            && now.on_disk < size
+            && Identity::decode(&now.identity).is_some_and(|i| i.size == size);
+        if !only_ours {
+            return Err(Error::Changed);
+        }
+        Ok((x, hold))
+    }
+
     /// For an approved [`Op::Download`] that replaces a local file (a cloud
     /// edit): the placeholder takes the new version. Dehydrated, it just
-    /// changes identity. Hydrated, its content is the last synced version
+    /// changes identity. Partly here (a download cut short), it holds only
+    /// bytes of the old cloud version, which OneDrive keeps: dehydrated with
+    /// the new identity without reading it ([`LocalFs::open_partial`]), no
+    /// copy kept. Hydrated, its content is the last synced version
     /// (checked under the share-none handle against `synced`, with Windows'
     /// own `VERIFY_IN_SYNC` on top); a copy goes to the version store unless
     /// the token says [`OldCopy::DropIfSynced`] and it proved to be that
@@ -177,6 +246,8 @@ impl LocalFs {
             let _hold = self.hold_dehydrated(&h).ok_or(Error::Changed)?;
             provider::update_dehydrated(&h.as_file(), &identity, v.identity.size, v.modified)
                 .map_err(placeholder_error)?;
+        } else if pre.stamp.is_some_and(|(size, _)| info.on_disk < size) {
+            return self.replace_partial(h, pre, *to, &path, v);
         } else {
             let proved = self.is_synced_pub(&h, pre, synced)?;
             if a.old_copy() != OldCopy::DropIfSynced || !proved {
@@ -199,6 +270,28 @@ impl LocalFs {
         }
         let entry = win::stat_handle(&h, FileId(pre.id.0))?.ok_or(Error::Changed)?;
         Ok(Done::Placed { parent: *to, entry, kept })
+    }
+
+    /// [`LocalFs::replace_placeholder`] for one partly here: dehydrated with
+    /// the new identity through the share-none handle (`VERIFY_IN_SYNC` on
+    /// top), never read.
+    fn replace_partial(
+        &self,
+        h: win::Handle,
+        pre: &LocalPre,
+        to: LocalId,
+        path: &std::path::Path,
+        v: &Version,
+    ) -> Result<Done> {
+        let (x, hold) = self.open_partial(h, pre, path)?;
+        oneup_cfapi::ours::note(pre.id.0);
+        let x = Exclusive::from_file(x.into_file());
+        x.dehydrate(Some((&v.identity.encode(), v.identity.size, v.modified))).map_err(placeholder_error)?;
+        drop(x);
+        drop(hold);
+        let h = win::open_path_for_dehydrated(path)?;
+        let entry = win::stat_handle(&h, FileId(pre.id.0))?.ok_or(Error::Changed)?;
+        Ok(Done::Placed { parent: to, entry, kept: None })
     }
 
     /// After a verified upload of `pre`: the file becomes (or stays) a
@@ -256,11 +349,14 @@ impl LocalFs {
     }
 
     /// Whether the open placeholder has all its content on disk (reading it
-    /// then never asks the cloud). Not a placeholder: true.
+    /// then never asks the cloud). Not a placeholder: true, unless its
+    /// attributes or reparse tag say it is one after all (then nothing
+    /// vouches for its content). Removing the OneDrive copy relies on this
+    /// ([`LocalFs::has_content`]), so any doubt answers false.
     pub(crate) fn fully_on_disk(&self, h: &win::Handle, size: i64) -> bool {
         match provider::info(&h.as_file()) {
             Ok(Some(i)) => i.on_disk >= size,
-            Ok(None) => true,
+            Ok(None) => win::attribute_tag(h).is_ok_and(|(attributes, tag)| !looks_like_placeholder(attributes, tag)),
             Err(_) => false,
         }
     }
@@ -392,6 +488,16 @@ impl LocalFs {
         let path = long(&win::final_path(&probe)?);
         Ok(self.is_inside_pub(&path).then_some(path))
     }
+}
+
+/// Whether a file's attributes or reparse tag mark a cloud placeholder or
+/// content that isn't here (offline, recalled on open or data access).
+fn looks_like_placeholder(attributes: u32, reparse_tag: u32) -> bool {
+    use oneup_ntfs::dirent::{
+        FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    };
+    attributes & (FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS | FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0
+        || oneup_cfapi::placeholder_state(attributes, reparse_tag).is_placeholder()
 }
 
 fn placeholder_error(e: provider::Error) -> Error {

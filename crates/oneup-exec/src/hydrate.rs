@@ -138,10 +138,9 @@ impl<C: Cloud + 'static> Hydrator<C> {
             return Err(Refusal::NotCurrent);
         }
 
-        let path = self.staging.join(format!("{}-{}.hydrating", std::process::id(), self.seq.fetch_add(1, Relaxed)));
-        let result = self.download_and_transfer(fetch, &id, &path).await;
-        let _ = std::fs::remove_file(&path);
-        result
+        let staged =
+            Staged(self.staging.join(format!("{}-{}.hydrating", std::process::id(), self.seq.fetch_add(1, Relaxed))));
+        self.download_and_transfer(fetch, &id, &staged.0).await
     }
 
     async fn download_and_transfer(&self, fetch: &Fetch, id: &Identity, path: &PathBuf) -> Result<u64, Refusal> {
@@ -233,6 +232,17 @@ impl<C: Cloud + 'static> Provider for Serve<C> {
     }
 }
 
+/// A download's staging file, removed when dropped: also when a cancelled
+/// fetch aborts its task mid-download, so repeated cancels of big files
+/// don't fill the disk until the next start.
+struct Staged(PathBuf);
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 fn fetch_key(f: &Fetch) -> i64 {
     f.transfer_key()
 }
@@ -256,4 +266,40 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A cancel aborts the hydration task mid-download: its staging file,
+    /// still open and part-written, goes with it.
+    #[test]
+    fn an_aborted_download_leaves_no_staging_file() {
+        let dir = std::env::temp_dir().join(format!("oneup-exec-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1-0.hydrating");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let (started, written) = std::sync::mpsc::channel();
+        let staged = Staged(path.clone());
+        let task = rt.spawn(async move {
+            let mut file = std::fs::File::create_new(&staged.0).unwrap();
+            file.write_all(b"part of a download").unwrap();
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop((file, staged));
+        });
+        rt.block_on(async {
+            while written.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        });
+        assert!(path.exists());
+        task.abort();
+        let _ = rt.block_on(task);
+        assert!(!path.exists(), "removed with the aborted task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

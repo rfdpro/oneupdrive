@@ -33,7 +33,7 @@ Rules are written like a `.gitignore` file, one per line:
 | `logs/**` | everything inside `logs` |
 | `!final.mp4` | brings back something an earlier rule skipped |
 
-Upper and lower case don't matter, and `\` works like `/`. When several rules match, the **last** one wins.
+Upper and lower case don't matter (in any alphabet, as in Windows), and `\` works like `/`. When several rules match, the **last** one wins.
 
 You can keep your rules in two places:
 

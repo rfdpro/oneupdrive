@@ -168,6 +168,132 @@ fn losing_the_on_demand_registration_halts() {
     fs.check_root().unwrap();
 }
 
+/// Our rename of a placeholder (which can clear its in-sync bit) leaves it
+/// in sync only if it was in sync before: one a user edited, not yet sent,
+/// stays "not in sync", so nothing frees it and loses the edit
+/// (invariant 12).
+#[test]
+fn renaming_a_placeholder_keeps_an_edit_not_in_sync() {
+    use oneup_cfapi::provider;
+    let r = Root::new("rename-in-sync");
+    drop(r.fs());
+    provider::register(&r.dir, b"token-1").unwrap();
+    let fs = r.fs();
+    assert!(fs.on_demand());
+    let root = fs.root_id();
+    let in_sync = |p: &Path| provider::info(&provider::open(p).unwrap()).unwrap().unwrap().in_sync;
+    for n in ["synced.txt", "edited.txt"] {
+        std::fs::write(r.p(n), b"synced content").unwrap();
+        provider::Exclusive::open(&r.p(n)).unwrap().convert(b"OD!x").unwrap();
+        assert!(in_sync(&r.p(n)), "{n}");
+    }
+    edit(&r.p("edited.txt"), "edited here");
+    assert!(!in_sync(&r.p("edited.txt")), "a program's edit clears the bit");
+
+    let rename = |from: &str, to: &str| {
+        fs.apply(&approve(Op::ConflictCopy { sid: 1, local: pre(&r.p(from)), dir: root, name: to.into() })).unwrap();
+    };
+    rename("synced.txt", "synced2.txt");
+    rename("edited.txt", "edited2.txt");
+    let result = (in_sync(&r.p("synced2.txt")), in_sync(&r.p("edited2.txt")));
+    drop(fs);
+    let _ = provider::unregister(&r.dir);
+    assert_eq!(result, (true, false), "(was in sync, edited)");
+}
+
+/// Serves the first MiB of a placeholder's content, then fails the rest:
+/// a download cut short. Counts the requests that reach it.
+struct CutShort {
+    data: Vec<u8>,
+    fetches: std::sync::atomic::AtomicU32,
+}
+
+struct ServeCutShort(std::sync::Arc<CutShort>);
+
+impl oneup_cfapi::provider::Provider for ServeCutShort {
+    fn fetch_data(&self, fetch: oneup_cfapi::provider::Fetch) {
+        let me = std::sync::Arc::clone(&self.0);
+        std::thread::spawn(move || {
+            me.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if fetch.offset == 0 {
+                let _ = fetch.transfer(0, &me.data[..1 << 20]);
+            }
+            fetch.fail(oneup_cfapi::provider::NOT_IN_SYNC);
+        });
+    }
+}
+
+/// A placeholder partly here (a download cut short) holds only bytes of
+/// its cloud version. Replaced by a cloud edit or removed after a cloud
+/// deletion, it is never read: reading the rest would ask the cloud for a
+/// version it no longer has, fail, and fail the operation every round.
+#[test]
+fn partly_downloaded_placeholders_change_without_being_read() {
+    use oneup_cfapi::identity::Identity;
+    use oneup_cfapi::provider::{self, NewPlaceholder};
+    use std::sync::atomic::Ordering::Relaxed;
+    oneup_cfapi::expose_placeholders().unwrap();
+    let r = Root::new("partial");
+    drop(r.fs());
+    provider::register(&r.dir, b"token-1").unwrap();
+    let data: Vec<u8> = (0..3 << 20).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let cloud = std::sync::Arc::new(CutShort { data: data.clone(), fetches: Default::default() });
+    let conn = provider::connect(&r.dir, std::sync::Arc::new(ServeCutShort(std::sync::Arc::clone(&cloud)))).unwrap();
+    let fs = r.fs();
+    assert!(fs.on_demand());
+    let root = fs.root_id();
+    let size = data.len() as i64;
+    let old = Identity { item: "P".into(), etag: "e1".into(), size, hash: qxh(&data) };
+    let info = |p: &Path| provider::info(&provider::open(p).unwrap()).unwrap().unwrap();
+    let names = ["replaced.bin", "removed.bin", "discarded.bin"];
+    for name in names {
+        let item = NewPlaceholder { name, identity: &old.encode(), size, modified: 0, folder: false };
+        provider::create(&r.dir, &[item]).unwrap();
+        // A program's read, cut short.
+        use std::os::windows::process::CommandExt as _;
+        let out = r.dir.with_extension("read");
+        std::process::Command::new("cmd.exe")
+            .raw_arg(format!("/C copy /Y /B \"{}\" \"{}\" >nul 2>nul", r.p(name).display(), out.display()))
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_file(out);
+        let i = info(&r.p(name));
+        assert!(i.on_disk > 0 && i.on_disk < size && i.in_sync && i.modified == 0, "{name}: {i:?}");
+    }
+    let asked = cloud.fetches.load(Relaxed);
+
+    // A cloud edit: dehydrated with the new identity, no copy kept.
+    let new = Identity { item: "P".into(), etag: "e2".into(), size: 11, hash: qxh(b"new version") };
+    let replace = Op::Download {
+        remote: remote(),
+        to: root,
+        parent: 0,
+        name: names[0].into(),
+        replace: Some(pre(&r.p(names[0]))),
+        link: Link::Existing(1),
+    };
+    let v = oneup_effects::Version { identity: new.clone(), modified: 0 };
+    let replaced = fs.replace_placeholder(&approve(replace), &v, Some(&old.hash));
+    // A cloud deletion, kept or discarded: removed, nothing kept.
+    let removed = fs.apply(&approve(Op::RecycleLocal { sid: 2, local: pre(&r.p(names[1])) }));
+    let discard = approve_discard(Op::RecycleLocal { sid: 3, local: pre(&r.p(names[2])) });
+    let discarded = fs.recycle(&discard, Some(&old.hash));
+    let after = info(&r.p(names[0]));
+    let (gone, versions) = ([1, 2].map(|i| !r.p(names[i]).exists()), fs.versions().unwrap());
+    let fetched = cloud.fetches.load(Relaxed) - asked;
+    drop(fs);
+    drop(conn);
+    let _ = provider::unregister(&r.dir);
+
+    assert!(matches!(replaced, Ok(Done::Placed { kept: None, .. })), "{replaced:?}");
+    assert_eq!((after.on_disk, after.identity), (0, new.encode()), "dehydrated with the new identity");
+    assert!(matches!(removed, Ok(Done::Recycled { kept: None })), "{removed:?}");
+    assert!(matches!(discarded, Ok(Done::Recycled { kept: None })), "{discarded:?}");
+    assert_eq!(gone, [true, true]);
+    assert!(versions.is_empty(), "{versions:?}");
+    assert_eq!(fetched, 0, "nothing asked for the old version");
+}
+
 #[test]
 fn mkdir_never_reuses_a_name_and_checks_names() {
     let r = Root::new("mkdir");
@@ -327,6 +453,67 @@ fn kept_items_are_listed_restored_without_replacing_and_pruned() {
     // By age: everything kept before now.
     fs.prune_versions(Some(i64::MAX), None, false).unwrap();
     assert!(fs.versions().unwrap().is_empty());
+}
+
+/// Listing the store measures each slot once: later listings take its
+/// size from `.oneup\versions.cache`, checked against the slot folder's
+/// creation time, and follow slots added and removed. A missing or
+/// damaged cache only costs measuring again.
+#[test]
+fn the_version_store_is_measured_once_per_slot() {
+    let r = Root::new("versions-cache");
+    let fs = r.fs();
+    let cache = r.p(".oneup/versions.cache");
+    let keep = |name: &str, content: &[u8]| {
+        std::fs::write(r.p(name), content).unwrap();
+        fs.apply(&approve(Op::RecycleLocal { sid: 1, local: pre(&r.p(name)) })).unwrap();
+    };
+    let bytes = || fs.versions().unwrap().iter().map(|s| (s.name.clone(), s.bytes)).collect::<Vec<_>>();
+    // Rewrites one field of every cache line.
+    let set_field = |n: usize, value: &str| {
+        let text = std::fs::read_to_string(&cache).unwrap();
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| {
+                let mut f: Vec<&str> = l.split('\t').collect();
+                f[n] = value;
+                f.join("\t")
+            })
+            .collect();
+        std::fs::write(&cache, lines.join("\n") + "\n").unwrap();
+    };
+
+    keep("a.txt", b"12345");
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
+
+    // Not measured again: the cache is what's read.
+    set_field(2, "999");
+    assert_eq!(bytes(), [("a.txt".to_string(), 999)]);
+    // Of another slot folder (another creation time): measured.
+    set_field(1, "1");
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    // Damaged or missing: measured, and written again.
+    std::fs::write(&cache, "garbage\tline\n").unwrap();
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    std::fs::remove_file(&cache).unwrap();
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    assert!(cache.exists());
+
+    // Slots added and removed.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    keep("b.txt", b"0123456789");
+    assert_eq!(bytes(), [("a.txt".to_string(), 5), ("b.txt".to_string(), 10)]);
+    let a = fs.versions().unwrap()[0].id.clone();
+    fs.restore(&a, None).unwrap();
+    assert_eq!(bytes(), [("b.txt".to_string(), 10)]);
+    assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
+    fs.prune_versions(Some(i64::MAX), None, false).unwrap();
+    assert!(bytes().is_empty());
+    assert_eq!(std::fs::read_to_string(&cache).unwrap(), "");
+    // Only the cache itself in our folder: no temp files left.
+    let ours: Vec<_> = std::fs::read_dir(r.p(".oneup")).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(!ours.iter().any(|n| n.to_string_lossy().ends_with(".tmp")), "{ours:?}");
 }
 
 #[test]

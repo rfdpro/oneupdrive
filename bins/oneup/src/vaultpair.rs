@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, bail};
-use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone};
+use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone, VersionMark};
 use oneup_graph::Graph;
 use oneup_store::{RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
@@ -129,15 +129,13 @@ pub fn new_name(main: &Path, remote: &str) -> String {
 
 pub fn save_key(dir: &Path, key: &Masterkey) -> Result<()> {
     let sealed = oneup_sys::dpapi::protect(key.export().as_ref()).context("protecting the vault's keys")?;
-    let tmp = dir.join(format!("{KEY_FILE}.tmp"));
-    std::fs::write(&tmp, sealed)?;
-    std::fs::rename(&tmp, dir.join(KEY_FILE))?;
+    crate::ownfile::write(&dir.join(KEY_FILE), &sealed)?;
     Ok(())
 }
 
 pub fn load_key(dir: &Path) -> Result<Option<Masterkey>> {
     let Ok(sealed) = std::fs::read(dir.join(KEY_FILE)) else { return Ok(None) };
-    let raw = Zeroizing::new(oneup_sys::dpapi::unprotect(&sealed).context("reading the remembered vault keys")?);
+    let raw = oneup_sys::dpapi::unprotect(&sealed).context("reading the remembered vault keys")?;
     let raw: &[u8; 64] = raw.as_slice().try_into().context("the remembered vault keys are damaged")?;
     Ok(Some(Masterkey::import(raw)))
 }
@@ -170,9 +168,7 @@ pub fn save_key_hello(dir: &Path, key: &Masterkey) -> Result<()> {
     let challenge = oneup_vault::sealed::new_challenge()?;
     let secret = Zeroizing::new(oneup_sys::hello::secret(&hello_name(dir)?, &challenge, true)?);
     let blob = oneup_vault::sealed::seal(key, &secret, &challenge)?;
-    let tmp = dir.join(format!("{HELLO_FILE}.tmp"));
-    std::fs::write(&tmp, blob)?;
-    std::fs::rename(&tmp, dir.join(HELLO_FILE))?;
+    crate::ownfile::write(&dir.join(HELLO_FILE), &blob)?;
     Ok(())
 }
 
@@ -390,6 +386,32 @@ impl Cloud for PairCloud {
         }
     }
 
+    async fn version_mark(&self, pre: &RemotePre, size: i64) -> Result<Option<VersionMark>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.version_mark(pre, size).await,
+            PairCloud::Vault(c) => c.version_mark(pre, size).await,
+        }
+    }
+
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.replaced_other(id, mark).await,
+            PairCloud::Vault(c) => c.replaced_other(id, mark).await,
+        }
+    }
+
+    async fn download_version(
+        &self,
+        id: &RemoteId,
+        version: &str,
+        out: &mut (dyn std::io::Write + Send),
+    ) -> Result<u64, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.download_version(id, version, out).await,
+            PairCloud::Vault(c) => c.download_version(id, version, out).await,
+        }
+    }
+
     fn can_copy(&self) -> bool {
         match self {
             PairCloud::Plain(c) => c.can_copy(),
@@ -507,6 +529,12 @@ fn remote_path(p: &str) -> Result<String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
+/// Whether OneDrive paths `a` and `b` (as [`remote_path`] gives them) name
+/// one folder, as OneDrive compares names.
+fn same_remote(a: &str, b: &str) -> bool {
+    oneup_sync::fold(a) == oneup_sync::fold(b)
+}
+
 /// What [`add`] made.
 pub struct Added {
     pub entry: Entry,
@@ -531,7 +559,7 @@ pub async fn add(
         bail!("give the main data folder, not a vault pair's");
     }
     let remote = remote_path(remote)?;
-    if list(main).iter().any(|e| e.remote.eq_ignore_ascii_case(&remote)) {
+    if list(main).iter().any(|e| same_remote(&e.remote, &remote)) {
         bail!("the vault at {remote} is already paired");
     }
 
@@ -758,4 +786,17 @@ pub fn remove(e: &Entry) -> Result<(PathBuf, bool)> {
     }
     std::fs::remove_dir_all(&e.dir).with_context(|| format!("removing {}", e.dir.display()))?;
     Ok((local, on))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_vault_is_already_paired_under_a_name_windows_takes_for_the_same() {
+        use super::same_remote;
+        assert!(same_remote("/Vault", "/VAULT"));
+        assert!(same_remote("/ΟΔΟΣ", "/οδος"));
+        assert!(same_remote("/ΟΔΟΣ", "/οδοσ"), "final sigma folds as sigma");
+        assert!(!same_remote("/\u{212A}it", "/kit"), "the Kelvin sign is its own letter");
+        assert!(!same_remote("/Vault", "/Vault2"));
+    }
 }
