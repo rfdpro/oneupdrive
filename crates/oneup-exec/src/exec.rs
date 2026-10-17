@@ -49,6 +49,17 @@ impl<'a> Db<'a> {
 /// held for the report.
 const WINDOW: usize = 256;
 
+/// At most this many operations a round takes in for the folders it
+/// creates ([`Executor::run_following`]); what's in folders created after
+/// that waits for the next round, which their marks bring.
+pub const FOLLOW_MAX: usize = 20_000;
+
+/// Plans and reviews what goes into folders a round has just created: given
+/// the store and those folders (Synced rows the round linked), the approved
+/// operations for their contents, in the planner's order. The caller's
+/// planner and gate, as for a round ([`Executor::run_following`]).
+pub type Follow<'a> = dyn Fn(&Ops<'_>, &[Sid]) -> Vec<Approved> + Sync + 'a;
+
 /// Why an operation was skipped. Nothing was changed; the next round plans
 /// again from fresh state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,8 +300,8 @@ fn stage(op: &Op) -> &'static str {
 /// link serves whatever the file holds when it's used, and only the hash
 /// tells another content of the same size from the planned one; without
 /// it, the link is read right before the download, as always.
-fn coming_downloads(store: &Db<'_>, ops: &[Approved]) -> Vec<RemotePre> {
-    ops.iter()
+fn coming_downloads<'a>(store: &Db<'_>, ops: impl IntoIterator<Item = &'a Approved>) -> Vec<RemotePre> {
+    ops.into_iter()
         .filter_map(|a| match a.op() {
             Op::Download { remote, .. } => Some(remote),
             _ => None,
@@ -316,10 +327,24 @@ fn may_copy(can_copy: bool, new: bool, size: i64) -> bool {
 /// Consecutive operations of the round that run as one: a single
 /// operation, or a batch.
 struct Unit {
-    /// Where in the round they start, and how many.
+    /// Where in the round they start.
     start: usize,
-    len: usize,
+    group: Vec<Approved>,
     claims: Claims,
+}
+
+/// The Synced folder `op` linked, if it made one: a new folder on either
+/// side, or two new ones paired. Its contents weren't planned with the
+/// round: the folder had no Synced row then.
+fn made_folder(o: &Ops<'_>, op: &Op) -> oneup_store::Result<Option<Sid>> {
+    let b = match op {
+        Op::MkdirRemote { local, link: Link::New, .. } | Op::Pair { local, kind: NodeKind::Folder, .. } => {
+            o.synced_by_local(local.id.0)?
+        }
+        Op::MkdirLocal { remote, link: Link::New, .. } => o.synced_by_remote(&remote.id.0)?,
+        _ => None,
+    };
+    Ok(b.filter(|b| b.kind == NodeKind::Folder).map(|b| b.sid))
 }
 
 /// Where the store has an item that an operation moves or removes.
@@ -731,6 +756,27 @@ impl<C: Cloud> Executor<C> {
         done: &(dyn Fn(usize) + Sync),
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Report {
+        self.run_following(store, approved, done, may_run, &|_, _| Vec::new()).await
+    }
+
+    /// [`Self::run_checked`], taking in what goes into the folders the
+    /// round makes as it goes: once an operation that made a folder is
+    /// recorded, `follow` plans and reviews the folder's contents, and they
+    /// run after everything taken in before them, as if planned last. A new
+    /// tree then goes in one round instead of one level a round, without a
+    /// round's start (the change journal, the cloud listing) for each level,
+    /// and a level's folders are made while the level above is still being
+    /// sent. At most [`FOLLOW_MAX`] operations are taken in this way; the
+    /// rest wait for the next round, which the new folders' marks bring, as
+    /// does whatever `follow` leaves out.
+    pub async fn run_following(
+        &self,
+        store: &mut Store,
+        approved: Vec<Approved>,
+        done: &(dyn Fn(usize) + Sync),
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+        follow: &Follow<'_>,
+    ) -> Report {
         let mut report = Report::default();
         if let Err(e) = self.fs.check_root() {
             report.halted = Some(e.to_string());
@@ -747,27 +793,30 @@ impl<C: Cloud> Executor<C> {
         // the round's other uploads and new folders aren't sent only to be
         // refused; everything else goes on.
         let full = AtomicBool::new(false);
+        // Not taken in yet: the round's operations from the `next`th on.
+        let mut pending: VecDeque<Approved> = approved.into();
+        let mut followed = 0;
         let mut waiting: VecDeque<Unit> = VecDeque::new();
         let mut held = Held::default();
         let mut running = FuturesUnordered::new();
         // Outcomes from the first not yet reported on: they're reported in
         // the planner's order, as soon as everything before has finished.
         let mut reported = 0;
-        let mut outcomes: VecDeque<Option<(Res, Notes)>> = VecDeque::new();
+        let mut outcomes: VecDeque<Option<(Op, Res, Notes)>> = VecDeque::new();
         let can_copy = self.cloud.can_copy();
         let mut next = 0;
         loop {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
-            let from = next;
-            while next - reported < WINDOW && next < approved.len() {
-                let (n, claims) = batch_of(&db, &approved[next..], can_copy);
-                waiting.push_back(Unit { start: next, len: n, claims });
+            let first_new = waiting.len();
+            while next - reported < WINDOW && !pending.is_empty() {
+                let (n, claims) = batch_of(&db, pending.make_contiguous(), can_copy);
+                waiting.push_back(Unit { start: next, group: pending.drain(..n).collect(), claims });
                 next += n;
             }
             // On demand, a download is a placeholder: nothing is fetched.
-            if next > from && !self.fs.on_demand() {
-                let coming = coming_downloads(&db, &approved[from..next]);
+            if waiting.len() > first_new && !self.fs.on_demand() {
+                let coming = coming_downloads(&db, waiting.range(first_new..).flat_map(|u| &u.group));
                 if !coming.is_empty() {
                     self.cloud.upcoming(&coming);
                 }
@@ -794,37 +843,64 @@ impl<C: Cloud> Executor<C> {
                 }
                 let Some(u) = waiting.remove(k) else { break };
                 held.add(&u.claims);
-                running.push(self.unit(&db, &approved, u, &full, may_run));
+                running.push(self.unit(&db, u, &full, may_run));
             }
             let Some((u, finished)) = running.next().await else { break };
             held.remove(&u.claims);
-            done(u.len);
+            let len = u.group.len();
+            done(len);
             let halted = finished.iter().any(|(r, notes)| halts(r, notes));
-            let from = u.start - reported;
-            if outcomes.len() < from + u.len {
-                outcomes.resize_with(from + u.len, || None);
+            if !halted && followed < FOLLOW_MAX {
+                let more = self.follow(&db, &u.group, &finished, follow);
+                followed += more.len();
+                pending.extend(more);
             }
-            for (k, o) in finished.into_iter().enumerate() {
-                outcomes[from + k] = Some(o);
+            let from = u.start - reported;
+            if outcomes.len() < from + len {
+                outcomes.resize_with(from + len, || None);
+            }
+            for (k, (a, (r, notes))) in u.group.into_iter().zip(finished).enumerate() {
+                outcomes[from + k] = Some((a.op().clone(), r, notes));
             }
             if halted {
                 break;
             }
             while let Some(Some(_)) = outcomes.front() {
-                if let Some(Some((outcome, notes))) = outcomes.pop_front() {
-                    record(&mut report, approved[reported].op().clone(), outcome, notes);
+                if let Some(Some((op, outcome, notes))) = outcomes.pop_front() {
+                    record(&mut report, op, outcome, notes);
                 }
                 reported += 1;
             }
         }
         drop(running);
         // After a halt: what finished, still in the planner's order.
-        for (a, o) in approved[reported..].iter().zip(outcomes) {
-            if let Some((outcome, notes)) = o {
-                record(&mut report, a.op().clone(), outcome, notes);
-            }
+        for (op, outcome, notes) in outcomes.into_iter().flatten() {
+            record(&mut report, op, outcome, notes);
         }
         report
+    }
+
+    /// What goes into the folders `group` made ([`Self::run_following`]),
+    /// read from the store once they're recorded. A store that fails here
+    /// leaves them to the next round.
+    fn follow(
+        &self,
+        store: &Db<'_>,
+        group: &[Approved],
+        finished: &[(Res, Notes)],
+        follow: &Follow<'_>,
+    ) -> Vec<Approved> {
+        let made = store.read(|o| {
+            let mut made = Vec::new();
+            for (a, _) in group.iter().zip(finished).filter(|(_, (r, _))| r.is_ok()) {
+                made.extend(made_folder(o, a.op())?);
+            }
+            Ok(if made.is_empty() { Vec::new() } else { follow(o, &made) })
+        });
+        made.unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "what goes into a new folder is left to the next round");
+            Vec::new()
+        })
     }
 
     /// The limits this round runs under: one at a time for a cloud that
@@ -842,12 +918,11 @@ impl<C: Cloud> Executor<C> {
     async fn unit(
         &self,
         store: &Db<'_>,
-        approved: &[Approved],
         u: Unit,
         full: &AtomicBool,
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> (Unit, Vec<(Res, Notes)>) {
-        let group = &approved[u.start..u.start + u.len];
+        let group = &u.group;
         let mut out: Vec<Option<(Res, Notes)>> = std::iter::repeat_with(|| None).take(group.len()).collect();
         let mut go = Vec::new();
         for (k, a) in group.iter().enumerate() {

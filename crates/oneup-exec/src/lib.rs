@@ -7,6 +7,11 @@
 //!   operations keep the planner's order. Independent ones run
 //!   concurrently, up to the memory profile's limits; moves, renames and
 //!   removals of folders run alone (`claims_in` in `exec.rs`, `schedule.rs`).
+//! * **New folders' contents in the same round.** Once an operation that
+//!   made a folder is recorded, the caller's planner and gate plan and
+//!   review what goes into it, and that runs after it in the same round
+//!   (`Executor::run_following`), so a new tree doesn't take a round per
+//!   level.
 //! * Local changes go through [`oneup_effects::LocalFs`], cloud changes
 //!   through a [`Cloud`] (Graph in production, a fake in tests). Neither is
 //!   reachable without an [`oneup_gate::Approved`] token for that operation.
@@ -54,7 +59,7 @@ pub use cloud::{Cloud, CloudError, Meta, MetaDone, VersionMark};
 #[cfg(all(windows, feature = "crash-test"))]
 pub use exec::CRASHED;
 #[cfg(windows)]
-pub use exec::{Executor, Report, Skip, link_roots};
+pub use exec::{Executor, FOLLOW_MAX, Follow, Report, Skip, link_roots};
 pub use graph::{GraphCloud, UploadMemory};
 #[cfg(windows)]
 pub use schedule::Parallel;
