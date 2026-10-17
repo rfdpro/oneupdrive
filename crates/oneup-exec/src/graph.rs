@@ -46,6 +46,9 @@ const AHEAD_STALE: Duration = Duration::from_secs(300);
 /// How many coming downloads and unused links are kept.
 const LINKS_MAX: usize = 1024;
 
+/// How long a finished download waits for the links it started reading.
+const REFILL_WAIT: Duration = Duration::from_secs(5);
+
 /// How many links are kept in hand ahead of the downloads that use them.
 const LINKS_AHEAD: usize = 3 * BATCH_MAX;
 
@@ -65,8 +68,9 @@ struct Links {
     queued: HashSet<String>,
     /// Links read and not used yet, and when they were read.
     got: HashMap<String, (DownloadInfo, Instant)>,
-    /// Links being read now.
+    /// Links being read now, and in how many batches.
     reading: HashSet<String>,
+    batches: usize,
 }
 
 impl std::fmt::Debug for Links {
@@ -76,13 +80,14 @@ impl std::fmt::Debug for Links {
     }
 }
 
-/// What [`Links::take`] found.
+/// What [`Links::claim`] found.
 #[derive(Debug)]
 enum Took {
     Link(DownloadInfo),
     /// Being read with others: wait for it.
     Reading,
-    Missing,
+    /// Not read: these are reserved for reading, the item first.
+    Batch(Vec<String>),
 }
 
 impl Links {
@@ -111,33 +116,40 @@ impl Links {
         }
     }
 
-    /// `id`'s link if one read ahead is still fresh, taken out.
-    fn take(&mut self, id: &str, now: Instant) -> Took {
+    /// `id`'s link if one read ahead is still fresh, taken out; else
+    /// whether it's being read; else a batch reserved to read it with the
+    /// coming ones. One step, so two callers never both read it.
+    fn claim(&mut self, id: &str, now: Instant) -> Took {
         self.purge(now);
         if let Some((info, _)) = self.got.remove(id) {
             return Took::Link(info);
         }
-        if self.reading.contains(id) { Took::Reading } else { Took::Missing }
+        if self.reading.contains(id) {
+            return Took::Reading;
+        }
+        Took::Batch(self.batch_for(Some(id), BATCH_MAX))
     }
 
-    /// Whether to read the next batch now, ahead of need: more downloads
-    /// are coming, fewer than [`LINKS_AHEAD`] links are in hand or being
-    /// read, and at most one other batch is being read. A batch took
-    /// 600-750 ms, about as long as small downloads take to use 40 links,
-    /// so downloads then rarely wait for one.
-    fn refill_due(&self) -> bool {
-        !self.ahead.is_empty()
-            && self.reading.len() < 2 * BATCH_MAX
-            && self.got.len() + self.reading.len() < LINKS_AHEAD
+    /// The coming downloads to read ahead now, reserved (empty: none):
+    /// while more are coming, at most [`LINKS_AHEAD`] links are in hand or
+    /// being read, in at most two batches at once. A batch took 600-750 ms,
+    /// about as long as small downloads take to use 40 links, so downloads
+    /// then rarely wait for one.
+    fn refill(&mut self, now: Instant) -> Vec<String> {
+        self.purge(now);
+        let room = LINKS_AHEAD.saturating_sub(self.got.len() + self.reading.len());
+        if self.ahead.is_empty() || self.batches >= 2 || room == 0 {
+            return Vec::new();
+        }
+        self.batch_for(None, room.min(BATCH_MAX))
     }
 
     /// The items to read with `id`'s (none: only coming ones): it first,
-    /// then the coming ones not read yet, up to a batch. They count as
-    /// being read until [`Links::finish`].
-    fn batch_for(&mut self, id: Option<&str>, now: Instant) -> Vec<String> {
-        self.purge(now);
+    /// then the coming ones not read yet, `max` in all. They count as being
+    /// read, in one more batch, until [`Links::finish`].
+    fn batch_for(&mut self, id: Option<&str>, max: usize) -> Vec<String> {
         let mut ids: Vec<String> = id.into_iter().map(str::to_string).collect();
-        while ids.len() < BATCH_MAX
+        while ids.len() < max
             && let Some((next, _)) = self.ahead.pop_front()
         {
             self.queued.remove(&next);
@@ -148,14 +160,21 @@ impl Links {
         if let Some(id) = id {
             self.queued.remove(id);
         }
-        self.reading.extend(ids.iter().cloned());
+        if !ids.is_empty() {
+            self.reading.extend(ids.iter().cloned());
+            self.batches += 1;
+        }
         ids
     }
 
     fn finish(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
         for id in ids {
             self.reading.remove(id);
         }
+        self.batches = self.batches.saturating_sub(1);
     }
 
     fn keep(&mut self, id: String, info: DownloadInfo, now: Instant) {
@@ -165,7 +184,7 @@ impl Links {
     }
 }
 
-/// Ends a batch of [`Links::batch_for`] however it ends, the round
+/// Ends a batch of [`Links::claim`] or [`Links::refill`] however it ends, the round
 /// stopping too: its links no longer count as being read, and the
 /// downloads waiting for them look again.
 struct Reading<'a> {
@@ -235,18 +254,18 @@ impl GraphCloud {
     /// the coming downloads' ([`Links`]); `None` if it's gone. Whether it
     /// was read ahead.
     async fn link(&self, id: &str) -> Result<(Option<DownloadInfo>, bool), CloudError> {
-        loop {
+        let ids = loop {
             let read = self.links_read.notified();
             tokio::pin!(read);
             read.as_mut().enable();
-            let found = self.links().take(id, Instant::now());
+            let found = self.links().claim(id, Instant::now());
             match found {
                 Took::Link(info) => return Ok((Some(info), true)),
                 Took::Reading => read.await,
-                Took::Missing => break,
+                Took::Batch(ids) => break ids,
             }
-        }
-        let batch = Reading { cloud: self, ids: self.links().batch_for(Some(id), Instant::now()) };
+        };
+        let batch = Reading { cloud: self, ids };
         if batch.ids.len() > 1
             && let Some(mine) = self.read_links(batch, Some(id)).await
         {
@@ -298,15 +317,9 @@ impl GraphCloud {
         found
     }
 
-    /// Reads the next coming downloads' links if [`Links::refill_due`].
+    /// Reads the next coming downloads' links, if [`Links::refill`] says so.
     async fn refill(&self) {
-        let ids = {
-            let mut links = self.links();
-            if !links.refill_due() {
-                return;
-            }
-            links.batch_for(None, Instant::now())
-        };
+        let ids = self.links().refill(Instant::now());
         if !ids.is_empty() {
             self.read_links(Reading { cloud: self, ids }, None).await;
         }
@@ -609,9 +622,22 @@ impl Cloud for GraphCloud {
         // eTag check, the executor's hash check against the planned version
         // catches it before anything local changes.
         let started = Instant::now();
-        // The next links are read while this content arrives.
-        let content = self.graph.download_to(&url, out);
-        let ((), fetched) = futures_util::future::join(self.refill(), content).await;
+        // The next links are read while this content arrives. A download
+        // that fails, or is stopped, doesn't wait for them; one that's done
+        // waits a little (an unfinished batch is dropped, and read again).
+        let fetched = {
+            let refill = std::pin::pin!(self.refill());
+            let content = std::pin::pin!(self.graph.download_to(&url, &mut *out));
+            match futures_util::future::select(content, refill).await {
+                futures_util::future::Either::Left((fetched, refill)) => {
+                    if fetched.is_ok() {
+                        let _ = tokio::time::timeout(REFILL_WAIT, refill).await;
+                    }
+                    fetched
+                }
+                futures_util::future::Either::Right(((), content)) => content.await,
+            }
+        };
         let fetched = match fetched {
             // A link read ahead that no longer works (it expired sooner
             // than expected), before any byte arrived: read it again.
@@ -1153,30 +1179,32 @@ mod tests {
         l.announce((0..30).map(|k| format!("i{k}")), now);
         l.announce(["i3".to_string()], now);
         assert_eq!(l.ahead.len(), 30, "announced once");
-        let first = l.batch_for(Some("i0"), now);
+        let Took::Batch(first) = l.claim("i0", now) else { panic!("not read yet") };
         assert_eq!(first.len(), BATCH_MAX, "a batch's worth");
         assert_eq!(first[0], "i0");
         assert!(first.iter().skip(1).all(|id| id != "i0"), "{first:?}");
         // While they're read, their downloads wait instead of reading again.
-        assert!(matches!(l.take("i1", now), Took::Reading));
-        assert!(l.refill_due(), "one batch is being read, and few links are in hand");
-        let rest = l.batch_for(None, now);
-        assert!(!l.refill_due(), "two batches are being read");
+        assert!(matches!(l.claim("i1", now), Took::Reading));
+        let rest = l.refill(now);
         assert_eq!(rest.len(), 30 - BATCH_MAX, "the rest, and nothing being read");
+        l.announce((0..30).map(|k| format!("j{k}")), now);
+        assert!(l.refill(now).is_empty(), "two batches are being read");
         l.finish(&rest);
         for id in &first[1..] {
             l.keep(id.clone(), info(id), now);
         }
         l.finish(&first);
-        assert!(!l.refill_due(), "nothing more is coming");
-        l.announce(["j".to_string()], now);
-        assert!(l.refill_due(), "few links in hand, and more coming");
-        for k in 0..LINKS_AHEAD {
+        assert_eq!(l.batches, 0);
+        // 19 links in hand: room for 41 more, a batch at a time.
+        let next = l.refill(now);
+        assert_eq!(next.len(), BATCH_MAX);
+        l.finish(&next);
+        for k in 0..LINKS_AHEAD - 19 - 5 {
             l.keep(format!("h{k}"), info("h"), now);
         }
-        assert!(!l.refill_due(), "enough in hand");
-        assert!(matches!(l.take("i1", now), Took::Link(i) if i.id == "i1"));
-        assert!(matches!(l.take("i1", now), Took::Missing), "taken once");
+        assert_eq!(l.refill(now).len(), 5, "only the room left under the limit");
+        assert!(matches!(l.claim("i1", now), Took::Link(i) if i.id == "i1"));
+        assert!(matches!(l.claim("i1", now), Took::Batch(ids) if ids[0] == "i1"), "taken once: read again");
     }
 
     #[test]
@@ -1184,7 +1212,7 @@ mod tests {
         let mut l = Links::default();
         let then = Instant::now();
         l.keep("a".into(), info("a"), then);
-        assert!(matches!(l.take("a", then + LINK_FRESH), Took::Missing), "stale after a minute");
+        assert!(matches!(l.claim("a", then + LINK_FRESH), Took::Batch(_)), "stale after a minute");
         l.announce(["old".to_string()], then);
         l.announce(["new".to_string()], then + AHEAD_STALE);
         assert_eq!(l.ahead.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["new"], "one waiting too long goes");
