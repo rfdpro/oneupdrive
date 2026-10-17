@@ -361,6 +361,39 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
         }
         Ok(out)
     }
+
+    // The same filters as the lists above, applied as the inner tree hands
+    // out children, so a check stops at the first visible one.
+
+    fn any_base_child(&self, sid: Sid, f: &mut dyn FnMut(&Base) -> Result<bool, T::Error>) -> Result<bool, T::Error> {
+        self.inner.any_base_child(sid, &mut |b| Ok(!self.base_hidden(b)? && f(b)?))
+    }
+
+    fn any_local_child(
+        &self,
+        id: LocalId,
+        f: &mut dyn FnMut(&LocalNode) -> Result<bool, T::Error>,
+    ) -> Result<bool, T::Error> {
+        if let Some(rules) = self.rules
+            && self.local_dir(rules, id)?.excluded
+        {
+            return Ok(false);
+        }
+        self.inner.any_local_child(id, &mut |n| Ok(!self.local_excluded(n)? && !self.local_parked(n) && f(n)?))
+    }
+
+    fn any_remote_child(
+        &self,
+        id: &RemoteId,
+        f: &mut dyn FnMut(&RemoteNode) -> Result<bool, T::Error>,
+    ) -> Result<bool, T::Error> {
+        if let Some(rules) = self.rules
+            && self.remote_dir(rules, id)?.is_some_and(|d| d.excluded)
+        {
+            return Ok(false);
+        }
+        self.inner.any_remote_child(id, &mut |n| Ok(!self.remote_excluded(n)? && !self.remote_parked(n)? && f(n)?))
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +408,9 @@ mod tests {
         local: Vec<LocalNode>,
         remote: Vec<RemoteNode>,
         base: Vec<Base>,
+        /// A Synced record that must never be read: stands for the rest of
+        /// a long children list, which an emptiness check shouldn't need.
+        poison: Option<Sid>,
     }
 
     fn lroot() -> LocalNode {
@@ -417,7 +453,22 @@ mod tests {
             Ok(self.base.iter().find(|b| b.sid == sid).cloned())
         }
         fn base_children(&self, sid: Sid) -> Result<Vec<Base>, Self::Error> {
-            Ok(self.base.iter().filter(|b| b.parent == Some(sid)).cloned().collect())
+            let kids: Vec<Base> = self.base.iter().filter(|b| b.parent == Some(sid)).cloned().collect();
+            assert!(!kids.iter().any(|b| Some(b.sid) == self.poison), "read the whole list");
+            Ok(kids)
+        }
+        fn any_base_child(
+            &self,
+            sid: Sid,
+            f: &mut dyn FnMut(&Base) -> Result<bool, Self::Error>,
+        ) -> Result<bool, Self::Error> {
+            for b in self.base.iter().filter(|b| b.parent == Some(sid)) {
+                assert_ne!(Some(b.sid), self.poison, "read past the first visible child");
+                if f(b)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
         fn base_by_local(&self, id: LocalId) -> Result<Option<Base>, Self::Error> {
             Ok(self.base.iter().find(|b| b.local == Some(id)).cloned())
@@ -452,7 +503,7 @@ mod tests {
             remote: Some(RemoteId("r".into())),
             remote_etag: "e".into(),
         };
-        World { local: vec![lroot()], remote: vec![rroot()], base: vec![root] }
+        World { local: vec![lroot()], remote: vec![rroot()], base: vec![root], poison: None }
     }
 
     fn uploads(ops: &[Op]) -> Vec<String> {
@@ -639,6 +690,34 @@ mod tests {
         let mut up = uploads(&ops);
         up.sort();
         assert_eq!(up, ["keep.iso", "other.iso"]);
+    }
+
+    #[test]
+    fn emptiness_checks_hide_what_the_lists_hide_and_stop_at_the_first_visible_child() {
+        let mut w = world();
+        w.local.push(lfile(10, "x.tmp", 5));
+        w.local.push(lfile(11, "disk.iso", 5));
+        w.remote.push(rnode("c1", "r", "desktop.ini", NodeKind::File));
+        w.remote.push(rnode("c2", "r", "disk.iso", NodeKind::File));
+        // Excluded, and neither side visible: hidden.
+        let mut gone = synced(5, ROOT, "old.iso", NodeKind::File, 50, "R50");
+        w.base.push(gone.clone());
+        let rules = RuleSet::new(&[] as &[&str], &["*.iso"]).unwrap();
+        let p = Parked::with_rules(&w, &rules);
+        assert!(!p.has_local_children(LocalId(1)).unwrap());
+        assert!(!p.has_remote_children(&RemoteId("r".into())).unwrap());
+        assert!(!p.has_base_children(ROOT).unwrap());
+
+        w.local.push(lfile(12, "ok.txt", 5));
+        w.remote.push(rnode("c3", "r", "ok.txt", NodeKind::File));
+        w.base.push(synced(6, ROOT, "ok.txt", NodeKind::File, 12, "c3"));
+        gone.sid = 7;
+        w.base.push(gone);
+        w.poison = Some(7);
+        let p = Parked::with_rules(&w, &rules);
+        assert!(p.has_local_children(LocalId(1)).unwrap());
+        assert!(p.has_remote_children(&RemoteId("r".into())).unwrap());
+        assert!(p.has_base_children(ROOT).unwrap());
     }
 
     #[test]

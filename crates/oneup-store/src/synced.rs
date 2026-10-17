@@ -237,6 +237,19 @@ fn local_node(r: &Row<'_>) -> rusqlite::Result<LocalNode> {
 const REMOTE_NODE: &str = "SELECT id, parent_id, name, kind, size, etag, qxh FROM remote_item";
 const REMOTE_SYNCABLE: &str = "is_excluded = 0";
 
+/// The children lists the reconciler reads ([`Trees`]), each from a parent
+/// index.
+fn base_children_sql() -> String {
+    format!("SELECT {BASE_COLS} FROM synced_item WHERE parent_sid = ?1")
+}
+fn local_children_sql() -> String {
+    format!("{LOCAL_NODE} WHERE i.parent_id = ?1 AND i.kind IN (0, 1) AND {LOCAL_SYNCABLE} AND NOT {STAND_IN}")
+}
+fn remote_children_sql() -> String {
+    format!("{REMOTE_NODE} WHERE parent_id = ?1 AND kind IN (0, 1) AND {REMOTE_SYNCABLE}")
+}
+const SYNCED_HAS_CHILDREN: &str = "SELECT 1 FROM synced_item WHERE parent_sid = ?1 LIMIT 1";
+
 /// Evidence for every Synced item in the subtree in `t_sub`.
 pub(crate) const NOTE_SUBTREE_GONE: &str = "
 INSERT OR IGNORE INTO remote_gone(id)
@@ -268,9 +281,14 @@ impl Ops<'_> {
 
     /// Rows whose agreed parent is `sid` (unordered).
     pub fn synced_children(&self, sid: Sid) -> Result<Vec<Base>> {
-        let mut st = self.c.prepare_cached(&format!("SELECT {BASE_COLS} FROM synced_item WHERE parent_sid = ?1"))?;
+        let mut st = self.c.prepare_cached(&base_children_sql())?;
         let rows = st.query_map([sid_in(sid)], base_from_row)?;
         rows.map(|r| fix_base(r?)).collect()
+    }
+
+    /// Whether any row's agreed parent is `sid`: one probe of the parent index.
+    pub fn synced_has_children(&self, sid: Sid) -> Result<bool> {
+        Ok(self.c.prepare_cached(SYNCED_HAS_CHILDREN)?.exists([sid_in(sid)])?)
     }
 
     /// Up to `limit` Synced rows after `after` (by sid) on both sides whose
@@ -601,19 +619,55 @@ impl Trees for Ops<'_> {
     }
 
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>> {
-        let mut st = self.c.prepare_cached(&format!(
-            "{LOCAL_NODE} WHERE i.parent_id = ?1 AND i.kind IN (0, 1) AND {LOCAL_SYNCABLE} AND NOT {STAND_IN}"
-        ))?;
+        let mut st = self.c.prepare_cached(&local_children_sql())?;
         let v = st.query_map([blob(id.0)], local_node)?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
     }
 
     fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>> {
-        let mut st = self
-            .c
-            .prepare_cached(&format!("{REMOTE_NODE} WHERE parent_id = ?1 AND kind IN (0, 1) AND {REMOTE_SYNCABLE}"))?;
+        let mut st = self.c.prepare_cached(&remote_children_sql())?;
         let v = st.query_map([id.0.as_str()], remote_node)?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
+    }
+
+    // The same queries, stepped a row at a time: SQLite reads no further
+    // than the first child `f` accepts.
+
+    fn any_base_child(&self, sid: Sid, f: &mut dyn FnMut(&Base) -> Result<bool>) -> Result<bool> {
+        let mut st = self.c.prepare_cached(&base_children_sql())?;
+        let mut rows = st.query([sid_in(sid)])?;
+        while let Some(r) = rows.next()? {
+            if f(&fix_base(base_from_row(r)?)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn any_local_child(&self, id: LocalId, f: &mut dyn FnMut(&LocalNode) -> Result<bool>) -> Result<bool> {
+        let mut st = self.c.prepare_cached(&local_children_sql())?;
+        let mut rows = st.query([blob(id.0)])?;
+        while let Some(r) = rows.next()? {
+            if f(&local_node(r)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn any_remote_child(&self, id: &RemoteId, f: &mut dyn FnMut(&RemoteNode) -> Result<bool>) -> Result<bool> {
+        let mut st = self.c.prepare_cached(&remote_children_sql())?;
+        let mut rows = st.query([id.0.as_str()])?;
+        while let Some(r) = rows.next()? {
+            if f(&remote_node(r)?)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn has_base_children(&self, sid: Sid) -> Result<bool> {
+        self.synced_has_children(sid)
     }
 }
 
@@ -945,5 +999,41 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// The reconciler checks a deleted folder for children every round its
+    /// parent is planned; the folder may hold hundreds of thousands.
+    #[test]
+    fn emptiness_checks_agree_with_the_lists_and_stop_at_the_first_child() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            let (root, d) = (RemoteId("root".into()), RemoteId("d".into()));
+            assert!(o.has_base_children(ROOT)? && !o.has_base_children(2)?);
+            assert!(o.has_local_children(LocalId(1))? && !o.has_local_children(LocalId(3))?);
+            assert!(o.has_remote_children(&root)? && !o.has_remote_children(&d)?);
+            // Children the lists filter out don't count.
+            o.local_put(&lrow(4, Some(3), "x", LocalKind::File))?;
+            o.local_set_skip(4, Skip::Excluded)?;
+            o.upsert_item(&rrow("x", Some("d"), "x", Kind::Package), false)?;
+            assert!(!o.has_local_children(LocalId(3))? && !o.has_remote_children(&d)?);
+            // A row after the first is never read: this one would fail to.
+            o.c.execute("INSERT INTO synced_item(sid, parent_sid, name, kind) VALUES (99, 0, 'bad', 7)", [])?;
+            assert!(o.synced_children(ROOT).is_err());
+            assert!(o.any_base_child(ROOT, &mut |_| Ok(true))?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn children_queries_use_the_parent_indexes() {
+        let s = Store::open_in_memory().unwrap();
+        for sql in [base_children_sql(), local_children_sql(), remote_children_sql(), SYNCED_HAS_CHILDREN.into()] {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan: Vec<String> =
+                st.query_map([rusqlite::types::Null], |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+            assert!(!plan.iter().any(|step| step.starts_with("SCAN")), "{sql}\n{plan:#?}");
+        }
     }
 }

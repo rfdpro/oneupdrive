@@ -231,7 +231,7 @@ fn decide_synced<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: Base, adopted: Optio
         // Gone from both sides: nothing left to act on, only the record. A
         // folder's record goes last, once its children's records are gone.
         _ => {
-            if b.kind == NodeKind::File || t.base_children(b.sid)?.is_empty() {
+            if b.kind == NodeKind::File || !t.has_base_children(b.sid)? {
                 cx.out.push(Op::Forget(b.sid));
             }
             Ok(())
@@ -465,7 +465,7 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
     // first, each under its own preconditions. Their Synced rows must be
     // settled first too: deleting the folder drops its row, and a child row
     // left pointing at it would never be planned again.
-    if b.kind == NodeKind::File || (t.remote_children(&r.id)?.is_empty() && t.base_children(b.sid)?.is_empty()) {
+    if b.kind == NodeKind::File || (!t.has_remote_children(&r.id)? && !t.has_base_children(b.sid)?) {
         cx.out.push(Op::DeleteRemote { sid: b.sid, remote: rpre(&r) });
     }
     Ok(())
@@ -490,7 +490,7 @@ fn remote_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode) -
         });
         return Ok(());
     }
-    if b.kind == NodeKind::File || (t.local_children(l.id)?.is_empty() && t.base_children(b.sid)?.is_empty()) {
+    if b.kind == NodeKind::File || (!t.has_local_children(l.id)? && !t.has_base_children(b.sid)?) {
         cx.out.push(Op::RecycleLocal { sid: b.sid, local: lpre(&l) });
     }
     Ok(())

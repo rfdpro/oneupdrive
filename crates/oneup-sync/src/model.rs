@@ -127,6 +127,63 @@ pub trait Trees {
     fn remote(&self, id: &RemoteId) -> Result<Seen<RemoteNode>, Self::Error>;
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>, Self::Error>;
     fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>, Self::Error>;
+
+    /// Whether `f` holds for any of [`Self::base_children`], stopping at the
+    /// first that does. The defaults read the whole list; a backend that can
+    /// read children one at a time overrides these, because a deleted
+    /// folder's emptiness is checked every round its parent is planned and
+    /// the folder may hold hundreds of thousands of items.
+    fn any_base_child(
+        &self,
+        sid: Sid,
+        f: &mut dyn FnMut(&Base) -> Result<bool, Self::Error>,
+    ) -> Result<bool, Self::Error> {
+        for b in self.base_children(sid)? {
+            if f(&b)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    /// [`Self::any_base_child`] for [`Self::local_children`].
+    fn any_local_child(
+        &self,
+        id: LocalId,
+        f: &mut dyn FnMut(&LocalNode) -> Result<bool, Self::Error>,
+    ) -> Result<bool, Self::Error> {
+        for n in self.local_children(id)? {
+            if f(&n)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    /// [`Self::any_base_child`] for [`Self::remote_children`].
+    fn any_remote_child(
+        &self,
+        id: &RemoteId,
+        f: &mut dyn FnMut(&RemoteNode) -> Result<bool, Self::Error>,
+    ) -> Result<bool, Self::Error> {
+        for n in self.remote_children(id)? {
+            if f(&n)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether Synced folder `sid` has any child rows.
+    fn has_base_children(&self, sid: Sid) -> Result<bool, Self::Error> {
+        self.any_base_child(sid, &mut |_| Ok(true))
+    }
+    /// Whether local folder `id` has any children.
+    fn has_local_children(&self, id: LocalId) -> Result<bool, Self::Error> {
+        self.any_local_child(id, &mut |_| Ok(true))
+    }
+    /// Whether cloud folder `id` has any children.
+    fn has_remote_children(&self, id: &RemoteId) -> Result<bool, Self::Error> {
+        self.any_remote_child(id, &mut |_| Ok(true))
+    }
 }
 
 /// Names are compared the way Windows and OneDrive do: case-insensitively.
