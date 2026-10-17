@@ -701,6 +701,14 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    /// The temp folder by its long name: CI's is an 8.3 short path
+    /// (`RUNNER~1`), and the shell stores shortcut paths long.
+    fn long_temp() -> PathBuf {
+        let t = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let s = t.to_string_lossy();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+    }
+
     fn m(from: &str, to: &str) -> Mapping {
         Mapping { from: from.into(), to: to.into() }
     }
@@ -766,7 +774,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shortcuts_are_fixed_with_a_copy_and_undone() {
-        let root = std::env::temp_dir().join(format!("oneup-shortcuts-{}", std::process::id()));
+        let root = long_temp().join(format!("oneup-shortcuts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (old, new, desk, data) =
             (root.join("OneDrive"), root.join("OneUpDrive"), root.join("Desktop"), root.join("data"));
@@ -813,7 +821,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn undo_leaves_a_shortcut_changed_since() {
-        let root = std::env::temp_dir().join(format!("oneup-shortcuts-undo-{}", std::process::id()));
+        let root = long_temp().join(format!("oneup-shortcuts-undo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (old, new, desk, data) =
             (root.join("OneDrive"), root.join("OneUpDrive"), root.join("Desktop"), root.join("data"));
@@ -836,7 +844,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_shortcut_the_shell_cant_follow_is_saved_again() {
-        let root = std::env::temp_dir().join(format!("oneup-shortcuts-dead-{}", std::process::id()));
+        let root = long_temp().join(format!("oneup-shortcuts-dead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (ours, menu, data) = (root.join("OneDrive"), root.join("Menu"), root.join("data"));
         for d in [ours.join("Tools"), menu.clone(), data.clone()] {
@@ -867,7 +875,7 @@ mod tests {
     /// Old, new and Desktop folders and a data folder, in a temp folder.
     #[cfg(windows)]
     fn sandbox(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("oneup-shortcuts-{name}-{}", std::process::id()));
+        let root = long_temp().join(format!("oneup-shortcuts-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (old, new, desk, data) =
             (root.join("OneDrive"), root.join("OneUpDrive"), root.join("Desktop"), root.join("data"));
@@ -1040,7 +1048,7 @@ mod tests {
 
     #[test]
     fn strict_listings_are_empty_only_when_there_is_nothing() {
-        let dir = std::env::temp_dir().join(format!("oneup-shortcuts-lists-{}", std::process::id()));
+        let dir = long_temp().join(format!("oneup-shortcuts-lists-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(crate::pairs::list_strict(&dir).unwrap().is_empty(), "no pairs folder");

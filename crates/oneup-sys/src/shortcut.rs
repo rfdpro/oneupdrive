@@ -266,9 +266,17 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    /// The temp folder by its long name: CI's is an 8.3 short path
+    /// (`RUNNER~1`), and the shell stores shortcut paths long.
+    fn long_temp() -> PathBuf {
+        let t = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let s = t.to_string_lossy();
+        PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
+    }
+
     #[test]
     fn a_shortcut_can_be_read_and_pointed_elsewhere() {
-        let dir = std::env::temp_dir().join(format!("oneup-lnk-{}", std::process::id()));
+        let dir = long_temp().join(format!("oneup-lnk-{}", std::process::id()));
         let (old, new) = (dir.join("old"), dir.join("new"));
         std::fs::create_dir_all(&old).unwrap();
         std::fs::create_dir_all(&new).unwrap();
@@ -289,7 +297,7 @@ mod tests {
 
     #[test]
     fn a_chain_the_shell_cant_follow_still_has_its_stored_path() {
-        let dir = std::env::temp_dir().join(format!("oneup-lnk-dead-{}", std::process::id()));
+        let dir = long_temp().join(format!("oneup-lnk-dead-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (target, lnk) = (dir.join("tool.exe"), dir.join("tool.lnk"));
         std::fs::write(&target, b"x").unwrap();
@@ -309,7 +317,7 @@ mod tests {
     /// An ANSI LinkInfo path outside ASCII: its code page is unknown.
     #[test]
     fn a_stored_ansi_path_outside_ascii_is_refused() {
-        let dir = std::env::temp_dir().join(format!("oneup-lnk-ansi-{}", std::process::id()));
+        let dir = long_temp().join(format!("oneup-lnk-ansi-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (target, lnk) = (dir.join("tool.exe"), dir.join("tool.lnk"));
         std::fs::write(&target, b"x").unwrap();
@@ -327,7 +335,7 @@ mod tests {
 
     #[test]
     fn a_shortcut_is_replaced_whole_keeping_its_streams() {
-        let dir = std::env::temp_dir().join(format!("oneup-lnk-replace-{}", std::process::id()));
+        let dir = long_temp().join(format!("oneup-lnk-replace-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (a, b, lnk, tmp) = (dir.join("a.txt"), dir.join("b.txt"), dir.join("x.lnk"), dir.join("x.tmp"));
         std::fs::write(&a, b"a").unwrap();
