@@ -48,6 +48,7 @@ pub mod hydrate;
 pub mod placement;
 #[cfg(windows)]
 mod schedule;
+pub mod timing;
 
 pub use cloud::{Cloud, CloudError, Meta, MetaDone, VersionMark};
 #[cfg(all(windows, feature = "crash-test"))]
@@ -57,3 +58,4 @@ pub use exec::{Executor, Report, Skip, link_roots};
 pub use graph::{GraphCloud, UploadMemory};
 #[cfg(windows)]
 pub use schedule::Parallel;
+pub use timing::Timings;

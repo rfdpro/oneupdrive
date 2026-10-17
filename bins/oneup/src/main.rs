@@ -1817,7 +1817,8 @@ async fn run() -> Result<()> {
             if !auth.is_signed_in()? {
                 bail!("not signed in; run `oneup login --test-account` first");
             }
-            let graph = Arc::new(Graph::new(http, auth, Aimd::new(4, 8)));
+            let requests = oneup_app::config::load_agent(&dir).unwrap_or_default().requests();
+            let graph = Arc::new(Graph::new(http, auth, requests));
             let opts = sync::Options {
                 data_dir: dir.clone(),
                 local: args.local.clone(),

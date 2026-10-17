@@ -19,6 +19,7 @@ use oneup_sync::{
 
 use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, VersionMark};
 use crate::schedule::{Claims, Held, Node, Parallel};
+use crate::timing::Timings;
 
 /// The store, shared by the operations under way. Each use locks it for
 /// one synchronous read or transaction, never across an `.await`.
@@ -263,6 +264,26 @@ fn batch_of(store: &Db<'_>, ops: &[Approved], can_copy: bool) -> (usize, Claims)
     (n, all)
 }
 
+/// The [`Timings`] stage an operation's time is counted in.
+fn stage(op: &Op) -> &'static str {
+    match op {
+        Op::Upload { .. } => "op: upload",
+        Op::Download { .. } => "op: download",
+        Op::MkdirRemote { .. } | Op::MoveRemote { .. } | Op::RenameRemote { .. } | Op::DeleteRemote { .. } => {
+            "op: cloud change"
+        }
+        Op::PruneRemote { .. } => "op: cloud prune",
+        Op::MkdirLocal { .. }
+        | Op::MoveLocal { .. }
+        | Op::RenameLocal { .. }
+        | Op::ConflictCopy { .. }
+        | Op::RecycleLocal { .. }
+        | Op::Dehydrate { .. } => "op: local change",
+        Op::Hash(_) => "op: hash",
+        Op::Pair { .. } | Op::Record(_) | Op::Forget(_) | Op::Hold { .. } => "op: bookkeeping",
+    }
+}
+
 /// Whether a full OneDrive refuses `op`: new content and new folders. The
 /// agent holds the same while it stays full, in later rounds.
 fn needs_room(op: &Op) -> bool {
@@ -457,6 +478,8 @@ pub struct Executor<C> {
     rules: std::sync::RwLock<ExcludeSet>,
     /// How many operations run at once ([`Executor::set_parallel`]).
     parallel: std::sync::Mutex<Parallel>,
+    /// How long each kind of operation took ([`Executor::timed`]).
+    timings: std::sync::Arc<Timings>,
     /// Crash points left to pass before the injected crash; negative: off.
     #[cfg(feature = "crash-test")]
     crash: std::sync::atomic::AtomicI64,
@@ -471,6 +494,7 @@ impl<C: Cloud> Executor<C> {
             cloud,
             rules: std::sync::RwLock::new(rules),
             parallel: std::sync::Mutex::new(Parallel::for_profile("balanced")),
+            timings: std::sync::Arc::default(),
             #[cfg(feature = "crash-test")]
             crash: std::sync::atomic::AtomicI64::new(-1),
         }
@@ -479,6 +503,11 @@ impl<C: Cloud> Executor<C> {
     /// The rules changed: rows written from now on follow these.
     pub fn set_rules(&self, rules: ExcludeSet) {
         *self.rules.write().unwrap_or_else(|p| p.into_inner()) = rules;
+    }
+
+    /// Records how long its operations take in `t`.
+    pub fn timed(self, t: std::sync::Arc<Timings>) -> Self {
+        Self { timings: t, ..self }
     }
 
     /// How many operations later rounds run at once (the memory profile's,
@@ -812,9 +841,11 @@ impl<C: Cloud> Executor<C> {
             _ => {
                 tracing::debug!(n = go.len(), "cloud changes sent in one batch");
                 let members: Vec<&Approved> = go.iter().map(|&k| &group[k]).collect();
+                let started = std::time::Instant::now();
                 for (&k, r) in go.iter().zip(self.run_batch(store, &members).await) {
                     out[k] = Some((r, Notes::default()));
                 }
+                self.timings.record("op: batch of cloud changes", started);
             }
         }
         if out.iter().flatten().any(|(r, _)| matches!(r, Err(Fail::Skip(Skip::CloudFull)))) {
@@ -836,7 +867,9 @@ impl<C: Cloud> Executor<C> {
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> (Res, Notes) {
         let mut notes = Notes::default();
+        let started = std::time::Instant::now();
         let mut outcome = self.one(store, a, alone, &mut notes, may_run).await;
+        self.timings.record(stage(a.op()), started);
         if let Some(key) = pending_key(a.op())
             && !matches!(outcome, Err(Fail::Halt(_)))
             && let Err(e) = self.recover(store, &key)

@@ -460,6 +460,9 @@ pub struct Outcome {
 /// opened sync folder), OneDrive, and the exclusion rules.
 pub struct Engine {
     exec: Executor<crate::vaultpair::PairCloud>,
+    /// How long each kind of operation and request took, logged after each
+    /// round (`oneup_exec::timing`).
+    timings: Arc<oneup_exec::Timings>,
     graph: Arc<Graph>,
     /// A vault pair: its Remote tree is the vault's decrypted view.
     vault: Option<Arc<crate::vaultpair::VaultRemote>>,
@@ -570,15 +573,18 @@ impl Engine {
     ) -> Self {
         // Uploads hold up to a fragment in memory; the profile bounds it.
         let memory = crate::config::load_agent(data_dir).map(|a| a.memory).unwrap_or_default();
-        let plain = GraphCloud::with_memory(Arc::clone(&graph), oneup_exec::UploadMemory::for_profile(&memory));
+        let timings = Arc::new(oneup_exec::Timings::default());
+        let plain = GraphCloud::with_memory(Arc::clone(&graph), oneup_exec::UploadMemory::for_profile(&memory))
+            .timed(Arc::clone(&timings));
         let cloud = match &vault {
             Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
             None => crate::vaultpair::PairCloud::Plain(plain),
         };
-        let exec = Executor::new(fs, cloud, rules.clone());
+        let exec = Executor::new(fs, cloud, rules.clone()).timed(Arc::clone(&timings));
         exec.set_parallel(oneup_exec::Parallel::for_profile(&memory));
         Self {
             exec,
+            timings,
             graph,
             vault,
             rules: std::sync::Mutex::new(rules),
@@ -1547,6 +1553,7 @@ impl Engine {
             }
         };
         progress(None);
+        self.timings.log();
         report
     }
 

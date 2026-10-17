@@ -172,6 +172,13 @@ pub const MEMORY_PROFILES: &[(&str, u32)] =
     &[("minimal", 4 * 1024), ("balanced", 16 * 1024), ("performance", 64 * 1024)];
 
 impl Agent {
+    /// The Graph client's request limiter for the agent and `oneup sync`,
+    /// sized by the memory profile (`oneup_exec::Parallel::requests`).
+    pub fn requests(&self) -> std::sync::Arc<oneup_graph::Aimd> {
+        let (start, most) = oneup_exec::Parallel::for_profile(&self.memory).requests();
+        oneup_graph::Aimd::new(start, most)
+    }
+
     pub fn cache_kib(&self) -> u32 {
         MEMORY_PROFILES.iter().find(|(n, _)| *n == self.memory).map_or(16 * 1024, |(_, k)| *k)
     }

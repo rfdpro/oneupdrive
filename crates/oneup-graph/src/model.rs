@@ -41,8 +41,7 @@ pub struct Identity {
     pub display_name: Option<String>,
 }
 
-/// What a download needs to know first (`GET item?$select=id,eTag,folder,
-/// @microsoft.graph.downloadUrl`).
+/// What a download needs to know first (`GET item`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct DownloadInfo {
     pub id: String,

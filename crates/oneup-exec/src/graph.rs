@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::Instant;
 
 use oneup_graph::client::{Fragment, SIMPLE_UPLOAD_MAX};
 use oneup_graph::fragment::{MAX_UNITS, Sizer, UNIT};
@@ -15,6 +16,7 @@ use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
 
 use crate::cloud::{Cloud, CloudError, Meta, MetaDone, VersionMark};
+use crate::timing::Timings;
 
 /// The executor's view of a signed-in drive.
 #[derive(Debug, Clone)]
@@ -23,6 +25,8 @@ pub struct GraphCloud {
     /// Upload fragment sizes, learned from the connection and kept from one
     /// file to the next (`oneup_graph::fragment`).
     sizer: Arc<std::sync::Mutex<Sizer>>,
+    /// How long each kind of request took ([`GraphCloud::timed`]).
+    timings: Arc<Timings>,
 }
 
 /// How much memory an upload may hold at once (its largest fragment), by
@@ -52,7 +56,13 @@ impl GraphCloud {
     }
 
     pub fn with_memory(graph: Arc<Graph>, m: UploadMemory) -> Self {
-        Self { graph, sizer: Arc::new(std::sync::Mutex::new(Sizer::new(m.fragment))) }
+        Self { graph, sizer: Arc::new(std::sync::Mutex::new(Sizer::new(m.fragment))), timings: Arc::default() }
+    }
+
+    /// Records how long its requests take in `t` (shared with the
+    /// executor, [`crate::Executor::timed`]).
+    pub fn timed(self, t: Arc<Timings>) -> Self {
+        Self { timings: t, ..self }
     }
 
     /// The fragment size the next large upload would start with (learned).
@@ -71,9 +81,11 @@ impl GraphCloud {
         let mut item = item;
         let mut tries = 0;
         while item.file.is_some() && item.quick_xor_hash().is_none() && tries < 5 {
+            let started = Instant::now();
             tries += 1;
             tokio::time::sleep(std::time::Duration::from_millis(500 * tries)).await;
             item = self.graph.item(&item.id).await.map_err(map)?.ok_or(CloudError::Changed)?;
+            self.timings.record("upload: hash not ready, read again", started);
         }
         oneup_remote::ingest::to_row(&item).ok_or_else(|| CloudError::Other("item without a name".into()))
     }
@@ -338,7 +350,9 @@ impl Cloud for GraphCloud {
     }
 
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
+        let started = Instant::now();
         let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
+        self.timings.record("download: item and link", started);
         if info.e_tag.as_deref() != Some(pre.etag.as_str()) {
             return Err(CloudError::Changed);
         }
@@ -349,10 +363,12 @@ impl Cloud for GraphCloud {
         // The URL serves the current content. If the file changed after the
         // eTag check, the executor's hash check against the planned version
         // catches it before anything local changes.
+        let started = Instant::now();
         self.graph.download_to(&url, out).await.map_err(|e| match e {
             oneup_graph::Error::Local(io) => CloudError::Io(io),
             e => map(e),
         })?;
+        self.timings.record("download: content", started);
         Ok(None)
     }
 
@@ -366,16 +382,21 @@ impl Cloud for GraphCloud {
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let total = u64::try_from(size).map_err(|_| CloudError::Other("negative size".into()))?;
         let replace = replace.map(|p| (p.id.0.as_str(), p.etag.as_str()));
+        let started = Instant::now();
         let item = if total as usize <= SIMPLE_UPLOAD_MAX {
             let mut buf = vec![0u8; total as usize];
             if fill(src, &mut buf)? != buf.len() {
                 return Err(short());
             }
-            self.graph.upload_small(&parent.0, name, replace, &buf).await.map_err(map)?
+            let item = self.graph.upload_small(&parent.0, name, replace, &buf).await.map_err(map)?;
+            self.timings.record("upload: one request", started);
+            item
         } else {
             let url = self.graph.upload_session(&parent.0, name, replace).await.map_err(map)?;
             let session = GraphSession { graph: &self.graph, url };
-            send_session(&session, &self.sizer, replace, total, src).await?
+            let item = send_session(&session, &self.sizer, replace, total, src).await?;
+            self.timings.record("upload: session", started);
+            item
         };
         Ok((self.row_of(item).await?, None))
     }

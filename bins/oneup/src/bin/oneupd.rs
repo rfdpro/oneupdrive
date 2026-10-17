@@ -60,7 +60,7 @@ use oneup_app::problem;
 use oneup_app::setup::{self, DirLock, KEY_PRESET};
 use oneup_app::sync::{self, Answers, Asker, End, Halted, Scope};
 use oneup_gate::Recent;
-use oneup_graph::{Aimd, Graph};
+use oneup_graph::Graph;
 use oneup_ipc::{Activity, LastRun};
 use oneup_store::Store;
 use tokio::sync::Notify;
@@ -235,11 +235,11 @@ async fn run(args: Args) -> Result<()> {
     if !auth.is_signed_in()? {
         return Err(oneup_graph::Error::NotSignedIn.into());
     }
-    // An extra folder pair lists only its own folder (oneup_app::pairs).
-    let graph = Arc::new(oneup_app::pairs::scoped(dir, Graph::new(http, auth, Aimd::new(4, 8)))?);
     // How it uses the PC (config.toml [agent]): memory and priority are
     // read once here; the bandwidth caps every round.
     let settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
+    // An extra folder pair lists only its own folder (oneup_app::pairs).
+    let graph = Arc::new(oneup_app::pairs::scoped(dir, Graph::new(http, auth, settings.requests()))?);
     let priority_set = match oneup_sys::priority::set_background(settings.background) {
         Ok(()) => true,
         Err(e) => {
