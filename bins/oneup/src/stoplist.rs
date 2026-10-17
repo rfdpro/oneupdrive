@@ -19,7 +19,7 @@ pub fn path(data_dir: &Path, code: &str) -> PathBuf {
 }
 
 /// Writes the list for `code`: `header`, then `lines`, the first of `total`
-/// (whole, then renamed into place: a reader never sees half of it).
+/// (atomically: a reader never sees half of it).
 pub fn write(data_dir: &Path, code: &str, header: &str, lines: &[String], total: usize) -> std::io::Result<()> {
     let file = path(data_dir, code);
     std::fs::create_dir_all(data_dir.join(DIR))?;
@@ -32,9 +32,7 @@ pub fn write(data_dir: &Path, code: &str, header: &str, lines: &[String], total:
     if total > shown {
         text.push_str(&format!("… and {} more (`oneup sync --dry-run` lists them all)\r\n", total - shown));
     }
-    let tmp = file.with_extension("txt.tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, &file)
+    crate::ownfile::write(&file, text.as_bytes())
 }
 
 /// One held-back change, as a line of the list says it.

@@ -241,12 +241,10 @@ pub fn log(store: &mut oneup_store::Store, p: &Problem, resolved: bool) -> oneup
     store.write(|o| o.activity_add(&[entry]))
 }
 
-/// Saves why the agent stopped (our own file: written whole, then renamed).
+/// Saves why the agent stopped (our own file, written atomically).
 pub fn save_stopped(data_dir: &Path, p: &Problem) -> std::io::Result<()> {
-    let file = data_dir.join(STOPPED_FILE);
-    let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(p).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&tmp, file)
+    let bytes = serde_json::to_vec(p).map_err(std::io::Error::other)?;
+    crate::ownfile::write(&data_dir.join(STOPPED_FILE), &bytes)
 }
 
 /// Why the agent last stopped, if an error stopped it (and it hasn't
