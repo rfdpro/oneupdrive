@@ -159,6 +159,7 @@ fn graph_kind(g: &oneup_graph::Error) -> Option<Kind> {
         G::Http(r) => {
             Some(if r.is_connect() || r.is_timeout() || r.is_request() { Kind::Offline } else { Kind::OneDrive })
         }
+        G::Stalled(..) => Some(Kind::Offline),
         G::Auth(_) | G::NotSignedIn => Some(Kind::SignIn),
         G::Status { status: 401, .. } => Some(Kind::SignIn),
         G::Status { status: 507, .. } => Some(Kind::CloudFull),
@@ -263,6 +264,12 @@ mod tests {
         assert_eq!(classify(&err(status(403, r#"{"error":{"code":"quotaLimitReached"}}"#))), Kind::CloudFull);
         assert_eq!(classify(&err(status(503, ""))), Kind::OneDrive);
         assert_eq!(classify(&err(oneup_graph::Error::Exhausted(5))), Kind::OneDrive);
+        assert_eq!(classify(&err(oneup_graph::Error::Stalled("download", 60))), Kind::Offline);
+        // The sign-in service busy is not "sign in again".
+        assert_eq!(
+            classify(&err(oneup_graph::Error::refused(503, "the sign-in service", String::new()))),
+            Kind::OneDrive
+        );
         assert_eq!(classify(&err(std::io::Error::from_raw_os_error(112))), Kind::DiskFull);
         assert_eq!(classify(&err(oneup_effects::Error::RootChanged("moved"))), Kind::Folder);
         assert_eq!(

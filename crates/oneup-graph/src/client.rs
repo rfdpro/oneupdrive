@@ -10,6 +10,8 @@ use crate::model::{DriveItem, ITEM_SELECT, Page};
 use crate::{Aimd, Auth, Error, Result};
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
+/// What OneUpDrive's HTTP clients call themselves.
+pub const USER_AGENT: &str = concat!("OneUpDrive/", env!("CARGO_PKG_VERSION"));
 /// Largest page size Graph honours for drive collections (measured 2.6× faster than the default).
 pub const PAGE_SIZE: u32 = 1000;
 const MAX_ATTEMPTS: u32 = 8;
@@ -43,6 +45,28 @@ pub struct Graph {
     /// Bandwidth caps for file content (`rules.md` § User controls).
     pub upload: crate::throttle::Throttle,
     pub download: crate::throttle::Throttle,
+    /// How long a download may receive nothing before it's abandoned.
+    stall: Duration,
+    /// For [`Graph::download_version`], which must see the redirect.
+    no_redirect: std::sync::OnceLock<reqwest::Client>,
+}
+
+/// The settings every OneUpDrive HTTP client starts from: a bounded
+/// connect, a total timeout for metadata requests (transfers set their own)
+/// and TCP keepalive, so a connection that died without closing (sleep and
+/// resume, a NAT dropping it) fails instead of hanging. There's deliberately
+/// no client-wide read timeout: reqwest's also bounds the wait for the
+/// response headers, which for an upload includes sending its whole body, so
+/// it would fail slow-but-moving uploads. Downloads detect a stall per read
+/// instead ([`Graph::download_to`]).
+pub fn http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(120))
+        // reqwest's default, stated: probes every 15 s once idle for 15 s.
+        .tcp_keepalive(Duration::from_secs(15))
+        .tcp_keepalive_interval(Duration::from_secs(15))
 }
 
 /// Percent-encodes a drive path for `root:/path:` addressing. Always uses
@@ -112,6 +136,9 @@ pub const FRAGMENT: usize = crate::fragment::START_UNITS * crate::fragment::UNIT
 /// (120 s) is for metadata; a fragment or a large download legitimately
 /// takes longer on a slow line.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
+/// How long a download may go without receiving a byte. Each read restarts
+/// it, so a slow line that keeps moving is never cut off.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What [`Graph::upload_fragment`] reports.
 #[derive(Debug)]
@@ -176,7 +203,7 @@ impl BatchResp {
     }
 
     pub fn error(&self, what: &str) -> Error {
-        Error::Status { status: self.status, what: what.into(), body: self.body.to_string() }
+        Error::refused(self.status, what, self.body.to_string())
     }
 }
 
@@ -229,7 +256,11 @@ impl Graph {
     pub async fn download_to(&self, url: &str, out: &mut (dyn std::io::Write + Send)) -> Result<u64> {
         let _permit = self.limiter.acquire().await;
         self.stats.requests.fetch_add(1, Relaxed);
-        let mut resp = self.http.get(url).timeout(TRANSFER_TIMEOUT).send().await?;
+        // A dead connection holds the limiter's permit while it hangs, so
+        // waiting for the answer and for each read is bounded.
+        let stalled = |_| Error::Stalled("download", self.stall.as_secs());
+        let sent = self.http.get(url).timeout(TRANSFER_TIMEOUT).send();
+        let mut resp = tokio::time::timeout(self.stall, sent).await.map_err(stalled)??;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             if status == 429 || status == 503 {
@@ -240,7 +271,7 @@ impl Graph {
             return Err(Error::Status { status, what: "download".into(), body: String::new() });
         }
         let mut n = 0u64;
-        while let Some(chunk) = resp.chunk().await? {
+        while let Some(chunk) = tokio::time::timeout(self.stall, resp.chunk()).await.map_err(stalled)?? {
             out.write_all(&chunk).map_err(Error::Local)?;
             n += chunk.len() as u64;
             // Not reading meanwhile slows the sender down (TCP flow control).
@@ -533,6 +564,8 @@ impl Graph {
             stats: NetStats::default(),
             upload: crate::throttle::Throttle::default(),
             download: crate::throttle::Throttle::default(),
+            stall: STALL_TIMEOUT,
+            no_redirect: std::sync::OnceLock::new(),
             drive: "/me/drive".into(),
             scope: None,
         }
@@ -617,8 +650,21 @@ impl Graph {
                 return Err(Error::Exhausted(attempt));
             }
             let mut rb = self.http.request(req.method.clone(), url);
+            let mut token = None;
             if req.auth {
-                rb = rb.bearer_auth(self.auth.access_token().await?);
+                match self.auth.access_token().await {
+                    Ok(t) => rb = rb.bearer_auth(token.insert(t)),
+                    // The token endpoint unreachable, busy or failing isn't a
+                    // refused sign-in: try again like a failed request.
+                    Err(e) if e.is_transient() => {
+                        self.stats.retries.fetch_add(1, Relaxed);
+                        let wait = backoff(attempt).max(self.auth.retry_after());
+                        tracing::warn!(error = %e, attempt, wait_s = wait.as_secs(), "token refresh failed; retrying");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             if let Some(tag) = req.if_match {
                 rb = rb.header(reqwest::header::IF_MATCH, tag);
@@ -675,9 +721,12 @@ impl Graph {
                 measure.attempts -= 1;
                 continue;
             }
-            if status == 401 && req.auth && attempt <= 2 {
+            if status == 401
+                && let Some(t) = &token
+                && attempt <= 2
+            {
                 drop(permit);
-                self.auth.invalidate().await;
+                self.auth.invalidate(t).await;
                 continue;
             }
             if (500..600).contains(&status) {
@@ -704,7 +753,7 @@ impl Graph {
                     Some(l) => l.to_string(),
                     None => url.split('?').next().unwrap_or(url).to_string(),
                 };
-                return Err(Error::Status { status, what, body: String::from_utf8_lossy(&body).into_owned() });
+                return Err(Error::refused(status, what, String::from_utf8_lossy(&body).into_owned()));
             }
             self.limiter.on_success();
             return Ok((status, body.to_vec(), measure));
@@ -834,8 +883,15 @@ impl Graph {
         out: &mut (dyn std::io::Write + Send),
     ) -> Result<u64> {
         let url = format!("{}/items/{}/versions/{}/content", self.drive_url(), encode_id(id), encode_id(version));
-        let http =
-            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(TRANSFER_TIMEOUT).build()?;
+        // Only the redirect is read here; the content comes through
+        // `download_to`, with its transfer timeout and stall detection.
+        let http = match self.no_redirect.get() {
+            Some(c) => c,
+            None => {
+                let c = http_builder().redirect(reqwest::redirect::Policy::none()).build()?;
+                self.no_redirect.get_or_init(|| c)
+            }
+        };
         let _permit = self.limiter.acquire().await;
         let resp = http.get(&url).bearer_auth(self.auth.access_token().await?).send().await?;
         let status = resp.status().as_u16();
@@ -985,6 +1041,64 @@ mod tests {
         assert!(r.is_root() && r.parent_id().is_none(), "the scope's folder stands in for the root");
         let other = g.rooted(item("ABC!8"));
         assert!(!other.is_root() && other.parent_id() == Some("P"));
+    }
+
+    /// A one-connection HTTP server on loopback: answers the request with
+    /// `head`, then sends each of `drips` `gap` apart, then holds the
+    /// connection open without sending more (a connection gone dead).
+    async fn serve(head: Vec<u8>, drips: Vec<&'static [u8]>, gap: Duration) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = s.read(&mut buf).await;
+            s.write_all(&head).await.unwrap();
+            for d in drips {
+                tokio::time::sleep(gap).await;
+                s.write_all(d).await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_download_that_stops_receiving_fails_instead_of_hanging() {
+        let mut g = graph();
+        g.stall = Duration::from_millis(300);
+        let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_vec(), vec![], Duration::ZERO).await;
+        let mut out = Vec::new();
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await;
+        assert!(matches!(r, Ok(Err(Error::Stalled(..)))), "{r:?}");
+        assert_eq!(out, b"abc");
+    }
+
+    #[tokio::test]
+    async fn a_slow_download_that_keeps_moving_completes() {
+        let mut g = graph();
+        g.stall = Duration::from_millis(300);
+        // Ten bytes, 100 ms apart: much longer in total than the stall limit.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".to_vec();
+        let url = serve(head, vec![b"x"; 10], Duration::from_millis(100)).await;
+        let mut out = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap().unwrap();
+        assert_eq!((n, out.as_slice()), (10, b"xxxxxxxxxx".as_slice()));
+    }
+
+    #[tokio::test]
+    async fn a_huge_refusal_body_is_cut_before_it_becomes_an_error() {
+        let page = "<p>".repeat(100_000);
+        let head = format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\n\r\n{page}", page.len()).into_bytes();
+        let url = serve(head, vec![], Duration::ZERO).await;
+        let req = Req { auth: false, ..Req::new(reqwest::Method::GET, &url) };
+        match graph().send(&req).await {
+            Err(Error::Status { status: 403, body, .. }) => {
+                assert!(body.len() <= crate::MAX_ERROR_BODY + 16, "kept {} bytes", body.len());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
