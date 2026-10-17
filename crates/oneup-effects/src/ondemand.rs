@@ -69,11 +69,13 @@ impl LocalFs {
     /// While the returned hold lives, the open placeholder's content can't
     /// arrive (every fetch of it fails). `None` unless, under that hold, it
     /// is still dehydrated with the same identity: then it has no content
-    /// here to lose. It is then marked in sync (a rename may have cleared
+    /// here to lose. Also `None` while a program's fetch of it is under way:
+    /// its old version's content is on its way, though none shows yet
+    /// (invariant 13). It is then marked in sync (a rename may have cleared
     /// the bit; with no content, that bit protects nothing).
     pub(crate) fn hold_dehydrated(&self, h: &win::Handle) -> Option<provider::Hold> {
         let before = provider::info(&h.as_file()).ok()??;
-        let hold = provider::hold(&before.identity);
+        let hold = provider::hold(&before.identity)?;
         let now = provider::info(&h.as_file()).ok()??;
         if now.on_disk != 0 || now.identity != before.identity {
             return None;

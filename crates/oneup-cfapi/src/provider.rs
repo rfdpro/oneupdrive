@@ -17,6 +17,8 @@
 //!   programs. Where that matters (removing one, or changing its version),
 //!   [`hold`] makes every fetch of it fail meanwhile: as the provider, we
 //!   are the only way its content can arrive, so it can't change under us.
+//!   A hold isn't given while a fetch is under way (its content may still
+//!   arrive), nor a fetch started while a hold stands.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -160,15 +162,66 @@ pub fn registration(path: &Path) -> Option<(String, Vec<u8>)> {
 
 // --------------------------------------------------------------------- holds
 
-/// Identities whose fetches are refused for now (see [`hold`]).
-static HELD: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+/// Identities held ([`hold`]) and identities with a fetch under way, kept
+/// under one lock so that holding one and starting a fetch of it exclude
+/// each other. A fetch is under way from its callback until its [`Fetch`]
+/// is gone (completed, failed or dropped), so for its whole download: the
+/// hydration downloads the whole file before transferring the first byte,
+/// and meanwhile the placeholder still shows nothing on disk.
+#[derive(Debug, Default)]
+struct Flights {
+    held: Vec<Vec<u8>>,
+    fetching: Vec<Vec<u8>>,
+}
+
+impl Flights {
+    const fn new() -> Self {
+        Self { held: Vec::new(), fetching: Vec::new() }
+    }
+
+    /// Holds `identity`, unless a fetch of it is under way.
+    fn hold(&mut self, identity: &[u8]) -> bool {
+        if self.fetching.iter().any(|f| f == identity) {
+            return false;
+        }
+        self.held.push(identity.to_vec());
+        true
+    }
+
+    /// Starts a fetch of `identity`, unless it is held.
+    fn start(&mut self, identity: &[u8]) -> bool {
+        if self.is_held(identity) {
+            return false;
+        }
+        self.fetching.push(identity.to_vec());
+        true
+    }
+
+    fn is_held(&self, identity: &[u8]) -> bool {
+        self.held.iter().any(|h| h == identity)
+    }
+
+    /// Ends one hold (`held`) or one fetch (`fetching`) of `identity`.
+    fn end(list: &mut Vec<Vec<u8>>, identity: &[u8]) {
+        if let Some(i) = list.iter().position(|h| h == identity) {
+            list.swap_remove(i);
+        }
+    }
+}
+
+static FLIGHTS: std::sync::Mutex<Flights> = std::sync::Mutex::new(Flights::new());
+
+fn flights() -> std::sync::MutexGuard<'static, Flights> {
+    FLIGHTS.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// While the returned guard lives, every `FETCH_DATA` for a placeholder
 /// with this identity fails at once, before any [`Provider`] sees it: its
 /// content can't arrive, so a dehydrated placeholder stays dehydrated.
-pub fn hold(identity: &[u8]) -> Hold {
-    HELD.lock().unwrap_or_else(|p| p.into_inner()).push(identity.to_vec());
-    Hold(identity.to_vec())
+/// `None` while a fetch of it is under way: its content may still arrive
+/// (the caller leaves the placeholder alone and tries again later).
+pub fn hold(identity: &[u8]) -> Option<Hold> {
+    flights().hold(identity).then(|| Hold(identity.to_vec()))
 }
 
 /// See [`hold`].
@@ -176,15 +229,8 @@ pub struct Hold(Vec<u8>);
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(i) = held.iter().position(|h| *h == self.0) {
-            held.swap_remove(i);
-        }
+        Flights::end(&mut flights().held, &self.0);
     }
-}
-
-fn is_held(identity: &[u8]) -> bool {
-    HELD.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|h| h == identity)
 }
 
 // ----------------------------------------------------------------- callbacks
@@ -215,6 +261,8 @@ pub struct Fetch {
     pub file_id: i64,
     pub process: Option<Process>,
     done: AtomicBool,
+    /// Counted among the fetches under way ([`Flights`]) until dropped.
+    started: bool,
 }
 
 // SAFETY: the connection key and transfer keys are plain integers that
@@ -263,8 +311,14 @@ impl Fetch {
 
     /// Sends bytes `offset..offset + data.len()` of the file. Offsets and
     /// lengths are multiples of 4 KiB, except for a chunk ending at the end
-    /// of the file.
+    /// of the file. Refused once the identity is held ([`hold`]), which a
+    /// fetch under way already prevents: never a byte into a placeholder
+    /// that may be changing version.
     pub fn transfer(&self, offset: i64, data: &[u8]) -> Result<()> {
+        if flights().is_held(&self.identity) {
+            let source = windows::core::Error::from_hresult(NTSTATUS(NOT_IN_SYNC).to_hresult());
+            return Err(Error::Win { what: "transfer of a held placeholder", source });
+        }
         self.execute(Some(data), offset, NTSTATUS(0))
     }
 
@@ -296,6 +350,10 @@ impl Drop for Fetch {
     fn drop(&mut self) {
         if !self.done.load(Relaxed) {
             let _ = self.execute(None, self.offset, NTSTATUS(UNSUCCESSFUL));
+        }
+        // After its last transfer: only then may the placeholder be held.
+        if self.started {
+            Flights::end(&mut flights().fetching, &self.identity);
         }
     }
 }
@@ -412,6 +470,9 @@ unsafe extern "system" fn on_fetch_data(info: *const CF_CALLBACK_INFO, params: *
             // SAFETY: valid during the callback; copied out.
             unsafe { *info.CorrelationVector }
         };
+        // Counted as under way before anything checks the version: from
+        // here on, the placeholder can't be held and given another.
+        let started = flights().start(&identity);
         let fetch = Fetch {
             key: info.ConnectionKey,
             transfer_key: info.TransferKey,
@@ -425,8 +486,10 @@ unsafe extern "system" fn on_fetch_data(info: *const CF_CALLBACK_INFO, params: *
             file_id: info.FileId,
             process,
             done: AtomicBool::new(false),
+            started,
         };
-        if is_held(&fetch.identity) {
+        if !started {
+            // Held.
             fetch.fail(NOT_IN_SYNC);
             return;
         }
@@ -823,6 +886,27 @@ impl Exclusive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hold_and_a_fetch_of_one_identity_exclude_each_other() {
+        let mut f = Flights::default();
+        assert!(f.start(b"a"));
+        assert!(!f.hold(b"a"), "a fetch under way: its content may still arrive");
+        assert!(f.hold(b"b") && f.is_held(b"b"));
+        assert!(!f.start(b"b"), "held: refused");
+        // Another program's fetch of the same file: held only once both end.
+        assert!(f.start(b"a"));
+        Flights::end(&mut f.fetching, b"a");
+        assert!(!f.hold(b"a"));
+        Flights::end(&mut f.fetching, b"a");
+        assert!(f.hold(b"a"));
+        // Two holds: fetches wait for both to go.
+        assert!(f.hold(b"b"));
+        Flights::end(&mut f.held, b"b");
+        assert!(!f.start(b"b"));
+        Flights::end(&mut f.held, b"b");
+        assert!(f.start(b"b") && !f.is_held(b"b"));
+    }
 
     #[test]
     fn only_not_a_cloud_file_means_not_a_placeholder() {
