@@ -228,20 +228,15 @@ impl Graph {
     /// An item's eTag, kind and pre-authenticated download URL. `None` if
     /// it no longer exists.
     pub async fn download_info(&self, id: &str) -> Result<Option<crate::model::DownloadInfo>> {
-        // `$select` keeps the response small, but whether it returns the
-        // annotation varies by service version; fall back to the full item.
-        let narrow =
-            format!("{}/items/{}?$select=id,eTag,folder,@microsoft.graph.downloadUrl", self.drive_url(), encode_id(id));
-        let full = format!("{}/items/{}", self.drive_url(), encode_id(id));
-        for url in [narrow, full] {
-            match self.get::<crate::model::DownloadInfo>(&url).await {
-                Ok(it) if it.download_url.is_some() || it.folder.is_some() => return Ok(Some(it)),
-                Ok(_) => continue,
-                Err(e) if e.status() == Some(404) => return Ok(None),
-                Err(e) => return Err(e),
-            }
+        // The full item: OneDrive Personal leaves the link out of a
+        // `$select`ed answer (measured: every time), which then cost a
+        // second request per download.
+        let url = format!("{}/items/{}", self.drive_url(), encode_id(id));
+        match self.get::<crate::model::DownloadInfo>(&url).await {
+            Ok(it) => Ok(Some(it)),
+            Err(e) if e.status() == Some(404) => Ok(None),
+            Err(e) => Err(e),
         }
-        Ok(Some(crate::model::DownloadInfo { id: id.to_string(), e_tag: None, folder: None, download_url: None }))
     }
 
     /// The item at drive path `path` ("/a/b.txt"), or `None`.

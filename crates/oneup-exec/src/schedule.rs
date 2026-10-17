@@ -175,6 +175,16 @@ impl Parallel {
         }
     }
 
+    /// The Graph client's limits on requests in flight, `(to start with,
+    /// at most)`: enough for every operation under way to have its
+    /// request out, with room for the round's listing and checks. The
+    /// client starts there and grows towards the most while OneDrive
+    /// answers, and halves when it throttles (`oneup_graph::limiter`).
+    pub fn requests(self) -> (usize, usize) {
+        let ops = self.ops.max(1);
+        (ops, (ops * 2).min(32))
+    }
+
     /// At least one of each, whatever was set.
     pub(crate) fn at_least_one(self) -> Self {
         Self { ops: self.ops.max(1), large_uploads: self.large_uploads.max(1) }
@@ -225,6 +235,17 @@ mod tests {
         let mut elsewhere = Claims::default();
         elsewhere.name(&l(11), "x");
         assert!(!held(&[&frees]).conflicts(&elsewhere));
+    }
+
+    #[test]
+    fn every_operation_under_way_can_have_a_request_out() {
+        for profile in ["minimal", "balanced", "performance"] {
+            let p = Parallel::for_profile(profile);
+            let (start, most) = p.requests();
+            assert_eq!(start, p.ops, "{profile}");
+            assert!(most > start && most <= 32, "{profile}");
+        }
+        assert_eq!(Parallel { ops: 0, large_uploads: 0 }.requests(), (1, 2));
     }
 
     #[test]
