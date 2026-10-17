@@ -79,6 +79,8 @@ const MIN_WAKE_GAP: Duration = Duration::from_millis(500);
 /// journal: the tracker must ask who wrote a file before the writer closes
 /// it, so it can't wait for the next wake-up.
 const TRACK_GAP: Duration = Duration::from_millis(50);
+/// Lookups of a batch's delete records before the watcher gives up on it.
+const REMEMBER_TRIES: u32 = 3;
 /// Pauses before the journal watcher tries again after reading failed.
 const WATCH_RETRY_FIRST: Duration = Duration::from_secs(1);
 const WATCH_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
@@ -859,6 +861,30 @@ struct Watch {
 }
 
 impl Watch {
+    /// Keeps the synced items' delete records among `records`. The
+    /// database can be busy for a moment: tried a few times, then given up
+    /// (those deletions are held after a journal loss, as without the log).
+    fn remember(&self, store: &Store, journal_id: u64, records: &[oneup_ntfs::record::UsnRecord]) {
+        let mut pause = Duration::from_millis(100);
+        for attempt in 1..=REMEMBER_TRIES {
+            match oneup_local::observe::remember_deletes(
+                store,
+                oneup_local::observe::seen_deletes(),
+                journal_id,
+                records,
+            ) {
+                Ok(_) => return,
+                Err(e) if attempt == REMEMBER_TRIES => {
+                    tracing::warn!(error = %e, "delete records could not be looked up; those deletions are held after a journal loss");
+                }
+                Err(_) => {
+                    std::thread::sleep(pause);
+                    pause *= 4;
+                }
+            }
+        }
+    }
+
     /// Reads the journal from `from` until the agent is done (`Ok`) or
     /// reading fails, keeping `from` at the next record to read.
     fn tail(&self, root: &Path, from: &mut Option<(u64, i64)>, read_any: &mut bool) -> oneup_ntfs::win::Result<()> {
@@ -876,15 +902,8 @@ impl Watch {
             if read.lost {
                 tracing::info!("the change journal wrapped before it was read; deletions meanwhile are held");
             }
-            if let Some(store) = &self.deletes
-                && let Err(e) = oneup_local::observe::remember_deletes(
-                    store,
-                    oneup_local::observe::seen_deletes(),
-                    journal_id,
-                    &read.records,
-                )
-            {
-                tracing::debug!(error = %e, "delete records could not be looked up");
+            if let Some(store) = &self.deletes {
+                self.remember(store, journal_id, &read.records);
             }
             let (now, wall) = (Instant::now(), std::time::SystemTime::now());
             for r in &read.records {

@@ -331,13 +331,15 @@ pub struct SeenDeletes {
 #[derive(Debug, Default)]
 struct Seen {
     journal_id: u64,
+    /// Where the observer has read up to: older records are its already.
+    floor: i64,
     /// (USN of the record, file ID), oldest first.
     ids: VecDeque<(i64, u128)>,
 }
 
 impl SeenDeletes {
     pub const fn new() -> Self {
-        Self { inner: Mutex::new(Seen { journal_id: 0, ids: VecDeque::new() }) }
+        Self { inner: Mutex::new(Seen { journal_id: 0, floor: 0, ids: VecDeque::new() }) }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Seen> {
@@ -346,12 +348,16 @@ impl SeenDeletes {
 
     /// Records that journal `journal_id` holds a delete record for `id` at
     /// `usn`. Records of another journal are dropped: a new journal's
-    /// positions start over.
+    /// positions start over. A record the observer has read past already
+    /// (a watcher's read that lost the race with the observer) is refused.
     pub fn saw(&self, journal_id: u64, usn: i64, id: u128) {
         let mut s = self.lock();
         if s.journal_id != journal_id {
             s.ids.clear();
-            s.journal_id = journal_id;
+            (s.journal_id, s.floor) = (journal_id, 0);
+        }
+        if usn < s.floor {
+            return;
         }
         if s.ids.len() >= SEEN_MAX {
             s.ids.pop_front();
@@ -359,13 +365,17 @@ impl SeenDeletes {
         s.ids.push_back((usn, id));
     }
 
-    /// Forgets the records before `cursor`: the observer has read them.
+    /// Forgets the records before `cursor`, and refuses them from now on:
+    /// the observer has read them.
     pub fn trim(&self, journal_id: u64, cursor: i64) {
         let mut s = self.lock();
-        if s.journal_id == journal_id {
-            while s.ids.front().is_some_and(|&(usn, _)| usn < cursor) {
-                s.ids.pop_front();
-            }
+        if s.journal_id != journal_id {
+            s.ids.clear();
+            (s.journal_id, s.floor) = (journal_id, 0);
+        }
+        s.floor = s.floor.max(cursor);
+        while s.ids.front().is_some_and(|&(usn, _)| usn < s.floor) {
+            s.ids.pop_front();
         }
     }
 
@@ -666,7 +676,12 @@ mod driver {
             let mut retried = false;
             let (next, records) = loop {
                 match self.volume.read_journal(self.journal_id, self.cursor, wait, &mut self.buf) {
-                    Ok((next, records)) => break (next, records.flatten().collect::<Vec<_>>()),
+                    // A record that doesn't parse stops the read (and the
+                    // position) there, as it does the observer's.
+                    Ok((next, records)) => {
+                        let records = records.collect::<std::result::Result<Vec<_>, _>>()?;
+                        break (next, records);
+                    }
                     // Wrapped or replaced meanwhile (a wait can be long):
                     // once more from the oldest record. Anything else, or a
                     // second failure, is the caller's.
@@ -1084,15 +1099,21 @@ mod tests {
         for usn in 0..10 {
             log.saw(JOURNAL, usn, usn as u128);
         }
-        log.trim(JOURNAL + 1, 100);
-        assert_eq!(log.len(), 10, "another journal's position says nothing");
         log.trim(JOURNAL, 6);
         assert_eq!(log.ids(JOURNAL), [6, 7, 8, 9]);
+        // A watcher's read that lost the race with the observer.
+        log.saw(JOURNAL, 5, 99);
+        assert_eq!(log.ids(JOURNAL), [6, 7, 8, 9], "already read by the observer");
         for usn in 10..(SEEN_MAX as i64 + 10) {
             log.saw(JOURNAL, usn, 1);
         }
         assert_eq!(log.len(), SEEN_MAX);
         assert_eq!(log.ids(JOURNAL)[0], 1, "the oldest went first");
+        // The observer on another journal: what this one held is stale.
+        log.trim(JOURNAL + 1, 100);
+        assert!(log.ids(JOURNAL).is_empty() && log.ids(JOURNAL + 1).is_empty());
+        log.saw(JOURNAL + 1, 50, 7);
+        assert!(log.is_empty(), "before the observer's position");
     }
 
     #[test]
