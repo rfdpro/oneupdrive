@@ -322,16 +322,32 @@ impl<A: RemoteApi> Mirror<A> {
         let mut running: HashSet<String> = HashSet::new();
         let mut set: JoinSet<(String, Result<()>)> = JoinSet::new();
         let mut first_error: Option<Error> = None;
+        let mut recount = Throttle::new(UNIT_COUNT_PERIOD);
         loop {
             if first_error.is_none() && !self.cancel.load(Relaxed) && running.len() < self.cfg.max_tasks {
                 // The running units are still pending, so the first
                 // `max_tasks` hold every unit there's room to start.
                 let max = self.cfg.max_tasks;
-                let (pending, waiting) =
-                    Self::db(&self.store, move |s| s.read(|o| Ok((o.pending_units(max)?, o.pending_unit_count()?))))
-                        .await?;
+                // Counting the pending units costs O(pending), and this runs
+                // once per finished unit: counted every time, an enumeration
+                // of N units would be O(N²). The count only feeds a progress
+                // estimate, so it's refreshed at most once a period.
+                let count = recount.due(Instant::now());
+                let (pending, waiting) = Self::db(&self.store, move |s| {
+                    s.read(|o| {
+                        let waiting = if count { Some(o.pending_unit_count()?) } else { None };
+                        Ok((o.pending_units(max)?, waiting))
+                    })
+                })
+                .await?;
                 let done = self.progress.units_done.load(Relaxed);
-                self.progress.units_known.store(done + waiting, Relaxed);
+                match waiting {
+                    Some(waiting) => self.progress.units_known.store(done + waiting, Relaxed),
+                    // Between counts, at least never show more done than known.
+                    None => {
+                        self.progress.units_known.fetch_max(done, Relaxed);
+                    }
+                }
                 for unit in pending {
                     if running.len() >= self.cfg.max_tasks {
                         break;
@@ -613,5 +629,48 @@ async fn run_unit<A: RemoteApi>(
             Some(l) => url = l,
             None => return Ok(()),
         }
+    }
+}
+
+/// How often enumeration recounts its pending units for the progress figure.
+const UNIT_COUNT_PERIOD: Duration = Duration::from_secs(1);
+
+/// Lets something run at most once per `period`; the first call is always due.
+#[derive(Debug)]
+struct Throttle {
+    period: Duration,
+    last: Option<Instant>,
+}
+
+impl Throttle {
+    fn new(period: Duration) -> Self {
+        Self { period, last: None }
+    }
+
+    /// Whether the period has passed since the last time this returned `true`
+    /// (and if so, starts a new period at `now`).
+    fn due(&mut self, now: Instant) -> bool {
+        let due = self.last.is_none_or(|last| now.saturating_duration_since(last) >= self.period);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_throttle_is_due_first_then_once_a_period() {
+        let mut t = Throttle::new(Duration::from_secs(1));
+        let t0 = Instant::now();
+        assert!(t.due(t0), "the first pass always counts");
+        assert!(!t.due(t0));
+        assert!(!t.due(t0 + Duration::from_millis(999)));
+        assert!(t.due(t0 + Duration::from_secs(1)));
+        assert!(!t.due(t0 + Duration::from_millis(1500)));
+        assert!(t.due(t0 + Duration::from_secs(2)));
     }
 }
