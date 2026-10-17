@@ -574,6 +574,18 @@ impl LocalFs {
             tracing::debug!("removed a dehydrated placeholder (no local content)");
             return Ok(Done::Recycled { kept: None });
         }
+        if self.on_demand && !entry.is_dir() && pre.stamp.is_some_and(|(size, _)| self.is_partial(&h, size)) {
+            // Partly here (a download cut short): only bytes of the cloud
+            // version, now in OneDrive's recycle bin, and reading the rest
+            // would ask for that removed version. Proved and removed under
+            // a share-none handle, never read.
+            let (x, hold) = self.open_partial(h, pre, &path)?;
+            win::delete_handle(&x)?;
+            drop(x);
+            drop(hold);
+            tracing::debug!("removed a partly downloaded placeholder (no local content)");
+            return Ok(Done::Recycled { kept: None });
+        }
         if old == OldCopy::DropIfSynced && !entry.is_dir() && self.is_synced(&h, pre, synced)? {
             win::delete_handle(&h)?;
             tracing::debug!("removed without a local copy (OneDrive has this version)");

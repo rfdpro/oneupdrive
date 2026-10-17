@@ -201,6 +201,99 @@ fn renaming_a_placeholder_keeps_an_edit_not_in_sync() {
     assert_eq!(result, (true, false), "(was in sync, edited)");
 }
 
+/// Serves the first MiB of a placeholder's content, then fails the rest:
+/// a download cut short. Counts the requests that reach it.
+struct CutShort {
+    data: Vec<u8>,
+    fetches: std::sync::atomic::AtomicU32,
+}
+
+struct ServeCutShort(std::sync::Arc<CutShort>);
+
+impl oneup_cfapi::provider::Provider for ServeCutShort {
+    fn fetch_data(&self, fetch: oneup_cfapi::provider::Fetch) {
+        let me = std::sync::Arc::clone(&self.0);
+        std::thread::spawn(move || {
+            me.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if fetch.offset == 0 {
+                let _ = fetch.transfer(0, &me.data[..1 << 20]);
+            }
+            fetch.fail(oneup_cfapi::provider::NOT_IN_SYNC);
+        });
+    }
+}
+
+/// A placeholder partly here (a download cut short) holds only bytes of
+/// its cloud version. Replaced by a cloud edit or removed after a cloud
+/// deletion, it is never read: reading the rest would ask the cloud for a
+/// version it no longer has, fail, and fail the operation every round.
+#[test]
+fn partly_downloaded_placeholders_change_without_being_read() {
+    use oneup_cfapi::identity::Identity;
+    use oneup_cfapi::provider::{self, NewPlaceholder};
+    use std::sync::atomic::Ordering::Relaxed;
+    oneup_cfapi::expose_placeholders().unwrap();
+    let r = Root::new("partial");
+    drop(r.fs());
+    provider::register(&r.dir, b"token-1").unwrap();
+    let data: Vec<u8> = (0..3 << 20).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let cloud = std::sync::Arc::new(CutShort { data: data.clone(), fetches: Default::default() });
+    let conn = provider::connect(&r.dir, std::sync::Arc::new(ServeCutShort(std::sync::Arc::clone(&cloud)))).unwrap();
+    let fs = r.fs();
+    assert!(fs.on_demand());
+    let root = fs.root_id();
+    let size = data.len() as i64;
+    let old = Identity { item: "P".into(), etag: "e1".into(), size, hash: qxh(&data) };
+    let info = |p: &Path| provider::info(&provider::open(p).unwrap()).unwrap().unwrap();
+    let names = ["replaced.bin", "removed.bin", "discarded.bin"];
+    for name in names {
+        let item = NewPlaceholder { name, identity: &old.encode(), size, modified: 0, folder: false };
+        provider::create(&r.dir, &[item]).unwrap();
+        // A program's read, cut short.
+        use std::os::windows::process::CommandExt as _;
+        let out = r.dir.with_extension("read");
+        std::process::Command::new("cmd.exe")
+            .raw_arg(format!("/C copy /Y /B \"{}\" \"{}\" >nul 2>nul", r.p(name).display(), out.display()))
+            .status()
+            .unwrap();
+        let _ = std::fs::remove_file(out);
+        let i = info(&r.p(name));
+        assert!(i.on_disk > 0 && i.on_disk < size && i.in_sync && i.modified == 0, "{name}: {i:?}");
+    }
+    let asked = cloud.fetches.load(Relaxed);
+
+    // A cloud edit: dehydrated with the new identity, no copy kept.
+    let new = Identity { item: "P".into(), etag: "e2".into(), size: 11, hash: qxh(b"new version") };
+    let replace = Op::Download {
+        remote: remote(),
+        to: root,
+        parent: 0,
+        name: names[0].into(),
+        replace: Some(pre(&r.p(names[0]))),
+        link: Link::Existing(1),
+    };
+    let v = oneup_effects::Version { identity: new.clone(), modified: 0 };
+    let replaced = fs.replace_placeholder(&approve(replace), &v, Some(&old.hash));
+    // A cloud deletion, kept or discarded: removed, nothing kept.
+    let removed = fs.apply(&approve(Op::RecycleLocal { sid: 2, local: pre(&r.p(names[1])) }));
+    let discard = approve_discard(Op::RecycleLocal { sid: 3, local: pre(&r.p(names[2])) });
+    let discarded = fs.recycle(&discard, Some(&old.hash));
+    let after = info(&r.p(names[0]));
+    let (gone, versions) = ([1, 2].map(|i| !r.p(names[i]).exists()), fs.versions().unwrap());
+    let fetched = cloud.fetches.load(Relaxed) - asked;
+    drop(fs);
+    drop(conn);
+    let _ = provider::unregister(&r.dir);
+
+    assert!(matches!(replaced, Ok(Done::Placed { kept: None, .. })), "{replaced:?}");
+    assert_eq!((after.on_disk, after.identity), (0, new.encode()), "dehydrated with the new identity");
+    assert!(matches!(removed, Ok(Done::Recycled { kept: None })), "{removed:?}");
+    assert!(matches!(discarded, Ok(Done::Recycled { kept: None })), "{discarded:?}");
+    assert_eq!(gone, [true, true]);
+    assert!(versions.is_empty(), "{versions:?}");
+    assert_eq!(fetched, 0, "nothing asked for the old version");
+}
+
 #[test]
 fn mkdir_never_reuses_a_name_and_checks_names() {
     let r = Root::new("mkdir");
