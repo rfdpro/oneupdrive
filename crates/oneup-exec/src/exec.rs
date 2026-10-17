@@ -284,6 +284,22 @@ fn stage(op: &Op) -> &'static str {
     }
 }
 
+/// The downloads among `ops` whose links may be read ahead
+/// ([`Cloud::upcoming`]): those whose cloud file has OneDrive's hash. A
+/// link serves whatever the file holds when it's used, and only the hash
+/// tells another content of the same size from the planned one; without
+/// it, the link is read right before the download, as always.
+fn coming_downloads(store: &Db<'_>, ops: &[Approved]) -> Vec<RemotePre> {
+    ops.iter()
+        .filter_map(|a| match a.op() {
+            Op::Download { remote, .. } => Some(remote),
+            _ => None,
+        })
+        .filter(|r| store.read(|o| o.get_item(&r.id.0)).ok().flatten().is_some_and(|row| row.qxh.is_some()))
+        .cloned()
+        .collect()
+}
+
 /// Whether a full OneDrive refuses `op`: new content and new folders. The
 /// agent holds the same while it stays full, in later rounds.
 fn needs_room(op: &Op) -> bool {
@@ -751,13 +767,7 @@ impl<C: Cloud> Executor<C> {
             }
             // On demand, a download is a placeholder: nothing is fetched.
             if next > from && !self.fs.on_demand() {
-                let coming: Vec<RemotePre> = approved[from..next]
-                    .iter()
-                    .filter_map(|a| match a.op() {
-                        Op::Download { remote, .. } => Some(remote.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let coming = coming_downloads(&db, &approved[from..next]);
                 if !coming.is_empty() {
                     self.cloud.upcoming(&coming);
                 }
@@ -1875,6 +1885,38 @@ mod tests {
             replace: None,
             link: Link::New,
         }
+    }
+
+    #[test]
+    fn only_downloads_with_onedrives_hash_have_their_links_read_ahead() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (x, _, _) = tree(&mut store);
+        store
+            .write(|o| {
+                o.upsert_item(
+                    &RemoteRow { qxh: Some([1; 20]), ..remote("rh", Some("rx"), "h.txt", Kind::File) },
+                    false,
+                )?;
+                o.upsert_item(&remote("rn", Some("rx"), "n.txt", Kind::File), false)
+            })
+            .unwrap();
+        let download = |id: &str| Op::Download {
+            remote: rpre(id),
+            to: LocalId(10),
+            parent: x,
+            name: format!("{id}.txt"),
+            replace: None,
+            link: Link::New,
+        };
+        let gate = oneup_gate::Policy::default();
+        let r = oneup_gate::review_in(
+            &gate,
+            &oneup_gate::Context::default(),
+            vec![download("rh"), download("rn"), upload(13, x, "c.txt")],
+        );
+        let db = Db::new(&mut store);
+        let coming: Vec<String> = coming_downloads(&db, &r.approved).into_iter().map(|p| p.id.0).collect();
+        assert_eq!(coming, ["rh"]);
     }
 
     #[test]
