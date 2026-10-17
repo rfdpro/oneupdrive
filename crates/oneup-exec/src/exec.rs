@@ -61,6 +61,11 @@ pub struct Report {
     /// committing (see [`Cloud::version_mark`]), and the name of the new
     /// file in OneDrive that keeps the edited version.
     pub kept_theirs: Vec<(Op, String)>,
+    /// Uploads that went over such an edit whose version couldn't be kept
+    /// as a new file, and why. The upload itself is done (they're in
+    /// [`Report::done`] too), and the edit is in the file's version
+    /// history in OneDrive.
+    pub theirs_not_kept: Vec<(Op, String)>,
 }
 
 impl Report {
@@ -126,21 +131,51 @@ const NAME_TRIES: usize = 5;
 /// What a halt reports for operations of a batch not recorded after it.
 const NOT_RUN: &str = "not run: the round stopped";
 
+/// What an operation that was done reports besides being done (see
+/// [`Executor::one`]).
+#[derive(Default)]
+struct Notes {
+    /// [`Report::kept_instead`].
+    kept_instead: bool,
+    /// [`Report::copied`].
+    copied: bool,
+    /// [`Report::kept_theirs`].
+    theirs: Option<String>,
+    /// [`Report::theirs_not_kept`].
+    theirs_not_kept: Option<String>,
+    /// Done, but the round stops after it (the store failed, or the sync
+    /// folder its identity check, while keeping such a version).
+    halt: Option<String>,
+}
+
 /// Adds one operation's outcome to the report; true if the round halts.
-fn record(report: &mut Report, op: Op, outcome: Res, kept_instead: bool, copied: bool, theirs: Option<String>) -> bool {
+fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) -> bool {
     match outcome {
         Ok(()) => {
-            if kept_instead {
+            if notes.kept_instead {
                 report.kept_instead.push(op.clone());
             }
-            if copied {
+            if notes.copied {
                 report.copied.push(op.clone());
             }
-            if let Some(name) = theirs {
+            if let Some(name) = notes.theirs {
                 report.kept_theirs.push((op.clone(), name));
             }
+            if let Some(why) = notes.theirs_not_kept {
+                tracing::warn!(error = %why, "an edit an upload went over wasn't kept as a new file");
+                report.theirs_not_kept.push((op.clone(), why));
+            }
             report.done.push(op);
-            false
+            match notes.halt {
+                Some(m) => {
+                    if report.halted.is_none() {
+                        tracing::warn!(reason = %m, "round halted");
+                        report.halted = Some(m);
+                    }
+                    true
+                }
+                None => false,
+            }
         }
         Err(Fail::Skip(s)) => {
             tracing::debug!(reason = ?s, "operation skipped");
@@ -478,7 +513,7 @@ impl<C: Cloud> Executor<C> {
                 let halted = approved[i..i + n]
                     .iter()
                     .zip(outcomes)
-                    .any(|(a, outcome)| record(&mut report, a.op().clone(), outcome, false, false, None));
+                    .any(|(a, outcome)| record(&mut report, a.op().clone(), outcome, Notes::default()));
                 done(n);
                 if halted {
                     break;
@@ -489,19 +524,17 @@ impl<C: Cloud> Executor<C> {
             let a = &approved[i];
             i += 1;
             if !may_run(a.op()) {
-                record(&mut report, a.op().clone(), Err(Fail::NotNow), false, false, None);
+                record(&mut report, a.op().clone(), Err(Fail::NotNow), Notes::default());
                 done(1);
                 continue;
             }
             if full && matches!(a.op(), Op::Upload { .. }) {
-                record(&mut report, a.op().clone(), Err(Fail::Skip(Skip::CloudFull)), false, false, None);
+                record(&mut report, a.op().clone(), Err(Fail::Skip(Skip::CloudFull)), Notes::default());
                 done(1);
                 continue;
             }
-            let mut kept_instead = false;
-            let mut copied = false;
-            let mut theirs = None;
-            let mut outcome = self.one(store, a, &mut kept_instead, &mut copied, &mut theirs, may_run).await;
+            let mut notes = Notes::default();
+            let mut outcome = self.one(store, a, &mut notes, may_run).await;
             if writes_ahead(a.op())
                 && !matches!(outcome, Err(Fail::Halt(_)))
                 && let Err(e) = self.recover(store)
@@ -509,7 +542,7 @@ impl<C: Cloud> Executor<C> {
                 outcome = Err(e);
             }
             full |= matches!(outcome, Err(Fail::Skip(Skip::CloudFull)));
-            let halted = record(&mut report, a.op().clone(), outcome, kept_instead, copied, theirs);
+            let halted = record(&mut report, a.op().clone(), outcome, notes);
             done(1);
             if halted {
                 break;
@@ -756,18 +789,13 @@ impl<C: Cloud> Executor<C> {
         self.cloud.item(&into).await?.ok_or(Fail::Skip(Skip::Changed))
     }
 
-    /// Runs one operation. `kept_instead` is set if an old copy the gate
-    /// allowed to drop was kept (see [`Report::kept_instead`]); `copied` if
-    /// an upload was done as a copy in OneDrive ([`Report::copied`]);
-    /// `theirs` if an upload went over an edit made in OneDrive meanwhile
-    /// ([`Report::kept_theirs`]). `may_run`: see [`Self::run_checked`].
+    /// Runs one operation, noting in `notes` what else a done one reports
+    /// (see [`Notes`]). `may_run`: see [`Self::run_checked`].
     async fn one(
         &self,
         store: &mut Store,
         a: &Approved,
-        kept_instead: &mut bool,
-        copied: &mut bool,
-        theirs: &mut Option<String>,
+        notes: &mut Notes,
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Res {
         match a.op() {
@@ -840,7 +868,7 @@ impl<C: Cloud> Executor<C> {
                     .await?
                 {
                     Some((row, hash)) => {
-                        *copied = true;
+                        notes.copied = true;
                         (row, hash, u64::try_from(size).unwrap_or(0), None)
                     }
                     None => {
@@ -887,8 +915,22 @@ impl<C: Cloud> Executor<C> {
                         tracing::debug!(error = %e, "an uploaded file wasn't marked in sync");
                     }
                 }
+                // The upload is done and recorded from here on, whatever
+                // happens to the version it may have gone over: one that
+                // isn't kept is reported on its own (it's still in the
+                // file's version history), not as the upload failing, which
+                // would leave it out of what the round did.
                 if let (Some(pre), Some(mark)) = (replace, mark) {
-                    *theirs = self.keep_replaced(store, &pre.id, *parent, to, name, &mark).await?;
+                    match self.keep_replaced(store, &pre.id, *parent, to, name, &mark).await {
+                        Ok(kept) => notes.theirs = kept,
+                        Err(Fail::Failed(why)) => notes.theirs_not_kept = Some(why),
+                        Err(Fail::Skip(s)) => notes.theirs_not_kept = Some(format!("{THEIRS_NOT_KEPT}: {s:?}")),
+                        Err(Fail::NotNow) => notes.theirs_not_kept = Some(THEIRS_NOT_KEPT.into()),
+                        Err(Fail::Halt(m)) => {
+                            notes.theirs_not_kept = Some(format!("{THEIRS_NOT_KEPT}: {m}"));
+                            notes.halt = Some(m);
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -912,7 +954,7 @@ impl<C: Cloud> Executor<C> {
                     Some(_) => self.fs.replace_placeholder(a, &v, synced.as_ref())?,
                 };
                 let Done::Placed { entry, kept, .. } = placed else { return Err(odd()) };
-                *kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
+                notes.kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                 self.crash_point()?;
                 store.try_write(|o| {
                     let row = self.local_row(&entry, *to);
@@ -960,7 +1002,8 @@ impl<C: Cloud> Executor<C> {
                 }
                 let entry = match self.fs.place_download(a, staged, synced.as_ref()) {
                     Ok(Done::Placed { entry, kept, .. }) => {
-                        *kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
+                        notes.kept_instead =
+                            replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                         entry
                     }
                     Ok(_) => return Err(odd()),
@@ -1053,7 +1096,7 @@ impl<C: Cloud> Executor<C> {
                 self.crash_point()?;
                 match self.fs.recycle(a, synced.as_ref()) {
                     Ok(Done::Recycled { kept }) => {
-                        *kept_instead = kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
+                        notes.kept_instead = kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                     }
                     Ok(_) => return Err(odd()),
                     Err(e) => return Err(e.into()),

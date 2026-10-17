@@ -2280,6 +2280,13 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
                 let why = format!("it changed in OneDrive during the upload; that version is kept as {copy}");
                 println!("  ok    {line}  ({why})");
                 entry(line, ActivityOutcome::Done, Some(why));
+            } else if let Some((_, why)) = r.theirs_not_kept.iter().find(|(o, _)| o == op) {
+                // Done, and a failure of its own: the edit it went over
+                // wasn't kept next to it.
+                println!("  ok    {line}");
+                println!("  FAIL  {line}  ({why})");
+                entry(line, ActivityOutcome::Done, None);
+                entry(line, ActivityOutcome::Failed, Some(why.clone()));
             } else if !matches!(op, Op::Record(_) | Op::Forget(_)) {
                 println!("  ok    {line}");
                 if !quiet(op) {
@@ -2645,6 +2652,29 @@ mod tests {
         // would back off; the marks stay all the same (`rounds`).
         let paused = Report { not_run: vec![op()], ..Report::default() };
         assert_eq!(settle(&paused, 0, &mut 0), (true, Some(End::Settled)));
+    }
+
+    /// An upload done over an edit it couldn't keep is logged as done, and
+    /// the edit not kept as a failure of its own, naming the file; it isn't
+    /// a failed operation (which would be retried and backed off).
+    #[test]
+    fn an_edit_not_kept_is_logged_as_a_failure_next_to_its_done_upload() {
+        use oneup_sync::{Link, LocalId, LocalPre, RemoteId, RemotePre};
+        let op = Op::Upload {
+            local: LocalPre { id: LocalId(4), stamp: Some((1, 2)) },
+            to: RemoteId("d".into()),
+            parent: 1,
+            name: "a.txt".into(),
+            replace: Some(RemotePre { id: RemoteId("r".into()), etag: "e".into() }),
+            link: Link::Existing(2),
+        };
+        let planned = [(op.clone(), Line::new("upload", "/docs/a.txt".into(), ""))];
+        let why = "uploaded, over an edit made in OneDrive meanwhile; the file's version history in OneDrive has that edit: HTTP 500";
+        let report = Report { done: vec![op.clone()], theirs_not_kept: vec![(op, why.into())], ..Report::default() };
+        let log = print_round(1, &planned, &report);
+        let got: Vec<_> = log.iter().map(|e| (e.outcome, e.path.as_str(), e.detail.as_str())).collect();
+        assert_eq!(got, [(ActivityOutcome::Done, "/docs/a.txt", ""), (ActivityOutcome::Failed, "/docs/a.txt", why)]);
+        assert_eq!(settle(&report, 0, &mut 0), (true, None), "not a failure to retry");
     }
 
     /// A failure that waits its turn (`crate::backoff`) and uploads OneDrive

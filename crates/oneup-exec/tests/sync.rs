@@ -64,6 +64,8 @@ struct State {
     /// last replacing upload went over.
     old: BTreeMap<u64, Vec<u8>>,
     replaced: BTreeMap<String, u64>,
+    /// Versions in the history can't be downloaded (a service error).
+    versions_fail: bool,
     /// No room left: uploads are refused (as with HTTP 507), and counted.
     full: bool,
     refused: u64,
@@ -391,7 +393,12 @@ impl Cloud for Fake {
         version: &str,
         out: &mut (dyn Write + Send),
     ) -> Result<u64, CloudError> {
-        let content = self.0.lock().unwrap().old.get(&version.parse().unwrap()).cloned();
+        let s = self.0.lock().unwrap();
+        if s.versions_fail {
+            return Err(CloudError::Other("HTTP 500".into()));
+        }
+        let content = s.old.get(&version.parse().unwrap()).cloned();
+        drop(s);
         let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
         out.write_all(&content)?;
         Ok(content.len() as u64)
@@ -907,6 +914,47 @@ async fn an_edit_in_onedrive_that_an_upload_went_over_is_kept_as_a_copy() {
     write(&s.p("notes.txt"), b"mine, again");
     s.settle().await;
     assert_eq!(cloud.tree().len(), 2);
+}
+
+/// An edit an upload went over that can't be kept as a new file (its
+/// version won't download): the upload is still done, counted as such and
+/// not as a failure, and the edit is reported as not kept. It stays in the
+/// file's version history.
+#[tokio::test]
+async fn an_upload_over_an_edit_that_cant_be_kept_is_still_done() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-unkept", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        st.race = Some(b"theirs".to_vec());
+        st.versions_fail = true;
+    }
+    let mut not_kept = Vec::new();
+    for _ in 0..5 {
+        // `round` also checks nothing failed.
+        let r = s.round().await;
+        for (op, why) in &r.theirs_not_kept {
+            assert!(matches!(op, Op::Upload { replace: Some(_), .. }), "{op:?}");
+            assert!(r.done.contains(op), "the upload counts as done: {r:?}");
+            assert!(why.contains("the file's version history in OneDrive has that edit"), "{why}");
+        }
+        assert!(r.kept_theirs.is_empty(), "{r:?}");
+        not_kept.extend(r.theirs_not_kept);
+        if !not_kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(not_kept.len(), 1);
+    s.settle().await;
+    for t in [local_tree(&s.dir.0), cloud.tree()] {
+        assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]));
+        assert_eq!(t.len(), 1, "{:?}", names(&t));
+    }
+    assert!(cloud.0.lock().unwrap().old.values().any(|v| v == b"theirs"), "in the version history");
 }
 
 /// Server-side copy: a new local file whose content OneDrive
