@@ -198,7 +198,8 @@ impl LocalFs {
         let Some((size, _)) = pre.stamp else { return Err(Error::WrongOp) };
         let before = provider::info(&h.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
         drop(h);
-        let hold = provider::hold(&before.identity);
+        // None while a fetch of it is under way: left for a later round.
+        let hold = provider::hold(&before.identity).ok_or(Error::Changed)?;
         let x = win::open_path_for_placeholder(path, false)?;
         let id = FileId(pre.id.0);
         if win::file_id(&x)?.1 != id {
