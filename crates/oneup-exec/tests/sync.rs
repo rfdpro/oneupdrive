@@ -243,7 +243,10 @@ impl Cloud for Fake {
             }
             it.content.clone()
         };
-        out.write_all(&content)?;
+        // In pieces, as data arrives over the network.
+        for piece in content.chunks(4096) {
+            out.write_all(piece)?;
+        }
         Ok(None)
     }
 
@@ -580,6 +583,12 @@ impl Sync {
 
     /// A round that may halt (an injected crash).
     async fn attempt(&mut self) -> Report {
+        self.attempt_checked(&|_| true).await
+    }
+
+    /// [`Sync::attempt`], the executor asking `may_run` before each
+    /// operation (as the agent's pause does).
+    async fn attempt_checked(&mut self, may_run: &(dyn Fn(&Op) -> bool + std::marker::Sync)) -> Report {
         self.obs.catch_up().unwrap();
         let store = self.obs.store_mut();
         self.cloud.pull(store);
@@ -621,18 +630,20 @@ impl Sync {
         let count = |n: usize| {
             counted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         };
-        let report = self.exec.run_counted(store, r.approved, &count).await;
+        let report = self.exec.run_checked(store, r.approved, &count, may_run).await;
         // Progress counts every operation once, batched or not.
         if report.halted.is_none() {
             let counted = counted.into_inner();
             assert_eq!(counted, planned, "progress count");
-            assert_eq!(counted, report.done.len() + report.skipped.len() + report.failed.len());
+            let ended = report.done.len() + report.skipped.len() + report.failed.len() + report.not_run.len();
+            assert_eq!(counted, ended);
         }
         // A halted round (a crash) leaves its marks, as a killed process
         // would. A skipped operation (say, a file held open) left nothing behind to
-        // mark its folder again, so its marks stay for the retry; so does a
-        // batch waiting for the user's decision (as `oneup sync` does).
-        if report.halted.is_none() && report.skipped.is_empty() && !awaiting {
+        // mark its folder again, so its marks stay for the retry; so do a
+        // batch waiting for the user's decision and what wasn't run (as
+        // `oneup sync` does).
+        if report.halted.is_none() && report.skipped.is_empty() && report.not_run.is_empty() && !awaiting {
             store.write(|o| o.dirty_clear(scope.upto)).unwrap();
             self.planned_rules = fingerprint;
         }
@@ -998,6 +1009,76 @@ async fn a_file_held_open_is_retried_not_forced() {
     drop(held);
     s.settle().await;
     assert_eq!(std::fs::read(s.p("locked.txt")).unwrap(), b"two");
+}
+
+/// A pause of changes to OneDrive that comes while a round runs stops the
+/// round's OneDrive changes before the next one, batched or not: the rest
+/// aren't run (neither skipped nor failed), changes to this PC go on, and
+/// resuming plans the rest again from the marks.
+#[tokio::test]
+async fn a_pause_mid_round_stops_that_sides_operations_and_resuming_finishes_them() {
+    use oneup_gate::Side;
+    let cloud = Fake::new();
+    cloud.add("from-cloud.txt", Some(b"cloud"));
+    let mut s = Sync::new("pause", cloud.clone());
+    for d in ["a", "b", "c", "d"] {
+        std::fs::create_dir_all(s.p(d)).unwrap();
+    }
+    for f in ["1.txt", "2.txt", "3.txt"] {
+        write(&s.p(f), f.as_bytes());
+    }
+    // Paused once five of the seven OneDrive changes were let through, in
+    // the middle of the four new folders, which would go in one batch
+    // (asked again, those let through still may: the executor can ask twice).
+    let allowed = Mutex::new(Vec::<Op>::new());
+    let may_run = |op: &Op| {
+        let mut a = allowed.lock().unwrap();
+        if Side::changed_by(op) != Some(Side::Remote) || a.contains(op) {
+            return true;
+        }
+        if a.len() < 5 {
+            a.push(op.clone());
+            return true;
+        }
+        false
+    };
+    let r = s.attempt_checked(&may_run).await;
+    assert!(r.halted.is_none() && r.failed.is_empty() && r.skipped.is_empty(), "{r:?}");
+    assert_eq!(r.not_run.len(), 2, "{r:?}");
+    assert!(r.not_run.iter().all(|op| Side::changed_by(op) == Some(Side::Remote)));
+    let made = |t: &Tree| {
+        let all = ["/a", "/b", "/c", "/d", "/1.txt", "/2.txt", "/3.txt"];
+        all.iter().filter(|p| t.contains_key(**p)).count()
+    };
+    assert_eq!(made(&cloud.tree()), 5, "only what went before the pause");
+    assert_eq!(std::fs::read(s.p("from-cloud.txt")).unwrap(), b"cloud", "this PC's side went on");
+
+    s.settle().await;
+    assert_eq!(made(&cloud.tree()), 7);
+}
+
+/// A download under way when changes to this PC are paused stops as its
+/// next data arrives: nothing is placed, its staging file goes, and it's
+/// done again once resumed.
+#[tokio::test]
+async fn a_pause_stops_a_download_under_way_without_placing_anything() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let big: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let cloud = Fake::new();
+    cloud.add("big.bin", Some(&big));
+    let mut s = Sync::new("pause-download", cloud.clone());
+    // Asked before it starts, then at each piece: paused after the first.
+    let asked = AtomicUsize::new(0);
+    let may_run = |op: &Op| !matches!(op, Op::Download { .. }) || asked.fetch_add(1, Relaxed) < 2;
+    let r = s.attempt_checked(&may_run).await;
+    assert!(r.halted.is_none() && r.failed.is_empty() && r.skipped.is_empty(), "{r:?}");
+    assert!(matches!(r.not_run.as_slice(), [Op::Download { .. }]), "{r:?}");
+    assert_eq!(asked.load(Relaxed), 3, "stopped at the second of 16 pieces");
+    assert!(!s.p("big.bin").exists());
+    assert_eq!(std::fs::read_dir(s.p(".oneup/staging")).unwrap().count(), 0, "no partial download left");
+
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("big.bin")).unwrap(), big);
 }
 
 /// Every content the crash scenario ever writes, on either side.

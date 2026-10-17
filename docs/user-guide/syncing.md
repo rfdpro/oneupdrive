@@ -71,6 +71,8 @@ oneup --data-dir … resume --folder Videos
 
 A pause is remembered: if `oneupd` restarts, it's still paused. While paused, changes are noted but not acted on. Nothing is missed, and they sync once you resume.
 
+A pause takes effect at once, even in the middle of a long sync: nothing more starts on the paused side, and a download under way stops (it starts over when you resume). An upload that's already sending finishes. Opening an online-only file still downloads it: you asked for it.
+
 A paused folder is saved in the data folder's `config.toml`, so it stays paused until you resume it, even if `oneupd` isn't running when you pause it. Both copies stay as they are meanwhile; nothing is deleted. `oneup explain` shows a file as paused.
 
 ### How it uses your PC
@@ -89,7 +91,7 @@ oneup --data-dir … settings --busy-quiet-s 30             # send a file that k
 oneup --data-dir … settings --hold-busy-files off         # send every change right away
 ```
 
-* **Pausing by itself:** by default `oneupd` pauses while the internet connection is metered (a phone hotspot, a data plan Windows knows is limited), while battery saver is on, while a game, a presentation or another full-screen program has the screen, and while a video plays full screen (in a browser or a video player), and resumes when that ends. Games and videos are separate settings, so you can pause for one and not the other. Windows reports a full-screen video and a game that runs in a borderless window the same way, so OneUpDrive goes by the program: a browser or a video player is a video, anything else a game. Quiet hours (none by default) pause it every day between those times. `oneup status` shows when and why it paused by itself. It checks whenever it would wake up anyway, so it may take up to 10 minutes to notice that the connection or battery saver changed.
+* **Pausing by itself:** by default `oneupd` pauses while the internet connection is metered (a phone hotspot, a data plan Windows knows is limited), while battery saver is on, while a game, a presentation or another full-screen program has the screen, and while a video plays full screen (in a browser or a video player), and resumes when that ends. Games and videos are separate settings, so you can pause for one and not the other. Windows reports a full-screen video and a game that runs in a borderless window the same way, so OneUpDrive goes by the program: a browser or a video player is a video, anything else a game. Quiet hours (none by default) pause it every day between those times. `oneup status` shows when and why it paused by itself. It checks whenever it would wake up anyway, and every 30 seconds while it syncs, so it may take up to 10 minutes to notice, while idle, that the connection or battery saver changed. A pause it notices while syncing stops that sync as `oneup pause` does.
 
 * **Bandwidth caps** apply to file contents, at once, even while `oneupd` runs. With `--cap-hours 09:00-18:00` they apply only in those hours (`--cap-hours always` to undo).
 * **Background priority** is on by default: `oneupd` gives way to your programs for processor, disk and memory, and Windows may run it on power-efficient cores. Syncing a large batch can take a little longer.

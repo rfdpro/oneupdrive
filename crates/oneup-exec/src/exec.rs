@@ -44,6 +44,11 @@ pub struct Report {
     /// Uploads done as a copy, in OneDrive, of a file with the same content
     /// (nothing was sent).
     pub copied: Vec<Op>,
+    /// Not run: the caller's check refused them when their turn came
+    /// ([`Executor::run_checked`]), or stopped a download of theirs under
+    /// way. Nothing was changed, and they're neither skipped nor failed:
+    /// the next round plans them again.
+    pub not_run: Vec<Op>,
 }
 
 impl Report {
@@ -57,6 +62,8 @@ enum Fail {
     Skip(Skip),
     Failed(String),
     Halt(String),
+    /// The caller's check refused it (see [`Report::not_run`]).
+    NotNow,
 }
 
 impl From<FxError> for Fail {
@@ -120,6 +127,10 @@ fn record(report: &mut Report, op: Op, outcome: Res, kept_instead: bool, copied:
         Err(Fail::Failed(m)) => {
             tracing::warn!(error = %m, "operation failed");
             report.failed.push((op, m));
+            false
+        }
+        Err(Fail::NotNow) => {
+            report.not_run.push(op);
             false
         }
         Err(Fail::Halt(m)) => {
@@ -337,6 +348,23 @@ impl<C: Cloud> Executor<C> {
         approved: Vec<Approved>,
         done: &(dyn Fn(usize) + Sync),
     ) -> Report {
+        self.run_checked(store, approved, done, &|_| true).await
+    }
+
+    /// [`Self::run_counted`], asking `may_run` before each operation
+    /// whether it may run now (a pause that came meanwhile, say). One it
+    /// refuses isn't started ([`Report::not_run`]). A download under way is
+    /// asked again as its data arrives, and stopped once refused: nothing
+    /// was placed yet, so it's simply done again later. Anything else that
+    /// started runs to its end (an upload commits, a batch is answered).
+    /// `may_run` is called often: it must be cheap.
+    pub async fn run_checked(
+        &self,
+        store: &mut Store,
+        approved: Vec<Approved>,
+        done: &(dyn Fn(usize) + Sync),
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> Report {
         let mut report = Report::default();
         if let Err(e) = self.fs.check_root() {
             report.halted = Some(e.to_string());
@@ -352,6 +380,8 @@ impl<C: Cloud> Executor<C> {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
             let n = batchable(store, &approved[i..]);
+            // Up to the first the caller refuses, which goes on its own.
+            let n = approved[i..i + n].iter().take_while(|a| may_run(a.op())).count();
             if n >= 2 {
                 tracing::debug!(n, "cloud changes sent in one batch");
                 let outcomes = self.run_batch(store, &approved[i..i + n]).await;
@@ -368,9 +398,14 @@ impl<C: Cloud> Executor<C> {
             }
             let a = &approved[i];
             i += 1;
+            if !may_run(a.op()) {
+                record(&mut report, a.op().clone(), Err(Fail::NotNow), false, false);
+                done(1);
+                continue;
+            }
             let mut kept_instead = false;
             let mut copied = false;
-            let mut outcome = self.one(store, a, &mut kept_instead, &mut copied).await;
+            let mut outcome = self.one(store, a, &mut kept_instead, &mut copied, may_run).await;
             if writes_ahead(a.op())
                 && !matches!(outcome, Err(Fail::Halt(_)))
                 && let Err(e) = self.recover(store)
@@ -627,7 +662,15 @@ impl<C: Cloud> Executor<C> {
     /// Runs one operation. `kept_instead` is set if an old copy the gate
     /// allowed to drop was kept (see [`Report::kept_instead`]); `copied` if
     /// an upload was done as a copy in OneDrive ([`Report::copied`]).
-    async fn one(&self, store: &mut Store, a: &Approved, kept_instead: &mut bool, copied: &mut bool) -> Res {
+    /// `may_run`: see [`Self::run_checked`].
+    async fn one(
+        &self,
+        store: &mut Store,
+        a: &Approved,
+        kept_instead: &mut bool,
+        copied: &mut bool,
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> Res {
         match a.op() {
             // ------------------------------------------------ bookkeeping
             Op::Pair { local, remote, parent, name, kind, size, hash } => {
@@ -775,8 +818,13 @@ impl<C: Cloud> Executor<C> {
                 let mut staged = self.fs.stage()?;
                 let (len, digest) = {
                     let Some(file) = staged.file() else { return Err(odd()) };
-                    let mut w = Hashing::new(file);
-                    let received = self.cloud.download(remote, &mut w).await?;
+                    let go = || may_run(a.op());
+                    let mut w = Hashing::new(Stoppable { inner: file, go: &go, stopped: false });
+                    let received = match self.cloud.download(remote, &mut w).await {
+                        // Only staged so far, which goes with `staged`.
+                        Err(_) if w.inner.stopped => return Err(Fail::NotNow),
+                        r => r?,
+                    };
                     // In the cloud's terms (see `cloud`): what it received, if it transformed it.
                     (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
                 };
@@ -1027,6 +1075,30 @@ impl Pending {
             }
             _ => None,
         }
+    }
+}
+
+/// Passes a download's bytes on while `go` says it may go on; once it says
+/// no, refuses them (and notes it in `stopped`), which ends the download.
+/// Asked at every write, as data arrives: a stalled connection writes
+/// nothing, and uses nothing either.
+struct Stoppable<'a, W> {
+    inner: W,
+    go: &'a (dyn Fn() -> bool + Sync),
+    stopped: bool,
+}
+
+impl<W: std::io::Write> std::io::Write for Stoppable<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.stopped || !(self.go)() {
+            self.stopped = true;
+            // Not `Interrupted`: `write_all` would try again.
+            return Err(std::io::Error::other("stopped: not to run now"));
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 

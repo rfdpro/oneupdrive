@@ -96,6 +96,9 @@ pub struct Controls {
     /// Paths (relative to the synced folder) to transfer before anything
     /// else (`oneup sync-now PATH`).
     pub first: Vec<String>,
+    /// The pause as it changes while a round runs (the agent's; `None`:
+    /// nothing pauses mid-round).
+    pub live: Option<Arc<crate::control::LivePause>>,
 }
 
 /// Who the messages are for: `oneup sync` takes answers on its next run,
@@ -1167,7 +1170,11 @@ impl Engine {
                 })
                 .unzip();
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
-            let report = self.run_reported(&mut store, approved, n, bytes_total, progress).await;
+            let report =
+                self.run_reported(&mut store, approved, n, bytes_total, progress, controls.live.as_deref()).await;
+            // Paused meanwhile: what didn't run is planned again from the
+            // marks, which stay, as for work the gate put off.
+            let deferred = deferred || !report.not_run.is_empty();
             // Counted before anything below can fail: what ran must reach
             // the caller's safety window even if this call ends in an error.
             executed.suspicious += report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
@@ -1179,6 +1186,11 @@ impl Engine {
                 }
             }
             let mut log = print_round(n, &planned, &report);
+            if !report.not_run.is_empty() {
+                let detail = format!("{} operations wait until sync resumes", report.not_run.len());
+                println!("  {detail}");
+                log.push(notice(ActivityOutcome::Waiting, "paused", detail));
+            }
             if let Some(why) = &report.halted {
                 log.push(notice(ActivityOutcome::Failed, "stopped", why.clone()));
             }
@@ -1329,7 +1341,8 @@ impl Engine {
     /// Carries out round `round`'s operations, telling `progress` how far
     /// it is about once a second (and `None` once it's over). Bytes are
     /// counted where every transfer passes, the bandwidth caps, so a large
-    /// file moves them while it's on its way.
+    /// file moves them while it's on its way. With `live`, a pause that
+    /// comes meanwhile stops the paused side's operations from then on.
     async fn run_reported(
         &self,
         store: &mut Store,
@@ -1337,6 +1350,7 @@ impl Engine {
         round: usize,
         bytes_total: u64,
         progress: &(dyn Fn(Option<Progress>) + Send + Sync),
+        live: Option<&crate::control::LivePause>,
     ) -> Report {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let items_total = approved.len() as u64;
@@ -1357,7 +1371,9 @@ impl Engine {
         let count = |n: usize| {
             items_done.fetch_add(n as u64, Relaxed);
         };
-        let run = self.exec.run_counted(store, approved, &count);
+        let paused = live.map(crate::control::LivePause::round_check);
+        let may_run = |op: &Op| paused.as_ref().is_none_or(|p| p(op));
+        let run = self.exec.run_checked(store, approved, &count, &may_run);
         tokio::pin!(run);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2443,6 +2459,10 @@ mod tests {
         let busy = Report { done: vec![op()], ..skipped(&[Skip::NameTaken]) };
         assert_eq!(settle(&busy, &mut 0), (true, None));
         assert_eq!(settle(&Report::default(), &mut 0), (true, Some(End::Settled)));
+        // Not run (paused meanwhile): neither a failure nor a retry, which
+        // would back off; the marks stay all the same (`rounds`).
+        let paused = Report { not_run: vec![op()], ..Report::default() };
+        assert_eq!(settle(&paused, &mut 0), (true, Some(End::Settled)));
     }
 
     /// A "changed meanwhile" that a new round doesn't clear (a stale row)

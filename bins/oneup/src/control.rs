@@ -17,6 +17,7 @@ use oneup_gate::{Breaker, Overflow, OverflowOutcome, Side};
 use oneup_ipc::{
     Activity, Answer, Call, Direction, INVALID_PARAMS, LastRun, NO_SUCH_BATCH, PauseState, RpcError, SafetyStop, Status,
 };
+use oneup_sync::Op;
 use tokio::sync::Notify;
 
 use crate::sync::{Answers, Controls, Offer};
@@ -28,9 +29,47 @@ pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// Which sides are paused right now, for a round already under way: set by
+/// [`Control`] the moment the pause changes (the user's or the agent's own),
+/// read by the executor before each operation, so it is two flags, not a
+/// lock or a file.
+#[derive(Debug, Default)]
+pub struct LivePause {
+    local: AtomicBool,
+    remote: AtomicBool,
+}
+
+impl LivePause {
+    fn set(&self, local: bool, remote: bool) {
+        self.local.store(local, Relaxed);
+        self.remote.store(remote, Relaxed);
+    }
+
+    /// For one round: whether an operation may run now. Not one that
+    /// changes a side paused since the round began, nor, after that, any
+    /// other changing that side, even if it resumed meanwhile: they may
+    /// depend on one that didn't run. Bookkeeping always may.
+    pub fn round_check(&self) -> impl Fn(&Op) -> bool + Sync + '_ {
+        let stopped = [AtomicBool::new(false), AtomicBool::new(false)];
+        move |op| {
+            let (i, paused) = match Side::changed_by(op) {
+                Some(Side::Local) => (0, &self.local),
+                Some(Side::Remote) => (1, &self.remote),
+                None => return true,
+            };
+            if paused.load(Relaxed) {
+                stopped[i].store(true, Relaxed);
+            }
+            !stopped[i].load(Relaxed)
+        }
+    }
+}
+
 /// The agent's shared control state.
 pub struct Control {
     state: Mutex<Shared>,
+    /// The pause in effect, for rounds under way (see [`LivePause`]).
+    live: Arc<LivePause>,
     /// Where the pause is saved (`None`: nowhere, in tests).
     pause_file: Option<PathBuf>,
     /// Pinged when a call changed something the loop must act on.
@@ -80,6 +119,13 @@ fn code(f: u64) -> String {
     format!("{f:016x}")
 }
 
+/// Which sides are paused, the user's way or the agent's own (which pauses
+/// both).
+fn paused_sides(s: &Shared) -> (bool, bool) {
+    let auto = s.auto_pause.is_some();
+    (s.pause.local || auto, s.pause.remote || auto)
+}
+
 /// Reads a saved pause; anything unreadable counts as "not paused" (it's
 /// our own file, and not pausing loses nothing).
 fn load_pause(file: &Path) -> PauseState {
@@ -105,7 +151,10 @@ impl Control {
     pub fn new(data_dir: Option<&Path>, local: String, remote: String, answers: Answers) -> Self {
         let pause_file = data_dir.map(|d| d.join(PAUSE_FILE));
         let pause = pause_file.as_deref().map(load_pause).unwrap_or_default();
+        let live = LivePause::default();
+        live.set(pause.local, pause.remote);
         Self {
+            live: Arc::new(live),
             state: Mutex::new(Shared {
                 pause,
                 answers,
@@ -135,9 +184,12 @@ impl Control {
         }
     }
 
-    /// Moves the revision on if the status changed. Called with the state
-    /// locked, after each change to it.
+    /// Moves the revision on if the status changed, and passes the pause
+    /// on to a round under way. Called with the state locked, after each
+    /// change to it.
     fn publish(&self, s: &mut Shared) {
+        let (local, remote) = paused_sides(s);
+        self.live.set(local, remote);
         let now = Status { rev: 0, ..self.status(s) };
         if s.shown.as_ref() != Some(&now) {
             s.shown = Some(now);
@@ -172,14 +224,17 @@ impl Control {
         s.pause
     }
 
-    /// The controls for the next rounds.
+    /// The controls for the next rounds. Pausing by itself pauses both
+    /// sides, like the user's pause: it can begin while rounds run.
     pub fn controls(&self) -> Controls {
         let s = self.lock();
+        let (pause_local, pause_remote) = paused_sides(&s);
         Controls {
             answers: s.answers.clone(),
-            pause_local: s.pause.local,
-            pause_remote: s.pause.remote,
+            pause_local,
+            pause_remote,
             first: s.first.clone(),
+            live: Some(Arc::clone(&self.live)),
         }
     }
 
@@ -551,6 +606,33 @@ mod tests {
         std::fs::write(dir.join(PAUSE_FILE), b"{garbage").unwrap();
         assert!(!control(Some(&dir)).controls().pause_local);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pause_mid_round_stops_that_side_for_the_rest_of_the_round() {
+        use oneup_sync::{LocalId, LocalPre, RemoteId, RemotePre};
+        let c = control(None);
+        let live = c.controls().live.unwrap();
+        let here = Op::RecycleLocal { sid: 1, local: LocalPre { id: LocalId(1), stamp: None } };
+        let there = Op::DeleteRemote { sid: 2, remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() } };
+        let check = live.round_check();
+        assert!(check(&here) && check(&there));
+        c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
+        assert!(check(&here) && !check(&there) && check(&Op::Forget(3)));
+        // Not again before the round ends: what's left may depend on what
+        // didn't run. The next round plans it again.
+        c.call(Call::Resume { direction: Direction::Remote }, 0).unwrap();
+        assert!(!check(&there));
+        assert!(live.round_check()(&there));
+
+        // Pausing by itself pauses both sides, for the next rounds too.
+        c.set_auto_pause(Some("on a metered connection".into()));
+        let check = live.round_check();
+        assert!(!check(&here) && !check(&there));
+        assert!(c.controls().pause_local && c.controls().pause_remote);
+        assert!(!c.snapshot().paused.local, "the user's pause is the user's");
+        c.set_auto_pause(None);
+        assert!(live.round_check()(&here));
     }
 
     #[test]

@@ -23,7 +23,10 @@
 //! status`, `pause`/`resume` (both directions or one, optionally timed; kept
 //! across restarts), `approve`/`keep`/`discard`, and `sync-now`, all while
 //! the agent keeps running. While both directions are paused, no rounds run
-//! at all; the journal is still read, so nothing is missed.
+//! at all; the journal is still read, so nothing is missed. A pause that
+//! comes during a round (the user's, or the agent's own on a metered
+//! connection and the like) stops that side's operations from the next one
+//! on, and a download under way; what didn't run waits for the resume.
 //!
 //! **Safety.** Everything `oneup sync` guarantees holds (same gate, same
 //! effects layer). In addition, the safety stops count what the agent did
@@ -100,6 +103,9 @@ const PUSH_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 /// While fully paused: how long a wait may be at most (a timed pause ends
 /// earlier). Nothing is checked meanwhile; this only bounds the wait.
 const PAUSED_WAIT: Duration = Duration::from_secs(60 * 60);
+/// While rounds run: how often the automatic pauses are looked at again,
+/// so a metered connection or battery saver stops a long round too.
+const AUTO_PAUSE_CHECK: Duration = Duration::from_secs(30);
 /// SQLite page cache (the "balanced" memory profile).
 
 #[derive(Parser)]
@@ -527,13 +533,7 @@ async fn agent(
         }
         busy.set_settings(settings.busy);
         let minute = autopause::local_minute_of_day();
-        let conditions = autopause::Conditions {
-            metered: oneup_sys::conditions::metered(),
-            battery_saver: oneup_sys::conditions::battery_saver(),
-            full_screen: oneup_sys::conditions::full_screen(),
-            minute_of_day: minute,
-        };
-        let auto = autopause::reason(&settings, &conditions);
+        let auto = auto_pause(&settings, minute);
         if auto != auto_was {
             match &auto {
                 Some(why) => println!("oneupd: pausing by itself: {why}"),
@@ -561,11 +561,14 @@ async fn agent(
             let started = Instant::now();
             let mut executed = Recent::default();
             let recent = window.recent();
-            let rounds = engine
-                .rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
+            let rounds = watching_auto_pause(
+                engine.rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
                     control.set_progress(p)
-                })
-                .await;
+                }),
+                &settings,
+                control,
+            )
+            .await;
             // Before the error, if any: the retry must still count them.
             window.add(executed);
             let (s, out) = rounds?;
@@ -665,6 +668,40 @@ async fn agent(
         store = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next).await?;
         if stop.requested() {
             return Ok(());
+        }
+    }
+}
+
+/// Why the agent pauses by itself now (config.toml [agent]), if it does.
+fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<String> {
+    let conditions = autopause::Conditions {
+        metered: oneup_sys::conditions::metered(),
+        battery_saver: oneup_sys::conditions::battery_saver(),
+        full_screen: oneup_sys::conditions::full_screen(),
+        minute_of_day: minute,
+    };
+    autopause::reason(settings, &conditions)
+}
+
+/// Runs `rounds`, looking at the automatic pauses again meanwhile: one that
+/// begins pauses the round under way at its next operation (through
+/// `control`). Ending one waits for the rounds to end.
+async fn watching_auto_pause<T>(
+    rounds: impl Future<Output = T>,
+    settings: &oneup_app::config::Agent,
+    control: &Control,
+) -> T {
+    tokio::pin!(rounds);
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + AUTO_PAUSE_CHECK, AUTO_PAUSE_CHECK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            r = &mut rounds => return r,
+            _ = tick.tick() => {
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day()) {
+                    control.set_auto_pause(Some(why));
+                }
+            }
         }
     }
 }
