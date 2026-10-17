@@ -1571,8 +1571,8 @@ impl Engine {
         };
         let paused = live.map(crate::control::LivePause::round_check);
         let may_run = |op: &Op| paused.as_ref().is_none_or(|p| p(op));
-        let follow = |o: &Ops<'_>, made: &[oneup_sync::Sid]| follower.follow(o, made);
-        let run = self.exec.run_following(store, approved, &count, &may_run, &follow);
+        let follow = |o: &Ops<'_>, made: &[oneup_sync::Sid], room: usize| follower.follow(o, made, room);
+        let run = self.exec.run_following(store, approved, &count, &may_run, &follow, oneup_exec::FOLLOW_MAX);
         tokio::pin!(run);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1718,23 +1718,21 @@ struct Follower<'a> {
 }
 
 impl Follower<'_> {
-    fn follow(&self, o: &Ops<'_>, made: &[oneup_sync::Sid]) -> Vec<Approved> {
-        self.try_follow(o, made).unwrap_or_else(|e| {
+    /// At most `room` operations: the rest stays in the new folders, whose
+    /// marks bring them to the next round.
+    fn follow(&self, o: &Ops<'_>, made: &[oneup_sync::Sid], room: usize) -> Vec<Approved> {
+        self.try_follow(o, made, room).unwrap_or_else(|e| {
             tracing::debug!(error = %e, "what goes into new folders is left to the next round");
             Vec::new()
         })
     }
 
-    fn try_follow(&self, o: &Ops<'_>, made: &[oneup_sync::Sid]) -> oneup_store::Result<Vec<Approved>> {
+    fn try_follow(&self, o: &Ops<'_>, made: &[oneup_sync::Sid], room: usize) -> oneup_store::Result<Vec<Approved>> {
         use std::sync::atomic::Ordering::Relaxed;
         let (ops, _) = self.planning.plan(o, made.to_vec())?;
-        // A new folder's contents are new items: nothing in them removes,
-        // replaces or moves anything. A plan that does is left whole to the
-        // next round, where the breakers, the content guard and the version
-        // store's room weigh it with everything else. Without such
-        // operations no breaker can trip, so the gate here only withholds
-        // what a pause, a panic or a hold does.
-        if ops.iter().any(is_mass_sensitive) {
+        // Without mass-sensitive operations no breaker can trip, so the gate
+        // here only withholds what a pause, a panic or a hold does.
+        if !oneup_gate::may_follow(&ops) {
             return Ok(Vec::new());
         }
         let review = review_in(self.policy, &self.cx, ops);
@@ -1757,6 +1755,7 @@ impl Follower<'_> {
         let (planned, _, _) = self.engine.hold_failed(o, planned.collect())?;
         let (approved, lines): (Vec<Approved>, Vec<(Op, Line)>) = planned
             .into_iter()
+            .take(room)
             .map(|(a, l)| {
                 let op = a.op().clone();
                 (a, (op, l))

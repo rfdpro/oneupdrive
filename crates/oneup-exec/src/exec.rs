@@ -55,10 +55,11 @@ const WINDOW: usize = 256;
 pub const FOLLOW_MAX: usize = 20_000;
 
 /// Plans and reviews what goes into folders a round has just created: given
-/// the store and those folders (Synced rows the round linked), the approved
-/// operations for their contents, in the planner's order. The caller's
+/// the store, those folders (Synced rows the round linked) and how many
+/// operations may still be taken in, the approved operations for their
+/// contents, in the planner's order, at most that many. The caller's
 /// planner and gate, as for a round ([`Executor::run_following`]).
-pub type Follow<'a> = dyn Fn(&Ops<'_>, &[Sid]) -> Vec<Approved> + Sync + 'a;
+pub type Follow<'a> = dyn Fn(&Ops<'_>, &[Sid], usize) -> Vec<Approved> + Sync + 'a;
 
 /// Why an operation was skipped. Nothing was changed; the next round plans
 /// again from fresh state.
@@ -756,7 +757,7 @@ impl<C: Cloud> Executor<C> {
         done: &(dyn Fn(usize) + Sync),
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Report {
-        self.run_following(store, approved, done, may_run, &|_, _| Vec::new()).await
+        self.run_following(store, approved, done, may_run, &|_, _, _| Vec::new(), 0).await
     }
 
     /// [`Self::run_checked`], taking in what goes into the folders the
@@ -766,7 +767,7 @@ impl<C: Cloud> Executor<C> {
     /// tree then goes in one round instead of one level a round, without a
     /// round's start (the change journal, the cloud listing) for each level,
     /// and a level's folders are made while the level above is still being
-    /// sent. At most [`FOLLOW_MAX`] operations are taken in this way; the
+    /// sent. At most `follow_max` ([`FOLLOW_MAX`]) operations are taken in this way; the
     /// rest wait for the next round, which the new folders' marks bring, as
     /// does whatever `follow` leaves out.
     pub async fn run_following(
@@ -776,6 +777,7 @@ impl<C: Cloud> Executor<C> {
         done: &(dyn Fn(usize) + Sync),
         may_run: &(dyn Fn(&Op) -> bool + Sync),
         follow: &Follow<'_>,
+        follow_max: usize,
     ) -> Report {
         let mut report = Report::default();
         if let Err(e) = self.fs.check_root() {
@@ -850,8 +852,9 @@ impl<C: Cloud> Executor<C> {
             let len = u.group.len();
             done(len);
             let halted = finished.iter().any(|(r, notes)| halts(r, notes));
-            if !halted && followed < FOLLOW_MAX {
-                let more = self.follow(&db, &u.group, &finished, follow);
+            if !halted && followed < follow_max {
+                let mut more = self.follow(&db, &u.group, &finished, follow, follow_max - followed);
+                more.truncate(follow_max - followed);
                 followed += more.len();
                 pending.extend(more);
             }
@@ -889,13 +892,14 @@ impl<C: Cloud> Executor<C> {
         group: &[Approved],
         finished: &[(Res, Notes)],
         follow: &Follow<'_>,
+        room: usize,
     ) -> Vec<Approved> {
         let made = store.read(|o| {
             let mut made = Vec::new();
             for (a, _) in group.iter().zip(finished).filter(|(_, (r, _))| r.is_ok()) {
                 made.extend(made_folder(o, a.op())?);
             }
-            Ok(if made.is_empty() { Vec::new() } else { follow(o, &made) })
+            Ok(if made.is_empty() { Vec::new() } else { follow(o, &made, room) })
         });
         made.unwrap_or_else(|e| {
             tracing::debug!(error = %e, "what goes into a new folder is left to the next round");

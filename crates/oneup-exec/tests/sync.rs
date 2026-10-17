@@ -729,6 +729,8 @@ struct Sync {
     /// What goes into the folders a round makes is planned and run in the
     /// same round (`Executor::run_following`), as `oneup_app::sync` does.
     follow: bool,
+    /// At most this many operations taken in for new folders per round.
+    follow_max: usize,
 }
 
 impl Sync {
@@ -781,6 +783,7 @@ impl Sync {
             planned_rules: RuleSet::default().fingerprint(),
             pull: false,
             follow: true,
+            follow_max: oneup_exec::FOLLOW_MAX,
         }
     }
 
@@ -809,11 +812,27 @@ impl Sync {
             planned_rules,
             pull,
             follow,
+            follow_max,
         } = self;
         drop((obs, exec));
         let store = Store::open(&db.as_ref().expect("restart needs a database on disk").0, 4096).unwrap();
         let (obs, exec) = Self::start(&dir.0, store, &cloud);
-        Self { dir, db, obs, exec, cloud, policy, room, decisions, overflow: None, rules, planned_rules, pull, follow }
+        Self {
+            dir,
+            db,
+            obs,
+            exec,
+            cloud,
+            policy,
+            room,
+            decisions,
+            overflow: None,
+            rules,
+            planned_rules,
+            pull,
+            follow,
+            follow_max,
+        }
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -865,23 +884,22 @@ impl Sync {
             counted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         };
         // What goes into new folders, as `oneup_app::sync` plans it: like a
-        // round, and nothing of it if the gate would stop any of it or the
-        // version store would need room.
+        // round, by the same rule (`oneup_gate::may_follow`), at most `room`.
         let followed = Mutex::new(Vec::new());
         let (policy, on) = (&self.policy, self.follow);
-        let follow = |o: &oneup_store::Ops<'_>, made: &[oneup_sync::Sid]| {
+        let follow = |o: &oneup_store::Ops<'_>, made: &[oneup_sync::Sid], room: usize| {
             let Some(ops) = on.then(|| plan_in(o, rules, pull, made.to_vec()).unwrap()) else { return Vec::new() };
-            if oneup_gate::store_bytes(policy, &ops) > 0 {
+            if !oneup_gate::may_follow(&ops) {
                 return Vec::new();
             }
             let r = review_in(policy, &Context::default(), ops);
-            if !r.breakers.is_empty() {
-                return Vec::new();
-            }
-            followed.lock().unwrap().extend(r.approved.iter().map(|a| a.op().clone()));
-            r.approved
+            assert!(r.breakers.is_empty(), "nothing in a new folder trips a breaker: {:?}", r.breakers);
+            let mut approved = r.approved;
+            approved.truncate(room);
+            followed.lock().unwrap().extend(approved.iter().map(|a| a.op().clone()));
+            approved
         };
-        let report = self.exec.run_following(store, r.approved, &count, may_run, &follow).await;
+        let report = self.exec.run_following(store, r.approved, &count, may_run, &follow, self.follow_max).await;
         let followed = followed.into_inner().unwrap();
         let (planned, order) = (planned + followed.len(), [order, followed].concat());
         // Progress counts every operation once, batched or not.
@@ -2939,6 +2957,49 @@ async fn large_uploads_keep_to_their_own_limit() {
     s.settle().await;
     assert_eq!(cloud.most_transfers(), 2);
     assert_eq!(cloud.tree().len(), 6);
+}
+
+/// A round takes in at most its budget of new folders' contents; the rest
+/// goes in the next round, which the new folder's mark brings.
+#[tokio::test]
+async fn a_new_folders_contents_past_the_budget_wait_for_the_next_round() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("follow-budget", cloud.clone());
+    s.follow_max = 5;
+    for i in 0..12 {
+        write(&s.p(&format!("big/{i:02}.txt")), format!("file {i}").as_bytes());
+    }
+    let r = s.round().await;
+    let uploads = r.done.iter().filter(|op| matches!(op, Op::Upload { .. })).count();
+    assert_eq!(uploads, 5, "{r:?}");
+    s.settle().await;
+    assert_eq!(cloud.tree().keys().filter(|p| p.starts_with("/big/")).count(), 12);
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
+/// A synced file moved into a new folder: the move is planned where the
+/// file was (the planner decides a Synced item in its agreed folder), so
+/// it goes through a round's own review, never in with the new folder's
+/// contents (which `oneup_gate::may_follow` would refuse anyway). It lands,
+/// as a move, and nothing else changes.
+#[tokio::test]
+async fn a_move_into_a_new_folder_waits_for_the_next_rounds_review() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("follow-move", cloud.clone());
+    write(&s.p("a.txt"), b"synced");
+    s.settle().await;
+    std::fs::create_dir_all(s.p("new")).unwrap();
+    std::fs::rename(s.p("a.txt"), s.p("new/a.txt")).unwrap();
+    write(&s.p("new/b.txt"), b"new file");
+    let r = s.round().await;
+    assert!(r.done.iter().any(|op| matches!(op, Op::MkdirRemote { .. })), "{r:?}");
+    assert!(!r.done.iter().any(oneup_gate::is_mass_sensitive), "nothing moved in that round: {r:?}");
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(t["/new/a.txt"].as_deref(), Some(&b"synced"[..]), "{:?}", names(&t));
+    assert!(!t.contains_key("/a.txt"));
+    assert_eq!(cloud.0.lock().unwrap().uploaded, 6 + 8, "moved, not uploaded again");
+    assert_eq!(local_tree(&s.dir.0), t);
 }
 
 /// Behind one slow transfer, the rest of the round goes at most the
