@@ -455,6 +455,67 @@ fn kept_items_are_listed_restored_without_replacing_and_pruned() {
     assert!(fs.versions().unwrap().is_empty());
 }
 
+/// Listing the store measures each slot once: later listings take its
+/// size from `.oneup\versions.cache`, checked against the slot folder's
+/// creation time, and follow slots added and removed. A missing or
+/// damaged cache only costs measuring again.
+#[test]
+fn the_version_store_is_measured_once_per_slot() {
+    let r = Root::new("versions-cache");
+    let fs = r.fs();
+    let cache = r.p(".oneup/versions.cache");
+    let keep = |name: &str, content: &[u8]| {
+        std::fs::write(r.p(name), content).unwrap();
+        fs.apply(&approve(Op::RecycleLocal { sid: 1, local: pre(&r.p(name)) })).unwrap();
+    };
+    let bytes = || fs.versions().unwrap().iter().map(|s| (s.name.clone(), s.bytes)).collect::<Vec<_>>();
+    // Rewrites one field of every cache line.
+    let set_field = |n: usize, value: &str| {
+        let text = std::fs::read_to_string(&cache).unwrap();
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| {
+                let mut f: Vec<&str> = l.split('\t').collect();
+                f[n] = value;
+                f.join("\t")
+            })
+            .collect();
+        std::fs::write(&cache, lines.join("\n") + "\n").unwrap();
+    };
+
+    keep("a.txt", b"12345");
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
+
+    // Not measured again: the cache is what's read.
+    set_field(2, "999");
+    assert_eq!(bytes(), [("a.txt".to_string(), 999)]);
+    // Of another slot folder (another creation time): measured.
+    set_field(1, "1");
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    // Damaged or missing: measured, and written again.
+    std::fs::write(&cache, "garbage\tline\n").unwrap();
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    std::fs::remove_file(&cache).unwrap();
+    assert_eq!(bytes(), [("a.txt".to_string(), 5)]);
+    assert!(cache.exists());
+
+    // Slots added and removed.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    keep("b.txt", b"0123456789");
+    assert_eq!(bytes(), [("a.txt".to_string(), 5), ("b.txt".to_string(), 10)]);
+    let a = fs.versions().unwrap()[0].id.clone();
+    fs.restore(&a, None).unwrap();
+    assert_eq!(bytes(), [("b.txt".to_string(), 10)]);
+    assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
+    fs.prune_versions(Some(i64::MAX), None, false).unwrap();
+    assert!(bytes().is_empty());
+    assert_eq!(std::fs::read_to_string(&cache).unwrap(), "");
+    // Only the cache itself in our folder: no temp files left.
+    let ours: Vec<_> = std::fs::read_dir(r.p(".oneup")).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert!(!ours.iter().any(|n| n.to_string_lossy().ends_with(".tmp")), "{ours:?}");
+}
+
 #[test]
 fn automatic_trimming_follows_the_rule() {
     let r = Root::new("trim");
