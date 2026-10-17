@@ -934,6 +934,31 @@ async fn an_edit_in_onedrive_that_an_upload_went_over_is_kept_as_a_copy() {
     assert_eq!(cloud.tree().len(), 2);
 }
 
+/// The kept edit takes the first conflict name free, names compared as
+/// Windows compares them.
+#[tokio::test]
+async fn a_kept_edit_takes_the_first_conflict_name_not_taken() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-names", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    write(&s.p("notes (conflict 1).txt"), b"one");
+    write(&s.p("NOTES (CONFLICT 2).TXT"), b"two");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    let mut kept = Vec::new();
+    for _ in 0..5 {
+        kept.extend(s.round().await.kept_theirs.into_iter().map(|(_, name)| name));
+        if !kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(kept, ["notes (conflict 3).txt"]);
+    s.settle().await;
+    assert_eq!(cloud.tree()["/notes (conflict 3).txt"].as_deref(), Some(&b"theirs"[..]));
+}
+
 /// An edit an upload went over that can't be kept as a new file (its
 /// version won't download): the upload is still done, counted as such and
 /// not as a failure, and the edit is reported as not kept. It stays in the

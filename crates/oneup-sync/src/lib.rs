@@ -22,7 +22,7 @@ pub mod model;
 pub mod op;
 mod resolve;
 
-pub use merge::conflict_name;
+pub use merge::{conflict_candidate, conflict_name};
 pub use model::{
     Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold, fold_char,
 };

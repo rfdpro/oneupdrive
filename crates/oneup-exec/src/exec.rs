@@ -1,6 +1,5 @@
 //! The executor proper (see the crate docs).
 
-use std::collections::BTreeSet;
 use std::io::Seek as _;
 
 use oneup_cfapi::identity::Identity;
@@ -9,7 +8,7 @@ use oneup_gate::{Approved, OldCopy};
 use oneup_rules::ExcludeSet;
 use oneup_store::{Kind, LocalKind, LocalRow, Ops, RemoteRow, Store};
 use oneup_sync::{
-    Base, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, conflict_name, fold,
+    Base, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, conflict_candidate, fold,
 };
 
 use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, VersionMark};
@@ -379,16 +378,28 @@ impl<C: Cloud> Executor<C> {
         }
         let size = i64::try_from(len).map_err(|e| lost(e.to_string()))?;
         // Free on both sides, so the copy comes here under the same name.
-        let mut taken = store.read(|o| {
-            let mut taken: BTreeSet<String> = o.remote_children(&to.0)?.iter().map(|(r, _)| fold(&r.name)).collect();
-            if let Some(local) = o.synced_get(parent)?.and_then(|b| b.local) {
-                taken.extend(o.local_children(local.0)?.iter().map(|r| fold(&r.name)));
+        // Each name is looked up on its own: listing the folder would load
+        // every item in it, and a folder can hold millions.
+        let local = store.read(|o| Ok(o.synced_get(parent)?.and_then(|b| b.local)))?;
+        let free = |o: &Ops<'_>, copy: &str| -> oneup_store::Result<bool> {
+            if !o.remote_named(&to.0, copy)?.is_empty() {
+                return Ok(false);
             }
-            Ok(taken)
-        })?;
+            Ok(match local {
+                Some(l) => o.local_named(l.0, copy)?.is_empty(),
+                None => true,
+            })
+        };
+        let mut n = 0;
+        let mut tries = 0;
         // A name OneDrive has that the Remote tree doesn't yet: another.
-        for _ in 0..NAME_TRIES {
-            let copy = conflict_name(name, NodeKind::File, &mut taken);
+        while tries < NAME_TRIES {
+            n += 1;
+            let copy = conflict_candidate(name, NodeKind::File, n);
+            if !store.read(|o| free(o, &copy))? {
+                continue;
+            }
+            tries += 1;
             file.rewind().map_err(|e| lost(e.to_string()))?;
             let mut reader = Hashing::new(&mut *file);
             match self.cloud.upload(to, &copy, None, size, &mut reader).await {

@@ -118,19 +118,26 @@ fn unstaged(name: &str) -> Option<&str> {
 /// `name (conflict N).ext`, with N chosen so the folded result isn't in
 /// `taken` (which it then joins).
 pub fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -> String {
-    let (stem, ext) = match (kind, name.rfind('.')) {
-        // A leading dot (".gitignore") is part of the stem, not an extension.
-        (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
-        _ => (name, ""),
-    };
     let mut n = 1u32;
     loop {
-        let candidate = format!("{stem} (conflict {n}){ext}");
+        let candidate = conflict_candidate(name, kind, n);
         if taken.insert(fold(&candidate)) {
             return candidate;
         }
         n += 1;
     }
+}
+
+/// The `n`th name [`conflict_name`] tries: `name (conflict N).ext`. For a
+/// caller that asks whether each is taken instead of listing every name
+/// in the folder first.
+pub fn conflict_candidate(name: &str, kind: NodeKind, n: u32) -> String {
+    let (stem, ext) = match (kind, name.rfind('.')) {
+        // A leading dot (".gitignore") is part of the stem, not an extension.
+        (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    format!("{stem} (conflict {n}){ext}")
 }
 
 struct Ctx<'t, T: Trees + ?Sized> {

@@ -647,6 +647,18 @@ const PENDING_UNITS: &str = "SELECT folder_id, path, kind, depth, next_link, ite
      WHERE state = 0 ORDER BY depth, path LIMIT ?1";
 const PENDING_COUNT: &str = "SELECT count(*) FROM enum_unit WHERE state = 0";
 
+/// Children of `?1` named `?3` (folded), whose names are `?2` characters
+/// long. The fold maps each character to one, so a name of another length
+/// can't match: that cheap check spares folding most names.
+fn remote_named_sql() -> String {
+    format!("SELECT {ITEM_COLS} FROM remote_item WHERE parent_id = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3")
+}
+
+/// A name's length as SQLite's `length()` counts it: in characters.
+pub(crate) fn char_count(name: &str) -> i64 {
+    i64::try_from(name.chars().count()).unwrap_or(i64::MAX)
+}
+
 const REMOTE_ROOT: &str =
     "SELECT id, parent_id, name, kind, size, etag, qxh, mtime FROM remote_item WHERE kind = 2 LIMIT 1";
 
@@ -884,6 +896,18 @@ impl Ops<'_> {
             Ok((fix_kind(row)?, x))
         })
         .collect()
+    }
+
+    /// The stored children of cloud folder `parent_id` whose name is `name`
+    /// as Windows and OneDrive compare names ([`oneup_sync::fold`]): one, or
+    /// several where names that fold alike coexist in OneDrive. Read through
+    /// the parent index, and only the matches are loaded, however many
+    /// children the folder has.
+    pub fn remote_named(&self, parent_id: &str, name: &str) -> Result<Vec<RemoteRow>> {
+        let mut st = self.c.prepare_cached(&remote_named_sql())?;
+        let params = rusqlite::params![parent_id, char_count(name), oneup_sync::fold(name)];
+        let rows = st.query_map(params, RemoteRow::from_row)?;
+        rows.map(|r| fix_kind(r?)).collect()
     }
 
     /// Calls `f(id, name, is_excluded)` for every stored folder.
@@ -1363,6 +1387,55 @@ mod tests {
             let plan: Vec<String> = st.query_map([], |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
             assert!(!plan.iter().any(|step| step.starts_with("SCAN")), "{sql}\n{plan:#?}");
         }
+    }
+
+    /// Finding a child by name reads the folder's rows from the parent
+    /// index, never the whole table: a conflict name is chosen this way in
+    /// folders that can hold millions of items.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn by_name_queries_use_the_parent_indexes() {
+        let s = Store::open_in_memory().unwrap();
+        for sql in [remote_named_sql(), local::local_named_sql()] {
+            let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let nulls = std::iter::repeat_n(rusqlite::types::Null, st.parameter_count());
+            let plan: Vec<String> =
+                st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+            assert!(!plan.iter().any(|step| step.starts_with("SCAN")), "{sql}\n{plan:#?}");
+            assert!(plan.iter().any(|step| step.contains("_parent")), "{sql}\n{plan:#?}");
+        }
+    }
+
+    /// Names match as the planner compares them: per character, through
+    /// its simple upper case.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn children_are_found_by_name_as_windows_compares_names() {
+        let mut s = Store::open_in_memory().unwrap();
+        let item = |id: &str, parent: &str, name: &str| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind: Kind::File,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| {
+            o.upsert_item(&item("a", "p", "ΟΔΟΣ.txt"), false)?;
+            o.upsert_item(&item("b", "p", "\u{212A}.txt"), false)?;
+            o.upsert_item(&item("c", "q", "οδοσ.txt"), false)?;
+            Ok(())
+        })
+        .unwrap();
+        let ids = |name: &str| -> Vec<String> {
+            s.read(|o| o.remote_named("p", name)).unwrap().into_iter().map(|r| r.id).collect()
+        };
+        assert_eq!(ids("οδοσ.TXT"), ["a"]);
+        assert_eq!(ids("\u{212A}.TXT"), ["b"]);
+        assert!(ids("k.txt").is_empty(), "the Kelvin sign isn't k");
+        assert!(ids("ΟΔΟ.txt").is_empty());
     }
 
     /// Picking the next enumeration units and finding the drive's root read
