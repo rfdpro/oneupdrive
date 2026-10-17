@@ -5,12 +5,14 @@
 //! [`CloudError::NameTaken`]; the executor skips and re-plans either way.
 //! 507 (no room left) is [`CloudError::Full`].
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use oneup_graph::client::{Fragment, SIMPLE_UPLOAD_MAX};
+use oneup_graph::client::{BATCH_MAX, Fragment, SIMPLE_UPLOAD_MAX};
 use oneup_graph::fragment::{MAX_UNITS, Sizer, UNIT};
+use oneup_graph::model::DownloadInfo;
 use oneup_graph::{DriveItem, FileVersion, Graph};
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
@@ -27,6 +29,182 @@ pub struct GraphCloud {
     sizer: Arc<std::sync::Mutex<Sizer>>,
     /// How long each kind of request took ([`GraphCloud::timed`]).
     timings: Arc<Timings>,
+    /// Download links read ahead ([`Links`]), and a signal for when a
+    /// batch of them was read.
+    links: Arc<Mutex<Links>>,
+    links_read: Arc<tokio::sync::Notify>,
+}
+
+/// How long a link read ahead is used: they're pre-authenticated and
+/// short-lived, and one used within a minute of reading it works.
+const LINK_FRESH: Duration = Duration::from_secs(60);
+
+/// How long a coming download waits to have its link read ahead: one the
+/// round didn't get to (skipped, refused, the round stopped) is dropped.
+const AHEAD_STALE: Duration = Duration::from_secs(300);
+
+/// How many coming downloads and unused links are kept.
+const LINKS_MAX: usize = 1024;
+
+/// How long a finished download waits for the links it started reading.
+const REFILL_WAIT: Duration = Duration::from_secs(5);
+
+/// How many links are kept in hand ahead of the downloads that use them.
+const LINKS_AHEAD: usize = 3 * BATCH_MAX;
+
+/// Download links read ahead, [`BATCH_MAX`] at a time: a download first
+/// reads its item for the eTag and the link, and on its own that request
+/// took about four times the content of a small file (measured: 520 ms
+/// against 120 ms). The executor says which downloads are coming
+/// ([`Cloud::upcoming`]); a download whose link isn't here reads it with
+/// the next ones', and one whose link is being read waits for that, so
+/// downloads starting together send one batch. Bounded, self-cleaning, and
+/// each link is taken out when used.
+#[derive(Default)]
+struct Links {
+    /// Coming downloads whose links aren't read yet, oldest first, with
+    /// when they were announced; and the same as a set.
+    ahead: VecDeque<(String, Instant)>,
+    queued: HashSet<String>,
+    /// Links read and not used yet, and when they were read.
+    got: HashMap<String, (DownloadInfo, Instant)>,
+    /// Links being read now, and in how many batches.
+    reading: HashSet<String>,
+    batches: usize,
+}
+
+impl std::fmt::Debug for Links {
+    // The links are credentials: never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Links").field("ahead", &self.ahead.len()).field("got", &self.got.len()).finish()
+    }
+}
+
+/// What [`Links::claim`] found.
+#[derive(Debug)]
+enum Took {
+    Link(DownloadInfo),
+    /// Being read with others: wait for it.
+    Reading,
+    /// Not read: these are reserved for reading, the item first.
+    Batch(Vec<String>),
+}
+
+impl Links {
+    /// Drops links gone stale and coming downloads waiting too long.
+    fn purge(&mut self, now: Instant) {
+        self.got.retain(|_, (_, at)| now.saturating_duration_since(*at) < LINK_FRESH);
+        while let Some((id, at)) = self.ahead.front()
+            && now.saturating_duration_since(*at) >= AHEAD_STALE
+        {
+            self.queued.remove(id);
+            self.ahead.pop_front();
+        }
+    }
+
+    fn announce(&mut self, ids: impl IntoIterator<Item = String>, now: Instant) {
+        self.purge(now);
+        for id in ids {
+            if !self.got.contains_key(&id) && !self.reading.contains(&id) && self.queued.insert(id.clone()) {
+                self.ahead.push_back((id, now));
+            }
+        }
+        while self.ahead.len() > LINKS_MAX {
+            if let Some((id, _)) = self.ahead.pop_front() {
+                self.queued.remove(&id);
+            }
+        }
+    }
+
+    /// `id`'s link if one read ahead is still fresh, taken out; else
+    /// whether it's being read; else a batch reserved to read it with the
+    /// coming ones, as many as the room left under [`LINKS_AHEAD`] (just
+    /// it, when two batches are being read or there's no room). One step,
+    /// so two callers never both read it.
+    fn claim(&mut self, id: &str, now: Instant) -> Took {
+        self.purge(now);
+        if let Some((info, _)) = self.got.remove(id) {
+            return Took::Link(info);
+        }
+        if self.reading.contains(id) {
+            return Took::Reading;
+        }
+        let room = if self.batches >= 2 { 0 } else { self.room() };
+        Took::Batch(self.batch_for(Some(id), room.clamp(1, BATCH_MAX)))
+    }
+
+    /// How many more links may be in hand or being read.
+    fn room(&self) -> usize {
+        LINKS_AHEAD.saturating_sub(self.got.len() + self.reading.len())
+    }
+
+    /// The coming downloads to read ahead now, reserved (empty: none):
+    /// while more are coming, at most [`LINKS_AHEAD`] links are in hand or
+    /// being read, in at most two batches at once. A batch took 600-750 ms,
+    /// about as long as small downloads take to use 40 links, so downloads
+    /// then rarely wait for one.
+    fn refill(&mut self, now: Instant) -> Vec<String> {
+        self.purge(now);
+        let room = self.room();
+        if self.ahead.is_empty() || self.batches >= 2 || room == 0 {
+            return Vec::new();
+        }
+        self.batch_for(None, room.min(BATCH_MAX))
+    }
+
+    /// The items to read with `id`'s (none: only coming ones): it first,
+    /// then the coming ones not read yet, `max` in all. They count as being
+    /// read, in one more batch, until [`Links::finish`].
+    fn batch_for(&mut self, id: Option<&str>, max: usize) -> Vec<String> {
+        let mut ids: Vec<String> = id.into_iter().map(str::to_string).collect();
+        while ids.len() < max
+            && let Some((next, _)) = self.ahead.pop_front()
+        {
+            self.queued.remove(&next);
+            if !self.got.contains_key(&next) && !self.reading.contains(&next) && !ids.contains(&next) {
+                ids.push(next);
+            }
+        }
+        if let Some(id) = id {
+            self.queued.remove(id);
+        }
+        if !ids.is_empty() {
+            self.reading.extend(ids.iter().cloned());
+            self.batches += 1;
+        }
+        ids
+    }
+
+    fn finish(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            self.reading.remove(id);
+        }
+        self.batches = self.batches.saturating_sub(1);
+    }
+
+    fn keep(&mut self, id: String, info: DownloadInfo, now: Instant) {
+        if self.got.len() < LINKS_MAX {
+            self.got.insert(id, (info, now));
+        }
+    }
+}
+
+/// Ends a batch of [`Links::claim`] or [`Links::refill`] however it ends, the round
+/// stopping too: its links no longer count as being read, and the
+/// downloads waiting for them look again.
+struct Reading<'a> {
+    cloud: &'a GraphCloud,
+    ids: Vec<String>,
+}
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        self.cloud.links().finish(&self.ids);
+        self.cloud.links_read.notify_waiters();
+    }
 }
 
 /// How much memory an upload may hold at once (its largest fragment), by
@@ -56,7 +234,13 @@ impl GraphCloud {
     }
 
     pub fn with_memory(graph: Arc<Graph>, m: UploadMemory) -> Self {
-        Self { graph, sizer: Arc::new(std::sync::Mutex::new(Sizer::new(m.fragment))), timings: Arc::default() }
+        Self {
+            graph,
+            sizer: Arc::new(std::sync::Mutex::new(Sizer::new(m.fragment))),
+            timings: Arc::default(),
+            links: Arc::default(),
+            links_read: Arc::default(),
+        }
     }
 
     /// Records how long its requests take in `t` (shared with the
@@ -68,6 +252,85 @@ impl GraphCloud {
     /// The fragment size the next large upload would start with (learned).
     pub fn fragment_size(&self) -> usize {
         self.sizer().next(u64::MAX)
+    }
+
+    fn links(&self) -> std::sync::MutexGuard<'_, Links> {
+        self.links.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Item `id`'s eTag, kind and download link: read ahead, or read with
+    /// the coming downloads' ([`Links`]); `None` if it's gone. Whether it
+    /// was read ahead.
+    async fn link(&self, id: &str) -> Result<(Option<DownloadInfo>, bool), CloudError> {
+        let ids = loop {
+            let read = self.links_read.notified();
+            tokio::pin!(read);
+            read.as_mut().enable();
+            let found = self.links().claim(id, Instant::now());
+            match found {
+                Took::Link(info) => return Ok((Some(info), true)),
+                Took::Reading => read.await,
+                Took::Batch(ids) => break ids,
+            }
+        };
+        let batch = Reading { cloud: self, ids };
+        if batch.ids.len() > 1
+            && let Some(mine) = self.read_links(batch, Some(id)).await
+        {
+            return Ok((mine, false));
+        }
+        let started = Instant::now();
+        let info = self.graph.download_info(id).await.map_err(map)?;
+        self.timings.record("download: item and link", started);
+        Ok((info, false))
+    }
+
+    /// Reads `batch`'s links in one request and keeps them, apart from
+    /// `mine`'s, which it returns (`None`: not read, read it on its own).
+    async fn read_links(&self, batch: Reading<'_>, mine: Option<&str>) -> Option<Option<DownloadInfo>> {
+        let started = Instant::now();
+        let refs: Vec<&str> = batch.ids.iter().map(String::as_str).collect();
+        let answers = match self.graph.download_infos(&refs).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::debug!(error = %e, "download links couldn't be read together");
+                return None;
+            }
+        };
+        self.timings.record("download: links, read together", started);
+        let now = Instant::now();
+        let mut found = None;
+        let mut links = self.links();
+        for (other, answer) in batch.ids.iter().zip(answers) {
+            let is_mine = mine == Some(other.as_str());
+            match answer {
+                // Only an answer about the item asked for, with a link.
+                Ok(Some(info))
+                    if info.id.eq_ignore_ascii_case(other)
+                        && (info.download_url.is_some() || info.folder.is_some()) =>
+                {
+                    if is_mine {
+                        found = Some(Some(info));
+                    } else {
+                        links.keep(other.clone(), info, now);
+                    }
+                }
+                Ok(None) if is_mine => found = Some(None),
+                // Read on its own when its turn comes.
+                _ => {}
+            }
+        }
+        drop(links);
+        drop(batch);
+        found
+    }
+
+    /// Reads the next coming downloads' links, if [`Links::refill`] says so.
+    async fn refill(&self) {
+        let ids = self.links().refill(Instant::now());
+        if !ids.is_empty() {
+            self.read_links(Reading { cloud: self, ids }, None).await;
+        }
     }
 
     fn sizer(&self) -> std::sync::MutexGuard<'_, Sizer> {
@@ -349,10 +612,13 @@ impl Cloud for GraphCloud {
         true
     }
 
+    fn upcoming(&self, downloads: &[RemotePre]) {
+        self.links().announce(downloads.iter().map(|p| p.id.0.clone()), Instant::now());
+    }
+
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
-        let started = Instant::now();
-        let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
-        self.timings.record("download: item and link", started);
+        let (info, read_ahead) = self.link(&pre.id.0).await?;
+        let info = info.ok_or(CloudError::Changed)?;
         if info.e_tag.as_deref() != Some(pre.etag.as_str()) {
             return Err(CloudError::Changed);
         }
@@ -364,7 +630,37 @@ impl Cloud for GraphCloud {
         // eTag check, the executor's hash check against the planned version
         // catches it before anything local changes.
         let started = Instant::now();
-        self.graph.download_to(&url, out).await.map_err(|e| match e {
+        // The next links are read while this content arrives. A download
+        // that fails, or is stopped, doesn't wait for them; one that's done
+        // waits a little (an unfinished batch is dropped, and read again).
+        let fetched = {
+            let refill = std::pin::pin!(self.refill());
+            let content = std::pin::pin!(self.graph.download_to(&url, &mut *out));
+            match futures_util::future::select(content, refill).await {
+                futures_util::future::Either::Left((fetched, refill)) => {
+                    if fetched.is_ok() {
+                        let _ = tokio::time::timeout(REFILL_WAIT, refill).await;
+                    }
+                    fetched
+                }
+                futures_util::future::Either::Right(((), content)) => content.await,
+            }
+        };
+        let fetched = match fetched {
+            // A link read ahead that no longer works (it expired sooner
+            // than expected), before any byte arrived: read it again.
+            Err(e) if read_ahead && e.status().is_some_and(|s| matches!(s, 401 | 403 | 404 | 410)) => {
+                tracing::debug!(error = %e, "a download link read ahead didn't work; reading it again");
+                let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
+                if info.e_tag.as_deref() != Some(pre.etag.as_str()) {
+                    return Err(CloudError::Changed);
+                }
+                let url = info.download_url.ok_or_else(|| CloudError::Other("no download URL".into()))?;
+                self.graph.download_to(&url, out).await
+            }
+            r => r,
+        };
+        fetched.map_err(|e| match e {
             oneup_graph::Error::Local(io) => CloudError::Io(io),
             e => map(e),
         })?;
@@ -878,5 +1174,84 @@ mod tests {
         assert!(matches!(map(refused(400, r#"{"error":{"code":"insufficientStorage"}}"#)), CloudError::Full));
         assert!(matches!(map(refused(500, "")), CloudError::Other(_)));
         assert!(matches!(map(refused(412, "")), CloudError::Changed));
+    }
+
+    fn info(id: &str) -> DownloadInfo {
+        DownloadInfo { id: id.into(), e_tag: Some("e".into()), folder: None, download_url: Some("u".into()) }
+    }
+
+    #[test]
+    fn a_missing_link_is_read_with_the_coming_ones_and_each_used_once() {
+        let mut l = Links::default();
+        let now = Instant::now();
+        l.announce((0..30).map(|k| format!("i{k}")), now);
+        l.announce(["i3".to_string()], now);
+        assert_eq!(l.ahead.len(), 30, "announced once");
+        let Took::Batch(first) = l.claim("i0", now) else { panic!("not read yet") };
+        assert_eq!(first.len(), BATCH_MAX, "a batch's worth");
+        assert_eq!(first[0], "i0");
+        assert!(first.iter().skip(1).all(|id| id != "i0"), "{first:?}");
+        // While they're read, their downloads wait instead of reading again.
+        assert!(matches!(l.claim("i1", now), Took::Reading));
+        let rest = l.refill(now);
+        assert_eq!(rest.len(), 30 - BATCH_MAX, "the rest, and nothing being read");
+        l.announce((0..30).map(|k| format!("j{k}")), now);
+        assert!(l.refill(now).is_empty(), "two batches are being read");
+        l.finish(&rest);
+        for id in &first[1..] {
+            l.keep(id.clone(), info(id), now);
+        }
+        l.finish(&first);
+        assert_eq!(l.batches, 0);
+        // 19 links in hand: room for 41 more, a batch at a time.
+        let next = l.refill(now);
+        assert_eq!(next.len(), BATCH_MAX);
+        l.finish(&next);
+        for k in 0..LINKS_AHEAD - 19 - 5 {
+            l.keep(format!("h{k}"), info("h"), now);
+        }
+        assert_eq!(l.refill(now).len(), 5, "only the room left under the limit");
+        assert!(matches!(l.claim("i1", now), Took::Link(i) if i.id == "i1"));
+        assert!(matches!(l.claim("i1", now), Took::Batch(ids) if ids[0] == "i1"), "taken once: read again");
+    }
+
+    #[test]
+    fn a_missing_link_keeps_to_the_bounds_too() {
+        let mut l = Links::default();
+        let now = Instant::now();
+        l.announce((0..100).map(|k| format!("i{k}")), now);
+        let (a, b) = (l.refill(now), l.refill(now));
+        assert_eq!((a.len(), b.len(), l.batches), (BATCH_MAX, BATCH_MAX, 2));
+        assert!(l.refill(now).is_empty());
+        // Two batches are being read: a download whose link isn't among
+        // them reads only its own.
+        assert!(matches!(l.claim("x", now), Took::Batch(ids) if ids == ["x"]));
+        l.finish(&a);
+        l.finish(&b);
+        l.finish(&["x".to_string()]);
+        // Room for 5 more under the limit: it and 4 coming ones.
+        for k in 0..LINKS_AHEAD - 5 {
+            l.keep(format!("h{k}"), info("h"), now);
+        }
+        assert!(matches!(l.claim("y", now), Took::Batch(ids) if ids.len() == 5 && ids[0] == "y"));
+    }
+
+    #[test]
+    fn links_read_ahead_go_stale_and_stay_bounded() {
+        let mut l = Links::default();
+        let then = Instant::now();
+        l.keep("a".into(), info("a"), then);
+        assert!(matches!(l.claim("a", then + LINK_FRESH), Took::Batch(_)), "stale after a minute");
+        l.announce(["old".to_string()], then);
+        l.announce(["new".to_string()], then + AHEAD_STALE);
+        assert_eq!(l.ahead.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["new"], "one waiting too long goes");
+        l.announce((0..LINKS_MAX + 10).map(|k| format!("i{k}")), then + AHEAD_STALE);
+        assert_eq!((l.ahead.len(), l.queued.len()), (LINKS_MAX, LINKS_MAX));
+        for k in 0..LINKS_MAX + 10 {
+            l.keep(format!("k{k}"), info("k"), then);
+        }
+        assert_eq!(l.got.len(), LINKS_MAX);
+        // Its debug output holds no link.
+        assert!(!format!("{l:?}").contains('u'));
     }
 }

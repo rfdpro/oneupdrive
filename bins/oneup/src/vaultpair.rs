@@ -412,6 +412,14 @@ impl Cloud for PairCloud {
         }
     }
 
+    fn upcoming(&self, downloads: &[RemotePre]) {
+        match self {
+            PairCloud::Plain(c) => c.upcoming(downloads),
+            // A vault downloads each file's encrypted content by its own ID.
+            PairCloud::Vault(_) => {}
+        }
+    }
+
     fn concurrent(&self) -> bool {
         match self {
             PairCloud::Plain(c) => c.concurrent(),

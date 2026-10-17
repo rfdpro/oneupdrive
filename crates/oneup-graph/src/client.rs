@@ -239,6 +239,21 @@ impl Graph {
         }
     }
 
+    /// [`Graph::download_info`] for up to [`BATCH_MAX`] items in one round
+    /// trip, in the order given; each `None` if it no longer exists.
+    pub async fn download_infos(&self, ids: &[&str]) -> Result<Vec<Result<Option<crate::model::DownloadInfo>>>> {
+        let reqs: Vec<BatchReq> = ids.iter().map(|id| self.batch_get(id)).collect();
+        let answers = self.batch(&reqs).await?;
+        Ok(answers
+            .into_iter()
+            .map(|a| match a.status {
+                404 => Ok(None),
+                200..=299 => Ok(Some(serde_json::from_value(a.body)?)),
+                _ => Err(a.error("reading a download link")),
+            })
+            .collect())
+    }
+
     /// The item at drive path `path` ("/a/b.txt"), or `None`.
     pub async fn item_by_path(&self, path: &str) -> Result<Option<DriveItem>> {
         let url = format!("{}:/{}", self.top_url(), encode_drive_path(path.trim_start_matches('/')));
