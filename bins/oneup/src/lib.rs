@@ -39,6 +39,7 @@ pub mod settingsapi;
 pub mod setup;
 #[cfg(windows)]
 pub mod shellstatus;
+pub mod shortcuts;
 pub mod space;
 pub mod stoplist;
 pub mod sync;

@@ -99,6 +99,16 @@ fn check_folders(path: &Path, onedrive_folders: &[PathBuf]) -> Option<OtherEngin
         .map(|f| OtherEngine::Contains { provider: provider(), folder: f.clone() })
 }
 
+/// `\\?\C:\x` → `C:\x` and `\\?\UNC\srv\x` → `\\srv\x`: a path as people
+/// and shortcuts write it.
+pub fn plain(p: &Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    match s.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}").into(),
+        None => s.strip_prefix(r"\\?\").unwrap_or(&s).into(),
+    }
+}
+
 /// Whether `child` is `parent` or below it, comparing path components
 /// case-insensitively (as Windows does) and ignoring `\\?\` prefixes and
 /// trailing separators.
@@ -123,6 +133,13 @@ pub fn is_within(child: &Path, parent: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_paths_lose_the_long_path_prefix() {
+        assert_eq!(plain(Path::new(r"\\?\C:\Users\Me\OneUpDrive")), Path::new(r"C:\Users\Me\OneUpDrive"));
+        assert_eq!(plain(Path::new(r"\\?\UNC\nas\share")), Path::new(r"\\nas\share"));
+        assert_eq!(plain(Path::new(r"D:\Sync")), Path::new(r"D:\Sync"));
+    }
 
     #[test]
     fn within_is_case_insensitive_and_component_wise() {

@@ -45,6 +45,14 @@ Any new background behaviour must be pausable, prioritisable, explainable (`oneu
 * Planner and safety gate must stay **pure** (no I/O) so they can run under deterministic simulation.
 * Prefer small, well-named modules; match surrounding style; comment the *why*, not the *what*.
 
+## Interface copy
+Labels, buttons, statuses and CLI messages: short, direct, plain.
+* Name the action or setting by what it does: "Update shortcuts to use OneUpDrive folder", "Timeout highly active files". Avoid vague phrases ("Files that keep changing", "Wait until they're left alone").
+* Buttons are one verb: **Search**, **Update**, **Undo**. Statuses are terse: "Nothing found."
+* Don't explain what the user can infer (that a backup is kept, that Undo undoes). If a note restates the button, delete it.
+* Precise terms beat gentle ones: "Timeout (seconds)", not "Quiet for".
+* No hedging, no chatty clauses, no "but can…" or "left as they were"; say "skipped".
+
 ## Dependencies & licensing
 * License: MIT. New dependencies must be compatible (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, CDLA-Permissive-2.0: the list in `packaging/about.toml`); after changing dependencies, regenerate `THIRD-PARTY-NOTICES.txt` (command in `CONTRIBUTING.md`). **No GPL/AGPL/LGPL code**. In particular, do not copy from Cryptomator (AGPL/GPL) or abraunegg/onedrive (GPL). Implement from public specs. rclone (MIT) may be consulted, with attribution.
 * Crypto: RustCrypto crates only. No hand-rolled primitives. `zeroize` all key material.

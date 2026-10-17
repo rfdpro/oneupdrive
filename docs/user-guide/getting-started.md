@@ -23,6 +23,19 @@ After that it runs quietly in the background, and the window shows your files on
 
 > In OneDrive you can choose a folder, or `/` for all of it. Coming from the OneDrive app? Read [Moving over from the OneDrive app](migrating-from-onedrive.md) first.
 
+## Shortcuts to your old OneDrive folder
+Shortcuts made while the OneDrive app ran break after you switch:
+* **Started in a new folder:** they still point into the old `OneDrive` folder.
+* **Moved over:** the path is right, but Windows can't open the shortcut any more. It was saved through the OneDrive app's entry in Explorer, which is removed when the app is unlinked.
+
+To fix them, open **General → Update shortcuts to use OneUpDrive folder** and select **Search**. It checks the Desktop, Start menu and taskbar. **Update** fixes every shortcut listed; **Undo** restores them.
+
+It only changes shortcuts whose file or folder is in your synced folder now. Shortcuts stored inside a synced folder are skipped, because changing them would change OneDrive too.
+
+After setup, the window opens this section by itself if it finds any.
+
+Command line: `oneup shortcuts` lists, `--fix` updates, `--undo` restores. `--from "D:\OneDrive"` names the old folder if it wasn't `%USERPROFILE%\OneDrive`.
+
 ## Updates
 **Updates install themselves.** About once a day OneUpDrive looks for a new release, downloads it in the background and checks that it's signed by the same publisher as the copy you have; anything else is thrown away. It installs the update when nothing is syncing (pausing syncing around it) and tells you; **Install update…** in the icon's menu does it straight away. In the settings window, **General** has **Check now**, turns automatic installing off (an update found is then installed only when you choose **Install update…**), or gets preview versions too. From the command line: `oneup updates` shows the choice, `--auto on|off` and `--channel stable|preview` change it, and `--check` looks now.
 

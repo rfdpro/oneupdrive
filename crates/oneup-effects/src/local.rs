@@ -9,10 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use oneup_gate::{Approved, OldCopy};
 use oneup_ntfs::FileId;
-use oneup_ntfs::dirent::{
-    DirEntry, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
-    FILE_ATTRIBUTE_REPARSE_POINT,
-};
+use oneup_ntfs::dirent::{DirEntry, FILE_ATTRIBUTE_REPARSE_POINT};
 use oneup_ntfs::win::{self, Handle, Volume};
 use oneup_rules::ENGINE_DIR;
 use oneup_sync::{Hash, LocalId, LocalPre, Op};
@@ -47,10 +44,7 @@ const ORIGIN: &str = "origin.txt";
 
 /// Attributes that make an item something other than an ordinary file or
 /// folder whose data is on disk. Such items are never changed.
-const NOT_ORDINARY: u32 = FILE_ATTRIBUTE_REPARSE_POINT
-    | FILE_ATTRIBUTE_OFFLINE
-    | FILE_ATTRIBUTE_RECALL_ON_OPEN
-    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+const NOT_ORDINARY: u32 = oneup_ntfs::dirent::NOT_PLAIN;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

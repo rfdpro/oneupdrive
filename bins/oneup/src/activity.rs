@@ -21,10 +21,7 @@ pub fn within(root: &Path, path: &str) -> Result<String> {
         return Ok(path.to_owned());
     }
     // The recorded folder is canonical (`\\?\C:\…`); typed paths usually aren't.
-    let plain = |s: &str| match s.strip_prefix(r"\\?\UNC\") {
-        Some(rest) => format!(r"\\{rest}"),
-        None => s.strip_prefix(r"\\?\").unwrap_or(s).to_owned(),
-    };
+    let plain = |s: &str| oneup_local::coexist::plain(Path::new(s)).to_string_lossy().into_owned();
     let (root, p) = (plain(&root.to_string_lossy()), plain(path));
     let lower = |c: Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
     let mut parts = Path::new(&p).components().filter(|c| !matches!(c, Component::CurDir));

@@ -1,12 +1,13 @@
 //! Where Windows keeps a user's own folders (Desktop, Documents, ...), for
-//! PC folder backup. Read only: OneUpDrive never moves or redirects them.
+//! PC folder backup, and the folders holding their shortcuts. Read only:
+//! OneUpDrive never moves or redirects them.
 
 use std::path::PathBuf;
 
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT,
-    SHGetKnownFolderPath,
+    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_StartMenu, FOLDERID_UserPinned,
+    FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
 };
 use windows::core::GUID;
 
@@ -51,16 +52,31 @@ impl Known {
     /// Where the folder is now (it may have been moved, e.g. into the
     /// OneDrive app's folder by its own backup).
     pub fn path(self) -> crate::Result<PathBuf> {
-        // SAFETY: the GUID is a valid reference for the call; on success the
-        // returned string is a valid NUL-terminated wide string that we own
-        // and free with CoTaskMemFree once copied.
-        unsafe {
-            let p = SHGetKnownFolderPath(&self.id(), KF_FLAG_DEFAULT, None)
-                .map_err(|source| crate::Error::Win32 { op: "SHGetKnownFolderPath", source })?;
-            let s = p.to_string().ok();
-            CoTaskMemFree(Some(p.0 as *const _));
-            s.map(PathBuf::from).ok_or(crate::Error::Unsupported)
-        }
+        known_path(&self.id())
+    }
+}
+
+/// The user's Start menu (`%APPDATA%\Microsoft\Windows\Start Menu`).
+pub fn start_menu() -> crate::Result<PathBuf> {
+    known_path(&FOLDERID_StartMenu)
+}
+
+/// The shortcuts pinned to the taskbar (and the Start menu's pins of
+/// older Windows), in `TaskBar` and `StartMenu` below it.
+pub fn user_pinned() -> crate::Result<PathBuf> {
+    known_path(&FOLDERID_UserPinned)
+}
+
+fn known_path(id: &GUID) -> crate::Result<PathBuf> {
+    // SAFETY: the GUID is a valid reference for the call; on success the
+    // returned string is a valid NUL-terminated wide string that we own
+    // and free with CoTaskMemFree once copied.
+    unsafe {
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)
+            .map_err(|source| crate::Error::Win32 { op: "SHGetKnownFolderPath", source })?;
+        let s = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const _));
+        s.map(PathBuf::from).ok_or(crate::Error::Unsupported)
     }
 }
 
@@ -75,5 +91,7 @@ mod tests {
         assert!(docs.is_absolute());
         assert_eq!(Known::parse("pictures"), Some(Known::Pictures));
         assert_eq!(Known::parse("Downloads"), None);
+        assert!(start_menu().unwrap().is_absolute());
+        assert!(user_pinned().unwrap().is_absolute());
     }
 }

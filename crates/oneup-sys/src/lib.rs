@@ -33,6 +33,8 @@ pub mod known;
 #[cfg(windows)]
 pub mod processes;
 #[cfg(windows)]
+pub mod shortcut;
+#[cfg(windows)]
 pub mod signal;
 #[cfg(windows)]
 pub mod tray;

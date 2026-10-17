@@ -24,10 +24,7 @@ use std::os::windows::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 use oneup_ntfs::FileId;
-use oneup_ntfs::dirent::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
-};
+use oneup_ntfs::dirent::FILE_ATTRIBUTE_DIRECTORY;
 use oneup_ntfs::win::{self, Volume};
 use oneup_store::{LocalKind, LocalRoot, LocalRow};
 
@@ -35,11 +32,7 @@ use crate::classify::is_cloud_tag;
 
 /// Attributes that mean "not an ordinary file whose data is simply on disk".
 /// Any of them is reason enough not to read it.
-const NOT_ORDINARY: u32 = FILE_ATTRIBUTE_REPARSE_POINT
-    | FILE_ATTRIBUTE_OFFLINE
-    | FILE_ATTRIBUTE_RECALL_ON_OPEN
-    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
-    | FILE_ATTRIBUTE_DIRECTORY;
+const NOT_ORDINARY: u32 = oneup_ntfs::dirent::NOT_PLAIN | FILE_ATTRIBUTE_DIRECTORY;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

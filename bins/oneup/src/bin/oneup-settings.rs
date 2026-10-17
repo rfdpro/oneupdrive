@@ -570,6 +570,38 @@ mod win {
                 }
                 Ok(Value::from(at??))
             }
+            "shortcuts" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let s = oneup_app::shortcuts::find(&d, None)?;
+                    Ok(oneup_app::shortcuts::scan_json(&d, &s))
+                })
+                .await?
+            }
+            "shortcuts_fix" => {
+                let d = dir.to_path_buf();
+                let links: Vec<String> = args
+                    .get("links")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                    .unwrap_or_default();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let s = oneup_app::shortcuts::find(&d, None)?;
+                    let chosen: Vec<_> =
+                        s.found.into_iter().filter(|f| links.iter().any(|l| Path::new(l) == f.link)).collect();
+                    let o = oneup_app::shortcuts::fix(&d, &chosen)?;
+                    Ok(json!({ "changed": o.changed, "skipped": o.skipped.len() }))
+                })
+                .await?
+            }
+            "shortcuts_undo" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let o = oneup_app::shortcuts::undo(&d)?;
+                    Ok(json!({ "changed": o.changed, "skipped": o.skipped.len() }))
+                })
+                .await?
+            }
             "sync_first" => agent(dir, Call::SyncFirst { path: text(args, "rel") }).await,
             "sign_out" => {
                 // Syncing stops with it; files stay where they are.

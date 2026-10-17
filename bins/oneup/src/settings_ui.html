@@ -1990,13 +1990,20 @@
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
             <p class="note">Memory and priority apply after a restart.</p>
-            <h3>Files that keep changing</h3>
+            <h3>File changes</h3>
             <div class="card">
                 <div class="row">
-                    <div class="label"><b>Wait until they're left alone</b><small>A file saved again and again is sent once it stops changing, not after every save</small></div>
-                    <label class="toggle"><input type="checkbox" data-agent="hold_busy_files" aria-label="Wait until files that keep changing are left alone"><span></span></label></div>
+                    <div class="label"><b>Timeout highly active files</b><small>Don't upload files with constant updates on every change, wait for quiet period.</small></div>
+                    <label class="toggle"><input type="checkbox" data-agent="hold_busy_files" aria-label="Timeout highly active files"><span></span></label></div>
                 <div class="row">
-                    <div class="label"><b>Quiet for</b><small>Seconds without a change before it's sent</small></div><input type="number" min="1" data-agent="busy_quiet_s"></div>
+                    <div class="label"><b>Timeout (seconds)</b><small>Ensure file is quiet before sending update</small></div><input type="number" min="1" data-agent="busy_quiet_s"></div>
+            </div>
+            <h3 id="shortcuts">Shortcuts</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Update shortcuts to use OneUpDrive folder</b><small id="sc-state">Desktop, Start menu and taskbar</small></div>
+                    <div class="actions"><button class="btn" id="sc-undo" hidden>Undo</button><button class="btn" id="sc-find">Search</button><button class="btn primary" id="sc-fix" hidden>Update</button></div></div>
+                <div id="sc-list"></div>
             </div>
             <h3>Updates</h3>
             <div class="card">
@@ -2285,6 +2292,7 @@
             }
             if (page === "files") openFiles();
             if (page === "accounts") loadAccounts();
+            if (page === "general" && !scSearched) loadShortcuts();
             if (page === "lists") loadList(true);
         }
         $$("nav button").forEach(b => b.onclick = () => show(b.dataset.page));
@@ -2491,6 +2499,45 @@
                 $("#upd-detail").textContent = e.message;
             }
         };
+
+        let scFound = [];
+        let scSearched = false;
+        const plural = (n, one) => n + " " + one + (n === 1 ? "" : "s");
+        async function loadShortcuts() {
+            scSearched = true;
+            $("#sc-state").textContent = "Searching…";
+            try {
+                const r = await call("shortcuts");
+                scFound = r.found;
+                const n = r.found.length;
+                $("#sc-state").textContent = n ? plural(n, "shortcut") + " to update" : "Nothing found.";
+                $("#sc-fix").hidden = !n;
+                $("#sc-fix").textContent = "Update " + plural(n, "shortcut");
+                $("#sc-undo").hidden = !r.last_fix;
+                if (r.last_fix) $("#sc-undo").title = "Restore the " + plural(r.last_fix.count, "shortcut") + " updated " + when(r.last_fix.at_ms);
+                $("#sc-list").replaceChildren(...r.found.map(f => el("div", {
+                    className: "row"
+                }, el("div", {
+                    className: "label"
+                }, el("b", {}, f.name), el("small", {
+                    className: "path",
+                    title: f.target
+                }, f.place + (f.broken ? " · broken" : "") + " → " + f.new_target)))));
+                return n;
+            } catch (e) {
+                $("#sc-state").textContent = "Search failed: " + e.message;
+                return 0;
+            }
+        }
+        async function scChange(op, args, done) {
+            await run(call(op, args), r => done + " " + plural(r.changed, "shortcut") + (r.skipped ? "; " + r.skipped + " skipped" : "")).catch(() => null);
+            loadShortcuts();
+        }
+        $("#sc-find").onclick = loadShortcuts;
+        $("#sc-fix").onclick = () => scChange("shortcuts_fix", {
+            links: scFound.map(f => f.link)
+        }, "Updated");
+        $("#sc-undo").onclick = () => scChange("shortcuts_undo", {}, "Restored");
 
         // ---- activity: what sync did, and the lists the icon's menu used
         // to show in a console or Notepad. It opens the window on one of
@@ -5485,6 +5532,10 @@
                 toast("Syncing has started");
                 await load();
                 show("files");
+                if (await loadShortcuts()) {
+                    show("general");
+                    $("#shortcuts").scrollIntoView();
+                }
             } catch (e) {
                 $("#preview").textContent = e.message;
                 toast("Setting up didn't finish", true);
