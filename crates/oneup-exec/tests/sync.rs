@@ -1229,6 +1229,27 @@ async fn independent_cloud_changes_go_in_batches_and_dependent_ones_never_togeth
     assert!(cloud.holds(b"x.txt") && cloud.holds(b"y.txt") && cloud.holds(b"z.txt"));
 }
 
+/// A folder's move and a change deeper inside it can share a batch: each
+/// names its item by ID with its own eTag, and neither depends on where the
+/// other's item is. Both land, and nothing else changes.
+#[tokio::test]
+async fn a_folder_move_and_a_change_deep_inside_it_both_land() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("batch-deep", cloud.clone());
+    write(&s.p("a/sub/g.txt"), b"grandchild");
+    std::fs::create_dir_all(s.p("b")).unwrap();
+    s.settle().await;
+    cloud.0.lock().unwrap().batches.clear();
+    std::fs::rename(s.p("a/sub/g.txt"), s.p("a/sub/h.txt")).unwrap();
+    std::fs::rename(s.p("a"), s.p("b/a")).unwrap();
+    s.settle().await;
+    assert!(cloud.0.lock().unwrap().batches.contains(&2), "they went in one batch");
+    let t = cloud.tree();
+    assert_eq!(t["/b/a/sub/h.txt"].as_deref(), Some(&b"grandchild"[..]), "{:?}", names(&t));
+    assert!(!t.contains_key("/a") && !t.contains_key("/b/a/sub/g.txt"));
+    assert_eq!(local_tree(&s.dir.0), t);
+}
+
 #[tokio::test]
 async fn a_cloud_edit_replaces_the_local_file_and_its_version_history_has_the_old_one() {
     let cloud = Fake::new();
