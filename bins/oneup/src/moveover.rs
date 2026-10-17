@@ -40,6 +40,17 @@ pub fn app_folder() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+/// The app's folder when the pair was made: the app erases its own setting
+/// when it's unlinked.
+pub(crate) const KEY_APP_FOLDER: &str = "sync.app_folder";
+
+pub(crate) fn note_app_folder(o: &oneup_store::Ops<'_>, local: &Path) -> oneup_store::Result<()> {
+    match app_folder().filter(|a| !oneup_local::coexist::is_within(local, a)) {
+        Some(app) => o.meta_set(KEY_APP_FOLDER, &app.to_string_lossy()),
+        None => Ok(()),
+    }
+}
+
 /// The OneDrive app's folder on this PC, as it is now.
 #[derive(Debug, Clone)]
 pub struct App {

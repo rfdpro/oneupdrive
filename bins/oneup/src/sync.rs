@@ -295,6 +295,7 @@ async fn prepare(
         store.write(|o| {
             o.meta_set(KEY_LOCAL, &local.to_string_lossy())?;
             o.meta_set(KEY_REMOTE, &remote_path)?;
+            crate::moveover::note_app_folder(o, &local)?;
             o.meta_set(KEY_TOKEN, &token)
         })?;
     }

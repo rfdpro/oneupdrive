@@ -437,6 +437,23 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// List broken shortcuts to OneDrive files (Desktop, Start menu,
+    /// taskbar); `--fix` updates them to the synced folder, `--undo`
+    /// restores them
+    Shortcuts {
+        /// Update them
+        #[arg(long, conflicts_with = "undo")]
+        fix: bool,
+        /// Restore the shortcuts the last --fix updated
+        #[arg(long)]
+        undo: bool,
+        /// The OneDrive app's folder, if it was somewhere else
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Print what was found as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// The Microsoft accounts on this PC, each with its own data folder;
     /// `add NAME` makes one (sign in from the settings window it opens)
     Accounts {
@@ -923,6 +940,50 @@ impl Toggle {
 enum OverflowChoice {
     Hold,
     Keep,
+}
+
+fn shortcuts_cmd(dir: &Path, fix: bool, undo: bool, from: Option<&Path>, json: bool) -> Result<()> {
+    use oneup_app::shortcuts;
+    let n = |k: usize| format!("{k} shortcut{}", if k == 1 { "" } else { "s" });
+    let skipped = |o: &shortcuts::Outcome| {
+        for (link, why) in &o.skipped {
+            println!("  skipped {} ({why})", link.display());
+        }
+    };
+    if undo {
+        let o = shortcuts::undo(dir)?;
+        println!("Restored {}.", n(o.changed));
+        skipped(&o);
+        return Ok(());
+    }
+    let s = shortcuts::find(dir, from)?;
+    if json && !fix {
+        println!("{}", shortcuts::scan_json(dir, &s));
+        return Ok(());
+    }
+    for f in &s.found {
+        println!(
+            "{:<10}  {}{}\n            → {}",
+            f.place.label(),
+            f.link.display(),
+            if f.broken { "  (broken)" } else { "" },
+            f.new_target.display()
+        );
+    }
+    if s.unmatched > 0 {
+        let verb = if s.unmatched == 1 { "leads" } else { "lead" };
+        println!("{} {verb} to items not in the synced folder; not changed.", n(s.unmatched));
+    }
+    if s.found.is_empty() {
+        println!("Nothing found.");
+    } else if fix {
+        let o = shortcuts::fix(dir, &s.found)?;
+        println!("Updated {}. Undo: oneup shortcuts --undo", n(o.changed));
+        skipped(&o);
+    } else {
+        println!("Update: oneup shortcuts --fix");
+    }
+    Ok(())
 }
 
 /// An approval code: the 16 hex digits a safety stop prints.
@@ -1697,6 +1758,9 @@ async fn run() -> Result<()> {
         }
         Cmd::Updates { auto, channel, check } => {
             updates_cmd(&data_dir(&cli)?, auto.map(Toggle::on), channel.as_deref(), *check)
+        }
+        Cmd::Shortcuts { fix, undo, from, json } => {
+            shortcuts_cmd(&data_dir(&cli)?, *fix, *undo, from.as_deref(), *json)
         }
         Cmd::Accounts { add } => match add {
             Some(AccountsCmd::Add { name }) => {

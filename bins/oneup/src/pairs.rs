@@ -99,6 +99,30 @@ pub struct Entry {
     pub remote: String,
 }
 
+/// [`list`], for safety checks: only a missing folder or marker means
+/// "none"; any other error is returned rather than skipped.
+pub fn list_strict(main: &Path) -> std::io::Result<Vec<Entry>> {
+    let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let entries = match std::fs::read_dir(main.join(PAIRS)) {
+        Ok(e) => e,
+        Err(e) if not_found(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let e = e?;
+        let dir = e.path();
+        let remote = match std::fs::read_to_string(dir.join(MARKER)) {
+            Ok(r) => r,
+            Err(e) if not_found(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        out.push(Entry { name: e.file_name().to_string_lossy().into_owned(), dir, remote: remote.trim().to_string() });
+    }
+    out.sort_by_key(|e| e.name.to_lowercase());
+    Ok(out)
+}
+
 /// The extra pairs of the main data folder `main`.
 pub fn list(main: &Path) -> Vec<Entry> {
     let mut out: Vec<Entry> = std::fs::read_dir(main.join(PAIRS))
