@@ -14,7 +14,9 @@
 //!    version store wait for the user's decision (by default) while
 //!    everything else goes ahead;
 //! 5. the executor carries out what was approved, re-checking every
-//!    precondition right before acting.
+//!    precondition right before acting. What goes into the folders it
+//!    makes is planned and reviewed as each one is made, and runs in the
+//!    same round ([`Follower`]).
 //!
 //! The pairing (local folder ↔ OneDrive folder) is recorded in the data
 //! folder's database on the first run, together with the token written
@@ -625,16 +627,17 @@ impl Engine {
     #[allow(clippy::type_complexity)]
     fn hold_failed(
         &self,
-        store: &Store,
+        o: &Ops<'_>,
         planned: Vec<(Approved, Line)>,
-    ) -> Result<(Vec<(Approved, Line)>, Vec<(Approved, Line)>, Option<std::time::Instant>)> {
-        if !self.backs_off() || !store.read(|o| o.retry_any())? {
+    ) -> oneup_store::Result<(Vec<(Approved, Line)>, Vec<(Approved, Line)>, Option<std::time::Instant>)> {
+        if !self.backs_off() || !o.retry_any()? {
             return Ok((planned, Vec::new(), None));
         }
         let at = now_ms();
-        let waits = store.read(|o| {
-            planned.iter().map(|(a, _)| crate::backoff::until(o, a.op(), at)).collect::<oneup_store::Result<Vec<_>>>()
-        })?;
+        let waits = planned
+            .iter()
+            .map(|(a, _)| crate::backoff::until(o, a.op(), at))
+            .collect::<oneup_store::Result<Vec<_>>>()?;
         let (now, mut waits) = (std::time::Instant::now(), waits.into_iter());
         Ok(hold_back(planned, |_| waits.next().flatten().map(|u| after_ms(now, u - at))))
     }
@@ -1191,7 +1194,7 @@ impl Engine {
             };
             let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra };
             let t = std::time::Instant::now();
-            let Planned { review, problems, upto, suspicious } =
+            let Planned { review, problems, upto, suspicious, policy, synced, planning } =
                 plan_round(&store, Some(self.exec.local()), scope, controls, window, &user_rules, modes)?;
             // Said, so a slow start can be told from a slow round (one
             // can take minutes on a large folder).
@@ -1304,7 +1307,7 @@ impl Engine {
             } else {
                 (planned, Vec::new())
             };
-            let (planned, failing, retry_at) = self.hold_failed(&store, planned)?;
+            let (planned, failing, retry_at) = store.read(|o| self.hold_failed(o, planned))?;
             out.held_until = earliest(until, retry_at);
             let mut later: Vec<Op> = waiting.iter().map(|(op, _)| op.clone()).collect();
             later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
@@ -1328,8 +1331,30 @@ impl Engine {
                 })
                 .unzip();
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
-            let report =
-                self.run_reported(&mut store, approved, n, bytes_total, progress, controls.live.as_deref()).await;
+            let (approvals, decisions) = (controls.answers.approvals(), controls.answers.decisions());
+            let follower = Follower {
+                engine: self,
+                planning: &planning,
+                policy: &policy,
+                cx: GateContext {
+                    synced_items: synced,
+                    recent: window,
+                    approvals: &approvals,
+                    decisions: &decisions,
+                    room: None,
+                    suspicious: &[],
+                },
+                order: &order,
+                on_demand,
+                taken: std::sync::Mutex::default(),
+                items: std::sync::atomic::AtomicU64::new(0),
+                bytes: std::sync::atomic::AtomicU64::new(0),
+            };
+            let report = self
+                .run_reported(&mut store, approved, n, bytes_total, progress, controls.live.as_deref(), &follower)
+                .await;
+            // What went into the new folders ran after the rest: reported last.
+            let planned = [planned, follower.taken.into_inner().unwrap_or_else(|p| p.into_inner())].concat();
             // Paused meanwhile: what didn't run is planned again from the
             // marks, which stay, as for work the gate put off.
             let deferred = deferred || !report.not_run.is_empty();
@@ -1512,6 +1537,7 @@ impl Engine {
     /// counted where every transfer passes, the bandwidth caps, so a large
     /// file moves them while it's on its way. With `live`, a pause that
     /// comes meanwhile stops the paused side's operations from then on.
+    #[allow(clippy::too_many_arguments)]
     async fn run_reported(
         &self,
         store: &mut Store,
@@ -1520,6 +1546,7 @@ impl Engine {
         bytes_total: u64,
         progress: &(dyn Fn(Option<Progress>) + Send + Sync),
         live: Option<&crate::control::LivePause>,
+        follower: &Follower<'_>,
     ) -> Report {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         let items_total = approved.len() as u64;
@@ -1528,10 +1555,12 @@ impl Engine {
         let moved_before = moved();
         let started = std::time::Instant::now();
         let tell = || {
+            // What went into new folders counts as it's taken in.
+            let bytes_total = bytes_total + follower.bytes.load(Relaxed);
             progress(Some(Progress {
                 round,
                 items_done: items_done.load(Relaxed),
-                items_total,
+                items_total: items_total + follower.items.load(Relaxed),
                 bytes_done: moved().saturating_sub(moved_before).min(bytes_total),
                 bytes_total,
                 elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -1542,7 +1571,8 @@ impl Engine {
         };
         let paused = live.map(crate::control::LivePause::round_check);
         let may_run = |op: &Op| paused.as_ref().is_none_or(|p| p(op));
-        let run = self.exec.run_checked(store, approved, &count, &may_run);
+        let follow = |o: &Ops<'_>, made: &[oneup_sync::Sid], room: usize| follower.follow(o, made, room);
+        let run = self.exec.run_following(store, approved, &count, &may_run, &follow, oneup_exec::FOLLOW_MAX);
         tokio::pin!(run);
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1574,15 +1604,15 @@ impl Engine {
 /// different code). `fs`: the sync folder, to see how much room its version
 /// store has (only listed when the plan would add to it; without it, the
 /// store is taken to have no limit, which only a first dry run does).
-fn plan_round(
+fn plan_round<'a>(
     store: &Store,
     fs: Option<&LocalFs>,
     scope: Scope,
     controls: &Controls,
     recent: Recent,
-    rules: &RuleSet,
+    rules: &'a RuleSet,
     modes: Modes,
-) -> Result<Planned> {
+) -> Result<Planned<'a>> {
     let approvals = controls.answers.approvals();
     let decisions = controls.answers.decisions();
     let policy = oneup_gate::Policy {
@@ -1591,33 +1621,16 @@ fn plan_round(
         ..crate::versions::policy(store)?
     };
     let synced = store.read(|o| o.synced_stats())?.items.max(0) as u64;
-    // Exclusions only stop uploads (`pull`, `prune`): excluded items stay
-    // visible to planning (only paused folders, and those neither side
-    // lists, are hidden), and what would change OneDrive for them is
-    // dropped below.
-    let hide = if modes.pull { rules.upload_only() } else { rules.clone() };
-    let flow = crate::flow::get(store)?;
+    let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?);
     let (ops, problems, upto) = store.read(|o| {
-        let p = Parked::with_rules(o, &hide);
         let dirty = o.dirty_scope()?;
         let folders = match scope {
-            Scope::All => all_folders(&p)?,
+            Scope::All => all_folders(&Parked::with_rules(o, &planning.hide))?,
             Scope::Dirty => dirty.folders,
         };
-        let mut ops = plan_flow(&p, folders, flow)?;
-        if modes.pull {
-            let judge = Parked::with_rules(o, rules);
-            let mut kept = Vec::with_capacity(ops.len());
-            for op in ops {
-                if !judge.sends_excluded(&op)? {
-                    kept.push(op);
-                }
-            }
-            ops = kept;
-        }
+        let (mut ops, problems) = planning.plan(o, folders)?;
         ops.extend(modes.extra);
-        let problems = p
-            .problems()
+        let problems = problems
             .into_iter()
             .map(|(id, name, why)| Ok((o.local_path_of(id.0)?.unwrap_or(name), why)))
             .collect::<oneup_store::Result<Vec<_>>>()?;
@@ -1640,7 +1653,119 @@ fn plan_round(
         suspicious: &suspicious,
     };
     let review = review_in(&policy, &cx, ops);
-    Ok(Planned { review, problems, upto, suspicious })
+    Ok(Planned { review, problems, upto, suspicious, policy, synced, planning })
+}
+
+/// How a round plans: over the [`Parked`] view of the trees, with what
+/// pull mode never sends dropped.
+struct Planning<'a> {
+    /// Exclusions only stop uploads (`pull`, `prune`): excluded items stay
+    /// visible to planning (only paused folders, and those neither side
+    /// lists, are hidden), and what would change OneDrive for them is
+    /// dropped (`judge`).
+    hide: RuleSet,
+    judge: Option<&'a RuleSet>,
+    flow: oneup_sync::Flow,
+}
+
+impl<'a> Planning<'a> {
+    fn new(rules: &'a RuleSet, pull: bool, flow: oneup_sync::Flow) -> Self {
+        let hide = if pull { rules.upload_only() } else { rules.clone() };
+        Self { hide, judge: pull.then_some(rules), flow }
+    }
+
+    /// The plan for `folders`, and the items parking kept out of it.
+    #[allow(clippy::type_complexity)]
+    fn plan(
+        &self,
+        o: &Ops<'_>,
+        folders: Vec<oneup_sync::Sid>,
+    ) -> oneup_store::Result<(Vec<Op>, Vec<(LocalId, String, Why)>)> {
+        let p = Parked::with_rules(o, &self.hide);
+        let mut ops = plan_flow(&p, folders, self.flow)?;
+        if let Some(rules) = self.judge {
+            let judge = Parked::with_rules(o, rules);
+            let mut kept = Vec::with_capacity(ops.len());
+            for op in ops {
+                if !judge.sends_excluded(&op)? {
+                    kept.push(op);
+                }
+            }
+            ops = kept;
+        }
+        Ok((ops, p.problems()))
+    }
+}
+
+/// What goes into the folders a round makes, planned and reviewed while it
+/// runs (`Executor::run_following`): planned as the round was, reviewed by
+/// the gate with the round's policy, answers and window, and held back as
+/// the round's own operations are (files that keep changing, uploads while
+/// OneDrive is full, failures waiting their turn). What it leaves out is in
+/// a new folder, whose mark brings it to the next round.
+struct Follower<'a> {
+    engine: &'a Engine,
+    planning: &'a Planning<'a>,
+    policy: &'a oneup_gate::Policy,
+    cx: GateContext<'a>,
+    order: &'a crate::priority::Priority,
+    on_demand: bool,
+    /// What it took in, described, in the order it was taken in.
+    taken: std::sync::Mutex<Vec<(Op, Line)>>,
+    /// How many operations, and the bytes their transfers add up to.
+    items: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl Follower<'_> {
+    /// At most `room` operations: the rest stays in the new folders, whose
+    /// marks bring them to the next round.
+    fn follow(&self, o: &Ops<'_>, made: &[oneup_sync::Sid], room: usize) -> Vec<Approved> {
+        self.try_follow(o, made, room).unwrap_or_else(|e| {
+            tracing::debug!(error = %e, "what goes into new folders is left to the next round");
+            Vec::new()
+        })
+    }
+
+    fn try_follow(&self, o: &Ops<'_>, made: &[oneup_sync::Sid], room: usize) -> oneup_store::Result<Vec<Approved>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (ops, _) = self.planning.plan(o, made.to_vec())?;
+        // Without mass-sensitive operations no breaker can trip, so the gate
+        // here only withholds what a pause, a panic or a hold does.
+        if !oneup_gate::may_follow(&ops) {
+            return Ok(Vec::new());
+        }
+        let review = review_in(self.policy, &self.cx, ops);
+        let planned: Vec<(Approved, Line)> = review
+            .approved
+            .into_iter()
+            .map(|a| {
+                let l = describe_approved(o, &a);
+                let l = if self.on_demand { on_demand_line(a.op(), l) } else { l };
+                (a, l)
+            })
+            .collect();
+        let planned = crate::priority::apply(self.order, planned, |(a, l)| (a.op(), l.path.as_str()));
+        let now = std::time::Instant::now();
+        let (planned, _, _) = hold_back(planned, |(a, _)| self.engine.held_until(a.op(), now));
+        let full = self.engine.full_lock().is_some();
+        let planned = planned
+            .into_iter()
+            .filter(|(a, _)| !(full && matches!(a.op(), Op::Upload { .. } | Op::MkdirRemote { .. })));
+        let (planned, _, _) = self.engine.hold_failed(o, planned.collect())?;
+        let (approved, lines): (Vec<Approved>, Vec<(Op, Line)>) = planned
+            .into_iter()
+            .take(room)
+            .map(|(a, l)| {
+                let op = a.op().clone();
+                (a, (op, l))
+            })
+            .unzip();
+        self.items.fetch_add(approved.len() as u64, Relaxed);
+        self.bytes.fetch_add(transfer_bytes(o, &approved, self.on_demand)?, Relaxed);
+        self.taken.lock().unwrap_or_else(|p| p.into_inner()).extend(lines);
+        Ok(approved)
+    }
 }
 
 /// At most this many files a round reads the beginning of for the content
@@ -1680,7 +1805,7 @@ struct Modes {
 }
 
 /// One round's reviewed plan.
-struct Planned {
+struct Planned<'a> {
     review: oneup_gate::Review,
     /// Items that can't be synced, for the report.
     problems: Vec<(String, Why)>,
@@ -1689,6 +1814,11 @@ struct Planned {
     upto: i64,
     /// Files judged by the content guard (sorted).
     suspicious: Vec<LocalId>,
+    /// What it was reviewed with and planned by, for what goes into the
+    /// folders it makes ([`Follower`]).
+    policy: oneup_gate::Policy,
+    synced: u64,
+    planning: Planning<'a>,
 }
 
 async fn dry_run(
@@ -1748,7 +1878,7 @@ async fn dry_run(
     if let Some(o) = &review.overflow {
         print_overflow(o, &store, Asker::Sync)?;
     }
-    println!("Later rounds continue from there (e.g. a folder's contents after the folder).");
+    println!("Not listed: what goes into new folders, planned as each is made, and what later rounds find.");
     Ok(())
 }
 

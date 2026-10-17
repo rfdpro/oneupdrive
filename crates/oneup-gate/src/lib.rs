@@ -105,6 +105,18 @@ pub fn is_mass_sensitive(op: &Op) -> bool {
     )
 }
 
+/// Whether a plan for the contents of folders a round has just made may
+/// run in that round (`oneup_exec::Executor::run_following`): only if
+/// nothing in it is [`is_mass_sensitive`]. A new folder's contents are
+/// mostly new items, but not always (a one-way pair joining two new
+/// folders of the same name replaces OneDrive's differing files with this
+/// PC's); a plan that removes, replaces or moves anything is left whole to
+/// the next round, where the circuit breakers, the content guard and the
+/// version store's room weigh it with everything else.
+pub fn may_follow(ops: &[Op]) -> bool {
+    !ops.iter().any(is_mass_sensitive)
+}
+
 /// How many items `op` counts as for the circuit breakers: a pruned folder
 /// counts as everything in it.
 pub fn weight(op: &Op) -> usize {
@@ -589,6 +601,28 @@ mod tests {
             replace: Some(rpre(i)),
             link: Link::Existing(i as Sid),
         }
+    }
+
+    #[test]
+    fn a_new_folders_plan_follows_only_without_moves_replacements_or_removals() {
+        let new_file = Op::Upload {
+            local: LocalPre { id: LocalId(1), stamp: Some((1, 1)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a".into(),
+            replace: None,
+            link: oneup_sync::Link::New,
+        };
+        assert!(may_follow(std::slice::from_ref(&new_file)));
+        assert!(may_follow(&[]));
+        let mv = Op::MoveRemote {
+            sid: 2,
+            remote: RemotePre { id: RemoteId("x".into()), etag: "e".into() },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a".into(),
+        };
+        assert!(!may_follow(&[new_file, mv]), "one is enough to leave the whole plan");
     }
 
     #[test]
