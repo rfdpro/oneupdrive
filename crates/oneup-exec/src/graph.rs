@@ -124,6 +124,9 @@ trait Session: Sync {
     /// ([`Graph::upload_status`]).
     fn status(&self) -> impl Future<Output = oneup_graph::Result<Option<u64>>> + Send;
     fn cancel(&self) -> impl Future<Output = ()> + Send;
+    /// Waits before a fragment is sent again, longer the more times it
+    /// was sent already (`sends`).
+    fn pause(&self, sends: u32) -> impl Future<Output = ()> + Send;
     /// Item `id`'s eTag now; `None`: it's gone.
     fn etag(&self, id: &str) -> impl Future<Output = oneup_graph::Result<Option<String>>> + Send;
 }
@@ -144,16 +147,22 @@ impl Session for GraphSession<'_> {
     async fn cancel(&self) {
         self.graph.cancel_upload(&self.url).await;
     }
+    async fn pause(&self, sends: u32) {
+        tokio::time::sleep(std::time::Duration::from_millis(500 << sends.min(6))).await;
+    }
     async fn etag(&self, id: &str) -> oneup_graph::Result<Option<String>> {
         Ok(self.graph.item(id).await?.and_then(|it| it.e_tag))
     }
 }
 
-/// Most times one fragment goes on after its answer was lost.
-const RESUMES: u32 = 5;
+/// Most times one fragment is sent, the first included. The client sends a
+/// fragment once ([`Graph::upload_fragment`]); its retries are these, each
+/// after asking the session where it is. Waiting out throttling
+/// (`Retry-After`) isn't a send of its own: the client does that.
+const SENDS: u32 = 5;
 
 /// A failed fragment the session may have received anyway: the answer was
-/// lost (the connection failed, every attempt) or a retry found the bytes
+/// lost (the connection or the server failed) or a send found the bytes
 /// already there (416).
 fn maybe_received(e: &oneup_graph::Error) -> bool {
     e.is_transient() || matches!(e, oneup_graph::Error::Exhausted(_)) || e.status() == Some(416)
@@ -171,7 +180,7 @@ fn maybe_received(e: &oneup_graph::Error) -> bool {
 /// commit follows the check closely.
 ///
 /// A fragment whose answer was lost goes on from where the session says it
-/// is (`nextExpectedRanges`), a bounded number of times. The session can
+/// is (`nextExpectedRanges`), at most [`SENDS`] sends in all. The session can
 /// only be missing bytes of the fragment in flight, which is still in
 /// memory; anything else ends the upload (the source can't be read again).
 /// A session that is gone (expired, or completed by the lost answer) ends
@@ -225,50 +234,48 @@ async fn send_session<S: Session>(
                 return Err(CloudError::Changed);
             }
         }
-        // How much of this fragment the session has.
+        // How much of this fragment the session has, and how many times it
+        // was sent.
         let mut have = 0usize;
-        let mut resumes = 0;
+        let mut sends = 0;
         let item = loop {
+            sends += 1;
             let sent = std::time::Instant::now();
             let got = s.put(start + have as u64, total, &buf[have..n]).await;
             let took = sent.elapsed();
             match got {
                 Ok(f) => {
                     let secs = took.saturating_sub(f.paused + f.capped).as_secs_f64();
-                    tracing::debug!(bytes = n - have, secs, retried = f.retried, "upload fragment sent");
-                    sizer().observe(n - have, secs, f.retried || resumes > 0);
+                    tracing::debug!(bytes = n - have, secs, sends, "upload fragment sent");
+                    sizer().observe(n - have, secs, sends > 1);
                     break f.item;
                 }
-                Err(e) if maybe_received(&e) && resumes < RESUMES => {
-                    resumes += 1;
-                    match s.status().await {
-                        Ok(Some(next)) if (start..=end).contains(&next) => {
-                            tracing::debug!(
-                                resumes,
-                                "an upload fragment's answer was lost; going on from the session's state"
-                            );
-                            have = (next - start) as usize;
-                            if have == n {
-                                break None;
-                            }
+                Err(e) if maybe_received(&e) && sends < SENDS => match s.status().await {
+                    Ok(Some(next)) if (start..=end).contains(&next) => {
+                        tracing::debug!(
+                            sends,
+                            "an upload fragment's answer was lost; going on from the session's state"
+                        );
+                        have = (next - start) as usize;
+                        if have == n {
+                            break None;
                         }
-                        Ok(Some(_)) => {
-                            s.cancel().await;
-                            return Err(CloudError::Other("the upload session expects bytes already sent".into()));
-                        }
-                        Ok(None) if last => return Err(CloudError::Changed),
-                        Ok(None) => {
-                            return Err(CloudError::Other(
-                                "the upload session ended before the upload finished".into(),
-                            ));
-                        }
-                        Err(_) => {
-                            sizer().failed();
-                            s.cancel().await;
-                            return Err(map(e));
-                        }
+                        s.pause(sends).await;
                     }
-                }
+                    Ok(Some(_)) => {
+                        s.cancel().await;
+                        return Err(CloudError::Other("the upload session expects bytes already sent".into()));
+                    }
+                    Ok(None) if last => return Err(CloudError::Changed),
+                    Ok(None) => {
+                        return Err(CloudError::Other("the upload session ended before the upload finished".into()));
+                    }
+                    Err(_) => {
+                        sizer().failed();
+                        s.cancel().await;
+                        return Err(map(e));
+                    }
+                },
                 Err(e) => {
                     sizer().failed();
                     s.cancel().await;
@@ -616,6 +623,13 @@ mod tests {
         cancelled: Mutex<bool>,
         /// `(start, length)` of every fragment received.
         puts: Mutex<Vec<(u64, usize)>>,
+        /// The next this many sends fail with a server error, received or
+        /// not as `fail_received` says.
+        fail: Mutex<u32>,
+        fail_received: bool,
+        /// Every send, received or not, and every pause before one.
+        sends: Mutex<u32>,
+        pauses: Mutex<Vec<u32>>,
     }
 
     fn refused(status: u16) -> oneup_graph::Error {
@@ -624,8 +638,18 @@ mod tests {
 
     impl Session for Fake {
         async fn put(&self, start: u64, total: u64, bytes: &[u8]) -> oneup_graph::Result<Fragment> {
+            *self.sends.lock().unwrap() += 1;
             if *self.gone.lock().unwrap() {
                 return Err(refused(404));
+            }
+            let failing = {
+                let mut fail = self.fail.lock().unwrap();
+                let failing = *fail > 0;
+                *fail = fail.saturating_sub(1);
+                failing
+            };
+            if failing && !self.fail_received {
+                return Err(refused(500));
             }
             let mut got = self.got.lock().unwrap();
             if start != got.len() as u64 {
@@ -638,6 +662,10 @@ mod tests {
                 *self.etag.lock().unwrap() = "edited on the web".into();
             }
             let done = got.len() as u64 == total;
+            if failing {
+                *self.gone.lock().unwrap() = done;
+                return Err(refused(500));
+            }
             let mut lose = self.lose.lock().unwrap();
             if let Some(i) = lose.iter().position(|(at, _)| *at == start) {
                 let (_, status) = lose.remove(i);
@@ -658,7 +686,7 @@ mod tests {
                 root: None,
                 file_system_info: None,
             });
-            Ok(Fragment { item, retried: false, paused: Duration::ZERO, capped: Duration::ZERO })
+            Ok(Fragment { item, paused: Duration::ZERO, capped: Duration::ZERO })
         }
         async fn status(&self) -> oneup_graph::Result<Option<u64>> {
             Ok((!*self.gone.lock().unwrap()).then(|| self.got.lock().unwrap().len() as u64))
@@ -666,6 +694,9 @@ mod tests {
         async fn cancel(&self) {
             *self.cancelled.lock().unwrap() = true;
             *self.gone.lock().unwrap() = true;
+        }
+        async fn pause(&self, sends: u32) {
+            self.pauses.lock().unwrap().push(sends);
         }
         async fn etag(&self, _: &str) -> oneup_graph::Result<Option<String>> {
             Ok(Some(self.etag.lock().unwrap().clone()))
@@ -751,6 +782,38 @@ mod tests {
         assert!(matches!(r, Err(CloudError::Other(_))), "{r:?}");
         assert_eq!(s.puts.lock().unwrap().len(), 1, "a refusal is final");
         assert!(*s.cancelled.lock().unwrap());
+    }
+
+    /// One budget per fragment: a fragment that keeps failing is sent at
+    /// most `SENDS` times in all (the client sends each once), with a
+    /// growing pause before each send again, then the upload ends. One that
+    /// gets through within the budget goes on, and the next fragment has a
+    /// budget of its own.
+    #[tokio::test]
+    async fn a_fragment_is_sent_at_most_five_times() {
+        let c = content();
+        let s = fake();
+        *s.fail.lock().unwrap() = 100;
+        let r = send(&s, false, &c).await;
+        assert!(matches!(r, Err(CloudError::Other(_))), "{r:?}");
+        assert_eq!(*s.sends.lock().unwrap(), SENDS);
+        assert_eq!(*s.pauses.lock().unwrap(), [1, 2, 3, 4]);
+        assert!(*s.cancelled.lock().unwrap());
+
+        let s = fake();
+        *s.fail.lock().unwrap() = SENDS - 1;
+        send(&s, false, &c).await.unwrap();
+        assert_eq!(*s.got.lock().unwrap(), c);
+        assert_eq!(*s.sends.lock().unwrap(), SENDS + 2, "the first fragment's budget, then two");
+
+        // Received, the answer lost (the first two of three fragments): it
+        // goes on from where the session is, so nothing is sent twice.
+        let s = Fake { fail_received: true, ..fake() };
+        *s.fail.lock().unwrap() = 2;
+        send(&s, false, &c).await.unwrap();
+        assert_eq!(*s.got.lock().unwrap(), c);
+        assert_eq!(*s.sends.lock().unwrap(), 3);
+        assert!(s.pauses.lock().unwrap().is_empty(), "nothing was sent again");
     }
 
     fn version(id: &str, modified_ms: i64, size: i64) -> FileVersion {

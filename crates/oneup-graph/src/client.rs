@@ -105,6 +105,11 @@ struct Req<'a> {
     /// Shown in errors instead of the URL (pre-authenticated URLs carry a
     /// session token and must never be logged).
     label: Option<&'static str>,
+    /// Sent again after a network error or a server error. Off for an
+    /// upload fragment: its upload session owns those retries, asking the
+    /// session where it is first, and counts them per fragment. Throttling
+    /// (429, 503) is waited out either way, and isn't a retry.
+    retry: bool,
 }
 
 impl<'a> Req<'a> {
@@ -119,6 +124,7 @@ impl<'a> Req<'a> {
             content_range: None,
             timeout: None,
             label: None,
+            retry: true,
         }
     }
 }
@@ -145,8 +151,6 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Fragment {
     /// The uploaded item, once the last fragment completed it.
     pub item: Option<DriveItem>,
-    /// It took more than one attempt (a network error or a server error).
-    pub retried: bool,
     /// Time spent waiting because the service asked for it (throttling).
     pub paused: Duration,
     /// Time spent waiting for the user's bandwidth cap.
@@ -343,7 +347,10 @@ impl Graph {
     }
 
     /// Sends bytes `start..start + bytes.len()` of a `total`-byte upload.
-    /// The item comes back once the last fragment completes it.
+    /// The item comes back once the last fragment completes it. Sent once:
+    /// after a network or server error the caller asks the session where
+    /// it is ([`Graph::upload_status`]) and goes on from there. Throttling
+    /// is still waited out here.
     pub async fn upload_fragment(&self, upload_url: &str, start: u64, total: u64, bytes: &[u8]) -> Result<Fragment> {
         let capped = std::time::Instant::now();
         self.upload.take(bytes.len() as u64).await;
@@ -355,11 +362,12 @@ impl Graph {
             content_range: Some(format!("bytes {start}-{end}/{total}")),
             timeout: Some(TRANSFER_TIMEOUT),
             label: Some("upload session fragment"),
+            retry: false,
             ..Req::new(reqwest::Method::PUT, upload_url)
         };
         let (status, body, m) = self.send_measured(&req).await?;
         let item = if status == 202 { None } else { Some(serde_json::from_slice(&body)?) };
-        Ok(Fragment { item, retried: m.attempts > 1, paused: m.paused, capped })
+        Ok(Fragment { item, paused: m.paused, capped })
     }
 
     /// Asks OneDrive to copy file `source` into folder `parent` as `name`
@@ -707,6 +715,7 @@ impl Graph {
             let sent = rb.send().await;
             let resp = match sent {
                 Ok(r) => r,
+                Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
                     drop(permit);
                     self.stats.retries.fetch_add(1, Relaxed);
@@ -743,7 +752,7 @@ impl Graph {
                 self.auth.invalidate(t).await;
                 continue;
             }
-            if retried(status) {
+            if retried(status) && req.retry {
                 drop(permit);
                 self.stats.retries.fetch_add(1, Relaxed);
                 tokio::time::sleep(backoff(attempt)).await;
@@ -756,6 +765,7 @@ impl Graph {
             };
             let body = match body {
                 Ok(b) => b,
+                Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
                     drop(permit);
                     self.stats.retries.fetch_add(1, Relaxed);
@@ -1103,6 +1113,78 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         url
+    }
+
+    /// A loopback HTTP server answering each request (one per connection,
+    /// read whole first) with the next of `answers`, the last one again
+    /// after that; returns its URL and how many requests it got.
+    async fn serve_each(answers: Vec<&'static str>) -> (String, Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/up", l.local_addr().unwrap());
+        let count = Arc::new(AtomicU64::new(0));
+        let n = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let k = s.read(&mut buf).await.unwrap_or(0);
+                    if k == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..k]);
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let i = n.fetch_add(1, Relaxed) as usize;
+                let _ = s.write_all(answers[i.min(answers.len() - 1)].as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (url, count)
+    }
+
+    /// The client sends an upload fragment once: after a server or network
+    /// error its upload session decides what to send again (asking the
+    /// session first), within one budget per fragment. Throttling is still
+    /// waited out here, and isn't a send of its own for that budget.
+    #[tokio::test]
+    async fn an_upload_fragment_is_sent_once_and_throttling_waited_out() {
+        let fragment = |url: String| async move {
+            let g = graph();
+            let r = tokio::time::timeout(Duration::from_secs(20), g.upload_fragment(&url, 0, 10, b"0123456789")).await;
+            r.expect("not retried with back-off")
+        };
+        let failed = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, count) = serve_each(vec![failed]).await;
+        let r = fragment(url).await;
+        assert!(matches!(r, Err(Error::Status { status: 500, .. })), "{r:?}");
+        assert_eq!(count.load(Relaxed), 1);
+
+        // The connection closed without an answer.
+        let (url, count) = serve_each(vec![""]).await;
+        let r = fragment(url).await;
+        assert!(r.as_ref().is_err_and(Error::is_transient), "{r:?}");
+        assert_eq!(count.load(Relaxed), 1);
+
+        let throttled =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let accepted = "HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (url, count) = serve_each(vec![throttled, accepted]).await;
+        let f = fragment(url).await.unwrap();
+        assert!(f.item.is_none());
+        assert_eq!(count.load(Relaxed), 2, "the throttled send was waited out and sent again");
     }
 
     #[tokio::test]
