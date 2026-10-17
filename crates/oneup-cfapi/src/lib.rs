@@ -15,6 +15,7 @@ pub mod identity;
 pub mod ours;
 #[cfg(windows)]
 pub mod provider;
+mod recent;
 #[cfg(windows)]
 pub mod shell;
 

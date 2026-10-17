@@ -11,9 +11,10 @@
 //! In memory, for this process only (the agent runs both), bounded: at most
 //! [`MAX`] files and [`PER_FILE`] closes each, each for [`FOR`].
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::recent::Recent;
 
 /// How long a close is remembered: the tracker looks within seconds.
 pub const FOR: Duration = Duration::from_secs(60);
@@ -31,7 +32,7 @@ pub struct Close {
     pub exe: String,
 }
 
-static CLOSES: Mutex<Option<HashMap<u128, Vec<Close>>>> = Mutex::new(None);
+static CLOSES: Mutex<Option<Recent<Vec<Close>>>> = Mutex::new(None);
 
 /// The program `pid` (executable path or name `image`) closed the file with
 /// this ID (an NTFS file reference, as the Local tree stores it).
@@ -41,17 +42,9 @@ pub fn note(file_id: u128, pid: u32, image: &str) {
         return;
     }
     let mut g = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
-    let m = g.get_or_insert_with(HashMap::new);
     let now = Instant::now();
-    if m.len() >= MAX && !m.contains_key(&file_id) {
-        m.retain(|_, c| c.last().is_some_and(|c| now.duration_since(c.at) < FOR));
-        if m.len() >= MAX
-            && let Some(oldest) = m.iter().min_by_key(|(_, c)| c.last().map(|c| c.at)).map(|(id, _)| *id)
-        {
-            m.remove(&oldest);
-        }
-    }
-    let list = m.entry(file_id).or_default();
+    // Touched at each close, so the file whose latest close is oldest goes first.
+    let list = g.get_or_insert_with(|| Recent::new(MAX, FOR)).touch(file_id, now);
     // A program closing many handles in a row is one close.
     if let Some(last) = list.last_mut()
         && last.pid == pid
@@ -69,8 +62,8 @@ pub fn note(file_id: u128, pid: u32, image: &str) {
 pub fn since(file_id: u128, since: Instant) -> Vec<Close> {
     let g = CLOSES.lock().unwrap_or_else(|p| p.into_inner());
     g.as_ref()
-        .and_then(|m| m.get(&file_id))
-        .map(|c| c.iter().filter(|c| c.at >= since && c.at.elapsed() < FOR).cloned().collect())
+        .and_then(|m| m.get(file_id))
+        .map(|(_, c)| c.iter().filter(|c| c.at >= since && c.at.elapsed() < FOR).cloned().collect())
         .unwrap_or_default()
 }
 

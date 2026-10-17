@@ -8,38 +8,29 @@
 //! In memory, for this process only (the agent runs both), bounded: at
 //! most [`MAX`] files, each for [`FOR`].
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use crate::recent::Recent;
 
 /// How long a write stays noted: the tracker looks within seconds.
 pub const FOR: Duration = Duration::from_secs(120);
 /// Files noted at most; the oldest go first.
 pub const MAX: usize = 8192;
 
-static NOTED: Mutex<Option<HashMap<u128, Instant>>> = Mutex::new(None);
+static NOTED: Mutex<Option<Recent<()>>> = Mutex::new(None);
 
 /// OneUpDrive is writing the file with this ID (an NTFS file reference,
 /// as the Local tree stores it).
 pub fn note(file_id: u128) {
     let mut g = NOTED.lock().unwrap_or_else(|p| p.into_inner());
-    let m = g.get_or_insert_with(HashMap::new);
-    let now = Instant::now();
-    if m.len() >= MAX {
-        m.retain(|_, t| now.duration_since(*t) < FOR);
-        if m.len() >= MAX
-            && let Some(oldest) = m.iter().min_by_key(|(_, t)| **t).map(|(id, _)| *id)
-        {
-            m.remove(&oldest);
-        }
-    }
-    m.insert(file_id, now);
+    g.get_or_insert_with(|| Recent::new(MAX, FOR)).touch(file_id, Instant::now());
 }
 
 /// Whether OneUpDrive wrote the file recently.
 pub fn wrote(file_id: u128) -> bool {
     let g = NOTED.lock().unwrap_or_else(|p| p.into_inner());
-    g.as_ref().and_then(|m| m.get(&file_id)).is_some_and(|t| t.elapsed() < FOR)
+    g.as_ref().and_then(|m| m.get(file_id)).is_some_and(|(t, _)| t.elapsed() < FOR)
 }
 
 #[cfg(test)]
