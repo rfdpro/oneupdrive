@@ -83,6 +83,11 @@ struct State {
     /// have finished, and how many did meanwhile.
     stall: Option<String>,
     finished_during_stall: Option<usize>,
+    /// The next folder made with this name finds it taken: someone made it
+    /// in OneDrive meanwhile (it then exists, empty).
+    beaten: Option<String>,
+    /// The next folder made with this name fails (a service error).
+    mkdir_fails: Option<String>,
 }
 
 impl State {
@@ -259,6 +264,14 @@ impl Fake {
         }
         if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
             return Err(CloudError::Changed);
+        }
+        if s.mkdir_fails.as_deref() == Some(name) {
+            s.mkdir_fails = None;
+            return Err(CloudError::Other("service unavailable".into()));
+        }
+        if s.beaten.as_deref() == Some(name) {
+            s.beaten = None;
+            s.create(&parent.0, name, true, vec![]);
         }
         if s.child(&parent.0, name).is_some() {
             return Err(CloudError::NameTaken);
@@ -713,6 +726,9 @@ struct Sync {
     planned_rules: String,
     /// `cloud_copies = "pull"`: excluded items are planned but never sent.
     pull: bool,
+    /// What goes into the folders a round makes is planned and run in the
+    /// same round (`Executor::run_following`), as `oneup_app::sync` does.
+    follow: bool,
 }
 
 impl Sync {
@@ -764,6 +780,7 @@ impl Sync {
             rules: RuleSet::default(),
             planned_rules: RuleSet::default().fingerprint(),
             pull: false,
+            follow: true,
         }
     }
 
@@ -778,11 +795,25 @@ impl Sync {
     /// The process was killed and starts again: everything in memory is
     /// gone; the database, the folder and the cloud stay as they are.
     fn restart(self) -> Self {
-        let Self { dir, db, obs, exec, cloud, policy, room, decisions, overflow: _, rules, planned_rules, pull } = self;
+        let Self {
+            dir,
+            db,
+            obs,
+            exec,
+            cloud,
+            policy,
+            room,
+            decisions,
+            overflow: _,
+            rules,
+            planned_rules,
+            pull,
+            follow,
+        } = self;
         drop((obs, exec));
         let store = Store::open(&db.as_ref().expect("restart needs a database on disk").0, 4096).unwrap();
         let (obs, exec) = Self::start(&dir.0, store, &cloud);
-        Self { dir, db, obs, exec, cloud, policy, room, decisions, overflow: None, rules, planned_rules, pull }
+        Self { dir, db, obs, exec, cloud, policy, room, decisions, overflow: None, rules, planned_rules, pull, follow }
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -805,6 +836,8 @@ impl Sync {
     /// operation (as the agent's pause does).
     async fn attempt_checked(&mut self, may_run: &(dyn Fn(&Op) -> bool + std::marker::Sync)) -> Report {
         self.obs.catch_up().unwrap();
+        // Reading OneDrive's changes is a request too (the delta listing).
+        self.cloud.request().await;
         let store = self.obs.store_mut();
         self.cloud.pull(store);
         // Only the folders the store marked dirty are planned, as the
@@ -812,27 +845,12 @@ impl Sync {
         let fingerprint = self.rules.fingerprint();
         let all = fingerprint != self.planned_rules;
         let rules = &self.rules;
-        // As `oneup_app::sync` plans: in pull mode, excluded items stay
-        // visible and what would send them is dropped.
-        let hide = if self.pull { rules.upload_only() } else { rules.clone() };
         let pull = self.pull;
         let (scope, ops) = store
             .read(|o| {
-                let p = Parked::with_rules(o, &hide);
                 let scope = o.dirty_scope()?;
-                let folders = if all { all_folders(&p)? } else { scope.folders.clone() };
-                let mut ops = plan(&p, folders)?;
-                if pull {
-                    let judge = Parked::with_rules(o, rules);
-                    let mut kept = Vec::new();
-                    for op in ops {
-                        if !judge.sends_excluded(&op)? {
-                            kept.push(op);
-                        }
-                    }
-                    ops = kept;
-                }
-                Ok((scope, ops))
+                let folders = if all { all_folders(&Parked::with_rules(o, rules))? } else { scope.folders.clone() };
+                Ok((scope, plan_in(o, rules, pull, folders)?))
             })
             .unwrap();
         let cx = Context { room: self.room, decisions: &self.decisions, ..Context::default() };
@@ -846,7 +864,26 @@ impl Sync {
         let count = |n: usize| {
             counted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         };
-        let report = self.exec.run_checked(store, r.approved, &count, may_run).await;
+        // What goes into new folders, as `oneup_app::sync` plans it: like a
+        // round, and nothing of it if the gate would stop any of it or the
+        // version store would need room.
+        let followed = Mutex::new(Vec::new());
+        let (policy, on) = (&self.policy, self.follow);
+        let follow = |o: &oneup_store::Ops<'_>, made: &[oneup_sync::Sid]| {
+            let Some(ops) = on.then(|| plan_in(o, rules, pull, made.to_vec()).unwrap()) else { return Vec::new() };
+            if oneup_gate::store_bytes(policy, &ops) > 0 {
+                return Vec::new();
+            }
+            let r = review_in(policy, &Context::default(), ops);
+            if !r.breakers.is_empty() {
+                return Vec::new();
+            }
+            followed.lock().unwrap().extend(r.approved.iter().map(|a| a.op().clone()));
+            r.approved
+        };
+        let report = self.exec.run_following(store, r.approved, &count, may_run, &follow).await;
+        let followed = followed.into_inner().unwrap();
+        let (planned, order) = (planned + followed.len(), [order, followed].concat());
         // Progress counts every operation once, batched or not.
         if report.halted.is_none() {
             let counted = counted.into_inner();
@@ -933,6 +970,29 @@ impl Sync {
 
 /// The part of a tree a sync must make equal: without parked names, which
 /// stay on their own side by design.
+/// What a round plans for `folders`, as `oneup_app::sync` plans it: in pull
+/// mode, excluded items stay visible and what would send them is dropped.
+fn plan_in(
+    o: &oneup_store::Ops<'_>,
+    rules: &RuleSet,
+    pull: bool,
+    folders: Vec<oneup_sync::Sid>,
+) -> oneup_store::Result<Vec<Op>> {
+    let hide = if pull { rules.upload_only() } else { rules.clone() };
+    let ops = plan(&Parked::with_rules(o, &hide), folders)?;
+    if !pull {
+        return Ok(ops);
+    }
+    let judge = Parked::with_rules(o, rules);
+    let mut kept = Vec::new();
+    for op in ops {
+        if !judge.sends_excluded(&op)? {
+            kept.push(op);
+        }
+    }
+    Ok(kept)
+}
+
 fn syncable(t: Tree) -> Tree {
     t.into_iter()
         .filter(|(path, _)| {
@@ -1519,6 +1579,8 @@ const CRASH_CONTENTS: &[&[u8]] = &[
     b"cloud delete me",
     b"cloud new",
     b"x",
+    b"deeper",
+    b"y",
     b"base",
     b"mine",
     b"theirs",
@@ -1526,8 +1588,9 @@ const CRASH_CONTENTS: &[&[u8]] = &[
 
 /// Synced state, then one change of every kind on both sides: what the
 /// next round turns into uploads, downloads (new and replacing), folders
-/// on both sides, moves both ways, deletions both ways (one of them a
-/// local recycle) and a conflict copy.
+/// on both sides (two levels deep, whose contents go in the same round),
+/// moves both ways, deletions both ways (one of them a local recycle) and a
+/// conflict copy.
 async fn crash_scenario(tag: &str) -> Sync {
     let cloud = Fake::new();
     let mut s = Sync::on_disk(tag, cloud.clone());
@@ -1544,12 +1607,15 @@ async fn crash_scenario(tag: &str) -> Sync {
     write(&s.p("edit.txt"), b"edit v2");
     write(&s.p("new.txt"), b"new local");
     write(&s.p("localdir/inner.txt"), b"inner");
+    write(&s.p("localdir/sub/deeper.txt"), b"deeper");
     std::fs::remove_file(s.p("gone.txt")).unwrap();
     std::fs::rename(s.p("docs/move.txt"), s.p("moved.txt")).unwrap();
     write(&s.p("both.txt"), b"mine");
     cloud.add("cnew.txt", Some(b"cloud new"));
     cloud.add("cdir", None);
     cloud.add("cdir/x.txt", Some(b"x"));
+    cloud.add("cdir/sub", None);
+    cloud.add("cdir/sub/y.txt", Some(b"y"));
     cloud.edit("cedit.txt", b"cloud edit v2");
     cloud.delete("cgone.txt");
     cloud.rename("c.txt", "c2.txt");
@@ -1608,7 +1674,7 @@ async fn a_crash_at_any_point_of_a_round_loses_nothing() {
         for c in [&b"edit v2"[..], b"new local", b"inner", b"move me", b"cloud c", b"cloud edit v2", b"cloud new"] {
             assert!(here.contains(&c), "crash point {n}: {:?} isn't in the folder", String::from_utf8_lossy(c));
         }
-        for c in [&b"x"[..], b"alpha", b"mine", b"theirs"] {
+        for c in [&b"x"[..], b"y", b"deeper", b"alpha", b"mine", b"theirs"] {
             assert!(here.contains(&c), "crash point {n}: {:?} isn't in the folder", String::from_utf8_lossy(c));
         }
         for c in [&b"local delete me"[..], b"cloud delete me"] {
@@ -3035,6 +3101,239 @@ async fn everyday_on_demand_a_legacy_excluded_folder_mark_is_cleared_keeping_eve
     s.quiesce().await;
     let t = cloud.tree();
     assert!(t.contains_key("/app/index.js") && !t.keys().any(|p| p.contains("node_modules")), "{:?}", names(&t));
+    drop(s);
+    drop(od);
+}
+
+/// `n` new files on each side, spread over `depth` nested new folders
+/// (`up/d1/d2/…` here, `down/d1/d2/…` in OneDrive; none: all in `up` and
+/// `down`).
+fn tree(s: &Sync, cloud: &Fake, n: usize, depth: usize) {
+    let dirs: Vec<String> = (0..=depth).map(|d| (1..=d).map(|k| format!("/d{k}")).collect()).collect();
+    let dirs = if depth == 0 { &dirs[..] } else { &dirs[1..] };
+    cloud.add("down", None);
+    for d in dirs.iter().filter(|d| !d.is_empty()) {
+        cloud.add(&format!("down{d}"), None);
+    }
+    for i in 0..n {
+        let d = &dirs[i % dirs.len()];
+        write(&s.p(&format!("up{d}/{i:03}.txt")), format!("up {i}").as_bytes());
+        cloud.add(&format!("down{d}/{i:03}.txt"), Some(format!("down {i}").as_bytes()));
+    }
+}
+
+/// Timing, on a network where every request takes 100 ms: 200 new files
+/// each way, in one new folder or spread over 5 nested ones, with what goes
+/// into new folders run in the same round or left to the next. Run with
+/// `cargo test -p oneup-exec --test sync -- --ignored --nocapture timing_new`.
+#[tokio::test]
+#[ignore = "timing only"]
+async fn timing_new_folder_trees() {
+    for follow in [false, true] {
+        for depth in [0, 5] {
+            let cloud = Fake::new();
+            let mut s = Sync::new(&format!("timing-tree-{depth}-{follow}"), cloud.clone());
+            s.follow = follow;
+            tree(&s, &cloud, 200, depth);
+            cloud.0.lock().unwrap().latency = Some(Duration::from_millis(100));
+            let started = std::time::Instant::now();
+            let rounds = s.settle().await;
+            let took = started.elapsed();
+            assert_eq!(local_tree(&s.dir.0), cloud.tree());
+            eprintln!("follow {follow}, depth {depth}: {rounds} rounds, {took:.2?}");
+        }
+    }
+}
+
+/// A new folder tree, here and in OneDrive, takes as many rounds as the
+/// same files in one new folder: what goes into each new folder is planned,
+/// reviewed and run in the round that made the folder, not a level a round.
+#[tokio::test]
+async fn a_new_folder_tree_syncs_in_as_many_rounds_as_one_new_folder() {
+    let mut rounds = Vec::new();
+    for depth in [0, 5] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(&format!("tree-rounds-{depth}"), cloud.clone());
+        tree(&s, &cloud, 40, depth);
+        rounds.push(s.settle().await);
+        let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+        assert_eq!(here, there);
+        let files = |t: &Tree, top: &str| t.keys().filter(|p| p.starts_with(top) && p.ends_with(".txt")).count();
+        assert_eq!((files(&there, "/up/"), files(&here, "/down/")), (40, 40));
+    }
+    assert_eq!(rounds, [2, 2], "one round, and one that finds nothing left");
+}
+
+/// What a round plans for a new folder runs in that round, after the
+/// folder: the report lists it after the rest, as the progress count does.
+#[tokio::test]
+async fn a_new_folders_contents_run_after_it_in_the_same_round() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("tree-order", cloud.clone());
+    write(&s.p("a/b/c.txt"), b"c");
+    cloud.add("x", None);
+    cloud.add("x/y", None);
+    cloud.add("x/y/z.txt", Some(b"z"));
+    let r = s.round().await;
+    let at = |n: &str| r.done.iter().position(|op| op.target().is_some_and(|(_, name)| name == n)).unwrap();
+    assert!(at("a") < at("b") && at("b") < at("c.txt"), "{r:?}");
+    assert!(at("x") < at("y") && at("y") < at("z.txt"), "{r:?}");
+    assert_eq!(r.done.len(), 6, "{r:?}");
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
+/// A new folder whose creation is refused, because the name was taken in
+/// OneDrive meanwhile, takes none of its contents anywhere that round. The
+/// next rounds pair the two folders and send the contents into OneDrive's.
+#[tokio::test]
+async fn the_contents_of_a_new_folder_whose_name_was_taken_meanwhile_wait() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("tree-taken", cloud.clone());
+    write(&s.p("proj/a.txt"), b"a");
+    write(&s.p("proj/sub/b.txt"), b"b");
+    cloud.0.lock().unwrap().beaten = Some("proj".into());
+    let r = s.round().await;
+    let taken =
+        |(op, k): &(Op, oneup_exec::Skip)| matches!(op, Op::MkdirRemote { .. }) && *k == oneup_exec::Skip::NameTaken;
+    assert!(r.skipped.iter().any(taken), "{r:?}");
+    assert!(r.done.is_empty(), "{r:?}");
+    assert_eq!(names(&cloud.tree()), BTreeSet::from(["/proj"]), "only the folder made meanwhile");
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(names(&t), BTreeSet::from(["/proj", "/proj/a.txt", "/proj/sub", "/proj/sub/b.txt"]));
+    assert_eq!(local_tree(&s.dir.0), t);
+}
+
+/// The same from OneDrive: a new folder that can't be made here (another
+/// program made one of that name meanwhile) brings none of its contents.
+#[tokio::test]
+async fn the_contents_of_a_new_cloud_folder_not_made_here_wait() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("tree-taken-here", cloud.clone());
+    cloud.add("photos", None);
+    cloud.add("photos/2024", None);
+    cloud.add("photos/2024/a.jpg", Some(b"jpg"));
+    let dir = s.p("photos");
+    // Made by another program just before the folder is made here.
+    let may_run = |op: &Op| {
+        if matches!(op, Op::MkdirLocal { name, .. } if name == "photos") {
+            let _ = std::fs::create_dir(&dir);
+        }
+        true
+    };
+    let r = s.attempt_checked(&may_run).await;
+    assert!(r.halted.is_none() && r.failed.is_empty(), "{r:?}");
+    let taken =
+        |(op, k): &(Op, oneup_exec::Skip)| matches!(op, Op::MkdirLocal { .. }) && *k == oneup_exec::Skip::NameTaken;
+    assert!(r.skipped.iter().any(taken), "{r:?}");
+    assert!(r.done.is_empty(), "{r:?}");
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "nothing went into it");
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("photos/2024/a.jpg")).unwrap(), b"jpg");
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
+/// A new folder that fails to be made takes none of its contents along;
+/// they go once a later round makes it.
+#[tokio::test]
+async fn the_contents_of_a_new_folder_that_failed_wait_for_it() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("tree-failed", cloud.clone());
+    write(&s.p("proj/a.txt"), b"a");
+    write(&s.p("proj/sub/b.txt"), b"b");
+    cloud.0.lock().unwrap().mkdir_fails = Some("sub".into());
+    let r = s.attempt().await;
+    assert!(r.halted.is_none(), "{r:?}");
+    assert!(matches!(&r.failed[..], [(Op::MkdirRemote { name, .. }, _)] if name == "sub"), "{r:?}");
+    assert_eq!(names(&cloud.tree()), BTreeSet::from(["/proj", "/proj/a.txt"]), "nothing of sub");
+    s.settle().await;
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
+/// A pause that comes while a round runs stops what goes into its new
+/// folders too: not run, and planned again from the folders' marks once
+/// sync resumes.
+#[tokio::test]
+async fn a_pause_mid_round_stops_a_new_folders_contents_too() {
+    use oneup_gate::Side;
+    let cloud = Fake::new();
+    let mut s = Sync::new("tree-pause", cloud.clone());
+    write(&s.p("proj/a.txt"), b"a");
+    write(&s.p("proj/b.txt"), b"b");
+    // Paused once the folder was made.
+    let may_run = |op: &Op| Side::changed_by(op) != Some(Side::Remote) || matches!(op, Op::MkdirRemote { .. });
+    let r = s.attempt_checked(&may_run).await;
+    assert!(r.halted.is_none() && r.failed.is_empty() && r.skipped.is_empty(), "{r:?}");
+    assert_eq!(r.not_run.len(), 2, "{r:?}");
+    assert!(r.not_run.iter().all(|op| matches!(op, Op::Upload { .. })), "{r:?}");
+    assert_eq!(names(&cloud.tree()), BTreeSet::from(["/proj"]));
+    assert_eq!(s.settle().await, 2, "resuming sends them in the next round");
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
+/// The gate reviews what goes into new folders as it reviews the round:
+/// with changes to OneDrive paused, two new folders of the same name are
+/// paired and what OneDrive's holds comes here, and nothing goes there
+/// until sync resumes. Identical files are paired, different ones both
+/// kept, a level deeper too.
+#[tokio::test]
+async fn new_folders_on_both_sides_merge_in_one_round_as_the_gate_allows() {
+    use oneup_gate::Side;
+    let cloud = Fake::new();
+    let mut s = Sync::new("tree-merge", cloud.clone());
+    write(&s.p("shared/mine.txt"), b"mine");
+    write(&s.p("shared/deep/same.txt"), b"same");
+    write(&s.p("shared/deep/diff.txt"), b"this pc");
+    cloud.add("shared", None);
+    cloud.add("shared/theirs.txt", Some(b"theirs"));
+    cloud.add("shared/deep", None);
+    cloud.add("shared/deep/same.txt", Some(b"same"));
+    cloud.add("shared/deep/diff.txt", Some(b"onedrive's"));
+    s.policy.pause_remote = true;
+    let r = s.round().await;
+    assert_eq!(std::fs::read(s.p("shared/theirs.txt")).unwrap(), b"theirs", "{r:?}");
+    assert!(!r.done.iter().any(|op| Side::changed_by(op) == Some(Side::Remote)), "{r:?}");
+    assert!(!cloud.tree().contains_key("/shared/mine.txt"));
+    s.policy.pause_remote = false;
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), t);
+    assert_eq!(t["/shared/mine.txt"].as_deref(), Some(&b"mine"[..]));
+    assert_eq!(t["/shared/deep/same.txt"].as_deref(), Some(&b"same"[..]));
+    let kept: BTreeSet<&[u8]> = t.values().flatten().map(Vec::as_slice).collect();
+    assert!(kept.contains(&b"this pc"[..]) && kept.contains(&b"onedrive's"[..]), "{:?}", names(&t));
+}
+
+/// Files On-Demand: a new tree in OneDrive arrives in one round as
+/// placeholders, folders and files, without its content; a new tree here
+/// is sent in one round too, and marked in sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_new_folder_trees_arrive_in_one_round() {
+    let cloud = Fake::new();
+    let (od, mut s) = on_demand_sync("ondemand-tree", &cloud);
+    s.quiesce().await;
+    cloud.add("photos", None);
+    cloud.add("photos/2024", None);
+    cloud.add("photos/2024/trip", None);
+    cloud.add("photos/2024/trip/a.jpg", Some(b"a photo"));
+    write(&s.p("notes/work/todo.txt"), b"todo");
+    let r = s.round().await;
+    let made = |f: &dyn Fn(&Op) -> bool| r.done.iter().filter(|op| f(op)).count();
+    assert_eq!(made(&|op| matches!(op, Op::MkdirLocal { .. })), 3, "{r:?}");
+    assert_eq!(made(&|op| matches!(op, Op::Download { .. })), 1, "{r:?}");
+    assert_eq!(made(&|op| matches!(op, Op::MkdirRemote { .. })), 2, "{r:?}");
+    assert_eq!(made(&|op| matches!(op, Op::Upload { .. })), 1, "{r:?}");
+    for dir in ["photos", "photos/2024", "photos/2024/trip"] {
+        assert!(placeholder(&s.p(dir)).in_sync, "{dir}");
+    }
+    let i = placeholder(&s.p("photos/2024/trip/a.jpg"));
+    assert!(i.in_sync && i.on_disk == 0, "arrives without its content: {i:?}");
+    assert_eq!(std::fs::metadata(s.p("photos/2024/trip/a.jpg")).unwrap().len(), 7);
+    assert_eq!(cloud.tree()["/notes/work/todo.txt"].as_deref(), Some(&b"todo"[..]));
+    assert!(placeholder(&s.p("notes/work/todo.txt")).in_sync, "marked in sync once sent");
+    s.quiesce().await;
+    let problems = s.obs.store().read(|o| o.check_invariants()).unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
     drop(s);
     drop(od);
 }
