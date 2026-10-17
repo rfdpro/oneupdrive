@@ -139,6 +139,11 @@ pub trait Cloud: Send + Sync {
         out: &mut (dyn Write + Send),
     ) -> impl Future<Output = Result<u64, CloudError>> + Send;
 
+    /// Whether operations may run several at a time. `false`: the executor
+    /// runs one at a time. No default, like [`Cloud::children`]: a wrapper
+    /// that didn't pass a `false` on would run its cloud concurrently.
+    fn concurrent(&self) -> bool;
+
     /// Whether [`Cloud::copy`] can stand in for an upload of the same
     /// content (not for a vault: equal files encrypt differently).
     fn can_copy(&self) -> bool {

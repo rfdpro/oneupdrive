@@ -412,6 +412,13 @@ impl Cloud for PairCloud {
         }
     }
 
+    fn concurrent(&self) -> bool {
+        match self {
+            PairCloud::Plain(c) => c.concurrent(),
+            PairCloud::Vault(c) => c.concurrent(),
+        }
+    }
+
     fn can_copy(&self) -> bool {
         match self {
             PairCloud::Plain(c) => c.can_copy(),
