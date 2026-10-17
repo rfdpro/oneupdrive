@@ -529,6 +529,12 @@ fn remote_path(p: &str) -> Result<String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
+/// Whether OneDrive paths `a` and `b` (as [`remote_path`] gives them) name
+/// one folder, as OneDrive compares names.
+fn same_remote(a: &str, b: &str) -> bool {
+    oneup_sync::fold(a) == oneup_sync::fold(b)
+}
+
 /// What [`add`] made.
 pub struct Added {
     pub entry: Entry,
@@ -553,7 +559,7 @@ pub async fn add(
         bail!("give the main data folder, not a vault pair's");
     }
     let remote = remote_path(remote)?;
-    if list(main).iter().any(|e| oneup_sync::fold(&e.remote) == oneup_sync::fold(&remote)) {
+    if list(main).iter().any(|e| same_remote(&e.remote, &remote)) {
         bail!("the vault at {remote} is already paired");
     }
 
@@ -780,4 +786,17 @@ pub fn remove(e: &Entry) -> Result<(PathBuf, bool)> {
     }
     std::fs::remove_dir_all(&e.dir).with_context(|| format!("removing {}", e.dir.display()))?;
     Ok((local, on))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_vault_is_already_paired_under_a_name_windows_takes_for_the_same() {
+        use super::same_remote;
+        assert!(same_remote("/Vault", "/VAULT"));
+        assert!(same_remote("/ΟΔΟΣ", "/οδος"));
+        assert!(same_remote("/ΟΔΟΣ", "/οδοσ"), "final sigma folds as sigma");
+        assert!(!same_remote("/\u{212A}it", "/kit"), "the Kelvin sign is its own letter");
+        assert!(!same_remote("/Vault", "/Vault2"));
+    }
 }
