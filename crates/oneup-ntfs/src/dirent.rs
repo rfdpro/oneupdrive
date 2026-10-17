@@ -24,6 +24,13 @@ pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
 pub const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
 pub const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+/// Attributes that make an item something other than an ordinary file or
+/// folder whose data is on disk: a link, or a cloud placeholder that reading
+/// or listing can make its provider download.
+pub const NOT_PLAIN: u32 = FILE_ATTRIBUTE_REPARSE_POINT
+    | FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_RECALL_ON_OPEN
+    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
 
 pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
