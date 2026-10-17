@@ -23,11 +23,11 @@ pub fn within(root: &Path, path: &str) -> Result<String> {
     // The recorded folder is canonical (`\\?\C:\…`); typed paths usually aren't.
     let plain = |s: &str| oneup_local::coexist::plain(Path::new(s)).to_string_lossy().into_owned();
     let (root, p) = (plain(&root.to_string_lossy()), plain(path));
-    let lower = |c: Component<'_>| c.as_os_str().to_string_lossy().to_lowercase();
+    let folded = |c: Component<'_>| oneup_sync::fold(&c.as_os_str().to_string_lossy());
     let mut parts = Path::new(&p).components().filter(|c| !matches!(c, Component::CurDir));
     for r in Path::new(&root).components().filter(|c| !matches!(c, Component::CurDir)) {
         match parts.next() {
-            Some(c) if lower(c) == lower(r) => {}
+            Some(c) if folded(c) == folded(r) => {}
             _ => bail!("{path} isn't in the synced folder {root}"),
         }
     }
@@ -106,6 +106,8 @@ mod tests {
         assert_eq!(within(root, r"a\b.txt").unwrap(), r"a\b.txt");
         assert!(within(root, r"C:\Sync\Docs2\a.txt").is_err());
         assert!(within(root, r"D:\Sync\Docs\a.txt").is_err());
+        assert_eq!(within(Path::new(r"C:\ΟΔΟΣ"), r"C:\οδοσ\a.txt").unwrap(), "a.txt");
+        assert!(within(Path::new("C:\\u{212A}"), r"C:\k\a.txt").is_err(), "the Kelvin sign isn't k");
         let canonical = Path::new(r"\\?\C:\Sync\Docs");
         assert_eq!(within(canonical, r"C:\Sync\Docs\a.txt").unwrap(), "a.txt");
         let unc = Path::new(r"\\?\UNC\server\share\Docs");

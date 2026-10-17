@@ -212,6 +212,21 @@ pub fn fold_char(c: char) -> char {
     }
 }
 
+/// What follows `prefix` in `s`, the two compared as [`fold`] compares
+/// names; `None` if `s` doesn't start with it. For a path inside another:
+/// the rest keeps `s`'s own spelling, and as the fold keeps each
+/// character one character, it is cut at the right place even where
+/// folding changes a character's length in bytes.
+pub fn strip_folded_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let mut rest = s.chars();
+    for p in prefix.chars() {
+        if fold_char(rest.next()?) != fold_char(p) {
+            return None;
+        }
+    }
+    Some(rest.as_str())
+}
+
 /// A Synced row's local side as it is now. A detached row is "deleted":
 /// the executor itself removed the link, which is evidence.
 pub fn local_of<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Seen<LocalNode>, T::Error> {
@@ -253,6 +268,15 @@ mod tests {
             assert_ne!(fold(a), fold(b), "{a} and {b}");
         }
         assert_eq!(fold("ß"), "ß");
+    }
+
+    #[test]
+    fn a_folded_prefix_leaves_the_rest_as_it_was_spelled() {
+        assert_eq!(strip_folded_prefix("/ΟΔΟΣ/Docs", "/οδοσ/"), Some("Docs"));
+        assert_eq!(strip_folded_prefix("/ſync/a", "/SYNC"), Some("/a"), "ſ (2 bytes) folds onto S (1)");
+        assert_eq!(strip_folded_prefix("/\u{212A}/a", "/k"), None, "the Kelvin sign isn't k");
+        assert_eq!(strip_folded_prefix("/a", "/a/b"), None);
+        assert_eq!(strip_folded_prefix("/a", ""), Some("/a"));
     }
 
     #[test]

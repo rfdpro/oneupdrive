@@ -176,11 +176,11 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
         if parts.is_empty() && l.name.eq_ignore_ascii_case(ENGINE_DIR) {
             continue;
         }
-        let key = l.name.to_lowercase();
+        let key = oneup_sync::fold(&l.name);
         by_name.entry(key).or_default().0 = Some(l);
     }
     for r in remotes {
-        let key = r.0.name.to_lowercase();
+        let key = oneup_sync::fold(&r.0.name);
         by_name.entry(key).or_default().1 = Some(r);
     }
     let total = by_name.len();

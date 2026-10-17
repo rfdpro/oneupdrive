@@ -237,7 +237,9 @@ async fn prepare(
     let paired_remote = store.read(|o| o.meta_get(KEY_REMOTE))?;
     let first = match (&paired_local, &paired_remote) {
         (Some(l), Some(r)) => {
-            if !crate::test_account::same_dir(Path::new(l), &local) || !r.eq_ignore_ascii_case(&remote_path) {
+            if !crate::test_account::same_dir(Path::new(l), &local)
+                || oneup_sync::fold(r) != oneup_sync::fold(&remote_path)
+            {
                 bail!(
                     "this data folder already syncs {l} with OneDrive {r}; \
                      use another --data-dir for another pair"
@@ -1869,24 +1871,28 @@ pub(crate) fn normalize_remote(p: &str) -> Result<String> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-/// The ID of the OneDrive folder at `path`, from the mirror (names compared
-/// case-insensitively, as OneDrive does).
+/// The ID of the OneDrive folder at `path`, from the mirror, each name
+/// compared as Windows and OneDrive compare names (`oneup_sync::fold`).
+/// Refused if a part matches more than one folder (names that fold alike
+/// can coexist in OneDrive): picking one could pair the wrong folder.
 pub fn find_remote(store: &Store, path: &str) -> Result<Option<String>> {
-    Ok(store.read(|o| {
-        let Some(mut cur) = o.remote_root()? else { return Ok(None) };
-        for part in path.split('/').filter(|s| !s.is_empty()) {
-            let next = o
-                .remote_children(&cur.id)?
-                .into_iter()
-                .map(|(row, _)| row)
-                .find(|row| row.kind == Kind::Folder && row.name.to_lowercase() == part.to_lowercase());
-            match next {
-                Some(row) => cur = row,
-                None => return Ok(None),
-            }
+    let Some(root) = store.read(|o| o.remote_root())? else { return Ok(None) };
+    let mut cur = root.id;
+    let mut so_far = String::new();
+    for part in path.split('/').filter(|s| !s.is_empty()) {
+        so_far = format!("{so_far}/{part}");
+        let mut found = store.read(|o| o.remote_named(&cur, part))?.into_iter().filter(|r| r.kind == Kind::Folder);
+        let Some(row) = found.next() else { return Ok(None) };
+        if let Some(other) = found.next() {
+            bail!(
+                "{so_far} matches more than one OneDrive folder ({} and {}); rename one of them",
+                row.name,
+                other.name
+            );
         }
-        Ok(Some(cur.id))
-    })?)
+        cur = row.id;
+    }
+    Ok(Some(cur))
 }
 
 /// Creates the missing folders of `path` (with `conflictBehavior=fail`, so
@@ -2652,6 +2658,44 @@ mod tests {
         // would back off; the marks stay all the same (`rounds`).
         let paused = Report { not_run: vec![op()], ..Report::default() };
         assert_eq!(settle(&paused, 0, &mut 0), (true, Some(End::Settled)));
+    }
+
+    /// A pair's OneDrive folder is found with names compared as Windows
+    /// compares them, part by part, and two folders that match one part
+    /// are refused rather than one picked.
+    #[test]
+    fn a_pairs_onedrive_folder_is_found_by_name_as_windows_compares_names() {
+        let mut s = Store::open_in_memory().unwrap();
+        let row = |id: &str, parent: Option<&str>, name: &str, kind| oneup_store::RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: name.into(),
+            kind,
+            size: 0,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| {
+            o.upsert_item(&row("root", None, "root", Kind::Root), false)?;
+            o.upsert_item(&row("g", Some("root"), "ΟΔΟΣ", Kind::Folder), false)?;
+            o.upsert_item(&row("d", Some("g"), "Docs", Kind::Folder), false)?;
+            o.upsert_item(&row("k", Some("root"), "\u{212A}", Kind::Folder), false)?;
+            o.upsert_item(&row("f", Some("root"), "file", Kind::File), false)?;
+            // Two names OneDrive tells apart that fold alike (final ς and σ).
+            o.upsert_item(&row("l1", Some("root"), "λογος", Kind::Folder), false)?;
+            o.upsert_item(&row("l2", Some("root"), "λογοσ", Kind::Folder), false)?;
+            Ok(())
+        })
+        .unwrap();
+        let find = |p: &str| find_remote(&s, p).unwrap();
+        assert_eq!(find("/οδοσ/DOCS").as_deref(), Some("d"));
+        assert_eq!(find("/\u{212A}").as_deref(), Some("k"));
+        assert_eq!(find("/k"), None, "the Kelvin sign isn't k");
+        assert_eq!(find("/file"), None, "not a folder");
+        assert_eq!(find("/").as_deref(), Some("root"));
+        let err = find_remote(&s, "/ΛΟΓΟΣ/x").unwrap_err().to_string();
+        assert!(err.contains("/ΛΟΓΟΣ") && err.contains("λογος") && err.contains("λογοσ"), "{err}");
     }
 
     /// An upload done over an edit it couldn't keep is logged as done, and

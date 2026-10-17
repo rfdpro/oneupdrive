@@ -227,10 +227,11 @@ pub fn check_local(main: &Path, folder: &Path, except: Option<&Path>) -> Result<
     Ok(())
 }
 
-/// `a` is `b` or inside it, as OneDrive paths (case-insensitive).
+/// `a` is `b` or inside it, as OneDrive paths (names compared as
+/// `oneup_sync::fold` does).
 fn remote_within(a: &str, b: &str) -> bool {
-    let (a, b) = (a.trim_end_matches('/').to_lowercase(), b.trim_end_matches('/').to_lowercase());
-    a == b || b.is_empty() || a.starts_with(&format!("{b}/"))
+    let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+    b.is_empty() || oneup_sync::strip_folded_prefix(a, b).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Refuses OneDrive folder `remote` (in the account's own drive) if it
@@ -618,5 +619,8 @@ mod tests {
         assert!(remote_within("/Photos", "/Photos/"));
         assert!(!remote_within("/Photos2", "/Photos"));
         assert!(remote_within("/anything", ""), "the whole drive holds everything");
+        // As Windows compares names: per character, not whole-string lower case.
+        assert!(remote_within("/ΟΔΟΣ/a", "/οδοσ"));
+        assert!(!remote_within("/\u{212A}/a", "/k"), "the Kelvin sign isn't k");
     }
 }

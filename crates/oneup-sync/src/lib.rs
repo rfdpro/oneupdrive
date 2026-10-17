@@ -25,6 +25,7 @@ mod resolve;
 pub use merge::{conflict_candidate, conflict_name};
 pub use model::{
     Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold, fold_char,
+    strip_folded_prefix,
 };
 pub use op::{Dir, HoldReason, Link, LocalPre, Op, RemotePre, Vacates};
 
