@@ -205,7 +205,8 @@ pub fn apply_records(
     root_id: u128,
     rules: &ExcludeSet,
     records: &[UsnRecord],
-    stat: &mut dyn FnMut(FileId) -> Stat,
+    // (item, its parent per the record)
+    stat: &mut dyn FnMut(FileId, FileId) -> Stat,
     ch: &mut Changes,
 ) -> Result<()> {
     // Last record per ID, in the order those last records were written:
@@ -259,7 +260,7 @@ pub fn apply_records(
             }
             continue;
         }
-        let entry = match stat(r.file_id) {
+        let entry = match stat(r.file_id, r.parent_id) {
             Stat::Found(e) if !e.name.is_empty() => e,
             Stat::Found(_) | Stat::Unreadable => {
                 ch.unreadable += 1;
@@ -308,11 +309,13 @@ mod driver {
     use std::path::Path;
 
     use oneup_ntfs::FileId;
+    use oneup_ntfs::dirent::DirEntry;
     use oneup_ntfs::record::UsnRecord;
     use oneup_ntfs::win::{self, Volume};
     use oneup_store::{LocalRoot, Store};
 
     use super::{Changes, Error, Rescan, Result, Stat, apply_records};
+    use crate::classify;
     use crate::scan::{Config, Progress, list_queued};
 
     /// Brings a finished scan up to date from the change journal.
@@ -408,8 +411,8 @@ mod driver {
                 }
                 ch.records += records.len() as u64;
                 let (volume, rules, root_id) = (&self.volume, &self.cfg.rules, self.root.root_file_id);
-                let mut stat = |id: FileId| match volume.stat_by_id(id) {
-                    Ok(Some(e)) => Stat::Found(e),
+                let mut stat = |id: FileId, parent: FileId| match volume.stat_by_id(id) {
+                    Ok(Some(e)) => as_listed(volume, parent, e),
                     Ok(None) => Stat::Gone,
                     Err(e) => {
                         tracing::debug!(error = %e, "changed item could not be read");
@@ -444,6 +447,30 @@ mod driver {
 
         pub fn into_store(self) -> Store {
             self.store
+        }
+    }
+
+    /// A cloud placeholder folder read by ID, with the attributes its
+    /// parent's listing gives it. The handle may lack the recall flags that
+    /// mark it unpopulated (Microsoft documents `FILE_ATTRIBUTE_RECALL_ON_OPEN`
+    /// only for listings), and a folder judged populated is listed, which
+    /// would make its provider fetch its contents. Only the parent is asked,
+    /// for this one name. Unconfirmed (moved again, or unreadable), it's left
+    /// unread: its next record, or a rescan, reads it.
+    fn as_listed(volume: &Volume, parent: FileId, e: DirEntry) -> Stat {
+        if !e.is_dir()
+            || !classify::is_cloud_tag(e.reparse_tag)
+            || classify::is_unpopulated(e.attributes, e.reparse_tag)
+        {
+            return Stat::Found(e);
+        }
+        match volume.listed_in(parent, &e.name, e.file_id) {
+            Ok(Some(l)) => Stat::Found(DirEntry { attributes: l.attributes, reparse_tag: l.reparse_tag, ..e }),
+            Ok(None) => Stat::Unreadable,
+            Err(err) => {
+                tracing::debug!(error = %err, "a cloud folder's listing entry could not be read");
+                Stat::Unreadable
+            }
         }
     }
 }
@@ -532,7 +559,7 @@ mod tests {
     /// Applies `records` with a fake file system holding `live` entries.
     fn apply(s: &mut Store, records: &[UsnRecord], live: &[DirEntry]) -> Changes {
         let mut ch = Changes::default();
-        let mut stat = |id: FileId| match live.iter().find(|e| e.file_id == id) {
+        let mut stat = |id: FileId, _| match live.iter().find(|e| e.file_id == id) {
             Some(e) => Stat::Found(e.clone()),
             None => Stat::Gone,
         };
@@ -634,7 +661,8 @@ mod tests {
         let mut s = tree();
         let mut ch = Changes::default();
         let records = [rec(4, ROOT_ID, reason::FILE_DELETE), rec(ROOT_ID, 0, reason::FILE_DELETE)];
-        let r = s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), &records, &mut |_| Stat::Gone, &mut ch));
+        let r =
+            s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), &records, &mut |_, _| Stat::Gone, &mut ch));
         assert!(matches!(r, Err(Error::NeedsRescan(Rescan::RootGone))));
         assert!(s.read(|o| o.local_get(4)).unwrap().is_some(), "the batch was rolled back");
     }
@@ -651,7 +679,7 @@ mod tests {
                 ROOT_ID,
                 &ExcludeSet::dev(),
                 &[rec(3, 2, reason::CLOSE)],
-                &mut |_| Stat::Unreadable,
+                &mut |_, _| Stat::Unreadable,
                 &mut ch,
             )
         })

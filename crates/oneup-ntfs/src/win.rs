@@ -351,6 +351,55 @@ impl Volume {
         stat_handle(&h, id)
     }
 
+    /// Item `id`, named `name`, as folder `parent`'s listing reports it.
+    /// That can differ from what a handle on the item reports: Microsoft
+    /// documents `FILE_ATTRIBUTE_RECALL_ON_OPEN` (a placeholder folder whose
+    /// contents are still in the cloud) as returned only by directory
+    /// listings. Only `parent` is listed, for that one name, so a folder
+    /// `id` is never listed itself (which would make its cloud provider
+    /// fetch its contents). `Ok(None)` if `parent` has no such name, or it
+    /// is now another item's.
+    pub fn listed_in(&self, parent: FileId, name: &str, id: FileId) -> Result<Option<DirEntry>> {
+        use windows::Wdk::Storage::FileSystem::{FileIdExtdDirectoryInformation, NtQueryDirectoryFile};
+        use windows::Win32::Foundation::{STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, UNICODE_STRING};
+        use windows::Win32::System::IO::IO_STATUS_BLOCK;
+        use windows::core::PWSTR;
+
+        let dir = self.open_dir_by_id(parent)?;
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        let Ok(bytes) = u16::try_from(wide.len() * 2) else { return Ok(None) };
+        let pattern = UNICODE_STRING { Length: bytes, MaximumLength: bytes, Buffer: PWSTR(wide.as_mut_ptr()) };
+        // One entry: the fixed part plus a name of at most 255 UTF-16
+        // units. u64 words keep the buffer aligned for the struct.
+        let mut words = vec![0u64; (crate::dirent::NAME + 2 * 256).div_ceil(8)];
+        let mut io = IO_STATUS_BLOCK::default();
+        // SAFETY: `dir` is an open directory handle; `io`, `words` and
+        // `pattern` (with the `wide` buffer it points into) are valid for
+        // the stated sizes and outlive this synchronous call.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                dir.raw(),
+                None,
+                None,
+                None,
+                &mut io,
+                words.as_mut_ptr().cast::<c_void>(),
+                (words.len() * 8) as u32,
+                FileIdExtdDirectoryInformation,
+                true,
+                Some(&pattern),
+                true,
+            )
+        };
+        if status == STATUS_NO_SUCH_FILE || status == STATUS_NO_MORE_FILES {
+            return Ok(None);
+        }
+        status.ok().map_err(|source| Error::Win32 { op: "NtQueryDirectoryFile", source })?;
+        let buf: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // The name is a pattern (wildcards match): the ID decides.
+        Ok(parse_dir_buffer(&buf)?.into_iter().find(|e| e.file_id == id))
+    }
+
     /// Opens the item with this ID for changing it (rename, move, recycle),
     /// and for reading its metadata through the same handle, so what is
     /// checked is exactly what is then changed.
@@ -707,6 +756,13 @@ mod tests {
         assert!(attrs & crate::dirent::FILE_ATTRIBUTE_DIRECTORY != 0);
         assert_eq!(tag, 0);
         assert!(vol.open_dir_by_id(FileId(u128::MAX - 7)).is_err());
+
+        // One name from the parent's listing, exactly as the listing has it.
+        let top = file_id(&h).unwrap().1;
+        assert_eq!(vol.listed_in(top, "A.TXT", entries[0].file_id).unwrap().as_ref(), Some(&entries[0]));
+        assert_eq!(vol.listed_in(top, "sub", entries[0].file_id).unwrap(), None, "another item's name");
+        assert_eq!(vol.listed_in(top, "*", entries[1].file_id).unwrap(), None, "a pattern finds one entry at most");
+        assert_eq!(vol.listed_in(top, "none", entries[0].file_id).unwrap(), None);
         drop((h, sub));
         std::fs::remove_dir_all(&dir).unwrap();
     }
