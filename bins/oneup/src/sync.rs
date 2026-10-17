@@ -1930,6 +1930,15 @@ pub(crate) async fn mirror_with(graph: &Arc<Graph>, store: Store, rules: &Exclud
 /// nothing in the synced folder changed: the agent calls it on every
 /// journal wake to see whether anything needs a round).
 pub async fn observe(store: Store, rules: &ExcludeSet) -> Result<Store> {
+    observe_with(store, rules, oneup_local::observe::seen_deletes()).await
+}
+
+/// [`observe`], with the delete records read ahead in `seen`.
+async fn observe_with(
+    store: Store,
+    rules: &ExcludeSet,
+    seen: &'static oneup_local::observe::SeenDeletes,
+) -> Result<Store> {
     use oneup_local::observe::{Error, Observer, Rescan};
     let cfg = oneup_local::Config::new(rules.clone());
     tokio::task::spawn_blocking(move || -> Result<Store> {
@@ -1946,14 +1955,22 @@ pub async fn observe(store: Store, rules: &ExcludeSet) -> Result<Store> {
         }
         let mut obs = Observer::open(store, cfg.clone())?;
         match obs.catch_up() {
-            Ok(_) => Ok(obs.into_store()),
+            Ok(_) => Ok(caught_up(obs, seen)),
             Err(Error::NeedsRescan(why @ (Rescan::JournalWrapped | Rescan::JournalReplaced))) => {
-                rescan(obs.into_store(), cfg, why)
+                rescan(obs.into_store(), cfg, why, seen)
             }
             Err(e) => Err(e.into()),
         }
     })
     .await?
+}
+
+/// The store of an observer that caught up, forgetting the delete records
+/// the watcher read ahead that it has now read itself.
+fn caught_up(obs: oneup_local::observe::Observer, seen: &oneup_local::observe::SeenDeletes) -> Store {
+    let (journal_id, cursor) = obs.position();
+    seen.trim(journal_id, cursor);
+    obs.into_store()
 }
 
 /// The change journal lost track of the synced folder: expected after the
@@ -1963,7 +1980,12 @@ pub async fn observe(store: Store, rules: &ExcludeSet) -> Result<Store> {
 /// missing afterwards is held and reported, never deleted (`data-safety.md`
 /// invariant 3). Only the same folder (same volume, same folder ID) is
 /// rescanned; anything else stops sync, as before.
-fn rescan(store: Store, cfg: oneup_local::Config, why: oneup_local::observe::Rescan) -> Result<Store> {
+fn rescan(
+    store: Store,
+    cfg: oneup_local::Config,
+    why: oneup_local::observe::Rescan,
+    seen: &oneup_local::observe::SeenDeletes,
+) -> Result<Store> {
     use oneup_local::scan::{Replaced, Start};
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
     println!("The PC's change record can't be followed any more ({why}); looking the synced folder through again …");
@@ -1977,16 +1999,22 @@ fn rescan(store: Store, cfg: oneup_local::Config, why: oneup_local::observe::Res
         bail!("the rescan was interrupted");
     }
     let mut store = scan.into_store();
-    let detail = format!(
+    // Deletions the agent's journal watcher read before the journal wrapped
+    // are evidence still (`SeenDeletes`).
+    let deleted = oneup_local::observe::note_seen_deletes(&mut store, seen)?;
+    let mut detail = format!(
         "{why}; looked through again: {} files and {} folders in {:.1?}",
         summary.stats.files, summary.stats.folders, summary.elapsed
     );
+    if deleted > 0 {
+        detail.push_str(&format!("; {deleted} deletion(s) seen meanwhile"));
+    }
     println!("  {detail}");
     log_activity(&mut store, vec![notice(ActivityOutcome::Note, "rescan", detail)])?;
     // Changes made while the scan ran are in the journal from its start.
     let mut obs = oneup_local::observe::Observer::open(store, cfg)?;
     obs.catch_up()?;
-    Ok(obs.into_store())
+    Ok(caught_up(obs, seen))
 }
 
 /// Whether a pair may be the whole drive: once sync is released
@@ -2732,6 +2760,87 @@ mod tests {
         assert_eq!(store.read(|o| o.local_stats()).unwrap().files, 2);
         let log = store.read(|o| o.activity_recent(None, 5)).unwrap();
         assert!(log.iter().any(|e| e.action == "rescan"), "{log:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The agent's journal watcher read a synced file's delete record, then
+    /// the journal lost track before the observer read it: after the
+    /// rescan the file is deleted, with evidence, instead of held. The
+    /// volume's real records, read the way the watcher reads them. Temp
+    /// folder only.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn deletions_read_before_a_journal_loss_are_still_evidence() {
+        #![allow(clippy::unwrap_used)]
+        use oneup_local::observe::{SeenDeletes, remember_deletes};
+        use oneup_sync::{Base, LocalId, NodeKind, ROOT, RemoteId, Seen, Trees};
+        let dir = std::env::temp_dir().join(format!("oneup-seen-deletes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b").unwrap();
+        let rules = ExcludeSet::none();
+        let mut scan =
+            oneup_local::Scan::open(Store::open_in_memory().unwrap(), &dir, oneup_local::Config::new(rules.clone()))
+                .unwrap();
+        assert!(scan.run().unwrap().finished);
+        let mut store = scan.into_store();
+        let top = store.read(|o| o.local_root()).unwrap().unwrap().root_file_id;
+        let id_of = |s: &Store, name: &str| s.read(|o| o.local_named(top, name)).unwrap()[0].file_id;
+        let (a, b) = (id_of(&store, "a.txt"), id_of(&store, "b.txt"));
+        store
+            .write(|o| {
+                let base = |sid, name: &str, local, kind| Base {
+                    sid,
+                    parent: (sid != ROOT).then_some(ROOT),
+                    name: name.into(),
+                    kind,
+                    size: 1,
+                    hash: None,
+                    local: Some(LocalId(local)),
+                    local_mtime: 0,
+                    remote: Some(RemoteId(format!("r{sid}"))),
+                    remote_etag: String::new(),
+                };
+                o.synced_put(&base(ROOT, "", top, NodeKind::Folder))?;
+                o.synced_put(&base(1, "a.txt", a, NodeKind::File))?;
+                o.synced_put(&base(2, "b.txt", b, NodeKind::File))
+            })
+            .unwrap();
+
+        let volume = oneup_ntfs::win::Volume::open_containing(&dir).unwrap();
+        let j = volume.query_journal().unwrap();
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        let seen: &'static SeenDeletes = Box::leak(Box::new(SeenDeletes::new()));
+        let (mut cursor, end) = (j.next_usn, volume.query_journal().unwrap().next_usn);
+        let mut buf = vec![0u8; 64 * 1024];
+        while cursor < end {
+            let (next, records) = volume.read_journal(j.journal_id, cursor, false, &mut buf).unwrap();
+            let records: Vec<_> = records.flatten().collect();
+            remember_deletes(&store, seen, j.journal_id, &records).unwrap();
+            if next <= cursor {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.ids(j.journal_id), [b], "only the synced item's delete record is kept");
+        store.write(|o| o.local_set_journal_cursor(0)).unwrap();
+
+        let store = observe_with(store, &rules, seen).await.unwrap();
+        store
+            .read(|o| {
+                assert_eq!(o.local(LocalId(b))?, Seen::Deleted);
+                assert!(o.local(LocalId(a))?.present().is_some());
+                assert!(o.check_invariants()?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        let log = store.read(|o| o.activity_recent(None, 5)).unwrap();
+        assert!(
+            log.iter().any(|e| e.action == "rescan" && e.detail.contains("1 deletion(s) seen meanwhile")),
+            "{log:?}"
+        );
+        assert!(seen.is_empty(), "forgotten once the observer read past it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

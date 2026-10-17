@@ -491,7 +491,11 @@ async fn agent(
     let busy = Arc::new(Busy::new(oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?.busy));
     engine.hold_busy(Arc::clone(&busy));
     engine.back_off();
-    watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy));
+    // The watcher's own connection, to tell synced items' delete records.
+    let deletes = setup::open_store(dir, 1024)
+        .inspect_err(|e| tracing::warn!(error = %e, "deletions during a journal loss will be held"))
+        .ok();
+    watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy), deletes);
     let remote = Arc::new(Notify::new());
     // Files On-Demand: serve the placeholders' content while this attempt
     // runs (files-on-demand.md § Hydration).
@@ -775,10 +779,20 @@ async fn wait(
 /// next OneDrive check, which reads the journal too.
 ///
 /// It also hands every written file to the program tracker
-/// (`oneup_app::apps`), if there is one. When it falls far behind (a burst
-/// of activity on the disk), it skips ahead: the observer reads everything
-/// anyway; only those writes go uncounted.
-fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::apps::Tracker>, busy: Arc<Busy>) {
+/// (`oneup_app::apps`), if there is one, and keeps the delete records of
+/// synced items (`oneup_local::observe::SeenDeletes`, through `deletes`):
+/// the observer runs between rounds, and on a busy disk the journal can
+/// wrap before it gets there. With records waiting it reads on without
+/// pausing. Only when it falls far behind anyway (the disk busier than it
+/// can read) does it skip ahead: the observer reads everything, or rescans;
+/// only those writes go uncounted and those deletions held.
+fn watch_journal(
+    root: PathBuf,
+    wake: &Arc<Notify>,
+    tracker: Option<oneup_app::apps::Tracker>,
+    busy: Arc<Busy>,
+    deletes: Option<Store>,
+) {
     // The thread can't be interrupted while blocked in the kernel. It holds
     // only a weak reference, so once the agent is done with `wake` (a stop
     // or a restart) the thread ends at its next wake-up.
@@ -816,8 +830,19 @@ fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::a
             loop {
                 let next = {
                     let (next, records) = volume.read_journal(j.journal_id, cursor, true, &mut buf)?;
+                    let records: Vec<_> = records.flatten().collect();
+                    if let Some(store) = &deletes
+                        && let Err(e) = oneup_local::observe::remember_deletes(
+                            store,
+                            oneup_local::observe::seen_deletes(),
+                            j.journal_id,
+                            &records,
+                        )
+                    {
+                        tracing::debug!(error = %e, "delete records could not be looked up");
+                    }
                     let (now, wall) = (Instant::now(), std::time::SystemTime::now());
-                    for r in records.flatten() {
+                    for r in records {
                         // An online-only file wasn't written by a program:
                         // that's OneUpDrive making or freeing a
                         // placeholder. Asking who has it open downloaded
@@ -842,10 +867,21 @@ fn watch_journal(root: PathBuf, wake: &Arc<Notify>, tracker: Option<oneup_app::a
                 }
                 let _ = ping.try_send(());
                 let end = volume.query_journal()?.next_usn;
-                // Every record is read (for the program tracker and for
-                // files that keep changing) unless far behind.
-                cursor = if end - next > SKIP_AHEAD { end } else { next };
-                std::thread::sleep(if tracker.is_some() { TRACK_GAP } else { MIN_WAKE_GAP });
+                // Every record is read (for the program tracker, files that
+                // keep changing, and synced items' deletions) unless far
+                // behind.
+                let behind = end - next;
+                cursor = if behind > SKIP_AHEAD {
+                    tracing::debug!(behind, "change journal: skipping ahead");
+                    end
+                } else {
+                    next
+                };
+                // Caught up (less than a buffer waiting): pause. Otherwise
+                // read on, or a burst outruns the reads and gets skipped.
+                if behind < buf.len() as i64 {
+                    std::thread::sleep(if tracker.is_some() { TRACK_GAP } else { MIN_WAKE_GAP });
+                }
             }
         };
         if let Err(e) = run() {

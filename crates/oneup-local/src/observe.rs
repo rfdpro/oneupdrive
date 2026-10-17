@@ -34,19 +34,32 @@
 //! rebuild the tree. A rescan records **no** evidence: whatever disappeared
 //! meanwhile reads as Missing (`data-safety.md` invariant 3).
 //!
+//! ## Delete records read ahead ([`SeenDeletes`])
+//! The agent's journal watcher reads every record as it's written, while
+//! the observer only runs between rounds. A long round on a busy disk (a
+//! build tree or a dependency folder deleted: hundreds of thousands of
+//! records) can wrap a small journal before the observer reads it, losing
+//! the delete records of synced items deleted meanwhile, so they would be
+//! held instead of deleted in OneDrive. The watcher keeps the delete
+//! records of items a Synced row links ([`remember_deletes`]), and after a
+//! rescan they're noted as evidence for the items the rescan didn't find
+//! ([`note_seen_deletes`]). They are the same USN delete records the
+//! observer would have applied; nothing is inferred from absence.
+//!
 //! ## Cost
 //! Proportional to the journal's records, not the tree: one indexed lookup
 //! per mentioned ID, and one open-by-ID per item inside the tree. Folders
 //! are listed only when they enter the tree. The journal is volume-wide, so
 //! activity elsewhere on the disk costs a lookup per record and nothing more.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Mutex;
 
 use oneup_ntfs::FileId;
 use oneup_ntfs::dirent::DirEntry;
 use oneup_ntfs::record::{UsnRecord, reason};
 use oneup_rules::ExcludeSet;
-use oneup_store::{LocalKind, Ops, Skip};
+use oneup_store::{LocalKind, Ops, Skip, Store};
 
 use crate::classify;
 
@@ -301,6 +314,139 @@ pub fn apply_records(
     Ok(())
 }
 
+/// The most delete records [`SeenDeletes`] keeps (24 bytes each, so at most
+/// 6 MiB). Only synced items' records are kept, and only until the
+/// observer has read past them; past this, the oldest go, and their items
+/// are held after a rescan as they would be without the log.
+const SEEN_MAX: usize = 1 << 18;
+
+/// Delete records of synced items, read by the journal watcher ahead of the
+/// observer (see the module docs). One per process ([`seen_deletes`]); a
+/// process without a watcher leaves it empty.
+#[derive(Debug, Default)]
+pub struct SeenDeletes {
+    inner: Mutex<Seen>,
+}
+
+#[derive(Debug, Default)]
+struct Seen {
+    journal_id: u64,
+    /// (USN of the record, file ID), oldest first.
+    ids: VecDeque<(i64, u128)>,
+}
+
+impl SeenDeletes {
+    pub const fn new() -> Self {
+        Self { inner: Mutex::new(Seen { journal_id: 0, ids: VecDeque::new() }) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Seen> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records that journal `journal_id` holds a delete record for `id` at
+    /// `usn`. Records of another journal are dropped: a new journal's
+    /// positions start over.
+    pub fn saw(&self, journal_id: u64, usn: i64, id: u128) {
+        let mut s = self.lock();
+        if s.journal_id != journal_id {
+            s.ids.clear();
+            s.journal_id = journal_id;
+        }
+        if s.ids.len() >= SEEN_MAX {
+            s.ids.pop_front();
+        }
+        s.ids.push_back((usn, id));
+    }
+
+    /// Forgets the records before `cursor`: the observer has read them.
+    pub fn trim(&self, journal_id: u64, cursor: i64) {
+        let mut s = self.lock();
+        if s.journal_id == journal_id {
+            while s.ids.front().is_some_and(|&(usn, _)| usn < cursor) {
+                s.ids.pop_front();
+            }
+        }
+    }
+
+    /// The IDs recorded from journal `journal_id`.
+    pub fn ids(&self, journal_id: u64) -> Vec<u128> {
+        let s = self.lock();
+        if s.journal_id != journal_id {
+            return Vec::new();
+        }
+        s.ids.iter().map(|&(_, id)| id).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+static SEEN: SeenDeletes = SeenDeletes::new();
+
+/// This process's [`SeenDeletes`].
+pub fn seen_deletes() -> &'static SeenDeletes {
+    &SEEN
+}
+
+/// Keeps, in `seen`, the delete records among `records` (journal
+/// `journal_id`) whose items a Synced row links: the only ones evidence is
+/// ever recorded for. One indexed lookup per delete record, in one read.
+/// Returns how many were kept.
+pub fn remember_deletes(
+    store: &Store,
+    seen: &SeenDeletes,
+    journal_id: u64,
+    records: &[UsnRecord],
+) -> oneup_store::Result<usize> {
+    let deletes: Vec<&UsnRecord> = records.iter().filter(|r| r.has(reason::FILE_DELETE)).collect();
+    if deletes.is_empty() {
+        return Ok(0);
+    }
+    let synced = store.read(|o| {
+        let mut keep = Vec::new();
+        for r in deletes {
+            if o.synced_by_local(r.file_id.0)?.is_some() {
+                keep.push((r.usn, r.file_id.0));
+            }
+        }
+        Ok(keep)
+    })?;
+    for &(usn, id) in &synced {
+        seen.saw(journal_id, usn, id);
+    }
+    Ok(synced.len())
+}
+
+/// After a rescan: notes deletion evidence for the items `seen` holds delete
+/// records of (from the journal the rescan continues) and that the rescan
+/// didn't find. An item it found is left alone: it's there. Returns how
+/// many Synced items got evidence.
+pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::Result<u64> {
+    let Some(root) = store.read(|o| o.local_root())? else { return Ok(0) };
+    let Some((journal_id, _)) = root.journal else { return Ok(0) };
+    let ids = seen.ids(journal_id);
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    store.write(|o| {
+        let mut noted = 0;
+        for id in ids {
+            // The root's own delete record isn't evidence for anything
+            // (a rescan wouldn't have opened without it anyway).
+            if id != root.root_file_id && o.local_get(id)?.is_none() && o.note_local_deleted(id)? {
+                noted += 1;
+            }
+        }
+        Ok(noted)
+    })
+}
+
 #[cfg(windows)]
 pub use driver::Observer;
 
@@ -434,6 +580,11 @@ mod driver {
         fn drain_queue(&mut self) -> Result<()> {
             while list_queued(&mut self.store, &self.volume, &self.cfg, &mut self.buf, &self.progress)? > 0 {}
             Ok(())
+        }
+
+        /// The journal (id, USN) the tree is current up to.
+        pub fn position(&self) -> (u64, i64) {
+            (self.journal_id, self.cursor)
         }
 
         pub fn store(&self) -> &Store {
@@ -665,6 +816,110 @@ mod tests {
             s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), &records, &mut |_, _| Stat::Gone, &mut ch));
         assert!(matches!(r, Err(Error::NeedsRescan(Rescan::RootGone))));
         assert!(s.read(|o| o.local_get(4)).unwrap().is_some(), "the batch was rolled back");
+    }
+
+    const JOURNAL: u64 = 7;
+
+    /// [`tree`] as a rescan of journal [`JOURNAL`] leaves it after `gone`
+    /// were deleted while nothing read the journal: their rows dropped,
+    /// without evidence.
+    fn rescanned(gone: &[u128]) -> Store {
+        let mut s = tree();
+        s.write(|o| {
+            let root = oneup_store::LocalRoot {
+                path: r"C:\t".into(),
+                volume_serial: 1,
+                root_file_id: ROOT_ID,
+                rules: String::new(),
+                journal: Some((JOURNAL, 1000)),
+                started_at_ms: 0,
+                finished_at_ms: Some(1),
+                sync_root_provider: None,
+            };
+            // `local_begin` starts the Local tree over; what's left goes back.
+            o.local_begin(&root, &row(ROOT_ID, 0, "", LocalKind::Root))?;
+            let rows = [
+                row(2, ROOT_ID, "docs", LocalKind::Folder),
+                row(3, 2, "a.txt", LocalKind::File),
+                row(4, ROOT_ID, "b.txt", LocalKind::File),
+            ];
+            for r in rows.iter().filter(|r| !gone.contains(&r.file_id)) {
+                o.local_update(r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        s
+    }
+
+    fn seen(s: &Store, id: u128) -> Seen<oneup_sync::LocalNode> {
+        s.read(|o| o.local(LocalId(id))).unwrap()
+    }
+
+    #[test]
+    fn delete_records_read_ahead_are_evidence_after_a_rescan() {
+        // b.txt (synced) was deleted; the journal wrapped before the
+        // observer read it, but the watcher had.
+        let mut s = rescanned(&[4]);
+        assert_eq!(seen(&s, 4), Seen::Missing, "without the record: held");
+        let log = SeenDeletes::new();
+        let kept = remember_deletes(&s, &log, JOURNAL, &[rec(4, ROOT_ID, reason::FILE_DELETE | reason::CLOSE)]);
+        assert_eq!(kept.unwrap(), 1);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 1);
+        assert_eq!(seen(&s, 4), Seen::Deleted);
+        assert!(s.read(|o| o.check_invariants()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_synced_items_absent_after_the_rescan_get_evidence() {
+        let mut s = rescanned(&[3]);
+        let log = SeenDeletes::new();
+        let records = [
+            // a.txt: deleted, but never synced, so nothing asks about it.
+            rec(3, 2, reason::FILE_DELETE),
+            // Elsewhere on the disk.
+            rec(50, 49, reason::FILE_DELETE),
+            // Not a delete.
+            rec(4, ROOT_ID, reason::DATA_EXTEND | reason::CLOSE),
+        ];
+        assert_eq!(remember_deletes(&s, &log, JOURNAL, &records).unwrap(), 0);
+        assert!(log.is_empty());
+        // Even if a record of a present item got in, the item is there.
+        log.saw(JOURNAL, 10, 4);
+        log.saw(JOURNAL, 11, ROOT_ID);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 0);
+        assert!(seen(&s, 4).present().is_some());
+        assert!(s.read(|o| o.check_invariants()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn records_of_another_journal_are_not_evidence() {
+        let mut s = rescanned(&[4]);
+        let log = SeenDeletes::new();
+        log.saw(JOURNAL + 1, 10, 4);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 0);
+        assert_eq!(seen(&s, 4), Seen::Missing);
+        // A new journal drops what an old one held.
+        log.saw(JOURNAL, 5, 9);
+        assert_eq!(log.ids(JOURNAL), [9]);
+        assert!(log.ids(JOURNAL + 1).is_empty());
+    }
+
+    #[test]
+    fn the_log_forgets_what_the_observer_read_and_stays_bounded() {
+        let log = SeenDeletes::new();
+        for usn in 0..10 {
+            log.saw(JOURNAL, usn, usn as u128);
+        }
+        log.trim(JOURNAL + 1, 100);
+        assert_eq!(log.len(), 10, "another journal's position says nothing");
+        log.trim(JOURNAL, 6);
+        assert_eq!(log.ids(JOURNAL), [6, 7, 8, 9]);
+        for usn in 10..(SEEN_MAX as i64 + 10) {
+            log.saw(JOURNAL, usn, 1);
+        }
+        assert_eq!(log.len(), SEEN_MAX);
+        assert_eq!(log.ids(JOURNAL)[0], 1, "the oldest went first");
     }
 
     #[test]
