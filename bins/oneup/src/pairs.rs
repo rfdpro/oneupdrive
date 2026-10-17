@@ -489,10 +489,34 @@ pub fn remove(e: &Entry) -> Result<Described> {
             .context("pairing token missing")?;
         crate::syncroot::unregister(&d.local, &token).context("releasing the folder")?;
     }
-    // The lock file goes with the folder, so it can't stay open.
+    // An agent started for this folder once the lock is free would find a
+    // live database and sync it again, so the folder is emptied under the
+    // lock first; only the lock file, which can't go while it's open, is
+    // left for after.
+    empty_but_lock(&e.dir, &lock)?;
     drop(lock);
     std::fs::remove_dir_all(&e.dir).with_context(|| format!("removing {}", e.dir.display()))?;
     Ok(d)
+}
+
+/// Removes everything in the data folder `dir` (ours, not user content)
+/// but the file `lock` holds open. The pair marker goes last: if anything
+/// else can't be removed, the folder is still a pair that removing again
+/// can finish.
+fn empty_but_lock(dir: &Path, lock: &crate::setup::DirLock) -> Result<()> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("listing {}", dir.display()))? {
+        let entry = entry?;
+        if entry.path() != lock.path() {
+            entries.push((entry.file_name() == MARKER, entry.path(), entry.file_type()?.is_dir()));
+        }
+    }
+    entries.sort_by_key(|(marker, ..)| *marker);
+    for (_, path, is_dir) in entries {
+        let removed = if is_dir { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        removed.with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Stops the main data folder `dir` syncing its folder, as [`remove`] does
@@ -564,6 +588,28 @@ mod tests {
         assert!(dir.exists());
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_empties_the_data_folder_before_letting_go_of_its_lock() {
+        let dir = std::env::temp_dir().join(format!("oneup-pairs-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(crate::setup::open_store(&dir, 1024).unwrap());
+        std::fs::write(dir.join(MARKER), "/p").unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join("logs").join("a.log"), "x").unwrap();
+
+        let lock = crate::setup::DirLock::acquire(&dir).unwrap();
+        empty_but_lock(&dir, &lock).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["sync.lock"], "only the held lock file is left");
+        drop(lock);
+
+        std::fs::write(dir.join(MARKER), "/p").unwrap();
+        drop(crate::setup::open_store(&dir, 1024).unwrap());
+        let e = Entry { name: "p".into(), dir: dir.clone(), remote: "/p".into() };
+        remove(&e).unwrap();
+        assert!(!dir.exists(), "no data folder is left behind");
     }
 
     #[test]
