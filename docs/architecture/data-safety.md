@@ -9,7 +9,7 @@ Never losing user data comes before every other goal. The rules below are enforc
 2. **No remote delete or overwrite without a precondition.** Every mutation carries `If-Match: <eTag>`; a mismatch means re-plan, never force.
 3. **Deletions come only from explicit evidence.** A USN delete record, a delta `deleted` facet, or the item's synced path (or a folder above it) recorded in this Windows user's own Recycle Bin index (`$I` files): File Explorer deletes by moving into the Recycle Bin, which the journal records only as a move out of the folder. Absence from a scan is *suspicion*, not evidence: such items are held, and deletions pass the safety gate (with user confirmation above thresholds).
 4. **Sync-root identity check.** Volume serial + root file ID + a `.oneup` marker must match before any operation runs. A missing, unmounted or replaced root ⇒ **halt**, never "everything was deleted".
-5. **Compare-and-swap execution.** Immediately before acting, re-check local preconditions (file ID, USN, size, mtime). Any drift ⇒ abort the operation and re-plan.
+5. **Compare-and-swap execution.** Immediately before acting, open the item by file ID and re-check it on that handle: a file's size and last-write time, or that a folder is still a folder. Any drift ⇒ abort the operation and re-plan.
 6. **Verify every transfer.** Downloads are hashed before they're placed; uploads compare the server's QuickXorHash and confirm the file didn't change mid-upload.
 7. **Crash consistency.** Write-ahead intent records (fsync'd) → do → mark done. Recovery replays or rolls back idempotently.
 8. **Circuit breakers** in both directions. Mass delete/move/overwrite above thresholds (count and percentage) pauses that direction and asks the user, showing a preview.
