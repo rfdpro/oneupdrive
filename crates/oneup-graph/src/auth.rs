@@ -173,6 +173,17 @@ impl Auth {
             return Ok(a.token.clone());
         }
         let rt = self.store.load()?.ok_or(Error::NotSignedIn)?;
+        // The requests queued on this lock behind one the endpoint asked to
+        // wait would each ask it again at once; they get the same answer
+        // without a request, and the caller backs off for `retry_after`.
+        let wait = self.retry_after();
+        if !wait.is_zero() {
+            return Err(Error::refused(
+                429,
+                "the sign-in service",
+                format!("asked to wait {} s before the next request", wait.as_secs()),
+            ));
+        }
         let t = self
             .token_request(&[
                 ("grant_type", "refresh_token"),
@@ -217,6 +228,7 @@ impl Auth {
         // A transport failure stays `Error::Http`: offline, not signed out.
         let resp = self.http.post(format!("{AUTHORITY}/token")).form(form).send().await?;
         if resp.status().is_success() {
+            *self.retry_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             return Ok(resp.json().await?);
         }
         let status = resp.status().as_u16();
@@ -368,6 +380,49 @@ mod tests {
         assert_eq!(auth.access_token().await.unwrap(), "new", "the newer token is kept");
         auth.invalidate("new").await;
         assert!(auth.access.lock().await.is_none());
+    }
+
+    struct SignedIn;
+    impl TokenStore for SignedIn {
+        fn load(&self) -> Result<Option<String>> {
+            Ok(Some("rt".into()))
+        }
+        fn save(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn no_token_request_goes_out_while_the_endpoint_asked_to_wait() {
+        // The token endpoint resolves to a local listener that counts
+        // connections (any attempt fails its TLS handshake there).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+        let http = reqwest::Client::builder().resolve("login.microsoftonline.com", addr).build().unwrap();
+        let auth = Auth::new(http, "x".into(), "s", Box::new(SignedIn));
+        *auth.retry_at.lock().unwrap() = Some(Instant::now() + Duration::from_secs(60));
+        for _ in 0..3 {
+            let e = auth.access_token().await.unwrap_err();
+            assert!(e.is_transient() && e.status() == Some(429), "{e}");
+        }
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(auth.retry_after() > Duration::from_secs(50), "the wait isn't consumed");
+
+        // Once the wait is over, the endpoint is asked again.
+        *auth.retry_at.lock().unwrap() = Some(Instant::now());
+        assert!(auth.access_token().await.is_err());
+        assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[cfg(windows)]
