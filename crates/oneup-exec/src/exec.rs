@@ -42,9 +42,11 @@ impl<'a> Db<'a> {
     }
 }
 
-/// How many units (operations or batches) ahead of the oldest unfinished
-/// one the executor looks for one it can start.
-const WINDOW: usize = 64;
+/// How many operations, from the oldest not yet finished, the executor
+/// takes in to look for ones it can start. Behind one slow operation, the
+/// rest go at most this far ahead (plus one batch), which bounds what is
+/// held for the report.
+const WINDOW: usize = 256;
 
 /// Why an operation was skipped. Nothing was changed; the next round plans
 /// again from fresh state.
@@ -594,6 +596,12 @@ impl<C: Cloud> Executor<C> {
     /// upload it. The copy is verified: one whose content turned out
     /// different (the source changed in between) is removed again, into
     /// OneDrive's recycle bin, before uploading instead.
+    ///
+    /// A file over [`READ_ALONE`] is read whole only if the upload runs
+    /// `alone`: whether it would was decided when it was taken in, and a
+    /// file of its size may have reached OneDrive since (an earlier upload
+    /// of the round). It's then uploaded, which reads it a fragment at a
+    /// time.
     async fn copy_instead(
         &self,
         store: &Db<'_>,
@@ -601,9 +609,10 @@ impl<C: Cloud> Executor<C> {
         to: &RemoteId,
         name: &str,
         new: bool,
+        alone: bool,
     ) -> Res<Option<(RemoteRow, Hash)>> {
         use std::io::{Seek, SeekFrom};
-        if !may_copy(self.cloud.can_copy(), new, src.size) {
+        if !may_copy(self.cloud.can_copy(), new, src.size) || (src.size > READ_ALONE && !alone) {
             return Ok(None);
         }
         let candidates = store.read(|o| o.remote_files_of_size(src.size, 16))?;
@@ -705,7 +714,7 @@ impl<C: Cloud> Executor<C> {
         loop {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
-            while waiting.len() < WINDOW && next < approved.len() {
+            while next - reported < WINDOW && next < approved.len() {
                 let (n, claims) = batch_of(&db, &approved[next..], can_copy);
                 waiting.push_back(Unit { start: next, len: n, claims });
                 next += n;
@@ -799,7 +808,7 @@ impl<C: Cloud> Executor<C> {
         }
         match go.as_slice() {
             [] => {}
-            &[k] => out[k] = Some(self.single(store, &group[k], may_run).await),
+            &[k] => out[k] = Some(self.single(store, &group[k], u.claims.alone, may_run).await),
             _ => {
                 tracing::debug!(n = go.len(), "cloud changes sent in one batch");
                 let members: Vec<&Approved> = go.iter().map(|&k| &group[k]).collect();
@@ -818,9 +827,16 @@ impl<C: Cloud> Executor<C> {
     /// One operation on its own, then the settling of the write-ahead
     /// record it left if it didn't finish: right after it, with no `.await`
     /// in between, so no other operation runs first.
-    async fn single(&self, store: &Db<'_>, a: &Approved, may_run: &(dyn Fn(&Op) -> bool + Sync)) -> (Res, Notes) {
+    /// `alone`: it runs with nothing else ([`claims_in`]).
+    async fn single(
+        &self,
+        store: &Db<'_>,
+        a: &Approved,
+        alone: bool,
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> (Res, Notes) {
         let mut notes = Notes::default();
-        let mut outcome = self.one(store, a, &mut notes, may_run).await;
+        let mut outcome = self.one(store, a, alone, &mut notes, may_run).await;
         if let Some(key) = pending_key(a.op())
             && !matches!(outcome, Err(Fail::Halt(_)))
             && let Err(e) = self.recover(store, &key)
@@ -1069,11 +1085,13 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// Runs one operation, noting in `notes` what else a done one reports
-    /// (see [`Notes`]). `may_run`: see [`Self::run_checked`].
+    /// (see [`Notes`]). `alone`: see [`Self::single`]; `may_run`: see
+    /// [`Self::run_checked`].
     async fn one(
         &self,
         store: &Db<'_>,
         a: &Approved,
+        alone: bool,
         notes: &mut Notes,
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Res {
@@ -1143,7 +1161,7 @@ impl<C: Cloud> Executor<C> {
                 let (size, mtime) = (src.size, src.mtime);
                 // The file stays open (no writers) from here until recorded.
                 let (row, sent, sent_len, mark) = match self
-                    .copy_instead(store, &mut src, to, name, replace.is_none())
+                    .copy_instead(store, &mut src, to, name, replace.is_none(), alone)
                     .await?
                 {
                     Some((row, hash)) => {
