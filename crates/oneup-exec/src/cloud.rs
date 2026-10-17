@@ -38,6 +38,10 @@ pub enum CloudError {
     /// executor moves it in parts instead.
     #[error("OneDrive won't move a folder with this many items in one go")]
     TooManyItems,
+    /// The OneDrive has no room left (HTTP 507, `quotaLimitReached`,
+    /// `insufficientStorage`). Nothing was changed; uploads wait for room.
+    #[error("OneDrive is full")]
+    Full,
     /// Writing the downloaded content locally failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),

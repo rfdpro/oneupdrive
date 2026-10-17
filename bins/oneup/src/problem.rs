@@ -76,8 +76,8 @@ impl Kind {
                 "Open Settings > Accounts and select Sign in.",
             ),
             Kind::CloudFull => (
-                "OneDrive storage is full",
-                "Uploads can't go through until there's room in OneDrive.",
+                "OneDrive is full",
+                "Uploads wait until there's room in OneDrive. Downloads go on.",
                 "Free up space in OneDrive (its recycle bin counts too), or get more storage.",
             ),
             Kind::DiskFull => (
@@ -208,6 +208,25 @@ pub fn describe(e: &anyhow::Error, prev: Option<&Problem>, now_ms: i64, retry_ms
     }
 }
 
+/// OneDrive refused an upload for want of room (since `since_ms`; `remaining`:
+/// the room it said it had left). Not an error the agent stops for: uploads
+/// wait (`crate::sync`) and the room is looked at again by `retry_ms`.
+pub fn cloud_full(since_ms: i64, remaining: Option<i64>, retry_ms: i64) -> Problem {
+    let kind = Kind::CloudFull;
+    let (title, detail, action) = kind.words();
+    let left = remaining.map_or_else(|| "not told".to_string(), |r| format!("{r} bytes"));
+    Problem {
+        kind: kind.code().into(),
+        title: title.into(),
+        detail: detail.into(),
+        action: action.into(),
+        technical: format!("OneDrive refused an upload for want of room (HTTP 507); room left: {left}"),
+        since_ms,
+        attempts: 1,
+        retry_ms: Some(retry_ms),
+    }
+}
+
 /// Notes in the activity log that `p` began (`resolved` false) or cleared,
 /// so what happened, and when, can be seen later.
 pub fn log(store: &mut oneup_store::Store, p: &Problem, resolved: bool) -> oneup_store::Result<()> {
@@ -282,6 +301,16 @@ mod tests {
             classify(&anyhow::anyhow!("writing: There is not enough space on the disk. (os error 112)")),
             Kind::DiskFull
         );
+    }
+
+    #[test]
+    fn a_full_onedrive_reads_the_same_whether_an_error_or_an_upload_found_it() {
+        let status = |status, body: &str| oneup_graph::Error::Status { status, what: "x".into(), body: body.into() };
+        let from_error = describe(&err(status(507, "")), None, 5, Some(9));
+        let from_upload = cloud_full(5, Some(0), 9);
+        assert_eq!((from_upload.title.as_str(), from_upload.kind.as_str()), ("OneDrive is full", "cloud-full"));
+        assert_eq!((from_error.title, from_error.detail), (from_upload.title, from_upload.detail));
+        assert_eq!(from_upload.retry_ms, Some(9));
     }
 
     #[test]

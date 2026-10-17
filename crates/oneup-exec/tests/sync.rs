@@ -64,6 +64,9 @@ struct State {
     /// last replacing upload went over.
     old: BTreeMap<u64, Vec<u8>>,
     replaced: BTreeMap<String, u64>,
+    /// No room left: uploads are refused (as with HTTP 507), and counted.
+    full: bool,
+    refused: u64,
 }
 
 impl State {
@@ -273,6 +276,10 @@ impl Cloud for Fake {
         src.read_to_end(&mut content).map_err(|e| CloudError::Other(e.to_string()))?;
         assert_eq!(content.len() as i64, size);
         let mut s = self.0.lock().unwrap();
+        if s.full {
+            s.refused += 1;
+            return Err(CloudError::Full);
+        }
         s.uploaded += content.len() as u64;
         let id = match replace {
             Some(pre) => {
@@ -1156,6 +1163,36 @@ async fn a_pause_stops_a_download_under_way_without_placing_anything() {
 
     s.settle().await;
     assert_eq!(std::fs::read(s.p("big.bin")).unwrap(), big);
+}
+
+/// A full OneDrive refuses an upload: the round sends no other upload
+/// (each is skipped, not failed, so it's tried again once there's room),
+/// and downloads go on.
+#[tokio::test]
+async fn a_full_onedrive_stops_the_rounds_uploads_while_downloads_go_on() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("full", cloud.clone());
+    write(&s.p("old.txt"), b"synced before");
+    s.settle().await;
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(&s.p(name), name.as_bytes());
+    }
+    cloud.add("d.txt", Some(b"from the cloud"));
+    cloud.0.lock().unwrap().full = true;
+    let refused = |c: &Fake| c.0.lock().unwrap().refused;
+    let r = s.round().await;
+    let full = r.skipped.iter().filter(|(op, k)| *k == oneup_exec::Skip::CloudFull && matches!(op, Op::Upload { .. }));
+    assert_eq!(full.count(), 3, "{r:?}");
+    assert_eq!(refused(&cloud), 1, "only the first upload was sent");
+    assert!(r.done.iter().any(|op| matches!(op, Op::Download { .. })), "{r:?}");
+    assert_eq!(std::fs::read(s.p("d.txt")).unwrap(), b"from the cloud");
+
+    // Room again: they go.
+    cloud.0.lock().unwrap().full = false;
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(t["/b.txt"].as_deref(), Some(&b"b.txt"[..]));
+    assert_eq!(refused(&cloud), 1);
 }
 
 /// Every content the crash scenario ever writes, on either side.

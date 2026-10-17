@@ -37,7 +37,9 @@
 //! the version store are not a stop: they wait for `oneup keep`/`discard`
 //! while everything else syncs. Each is shown once. A sync folder that
 //! fails its identity check ends the agent. Network and service errors are
-//! retried with a growing pause.
+//! retried with a growing pause; so is each failed operation, item by item
+//! (`oneup_app::backoff`). While OneDrive is full, uploads wait and the rest
+//! goes on.
 //!
 //! While [`oneup::setup::PRE_RELEASE`] is on, test-account data folders
 //! only, like `oneup sync`. One process per data folder (`sync.lock`). Ctrl+C stops after the current
@@ -488,6 +490,7 @@ async fn agent(
     let tracker = oneup_app::apps::Tracker::start(dir, Path::new(&root.path));
     let busy = Arc::new(Busy::new(oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?.busy));
     engine.hold_busy(Arc::clone(&busy));
+    engine.back_off();
     watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy));
     let remote = Arc::new(Notify::new());
     // Files On-Demand: serve the placeholders' content while this attempt
@@ -575,6 +578,10 @@ async fn agent(
             store = s;
             held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
+            // Failed items waiting their turn (`oneup_app::backoff`); the
+            // wait below ends when the first one's comes (`held_until`).
+            let (count, next_ms) = store.read(|o| o.retry_waiting(now_ms()))?;
+            control.set_retrying(next_ms.filter(|_| count > 0).map(|next_ms| oneup_ipc::Retrying { count, next_ms }));
             if !out.totals.is_quiet() {
                 out.totals.print(out.rounds);
             }
@@ -615,6 +622,10 @@ async fn agent(
             // dropped channel pings `remote` itself, so a check follows at
             // once, and later waits use `poll` again.
             let check = if push_up.load(Relaxed) { PUSH_POLL.max(poll) } else { poll };
+            // Uploads wait while OneDrive is full; its room is looked at
+            // again at the next wake-up, at the latest the timed check.
+            let room_ms = now + i64::try_from(check.as_millis()).unwrap_or(i64::MAX / 2);
+            control.set_cloud_full(engine.cloud_full().map(|f| problem::cloud_full(f.since_ms, f.remaining, room_ms)));
             match out.end {
                 End::Settled => {
                     control.clear_first();
@@ -654,7 +665,8 @@ async fn agent(
                 }
             }
         };
-        // A held upload goes once its file has been left alone.
+        // A held upload goes once its file has been left alone, a failed
+        // operation once its wait is over.
         let next = held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now())));
         // A timed pause ends the wait when it's over.
         let next = match paused.until_ms {

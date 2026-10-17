@@ -34,6 +34,7 @@ impl Handler for Agent {
             prune_offer: None,
             progress: None,
             unsynced: None,
+            retrying: None,
         })
     }
 

@@ -797,7 +797,7 @@ pub(crate) mod tests {
                 // What a v15 database looks like.
                 o.c.execute_batch(
                     "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
-                     DROP INDEX enum_unit_pending; DROP INDEX remote_item_root;
+                     DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;
                      INSERT INTO remote_gone(id) VALUES ('f'), ('gone');
                      INSERT INTO synced_item(sid, parent_sid, name, kind, remote_id) VALUES (9, 0, 'gone', 0, 'gone');
                      PRAGMA user_version = 15;",

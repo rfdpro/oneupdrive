@@ -111,6 +111,11 @@ struct Shared {
     progress: Option<oneup_ipc::Progress>,
     /// What can't sync until the user acts (`crate::unsynced`).
     unsynced: Option<oneup_ipc::Unsynced>,
+    /// Failed items waiting before they're tried again (`crate::backoff`).
+    retrying: Option<oneup_ipc::Retrying>,
+    /// OneDrive is full: uploads wait, everything else goes on. Shown as
+    /// the problem while no other one is.
+    cloud_full: Option<oneup_ipc::Problem>,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
 }
@@ -173,6 +178,8 @@ impl Control {
                 first: Vec::new(),
                 progress: None,
                 unsynced: None,
+                retrying: None,
+                cloud_full: None,
                 shown: None,
             }),
             pause_file,
@@ -262,6 +269,20 @@ impl Control {
     pub fn set_unsynced(&self, u: Option<oneup_ipc::Unsynced>) {
         let mut s = self.lock();
         s.unsynced = u;
+        self.publish(&mut s);
+    }
+
+    /// The failed items waiting to be tried again (`crate::backoff`).
+    pub fn set_retrying(&self, r: Option<oneup_ipc::Retrying>) {
+        let mut s = self.lock();
+        s.retrying = r;
+        self.publish(&mut s);
+    }
+
+    /// OneDrive is full (`crate::problem::cloud_full`), or no longer.
+    pub fn set_cloud_full(&self, p: Option<oneup_ipc::Problem>) {
+        let mut s = self.lock();
+        s.cloud_full = p;
         self.publish(&mut s);
     }
 
@@ -398,11 +419,12 @@ impl Control {
                 o.waiting &= !s.answered.contains(&o.code);
                 o
             }),
-            problem: s.problem.clone(),
+            problem: s.problem.clone().or_else(|| s.cloud_full.clone()),
             auto_pause: s.auto_pause.clone(),
             prune_offer: s.prune_offer.clone().filter(|o| !s.answered.contains(&o.code)),
             progress: s.progress.clone(),
             unsynced: s.unsynced.clone(),
+            retrying: s.retrying.clone(),
         }
     }
 

@@ -3,6 +3,7 @@
 //! Status codes map onto the executor's outcomes: 412 (eTag moved on) and
 //! 404 (gone) are [`CloudError::Changed`], 409 (name taken) is
 //! [`CloudError::NameTaken`]; the executor skips and re-plans either way.
+//! 507 (no room left) is [`CloudError::Full`].
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -86,6 +87,7 @@ fn classify(status: u16, code: Option<String>) -> Option<CloudError> {
     match (code.as_deref(), status) {
         (Some("nameAlreadyExists"), _) => Some(CloudError::NameTaken),
         (Some("resourceModified" | "itemNotFound"), _) => Some(CloudError::Changed),
+        (Some("quotaLimitReached" | "insufficientStorage"), _) | (_, 507) => Some(CloudError::Full),
         (_, 404 | 412) => Some(CloudError::Changed),
         (_, 409) => Some(CloudError::NameTaken),
         _ => None,
@@ -774,5 +776,18 @@ mod tests {
         // no guess.
         assert_eq!(replaced_version(&[ours, theirs], &base), None);
         assert_eq!(replaced_version(&[planned], &base), None);
+    }
+
+    /// A full OneDrive reads as such whichever way OneDrive says it, and
+    /// never as a plain failure (which would be retried as one).
+    #[test]
+    fn a_full_onedrive_is_recognised() {
+        let refused = |status, body: &str| oneup_graph::Error::refused(status, "upload", body.into());
+        assert!(matches!(map(refused(507, "")), CloudError::Full));
+        assert!(matches!(map(refused(507, r#"{"error":{"code":"quotaLimitReached"}}"#)), CloudError::Full));
+        assert!(matches!(map(refused(403, r#"{"error":{"code":"quotaLimitReached"}}"#)), CloudError::Full));
+        assert!(matches!(map(refused(400, r#"{"error":{"code":"insufficientStorage"}}"#)), CloudError::Full));
+        assert!(matches!(map(refused(500, "")), CloudError::Other(_)));
+        assert!(matches!(map(refused(412, "")), CloudError::Changed));
     }
 }

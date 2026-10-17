@@ -447,7 +447,7 @@ impl Graph {
                 }
                 let status = r.get("status").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
                 let resp = BatchResp { status, body: r.get("body").cloned().unwrap_or(serde_json::Value::Null) };
-                let retry = status == 429 || (500..600).contains(&status);
+                let retry = status == 429 || retried(status);
                 if retry && attempt < MAX_ATTEMPTS {
                     if status == 429 || status == 503 {
                         let after = r
@@ -743,7 +743,7 @@ impl Graph {
                 self.auth.invalidate(t).await;
                 continue;
             }
-            if (500..600).contains(&status) {
+            if retried(status) {
                 drop(permit);
                 self.stats.retries.fetch_add(1, Relaxed);
                 tokio::time::sleep(backoff(attempt)).await;
@@ -834,6 +834,13 @@ impl Graph {
         let v: serde_json::Value = self.get(&format!("{GRAPH}/me/drive?$select=quota")).await?;
         let n = |k: &str| v.pointer(&format!("/quota/{k}")).and_then(serde_json::Value::as_i64);
         Ok(n("used").zip(n("total")))
+    }
+
+    /// The room left in the drive requests address, in bytes (`None`: not
+    /// told, as for a drive someone else owns). One small request.
+    pub async fn remaining(&self) -> Result<Option<i64>> {
+        let v: serde_json::Value = self.get(&format!("{}?$select=quota", self.drive_url())).await?;
+        Ok(v.pointer("/quota/remaining").and_then(serde_json::Value::as_i64))
     }
 
     /// `None` if the item no longer exists.
@@ -1017,6 +1024,13 @@ fn header_u64(h: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
     h.get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
+/// Server errors worth sending again. Not 507: the drive has no room
+/// left, which another try a moment later won't change, and retried, it
+/// reached the caller only as "gave up", without its code.
+fn retried(status: u16) -> bool {
+    (500..600).contains(&status) && status != 507
+}
+
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(500u64.saturating_mul(1 << attempt.min(6)))
 }
@@ -1142,6 +1156,21 @@ Content-Length: 50000000
         match tokio::time::timeout(Duration::from_secs(10), graph().send(&req)).await {
             Ok(Err(Error::Status { status: 403, body, .. })) => {
                 assert!(body.starts_with("xxxx") && body.ends_with("(cut)"), "{body}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_drive_is_answered_at_once_with_its_code() {
+        let body = r#"{"error":{"code":"quotaLimitReached","message":"Insufficient Space Available"}}"#;
+        let head = format!("HTTP/1.1 507 Insufficient Storage\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        // One connection only: a second try would wait for good.
+        let url = serve(head.into_bytes(), vec![], Duration::ZERO).await;
+        let req = Req { auth: false, ..Req::new(reqwest::Method::PUT, &url) };
+        match tokio::time::timeout(Duration::from_secs(10), graph().send(&req)).await {
+            Ok(Err(e @ Error::Status { status: 507, .. })) => {
+                assert_eq!(e.code().as_deref(), Some("quotaLimitReached"))
             }
             other => panic!("{other:?}"),
         }

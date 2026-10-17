@@ -354,6 +354,18 @@ pub struct Status {
     pub progress: Option<Progress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsynced: Option<Unsynced>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrying: Option<Retrying>,
+}
+
+/// Items whose operations failed and wait before they're tried again (a
+/// minute after the first failure, doubling to an hour; `oneup explain`
+/// tells one item's).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retrying {
+    pub count: u64,
+    /// When the first is tried again (Unix ms).
+    pub next_ms: i64,
 }
 
 // ------------------------------------------------------------- JSON-RPC

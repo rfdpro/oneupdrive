@@ -37,8 +37,8 @@ OneDrive no longer accepts OneUpDrive's sign-in: it expired, you changed your pa
 **What to do:** in the settings window, **Accounts**, select **Sign in**, and sign in with the same Microsoft account.
 
 <a id="cloud-full"></a>
-### OneDrive storage is full
-Uploads can't go through until there's room in OneDrive.
+### OneDrive is full
+OneDrive refused an upload because it has no room left. Uploads and new folders wait (they aren't counted as failed); downloads and everything else on this PC go on. OneUpDrive looks at how much room OneDrive has whenever it checks OneDrive (every minute or so, or every 10 minutes while notifications work) and sends what waited once there's more. If OneDrive doesn't say how much room it has (a folder someone shares with you), it tries one upload again every hour.
 
 **What to do:** free up space in OneDrive (on the web: delete large files, then empty OneDrive's recycle bin, which counts towards your storage), or get more storage. The settings window's **Files** page sorts by **Size** to find what takes the most room.
 
@@ -77,6 +77,13 @@ OneDrive answered with errors or asked OneUpDrive to slow down. This is almost a
 Something else went wrong. OneUpDrive tries again by itself.
 
 **What to do:** if it keeps happening, select **Copy details** and report it, with what you were doing when it started.
+
+## A file that fails again and again
+When one file or folder can't be synced (OneDrive refuses it, or an error comes back every time), only that item waits: a minute after the first failure, then twice as long after each one in a row, up to an hour. Everything else keeps syncing. Changing the item, here or in OneDrive, ends the wait at once, and so does syncing it. The wait is kept when OneUpDrive restarts.
+
+* `oneup status` has a "failed" line: how many items wait, and when the next is tried.
+* `oneup explain PATH` says how often that item failed, why, and when it's tried again.
+* `oneup activity PATH` lists each failure.
 
 ## OneUpDrive stopped
 If an error stopped OneUpDrive, the icon's menu says "Stopped: …", the notification says why, and the settings window shows the problem with **Start**. Fix the cause (above), then **Start**. If OneUpDrive stopped without saying why, the end of `oneupd.log` usually does.

@@ -31,6 +31,9 @@ pub enum Skip {
     /// Can't be done as planned: a name Windows can't use, a special item
     /// (placeholder, link), or something outside the sync folder.
     Refused,
+    /// The OneDrive has no room left: an upload refused for it, or one not
+    /// tried after another was in the same round.
+    CloudFull,
 }
 
 /// What one round did.
@@ -101,6 +104,7 @@ impl From<CloudError> for Fail {
             CloudError::Changed => Fail::Skip(Skip::Changed),
             CloudError::NameTaken => Fail::Skip(Skip::NameTaken),
             CloudError::NotEmpty => Fail::Skip(Skip::NotEmpty),
+            CloudError::Full => Fail::Skip(Skip::CloudFull),
             CloudError::Io(_) | CloudError::Other(_) | CloudError::TooManyItems => Fail::Failed(e.to_string()),
         }
     }
@@ -458,6 +462,9 @@ impl<C: Cloud> Executor<C> {
             report.halted = Some(m);
             return report;
         }
+        // Once OneDrive says it's full, the round's other uploads aren't
+        // sent only to be refused; everything else goes on.
+        let mut full = false;
         let mut i = 0;
         while i < approved.len() {
             // A run of independent cloud metadata changes goes in one batch;
@@ -486,6 +493,11 @@ impl<C: Cloud> Executor<C> {
                 done(1);
                 continue;
             }
+            if full && matches!(a.op(), Op::Upload { .. }) {
+                record(&mut report, a.op().clone(), Err(Fail::Skip(Skip::CloudFull)), false, false, None);
+                done(1);
+                continue;
+            }
             let mut kept_instead = false;
             let mut copied = false;
             let mut theirs = None;
@@ -496,6 +508,7 @@ impl<C: Cloud> Executor<C> {
             {
                 outcome = Err(e);
             }
+            full |= matches!(outcome, Err(Fail::Skip(Skip::CloudFull)));
             let halted = record(&mut report, a.op().clone(), outcome, kept_instead, copied, theirs);
             done(1);
             if halted {
