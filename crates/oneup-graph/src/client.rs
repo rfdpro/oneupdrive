@@ -735,7 +735,12 @@ impl Graph {
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
-            let body = match resp.bytes().await {
+            let body = if (200..300).contains(&status) {
+                resp.bytes().await.map(Vec::from)
+            } else {
+                crate::error_body(resp).await
+            };
+            let body = match body {
                 Ok(b) => b,
                 Err(e) => {
                     drop(permit);
@@ -756,7 +761,7 @@ impl Graph {
                 return Err(Error::refused(status, what, String::from_utf8_lossy(&body).into_owned()));
             }
             self.limiter.on_success();
-            return Ok((status, body.to_vec(), measure));
+            return Ok((status, body, measure));
         }
     }
 
@@ -1096,6 +1101,25 @@ mod tests {
         match graph().send(&req).await {
             Err(Error::Status { status: 403, body, .. }) => {
                 assert!(body.len() <= crate::MAX_ERROR_BODY + 16, "kept {} bytes", body.len());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_body_is_not_read_past_what_the_error_keeps() {
+        // Declares 50 MB but sends only the start, then nothing: reading the
+        // whole body would never finish.
+        let head = b"HTTP/1.1 403 Forbidden
+Content-Length: 50000000
+
+"
+        .to_vec();
+        let url = serve(head, vec![&[b'x'; 16 * 1024]], Duration::ZERO).await;
+        let req = Req { auth: false, ..Req::new(reqwest::Method::GET, &url) };
+        match tokio::time::timeout(Duration::from_secs(10), graph().send(&req)).await {
+            Ok(Err(Error::Status { status: 403, body, .. })) => {
+                assert!(body.starts_with("xxxx") && body.ends_with("(cut)"), "{body}");
             }
             other => panic!("{other:?}"),
         }

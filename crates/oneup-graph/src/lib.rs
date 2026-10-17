@@ -62,6 +62,21 @@ pub enum Error {
 /// them fail. Graph's own error bodies are far smaller.
 pub const MAX_ERROR_BODY: usize = 2048;
 
+/// Reads the body of a refused response, but only as much of it as
+/// [`Error::refused`] keeps (plus a little, so it knows the body was cut):
+/// a huge page is never downloaded only to be thrown away.
+pub(crate) async fn error_body(mut resp: reqwest::Response) -> reqwest::Result<Vec<u8>> {
+    let limit = MAX_ERROR_BODY + 4;
+    let mut body = Vec::new();
+    while body.len() < limit
+        && let Some(chunk) = resp.chunk().await?
+    {
+        body.extend_from_slice(&chunk);
+    }
+    body.truncate(limit);
+    Ok(body)
+}
+
 impl Error {
     /// [`Error::Status`] for a refused request, keeping at most
     /// [`MAX_ERROR_BODY`] bytes of its body (cut on a character boundary).

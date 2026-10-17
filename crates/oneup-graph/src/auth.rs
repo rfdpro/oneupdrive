@@ -238,7 +238,7 @@ impl Auth {
             .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok())
             .map(|s| Instant::now() + Duration::from_secs(s));
         *self.retry_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = after;
-        Err(refusal(status, &resp.bytes().await?))
+        Err(refusal(status, &crate::error_body(resp).await?))
     }
 
     /// Interactive sign-in in the default browser. `open_browser` receives
