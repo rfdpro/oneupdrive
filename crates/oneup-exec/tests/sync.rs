@@ -66,7 +66,8 @@ struct State {
     replaced: BTreeMap<String, u64>,
     /// Versions in the history can't be downloaded (a service error).
     versions_fail: bool,
-    /// No room left: uploads are refused (as with HTTP 507), and counted.
+    /// No room left: uploads and new folders are refused (as with HTTP
+    /// 507), and the requests refused counted (a batch counts once).
     full: bool,
     refused: u64,
 }
@@ -236,6 +237,24 @@ impl Fake {
     }
 }
 
+impl Fake {
+    /// [`Cloud::mkdir`], alone or in a batch.
+    fn make_dir(&self, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        let mut s = self.0.lock().unwrap();
+        if s.full {
+            return Err(CloudError::Full);
+        }
+        if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
+            return Err(CloudError::Changed);
+        }
+        if s.child(&parent.0, name).is_some() {
+            return Err(CloudError::NameTaken);
+        }
+        let id = s.create(&parent.0, name, true, vec![]);
+        Ok(s.row(&id))
+    }
+}
+
 fn resolve(s: &State, path: &str) -> String {
     let mut cur = "root".to_string();
     for part in path.split('/').filter(|p| !p.is_empty()) {
@@ -341,15 +360,11 @@ impl Cloud for Fake {
     }
 
     async fn mkdir(&self, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
-        let mut s = self.0.lock().unwrap();
-        if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
-            return Err(CloudError::Changed);
+        let made = self.make_dir(parent, name);
+        if matches!(made, Err(CloudError::Full)) {
+            self.0.lock().unwrap().refused += 1;
         }
-        if s.child(&parent.0, name).is_some() {
-            return Err(CloudError::NameTaken);
-        }
-        let id = s.create(&parent.0, name, true, vec![]);
-        Ok(s.row(&id))
+        made
     }
 
     async fn move_item(&self, pre: &RemotePre, to: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
@@ -459,7 +474,7 @@ impl Cloud for Fake {
         for (m, ok) in ops.iter().zip(before) {
             out.push(match (m, ok) {
                 (_, Err(e)) => Err(e),
-                (Meta::Mkdir { parent, name }, Ok(())) => self.mkdir(parent, name).await.map(MetaDone::Item),
+                (Meta::Mkdir { parent, name }, Ok(())) => self.make_dir(parent, name).map(MetaDone::Item),
                 (Meta::Move { pre, to, name }, Ok(())) => {
                     let done = self.move_item(pre, to, name).await.map(MetaDone::Item);
                     let mut s = self.0.lock().unwrap();
@@ -472,6 +487,9 @@ impl Cloud for Fake {
                 }
                 (Meta::Delete { pre }, Ok(())) => Cloud::delete(self, pre).await.map(|()| MetaDone::Deleted),
             });
+        }
+        if out.iter().any(|r| matches!(r, Err(CloudError::Full))) {
+            self.0.lock().unwrap().refused += 1;
         }
         out
     }
@@ -1241,6 +1259,43 @@ async fn a_full_onedrive_stops_the_rounds_uploads_while_downloads_go_on() {
     let t = cloud.tree();
     assert_eq!(t["/b.txt"].as_deref(), Some(&b"b.txt"[..]));
     assert_eq!(refused(&cloud), 1);
+}
+
+/// A full OneDrive refuses new folders too, also in a batch: after the
+/// first refused request, batched or not, the round sends no other folder
+/// creation or upload (each is skipped as CloudFull, to be tried again
+/// once there's room), and downloads go on.
+#[tokio::test]
+async fn a_full_onedrive_stops_the_rounds_new_folders_and_uploads_batched_or_not() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("full-batch", cloud.clone());
+    write(&s.p("old.txt"), b"synced before");
+    s.settle().await;
+    // More new folders than one batch takes, and new files.
+    let folders: Vec<String> = (0..oneup_graph::client::BATCH_MAX + 5).map(|k| format!("d{k:02}")).collect();
+    for d in &folders {
+        std::fs::create_dir_all(s.p(d)).unwrap();
+    }
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(&s.p(name), name.as_bytes());
+    }
+    cloud.add("e.txt", Some(b"from the cloud"));
+    cloud.0.lock().unwrap().full = true;
+    let r = s.round().await;
+    assert_eq!(cloud.0.lock().unwrap().refused, 1, "one refused request, then none: {r:?}");
+    let held = |op: &Op| matches!(op, Op::Upload { .. } | Op::MkdirRemote { .. });
+    let full = r.skipped.iter().filter(|(op, k)| *k == oneup_exec::Skip::CloudFull && held(op));
+    assert_eq!(full.count(), folders.len() + 3, "{r:?}");
+    assert!(!r.done.iter().any(held), "{r:?}");
+    assert!(r.done.iter().any(|op| matches!(op, Op::Download { .. })), "{r:?}");
+    assert_eq!(std::fs::read(s.p("e.txt")).unwrap(), b"from the cloud");
+
+    // Room again: they go.
+    cloud.0.lock().unwrap().full = false;
+    s.settle().await;
+    let t = cloud.tree();
+    assert!(folders.iter().all(|d| t.get(&format!("/{d}")) == Some(&None)), "{:?}", names(&t));
+    assert_eq!(t["/c.txt"].as_deref(), Some(&b"c.txt"[..]));
 }
 
 /// Every content the crash scenario ever writes, on either side.

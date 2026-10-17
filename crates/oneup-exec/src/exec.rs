@@ -31,8 +31,8 @@ pub enum Skip {
     /// Can't be done as planned: a name Windows can't use, a special item
     /// (placeholder, link), or something outside the sync folder.
     Refused,
-    /// The OneDrive has no room left: an upload refused for it, or one not
-    /// tried after another was in the same round.
+    /// The OneDrive has no room left: an upload or a new folder refused
+    /// for it, or one not tried after OneDrive said so in the same round.
     CloudFull,
 }
 
@@ -254,6 +254,12 @@ fn batchable(store: &Store, ops: &[Approved]) -> usize {
         n += 1;
     }
     n
+}
+
+/// Whether a full OneDrive refuses `op`: new content and new folders. The
+/// agent holds the same while it stays full, in later rounds.
+fn needs_room(op: &Op) -> bool {
+    matches!(op, Op::Upload { .. } | Op::MkdirRemote { .. })
 }
 
 /// Skip unless `ok`.
@@ -497,19 +503,22 @@ impl<C: Cloud> Executor<C> {
             report.halted = Some(m);
             return report;
         }
-        // Once OneDrive says it's full, the round's other uploads aren't
-        // sent only to be refused; everything else goes on.
+        // Once OneDrive says it's full (to one operation or in a batch),
+        // the round's other uploads and new folders aren't sent only to be
+        // refused; everything else goes on.
         let mut full = false;
         let mut i = 0;
         while i < approved.len() {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
             let n = batchable(store, &approved[i..]);
-            // Up to the first the caller refuses, which goes on its own.
-            let n = approved[i..i + n].iter().take_while(|a| may_run(a.op())).count();
+            // Up to the first the caller refuses, or a full OneDrive would,
+            // which goes on its own.
+            let n = approved[i..i + n].iter().take_while(|a| may_run(a.op()) && !(full && needs_room(a.op()))).count();
             if n >= 2 {
                 tracing::debug!(n, "cloud changes sent in one batch");
                 let outcomes = self.run_batch(store, &approved[i..i + n]).await;
+                full |= outcomes.iter().any(|o| matches!(o, Err(Fail::Skip(Skip::CloudFull))));
                 let halted = approved[i..i + n]
                     .iter()
                     .zip(outcomes)
@@ -528,7 +537,7 @@ impl<C: Cloud> Executor<C> {
                 done(1);
                 continue;
             }
-            if full && matches!(a.op(), Op::Upload { .. }) {
+            if full && needs_room(a.op()) {
                 record(&mut report, a.op().clone(), Err(Fail::Skip(Skip::CloudFull)), Notes::default());
                 done(1);
                 continue;
