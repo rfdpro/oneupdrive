@@ -314,8 +314,8 @@ pub fn apply_records(
     Ok(())
 }
 
-/// The most delete records [`SeenDeletes`] keeps (24 bytes each, so at most
-/// 6 MiB). Only synced items' records are kept, and only until the
+/// The most delete records [`SeenDeletes`] keeps (32 bytes each, so at most
+/// 8 MiB). Only synced items' records are kept, and only until the
 /// observer has read past them; past this, the oldest go, and their items
 /// are held after a rescan as they would be without the log.
 const SEEN_MAX: usize = 1 << 18;
@@ -449,6 +449,8 @@ pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::
 
 #[cfg(windows)]
 pub use driver::Observer;
+#[cfg(windows)]
+pub use driver::{JournalTail, Tailed};
 
 #[cfg(windows)]
 mod driver {
@@ -601,6 +603,91 @@ mod driver {
         }
     }
 
+    /// Reads a volume's change journal record by record from a position
+    /// on, for the agent's journal watcher. It never skips ahead by choice.
+    /// When the journal wrapped past its position anyway (the disk wrote
+    /// faster than it read), it goes on from the oldest record still kept;
+    /// when the journal was replaced, from the new journal's start. Either
+    /// way it says so ([`Tailed::lost`]): what was lost is held, as after
+    /// any journal loss.
+    #[derive(Debug)]
+    pub struct JournalTail {
+        volume: Volume,
+        journal_id: u64,
+        cursor: i64,
+        /// 64 KiB holds several hundred records.
+        buf: Vec<u8>,
+    }
+
+    /// One read of a [`JournalTail`].
+    #[derive(Debug, Default)]
+    pub struct Tailed {
+        pub records: Vec<UsnRecord>,
+        /// Records were lost before these (the journal wrapped past the
+        /// position, or was replaced).
+        pub lost: bool,
+    }
+
+    impl JournalTail {
+        /// Opens the journal of the volume holding `path`, at `from` (a
+        /// journal ID and position, e.g. the observer's) if that journal is
+        /// still the volume's; at its oldest kept record if it no longer
+        /// reaches back that far; else at its end.
+        pub fn open(path: &Path, from: Option<(u64, i64)>) -> win::Result<Self> {
+            let volume = Volume::open_containing(path)?;
+            let j = volume.query_journal()?;
+            let cursor = match from {
+                Some((id, usn)) if id == j.journal_id => usn.clamp(oldest(&j), j.next_usn),
+                _ => j.next_usn,
+            };
+            Ok(Self { volume, journal_id: j.journal_id, cursor, buf: vec![0u8; 64 * 1024] })
+        }
+
+        /// The journal and position the next read starts from.
+        pub fn position(&self) -> (u64, i64) {
+            (self.journal_id, self.cursor)
+        }
+
+        /// How many bytes of records are waiting to be read.
+        pub fn behind(&self) -> win::Result<i64> {
+            Ok(self.volume.query_journal()?.next_usn.saturating_sub(self.cursor))
+        }
+
+        /// The next records, up to a buffer's worth. With `wait`, blocks in
+        /// the kernel until there's at least one.
+        pub fn next(&mut self, wait: bool) -> win::Result<Tailed> {
+            // Checked first as well: a read from before the oldest record
+            // fails, but one from position 0 reads from the start silently.
+            let j = self.volume.query_journal()?;
+            let mut lost = false;
+            if j.journal_id != self.journal_id || self.cursor < oldest(&j) {
+                (self.journal_id, self.cursor, lost) = (j.journal_id, oldest(&j), true);
+            }
+            let mut retried = false;
+            let (next, records) = loop {
+                match self.volume.read_journal(self.journal_id, self.cursor, wait, &mut self.buf) {
+                    Ok((next, records)) => break (next, records.flatten().collect::<Vec<_>>()),
+                    // Wrapped or replaced meanwhile (a wait can be long):
+                    // once more from the oldest record. Anything else, or a
+                    // second failure, is the caller's.
+                    Err(e) => {
+                        let j = self.volume.query_journal()?;
+                        if retried || (j.journal_id == self.journal_id && self.cursor >= oldest(&j)) {
+                            return Err(e);
+                        }
+                        (self.journal_id, self.cursor, lost, retried) = (j.journal_id, oldest(&j), true, true);
+                    }
+                }
+            };
+            self.cursor = self.cursor.max(next);
+            Ok(Tailed { records, lost })
+        }
+    }
+
+    fn oldest(j: &win::JournalInfo) -> i64 {
+        j.first_usn.max(j.lowest_valid_usn)
+    }
+
     /// A cloud placeholder folder read by ID, with the attributes its
     /// parent's listing gives it. The handle may lack the recall flags that
     /// mark it unpopulated (Microsoft documents `FILE_ATTRIBUTE_RECALL_ON_OPEN`
@@ -622,6 +709,92 @@ mod driver {
                 tracing::debug!(error = %err, "a cloud folder's listing entry could not be read");
                 Stat::Unreadable
             }
+        }
+    }
+
+    /// The temp folder's volume journal; temp folders only.
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+        use oneup_ntfs::record::reason;
+
+        fn temp(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("oneup-tail-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// Reads until caught up; the deleted IDs, and whether any read lost records.
+        fn drain(tail: &mut JournalTail) -> (Vec<u128>, bool) {
+            let (mut deleted, mut lost) = (Vec::new(), false);
+            while tail.behind().unwrap() > 0 {
+                let read = tail.next(false).unwrap();
+                lost |= read.lost;
+                deleted.extend(read.records.iter().filter(|r| r.has(reason::FILE_DELETE)).map(|r| r.file_id.0));
+                if read.records.is_empty() {
+                    break;
+                }
+            }
+            (deleted, lost)
+        }
+
+        fn file_id(path: &Path) -> u128 {
+            let dir = win::open_dir(path.parent().unwrap()).unwrap();
+            let (mut buf, mut out) = (vec![0u8; 64 * 1024], Vec::new());
+            win::list_dir(&dir, &mut buf, &mut out).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            out.iter().find(|e| e.name == name).unwrap().file_id.0
+        }
+
+        #[test]
+        fn a_backlog_larger_than_a_buffer_is_read_whole() {
+            let dir = temp("backlog");
+            let mut tail = JournalTail::open(&dir, None).unwrap();
+            // Hundreds of KiB of records ahead of the one that matters.
+            for i in 0..3000 {
+                let p = dir.join(format!("f{i}"));
+                std::fs::write(&p, b"x").unwrap();
+                std::fs::remove_file(&p).unwrap();
+            }
+            let last = dir.join("last.txt");
+            std::fs::write(&last, b"x").unwrap();
+            let id = file_id(&last);
+            std::fs::remove_file(&last).unwrap();
+            assert!(tail.behind().unwrap() > 64 * 1024, "more than one read waiting");
+            let (deleted, lost) = drain(&mut tail);
+            assert!(!lost);
+            assert!(deleted.contains(&id));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_position_the_journal_wrapped_past_goes_on_from_the_oldest_record() {
+            let dir = temp("wrapped");
+            let mut tail = JournalTail::open(&dir, None).unwrap();
+            let (journal_id, _) = tail.position();
+            // As if the disk outran the reads: a position before the oldest
+            // record kept.
+            tail.cursor = 8;
+            let read = tail.next(false).unwrap();
+            assert!(read.lost);
+            assert!(tail.position().1 > 8);
+            assert_eq!(tail.position().0, journal_id);
+            // Opening at such a position starts at the oldest record instead.
+            let tail = JournalTail::open(&dir, Some((journal_id, 8))).unwrap();
+            assert!(tail.position().1 > 8);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn another_journals_position_starts_at_the_end() {
+            let dir = temp("other");
+            let now = JournalTail::open(&dir, None).unwrap().position();
+            let tail = JournalTail::open(&dir, Some((now.0.wrapping_add(1), 0))).unwrap();
+            assert_eq!(tail.position().0, now.0);
+            assert!(tail.position().1 >= now.1);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

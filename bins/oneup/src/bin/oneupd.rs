@@ -79,9 +79,9 @@ const MIN_WAKE_GAP: Duration = Duration::from_millis(500);
 /// journal: the tracker must ask who wrote a file before the writer closes
 /// it, so it can't wait for the next wake-up.
 const TRACK_GAP: Duration = Duration::from_millis(50);
-/// The journal watcher skips ahead when this many bytes of records are
-/// waiting (see `watch_journal`).
-const SKIP_AHEAD: i64 = 4 << 20;
+/// Pauses before the journal watcher tries again after reading failed.
+const WATCH_RETRY_FIRST: Duration = Duration::from_secs(1);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 /// Pauses before retrying skipped or failed operations, and after errors.
 const RETRY_FIRST: Duration = Duration::from_secs(30);
 /// Converting files already here into placeholders (`Engine::convert_leftovers`):
@@ -495,7 +495,7 @@ async fn agent(
     let deletes = setup::open_store(dir, 1024)
         .inspect_err(|e| tracing::warn!(error = %e, "deletions during a journal loss will be held"))
         .ok();
-    watch_journal(PathBuf::from(&root.path), &journal, tracker, Arc::clone(&busy), deletes);
+    watch_journal(PathBuf::from(&root.path), root.journal, &journal, tracker, Arc::clone(&busy), deletes);
     let remote = Arc::new(Notify::new());
     // Files On-Demand: serve the placeholders' content while this attempt
     // runs (files-on-demand.md § Hydration).
@@ -782,12 +782,14 @@ async fn wait(
 /// (`oneup_app::apps`), if there is one, and keeps the delete records of
 /// synced items (`oneup_local::observe::SeenDeletes`, through `deletes`):
 /// the observer runs between rounds, and on a busy disk the journal can
-/// wrap before it gets there. With records waiting it reads on without
-/// pausing. Only when it falls far behind anyway (the disk busier than it
-/// can read) does it skip ahead: the observer reads everything, or rescans;
-/// only those writes go uncounted and those deletions held.
+/// wrap before it gets there. So it reads every record, from `start` (the
+/// observer's position), without pausing while records wait. If the
+/// journal wraps past it anyway, it goes on from the oldest record kept
+/// (those deletions are held); if reading fails, it tries again after a
+/// pause, from where it was.
 fn watch_journal(
     root: PathBuf,
+    start: Option<(u64, i64)>,
     wake: &Arc<Notify>,
     tracker: Option<oneup_app::apps::Tracker>,
     busy: Arc<Busy>,
@@ -820,76 +822,100 @@ fn watch_journal(
         if let Err(e) = oneup_cfapi::expose_placeholders() {
             tracing::warn!(error = %e, "online-only files may look ordinary to the app tracker");
         }
-        let run = || -> oneup_ntfs::win::Result<()> {
-            let volume = oneup_ntfs::win::Volume::open_containing(&root)?;
-            let j = volume.query_journal()?;
-            let mut cursor = j.next_usn;
-            // The observer reads the records properly; here they only wake
-            // the agent and name written files for the tracker.
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let next = {
-                    let (next, records) = volume.read_journal(j.journal_id, cursor, true, &mut buf)?;
-                    let records: Vec<_> = records.flatten().collect();
-                    if let Some(store) = &deletes
-                        && let Err(e) = oneup_local::observe::remember_deletes(
-                            store,
-                            oneup_local::observe::seen_deletes(),
-                            j.journal_id,
-                            &records,
-                        )
-                    {
-                        tracing::debug!(error = %e, "delete records could not be looked up");
-                    }
-                    let (now, wall) = (Instant::now(), std::time::SystemTime::now());
-                    for r in records {
-                        // An online-only file wasn't written by a program:
-                        // that's OneUpDrive making or freeing a
-                        // placeholder. Asking who has it open downloaded
-                        // it (thousands of files on a large folder).
-                        if r.has(oneup_ntfs::record::reason::CONTENT)
-                            && !r.is_directory()
-                            && !oneup_ntfs::dirent::recalls(r.attributes)
-                        {
-                            if let Some(t) = &tracker {
-                                t.saw(r.file_id.0);
-                            }
-                            // Our own downloads don't make a file busy.
-                            if !oneup_cfapi::ours::wrote(r.file_id.0) {
-                                busy.changed(r.file_id.0, oneup_app::busy::instant_of(r.timestamp, now, wall));
-                            }
-                        }
-                    }
-                    next
-                };
-                if alive.strong_count() == 0 {
-                    return Ok(());
-                }
-                let _ = ping.try_send(());
-                let end = volume.query_journal()?.next_usn;
-                // Every record is read (for the program tracker, files that
-                // keep changing, and synced items' deletions) unless far
-                // behind.
-                let behind = end - next;
-                cursor = if behind > SKIP_AHEAD {
-                    tracing::debug!(behind, "change journal: skipping ahead");
-                    end
-                } else {
-                    next
-                };
-                // Caught up (less than a buffer waiting): pause. Otherwise
-                // read on, or a burst outruns the reads and gets skipped.
-                if behind < buf.len() as i64 {
-                    std::thread::sleep(if tracker.is_some() { TRACK_GAP } else { MIN_WAKE_GAP });
-                }
+        // From where the observer is, so nothing between its last read and
+        // this thread's start goes unseen; on a retry, from where it was.
+        let watch = Watch { alive, ping, tracker, busy, deletes };
+        let mut from = start;
+        let mut pause = WATCH_RETRY_FIRST;
+        loop {
+            let mut read_any = false;
+            let ended = watch.tail(&root, &mut from, &mut read_any);
+            if watch.alive.strong_count() == 0 {
+                return;
             }
-        };
-        if let Err(e) = run() {
-            tracing::warn!(error = %e, "can't watch the change journal; local changes are picked up at each OneDrive check");
+            if read_any {
+                pause = WATCH_RETRY_FIRST;
+            }
+            if let Err(e) = ended {
+                tracing::warn!(error = %e, retry_s = pause.as_secs(), "can't watch the change journal; local changes are picked up at each OneDrive check meanwhile");
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(WATCH_RETRY_MAX);
         }
     });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "can't start the change-journal watcher");
+    }
+}
+
+/// What the journal-watch thread works with (see [`watch_journal`]).
+struct Watch {
+    /// Gone once the agent is done with this watcher.
+    alive: std::sync::Weak<Notify>,
+    ping: std::sync::mpsc::SyncSender<()>,
+    tracker: Option<oneup_app::apps::Tracker>,
+    busy: Arc<Busy>,
+    deletes: Option<Store>,
+}
+
+impl Watch {
+    /// Reads the journal from `from` until the agent is done (`Ok`) or
+    /// reading fails, keeping `from` at the next record to read.
+    fn tail(&self, root: &Path, from: &mut Option<(u64, i64)>, read_any: &mut bool) -> oneup_ntfs::win::Result<()> {
+        let mut tail = oneup_local::observe::JournalTail::open(root, *from)?;
+        // Records older than this are only read for their deletions: the
+        // program tracker and busy files are about writes happening now.
+        let live = (tail.position().0, tail.behind().map(|b| tail.position().1 + b)?);
+        loop {
+            let read = tail.next(true)?;
+            *read_any = true;
+            if self.alive.strong_count() == 0 {
+                return Ok(());
+            }
+            let (journal_id, _) = tail.position();
+            if read.lost {
+                tracing::info!("the change journal wrapped before it was read; deletions meanwhile are held");
+            }
+            if let Some(store) = &self.deletes
+                && let Err(e) = oneup_local::observe::remember_deletes(
+                    store,
+                    oneup_local::observe::seen_deletes(),
+                    journal_id,
+                    &read.records,
+                )
+            {
+                tracing::debug!(error = %e, "delete records could not be looked up");
+            }
+            let (now, wall) = (Instant::now(), std::time::SystemTime::now());
+            for r in &read.records {
+                if journal_id == live.0 && r.usn < live.1 {
+                    continue;
+                }
+                // An online-only file wasn't written by a program: that's
+                // OneUpDrive making or freeing a placeholder. Asking who has
+                // it open downloaded it (thousands of files on a large
+                // folder).
+                if r.has(oneup_ntfs::record::reason::CONTENT)
+                    && !r.is_directory()
+                    && !oneup_ntfs::dirent::recalls(r.attributes)
+                {
+                    if let Some(t) = &self.tracker {
+                        t.saw(r.file_id.0);
+                    }
+                    // Our own downloads don't make a file busy.
+                    if !oneup_cfapi::ours::wrote(r.file_id.0) {
+                        self.busy.changed(r.file_id.0, oneup_app::busy::instant_of(r.timestamp, now, wall));
+                    }
+                }
+            }
+            *from = Some(tail.position());
+            let _ = self.ping.try_send(());
+            // Caught up (less than a buffer waiting): pause. Otherwise read
+            // on, or a burst outruns the reads and the journal wraps past.
+            if tail.behind()? < 64 * 1024 {
+                std::thread::sleep(if self.tracker.is_some() { TRACK_GAP } else { MIN_WAKE_GAP });
+            }
+        }
     }
 }
 

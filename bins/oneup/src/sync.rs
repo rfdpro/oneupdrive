@@ -2007,7 +2007,7 @@ fn rescan(
         summary.stats.files, summary.stats.folders, summary.elapsed
     );
     if deleted > 0 {
-        detail.push_str(&format!("; {deleted} deletion(s) seen meanwhile"));
+        detail.push_str(&format!("; deletions found in the journal: {deleted}"));
     }
     println!("  {detail}");
     log_activity(&mut store, vec![notice(ActivityOutcome::Note, "rescan", detail)])?;
@@ -2837,7 +2837,7 @@ mod tests {
             .unwrap();
         let log = store.read(|o| o.activity_recent(None, 5)).unwrap();
         assert!(
-            log.iter().any(|e| e.action == "rescan" && e.detail.contains("1 deletion(s) seen meanwhile")),
+            log.iter().any(|e| e.action == "rescan" && e.detail.contains("deletions found in the journal: 1")),
             "{log:?}"
         );
         assert!(seen.is_empty(), "forgotten once the observer read past it");
