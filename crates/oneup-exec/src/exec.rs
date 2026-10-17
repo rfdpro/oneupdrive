@@ -743,10 +743,24 @@ impl<C: Cloud> Executor<C> {
         loop {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
+            let from = next;
             while next - reported < WINDOW && next < approved.len() {
                 let (n, claims) = batch_of(&db, &approved[next..], can_copy);
                 waiting.push_back(Unit { start: next, len: n, claims });
                 next += n;
+            }
+            // On demand, a download is a placeholder: nothing is fetched.
+            if next > from && !self.fs.on_demand() {
+                let coming: Vec<RemotePre> = approved[from..next]
+                    .iter()
+                    .filter_map(|a| match a.op() {
+                        Op::Download { remote, .. } => Some(remote.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !coming.is_empty() {
+                    self.cloud.upcoming(&coming);
+                }
             }
             // Each in the planner's order, once nothing under way and
             // nothing before it still waiting conflicts with it.

@@ -144,6 +144,14 @@ pub trait Cloud: Send + Sync {
     /// that didn't pass a `false` on would run its cloud concurrently.
     fn concurrent(&self) -> bool;
 
+    /// Downloads coming up in the round, in the planner's order: a hint, so
+    /// a cloud that reads each download's link first may read the coming
+    /// ones together. By default nothing; a wrapper that doesn't pass it
+    /// on only loses that.
+    fn upcoming(&self, downloads: &[RemotePre]) {
+        let _ = downloads;
+    }
+
     /// Whether [`Cloud::copy`] can stand in for an upload of the same
     /// content (not for a vault: equal files encrypt differently).
     fn can_copy(&self) -> bool {

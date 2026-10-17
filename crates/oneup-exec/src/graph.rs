@@ -5,12 +5,14 @@
 //! [`CloudError::NameTaken`]; the executor skips and re-plans either way.
 //! 507 (no room left) is [`CloudError::Full`].
 
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use oneup_graph::client::{Fragment, SIMPLE_UPLOAD_MAX};
+use oneup_graph::client::{BATCH_MAX, Fragment, SIMPLE_UPLOAD_MAX};
 use oneup_graph::fragment::{MAX_UNITS, Sizer, UNIT};
+use oneup_graph::model::DownloadInfo;
 use oneup_graph::{DriveItem, FileVersion, Graph};
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
@@ -27,6 +29,76 @@ pub struct GraphCloud {
     sizer: Arc<std::sync::Mutex<Sizer>>,
     /// How long each kind of request took ([`GraphCloud::timed`]).
     timings: Arc<Timings>,
+    /// Download links read ahead ([`Links`]).
+    links: Arc<Mutex<Links>>,
+}
+
+/// How long a link read ahead is used: they're pre-authenticated and
+/// short-lived, and one used within a minute of reading it works.
+const LINK_FRESH: Duration = Duration::from_secs(60);
+
+/// How many coming downloads and unused links are kept.
+const LINKS_MAX: usize = 1024;
+
+/// Download links read ahead, [`BATCH_MAX`] at a time: a download first
+/// reads its item for the eTag and the link, and on its own that request
+/// took about four times the content of a small file (measured: 520 ms
+/// against 120 ms). The executor says which downloads are coming
+/// ([`Cloud::upcoming`]); a download whose link isn't here reads it with
+/// the next ones'. Bounded, and each link is taken out when used.
+#[derive(Default)]
+struct Links {
+    /// Coming downloads whose links aren't read yet, oldest first.
+    ahead: VecDeque<String>,
+    /// Links read and not used yet, and when they were read.
+    got: HashMap<String, (DownloadInfo, Instant)>,
+}
+
+impl std::fmt::Debug for Links {
+    // The links are credentials: never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Links").field("ahead", &self.ahead.len()).field("got", &self.got.len()).finish()
+    }
+}
+
+impl Links {
+    fn announce(&mut self, ids: impl IntoIterator<Item = String>) {
+        for id in ids {
+            if !self.got.contains_key(&id) {
+                self.ahead.push_back(id);
+            }
+        }
+        while self.ahead.len() > LINKS_MAX {
+            self.ahead.pop_front();
+        }
+    }
+
+    /// `id`'s link if one read ahead is still fresh, taken out. Drops the
+    /// ones gone stale.
+    fn take(&mut self, id: &str, now: Instant) -> Option<DownloadInfo> {
+        self.got.retain(|_, (_, at)| now.saturating_duration_since(*at) < LINK_FRESH);
+        self.got.remove(id).map(|(info, _)| info)
+    }
+
+    /// The items to read with `id`'s: it first, then the coming ones not
+    /// read yet, up to a batch.
+    fn batch_for(&mut self, id: &str) -> Vec<String> {
+        let mut ids = vec![id.to_string()];
+        while ids.len() < BATCH_MAX
+            && let Some(next) = self.ahead.pop_front()
+        {
+            if !self.got.contains_key(&next) && !ids.contains(&next) {
+                ids.push(next);
+            }
+        }
+        ids
+    }
+
+    fn keep(&mut self, id: String, info: DownloadInfo, now: Instant) {
+        if self.got.len() < LINKS_MAX {
+            self.got.insert(id, (info, now));
+        }
+    }
 }
 
 /// How much memory an upload may hold at once (its largest fragment), by
@@ -56,7 +128,12 @@ impl GraphCloud {
     }
 
     pub fn with_memory(graph: Arc<Graph>, m: UploadMemory) -> Self {
-        Self { graph, sizer: Arc::new(std::sync::Mutex::new(Sizer::new(m.fragment))), timings: Arc::default() }
+        Self {
+            graph,
+            sizer: Arc::new(std::sync::Mutex::new(Sizer::new(m.fragment))),
+            timings: Arc::default(),
+            links: Arc::default(),
+        }
     }
 
     /// Records how long its requests take in `t` (shared with the
@@ -68,6 +145,51 @@ impl GraphCloud {
     /// The fragment size the next large upload would start with (learned).
     pub fn fragment_size(&self) -> usize {
         self.sizer().next(u64::MAX)
+    }
+
+    fn links(&self) -> std::sync::MutexGuard<'_, Links> {
+        self.links.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Item `id`'s eTag, kind and download link, read with the coming
+    /// downloads' ([`Links`]); `None` if it's gone.
+    async fn link(&self, id: &str) -> Result<Option<DownloadInfo>, CloudError> {
+        let ids = self.links().batch_for(id);
+        if ids.len() > 1 {
+            let started = Instant::now();
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            match self.graph.download_infos(&refs).await {
+                Ok(answers) => {
+                    self.timings.record("download: links, read together", started);
+                    let now = Instant::now();
+                    let mut mine = None;
+                    let mut links = self.links();
+                    for (other, answer) in ids.into_iter().zip(answers) {
+                        match answer {
+                            Ok(Some(info)) if info.download_url.is_some() || info.folder.is_some() => {
+                                if other == id {
+                                    mine = Some(Some(info));
+                                } else {
+                                    links.keep(other, info, now);
+                                }
+                            }
+                            Ok(None) if other == id => mine = Some(None),
+                            // Read on its own when its turn comes.
+                            _ => {}
+                        }
+                    }
+                    drop(links);
+                    if let Some(mine) = mine {
+                        return Ok(mine);
+                    }
+                }
+                Err(e) => tracing::debug!(error = %e, "download links couldn't be read together; reading one"),
+            }
+        }
+        let started = Instant::now();
+        let info = self.graph.download_info(id).await.map_err(map)?;
+        self.timings.record("download: item and link", started);
+        Ok(info)
     }
 
     fn sizer(&self) -> std::sync::MutexGuard<'_, Sizer> {
@@ -349,10 +471,17 @@ impl Cloud for GraphCloud {
         true
     }
 
+    fn upcoming(&self, downloads: &[RemotePre]) {
+        self.links().announce(downloads.iter().map(|p| p.id.0.clone()));
+    }
+
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
-        let started = Instant::now();
-        let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
-        self.timings.record("download: item and link", started);
+        let ahead = self.links().take(&pre.id.0, Instant::now());
+        let read_ahead = ahead.is_some();
+        let info = match ahead {
+            Some(info) => info,
+            None => self.link(&pre.id.0).await?.ok_or(CloudError::Changed)?,
+        };
         if info.e_tag.as_deref() != Some(pre.etag.as_str()) {
             return Err(CloudError::Changed);
         }
@@ -364,7 +493,21 @@ impl Cloud for GraphCloud {
         // eTag check, the executor's hash check against the planned version
         // catches it before anything local changes.
         let started = Instant::now();
-        self.graph.download_to(&url, out).await.map_err(|e| match e {
+        let fetched = match self.graph.download_to(&url, out).await {
+            // A link read ahead that no longer works (it expired sooner
+            // than expected), before any byte arrived: read it again.
+            Err(e) if read_ahead && e.status().is_some_and(|s| matches!(s, 401 | 403 | 404 | 410)) => {
+                tracing::debug!(error = %e, "a download link read ahead didn't work; reading it again");
+                let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
+                if info.e_tag.as_deref() != Some(pre.etag.as_str()) {
+                    return Err(CloudError::Changed);
+                }
+                let url = info.download_url.ok_or_else(|| CloudError::Other("no download URL".into()))?;
+                self.graph.download_to(&url, out).await
+            }
+            r => r,
+        };
+        fetched.map_err(|e| match e {
             oneup_graph::Error::Local(io) => CloudError::Io(io),
             e => map(e),
         })?;
@@ -878,5 +1021,46 @@ mod tests {
         assert!(matches!(map(refused(400, r#"{"error":{"code":"insufficientStorage"}}"#)), CloudError::Full));
         assert!(matches!(map(refused(500, "")), CloudError::Other(_)));
         assert!(matches!(map(refused(412, "")), CloudError::Changed));
+    }
+
+    fn info(id: &str) -> DownloadInfo {
+        DownloadInfo { id: id.into(), e_tag: Some("e".into()), folder: None, download_url: Some("u".into()) }
+    }
+
+    #[test]
+    fn a_missing_link_is_read_with_the_coming_ones_and_each_used_once() {
+        let mut l = Links::default();
+        l.announce((0..30).map(|k| format!("i{k}")));
+        let first = l.batch_for("i0");
+        assert_eq!(first.len(), BATCH_MAX, "a batch's worth");
+        assert_eq!(first[0], "i0");
+        assert!(first.iter().skip(1).all(|id| id != "i0"), "{first:?}");
+        let now = Instant::now();
+        for id in &first[1..] {
+            l.keep(id.clone(), info(id), now);
+        }
+        assert_eq!(l.take("i1", now).map(|i| i.id), Some("i1".into()));
+        assert!(l.take("i1", now).is_none(), "taken once");
+        // What's left to read: the ones not in the first batch.
+        let rest = l.batch_for("i25");
+        assert_eq!(rest.len(), 30 - BATCH_MAX, "it and the rest: {rest:?}");
+        assert!(rest.iter().all(|id| !first[1..].contains(id)), "nothing read twice: {rest:?}");
+    }
+
+    #[test]
+    fn links_read_ahead_go_stale_and_stay_bounded() {
+        let mut l = Links::default();
+        let then = Instant::now();
+        l.keep("a".into(), info("a"), then);
+        assert!(l.take("a", then + LINK_FRESH).is_none(), "stale after a minute");
+        l.announce((0..LINKS_MAX + 10).map(|k| format!("i{k}")));
+        assert_eq!(l.ahead.len(), LINKS_MAX);
+        assert_eq!(l.ahead.front().map(String::as_str), Some("i10"), "the oldest go first");
+        for k in 0..LINKS_MAX + 10 {
+            l.keep(format!("k{k}"), info("k"), then);
+        }
+        assert_eq!(l.got.len(), LINKS_MAX);
+        // Its debug output holds no link.
+        assert!(!format!("{l:?}").contains('u'));
     }
 }
