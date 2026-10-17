@@ -688,6 +688,17 @@ impl Ops<'_> {
         Ok(())
     }
 
+    /// The entries whose key is `prefix` or starts with `prefix.`, by key.
+    pub fn meta_under(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let mut st = self
+            .c
+            .prepare_cached("SELECT key, value FROM meta WHERE key = ?1 OR (key >= ?2 AND key < ?3) ORDER BY key")?;
+        // `prefix.` up to `prefix/`, the character after `.`: a range on the key's index.
+        let rows =
+            st.query_map([prefix, &format!("{prefix}."), &format!("{prefix}/")], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // ------------------------------------------------------------ items
 
     pub fn item_state(&self, id: &str) -> Result<ItemState> {
@@ -1246,6 +1257,23 @@ mod tests {
         assert!(!worth(257, 64), "just under a quarter");
         assert!(!worth(200, 63), "a quarter, but too little to be worth a copy");
         assert!(!worth(0, 0));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn meta_under_a_prefix_is_the_key_itself_and_its_dotted_children() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            for k in
+                ["exec.pending", "exec.pending.b", "exec.pending.a", "exec.pendingx", "exec", "other.exec.pending.c"]
+            {
+                o.meta_set(k, "v")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let keys: Vec<String> = s.read(|o| o.meta_under("exec.pending")).unwrap().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["exec.pending", "exec.pending.a", "exec.pending.b"]);
     }
 
     #[test]

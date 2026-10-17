@@ -332,6 +332,11 @@ fn fill(src: &mut (dyn Read + Send), buf: &mut [u8]) -> Result<usize, CloudError
 }
 
 impl Cloud for GraphCloud {
+    /// Graph's own limiter paces the requests ([`oneup_graph::limiter`]).
+    fn concurrent(&self) -> bool {
+        true
+    }
+
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
         let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
         if info.e_tag.as_deref() != Some(pre.etag.as_str()) {

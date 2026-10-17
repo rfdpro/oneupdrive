@@ -70,6 +70,19 @@ struct State {
     /// 507), and the requests refused counted (a batch counts once).
     full: bool,
     refused: u64,
+    /// Every request takes this long (a slow network). Every request lets
+    /// other operations run before and after it either way, as the network
+    /// would, so operations under way at once interleave.
+    latency: Option<Duration>,
+    /// Uploads and downloads under way, the most at once, and how many
+    /// have finished.
+    transfers: usize,
+    most_transfers: usize,
+    finished: usize,
+    /// A download of the file of this name takes until many others could
+    /// have finished, and how many did meanwhile.
+    stall: Option<String>,
+    finished_during_stall: Option<usize>,
 }
 
 impl State {
@@ -268,8 +281,60 @@ fn resolve_parent(s: &State, path: &str) -> (String, String) {
     (resolve(s, dir), name.to_string())
 }
 
-impl Cloud for Fake {
-    async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
+/// An upload or download under way ([`Fake::request`]).
+struct Transfer<'a>(&'a Fake);
+
+impl Drop for Transfer<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.0.lock().unwrap();
+        s.transfers -= 1;
+        s.finished += 1;
+    }
+}
+
+impl Fake {
+    /// The start of a request: other operations run first (and it takes
+    /// `latency`).
+    async fn request(&self) {
+        tokio::task::yield_now().await;
+        let latency = self.0.lock().unwrap().latency;
+        if let Some(d) = latency {
+            tokio::time::sleep(d).await;
+        }
+    }
+
+    /// The end of a request: its answer is on its way back.
+    async fn answer(&self) {
+        tokio::task::yield_now().await;
+    }
+
+    /// A request whose effect is `f`: other operations run before it and
+    /// after it, before its answer is back.
+    async fn exchange<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.request().await;
+        let done = f();
+        self.answer().await;
+        done
+    }
+
+    /// [`Fake::request`] for a transfer, counted while it lasts.
+    async fn transfer(&self) -> Transfer<'_> {
+        {
+            let mut s = self.0.lock().unwrap();
+            s.transfers += 1;
+            s.most_transfers = s.most_transfers.max(s.transfers);
+        }
+        let t = Transfer(self);
+        self.request().await;
+        t
+    }
+
+    /// The most uploads and downloads that were under way at once.
+    fn most_transfers(&self) -> usize {
+        self.0.lock().unwrap().most_transfers
+    }
+
+    fn download_now(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
         let content = {
             let s = self.0.lock().unwrap();
             let it = s.check(pre)?;
@@ -285,7 +350,7 @@ impl Cloud for Fake {
         Ok(None)
     }
 
-    async fn upload(
+    fn upload_now(
         &self,
         parent: &RemoteId,
         name: &str,
@@ -332,6 +397,46 @@ impl Cloud for Fake {
         };
         Ok((s.row(&id), None))
     }
+}
+
+impl Cloud for Fake {
+    fn concurrent(&self) -> bool {
+        true
+    }
+
+    async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
+        let _t = self.transfer().await;
+        let stalled = {
+            let s = self.0.lock().unwrap();
+            let name = s.items.get(&pre.id.0).map(|it| it.name.clone());
+            s.stall.is_some() && s.stall == name
+        };
+        if stalled {
+            let from = self.0.lock().unwrap().finished;
+            for _ in 0..20_000 {
+                tokio::task::yield_now().await;
+            }
+            let mut s = self.0.lock().unwrap();
+            s.finished_during_stall = Some(s.finished - from);
+        }
+        let done = self.download_now(pre, out);
+        self.answer().await;
+        done
+    }
+
+    async fn upload(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+        replace: Option<&RemotePre>,
+        size: i64,
+        src: &mut (dyn Read + Send),
+    ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
+        let _t = self.transfer().await;
+        let done = self.upload_now(parent, name, replace, size, src);
+        self.answer().await;
+        done
+    }
 
     async fn copy(
         &self,
@@ -340,66 +445,84 @@ impl Cloud for Fake {
         parent: &RemoteId,
         name: &str,
     ) -> Result<RemoteRow, CloudError> {
-        let mut s = self.0.lock().unwrap();
-        if s.copy_fails {
-            return Err(CloudError::Other("copy failed".into()));
-        }
-        let content = s.check(source)?.content.clone();
-        if qxh(&content) != *hash {
-            return Err(CloudError::Changed);
-        }
-        if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
-            return Err(CloudError::Changed);
-        }
-        if s.child(&parent.0, name).is_some() {
-            return Err(CloudError::NameTaken);
-        }
-        s.copies += 1;
-        let id = s.create(&parent.0, name, false, content);
-        Ok(s.row(&id))
+        self.exchange(|| -> Result<RemoteRow, CloudError> {
+            let mut s = self.0.lock().unwrap();
+            if s.copy_fails {
+                return Err(CloudError::Other("copy failed".into()));
+            }
+            let content = s.check(source)?.content.clone();
+            if qxh(&content) != *hash {
+                return Err(CloudError::Changed);
+            }
+            if !s.items.get(&parent.0).is_some_and(|p| p.folder) {
+                return Err(CloudError::Changed);
+            }
+            if s.child(&parent.0, name).is_some() {
+                return Err(CloudError::NameTaken);
+            }
+            s.copies += 1;
+            let id = s.create(&parent.0, name, false, content);
+            Ok(s.row(&id))
+        })
+        .await
     }
 
     async fn mkdir(&self, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
-        let made = self.make_dir(parent, name);
-        if matches!(made, Err(CloudError::Full)) {
-            self.0.lock().unwrap().refused += 1;
-        }
-        made
+        self.exchange(|| -> Result<RemoteRow, CloudError> {
+            let made = self.make_dir(parent, name);
+            if matches!(made, Err(CloudError::Full)) {
+                self.0.lock().unwrap().refused += 1;
+            }
+            made
+        })
+        .await
     }
 
     async fn move_item(&self, pre: &RemotePre, to: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
-        let mut s = self.0.lock().unwrap();
-        s.check(pre)?;
-        if s.child(&to.0, name).is_some_and(|c| c != pre.id.0) {
-            return Err(CloudError::NameTaken);
-        }
-        if s.threshold.is_some_and(|t| s.descendants(&pre.id.0) > t) {
-            return Err(CloudError::TooManyItems);
-        }
-        let etag = s.bump();
-        let it = s.items.get_mut(&pre.id.0).unwrap();
-        it.parent = Some(to.0.clone());
-        it.name = name.into();
-        it.etag = etag;
-        Ok(s.row(&pre.id.0))
+        self.exchange(|| -> Result<RemoteRow, CloudError> {
+            let mut s = self.0.lock().unwrap();
+            s.check(pre)?;
+            if s.child(&to.0, name).is_some_and(|c| c != pre.id.0) {
+                return Err(CloudError::NameTaken);
+            }
+            if s.threshold.is_some_and(|t| s.descendants(&pre.id.0) > t) {
+                return Err(CloudError::TooManyItems);
+            }
+            let etag = s.bump();
+            let it = s.items.get_mut(&pre.id.0).unwrap();
+            it.parent = Some(to.0.clone());
+            it.name = name.into();
+            it.etag = etag;
+            Ok(s.row(&pre.id.0))
+        })
+        .await
     }
 
     async fn item(&self, id: &RemoteId) -> Result<Option<RemoteRow>, CloudError> {
-        let s = self.0.lock().unwrap();
-        Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
+        self.exchange(|| -> Result<Option<RemoteRow>, CloudError> {
+            let s = self.0.lock().unwrap();
+            Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
+        })
+        .await
     }
 
     /// Every replacement is checked afterwards, as a large one over Graph.
     async fn version_mark(&self, pre: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
-        let s = self.0.lock().unwrap();
-        let it = s.check(pre)?;
-        Ok(Some(VersionMark { id: it.etag.to_string(), modified_ms: None, size: Some(it.content.len() as i64) }))
+        self.exchange(|| -> Result<Option<VersionMark>, CloudError> {
+            let s = self.0.lock().unwrap();
+            let it = s.check(pre)?;
+            Ok(Some(VersionMark { id: it.etag.to_string(), modified_ms: None, size: Some(it.content.len() as i64) }))
+        })
+        .await
     }
 
     async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
-        let s = self.0.lock().unwrap();
-        let over = s.replaced.get(&id.0).filter(|e| e.to_string() != mark.id);
-        Ok(over.map(|e| VersionMark { id: e.to_string(), modified_ms: None, size: Some(s.old[e].len() as i64) }))
+        self.exchange(|| -> Result<Option<VersionMark>, CloudError> {
+            let s = self.0.lock().unwrap();
+            let over = s.replaced.get(&id.0).filter(|e| e.to_string() != mark.id);
+            Ok(over.map(|e| VersionMark { id: e.to_string(), modified_ms: None, size: Some(s.old[e].len() as i64) }))
+        })
+        .await
     }
 
     async fn download_version(
@@ -408,52 +531,64 @@ impl Cloud for Fake {
         version: &str,
         out: &mut (dyn Write + Send),
     ) -> Result<u64, CloudError> {
-        let s = self.0.lock().unwrap();
-        if s.versions_fail {
-            return Err(CloudError::Other("HTTP 500".into()));
-        }
-        let content = s.old.get(&version.parse().unwrap()).cloned();
-        drop(s);
-        let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
-        out.write_all(&content)?;
-        Ok(content.len() as u64)
+        self.exchange(|| -> Result<u64, CloudError> {
+            let s = self.0.lock().unwrap();
+            if s.versions_fail {
+                return Err(CloudError::Other("HTTP 500".into()));
+            }
+            let content = s.old.get(&version.parse().unwrap()).cloned();
+            drop(s);
+            let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
+            out.write_all(&content)?;
+            Ok(content.len() as u64)
+        })
+        .await
     }
 
     /// Three at a time, so a folder takes several listings.
     async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
-        let mut s = self.0.lock().unwrap();
-        if let Some((item, to)) = s.wander.take() {
-            let etag = s.bump();
-            let it = s.items.get_mut(&item).unwrap();
-            it.parent = Some(to);
-            it.etag = etag;
-        }
-        let ids = s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&id.0)).map(|(id, _)| id).take(3);
-        Ok(ids.map(|id| s.row(id)).collect())
+        self.exchange(|| -> Result<Vec<RemoteRow>, CloudError> {
+            let mut s = self.0.lock().unwrap();
+            if let Some((item, to)) = s.wander.take() {
+                let etag = s.bump();
+                let it = s.items.get_mut(&item).unwrap();
+                it.parent = Some(to);
+                it.etag = etag;
+            }
+            let ids = s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&id.0)).map(|(id, _)| id).take(3);
+            Ok(ids.map(|id| s.row(id)).collect())
+        })
+        .await
     }
 
     async fn prune(&self, pre: &RemotePre) -> Result<(), CloudError> {
-        let mut s = self.0.lock().unwrap();
-        s.check(pre)?;
-        let mut gone = vec![pre.id.0.clone()];
-        let mut i = 0;
-        while i < gone.len() {
-            let p = gone[i].clone();
-            gone.extend(s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)).map(|(id, _)| id.clone()));
-            i += 1;
-        }
-        for id in gone {
-            let it = s.items.remove(&id).unwrap();
-            s.kept.push(it.content);
-            s.deleted.push(id);
-        }
-        Ok(())
+        self.exchange(|| -> Result<(), CloudError> {
+            let mut s = self.0.lock().unwrap();
+            s.check(pre)?;
+            let mut gone = vec![pre.id.0.clone()];
+            let mut i = 0;
+            while i < gone.len() {
+                let p = gone[i].clone();
+                gone.extend(
+                    s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)).map(|(id, _)| id.clone()),
+                );
+                i += 1;
+            }
+            for id in gone {
+                let it = s.items.remove(&id).unwrap();
+                s.kept.push(it.content);
+                s.deleted.push(id);
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// As Graph's batch: every change judged against the state before any
     /// of them (a folder still holds what another change in the batch
     /// removes), then applied in order.
     async fn batch(&self, ops: &[Meta]) -> Vec<Result<MetaDone, CloudError>> {
+        self.request().await;
         let before: Vec<Result<(), CloudError>> = {
             let mut s = self.0.lock().unwrap();
             s.batches.push(ops.len());
@@ -491,19 +626,23 @@ impl Cloud for Fake {
         if out.iter().any(|r| matches!(r, Err(CloudError::Full))) {
             self.0.lock().unwrap().refused += 1;
         }
+        self.answer().await;
         out
     }
 
     async fn delete(&self, pre: &RemotePre) -> Result<(), CloudError> {
-        let mut s = self.0.lock().unwrap();
-        s.check(pre)?;
-        if s.items.values().any(|it| it.parent.as_deref() == Some(&pre.id.0)) {
-            return Err(CloudError::NotEmpty);
-        }
-        let it = s.items.remove(&pre.id.0).unwrap();
-        s.kept.push(it.content);
-        s.deleted.push(pre.id.0.clone());
-        Ok(())
+        self.exchange(|| -> Result<(), CloudError> {
+            let mut s = self.0.lock().unwrap();
+            s.check(pre)?;
+            if s.items.values().any(|it| it.parent.as_deref() == Some(&pre.id.0)) {
+                return Err(CloudError::NotEmpty);
+            }
+            let it = s.items.remove(&pre.id.0).unwrap();
+            s.kept.push(it.content);
+            s.deleted.push(pre.id.0.clone());
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -702,6 +841,7 @@ impl Sync {
         self.overflow = r.overflow.clone();
         let awaiting = r.overflow.as_ref().is_some_and(|o| o.outcome == OverflowOutcome::Held);
         let planned = r.approved.len();
+        let order: Vec<Op> = r.approved.iter().map(|a| a.op().clone()).collect();
         let counted = std::sync::atomic::AtomicUsize::new(0);
         let count = |n: usize| {
             counted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -714,6 +854,16 @@ impl Sync {
             let ended = report.done.len() + report.skipped.len() + report.failed.len() + report.not_run.len();
             assert_eq!(counted, ended);
         }
+        // Each list follows the planner's order, whatever order the
+        // operations finished in (`oneup sync` and the activity log rely on it).
+        let in_order = |ops: Vec<&Op>| {
+            let mut plan = order.iter();
+            ops.into_iter().all(|op| plan.any(|p| p == op))
+        };
+        assert!(in_order(report.done.iter().collect()), "done out of order: {report:?}");
+        assert!(in_order(report.skipped.iter().map(|(op, _)| op).collect()), "skipped out of order: {report:?}");
+        assert!(in_order(report.failed.iter().map(|(op, _)| op).collect()), "failed out of order: {report:?}");
+        assert!(in_order(report.not_run.iter().collect()), "not run out of order: {report:?}");
         // A halted round (a crash) leaves its marks, as a killed process
         // would. A skipped operation (say, a file held open) left nothing behind to
         // mark its folder again, so its marks stay for the retry; so do a
@@ -1079,6 +1229,27 @@ async fn independent_cloud_changes_go_in_batches_and_dependent_ones_never_togeth
     assert!(cloud.holds(b"x.txt") && cloud.holds(b"y.txt") && cloud.holds(b"z.txt"));
 }
 
+/// A folder's move and a change deeper inside it can share a batch: each
+/// names its item by ID with its own eTag, and neither depends on where the
+/// other's item is. Both land, and nothing else changes.
+#[tokio::test]
+async fn a_folder_move_and_a_change_deep_inside_it_both_land() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("batch-deep", cloud.clone());
+    write(&s.p("a/sub/g.txt"), b"grandchild");
+    std::fs::create_dir_all(s.p("b")).unwrap();
+    s.settle().await;
+    cloud.0.lock().unwrap().batches.clear();
+    std::fs::rename(s.p("a/sub/g.txt"), s.p("a/sub/h.txt")).unwrap();
+    std::fs::rename(s.p("a"), s.p("b/a")).unwrap();
+    s.settle().await;
+    assert!(cloud.0.lock().unwrap().batches.contains(&2), "they went in one batch");
+    let t = cloud.tree();
+    assert_eq!(t["/b/a/sub/h.txt"].as_deref(), Some(&b"grandchild"[..]), "{:?}", names(&t));
+    assert!(!t.contains_key("/a") && !t.contains_key("/b/a/sub/g.txt"));
+    assert_eq!(local_tree(&s.dir.0), t);
+}
+
 #[tokio::test]
 async fn a_cloud_edit_replaces_the_local_file_and_its_version_history_has_the_old_one() {
     let cloud = Fake::new();
@@ -1256,16 +1427,23 @@ async fn a_pause_stops_a_download_under_way_without_placing_anything() {
     assert_eq!(std::fs::read(s.p("big.bin")).unwrap(), big);
 }
 
-/// A full OneDrive refuses an upload: the round sends no other upload
-/// (each is skipped, not failed, so it's tried again once there's room),
-/// and downloads go on.
+/// The most operations a round runs at once (the default profile's).
+fn at_once() -> u64 {
+    oneup_exec::Parallel::for_profile("balanced").ops as u64
+}
+
+/// A full OneDrive refuses an upload: the round starts no other upload
+/// (only those already under way are refused too; each is skipped, not
+/// failed, so it's tried again once there's room), and downloads go on.
 #[tokio::test]
 async fn a_full_onedrive_stops_the_rounds_uploads_while_downloads_go_on() {
     let cloud = Fake::new();
     let mut s = Sync::new("full", cloud.clone());
     write(&s.p("old.txt"), b"synced before");
     s.settle().await;
-    for name in ["a.txt", "b.txt", "c.txt"] {
+    // More uploads than run at once.
+    let files: Vec<String> = (0..at_once() * 4).map(|k| format!("f{k:02}.txt")).collect();
+    for name in &files {
         write(&s.p(name), name.as_bytes());
     }
     cloud.add("d.txt", Some(b"from the cloud"));
@@ -1273,8 +1451,9 @@ async fn a_full_onedrive_stops_the_rounds_uploads_while_downloads_go_on() {
     let refused = |c: &Fake| c.0.lock().unwrap().refused;
     let r = s.round().await;
     let full = r.skipped.iter().filter(|(op, k)| *k == oneup_exec::Skip::CloudFull && matches!(op, Op::Upload { .. }));
-    assert_eq!(full.count(), 3, "{r:?}");
-    assert_eq!(refused(&cloud), 1, "only the first upload was sent");
+    assert_eq!(full.count(), files.len(), "{r:?}");
+    let sent = refused(&cloud);
+    assert!((1..=at_once()).contains(&sent), "only uploads already under way were sent: {sent}");
     assert!(r.done.iter().any(|op| matches!(op, Op::Download { .. })), "{r:?}");
     assert_eq!(std::fs::read(s.p("d.txt")).unwrap(), b"from the cloud");
 
@@ -1282,14 +1461,15 @@ async fn a_full_onedrive_stops_the_rounds_uploads_while_downloads_go_on() {
     cloud.0.lock().unwrap().full = false;
     s.settle().await;
     let t = cloud.tree();
-    assert_eq!(t["/b.txt"].as_deref(), Some(&b"b.txt"[..]));
-    assert_eq!(refused(&cloud), 1);
+    assert_eq!(t["/f01.txt"].as_deref(), Some(&b"f01.txt"[..]));
+    assert_eq!(refused(&cloud), sent);
 }
 
 /// A full OneDrive refuses new folders too, also in a batch: after the
-/// first refused request, batched or not, the round sends no other folder
-/// creation or upload (each is skipped as CloudFull, to be tried again
-/// once there's room), and downloads go on.
+/// first refused request, batched or not, the round starts no other folder
+/// creation or upload (only those already under way are refused too; each
+/// is skipped as CloudFull, to be tried again once there's room), and
+/// downloads go on.
 #[tokio::test]
 async fn a_full_onedrive_stops_the_rounds_new_folders_and_uploads_batched_or_not() {
     let cloud = Fake::new();
@@ -1307,7 +1487,8 @@ async fn a_full_onedrive_stops_the_rounds_new_folders_and_uploads_batched_or_not
     cloud.add("e.txt", Some(b"from the cloud"));
     cloud.0.lock().unwrap().full = true;
     let r = s.round().await;
-    assert_eq!(cloud.0.lock().unwrap().refused, 1, "one refused request, then none: {r:?}");
+    let sent = cloud.0.lock().unwrap().refused;
+    assert!((1..=at_once()).contains(&sent), "refused requests already under way, then none: {sent} {r:?}");
     let held = |op: &Op| matches!(op, Op::Upload { .. } | Op::MkdirRemote { .. });
     let full = r.skipped.iter().filter(|(op, k)| *k == oneup_exec::Skip::CloudFull && held(op));
     assert_eq!(full.count(), folders.len() + 3, "{r:?}");
@@ -1412,7 +1593,7 @@ async fn a_crash_at_any_point_of_a_round_loses_nothing() {
         let store = s.obs.store_mut();
         let r = s.exec.run(store, Vec::new()).await;
         assert!(r.halted.is_none(), "crash point {n}: {r:?}");
-        assert_eq!(store.read(|o| o.meta_get("exec.pending")).unwrap(), None, "crash point {n}");
+        assert_eq!(store.read(|o| o.meta_under("exec.pending")).unwrap(), vec![], "crash point {n}");
         let problems = store.read(|o| o.check_invariants()).unwrap();
         assert!(problems.is_empty(), "crash point {n}: {problems:?}");
         s.settle().await;
@@ -2640,6 +2821,123 @@ async fn everyday_hundreds_of_new_files_at_once_all_arrive() {
     assert_eq!(there.keys().filter(|p| p.starts_with("/import/")).count(), 300);
     assert_eq!(here.keys().filter(|p| p.starts_with("/web-")).count(), 50);
     assert_eq!(names(&here), names(&there));
+}
+
+/// New files on both sides: what a round transfers.
+fn burst(s: &Sync, cloud: &Fake, n: usize) {
+    for i in 0..n {
+        write(&s.p(&format!("up/{i:03}.txt")), format!("up {i}").as_bytes());
+        cloud.add(&format!("down-{i:03}.txt"), Some(format!("down {i}").as_bytes()));
+    }
+}
+
+/// Independent uploads and downloads run side by side, up to the limit,
+/// and end the same as one at a time.
+#[tokio::test]
+async fn independent_transfers_run_side_by_side() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("side-by-side", cloud.clone());
+    burst(&s, &cloud, 40);
+    s.settle().await;
+    let most = cloud.most_transfers();
+    assert!(most > 1 && most as u64 <= at_once(), "{most} at once");
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(there.keys().filter(|p| p.starts_with("/up/")).count(), 40);
+    assert_eq!(here.keys().filter(|p| p.starts_with("/down-")).count(), 40);
+    assert_eq!(here, there);
+}
+
+/// One at a time when the limit says so.
+#[tokio::test]
+async fn one_at_a_time_never_overlaps_transfers() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("one-at-a-time", cloud.clone());
+    s.exec.set_parallel(oneup_exec::Parallel::ONE);
+    burst(&s, &cloud, 10);
+    s.settle().await;
+    assert_eq!(cloud.most_transfers(), 1);
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
+/// Uploads larger than one request (each holds a fragment in memory) run
+/// no more at once than their own limit.
+#[tokio::test]
+async fn large_uploads_keep_to_their_own_limit() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("large-uploads", cloud.clone());
+    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 2 });
+    let big = vec![7u8; oneup_graph::client::SIMPLE_UPLOAD_MAX + 1];
+    for i in 0..6 {
+        write(&s.p(&format!("big{i}.bin")), &big);
+    }
+    s.settle().await;
+    assert_eq!(cloud.most_transfers(), 2);
+    assert_eq!(cloud.tree().len(), 6);
+}
+
+/// Behind one slow transfer, the rest of the round goes at most the
+/// executor's window ahead (256 operations, `exec.rs` `WINDOW`, plus one
+/// batch), so what it holds for the report stays bounded.
+#[tokio::test]
+async fn a_slow_transfer_holds_back_the_rest_of_the_round_by_at_most_a_window() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("window", cloud.clone());
+    let n = 600;
+    cloud.add("a-slow.txt", Some(b"slow"));
+    for i in 0..n {
+        cloud.add(&format!("b-{i:03}.txt"), Some(format!("b {i}").as_bytes()));
+    }
+    cloud.0.lock().unwrap().stall = Some("a-slow.txt".into());
+    let r = s.round().await;
+    assert_eq!(r.done.len(), n + 1, "{r:?}");
+    let slow = |op: &Op| matches!(op, Op::Download { name, .. } if name == "a-slow.txt");
+    let before = r.done.iter().position(slow).unwrap();
+    assert!(before < 10, "the slow one is planned near the start: {before}");
+    let during = cloud.0.lock().unwrap().finished_during_stall.unwrap();
+    assert!(during > 0, "others ran alongside it");
+    assert!(during <= before + 256 + oneup_graph::client::BATCH_MAX, "{during} finished behind it");
+}
+
+/// A file over 64 MiB is read whole, to look for its content in OneDrive,
+/// only when its upload runs alone. Whether it would was decided when it
+/// was taken in: one whose size reached OneDrive only afterwards (an
+/// earlier upload of the round) is uploaded, a fragment at a time.
+#[tokio::test]
+async fn a_large_upload_not_taken_in_alone_is_not_read_whole() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("copy-alone", cloud.clone());
+    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 1 });
+    let big = vec![9u8; (64 << 20) + 1];
+    write(&s.p("a.bin"), &big);
+    write(&s.p("b.bin"), &big);
+    s.settle().await;
+    let st = cloud.0.lock().unwrap();
+    assert_eq!(st.copies, 0, "the second wasn't copied after reading it whole");
+    assert_eq!(st.uploaded, 2 * big.len() as u64);
+}
+
+/// Timing, on a network where every request takes 20 ms: a round of
+/// uploads and downloads one at a time, then side by side (`balanced`,
+/// `performance`). Run with
+/// `cargo test -p oneup-exec --test sync -- --ignored --nocapture timing`.
+#[tokio::test]
+#[ignore = "timing only"]
+async fn timing_one_at_a_time_and_side_by_side() {
+    let profile = oneup_exec::Parallel::for_profile;
+    for (tag, parallel) in
+        [("one", oneup_exec::Parallel::ONE), ("bal", profile("balanced")), ("perf", profile("performance"))]
+    {
+        let cloud = Fake::new();
+        let mut s = Sync::new(&format!("timing-{tag}"), cloud.clone());
+        s.exec.set_parallel(parallel);
+        burst(&s, &cloud, 100);
+        cloud.0.lock().unwrap().latency = Some(Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        s.settle().await;
+        let took = started.elapsed();
+        assert_eq!(local_tree(&s.dir.0), cloud.tree());
+        eprintln!("{parallel:?}: 100 uploads and 100 downloads in {took:.2?}");
+    }
 }
 
 /// Another program's file operation (`cmd /c ...`): renames and deletes by

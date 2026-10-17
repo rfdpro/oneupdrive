@@ -9,6 +9,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 oneup-cfapi = { path = "../oneup-cfapi" }
 oneup-effects = { path = "../oneup-effects" }
 oneup-gate = { path = "../oneup-gate" }

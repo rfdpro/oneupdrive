@@ -1,17 +1,52 @@
 //! The executor proper (see the crate docs).
 
+use std::collections::VecDeque;
 use std::io::Seek as _;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use oneup_cfapi::identity::Identity;
 use oneup_effects::{Done, Error as FxError, LocalFs, Version};
 use oneup_gate::{Approved, OldCopy};
+use oneup_graph::client::SIMPLE_UPLOAD_MAX;
 use oneup_rules::ExcludeSet;
 use oneup_store::{Kind, LocalKind, LocalRow, Ops, RemoteRow, Store};
 use oneup_sync::{
-    Base, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, conflict_candidate, fold,
+    Base, Dir, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, Vacates,
+    conflict_candidate, fold,
 };
 
 use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, VersionMark};
+use crate::schedule::{Claims, Held, Node, Parallel};
+
+/// The store, shared by the operations under way. Each use locks it for
+/// one synchronous read or transaction, never across an `.await`.
+struct Db<'a>(std::sync::Mutex<&'a mut Store>);
+
+impl<'a> Db<'a> {
+    fn new(store: &'a mut Store) -> Self {
+        Self(std::sync::Mutex::new(store))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, &'a mut Store> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn read<T>(&self, f: impl FnOnce(&Ops<'_>) -> oneup_store::Result<T>) -> oneup_store::Result<T> {
+        self.lock().read(f)
+    }
+
+    fn try_write<T, E: From<oneup_store::Error>>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T, E>) -> Result<T, E> {
+        self.lock().try_write(f)
+    }
+}
+
+/// How many operations, from the oldest not yet finished, the executor
+/// takes in to look for ones it can start. Behind one slow operation, the
+/// rest go at most this far ahead (plus one batch), which bounds what is
+/// held for the report.
+const WINDOW: usize = 256;
 
 /// Why an operation was skipped. Nothing was changed; the next round plans
 /// again from fresh state.
@@ -147,8 +182,13 @@ struct Notes {
     halt: Option<String>,
 }
 
-/// Adds one operation's outcome to the report; true if the round halts.
-fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) -> bool {
+/// Whether an operation's outcome halts the round.
+fn halts(outcome: &Res, notes: &Notes) -> bool {
+    matches!(outcome, Err(Fail::Halt(_))) || notes.halt.is_some()
+}
+
+/// Adds one operation's outcome to the report.
+fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
     match outcome {
         Ok(()) => {
             if notes.kept_instead {
@@ -165,100 +205,219 @@ fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) -> bool {
                 report.theirs_not_kept.push((op.clone(), why));
             }
             report.done.push(op);
-            match notes.halt {
-                Some(m) => {
-                    if report.halted.is_none() {
-                        tracing::warn!(reason = %m, "round halted");
-                        report.halted = Some(m);
-                    }
-                    true
-                }
-                None => false,
+            if let Some(m) = notes.halt
+                && report.halted.is_none()
+            {
+                tracing::warn!(reason = %m, "round halted");
+                report.halted = Some(m);
             }
         }
         Err(Fail::Skip(s)) => {
             tracing::debug!(reason = ?s, "operation skipped");
             report.skipped.push((op, s));
-            false
         }
         Err(Fail::Failed(m)) => {
             tracing::warn!(error = %m, "operation failed");
             report.failed.push((op, m));
-            false
         }
-        Err(Fail::NotNow) => {
-            report.not_run.push(op);
-            false
-        }
+        Err(Fail::NotNow) => report.not_run.push(op),
         Err(Fail::Halt(m)) => {
             if m != NOT_RUN && report.halted.is_none() {
                 tracing::warn!(reason = %m, "round halted");
                 report.halted = Some(m);
             }
-            true
         }
     }
 }
 
-/// How many of the operations at the start of `ops` can go to the cloud in
-/// one batch: consecutive cloud metadata changes (create folder, move or
-/// rename, delete), at most a batch's worth, none depending on another.
-/// Conservative: the group ends before an operation that touches an item
-/// another one in the group touches, moves into or deletes a folder another
-/// one changes or moves into, takes a name another one frees or takes, or
-/// deletes a folder something in the group came from (Graph would see it
-/// still holding that item). Below 2 the caller runs them one by one.
-fn batchable(store: &Store, ops: &[Approved]) -> usize {
-    use std::collections::HashSet;
-    let mut touched: HashSet<String> = HashSet::new(); // items moved or deleted
-    let mut parents: HashSet<String> = HashSet::new(); // their folders, and folders moved into
-    let mut names: HashSet<(String, String)> = HashSet::new(); // names freed or taken
+/// How many of the operations at the start of `ops` go to the cloud as one
+/// batch, and what they claim together: consecutive cloud metadata changes
+/// (create folder, move or rename, delete), at most a batch's worth, none
+/// conflicting with another ([`crate::schedule`]): the group ends before an
+/// operation that touches an item another one touches, changes a folder
+/// another one works in (Graph judges a batch against the state before any
+/// of it, so a folder deleted after something left it would still hold
+/// that item), or takes or frees a name another one takes or frees. Also
+/// before one whose item the store doesn't have. Anything else is a group
+/// of its own; below 2 the caller runs them one by one.
+fn batch_of(store: &Db<'_>, ops: &[Approved], can_copy: bool) -> (usize, Claims) {
+    let mut group = Held::default();
+    let mut all = Claims::default();
     let mut n = 0;
     for a in ops.iter().take(oneup_graph::client::BATCH_MAX) {
-        // The item's current folder and name, from the Remote tree.
-        let at = |id: &RemoteId| {
-            store.read(|o| o.get_item(&id.0)).ok().flatten().and_then(|r| r.parent_id.map(|p| (p, fold(&r.name))))
-        };
-        let (item, from, to) = match a.op() {
-            Op::MkdirRemote { to, name, .. } => (None, None, Some((to.0.clone(), fold(name)))),
-            Op::MoveRemote { remote, to, name, .. } | Op::RenameRemote { remote, dir: to, name } => {
-                match at(&remote.id) {
-                    Some(from) => (Some(remote.id.0.clone()), Some(from), Some((to.0.clone(), fold(name)))),
-                    None => break,
-                }
-            }
-            Op::DeleteRemote { remote, .. } => match at(&remote.id) {
-                Some(from) => (Some(remote.id.0.clone()), Some(from), None),
-                None => break,
-            },
-            _ => break,
-        };
-        let clash = item.as_ref().is_some_and(|i| touched.contains(i) || parents.contains(i))
-            || from.as_ref().is_some_and(|f| touched.contains(&f.0) || names.contains(f))
-            || to.as_ref().is_some_and(|t| touched.contains(&t.0) || names.contains(t));
-        if clash {
+        let meta = matches!(
+            a.op(),
+            Op::MkdirRemote { .. } | Op::MoveRemote { .. } | Op::RenameRemote { .. } | Op::DeleteRemote { .. }
+        );
+        let c = claims(store, a.op(), can_copy);
+        if n > 0 && (!meta || c.unknown || group.conflicts(&c)) {
             break;
         }
-        if let Some(i) = item {
-            touched.insert(i);
-        }
-        if let Some(f) = from {
-            parents.insert(f.0.clone());
-            names.insert(f);
-        }
-        if let Some(t) = to {
-            parents.insert(t.0.clone());
-            names.insert(t);
-        }
+        group.add(&c);
+        all.merge(c);
         n += 1;
+        if !meta {
+            break;
+        }
     }
-    n
+    (n, all)
 }
 
 /// Whether a full OneDrive refuses `op`: new content and new folders. The
 /// agent holds the same while it stays full, in later rounds.
 fn needs_room(op: &Op) -> bool {
     matches!(op, Op::Upload { .. } | Op::MkdirRemote { .. })
+}
+
+/// Whether an upload may be a copy in OneDrive instead
+/// ([`Executor::copy_instead`]), which first reads the whole file if
+/// OneDrive has one of its size.
+fn may_copy(can_copy: bool, new: bool, size: i64) -> bool {
+    can_copy && new && size >= oneup_store::COPY_MIN
+}
+
+/// Consecutive operations of the round that run as one: a single
+/// operation, or a batch.
+struct Unit {
+    /// Where in the round they start, and how many.
+    start: usize,
+    len: usize,
+    claims: Claims,
+}
+
+/// Where the store has an item that an operation moves or removes.
+struct Place {
+    folder: Option<Node>,
+    name: String,
+    file: bool,
+}
+
+/// What `op` touches ([`crate::schedule`]): what the operation names, and
+/// for an item it moves, renames or removes, where the store has it now.
+/// One whose item can't be read runs alone.
+fn claims(store: &Db<'_>, op: &Op, can_copy: bool) -> Claims {
+    store.read(|o| claims_in(o, op, can_copy)).unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "what an operation touches couldn't be read; it runs alone");
+        Claims::unknown()
+    })
+}
+
+/// Reading a file's whole content (hashing it) doesn't wait on the
+/// network, so the operations under way wait for it: a file larger than
+/// this is read with nothing else running.
+const READ_ALONE: i64 = 64 << 20;
+
+fn claims_in(o: &Ops<'_>, op: &Op, can_copy: bool) -> oneup_store::Result<Claims> {
+    use Node::{Local as L, Remote as R, Synced as S};
+    let big = |p: &LocalPre| p.stamp.is_some_and(|(size, _)| size > READ_ALONE);
+    let dir = |d: Dir| match d {
+        Dir::Local(id) => L(id),
+        Dir::Remote(id) => R(id),
+    };
+    let mut c = Claims::default();
+    // The items it acts on.
+    let (sid, local, remote) = op.subjects();
+    sid.into_iter().for_each(|s| c.item(&S(s)));
+    local.into_iter().for_each(|l| c.item(&L(l)));
+    remote.into_iter().for_each(|r| c.item(&R(r)));
+    // Where it puts something, and the name it takes there.
+    if let Some((d, name)) = op.target() {
+        let d = dir(d);
+        c.within(&d);
+        c.name(&d, name);
+    }
+    match op {
+        Op::Pair { parent, .. }
+        | Op::MkdirRemote { parent, .. }
+        | Op::MkdirLocal { parent, .. }
+        | Op::MoveRemote { parent, .. }
+        | Op::MoveLocal { parent, .. } => c.within(&S(*parent)),
+        Op::Upload { parent, to, .. } => {
+            c.within(&S(*parent));
+            c.within(&R(to.clone()));
+        }
+        Op::Download { parent, to, .. } => {
+            c.within(&S(*parent));
+            c.within(&L(*to));
+        }
+        Op::Record(b) => b.parent.into_iter().for_each(|p| c.within(&S(p))),
+        _ => {}
+    }
+    // What it moves or removes: the folder it leaves, and the name it frees.
+    match op.vacates() {
+        Some(Vacates::Local(id)) => {
+            let at = o.local_get(id.0)?.map(|r| Place {
+                folder: r.parent_id.map(|p| L(LocalId(p))),
+                name: r.name,
+                file: r.kind == LocalKind::File,
+            });
+            leaves(&mut c, at);
+        }
+        Some(Vacates::Remote(id)) => {
+            let at = o.get_item(&id.0)?.map(|r| Place {
+                folder: r.parent_id.map(|p| R(RemoteId(p))),
+                name: r.name,
+                file: r.kind == Kind::File,
+            });
+            leaves(&mut c, at);
+        }
+        None => {}
+    }
+    // A Synced row it moves or removes: the folder it leaves.
+    if let Some(sid) = sid
+        && (op.vacates().is_some() || matches!(op, Op::Forget(_)))
+    {
+        match o.synced_get(sid)? {
+            Some(b) => {
+                b.parent.into_iter().for_each(|p| c.within(&S(p)));
+                c.alone |= b.kind != NodeKind::File;
+            }
+            None => {
+                c.alone = true;
+                c.unknown = true;
+            }
+        }
+    }
+    match op {
+        // It removes a whole subtree in OneDrive.
+        Op::PruneRemote { .. } => c.alone = true,
+        Op::Upload { local, replace, .. } => {
+            c.large = local.stamp.is_some_and(|(size, _)| usize::try_from(size).is_ok_and(|s| s > SIMPLE_UPLOAD_MAX));
+            if let Some((size, _)) = local.stamp
+                && may_copy(can_copy, replace.is_none(), size)
+                && big(local)
+            {
+                c.alone |= !o.remote_files_of_size(size, 1)?.is_empty();
+            }
+        }
+        // Each reads a whole file: the old copy, to see whether it can go,
+        // or the file itself.
+        Op::Download { replace: Some(pre), .. }
+        | Op::RecycleLocal { local: pre, .. }
+        | Op::Hash(pre)
+        | Op::Dehydrate { local: pre, .. } => c.alone |= big(pre),
+        _ => {}
+    }
+    Ok(c)
+}
+
+/// Claims the folder an item leaves and the name it frees there, from where
+/// the store has it. Moving or removing a folder reaches everything below
+/// it, so that runs alone, as does an item the store doesn't have.
+fn leaves(c: &mut Claims, at: Option<Place>) {
+    match at {
+        Some(at) => {
+            if let Some(d) = &at.folder {
+                c.within(d);
+                c.name(d, &at.name);
+            }
+            c.alone |= !at.file;
+        }
+        None => {
+            c.alone = true;
+            c.unknown = true;
+        }
+    }
 }
 
 /// Skip unless `ok`.
@@ -296,6 +455,8 @@ pub struct Executor<C> {
     /// The name-only folder rules the Local tree follows; they can change
     /// between rounds ([`Executor::set_rules`]).
     rules: std::sync::RwLock<ExcludeSet>,
+    /// How many operations run at once ([`Executor::set_parallel`]).
+    parallel: std::sync::Mutex<Parallel>,
     /// Crash points left to pass before the injected crash; negative: off.
     #[cfg(feature = "crash-test")]
     crash: std::sync::atomic::AtomicI64,
@@ -309,6 +470,7 @@ impl<C: Cloud> Executor<C> {
             fs,
             cloud,
             rules: std::sync::RwLock::new(rules),
+            parallel: std::sync::Mutex::new(Parallel::for_profile("balanced")),
             #[cfg(feature = "crash-test")]
             crash: std::sync::atomic::AtomicI64::new(-1),
         }
@@ -317,6 +479,12 @@ impl<C: Cloud> Executor<C> {
     /// The rules changed: rows written from now on follow these.
     pub fn set_rules(&self, rules: ExcludeSet) {
         *self.rules.write().unwrap_or_else(|p| p.into_inner()) = rules;
+    }
+
+    /// How many operations later rounds run at once (the memory profile's,
+    /// [`Parallel::for_profile`]; `balanced` until set).
+    pub fn set_parallel(&self, p: Parallel) {
+        *self.parallel.lock().unwrap_or_else(|p| p.into_inner()) = p;
     }
 
     /// Test-only: the round stops at the crash point after `n` others have
@@ -352,7 +520,7 @@ impl<C: Cloud> Executor<C> {
     /// next round brings it here like any new file in OneDrive.
     async fn keep_replaced(
         &self,
-        store: &mut Store,
+        store: &Db<'_>,
         id: &RemoteId,
         parent: Sid,
         to: &RemoteId,
@@ -428,16 +596,23 @@ impl<C: Cloud> Executor<C> {
     /// upload it. The copy is verified: one whose content turned out
     /// different (the source changed in between) is removed again, into
     /// OneDrive's recycle bin, before uploading instead.
+    ///
+    /// A file over [`READ_ALONE`] is read whole only if the upload runs
+    /// `alone`: whether it would was decided when it was taken in, and a
+    /// file of its size may have reached OneDrive since (an earlier upload
+    /// of the round). It's then uploaded, which reads it a fragment at a
+    /// time.
     async fn copy_instead(
         &self,
-        store: &Store,
+        store: &Db<'_>,
         src: &mut oneup_effects::UploadSource,
         to: &RemoteId,
         name: &str,
         new: bool,
+        alone: bool,
     ) -> Res<Option<(RemoteRow, Hash)>> {
         use std::io::{Seek, SeekFrom};
-        if !new || src.size < oneup_store::COPY_MIN || !self.cloud.can_copy() {
+        if !may_copy(self.cloud.can_copy(), new, src.size) || (src.size > READ_ALONE && !alone) {
             return Ok(None);
         }
         let candidates = store.read(|o| o.remote_files_of_size(src.size, 16))?;
@@ -474,7 +649,9 @@ impl<C: Cloud> Executor<C> {
         &self.cloud
     }
 
-    /// Runs `approved` in order. Stops at the first halt.
+    /// Runs `approved`: in the planner's order wherever one operation
+    /// depends on another, side by side otherwise ([`crate::schedule`]).
+    /// Stops at the first halt.
     pub async fn run(&self, store: &mut Store, approved: Vec<Approved>) -> Report {
         self.run_counted(store, approved, &|_| {}).await
     }
@@ -490,13 +667,18 @@ impl<C: Cloud> Executor<C> {
         self.run_checked(store, approved, done, &|_| true).await
     }
 
-    /// [`Self::run_counted`], asking `may_run` before each operation
+    /// [`Self::run_counted`], asking `may_run` as each operation starts
     /// whether it may run now (a pause that came meanwhile, say). One it
     /// refuses isn't started ([`Report::not_run`]). A download under way is
     /// asked again as its data arrives, and stopped once refused: nothing
     /// was placed yet, so it's simply done again later. Anything else that
     /// started runs to its end (an upload commits, a batch is answered).
     /// `may_run` is called often: it must be cheap.
+    ///
+    /// Operations finish in any order; the report lists them in the
+    /// planner's order all the same, which callers rely on. A halt stops
+    /// the round at once: operations still under way are dropped where
+    /// they wait, as a crash would leave them, and aren't reported.
     pub async fn run_checked(
         &self,
         store: &mut Store,
@@ -509,73 +691,166 @@ impl<C: Cloud> Executor<C> {
             report.halted = Some(e.to_string());
             return report;
         }
-        // A record left by a round that was cut short.
-        if let Err(Fail::Halt(m) | Fail::Failed(m)) = self.recover(store) {
+        let db = Db::new(store);
+        // Records left by a round that was cut short.
+        if let Err(Fail::Halt(m) | Fail::Failed(m)) = self.recover_all(&db) {
             report.halted = Some(m);
             return report;
         }
+        let limits = self.parallel();
         // Once OneDrive says it's full (to one operation or in a batch),
         // the round's other uploads and new folders aren't sent only to be
         // refused; everything else goes on.
-        let mut full = false;
-        let mut i = 0;
-        while i < approved.len() {
+        let full = AtomicBool::new(false);
+        let mut waiting: VecDeque<Unit> = VecDeque::new();
+        let mut held = Held::default();
+        let mut running = FuturesUnordered::new();
+        // Outcomes from the first not yet reported on: they're reported in
+        // the planner's order, as soon as everything before has finished.
+        let mut reported = 0;
+        let mut outcomes: VecDeque<Option<(Res, Notes)>> = VecDeque::new();
+        let can_copy = self.cloud.can_copy();
+        let mut next = 0;
+        loop {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
-            let n = batchable(store, &approved[i..]);
-            // Up to the first the caller refuses, or a full OneDrive would,
-            // which goes on its own.
-            let n = approved[i..i + n].iter().take_while(|a| may_run(a.op()) && !(full && needs_room(a.op()))).count();
-            if n >= 2 {
-                tracing::debug!(n, "cloud changes sent in one batch");
-                let outcomes = self.run_batch(store, &approved[i..i + n]).await;
-                full |= outcomes.iter().any(|o| matches!(o, Err(Fail::Skip(Skip::CloudFull))));
-                let halted = approved[i..i + n]
-                    .iter()
-                    .zip(outcomes)
-                    .any(|(a, outcome)| record(&mut report, a.op().clone(), outcome, Notes::default()));
-                done(n);
-                if halted {
-                    break;
+            while next - reported < WINDOW && next < approved.len() {
+                let (n, claims) = batch_of(&db, &approved[next..], can_copy);
+                waiting.push_back(Unit { start: next, len: n, claims });
+                next += n;
+            }
+            // Each in the planner's order, once nothing under way and
+            // nothing before it still waiting conflicts with it.
+            let mut earlier = Held::default();
+            let mut k = 0;
+            while k < waiting.len() && held.units < limits.ops && held.alone == 0 {
+                let c = &waiting[k].claims;
+                let ready = if c.alone {
+                    held.units == 0 && k == 0
+                } else {
+                    !held.conflicts(c) && !earlier.conflicts(c) && !(c.large && held.large >= limits.large_uploads)
+                };
+                if !ready {
+                    if c.alone {
+                        // Everything after it waits for it.
+                        break;
+                    }
+                    earlier.add(c);
+                    k += 1;
+                    continue;
                 }
-                i += n;
-                continue;
+                let Some(u) = waiting.remove(k) else { break };
+                held.add(&u.claims);
+                running.push(self.unit(&db, &approved, u, &full, may_run));
             }
-            let a = &approved[i];
-            i += 1;
-            if !may_run(a.op()) {
-                record(&mut report, a.op().clone(), Err(Fail::NotNow), Notes::default());
-                done(1);
-                continue;
+            let Some((u, finished)) = running.next().await else { break };
+            held.remove(&u.claims);
+            done(u.len);
+            let halted = finished.iter().any(|(r, notes)| halts(r, notes));
+            let from = u.start - reported;
+            if outcomes.len() < from + u.len {
+                outcomes.resize_with(from + u.len, || None);
             }
-            if full && needs_room(a.op()) {
-                record(&mut report, a.op().clone(), Err(Fail::Skip(Skip::CloudFull)), Notes::default());
-                done(1);
-                continue;
+            for (k, o) in finished.into_iter().enumerate() {
+                outcomes[from + k] = Some(o);
             }
-            let mut notes = Notes::default();
-            let mut outcome = self.one(store, a, &mut notes, may_run).await;
-            if writes_ahead(a.op())
-                && !matches!(outcome, Err(Fail::Halt(_)))
-                && let Err(e) = self.recover(store)
-            {
-                outcome = Err(e);
-            }
-            full |= matches!(outcome, Err(Fail::Skip(Skip::CloudFull)));
-            let halted = record(&mut report, a.op().clone(), outcome, notes);
-            done(1);
             if halted {
                 break;
+            }
+            while let Some(Some(_)) = outcomes.front() {
+                if let Some(Some((outcome, notes))) = outcomes.pop_front() {
+                    record(&mut report, approved[reported].op().clone(), outcome, notes);
+                }
+                reported += 1;
+            }
+        }
+        drop(running);
+        // After a halt: what finished, still in the planner's order.
+        for (a, o) in approved[reported..].iter().zip(outcomes) {
+            if let Some((outcome, notes)) = o {
+                record(&mut report, a.op().clone(), outcome, notes);
             }
         }
         report
     }
 
-    /// Runs a group from [`batchable`]: every precondition in the store,
+    /// The limits this round runs under: one at a time for a cloud that
+    /// can't take more ([`Cloud::concurrent`]).
+    fn parallel(&self) -> Parallel {
+        if !self.cloud.concurrent() {
+            return Parallel::ONE;
+        }
+        self.parallel.lock().unwrap_or_else(std::sync::PoisonError::into_inner).at_least_one()
+    }
+
+    /// Runs one operation, or a batch. Whether each may run is asked as it
+    /// starts (a pause, a full OneDrive): one refused then isn't sent, and
+    /// the batch goes without it.
+    async fn unit(
+        &self,
+        store: &Db<'_>,
+        approved: &[Approved],
+        u: Unit,
+        full: &AtomicBool,
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> (Unit, Vec<(Res, Notes)>) {
+        let group = &approved[u.start..u.start + u.len];
+        let mut out: Vec<Option<(Res, Notes)>> = std::iter::repeat_with(|| None).take(group.len()).collect();
+        let mut go = Vec::new();
+        for (k, a) in group.iter().enumerate() {
+            if !may_run(a.op()) {
+                out[k] = Some((Err(Fail::NotNow), Notes::default()));
+            } else if full.load(Relaxed) && needs_room(a.op()) {
+                out[k] = Some((Err(Fail::Skip(Skip::CloudFull)), Notes::default()));
+            } else {
+                go.push(k);
+            }
+        }
+        match go.as_slice() {
+            [] => {}
+            &[k] => out[k] = Some(self.single(store, &group[k], u.claims.alone, may_run).await),
+            _ => {
+                tracing::debug!(n = go.len(), "cloud changes sent in one batch");
+                let members: Vec<&Approved> = go.iter().map(|&k| &group[k]).collect();
+                for (&k, r) in go.iter().zip(self.run_batch(store, &members).await) {
+                    out[k] = Some((r, Notes::default()));
+                }
+            }
+        }
+        if out.iter().flatten().any(|(r, _)| matches!(r, Err(Fail::Skip(Skip::CloudFull)))) {
+            full.store(true, Relaxed);
+        }
+        let out = out.into_iter().map(|o| o.unwrap_or_else(|| (Err(Fail::Halt(NOT_RUN.into())), Notes::default())));
+        (u, out.collect())
+    }
+
+    /// One operation on its own, then the settling of the write-ahead
+    /// record it left if it didn't finish: right after it, with no `.await`
+    /// in between, so no other operation runs first.
+    /// `alone`: it runs with nothing else ([`claims_in`]).
+    async fn single(
+        &self,
+        store: &Db<'_>,
+        a: &Approved,
+        alone: bool,
+        may_run: &(dyn Fn(&Op) -> bool + Sync),
+    ) -> (Res, Notes) {
+        let mut notes = Notes::default();
+        let mut outcome = self.one(store, a, alone, &mut notes, may_run).await;
+        if let Some(key) = pending_key(a.op())
+            && !matches!(outcome, Err(Fail::Halt(_)))
+            && let Err(e) = self.recover(store, &key)
+        {
+            outcome = Err(e);
+        }
+        (outcome, notes)
+    }
+
+    /// Runs a group from [`batch_of`]: every precondition in the store,
     /// then one cloud batch, then each record in order. After a halt (an
     /// injected crash) nothing more is recorded, as after a real crash: the
     /// cloud changes stay unrecorded and the next round finds them.
-    async fn run_batch(&self, store: &mut Store, group: &[Approved]) -> Vec<Res> {
+    async fn run_batch(&self, store: &Db<'_>, group: &[&Approved]) -> Vec<Res> {
         let mut outcomes: Vec<Option<Res>> = std::iter::repeat_with(|| None).take(group.len()).collect();
         let mut metas = Vec::new();
         let mut sent = Vec::new();
@@ -607,7 +882,7 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// The store-side precondition of a cloud metadata change, and what to send.
-    fn meta_pre(&self, store: &mut Store, op: &Op) -> Res<Meta> {
+    fn meta_pre(&self, store: &Db<'_>, op: &Op) -> Res<Meta> {
         match op {
             Op::MkdirRemote { local, to, parent, name, link } => {
                 store.try_write(|o| {
@@ -633,7 +908,7 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// Records a cloud metadata change that was made.
-    fn meta_post(&self, store: &mut Store, op: &Op, done: MetaDone) -> Res {
+    fn meta_post(&self, store: &Db<'_>, op: &Op, done: MetaDone) -> Res {
         match (op, done) {
             (Op::MkdirRemote { local, parent, name, link, .. }, MetaDone::Item(row)) => {
                 store.try_write(|o| {
@@ -693,7 +968,7 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// One cloud metadata change on its own: the same three steps.
-    async fn meta_one(&self, store: &mut Store, op: &Op) -> Res {
+    async fn meta_one(&self, store: &Db<'_>, op: &Op) -> Res {
         let m = self.meta_pre(store, op)?;
         let done = match &m {
             Meta::Mkdir { parent, name } => MetaDone::Item(self.cloud.mkdir(parent, name).await?),
@@ -713,7 +988,7 @@ impl<C: Cloud> Executor<C> {
     /// A move OneDrive refused because the folder has too many items below
     /// it ([`CloudError::TooManyItems`]), done in parts ([`Self::rebuild`])
     /// and then recorded as the move it stands for.
-    async fn move_in_parts(&self, store: &mut Store, op: &Op, m: &Meta) -> Res {
+    async fn move_in_parts(&self, store: &Db<'_>, op: &Op, m: &Meta) -> Res {
         let Meta::Move { pre, to, name } = m else { return Err(CloudError::TooManyItems.into()) };
         tracing::info!("OneDrive won't move a folder this large in one request; moving its contents item by item");
         let row = self.rebuild(store, pre, to, name).await?;
@@ -733,7 +1008,7 @@ impl<C: Cloud> Executor<C> {
     /// soon as it exists, and an interruption leaves what wasn't moved yet
     /// in the original folder, which the next round sees as a folder of its
     /// own (the user's move, done in part).
-    async fn rebuild(&self, store: &mut Store, pre: &RemotePre, to: &RemoteId, name: &str) -> Res<RemoteRow> {
+    async fn rebuild(&self, store: &Db<'_>, pre: &RemotePre, to: &RemoteId, name: &str) -> Res<RemoteRow> {
         let now = self.cloud.item(&pre.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
         need(now.etag.as_deref() == Some(pre.etag.as_str()))?;
         if now.kind != Kind::Folder {
@@ -810,11 +1085,13 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// Runs one operation, noting in `notes` what else a done one reports
-    /// (see [`Notes`]). `may_run`: see [`Self::run_checked`].
+    /// (see [`Notes`]). `alone`: see [`Self::single`]; `may_run`: see
+    /// [`Self::run_checked`].
     async fn one(
         &self,
-        store: &mut Store,
+        store: &Db<'_>,
         a: &Approved,
+        alone: bool,
         notes: &mut Notes,
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Res {
@@ -884,7 +1161,7 @@ impl<C: Cloud> Executor<C> {
                 let (size, mtime) = (src.size, src.mtime);
                 // The file stays open (no writers) from here until recorded.
                 let (row, sent, sent_len, mark) = match self
-                    .copy_instead(store, &mut src, to, name, replace.is_none())
+                    .copy_instead(store, &mut src, to, name, replace.is_none(), alone)
                     .await?
                 {
                     Some((row, hash)) => {
@@ -1016,7 +1293,7 @@ impl<C: Cloud> Executor<C> {
                 if let Some(old) = replace {
                     store.try_write(|o| {
                         o.note_local_deleted(old.id.0)?;
-                        Ok::<_, Fail>(o.meta_set(PENDING, &Pending::Evidence(old.id).encode())?)
+                        Ok::<_, Fail>(o.meta_set(&pending_of(old.id), &Pending::Evidence(old.id).encode())?)
                     })?;
                     self.crash_point()?;
                 }
@@ -1033,7 +1310,7 @@ impl<C: Cloud> Executor<C> {
                 store.try_write(|o| {
                     if let Some(old) = replace {
                         o.local_remove_subtree(old.id.0)?;
-                        o.meta_delete(PENDING)?;
+                        o.meta_delete(&pending_of(old.id))?;
                     }
                     let row = self.local_row(&entry, *to);
                     o.local_update(&row)?;
@@ -1094,14 +1371,14 @@ impl<C: Cloud> Executor<C> {
                     need(b.local == Some(local.id))?;
                     o.synced_put(&Base { local: None, ..b })?;
                     let p = Pending::Detached { sid: *sid, local: local.id, name: name.clone() };
-                    Ok(o.meta_set(PENDING, &p.encode())?)
+                    Ok(o.meta_set(&pending_of(local.id), &p.encode())?)
                 })?;
                 self.crash_point()?;
                 let Done::Placed { parent, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
                 self.crash_point()?;
                 store.try_write(|o| {
                     o.local_update(&self.local_row(&entry, parent))?;
-                    Ok(o.meta_delete(PENDING)?)
+                    Ok(o.meta_delete(&pending_of(local.id))?)
                 })
             }
 
@@ -1110,7 +1387,7 @@ impl<C: Cloud> Executor<C> {
                 let synced = store.try_write(|o| {
                     let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                     o.note_local_deleted(local.id.0)?;
-                    o.meta_set(PENDING, &Pending::Evidence(local.id).encode())?;
+                    o.meta_set(&pending_of(local.id), &Pending::Evidence(local.id).encode())?;
                     Ok::<_, Fail>(b.hash)
                 })?;
                 self.crash_point()?;
@@ -1125,7 +1402,7 @@ impl<C: Cloud> Executor<C> {
                 store.try_write(|o| {
                     o.local_remove_subtree(local.id.0)?;
                     o.synced_remove(*sid)?;
-                    Ok(o.meta_delete(PENDING)?)
+                    Ok(o.meta_delete(&pending_of(local.id))?)
                 })
             }
             Op::PruneRemote { remote, forget, keep, .. } => {
@@ -1188,14 +1465,14 @@ impl<C: Cloud> Executor<C> {
         oneup_local::classify::to_row(entry, parent.0, parent == self.fs.root_id(), &rules)
     }
 
-    /// Settles a write-ahead record whose operation didn't finish: it
-    /// failed, or the process died (then this runs at the start of the next
-    /// round). If the effect didn't happen, the record is undone; if it
-    /// did, the record stands and the change journal reports the rest.
-    /// Whether it happened is read from the folder itself, which, unlike
-    /// the journal, can't lag behind.
-    fn recover(&self, store: &mut Store) -> Res {
-        let Some(p) = store.try_write(|o| Ok::<_, Fail>(o.meta_get(PENDING)?))? else { return Ok(()) };
+    /// Settles the write-ahead record under `key` if its operation didn't
+    /// finish: it failed, or the process died (then this runs at the start
+    /// of the next round). If the effect didn't happen, the record is
+    /// undone; if it did, the record stands and the change journal reports
+    /// the rest. Whether it happened is read from the folder itself, which,
+    /// unlike the journal, can't lag behind.
+    fn recover(&self, store: &Db<'_>, key: &str) -> Res {
+        let Some(p) = store.try_write(|o| Ok::<_, Fail>(o.meta_get(key)?))? else { return Ok(()) };
         let pending = Pending::decode(&p);
         let undo = match &pending {
             // Recycling and replacing take the item out of the folder.
@@ -1218,16 +1495,40 @@ impl<C: Cloud> Executor<C> {
                 }
                 _ => {}
             }
-            Ok(o.meta_delete(PENDING)?)
+            Ok(o.meta_delete(key)?)
         })
+    }
+
+    /// Settles every record a round that was cut short left, including
+    /// one under [`PENDING`] itself, where versions that ran one operation
+    /// at a time kept theirs.
+    fn recover_all(&self, store: &Db<'_>) -> Res {
+        for (key, _) in store.read(|o| o.meta_under(PENDING))? {
+            self.recover(store, &key)?;
+        }
+        Ok(())
     }
 }
 
-/// The meta key holding the write-ahead record of the operation under way
-/// (see the crate docs): set in the same transaction as the write-ahead,
-/// cleared in the same transaction as the final record. Operations run one
-/// at a time, so there is at most one.
+/// Where write-ahead records are kept (see the crate docs): under
+/// `exec.pending.<local file ID>`, one per item, so operations under way
+/// at once each have their own. Set in the same transaction as the
+/// write-ahead, cleared in the same transaction as the final record.
 const PENDING: &str = "exec.pending";
+
+/// The key of item `id`'s write-ahead record.
+fn pending_of(id: LocalId) -> String {
+    format!("{PENDING}.{:x}", id.0)
+}
+
+/// The key of the record `op` writes ahead of its effect, if it writes one.
+fn pending_key(op: &Op) -> Option<String> {
+    match op {
+        Op::RecycleLocal { local, .. } | Op::ConflictCopy { local, .. } => Some(pending_of(local.id)),
+        Op::Download { replace: Some(old), .. } => Some(pending_of(old.id)),
+        _ => None,
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Pending {
@@ -1281,11 +1582,6 @@ impl<W: std::io::Write> std::io::Write for Stoppable<'_, W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-/// Whether `op` writes a record ahead of its effect (see [`PENDING`]).
-fn writes_ahead(op: &Op) -> bool {
-    matches!(op, Op::RecycleLocal { .. } | Op::ConflictCopy { .. } | Op::Download { replace: Some(_), .. })
 }
 
 /// What a placeholder for cloud item `r` stands for; `None` without
@@ -1376,6 +1672,10 @@ fn link_ok(o: &Ops<'_>, link: Link) -> oneup_store::Result<bool> {
 }
 
 fn link_row(o: &Ops<'_>, link: Link, b: Base) -> Res {
+    // Checked when the operation started too; other operations ran since.
+    if let Some(parent) = b.parent {
+        need(o.synced_get(parent)?.is_some())?;
+    }
     match link {
         Link::New => {
             o.synced_insert(&b)?;
@@ -1439,5 +1739,189 @@ mod tests {
             assert_eq!(Pending::decode(&p.encode()), Some(p));
         }
         assert_eq!(Pending::decode("something else"), None);
+    }
+
+    fn local(id: u128, parent: Option<u128>, name: &str, kind: LocalKind) -> LocalRow {
+        LocalRow {
+            file_id: id,
+            parent_id: parent,
+            name: name.into(),
+            name_lossy: false,
+            kind,
+            size: 1,
+            mtime: 1,
+            attributes: 0,
+            reparse_tag: 0,
+            skip: oneup_store::Skip::None,
+        }
+    }
+
+    fn remote(id: &str, parent: Option<&str>, name: &str, kind: Kind) -> RemoteRow {
+        RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: name.into(),
+            kind,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        }
+    }
+
+    /// Folder `x` (local 10, cloud `rx`) holding files `a.txt` (11, `ra`)
+    /// and `b.txt` (12, `rb`), all synced. Returns their Sids.
+    fn tree(store: &mut Store) -> (Sid, Sid, Sid) {
+        store
+            .write(|o| {
+                o.local_put(&local(1, None, "", LocalKind::Root))?;
+                o.local_put(&local(10, Some(1), "x", LocalKind::Folder))?;
+                o.local_put(&local(11, Some(10), "a.txt", LocalKind::File))?;
+                o.local_put(&local(12, Some(10), "b.txt", LocalKind::File))?;
+                o.upsert_item(&remote("r", None, "", Kind::Root), false)?;
+                o.upsert_item(&remote("rx", Some("r"), "x", Kind::Folder), false)?;
+                o.upsert_item(&remote("ra", Some("rx"), "a.txt", Kind::File), false)?;
+                o.upsert_item(&remote("rb", Some("rx"), "b.txt", Kind::File), false)?;
+                link_roots(o, 1, "r")?;
+                let base = |parent, name: &str, kind, l: u128, r: &str| Base {
+                    sid: 0,
+                    parent: Some(parent),
+                    name: name.into(),
+                    kind,
+                    size: 1,
+                    hash: None,
+                    local: Some(LocalId(l)),
+                    local_mtime: 1,
+                    remote: Some(RemoteId(r.into())),
+                    remote_etag: "e".into(),
+                };
+                let x = o.synced_insert(&base(ROOT, "x", NodeKind::Folder, 10, "rx"))?;
+                let a = o.synced_insert(&base(x, "a.txt", NodeKind::File, 11, "ra"))?;
+                let b = o.synced_insert(&base(x, "b.txt", NodeKind::File, 12, "rb"))?;
+                Ok((x, a, b))
+            })
+            .unwrap()
+    }
+
+    /// Whether `b` has to wait for `a` (or either runs alone).
+    fn waits(o: &Ops<'_>, a: &Op, b: &Op) -> bool {
+        let (ca, cb) = (claims_in(o, a, true).unwrap(), claims_in(o, b, true).unwrap());
+        let mut held = Held::default();
+        held.add(&ca);
+        ca.alone || cb.alone || held.conflicts(&cb)
+    }
+
+    fn lpre(id: u128) -> LocalPre {
+        LocalPre { id: LocalId(id), stamp: Some((1, 1)) }
+    }
+
+    fn rpre(id: &str) -> RemotePre {
+        RemotePre { id: RemoteId(id.into()), etag: "e".into() }
+    }
+
+    fn upload(id: u128, x: Sid, name: &str) -> Op {
+        Op::Upload {
+            local: lpre(id),
+            to: RemoteId("rx".into()),
+            parent: x,
+            name: name.into(),
+            replace: None,
+            link: Link::New,
+        }
+    }
+
+    #[test]
+    fn transfers_in_one_folder_run_together_and_wait_for_a_change_to_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (x, a, b) = tree(&mut store);
+        store
+            .read(|o| {
+                let (c, d) = (upload(13, x, "c.txt"), upload(14, x, "d.txt"));
+                assert!(!waits(o, &c, &d));
+                let replace = Op::Download {
+                    remote: rpre("ra"),
+                    to: LocalId(10),
+                    parent: x,
+                    name: "a.txt".into(),
+                    replace: Some(lpre(11)),
+                    link: Link::Existing(a),
+                };
+                assert!(!waits(o, &c, &replace));
+                let edit_b = Op::Upload {
+                    local: lpre(12),
+                    to: RemoteId("rx".into()),
+                    parent: x,
+                    name: "b.txt".into(),
+                    replace: Some(rpre("rb")),
+                    link: Link::Existing(b),
+                };
+                assert!(!waits(o, &replace, &edit_b));
+                // Moving the folder they go into: one after the other.
+                let mv = Op::MoveRemote {
+                    sid: x,
+                    remote: rpre("rx"),
+                    to: RemoteId("r".into()),
+                    parent: ROOT,
+                    name: "y".into(),
+                };
+                assert!(claims_in(o, &mv, true)?.alone);
+                assert!(waits(o, &c, &mv) && waits(o, &mv, &c));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_name_freed_and_taken_and_the_same_item_twice_keep_their_order() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (x, a, _) = tree(&mut store);
+        store
+            .read(|o| {
+                // a.txt goes, then a new a.txt arrives.
+                let recycle = Op::RecycleLocal { sid: a, local: lpre(11) };
+                let arrive = Op::Download {
+                    remote: rpre("rnew"),
+                    to: LocalId(10),
+                    parent: x,
+                    name: "A.TXT".into(),
+                    replace: None,
+                    link: Link::New,
+                };
+                assert!(!claims_in(o, &recycle, true)?.alone);
+                assert!(waits(o, &recycle, &arrive));
+                // A rename that frees b.txt, and one that takes it.
+                let free_b = Op::RenameLocal { local: lpre(12), dir: LocalId(10), name: "c.txt".into() };
+                let take_b = Op::RenameLocal { local: lpre(11), dir: LocalId(10), name: "b.txt".into() };
+                assert!(waits(o, &free_b, &take_b));
+                // Hashing a file, then uploading it.
+                assert!(waits(o, &Op::Hash(lpre(11)), &upload(11, x, "a.txt")));
+                // Unrelated names in the same folder don't wait.
+                assert!(!waits(o, &free_b, &upload(13, x, "d.txt")));
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn forgetting_or_recycling_a_folder_or_hashing_a_large_file_runs_alone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (x, a, _) = tree(&mut store);
+        store
+            .read(|o| {
+                assert!(claims_in(o, &Op::Forget(x), true)?.alone);
+                assert!(!claims_in(o, &Op::Forget(a), true)?.alone);
+                assert!(
+                    claims_in(o, &Op::RecycleLocal { sid: x, local: LocalPre { id: LocalId(10), stamp: None } }, true)?
+                        .alone
+                );
+                // Something the store doesn't have.
+                assert!(claims_in(o, &Op::Forget(999), true)?.alone);
+                // Reading a large file whole holds up everything else.
+                let size = |n| LocalPre { id: LocalId(11), stamp: Some((n, 1)) };
+                assert!(!claims_in(o, &Op::Hash(size(READ_ALONE)), true)?.alone);
+                assert!(claims_in(o, &Op::Hash(size(READ_ALONE + 1)), true)?.alone);
+                Ok(())
+            })
+            .unwrap();
     }
 }

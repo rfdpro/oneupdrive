@@ -1312,6 +1312,7 @@ dependencies = [
 name = "oneup-exec"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "oneup-cfapi",
  "oneup-effects",
  "oneup-exec",

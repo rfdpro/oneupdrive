@@ -576,6 +576,7 @@ impl Engine {
             None => crate::vaultpair::PairCloud::Plain(plain),
         };
         let exec = Executor::new(fs, cloud, rules.clone());
+        exec.set_parallel(oneup_exec::Parallel::for_profile(&memory));
         Self {
             exec,
             graph,
@@ -2243,14 +2244,14 @@ fn skip_label(s: Skip) -> &'static str {
     }
 }
 
-/// Prints each operation with its outcome, and returns the activity-log
-/// entries for them. `planned` is the approved list in order, described
-/// before it ran (afterwards a recycled item has no path). The executor
-/// runs operations in that order and puts each in exactly one of the
-/// report's lists, keeping the order, so one merge pass pairs them up.
 /// How an upload done as a server-side copy is described.
 const COPIED: &str = "OneDrive already had this content, so it copied it there: nothing was sent";
 
+/// Prints each operation with its outcome, and returns the activity-log
+/// entries for them. `planned` is the approved list in order, described
+/// before it ran (afterwards a recycled item has no path). The executor
+/// puts each operation in exactly one of the report's lists, in that order
+/// whatever order they ran in, so one merge pass pairs them up.
 fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntry> {
     let mut log = Vec::new();
     if r.done.is_empty() && r.skipped.is_empty() && r.failed.is_empty() {

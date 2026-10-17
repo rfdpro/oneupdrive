@@ -299,6 +299,13 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         }
     }
 
+    /// One operation at a time: a new file's storage folder is found or
+    /// made in several requests, which two uploads into one folder could
+    /// interleave.
+    fn concurrent(&self) -> bool {
+        false
+    }
+
     fn can_copy(&self) -> bool {
         false
     }

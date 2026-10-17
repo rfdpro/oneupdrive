@@ -274,7 +274,7 @@ impl Op {
 
     /// Everything the operation is about, for "one operation per item per
     /// round".
-    pub(crate) fn subjects(&self) -> (Option<Sid>, Option<LocalId>, Option<RemoteId>) {
+    pub fn subjects(&self) -> (Option<Sid>, Option<LocalId>, Option<RemoteId>) {
         let l = |p: &LocalPre| Some(p.id);
         let r = |p: &RemotePre| Some(p.id.clone());
         let link = |k: &Link| match k {
