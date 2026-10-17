@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oneup_effects::LocalFs;
-use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, link_roots};
+use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, VersionMark, link_roots};
 use oneup_gate::{Choice, Context, Decision, Overflow, OverflowOutcome, Policy, review_in};
 use oneup_local::observe::Observer;
 use oneup_local::{Config, Scan};
@@ -56,6 +56,14 @@ struct State {
     /// The next folder listing first moves this item into that folder (a
     /// user on the web, while a large folder is being moved).
     wander: Option<(String, String)>,
+    /// The next replacing upload commits over this edit, made in OneDrive
+    /// after the upload's last check (Graph checks an upload session's
+    /// If-Match only when it starts).
+    race: Option<Vec<u8>>,
+    /// The version history: content by eTag, and the version each file's
+    /// last replacing upload went over.
+    old: BTreeMap<u64, Vec<u8>>,
+    replaced: BTreeMap<String, u64>,
 }
 
 impl State {
@@ -138,10 +146,13 @@ impl Fake {
         s.create(&parent, &name, content.is_none(), content.unwrap_or_default().to_vec())
     }
     fn edit(&self, path: &str, content: &[u8]) {
+        let id = resolve(&self.0.lock().unwrap(), path);
+        self.edit_id(&id, content);
+    }
+    fn edit_id(&self, id: &str, content: &[u8]) {
         let mut s = self.0.lock().unwrap();
-        let id = resolve(&s, path);
         let etag = s.bump();
-        let it = s.items.get_mut(&id).unwrap();
+        let it = s.items.get_mut(id).unwrap();
         let old = std::mem::replace(&mut it.content, content.to_vec());
         it.etag = etag;
         s.kept.push(old);
@@ -266,11 +277,19 @@ impl Cloud for Fake {
         let id = match replace {
             Some(pre) => {
                 s.check(pre)?;
+                if let Some(theirs) = s.race.take() {
+                    drop(s);
+                    self.edit_id(&pre.id.0, &theirs);
+                    s = self.0.lock().unwrap();
+                }
                 let etag = s.bump();
                 let it = s.items.get_mut(&pre.id.0).unwrap();
+                let over = it.etag;
                 let old = std::mem::replace(&mut it.content, content);
                 it.etag = etag;
-                s.kept.push(old);
+                s.kept.push(old.clone());
+                s.old.insert(over, old);
+                s.replaced.insert(pre.id.0.clone(), over);
                 pre.id.0.clone()
             }
             None => {
@@ -344,6 +363,31 @@ impl Cloud for Fake {
     async fn item(&self, id: &RemoteId) -> Result<Option<RemoteRow>, CloudError> {
         let s = self.0.lock().unwrap();
         Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
+    }
+
+    /// Every replacement is checked afterwards, as a large one over Graph.
+    async fn version_mark(&self, pre: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
+        let s = self.0.lock().unwrap();
+        let it = s.check(pre)?;
+        Ok(Some(VersionMark { id: it.etag.to_string(), modified_ms: None, size: Some(it.content.len() as i64) }))
+    }
+
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+        let s = self.0.lock().unwrap();
+        let over = s.replaced.get(&id.0).filter(|e| e.to_string() != mark.id);
+        Ok(over.map(|e| VersionMark { id: e.to_string(), modified_ms: None, size: Some(s.old[e].len() as i64) }))
+    }
+
+    async fn download_version(
+        &self,
+        _: &RemoteId,
+        version: &str,
+        out: &mut (dyn Write + Send),
+    ) -> Result<u64, CloudError> {
+        let content = self.0.lock().unwrap().old.get(&version.parse().unwrap()).cloned();
+        let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
+        out.write_all(&content)?;
+        Ok(content.len() as u64)
     }
 
     /// Three at a time, so a folder takes several listings.
@@ -823,6 +867,39 @@ async fn changes_on_both_sides_propagate_and_removals_are_recoverable() {
     assert!(s.versions().contains(&b"cloud c".to_vec()));
     // The cloud kept the old version of the edited file.
     assert!(cloud.holds(b"v1"));
+}
+
+/// Graph checks a large upload's If-Match only when its session starts,
+/// and the upload re-checks the eTag just before it commits. An edit that
+/// lands in OneDrive between the two is gone over: it is kept as a
+/// conflict copy, not only in the file's version history.
+#[tokio::test]
+async fn an_edit_in_onedrive_that_an_upload_went_over_is_kept_as_a_copy() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    let mut kept = Vec::new();
+    for _ in 0..5 {
+        kept.extend(s.round().await.kept_theirs.into_iter().map(|(_, name)| name));
+        if !kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(kept, ["notes (conflict 1).txt"]);
+    s.settle().await;
+    for t in [local_tree(&s.dir.0), cloud.tree()] {
+        assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]));
+        assert_eq!(t["/notes (conflict 1).txt"].as_deref(), Some(&b"theirs"[..]));
+        assert_eq!(t.len(), 2, "{:?}", names(&t));
+    }
+    // Without a race, a replacement keeps nothing extra.
+    write(&s.p("notes.txt"), b"mine, again");
+    s.settle().await;
+    assert_eq!(cloud.tree().len(), 2);
 }
 
 /// Server-side copy: a new local file whose content OneDrive

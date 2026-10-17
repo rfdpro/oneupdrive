@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError};
+use oneup_exec::{Cloud, CloudError, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::key::Masterkey;
@@ -116,6 +116,16 @@ impl Cloud for Fake {
             None => s.create(&parent.0, name, false, content)?,
         };
         Ok((s.row(&id), None))
+    }
+    // Replacements here commit under their precondition.
+    async fn version_mark(&self, _: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
+        Ok(None)
+    }
+    async fn replaced_other(&self, _: &RemoteId, _: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+        Ok(None)
+    }
+    async fn download_version(&self, _: &RemoteId, _: &str, _: &mut (dyn Write + Send)) -> Result<u64, CloudError> {
+        Err(CloudError::Other("no version history".into()))
     }
     async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
         let s = self.0.lock().unwrap();

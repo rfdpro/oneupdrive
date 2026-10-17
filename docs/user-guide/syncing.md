@@ -130,6 +130,7 @@ A **safety stop** (see below) doesn't end `oneupd`: it changes nothing and waits
 
 ## Nothing is lost
 * **Edited on both sides?** You get both. Your PC's copy is renamed to `name (conflict 1).ext` and uploaded, and the OneDrive version keeps the original name.
+  * If the OneDrive edit lands in the last moment of a large upload from your PC, your PC's version keeps the original name instead and the OneDrive version arrives as `name (conflict 1).ext`. The activity log says so.
 * **Deleted on your PC?** The OneDrive copy goes to OneDrive's recycle bin, where you can restore it from the website.
 * **Deleted in OneDrive?** Your PC's copy is moved into the hidden `.oneup\versions` folder inside your synced folder, with a note of where it came from. (If that would make the folder too big, you're asked first: see [When the version store is full](#when-the-version-store-is-full).)
 * **Replaced by a newer version from OneDrive?** Your PC gets the new version. The old one isn't kept on your PC, because OneDrive keeps it in the file's **version history** (on the website: right-click the file, *Version history*). This only happens when you hadn't changed the file on your PC; if you had, you get both copies (see above). Before the old copy is removed, OneUpDrive reads it to make sure it really is the version OneDrive has. If it isn't, it's kept in `.oneup\versions` instead. To keep old versions on your PC as well, run `oneup versions --set-keep-replaced on`.

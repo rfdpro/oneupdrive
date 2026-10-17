@@ -26,7 +26,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError};
+use oneup_exec::{Cloud, CloudError, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::content::{Decryptor, Encryptor, encrypted_size};
@@ -414,6 +414,34 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
     /// parts here (the move is reported as failed).
     async fn children(&self, _: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
         Err(CloudError::Other("a vault folder can't be moved in parts".into()))
+    }
+
+    // OneDrive versions the encrypted contents; these address them.
+
+    async fn version_mark(&self, pre: &RemotePre, size: i64) -> Result<Option<VersionMark>, CloudError> {
+        let content = self.node(&pre.id.0)?.content.ok_or(CloudError::Changed)?;
+        let enc = i64::try_from(encrypted_size(u64::try_from(size).map_err(other)?)).map_err(other)?;
+        self.inner.version_mark(&RemotePre { id: RemoteId(content), etag: pre.etag.clone() }, enc).await
+    }
+
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+        let content = self.node(&id.0)?.content.ok_or(CloudError::Changed)?;
+        // Its size is the encrypted file's; decrypting checks the content.
+        Ok(self.inner.replaced_other(&RemoteId(content), mark).await?.map(|v| VersionMark { size: None, ..v }))
+    }
+
+    async fn download_version(
+        &self,
+        id: &RemoteId,
+        version: &str,
+        out: &mut (dyn Write + Send),
+    ) -> Result<u64, CloudError> {
+        let content = self.node(&id.0)?.content.ok_or(CloudError::Changed)?;
+        let mut got = Decryptor::new(&self.vault.key, out);
+        self.inner.download_version(&RemoteId(content), version, &mut got).await?;
+        // Checks the last chunk; nothing unauthenticated was passed on.
+        let (n, _) = got.finish().map_err(|e| CloudError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(n)
     }
 }
 

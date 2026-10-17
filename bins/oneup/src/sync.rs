@@ -2111,6 +2111,10 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
             } else if r.copied.contains(op) {
                 println!("  ok    {line}  ({COPIED})");
                 entry(line, ActivityOutcome::Done, Some(COPIED.into()));
+            } else if let Some((_, copy)) = r.kept_theirs.iter().find(|(o, _)| o == op) {
+                let why = format!("it changed in OneDrive during the upload; that version is kept as {copy}");
+                println!("  ok    {line}  ({why})");
+                entry(line, ActivityOutcome::Done, Some(why));
             } else if !matches!(op, Op::Record(_) | Op::Forget(_)) {
                 println!("  ok    {line}");
                 if !quiet(op) {

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, bail};
-use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone};
+use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone, VersionMark};
 use oneup_graph::Graph;
 use oneup_store::{RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
@@ -383,6 +383,32 @@ impl Cloud for PairCloud {
         match self {
             PairCloud::Plain(c) => c.upload(parent, name, replace, size, src).await,
             PairCloud::Vault(c) => c.upload(parent, name, replace, size, src).await,
+        }
+    }
+
+    async fn version_mark(&self, pre: &RemotePre, size: i64) -> Result<Option<VersionMark>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.version_mark(pre, size).await,
+            PairCloud::Vault(c) => c.version_mark(pre, size).await,
+        }
+    }
+
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.replaced_other(id, mark).await,
+            PairCloud::Vault(c) => c.replaced_other(id, mark).await,
+        }
+    }
+
+    async fn download_version(
+        &self,
+        id: &RemoteId,
+        version: &str,
+        out: &mut (dyn std::io::Write + Send),
+    ) -> Result<u64, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.download_version(id, version, out).await,
+            PairCloud::Vault(c) => c.download_version(id, version, out).await,
         }
     }
 

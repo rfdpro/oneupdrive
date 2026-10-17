@@ -319,7 +319,9 @@ impl Graph {
     }
 
     /// Starts an upload session (see [`Graph::upload_small`] for the
-    /// conditions) and returns its pre-authenticated upload URL.
+    /// conditions) and returns its pre-authenticated upload URL. Graph
+    /// checks `If-Match` here only, not when the last fragment commits the
+    /// upload: a replacing upload re-checks the eTag itself before then.
     pub async fn upload_session(&self, parent: &str, name: &str, replace: Option<(&str, &str)>) -> Result<String> {
         let (url, behavior) = match replace {
             Some((id, _)) => (format!("{}/items/{}/createUploadSession", self.drive_url(), encode_id(id)), "replace"),
@@ -522,6 +524,18 @@ impl Graph {
             url: format!("{}/items/{}", self.drive, encode_id(id)),
             if_match: Some(etag.to_string()),
             body: None,
+        }
+    }
+
+    /// Where an upload session stands: the first byte it still expects.
+    /// `None` if it takes no more (it expired, was cancelled or completed):
+    /// Graph answers 404 for a session that is gone.
+    pub async fn upload_status(&self, upload_url: &str) -> Result<Option<u64>> {
+        let req = Req { auth: false, label: Some("upload session"), ..Req::new(reqwest::Method::GET, upload_url) };
+        match self.send(&req).await {
+            Ok((_, body)) => Ok(next_expected(&serde_json::from_slice(&body)?)),
+            Err(e) if e.status() == Some(404) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -990,6 +1004,14 @@ impl Graph {
     }
 }
 
+/// The first byte an upload session's status still expects: the start of
+/// its first `nextExpectedRanges` entry (`"start-end"` or `"start-"`).
+/// `None` if it expects nothing more.
+fn next_expected(status: &serde_json::Value) -> Option<u64> {
+    let ranges = status.get("nextExpectedRanges")?.as_array()?;
+    ranges.iter().filter_map(|r| r.as_str()?.split('-').next()?.trim().parse().ok()).min()
+}
+
 /// An integer header value (e.g. `Retry-After: 30`, `RateLimit-Remaining: 12`).
 fn header_u64(h: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
     h.get(name)?.to_str().ok()?.trim().parse().ok()
@@ -1123,6 +1145,15 @@ Content-Length: 50000000
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn an_upload_sessions_status_says_where_to_go_on() {
+        let s = |v: serde_json::Value| next_expected(&v);
+        assert_eq!(s(serde_json::json!({ "nextExpectedRanges": ["655360-"] })), Some(655_360));
+        assert_eq!(s(serde_json::json!({ "nextExpectedRanges": ["12345-55232", "77829-99375"] })), Some(12_345));
+        assert_eq!(s(serde_json::json!({ "nextExpectedRanges": [] })), None);
+        assert_eq!(s(serde_json::json!({ "expirationDateTime": "2026-10-16T00:00:00Z" })), None);
     }
 
     #[test]

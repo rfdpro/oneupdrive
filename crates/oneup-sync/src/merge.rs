@@ -117,7 +117,7 @@ fn unstaged(name: &str) -> Option<&str> {
 
 /// `name (conflict N).ext`, with N chosen so the folded result isn't in
 /// `taken` (which it then joins).
-pub(crate) fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -> String {
+pub fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -> String {
     let (stem, ext) = match (kind, name.rfind('.')) {
         // A leading dot (".gitignore") is part of the stem, not an extension.
         (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
