@@ -118,7 +118,9 @@ impl Links {
 
     /// `id`'s link if one read ahead is still fresh, taken out; else
     /// whether it's being read; else a batch reserved to read it with the
-    /// coming ones. One step, so two callers never both read it.
+    /// coming ones, as many as the room left under [`LINKS_AHEAD`] (just
+    /// it, when two batches are being read or there's no room). One step,
+    /// so two callers never both read it.
     fn claim(&mut self, id: &str, now: Instant) -> Took {
         self.purge(now);
         if let Some((info, _)) = self.got.remove(id) {
@@ -127,7 +129,13 @@ impl Links {
         if self.reading.contains(id) {
             return Took::Reading;
         }
-        Took::Batch(self.batch_for(Some(id), BATCH_MAX))
+        let room = if self.batches >= 2 { 0 } else { self.room() };
+        Took::Batch(self.batch_for(Some(id), room.clamp(1, BATCH_MAX)))
+    }
+
+    /// How many more links may be in hand or being read.
+    fn room(&self) -> usize {
+        LINKS_AHEAD.saturating_sub(self.got.len() + self.reading.len())
     }
 
     /// The coming downloads to read ahead now, reserved (empty: none):
@@ -137,7 +145,7 @@ impl Links {
     /// then rarely wait for one.
     fn refill(&mut self, now: Instant) -> Vec<String> {
         self.purge(now);
-        let room = LINKS_AHEAD.saturating_sub(self.got.len() + self.reading.len());
+        let room = self.room();
         if self.ahead.is_empty() || self.batches >= 2 || room == 0 {
             return Vec::new();
         }
@@ -1205,6 +1213,27 @@ mod tests {
         assert_eq!(l.refill(now).len(), 5, "only the room left under the limit");
         assert!(matches!(l.claim("i1", now), Took::Link(i) if i.id == "i1"));
         assert!(matches!(l.claim("i1", now), Took::Batch(ids) if ids[0] == "i1"), "taken once: read again");
+    }
+
+    #[test]
+    fn a_missing_link_keeps_to_the_bounds_too() {
+        let mut l = Links::default();
+        let now = Instant::now();
+        l.announce((0..100).map(|k| format!("i{k}")), now);
+        let (a, b) = (l.refill(now), l.refill(now));
+        assert_eq!((a.len(), b.len(), l.batches), (BATCH_MAX, BATCH_MAX, 2));
+        assert!(l.refill(now).is_empty());
+        // Two batches are being read: a download whose link isn't among
+        // them reads only its own.
+        assert!(matches!(l.claim("x", now), Took::Batch(ids) if ids == ["x"]));
+        l.finish(&a);
+        l.finish(&b);
+        l.finish(&["x".to_string()]);
+        // Room for 5 more under the limit: it and 4 coming ones.
+        for k in 0..LINKS_AHEAD - 5 {
+            l.keep(format!("h{k}"), info("h"), now);
+        }
+        assert!(matches!(l.claim("y", now), Took::Batch(ids) if ids.len() == 5 && ids[0] == "y"));
     }
 
     #[test]
