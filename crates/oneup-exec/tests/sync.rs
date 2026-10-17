@@ -2980,7 +2980,7 @@ async fn a_new_folders_contents_past_the_budget_wait_for_the_next_round() {
 /// A synced file moved into a new folder: the move is planned where the
 /// file was (the planner decides a Synced item in its agreed folder), so
 /// it goes through a round's own review, never in with the new folder's
-/// contents (which `oneup_gate::may_follow` would refuse anyway). It lands,
+/// contents (`oneup_gate::may_follow` refuses a move there). It lands,
 /// as a move, and nothing else changes.
 #[tokio::test]
 async fn a_move_into_a_new_folder_waits_for_the_next_rounds_review() {

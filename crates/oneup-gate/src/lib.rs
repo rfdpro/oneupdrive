@@ -107,8 +107,10 @@ pub fn is_mass_sensitive(op: &Op) -> bool {
 
 /// Whether a plan for the contents of folders a round has just made may
 /// run in that round (`oneup_exec::Executor::run_following`): only if
-/// nothing in it is [`is_mass_sensitive`]. A new folder's contents are new
-/// items; a plan that removes, replaces or moves anything is left whole to
+/// nothing in it is [`is_mass_sensitive`]. A new folder's contents are
+/// mostly new items, but not always (a one-way pair joining two new
+/// folders of the same name replaces OneDrive's differing files with this
+/// PC's); a plan that removes, replaces or moves anything is left whole to
 /// the next round, where the circuit breakers, the content guard and the
 /// version store's room weigh it with everything else.
 pub fn may_follow(ops: &[Op]) -> bool {
