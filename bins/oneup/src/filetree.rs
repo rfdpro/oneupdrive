@@ -62,7 +62,8 @@ fn rules_at(data_dir: &Path, store: &Store, parts: &[&str]) -> Result<(RuleSet, 
             let _ = crate::rulefiles::add(&mut set, &mut verifier, &parts[..i].join("/"), &f);
         }
         let Some(part) = parts.get(i) else { break };
-        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| c.name.eq_ignore_ascii_case(part));
+        let part = oneup_sync::fold(part);
+        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| oneup_sync::fold(&c.name) == part);
     }
     Ok((set, row))
 }
@@ -74,8 +75,9 @@ fn remote_at(store: &Store, parts: &[&str]) -> Result<Option<String>> {
         return Ok(None);
     };
     for part in parts {
+        let part = oneup_sync::fold(part);
         let next = store.read(|o| o.remote_children(&cur.0))?.into_iter().find_map(|(r, excluded)| {
-            (r.kind == Kind::Folder && !excluded && r.name.eq_ignore_ascii_case(part)).then_some(r.id)
+            (r.kind == Kind::Folder && !excluded && oneup_sync::fold(&r.name) == part).then_some(r.id)
         });
         match next {
             Some(id) => cur = oneup_sync::RemoteId(id),
@@ -136,6 +138,15 @@ fn placement(path: &Path) -> Option<&'static str> {
 /// An item on this PC, in OneDrive (with its excluded flag), or both.
 type Both = (Option<LocalRow>, Option<(RemoteRow, bool)>);
 
+/// The first row for folded name `key` whose side isn't `taken` yet.
+fn free_slot<V>(rows: &BTreeMap<(String, usize), V>, key: String, taken: impl Fn(&V) -> bool) -> (String, usize) {
+    let mut n = 0;
+    while rows.get(&(key.clone(), n)).is_some_and(&taken) {
+        n += 1;
+    }
+    (key, n)
+}
+
 /// The pair's folders and modes.
 pub fn pair_info(store: &Store) -> Result<(PathBuf, String, bool)> {
     let pair = crate::sync::pairing(store)?;
@@ -170,17 +181,18 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
         Some(id) => store.read(|o| o.remote_children(&id))?,
         None => Vec::new(),
     };
-    // Merged by name, as Windows and OneDrive compare names.
-    let mut by_name: BTreeMap<String, Both> = BTreeMap::new();
+    // Merged by name, as Windows and OneDrive compare names. Two names on
+    // one side that fold alike (OneDrive may keep both) each get a row.
+    let mut by_name: BTreeMap<(String, usize), Both> = BTreeMap::new();
     for l in locals {
         if parts.is_empty() && l.name.eq_ignore_ascii_case(ENGINE_DIR) {
             continue;
         }
-        let key = oneup_sync::fold(&l.name);
+        let key = free_slot(&by_name, oneup_sync::fold(&l.name), |b| b.0.is_some());
         by_name.entry(key).or_default().0 = Some(l);
     }
     for r in remotes {
-        let key = oneup_sync::fold(&r.0.name);
+        let key = free_slot(&by_name, oneup_sync::fold(&r.0.name), |b| b.1.is_some());
         by_name.entry(key).or_default().1 = Some(r);
     }
     let total = by_name.len();
@@ -476,5 +488,22 @@ mod tests {
         assert!(r.verdict("x/[draft].docx", false).is_excluded());
         assert!(!r.verdict("x/d.docx", false).is_excluded());
         assert_eq!(super::clean("/a//b/./"), "a/b");
+    }
+
+    #[test]
+    fn names_that_fold_alike_on_one_side_each_get_a_row() {
+        use std::collections::BTreeMap;
+        type Pair<'a> = (Option<&'a str>, Option<&'a str>);
+        let mut rows: BTreeMap<(String, usize), Pair> = BTreeMap::new();
+        for name in ["λογος", "ΛΟΓΟΣ"] {
+            let key = super::free_slot(&rows, oneup_sync::fold(name), |b| b.0.is_some());
+            rows.entry(key).or_default().0 = Some(name);
+        }
+        for name in ["λογοσ", "λογος"] {
+            let key = super::free_slot(&rows, oneup_sync::fold(name), |b| b.1.is_some());
+            rows.entry(key).or_default().1 = Some(name);
+        }
+        let got: Vec<_> = rows.into_values().collect();
+        assert_eq!(got, [(Some("λογος"), Some("λογοσ")), (Some("ΛΟΓΟΣ"), Some("λογος"))]);
     }
 }

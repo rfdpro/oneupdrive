@@ -553,7 +553,7 @@ pub async fn add(
         bail!("give the main data folder, not a vault pair's");
     }
     let remote = remote_path(remote)?;
-    if list(main).iter().any(|e| e.remote.eq_ignore_ascii_case(&remote)) {
+    if list(main).iter().any(|e| oneup_sync::fold(&e.remote) == oneup_sync::fold(&remote)) {
         bail!("the vault at {remote} is already paired");
     }
 
