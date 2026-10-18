@@ -780,6 +780,9 @@ struct Sync {
     follow: bool,
     /// At most this many operations taken in for new folders per round.
     follow_max: usize,
+    /// Added to the next round's plan, as the agent adds the renames the
+    /// user chose (`oneup_exec::resolve`).
+    extra: Vec<Op>,
 }
 
 impl Sync {
@@ -833,6 +836,7 @@ impl Sync {
             pull: false,
             follow: true,
             follow_max: oneup_exec::FOLLOW_MAX,
+            extra: Vec::new(),
         }
     }
 
@@ -862,6 +866,7 @@ impl Sync {
             pull,
             follow,
             follow_max,
+            extra,
         } = self;
         drop((obs, exec));
         let store = Store::open(&db.as_ref().expect("restart needs a database on disk").0, 4096).unwrap();
@@ -881,6 +886,7 @@ impl Sync {
             pull,
             follow,
             follow_max,
+            extra,
         }
     }
 
@@ -906,6 +912,7 @@ impl Sync {
         self.obs.catch_up().unwrap();
         // Reading OneDrive's changes is a request too (the delta listing).
         self.cloud.request().await;
+        let extra = std::mem::take(&mut self.extra);
         let store = self.obs.store_mut();
         self.cloud.pull(store);
         // Only the folders the store marked dirty are planned, as the
@@ -914,13 +921,14 @@ impl Sync {
         let all = fingerprint != self.planned_rules;
         let rules = &self.rules;
         let pull = self.pull;
-        let (scope, ops) = store
+        let (scope, mut ops) = store
             .read(|o| {
                 let scope = o.dirty_scope()?;
                 let folders = if all { all_folders(&Parked::with_rules(o, rules))? } else { scope.folders.clone() };
                 Ok((scope, plan_in(o, rules, pull, folders)?))
             })
             .unwrap();
+        ops.extend(extra);
         let cx = Context { room: self.room, decisions: &self.decisions, ..Context::default() };
         let r = review_in(&self.policy, &cx, ops);
         assert!(r.breakers.is_empty(), "{:?}", r.breakers);
@@ -3489,4 +3497,264 @@ async fn on_demand_new_folder_trees_arrive_in_one_round() {
     assert!(problems.is_empty(), "{problems:?}");
     drop(s);
     drop(od);
+}
+
+// ------------------------------------------------- held items: the user's answers
+//
+// What `oneup unsynced resolve` does for items sync holds
+// (`oneup_exec::resolve`): the choice only changes what the planner reads,
+// and what follows runs through the gate and the executor like any change.
+
+use oneup_exec::resolve::{Change, Refused};
+use oneup_sync::LocalId;
+
+impl Fake {
+    /// Removes `path` and everything in it without delta telling of it:
+    /// gone from OneDrive with no evidence the mirror could see (as after a
+    /// mirror rebuild that doesn't find it). The content is kept, as
+    /// OneDrive's recycle bin would.
+    fn lose(&self, path: &str) {
+        let mut s = self.0.lock().unwrap();
+        let mut gone = vec![resolve(&s, path)];
+        let mut i = 0;
+        while i < gone.len() {
+            let p = gone[i].clone();
+            gone.extend(s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)).map(|(id, _)| id.clone()));
+            i += 1;
+        }
+        for id in gone {
+            if let Some(it) = s.items.remove(&id) {
+                s.kept.push(it.content);
+            }
+        }
+    }
+}
+
+impl Sync {
+    /// Forgets the mirror, as a rebuild does: the next round lists OneDrive
+    /// again, and what it no longer has reads as missing, not deleted.
+    fn rebuild_mirror(&mut self) {
+        self.obs.store_mut().write(|o| o.clear_remote()).unwrap();
+    }
+
+    /// The Synced record named `name` (unique in these tests).
+    fn sid(&self, name: &str) -> oneup_sync::Sid {
+        let all = self.obs.store().read(|o| o.synced_all()).unwrap();
+        all.into_iter().find(|b| b.name == name).unwrap_or_else(|| panic!("no record {name}")).sid
+    }
+
+    /// The local item at `rel`.
+    fn local_id(&self, rel: &str) -> LocalId {
+        self.obs
+            .store()
+            .read(|o| {
+                let mut cur = o.local_root()?.unwrap().root_file_id;
+                for part in rel.split('/') {
+                    cur = o.local_named(cur, part)?.into_iter().find(|n| n.name == part).unwrap().file_id;
+                }
+                Ok(LocalId(cur))
+            })
+            .unwrap()
+    }
+
+    /// Carries out the user's choice: works it out from the store and the
+    /// folder as they are now, then writes it (a rename joins the next
+    /// round). Returns how many items it concerns.
+    fn choose(
+        &mut self,
+        f: impl FnOnce(&oneup_store::Ops<'_>, &dyn Fn(LocalId) -> bool) -> oneup_exec::resolve::Result<Change>,
+    ) -> Result<usize, Refused> {
+        let Self { obs, exec, extra, .. } = self;
+        let fs = exec.local();
+        let present = |id| fs.is_present(id);
+        let done = obs.store_mut().try_write(|o| -> oneup_exec::resolve::Result<(usize, Option<Op>)> {
+            let c = f(o, &present)?;
+            let n = c.items();
+            Ok((n, c.commit(o)?))
+        });
+        match done {
+            Ok((n, op)) => {
+                extra.extend(op);
+                Ok(n)
+            }
+            Err(oneup_exec::resolve::Error::Refused(r)) => Err(r),
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// Items gone from this PC without a recorded deletion are held. Choosing
+/// "delete in OneDrive" for them (a folder with what's in it) deletes them
+/// there, into its recycle bin; their folder and what's still here stay.
+/// An item still here can't be chosen, nor restored into a folder that's
+/// gone too.
+#[tokio::test]
+async fn held_items_gone_from_this_pc_are_deleted_in_onedrive_when_chosen() {
+    use oneup_exec::resolve::{delete_there, restore};
+    let cloud = Fake::new();
+    let mut s = Sync::new("resolve-delete-there", cloud.clone());
+    let b = bin("resolve-delete-there");
+    write(&s.p("docs/a.txt"), b"alpha");
+    write(&s.p("docs/old/b.txt"), b"bravo");
+    write(&s.p("docs/old/deep/c.txt"), b"charlie");
+    write(&s.p("docs/keep.txt"), b"keep");
+    s.settle().await;
+
+    std::fs::rename(s.p("docs/a.txt"), b.0.join("a.txt")).unwrap();
+    std::fs::rename(s.p("docs/old"), b.0.join("old")).unwrap();
+    s.rounds(2).await;
+    assert!(cloud.tree().contains_key("/docs/old/deep/c.txt"), "held, not deleted on a guess");
+
+    let (keep, c) = (s.sid("keep.txt"), s.sid("c.txt"));
+    assert_eq!(s.choose(|o, p| delete_there(o, keep, p)), Err(Refused::Here));
+    assert_eq!(s.choose(|o, p| restore(o, c, p)), Err(Refused::FolderGoneHere));
+    let (a, old) = (s.sid("a.txt"), s.sid("old"));
+    assert_eq!(s.choose(|o, p| delete_there(o, a, p)), Ok(1));
+    assert_eq!(s.choose(|o, p| delete_there(o, old, p)), Ok(4));
+    s.settle().await;
+    assert_eq!(names(&cloud.tree()), BTreeSet::from(["/docs", "/docs/keep.txt"]));
+    assert!(cloud.holds(b"alpha") && cloud.holds(b"bravo") && cloud.holds(b"charlie"));
+    assert_eq!(s.choose(|o, p| delete_there(o, a, p)), Err(Refused::NotSynced));
+}
+
+/// A held item edited in OneDrive since it last synced isn't deleted there
+/// when that's chosen: the edit wins over the deletion, as anywhere else,
+/// and the file comes back here.
+#[tokio::test]
+async fn a_chosen_deletion_in_onedrive_gives_way_to_an_edit_made_there() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("resolve-edit-wins", cloud.clone());
+    let b = bin("resolve-edit-wins");
+    write(&s.p("a.txt"), b"first");
+    s.settle().await;
+    std::fs::rename(s.p("a.txt"), b.0.join("a.txt")).unwrap();
+    s.rounds(2).await;
+    cloud.edit("a.txt", b"edited in OneDrive");
+
+    let a = s.sid("a.txt");
+    assert_eq!(s.choose(|o, p| oneup_exec::resolve::delete_there(o, a, p)), Ok(1));
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("a.txt")).unwrap(), b"edited in OneDrive");
+    assert_eq!(cloud.tree()["/a.txt"].as_deref(), Some(&b"edited in OneDrive"[..]));
+}
+
+/// "Restore" brings a held item back from OneDrive, a folder with
+/// everything in it, sending nothing.
+#[tokio::test]
+async fn restoring_held_items_brings_them_back_from_onedrive() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("resolve-restore", cloud.clone());
+    let b = bin("resolve-restore");
+    write(&s.p("docs/old/b.txt"), b"bravo");
+    write(&s.p("docs/old/deep/c.txt"), b"charlie");
+    write(&s.p("docs/keep.txt"), b"keep");
+    s.settle().await;
+    let (uploaded, before) = (cloud.uploaded(), cloud.tree());
+    std::fs::rename(s.p("docs/old"), b.0.join("old")).unwrap();
+    s.rounds(2).await;
+
+    let old = s.sid("old");
+    assert_eq!(s.choose(|o, p| oneup_exec::resolve::restore(o, old, p)), Ok(4));
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("docs/old/b.txt")).unwrap(), b"bravo");
+    assert_eq!(std::fs::read(s.p("docs/old/deep/c.txt")).unwrap(), b"charlie");
+    assert_eq!((cloud.uploaded(), cloud.tree()), (uploaded, before));
+}
+
+/// Items gone from OneDrive without a recorded deletion are held. "Delete
+/// here" moves one into the version store, "upload" sends one again, and a
+/// file edited here since it last synced is uploaded even though "delete
+/// here" was chosen. An item still in OneDrive can't be chosen.
+#[tokio::test]
+async fn held_items_gone_from_onedrive_are_deleted_here_or_uploaded_when_chosen() {
+    use oneup_exec::resolve::{delete_here, upload};
+    let cloud = Fake::new();
+    let mut s = Sync::new("resolve-gone-there", cloud.clone());
+    for (f, c) in [("x.txt", "x-ray"), ("y.txt", "yankee"), ("z.txt", "zulu"), ("keep.txt", "keep")] {
+        write(&s.p(f), c.as_bytes());
+    }
+    s.settle().await;
+    for f in ["x.txt", "y.txt", "z.txt"] {
+        cloud.lose(f);
+    }
+    s.rebuild_mirror();
+    s.rounds(2).await;
+    assert!(s.p("x.txt").exists() && s.p("z.txt").exists(), "held, not deleted on a guess");
+    write(&s.p("z.txt"), b"zulu, edited here");
+
+    let keep = s.sid("keep.txt");
+    assert_eq!(s.choose(|o, _| delete_here(o, keep)), Err(Refused::There));
+    let (x, y, z) = (s.sid("x.txt"), s.sid("y.txt"), s.sid("z.txt"));
+    assert_eq!(s.choose(|o, _| delete_here(o, x)), Ok(1));
+    assert_eq!(s.choose(|o, _| upload(o, y)), Ok(1));
+    assert_eq!(s.choose(|o, _| delete_here(o, z)), Ok(1));
+    s.settle().await;
+    assert!(!s.p("x.txt").exists());
+    assert!(s.versions().contains(&b"x-ray".to_vec()), "kept in the version store");
+    let t = cloud.tree();
+    assert!(!t.contains_key("/x.txt"));
+    assert_eq!(t["/y.txt"].as_deref(), Some(&b"yankee"[..]));
+    assert_eq!(t["/z.txt"].as_deref(), Some(&b"zulu, edited here"[..]));
+}
+
+/// "Rename" for an item OneDrive won't take as it's named: refused for a
+/// name Windows doesn't allow or one taken here or in OneDrive (as Windows
+/// compares names); a free name renames it here, by its ID through the
+/// gate, and it syncs. One changed after the choice is left as it is.
+#[tokio::test]
+async fn a_chosen_rename_lets_an_item_with_a_refused_name_sync() {
+    use oneup_exec::resolve::rename;
+    let cloud = Fake::new();
+    let mut s = Sync::new("resolve-rename", cloud.clone());
+    write(&s.p("_vti_notes.txt"), b"notes");
+    write(&s.p("_vti_draft.txt"), b"draft");
+    write(&s.p("taken.txt"), b"taken");
+    s.settle().await;
+    assert!(!cloud.tree().contains_key("/_vti_notes.txt"), "OneDrive refuses the name");
+    cloud.add("there.txt", Some(b"only in OneDrive so far"));
+    cloud.pull(s.obs.store_mut());
+
+    let id = s.local_id("_vti_notes.txt");
+    assert_eq!(s.choose(|o, _| rename(o, id, "TAKEN.txt")), Err(Refused::NameTaken));
+    assert_eq!(s.choose(|o, _| rename(o, id, "there.txt")), Err(Refused::NameTakenThere));
+    assert_eq!(s.choose(|o, _| rename(o, id, "a|b.txt")), Err(Refused::BadName));
+    assert_eq!(s.choose(|o, _| rename(o, id, "_vti_notes.txt")), Err(Refused::SameName));
+    assert_eq!(s.choose(|o, _| rename(o, id, "notes.txt")), Ok(1));
+    s.settle().await;
+    assert!(!s.p("_vti_notes.txt").exists());
+    assert_eq!(cloud.tree()["/notes.txt"].as_deref(), Some(&b"notes"[..]));
+
+    // Changed after it was chosen: the rename is skipped, nothing renamed.
+    let id = s.local_id("_vti_draft.txt");
+    assert_eq!(s.choose(|o, _| rename(o, id, "draft.txt")), Ok(1));
+    write(&s.p("_vti_draft.txt"), b"draft, edited");
+    let r = s.round().await;
+    let skipped =
+        r.skipped.iter().any(|(op, k)| matches!(op, Op::RenameLocal { .. }) && *k == oneup_exec::Skip::Changed);
+    assert!(skipped, "{r:?}");
+    assert!(s.p("_vti_draft.txt").exists() && !s.p("draft.txt").exists());
+}
+
+/// Deletions chosen for many held items are counted by the circuit
+/// breakers like any others: above the limit, the round stops and asks.
+#[tokio::test]
+async fn deletions_chosen_for_many_held_items_still_trip_the_circuit_breaker() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("resolve-breaker", cloud.clone());
+    let b = bin("resolve-breaker");
+    for i in 0..6 {
+        write(&s.p(&format!("big/f{i}.txt")), format!("file {i}").as_bytes());
+    }
+    s.settle().await;
+    std::fs::rename(s.p("big"), b.0.join("big")).unwrap();
+    s.rounds(2).await;
+
+    let big = s.sid("big");
+    assert_eq!(s.choose(|o, p| oneup_exec::resolve::delete_there(o, big, p)), Ok(7));
+    let ops = s.obs.store().read(|o| plan_in(o, &s.rules, false, o.dirty_scope()?.folders)).unwrap();
+    let policy = Policy { max_count: 3, ..Policy::default() };
+    let r = review_in(&policy, &Context::default(), ops);
+    assert_eq!(r.breakers.len(), 1, "{:?}", r.breakers);
+    assert!(!r.approved.iter().any(|a| matches!(a.op(), Op::DeleteRemote { .. })));
+    assert!(cloud.tree().contains_key("/big/f0.txt"));
 }
