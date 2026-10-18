@@ -324,7 +324,7 @@ const SEEN_MAX: usize = 1 << 18;
 /// of the observer (see the module docs). One per process
 /// ([`seen_deletes`]); a process without a watcher leaves it empty. File IDs
 /// belong to the volume, not the journal, so records from a journal since
-/// replaced still count: a rescan takes them all ([`SeenDeletes::take`]).
+/// replaced still count: a rescan uses them all ([`note_seen_deletes`]).
 #[derive(Debug, Default)]
 pub struct SeenDeletes {
     inner: Mutex<VecDeque<Segment>>,
@@ -383,11 +383,24 @@ impl SeenDeletes {
         }
     }
 
-    /// Takes every record held, of any journal, oldest first. The floors
-    /// stay, so a late read of the same records is still refused.
-    pub fn take(&self) -> Vec<u128> {
+    /// Every record held, of any journal, oldest first: (journal, USN, ID).
+    pub fn pending(&self) -> Vec<(u64, i64, u128)> {
+        let s = self.lock();
+        s.iter().flat_map(|g| g.ids.iter().map(|&(usn, id)| (g.journal_id, usn, id))).collect()
+    }
+
+    /// Forgets `done` (from [`SeenDeletes::pending`]) once acted on, and
+    /// whatever came before them in their journals; what the watcher added
+    /// since stays. The floors stay too, so a late read of the same records
+    /// is still refused.
+    pub fn acknowledge(&self, done: &[(u64, i64, u128)]) {
         let mut s = self.lock();
-        s.iter_mut().flat_map(|g| g.ids.drain(..).map(|(_, id)| id)).collect()
+        for g in s.iter_mut() {
+            let Some(last) = done.iter().filter(|d| d.0 == g.journal_id).map(|d| d.1).max() else { continue };
+            while g.ids.front().is_some_and(|&(usn, _)| usn <= last) {
+                g.ids.pop_front();
+            }
+        }
     }
 
     /// The IDs held from journal `journal_id`.
@@ -457,18 +470,19 @@ pub fn remember_deletes(
 }
 
 /// After a rescan: notes deletion evidence for the items `seen` holds delete
-/// records of and that the rescan didn't find, taking them all. An item it
-/// found is left alone: it's there. Only Synced items get evidence
+/// records of and that the rescan didn't find, then forgets those records
+/// (kept if the write fails, for the next rescan). An item it found is left
+/// alone: it's there. Only Synced items get evidence
 /// (`Ops::note_local_deleted`). Returns how many did.
 pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::Result<u64> {
     let Some(root) = store.read(|o| o.local_root())? else { return Ok(0) };
-    let ids = seen.take();
-    if ids.is_empty() {
+    let pending = seen.pending();
+    if pending.is_empty() {
         return Ok(0);
     }
-    store.write(|o| {
+    let noted = store.write(|o| {
         let mut noted = 0;
-        for id in ids {
+        for &(_, _, id) in &pending {
             // The root's own delete record isn't evidence for anything
             // (a rescan wouldn't have opened without it anyway).
             if id != root.root_file_id && o.local_get(id)?.is_none() && o.note_local_deleted(id)? {
@@ -476,7 +490,9 @@ pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::
             }
         }
         Ok(noted)
-    })
+    })?;
+    seen.acknowledge(&pending);
+    Ok(noted)
 }
 
 #[cfg(windows)]
@@ -829,10 +845,17 @@ mod driver {
         #[test]
         fn a_replaced_journal_is_read_from_its_oldest_record() {
             let dir = temp("other");
+            // Deleted before the tail opens, after the position it's given.
+            let f = dir.join("gone.txt");
+            std::fs::write(&f, b"x").unwrap();
+            let id = file_id(&f);
+            std::fs::remove_file(&f).unwrap();
             let now = JournalTail::open(&dir, None).unwrap().position();
-            let tail = JournalTail::open(&dir, Some((now.0.wrapping_add(1), now.1))).unwrap();
+            let mut tail = JournalTail::open(&dir, Some((now.0.wrapping_add(1), now.1))).unwrap();
             assert_eq!(tail.position().0, now.0);
-            assert!(tail.position().1 > 0 && tail.position().1 <= now.1, "{:?} {now:?}", tail.position());
+            assert!(tail.position().1 < now.1, "{:?} {now:?}", tail.position());
+            let (deleted, _) = drain(&mut tail);
+            assert!(deleted.contains(&id), "the new journal's records are read");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -1115,7 +1138,7 @@ mod tests {
         log.saw(JOURNAL - 1, 10, 4);
         assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 1);
         assert_eq!(seen(&s, 4), Seen::Deleted);
-        assert!(log.is_empty(), "taken");
+        assert!(log.is_empty(), "acted on");
     }
 
     #[test]
@@ -1170,7 +1193,12 @@ mod tests {
         log.saw(JOURNAL + 1, 150, 8);
         assert_eq!(log.len(), SEEN_MAX);
         assert_eq!(log.ids(JOURNAL + 1), [8]);
-        assert_eq!(log.take().len(), SEEN_MAX);
+        let pending = log.pending();
+        assert_eq!(pending.len(), SEEN_MAX);
+        log.saw(JOURNAL + 1, 160, 9);
+        log.acknowledge(&pending);
+        assert_eq!(log.ids(JOURNAL + 1), [9], "added after the snapshot: kept");
+        log.acknowledge(&log.pending());
         assert!(log.is_empty());
         log.saw(JOURNAL, 5, 99);
         assert!(log.is_empty(), "the positions outlive a take");

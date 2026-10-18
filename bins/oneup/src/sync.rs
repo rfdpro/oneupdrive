@@ -2013,8 +2013,18 @@ fn rescan(
     log_activity(&mut store, vec![notice(ActivityOutcome::Note, "rescan", detail)])?;
     // Changes made while the scan ran are in the journal from its start.
     let mut obs = oneup_local::observe::Observer::open(store, cfg)?;
-    obs.catch_up()?;
-    Ok(caught_up(obs, seen))
+    match obs.catch_up() {
+        Ok(_) => Ok(caught_up(obs, seen)),
+        // Lost again while the scan ran (a busy disk): the tree is the
+        // scan's, and the next look at the journal rescans again.
+        Err(oneup_local::observe::Error::NeedsRescan(
+            why @ (oneup_local::observe::Rescan::JournalWrapped | oneup_local::observe::Rescan::JournalReplaced),
+        )) => {
+            tracing::info!(%why, "the change journal lost track again during the rescan");
+            Ok(obs.into_store())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Whether a pair may be the whole drive: once sync is released
