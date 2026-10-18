@@ -173,3 +173,26 @@ async fn long_names_move_in_every_direction_and_the_vault_stays_valid() {
     assert_eq!(got, b"in");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A long-name upload whose file can't be read to the end (its program
+/// saved it meanwhile) leaves its holder folder behind; sending the file
+/// again uses that folder instead of failing on its name.
+#[tokio::test]
+async fn a_long_name_upload_cut_short_can_be_sent_again() {
+    struct CutShort;
+    impl std::io::Read for CutShort {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("changed while read"))
+        }
+    }
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = format!("{}.txt", "cut short long name ".repeat(10));
+
+    assert!(s.vc.upload(&root, &long, None, 5, &mut CutShort).await.is_err());
+    s.vc.upload(&root, &long, None, 5, &mut &b"saved"[..]).await.unwrap();
+    s.refresh().await;
+    let got = decrypted(&s.pairs, &s.vc, &s.vault.root).await;
+    assert_eq!(got.get(&format!("/{long}")), Some(&Some(b"saved".to_vec())), "{got:?}");
+}
