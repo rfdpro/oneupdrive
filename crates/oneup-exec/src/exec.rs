@@ -1334,20 +1334,29 @@ impl<C: Cloud> Executor<C> {
                     }
                 };
                 self.crash_point()?;
+                // Written after its last read: what was sent is one version,
+                // but the stamp no longer vouches for what's here, so the
+                // next round hashes the file again (a same-size write that
+                // kept the time would otherwise look synced).
+                let written = !src.unchanged();
                 drop(src);
+                let local_mtime = if written { STAMP_UNKNOWN } else { mtime };
                 store.try_write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?))?;
                 if row.qxh != Some(sent) || i64::try_from(sent_len).ok() != Some(size) || row.size != size {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }
                 store.try_write(|o| {
-                    o.local_hash_put(local.id.0, size, mtime, &sent)?;
-                    let b = file_base(*parent, name, size, sent, local.id, mtime, &row);
+                    if !written {
+                        o.local_hash_put(local.id.0, size, mtime, &sent)?;
+                    }
+                    let b = file_base(*parent, name, size, sent, local.id, local_mtime, &row);
                     link_row(o, *link, b)
                 })?;
                 // On demand: the file now is (or stays) a placeholder in sync
                 // with what was sent. Best effort: if it changed meanwhile,
                 // the next round sends it again.
                 if self.fs.on_demand()
+                    && !written
                     && let Some(mut v) = version(&row)
                 {
                     v.modified = mtime;
@@ -1831,6 +1840,10 @@ fn link_row(o: &Ops<'_>, link: Link, b: Base) -> Res {
     }
     Ok(())
 }
+
+/// A synced file's last-write time when it isn't known: no file has it,
+/// so the next round sees the file as changed and hashes it.
+const STAMP_UNKNOWN: i64 = 0;
 
 fn file_base(
     parent: Sid,

@@ -158,6 +158,35 @@ fn qxh(b: &[u8]) -> [u8; 20] {
 struct SaveDuringUpload {
     path: PathBuf,
     content: Vec<u8>,
+    /// Saved after the upload read its last byte, at the same size and
+    /// with the file's time put back, so its stamp doesn't change.
+    after_last_byte: bool,
+    /// Saved by another program (`cmd.exe`), as Files On-Demand needs.
+    by_app: bool,
+}
+
+impl SaveDuringUpload {
+    fn in_place(path: PathBuf, content: &[u8]) -> Self {
+        Self { path, content: content.to_vec(), after_last_byte: false, by_app: false }
+    }
+
+    fn save(self) {
+        if self.by_app {
+            use std::os::windows::process::CommandExt;
+            let text = String::from_utf8(self.content).unwrap();
+            let st = std::process::Command::new("cmd")
+                .raw_arg(format!("/C echo {text}>\"{}\"", self.path.display()))
+                .status();
+            assert!(st.unwrap().success(), "the save must not fail");
+            return;
+        }
+        let modified = std::fs::metadata(&self.path).unwrap().modified().unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).truncate(!self.after_last_byte).open(&self.path).unwrap();
+        f.write_all(&self.content).unwrap();
+        if self.after_last_byte {
+            f.set_modified(modified).unwrap();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -381,16 +410,18 @@ impl Fake {
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let mut content = vec![0u8; size.clamp(0, 2) as usize];
         src.read_exact(&mut content)?;
-        if let Some(save) = self.0.lock().unwrap().saved_meanwhile.take() {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .open(save.path)
-                .unwrap()
-                .write_all(&save.content)
-                .unwrap();
+        let save = self.0.lock().unwrap().saved_meanwhile.take();
+        let (now, last) = match save {
+            Some(s) if s.after_last_byte => (None, Some(s)),
+            s => (s, None),
+        };
+        if let Some(s) = now {
+            s.save();
         }
         src.read_to_end(&mut content)?;
+        if let Some(s) = last {
+            s.save();
+        }
         assert_eq!(content.len() as i64, size);
         let mut s = self.0.lock().unwrap();
         if s.full {
@@ -1438,8 +1469,7 @@ async fn a_save_during_an_upload_goes_through_and_the_saved_version_is_sent() {
     let cloud = Fake::new();
     let mut s = Sync::new("saved-meanwhile", cloud.clone());
     write(&s.p("doc.txt"), b"first version");
-    cloud.0.lock().unwrap().saved_meanwhile =
-        Some(SaveDuringUpload { path: s.p("doc.txt"), content: b"saved meanwhile".to_vec() });
+    cloud.0.lock().unwrap().saved_meanwhile = Some(SaveDuringUpload::in_place(s.p("doc.txt"), b"saved meanwhile"));
     let r = s.round().await;
     assert!(r.skipped.iter().any(|(_, k)| *k == oneup_exec::Skip::Changed), "{r:?}");
     assert!(cloud.0.lock().unwrap().saved_meanwhile.is_none(), "the upload began");
@@ -1448,6 +1478,22 @@ async fn a_save_during_an_upload_goes_through_and_the_saved_version_is_sent() {
     s.settle().await;
     assert_eq!(cloud.tree()["/doc.txt"].as_deref(), Some(&b"saved meanwhile"[..]));
     assert!(!cloud.holds(b"first version") && !cloud.holds(b"fisaved meanwhile"));
+}
+
+#[tokio::test]
+async fn a_save_after_an_uploads_last_read_that_keeps_the_stamp_is_still_sent() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("saved-after-read", cloud.clone());
+    write(&s.p("doc.txt"), b"first version!!");
+    cloud.0.lock().unwrap().saved_meanwhile = Some(SaveDuringUpload {
+        after_last_byte: true,
+        ..SaveDuringUpload::in_place(s.p("doc.txt"), b"SAVED VERSION!!")
+    });
+    s.round().await;
+    assert!(cloud.0.lock().unwrap().saved_meanwhile.is_none(), "the upload began");
+    assert_eq!(cloud.tree()["/doc.txt"].as_deref(), Some(&b"first version!!"[..]));
+    s.settle().await;
+    assert_eq!(cloud.tree()["/doc.txt"].as_deref(), Some(&b"SAVED VERSION!!"[..]));
 }
 
 #[tokio::test]
@@ -2086,6 +2132,17 @@ async fn on_demand_placeholders_follow_both_sides() {
     let sent = cloud.tree()["/b.txt"].clone().unwrap();
     assert!(String::from_utf8_lossy(&sent).contains("edited here"), "the edit was sent");
     assert!(placeholder(&pb).in_sync, "marked in sync after the upload");
+
+    // A program saves it while it's being sent: the save goes through and
+    // the saved version is sent next.
+    app_append(&pb, "edited again");
+    cloud.0.lock().unwrap().saved_meanwhile =
+        Some(SaveDuringUpload { by_app: true, ..SaveDuringUpload::in_place(pb.clone(), b"saved during the upload") });
+    s.quiesce().await;
+    assert!(cloud.0.lock().unwrap().saved_meanwhile.is_none(), "the upload began");
+    let sent = cloud.tree()["/b.txt"].clone().unwrap();
+    assert!(String::from_utf8_lossy(&sent).contains("saved during the upload"), "{:?}", String::from_utf8_lossy(&sent));
+    assert!(placeholder(&pb).in_sync);
     assert_eq!(cloud.tree()["/docs/new.txt"].as_deref(), Some(&b"made here"[..]));
     let n = placeholder(&s.p("docs").join("new.txt"));
     assert!(n.in_sync && n.on_disk == 9, "converted, content kept: {n:?}");
