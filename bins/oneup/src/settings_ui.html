@@ -724,6 +724,30 @@
             color: var(--bad);
         }
 
+        /* Sync failures: what can be done about each */
+        #ls-table td.act {
+            white-space: nowrap;
+            text-align: right;
+        }
+
+        #ls-table td.act .btn+.btn,
+        #ls-table tr.group td .btn {
+            margin-left: 6px;
+        }
+
+        #ls-table tr.group td .btn {
+            font-weight: 400;
+        }
+
+        #ls-table tr.inside td {
+            border-top: 0;
+            padding-top: 0;
+        }
+
+        #ls-table tr.inside .tag {
+            margin-left: 8px;
+        }
+
         .seg .count {
             margin-left: 6px;
             font-size: 11px;
@@ -2150,6 +2174,18 @@
             <div class="df"><span class="muted" id="rm-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rm-go">Stop syncing</button></div>
         </form>
     </dialog>
+    <dialog id="dlg-resolve">
+        <form method="dialog">
+            <div class="dh">
+                <h3 id="rs-title"></h3>
+            </div>
+            <div class="db">
+                <ul class="facts" id="rs-facts"></ul>
+                <div class="field" id="rs-name-box"><input type="text" id="rs-name" spellcheck="false" aria-label="New name"></div>
+            </div>
+            <div class="df"><span class="muted" id="rs-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rs-go"></button></div>
+        </form>
+    </dialog>
     <dialog id="dlg-recovery">
         <form method="dialog">
             <div class="dh">
@@ -2679,18 +2715,6 @@
             return r && r.local ? r.local.replace(/\\+$/, "") + rel.replace(/\//g, "\\").replace(/\\+$/, "") : null;
         }
 
-        function revealBtn(rel) {
-            const p = listPath(rel);
-            return el("td", {}, p ? el("button", {
-                className: "btn small",
-                textContent: "Show",
-                title: "Show it in File Explorer",
-                onclick: () => run(call("reveal", {
-                    path: p
-                }))
-            }) : null);
-        }
-
         // Column titles ending in a space are numbers (right-aligned).
         function setTable(head, rows) {
             $("#ls-table thead").replaceChildren(el("tr", {}, ...head.map(h => el("th", {
@@ -2739,8 +2763,7 @@
                 sum.textContent = !r.length ? "Nothing yet." : rows.length === r.length ? "" : `${n(rows.length)} of ${n(r.length)} shown.`;
                 if (r.length >= L.limit) moreBtn("Show older");
             } else if (L.tab === "unsynced") {
-                const rows = r.items.filter(i => has(i.path, i.why));
-                setTable(["Item", "Why", ""], rows.map(i => el("tr", {}, cell(i.path, null, "wrap path"), cell(i.why, i.detail), revealBtn(i.path))));
+                renderUnsynced(r, has);
                 sum.textContent = !r.items.length ? "No sync failures." :
                     `${n(r.items.length)}${r.more ? "+" : ""} items. Each is retried when it changes.`;
             } else if (L.tab === "excluded") {
@@ -2796,6 +2819,176 @@
                     (q ? ` ${n(matching)} match.` : "") + " Decide from the icon's menu." +
                     (unwritten ? ` ${n(unwritten)} more not listed (oneup sync --dry-run lists all).` : "");
                 if (matching > shown) moreBtn(`Show more (${n(shown)} of ${n(matching)})`);
+            }
+        }
+
+        // ---- sync failures: what can be done about each (`oneup unsynced
+        // resolve`, which the agent carries out in its next round)
+        const KINDS = ["gone_here", "gone_there", "not_empty", "name_clash", "invalid_name", "name_taken", "too_large", "special", "one_way"];
+        // Where a deletion goes.
+        const DELETED_TO = {
+            "delete-in-onedrive": "To OneDrive's recycle bin.",
+            "delete-here": "To kept copies on this PC (.oneup\\versions)."
+        };
+
+        // "Delete in OneDrive" -> "Delete all 18 in OneDrive".
+        function allLabel(label, n) {
+            const i = label.indexOf(" ");
+            const all = "all " + n.toLocaleString();
+            return i < 0 ? `${label} ${all}` : `${label.slice(0, i)} ${all}${label.slice(i)}`;
+        }
+
+        function smallBtn(text, onclick, cls = "") {
+            return el("button", {
+                className: "btn small " + cls,
+                textContent: text,
+                onclick
+            });
+        }
+
+        function renderUnsynced(r, has) {
+            const shown = r.items.filter(i => has(i.path, i.why));
+            const rows = [];
+            for (const kind of KINDS) {
+                const group = shown.filter(i => i.kind === kind);
+                if (!group.length) continue;
+                const head = el("td", {
+                    colSpan: 3
+                }, `${group[0].why} · ${group.length.toLocaleString()}`);
+                // All of a kind at once: only while the whole kind is shown.
+                const all = r.items.filter(i => i.kind === kind);
+                const top = all.find(i => !i.nested) || all[0];
+                if (all.length > 1 && group.length === all.length && !all.some(i => i.queued)) {
+                    for (const c of top.choices.filter(c => c.bulk)) head.append(smallBtn(allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
+                }
+                rows.push(el("tr", {
+                    className: "group"
+                }, head));
+                for (const i of group) rows.push(unsyncedRow(i));
+            }
+            setTable(["Item", "Why", ""], rows);
+        }
+
+        function unsyncedRow(i) {
+            const act = el("td", {
+                className: "act"
+            });
+            if (i.queued) act.append(el("span", {
+                className: "tag wait",
+                textContent: "Queued: " + i.queued
+            }));
+            else {
+                for (const c of i.choices) act.append(smallBtn(c.label, () => resolveAsk(c, [i], false), c.deletes ? "danger" : ""));
+                if (i.kind === "not_empty") act.append(smallBtn("Contents", e => toggleInside(e.target.closest("tr"), i)));
+            }
+            const p = i.here && listPath(i.path);
+            if (p) {
+                const show = smallBtn("Show", () => run(call("reveal", {
+                    path: p
+                })));
+                show.title = "Show it in File Explorer";
+                act.append(show);
+            }
+            return el("tr", {}, cell(i.path, null, "wrap path"), cell(i.why, i.detail), act);
+        }
+
+        // What a folder held as not empty still holds (often what the
+        // rules leave out), under its row; click again to close.
+        async function toggleInside(row, i) {
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains("inside")) return next.remove();
+            const r = await call("unsynced_inside", {
+                root: L.root,
+                path: i.path
+            }).catch(e => {
+                toast(e.message, true);
+                return null;
+            });
+            if (!r) return;
+            const list = el("div", {
+                className: "app-file-list"
+            });
+            if (!r.items.length) list.append(el("div", {
+                className: "muted",
+                textContent: "Nothing listed."
+            }));
+            for (const k of r.items) list.append(el("div", {}, k.name + (k.folder ? "\\" : ""), k.excluded ? el("span", {
+                className: "tag",
+                textContent: "Excluded"
+            }) : null));
+            const cloud = r.side === "remote" ? smallBtn("Excluded in OneDrive", () => {
+                L.tab = "excluded";
+                $("#ls-filter").value = i.path;
+                loadList(true);
+            }) : null;
+            row.after(el("tr", {
+                className: "inside"
+            }, el("td", {
+                colSpan: 3
+            }, el("small", {
+                textContent: r.side === "remote" ? "In OneDrive" : "On this PC"
+            }), list, cloud)));
+        }
+
+        // Asks before anything is deleted, before a choice for many items,
+        // and for a new name; the rest are queued at once.
+        function resolveAsk(c, items, bulk) {
+            const rename = c.code === "rename";
+            if (!bulk && !c.deletes && !rename) return resolveGo(c, items, bulk);
+            const one = items[0];
+            const li = t => el("li", {
+                textContent: t
+            });
+            const facts = [];
+            if (bulk) {
+                facts.push(...items.slice(0, 5).map(i => li(i.path)));
+                if (items.length > 5) facts.push(li(`and ${(items.length - 5).toLocaleString()} more`));
+            } else {
+                facts.push(li(one.path));
+                const under = one.path.toLowerCase() + "/";
+                const inside = L.data.items.filter(i => i.path.toLowerCase().startsWith(under)).length;
+                if (inside) facts.push(li(`and ${plural(inside, "item")} in it`));
+            }
+            if (DELETED_TO[c.code]) facts.push(li(DELETED_TO[c.code]));
+            $("#rs-title").textContent = bulk ? allLabel(c.label, items.length) + "?" : rename ? "Rename" : c.label + "?";
+            $("#rs-facts").replaceChildren(...facts);
+            $("#rs-name-box").hidden = !rename;
+            $("#rs-busy").textContent = "";
+            const name = $("#rs-name");
+            if (rename) name.value = one.path.split("/").pop();
+            const go = $("#rs-go");
+            go.textContent = rename ? "Rename" : c.label.split(" ")[0];
+            go.disabled = false;
+            go.onclick = async() => {
+                go.disabled = true;
+                const ok = await resolveGo(c, items, bulk, rename ? name.value.trim() : null);
+                if (ok) $("#dlg-resolve").close();
+                else go.disabled = false;
+            };
+            $("#dlg-resolve").showModal();
+            if (rename) {
+                name.focus();
+                const dot = name.value.lastIndexOf(".");
+                name.setSelectionRange(0, dot > 0 ? dot : name.value.length);
+            }
+        }
+
+        async function resolveGo(c, items, bulk, name = null) {
+            const args = {
+                root: L.root,
+                choice: c.code
+            };
+            if (bulk) args.all = items.length;
+            else args.path = items[0].path;
+            if (name !== null) args.name = name;
+            try {
+                const out = await call("unsynced_resolve", args);
+                toast(out.trim().split("\n").pop());
+                loadList(false);
+                return true;
+            } catch (e) {
+                toast(e.message, true);
+                return false;
             }
         }
 
