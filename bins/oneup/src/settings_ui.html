@@ -743,6 +743,35 @@
             font-weight: 400;
         }
 
+        #ls-table .ug-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        #ls-table .ug-head small {
+            font-weight: 400;
+            margin-top: 2px;
+        }
+
+        #ls-table .ug-act {
+            flex: none;
+        }
+
+        #ls-table .count {
+            margin-left: 8px;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 0 6px;
+            border-radius: 8px;
+            background: var(--panel);
+        }
+
+        #ls-table tr.inner td.item {
+            color: var(--muted);
+        }
+
         #ls-table tr.inside td {
             border-top: 0;
             padding-top: 0;
@@ -2850,38 +2879,60 @@
             });
         }
 
+        // Grouped by why, the reason said once at the top of the group. An
+        // item inside a folder listed for the same reason sits under it,
+        // named from there and without buttons: the folder's answer covers it.
         function renderUnsynced(r, has) {
             const shown = r.items.filter(i => has(i.path, i.why));
             const rows = [];
             for (const kind of KINDS) {
-                const group = shown.filter(i => i.kind === kind);
+                const group = shown.filter(i => i.kind === kind).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
                 if (!group.length) continue;
-                const head = el("td", {
-                    colSpan: 3
-                }, `${group[0].why} · ${group.length.toLocaleString()}`);
-                // All of a kind at once: only while the whole kind is shown.
                 const all = r.items.filter(i => i.kind === kind);
+                const act = el("div", {
+                    className: "ug-act"
+                });
+                // All of a kind at once: only while the whole kind is shown.
                 const top = all.find(i => !i.nested) || all[0];
                 if (all.length > 1 && group.length === all.length && !all.some(i => i.queued)) {
-                    for (const c of top.choices.filter(c => c.bulk)) head.append(smallBtn(allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
+                    for (const c of top.choices.filter(c => c.bulk)) act.append(smallBtn(allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
                 }
                 rows.push(el("tr", {
                     className: "group"
-                }, head));
-                for (const i of group) rows.push(unsyncedRow(i));
+                }, el("td", {
+                    colSpan: 2
+                }, el("div", {
+                    className: "ug-head"
+                }, el("div", {}, group[0].why, el("span", {
+                    className: "count",
+                    textContent: group.length.toLocaleString()
+                }), el("small", {
+                    textContent: group[0].detail.charAt(0).toUpperCase() + group[0].detail.slice(1)
+                })), act))));
+                for (const i of group) rows.push(unsyncedRow(i, group));
             }
-            setTable(["Item", "Why", ""], rows);
+            setTable(["Item", ""], rows);
         }
 
-        function unsyncedRow(i) {
+        // The folder `i` is listed under in `group`, if one is: the nearest.
+        function listedFolder(i, group) {
+            let best = null;
+            for (const f of group) {
+                if (f !== i && i.path.toLowerCase().startsWith(f.path.toLowerCase() + "/") && (!best || f.path.length > best.path.length)) best = f;
+            }
+            return best;
+        }
+
+        function unsyncedRow(i, group) {
             const act = el("td", {
                 className: "act"
             });
+            const under = listedFolder(i, group);
             if (i.queued) act.append(el("span", {
                 className: "tag wait",
                 textContent: "Queued: " + i.queued
             }));
-            else {
+            else if (!under) {
                 for (const c of i.choices) act.append(smallBtn(c.label, () => resolveAsk(c, [i], false), c.deletes ? "danger" : ""));
                 if (i.kind === "not_empty") act.append(smallBtn("Contents", e => toggleInside(e.target.closest("tr"), i)));
             }
@@ -2893,8 +2944,17 @@
                 show.title = "Show it in File Explorer";
                 act.append(show);
             }
-            // The group above says what kind; the row, the rest.
-            return el("tr", {}, cell(i.path, null, "wrap path item"), cell(i.detail), act);
+            let depth = 0;
+            for (let f = under; f; f = listedFolder(f, group)) depth++;
+            const name = el("td", {
+                className: "wrap path item",
+                textContent: under ? i.path.slice(under.path.length + 1) : i.path,
+                title: i.path
+            });
+            if (depth) name.style.paddingLeft = `${16 + depth * 20}px`;
+            return el("tr", {
+                className: under ? "inner" : ""
+            }, name, act);
         }
 
         // What a folder held as not empty still holds (often what the
@@ -2933,7 +2993,7 @@
             row.after(el("tr", {
                 className: "inside"
             }, el("td", {
-                colSpan: 3
+                colSpan: 2
             }, el("small", {
                 textContent: r.side === "remote" ? "In OneDrive" : "On this PC"
             }), list, cloud)));
