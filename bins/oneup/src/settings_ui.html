@@ -2880,13 +2880,19 @@
         }
 
         // Grouped by why, the reason said once at the top of the group. An
-        // item inside a folder listed for the same reason sits under it,
-        // named from there and without buttons: the folder's answer covers it.
+        // item inside a folder held for the same reason (gone from one side)
+        // sits under it, named from there and without buttons: the folder's
+        // answer covers what's in it. A rename doesn't, so nothing nests there.
+        const NESTS = ["gone_here", "gone_there"];
+
         function renderUnsynced(r, has) {
             const shown = r.items.filter(i => has(i.path, i.why));
             const rows = [];
             for (const kind of KINDS) {
-                const group = shown.filter(i => i.kind === kind).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+                const group = shown.filter(i => i.kind === kind).map(i => ({
+                    i,
+                    lower: i.path.toLowerCase()
+                })).sort((a, b) => a.lower < b.lower ? -1 : a.lower > b.lower ? 1 : 0);
                 if (!group.length) continue;
                 const all = r.items.filter(i => i.kind === kind);
                 const act = el("div", {
@@ -2897,37 +2903,37 @@
                 if (all.length > 1 && group.length === all.length && !all.some(i => i.queued)) {
                     for (const c of top.choices.filter(c => c.bulk)) act.append(smallBtn(allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
                 }
+                // The reason, without what the buttons beside it say.
+                const why = group[0].i.detail.split("; ")[0];
                 rows.push(el("tr", {
                     className: "group"
                 }, el("td", {
                     colSpan: 2
                 }, el("div", {
                     className: "ug-head"
-                }, el("div", {}, group[0].why, el("span", {
+                }, el("div", {}, group[0].i.why, el("span", {
                     className: "count",
                     textContent: group.length.toLocaleString()
                 }), el("small", {
-                    textContent: group[0].detail.charAt(0).toUpperCase() + group[0].detail.slice(1)
+                    textContent: why.charAt(0).toUpperCase() + why.slice(1)
                 })), act))));
-                for (const i of group) rows.push(unsyncedRow(i, group));
+                // Sorted by path, a folder comes before what's in it: the
+                // folders above each row are a stack.
+                const above = [];
+                for (const g of group) {
+                    while (above.length && !g.lower.startsWith(above[above.length - 1].lower + "/")) above.pop();
+                    const under = NESTS.includes(kind) && above.length ? above[above.length - 1].i : null;
+                    rows.push(unsyncedRow(g.i, under, under ? above.length : 0));
+                    above.push(g);
+                }
             }
             setTable(["Item", ""], rows);
         }
 
-        // The folder `i` is listed under in `group`, if one is: the nearest.
-        function listedFolder(i, group) {
-            let best = null;
-            for (const f of group) {
-                if (f !== i && i.path.toLowerCase().startsWith(f.path.toLowerCase() + "/") && (!best || f.path.length > best.path.length)) best = f;
-            }
-            return best;
-        }
-
-        function unsyncedRow(i, group) {
+        function unsyncedRow(i, under, depth) {
             const act = el("td", {
                 className: "act"
             });
-            const under = listedFolder(i, group);
             if (i.queued) act.append(el("span", {
                 className: "tag wait",
                 textContent: "Queued: " + i.queued
@@ -2944,14 +2950,15 @@
                 show.title = "Show it in File Explorer";
                 act.append(show);
             }
-            let depth = 0;
-            for (let f = under; f; f = listedFolder(f, group)) depth++;
             const name = el("td", {
                 className: "wrap path item",
                 textContent: under ? i.path.slice(under.path.length + 1) : i.path,
                 title: i.path
             });
-            if (depth) name.style.paddingLeft = `${16 + depth * 20}px`;
+            if (under) {
+                name.style.paddingLeft = `${16 + depth * 20}px`;
+                name.setAttribute("aria-label", i.path);
+            }
             return el("tr", {
                 className: under ? "inner" : ""
             }, name, act);
