@@ -542,6 +542,15 @@ mod win {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::unsynced(&d)).await?
             }
+            "unsynced_preview" => {
+                let (d, choice) = (dir.to_path_buf(), text(args, "choice"));
+                let path = args.get("path").and_then(Value::as_str).map(str::to_string);
+                let name = args.get("name").and_then(Value::as_str).map(str::to_string);
+                tokio::task::spawn_blocking(move || {
+                    settingsapi::unsynced_preview(&d, path.as_deref(), &choice, name.as_deref())
+                })
+                .await?
+            }
             "unsynced_inside" => {
                 let (d, path) = (dir.to_path_buf(), text(args, "path"));
                 tokio::task::spawn_blocking(move || settingsapi::unsynced_inside(&d, &path)).await?
@@ -557,9 +566,13 @@ mod win {
                 }
                 let mut a: Vec<std::ffi::OsString> =
                     vec!["--data-dir".into(), dir.into(), "unsynced".into(), "resolve".into()];
-                match args.get("all").and_then(Value::as_u64) {
-                    Some(n) => a.extend(["--all".into(), "--expect".into(), n.to_string().into()]),
-                    None => a.push(text(args, "path").into()),
+                if flag(args, "all") {
+                    a.push("--all".into());
+                } else {
+                    a.push(text(args, "path").into());
+                }
+                if let Some(n) = args.get("expect").and_then(Value::as_u64) {
+                    a.extend(["--expect".into(), n.to_string().into()]);
                 }
                 a.push(
                     if choice == "rename" { format!("--rename={}", text(args, "name")) } else { format!("--{choice}") }

@@ -227,6 +227,18 @@ pub fn update<'a>(
     Ok(())
 }
 
+/// The item listed at `path`: spelled exactly so, or else the only one
+/// spelled so in another case (names that differ only in case can both be
+/// listed, in a case-sensitive folder).
+pub fn find<'a>(r: &'a Record, path: &str) -> Option<&'a Item> {
+    if let Some(i) = r.items.iter().find(|i| i.path == path) {
+        return Some(i);
+    }
+    let mut like = r.items.iter().filter(|i| i.path.eq_ignore_ascii_case(path));
+    let one = like.next()?;
+    like.next().is_none().then_some(one)
+}
+
 /// Items the user answered (`crate::resolve`) leave the record, with what
 /// sync held below them: none of it is held any more. Planned again, an
 /// item that still can't sync comes back.
@@ -240,7 +252,7 @@ pub fn answered(store: &mut Store, paths: &[String]) -> Result<()> {
         let (p, t) = (path.as_bytes(), top.trim_end_matches('/').as_bytes());
         p.len() > t.len() && p[..t.len()].eq_ignore_ascii_case(t) && p[t.len()] == b'/'
     };
-    r.items.retain(|i| !paths.iter().any(|p| i.path.eq_ignore_ascii_case(p) || (i.why.held() && below(&i.path, p))));
+    r.items.retain(|i| !paths.iter().any(|p| i.path == *p || (i.why.held() && below(&i.path, p))));
     if r != before {
         save(store, &r)?;
     }

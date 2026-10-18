@@ -155,14 +155,15 @@ fn subtree(o: &Ops<'_>, b: Base) -> oneup_store::Result<Vec<Base>> {
 }
 
 /// Record `sid` is gone from this PC and still in OneDrive: delete it in
-/// OneDrive, with everything under it that is gone from this PC too.
+/// OneDrive, with everything under it that is the same (gone from this PC,
+/// still in OneDrive). What's gone from both sides, or still here, is left.
 pub fn delete_there(o: &Ops<'_>, sid: Sid, present: &dyn Fn(LocalId) -> bool) -> Result<Change> {
     let b = record(o, sid)?;
     gone_here_still_there(o, &b, present)?;
     let mut items = Vec::new();
     for b in subtree(o, b)? {
         if let Some(l) = b.local
-            && !here(o, l, present)?
+            && still(gone_here_still_there(o, &b, present))?
         {
             items.push((b.sid, l));
         }
@@ -171,19 +172,29 @@ pub fn delete_there(o: &Ops<'_>, sid: Sid, present: &dyn Fn(LocalId) -> bool) ->
 }
 
 /// Record `sid` is gone from OneDrive and still on this PC: delete it here,
-/// with everything under it that is gone from OneDrive too.
+/// with everything under it that is the same (gone from OneDrive, still
+/// here).
 pub fn delete_here(o: &Ops<'_>, sid: Sid) -> Result<Change> {
     let b = record(o, sid)?;
     gone_there_still_here(o, &b)?;
     let mut items = Vec::new();
     for b in subtree(o, b)? {
-        if let Some(r) = b.remote
-            && !there(o, &r)?
+        if let Some(r) = b.remote.clone()
+            && still(gone_there_still_here(o, &b))?
         {
             items.push((b.sid, r));
         }
     }
     Ok(Change::GoneThere(items))
+}
+
+/// Whether a check passed: a refusal is `false`, a store error an error.
+fn still<T>(r: Result<T>) -> oneup_store::Result<bool> {
+    match r {
+        Ok(_) => Ok(true),
+        Err(Error::Refused(_)) => Ok(false),
+        Err(Error::Store(e)) => Err(e),
+    }
 }
 
 /// Record `sid` is gone from this PC and still in OneDrive: bring it back

@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
-use oneup_app::resolve::{self, Choice, Request};
+use anyhow::{Result, bail};
+use oneup_app::resolve::{self, Choice};
 use oneup_app::unsynced::{self, Item, Why};
 use oneup_store::Store;
 
@@ -12,52 +12,34 @@ use oneup_store::Store;
 pub struct Ask<'a> {
     pub paths: &'a [String],
     pub all: bool,
-    /// With `all`: how many items the caller saw (refused if the list changed).
+    /// How many items the caller was shown the choice would concern
+    /// (refused if that changed since).
     pub expect: Option<usize>,
     pub choice: Option<Choice>,
     pub name: Option<&'a str>,
     pub yes: bool,
 }
 
-/// Whether `path` is inside folder `top` (both record paths).
-fn below(path: &str, top: &str) -> bool {
-    let (p, t) = (path.as_bytes(), top.trim_end_matches('/').as_bytes());
-    p.len() > t.len() && p[..t.len()].eq_ignore_ascii_case(t) && p[t.len()] == b'/'
-}
-
 pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
     let pair = oneup_app::sync::pairing(&store)?;
     let backup = oneup_app::flow::get(&store)? == oneup_app::flow::Flow::Backup;
     let record = unsynced::load(&store)?;
-    let mut items: Vec<&Item> = if a.all {
-        let Some(c) = a.choice.filter(|c| c.in_bulk()) else {
-            bail!("--all needs --delete-in-onedrive, --keep-in-onedrive, --restore, --delete-here or --upload");
-        };
-        record.items.iter().filter(|i| resolve::choices(i.why, backup).contains(&c)).collect()
-    } else {
-        if a.paths.is_empty() {
-            bail!("name the items as `oneup unsynced` lists them, or use --all");
-        }
-        let mut v = Vec::new();
-        for p in a.paths {
-            let rel = crate::activity::normalize(&crate::activity::within(&pair.local, p)?);
-            let i = record.items.iter().find(|i| i.path.eq_ignore_ascii_case(&rel));
-            v.push(i.with_context(|| format!("{rel} isn't in the list (`oneup unsynced`)"))?);
-        }
-        v
-    };
-    if let Some(n) = a.expect
-        && n != items.len()
-    {
-        bail!("{} items fit now, not {n}: the list changed", items.len());
+    if !a.all && a.paths.is_empty() {
+        bail!("name the items as `oneup unsynced` lists them, or use --all");
     }
+    let paths: Vec<String> = a
+        .paths
+        .iter()
+        .map(|p| Ok(crate::activity::normalize(&crate::activity::within(&pair.local, p)?)))
+        .collect::<Result<_>>()?;
+    let items = resolve::select(&record, a.choice, (!a.all).then_some(paths.as_slice()), backup)?;
     let Some(choice) = a.choice else {
         for i in &items {
             show_choices(&store, i, backup)?;
         }
         return Ok(());
     };
-    if items.is_empty() {
+    if items.is_empty() && a.expect.is_none_or(|n| n == 0) {
         println!("Nothing to resolve.");
         return Ok(());
     }
@@ -77,39 +59,19 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         crate::agent::nudge(dir).await;
         return Ok(());
     }
-    // A folder answers for what's in it.
-    items.sort_by(|x, y| x.path.cmp(&y.path));
-    let mut tops: Vec<&Item> = Vec::new();
-    for i in items {
-        if !tops.iter().any(|t| below(&i.path, &t.path)) {
-            tops.push(i);
-        }
+    let p = resolve::prepare(&store, &items, choice, a.name, backup)?;
+    if let Some(n) = a.expect
+        && n != p.items
+    {
+        bail!("it concerns {} items now, not {n}: the list changed", p.items);
     }
-    let mut asked = Vec::new();
-    let mut refused = Vec::new();
-    let mut count = 0;
-    for i in tops {
-        match store.read(|o| resolve::check(o, i, choice, a.name, backup, &|_| false))? {
-            Ok(c) => {
-                count += c.items();
-                asked.push(Request { path: i.path.clone(), choice, name: a.name.map(|n| n.trim().to_string()) });
-            }
-            Err(why) => refused.push(format!("{}: {why}", i.path)),
-        }
+    if p.asked.is_empty() {
+        bail!("{}", p.refused.join("\n"));
     }
-    if asked.is_empty() {
-        bail!(
-            "{}",
-            refused.join(
-                "
-"
-            )
-        );
-    }
-    for r in &refused {
+    for r in &p.refused {
         println!("Skipped {r}.");
     }
-    let what = if asked.len() == 1 && count <= 1 { asked[0].path.clone() } else { format!("{count} items") };
+    let what = if p.asked.len() == 1 && p.items <= 1 { p.asked[0].path.clone() } else { format!("{} items", p.items) };
     if choice.deletes() && !a.yes {
         let to = if choice == Choice::DeleteHere {
             "on this PC, into its kept copies (.oneup\\versions)"
@@ -117,13 +79,13 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
             "in OneDrive, into its recycle bin"
         };
         println!("Would delete {to}:");
-        for r in &asked {
+        for r in &p.asked {
             println!("  {}", r.path);
         }
         println!("Add --yes to delete {what}.");
         return Ok(());
     }
-    resolve::ask(&mut store, &asked)?;
+    resolve::ask(&mut store, &p.asked)?;
     let done = match choice {
         Choice::DeleteInOnedrive => format!("delete {what} in OneDrive"),
         Choice::KeepInOnedrive => format!("keep {what} in OneDrive"),
@@ -142,6 +104,7 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
 
 /// What can be done about `i`, as options to type.
 fn show_choices(store: &Store, i: &Item, backup: bool) -> Result<()> {
+    const SHOWN: usize = 50;
     println!("{}  ({})", i.path, i.why.label());
     let choices = resolve::choices(i.why, backup);
     for c in choices {
@@ -149,15 +112,15 @@ fn show_choices(store: &Store, i: &Item, backup: bool) -> Result<()> {
         println!("  {flag:<22}{}", c.label());
     }
     if i.why == Why::NotEmpty {
-        let (side, kids) = store.read(|o| resolve::inside(o, &i.path))?;
-        let side = if side == "local" { "on this PC" } else { "in OneDrive" };
+        let c = store.read(|o| resolve::inside(o, &i.path, SHOWN))?;
+        let side = if c.side == "local" { "on this PC" } else { "in OneDrive" };
         println!("  Inside, {side}:");
-        for k in kids.iter().take(50) {
+        for k in &c.items {
             let tag = if k.excluded { "  (excluded)" } else { "" };
             println!("    {}{}{tag}", k.name, if k.folder { "\\" } else { "" });
         }
-        if kids.len() > 50 {
-            println!("    and {} more", kids.len() - 50);
+        if c.total > c.items.len() {
+            println!("    and {} more", c.total - c.items.len());
         }
     } else if choices.is_empty() {
         println!("  Change it in File Explorer or on OneDrive's website.");

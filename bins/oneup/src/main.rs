@@ -924,9 +924,9 @@ struct ResolveArgs {
     /// Every listed item the choice fits
     #[arg(long, conflicts_with = "paths")]
     all: bool,
-    /// With --all: go ahead only if this many items fit (the list may have
-    /// changed since it was shown)
-    #[arg(long, value_name = "N", requires = "all")]
+    /// Go ahead only if the choice concerns this many items, what's in
+    /// chosen folders included (as it was shown; it may have changed since)
+    #[arg(long, value_name = "N")]
     expect: Option<usize>,
     /// Gone from this PC: delete it in OneDrive too, into its recycle bin
     #[arg(long, group = "choice")]

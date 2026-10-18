@@ -620,10 +620,26 @@ pub fn unsynced(dir: &Path) -> Result<Value> {
 /// What's inside a folder held as not empty (`crate::resolve::inside`).
 pub fn unsynced_inside(dir: &Path, path: &str) -> Result<Value> {
     let store = crate::setup::open_store(dir, 1024)?;
-    let (side, kids) = store.read(|o| crate::resolve::inside(o, path))?;
+    let c = store.read(|o| crate::resolve::inside(o, path, 200))?;
     let items: Vec<Value> =
-        kids.iter().map(|k| json!({ "name": k.name, "folder": k.folder, "excluded": k.excluded })).collect();
-    Ok(json!({ "side": side, "items": items }))
+        c.items.iter().map(|k| json!({ "name": k.name, "folder": k.folder, "excluded": k.excluded })).collect();
+    Ok(json!({ "side": c.side, "total": c.total, "items": items }))
+}
+
+/// What a choice would do, before the window asks (`resolve::prepare`, as
+/// `oneup unsynced resolve` works it out): how many items it concerns,
+/// folders' contents included, and the items refused now. `path`: one
+/// listed item; `None`: every item the choice fits.
+pub fn unsynced_preview(dir: &Path, path: Option<&str>, choice: &str, name: Option<&str>) -> Result<Value> {
+    let choice = crate::resolve::Choice::from_code(choice).with_context(|| format!("unknown choice: {choice}"))?;
+    let store = crate::setup::open_store(dir, 1024)?;
+    let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
+    let record = crate::unsynced::load(&store)?;
+    let paths = path.map(|p| vec![p.to_string()]);
+    let items = crate::resolve::select(&record, Some(choice), paths.as_deref(), backup)?;
+    let p = crate::resolve::prepare(&store, &items, choice, name, backup)?;
+    let tops: Vec<&str> = p.asked.iter().map(|r| r.path.as_str()).collect();
+    Ok(json!({ "items": p.items, "tops": tops, "refused": p.refused }))
 }
 
 /// The lists of the safety stops standing now (`crate::stoplist`), each
@@ -884,8 +900,12 @@ mod tests {
             let mut s = crate::setup::open_store(&dir, 1024).unwrap();
             let record = r#"{"items":[["/old","gone_here"],["/old/a.txt","gone_here"],["/bad|name","invalid_name"]]}"#;
             s.write(|o| o.meta_set(crate::unsynced::KEY, record)).unwrap();
-            let r =
-                crate::resolve::Request { path: "/OLD".into(), choice: crate::resolve::Choice::Restore, name: None };
+            let r = crate::resolve::Request {
+                path: "/OLD".into(),
+                choice: crate::resolve::Choice::Restore,
+                name: None,
+                id: None,
+            };
             crate::resolve::ask(&mut s, &[r]).unwrap();
         }
         let v = unsynced(&dir).unwrap();

@@ -2921,6 +2921,10 @@
                 className: "tag",
                 textContent: "Excluded"
             }) : null));
+            if (r.total > r.items.length) list.append(el("div", {
+                className: "muted",
+                textContent: `and ${(r.total - r.items.length).toLocaleString()} more`
+            }));
             const cloud = r.side === "remote" ? smallBtn("Excluded in OneDrive", () => {
                 L.tab = "excluded";
                 $("#ls-filter").value = i.path;
@@ -2936,8 +2940,11 @@
         }
 
         // Asks before anything is deleted, before a choice for many items,
-        // and for a new name; the rest are queued at once.
-        function resolveAsk(c, items, bulk) {
+        // and for a new name; the rest are queued at once. What's asked
+        // about is worked out by OneUpDrive first (`unsynced_preview`): the
+        // items it concerns, folders' contents included, which the answer
+        // then must still be (`--expect`).
+        async function resolveAsk(c, items, bulk) {
             const rename = c.code === "rename";
             if (!bulk && !c.deletes && !rename) return resolveGo(c, items, bulk);
             const one = items[0];
@@ -2945,17 +2952,27 @@
                 textContent: t
             });
             const facts = [];
-            if (bulk) {
-                facts.push(...items.slice(0, 5).map(i => li(i.path)));
-                if (items.length > 5) facts.push(li(`and ${(items.length - 5).toLocaleString()} more`));
-            } else {
-                facts.push(li(one.path));
-                const under = one.path.toLowerCase() + "/";
-                const inside = L.data.items.filter(i => i.path.toLowerCase().startsWith(under)).length;
-                if (inside) facts.push(li(`and ${plural(inside, "item")} in it`));
+            let expect = null;
+            if (rename) facts.push(li(one.path));
+            else {
+                const pv = await call("unsynced_preview", {
+                    root: L.root,
+                    choice: c.code,
+                    path: bulk ? undefined : one.path
+                }).catch(e => {
+                    toast(e.message, true);
+                    return null;
+                });
+                if (!pv) return;
+                if (!pv.tops.length) return toast(pv.refused.join(" ") || "Nothing to do.", true);
+                expect = pv.items;
+                facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
+                if (pv.tops.length > 5) facts.push(li(`and ${(pv.tops.length - 5).toLocaleString()} more`));
+                if (pv.items > pv.tops.length) facts.push(li(`${plural(pv.items, "item")} in all`));
+                if (pv.refused.length) facts.push(li(`${pv.refused.length.toLocaleString()} skipped: ${pv.refused[0]}`));
             }
             if (DELETED_TO[c.code]) facts.push(li(DELETED_TO[c.code]));
-            $("#rs-title").textContent = bulk ? allLabel(c.label, items.length) + "?" : rename ? "Rename" : c.label + "?";
+            $("#rs-title").textContent = bulk ? allLabel(c.label, expect) + "?" : rename ? "Rename" : c.label + "?";
             $("#rs-facts").replaceChildren(...facts);
             $("#rs-name-box").hidden = !rename;
             $("#rs-busy").textContent = "";
@@ -2966,7 +2983,7 @@
             go.disabled = false;
             go.onclick = async() => {
                 go.disabled = true;
-                const ok = await resolveGo(c, items, bulk, rename ? name.value.trim() : null);
+                const ok = await resolveGo(c, items, bulk, rename ? name.value.trim() : null, expect);
                 if (ok) $("#dlg-resolve").close();
                 else go.disabled = false;
             };
@@ -2978,14 +2995,15 @@
             }
         }
 
-        async function resolveGo(c, items, bulk, name = null) {
+        async function resolveGo(c, items, bulk, name = null, expect = null) {
             const args = {
                 root: L.root,
                 choice: c.code
             };
-            if (bulk) args.all = items.length;
+            if (bulk) args.all = true;
             else args.path = items[0].path;
             if (name !== null) args.name = name;
+            if (expect !== null) args.expect = expect;
             try {
                 const out = await call("unsynced_resolve", args);
                 toast(out.trim().split("\n").pop());

@@ -22,7 +22,7 @@ use oneup_store::{ActivityEntry, ActivityOutcome, Ops, Store};
 use oneup_sync::{LocalId, Op, ROOT, RemoteId, Sid};
 use serde_json::{Value, json};
 
-use crate::unsynced::{Item, Why};
+use crate::unsynced::{Item, Record, Why};
 
 /// In `meta`: the answers waiting for the agent (JSON).
 pub const KEY: &str = "unsynced.resolve";
@@ -124,6 +124,9 @@ pub struct Request {
     pub choice: Choice,
     /// The new name, for a rename.
     pub name: Option<String>,
+    /// Which item it was when chosen ([`identity`]): an answer is carried
+    /// out only for that one, never for another that took its path since.
+    pub id: Option<String>,
 }
 
 /// The answers waiting (unreadable counts as none: the user can answer
@@ -138,6 +141,7 @@ pub fn queued(o: &Ops<'_>) -> oneup_store::Result<Vec<Request>> {
                 path: r["path"].as_str()?.to_string(),
                 choice: Choice::from_code(r["choice"].as_str()?)?,
                 name: r["name"].as_str().map(str::to_string),
+                id: r["id"].as_str().map(str::to_string),
             })
         })
         .collect())
@@ -148,7 +152,7 @@ fn save(o: &Ops<'_>, q: &[Request]) -> oneup_store::Result<()> {
         return o.meta_delete(KEY);
     }
     let v: Vec<Value> =
-        q.iter().map(|r| json!({ "path": r.path, "choice": r.choice.code(), "name": r.name })).collect();
+        q.iter().map(|r| json!({ "path": r.path, "choice": r.choice.code(), "name": r.name, "id": r.id })).collect();
     o.meta_set(KEY, &Value::from(v).to_string())
 }
 
@@ -156,7 +160,7 @@ fn save(o: &Ops<'_>, q: &[Request]) -> oneup_store::Result<()> {
 pub fn ask(store: &mut Store, asked: &[Request]) -> Result<()> {
     store.write(|o| {
         let mut q = queued(o)?;
-        q.retain(|r| !asked.iter().any(|a| a.path.eq_ignore_ascii_case(&r.path)));
+        q.retain(|r| !asked.iter().any(|a| a.path == r.path));
         q.extend(asked.iter().cloned());
         q.truncate(MAX);
         save(o, &q)
@@ -220,6 +224,18 @@ fn record_of(o: &Ops<'_>, item: &Item) -> oneup_store::Result<Option<Sid>> {
         }
     };
     Ok(b.map(|b| b.sid))
+}
+
+/// Which item the record's `item` is now, for `choice`: its Synced
+/// record, or for a rename its local item with the size and last-write
+/// time it has (a file changed since the choice is the user's to look at
+/// again). `None` if it can't be found.
+pub fn identity(o: &Ops<'_>, item: &Item, choice: Choice) -> oneup_store::Result<Option<String>> {
+    if choice == Choice::Rename {
+        let Some(l) = local_at(o, &item.path)? else { return Ok(None) };
+        return Ok(o.local_get(l.0)?.map(|r| format!("l:{:x}:{}:{}", r.file_id, r.size, r.mtime)));
+    }
+    Ok(record_of(o, item)?.map(|sid| format!("s:{sid}")))
 }
 
 /// Works out `choice` for the record's `item` against the state now,
@@ -314,9 +330,12 @@ pub fn apply_queued(store: &mut Store, backup: bool, present: &dyn Fn(LocalId) -
         let step = store.write(|o| {
             let mut q = queued(o)?;
             let Some(req) = q.get(i).cloned() else { return Ok(None) };
-            let item = record.items.iter().find(|it| it.path.eq_ignore_ascii_case(&req.path));
+            let item = crate::unsynced::find(&record, &req.path);
             let outcome = match item {
                 None => Err("it isn't in the list any more".to_string()),
+                Some(item) if identity(o, item, req.choice)? != req.id => {
+                    Err("it changed since you chose; choose again".to_string())
+                }
                 Some(item) => match check(o, item, req.choice, req.name.as_deref(), backup, present)? {
                     Ok(c) => {
                         let items = c.items();
@@ -374,6 +393,75 @@ pub fn ran(store: &mut Store, applied: &[(Op, Request)], report: &oneup_exec::Re
     Ok(())
 }
 
+/// What a choice for some listed items would do ([`prepare`]).
+#[derive(Debug, Default)]
+pub struct Prepared {
+    /// The answers to queue: one per item, a folder answering for what's in it.
+    pub asked: Vec<Request>,
+    /// How many items they concern, folders' contents included.
+    pub items: usize,
+    /// Those refused now, and why.
+    pub refused: Vec<String>,
+}
+
+/// The listed items `choice` is for: those at `paths` (as the record
+/// spells them), or with `None` every item it fits.
+pub fn select<'a>(
+    record: &'a Record,
+    choice: Option<Choice>,
+    paths: Option<&[String]>,
+    backup: bool,
+) -> Result<Vec<&'a Item>> {
+    let Some(paths) = paths else {
+        let Some(c) = choice.filter(|c| c.in_bulk()) else {
+            anyhow::bail!("--all needs --delete-in-onedrive, --keep-in-onedrive, --restore, --delete-here or --upload");
+        };
+        return Ok(record.items.iter().filter(|i| choices(i.why, backup).contains(&c)).collect());
+    };
+    paths
+        .iter()
+        .map(|p| {
+            crate::unsynced::find(record, p).ok_or_else(|| anyhow::anyhow!("{p} isn't in the list (`oneup unsynced`)"))
+        })
+        .collect()
+}
+
+/// Works out `choice` for `items` against the store as it is (changing
+/// nothing): the answers to queue, each bound to its item, and how many
+/// items they concern. An item inside another chosen folder goes with it.
+pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str>, backup: bool) -> Result<Prepared> {
+    let mut items: Vec<&Item> = items.to_vec();
+    items.sort_by(|x, y| x.path.cmp(&y.path));
+    let mut tops: Vec<&Item> = Vec::new();
+    for i in items {
+        if !tops.iter().any(|t| below(&i.path, &t.path)) {
+            tops.push(i);
+        }
+    }
+    let mut out = Prepared::default();
+    for i in tops {
+        let worked = store.read(|o| {
+            let id = identity(o, i, choice)?;
+            Ok(check(o, i, choice, name, backup, &|_| false)?.map(|c| (c.items(), id)))
+        })?;
+        match worked {
+            Ok((n, id)) => {
+                out.items += n;
+                let name = name.map(|n| n.trim().to_string());
+                out.asked.push(Request { path: i.path.clone(), choice, name, id });
+            }
+            Err(why) => out.refused.push(format!("{}: {why}", i.path)),
+        }
+    }
+    Ok(out)
+}
+
+/// Whether record path `path` is inside folder `top`.
+pub fn below(path: &str, top: &str) -> bool {
+    let (p, t) = (path.as_bytes(), top.trim_end_matches('/').as_bytes());
+    p.len() > t.len() && p[..t.len()].eq_ignore_ascii_case(t) && p[t.len()] == b'/'
+}
+
 /// An item inside a folder held as not empty ([`inside`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inside {
@@ -383,27 +471,42 @@ pub struct Inside {
     pub excluded: bool,
 }
 
+/// What a folder held as not empty still holds ([`inside`]).
+#[derive(Debug, Default)]
+pub struct Contents {
+    /// `local` (on this PC), `remote` (in OneDrive), or empty if it's gone.
+    pub side: &'static str,
+    /// How many items in all.
+    pub total: usize,
+    /// The first `limit` of them, by name.
+    pub items: Vec<Inside>,
+}
+
 /// What's inside a folder held as not empty: on this PC if it's still
-/// here (`local`), else in OneDrive (`remote`), read from the trees as last
-/// seen (nothing is opened or listed).
-pub fn inside(o: &Ops<'_>, path: &str) -> oneup_store::Result<(&'static str, Vec<Inside>)> {
-    if let Some(l) = local_at(o, path)? {
+/// here, else in OneDrive, read from the trees as last seen (nothing is
+/// opened or listed); at most `limit` items.
+pub fn inside(o: &Ops<'_>, path: &str, limit: usize) -> oneup_store::Result<Contents> {
+    let (side, mut items) = if let Some(l) = local_at(o, path)? {
         let kids = o.local_children(l.0)?.into_iter().map(|k| Inside {
             folder: k.kind == oneup_store::LocalKind::Folder,
             excluded: k.skip == oneup_store::Skip::Excluded,
             name: k.name,
         });
-        return Ok(("local", kids.collect()));
-    }
-    if let Some(r) = remote_at(o, path)? {
+        ("local", kids.collect::<Vec<_>>())
+    } else if let Some(r) = remote_at(o, path)? {
         let kids = o.remote_children(&r.0)?.into_iter().map(|(k, excluded)| Inside {
             folder: k.kind == oneup_store::Kind::Folder,
             excluded,
             name: k.name,
         });
-        return Ok(("remote", kids.collect()));
-    }
-    Ok(("", Vec::new()))
+        ("remote", kids.collect())
+    } else {
+        return Ok(Contents::default());
+    };
+    let total = items.len();
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    items.truncate(limit);
+    Ok(Contents { side, total, items })
 }
 
 #[cfg(test)]
@@ -432,16 +535,36 @@ mod tests {
         assert_eq!(Choice::ALL.iter().filter(|c| c.deletes()).count(), 2);
     }
 
+    fn req(path: &str, choice: Choice) -> Request {
+        Request { path: path.into(), choice, name: None, id: None }
+    }
+
     #[test]
     fn answers_queue_once_per_item_and_unreadable_queues_read_empty() {
         let mut s = Store::open_in_memory().unwrap();
-        let r = |p: &str, c| Request { path: p.into(), choice: c, name: None };
-        ask(&mut s, &[r("/a.txt", Choice::Restore), r("/b", Choice::DeleteHere)]).unwrap();
-        ask(&mut s, &[r("/A.txt", Choice::DeleteInOnedrive)]).unwrap();
+        ask(&mut s, &[req("/a.txt", Choice::Restore), req("/b", Choice::DeleteHere)]).unwrap();
+        // Another item: names differing only in case can both be listed.
+        ask(&mut s, &[req("/A.txt", Choice::DeleteInOnedrive), req("/b", Choice::Upload)]).unwrap();
         let q = s.read(queued).unwrap();
-        assert_eq!(q, [r("/b", Choice::DeleteHere), r("/A.txt", Choice::DeleteInOnedrive)]);
+        assert_eq!(
+            q,
+            [req("/a.txt", Choice::Restore), req("/A.txt", Choice::DeleteInOnedrive), req("/b", Choice::Upload)]
+        );
         s.write(|o| o.meta_set(KEY, "{nonsense")).unwrap();
         assert!(s.read(queued).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_listed_path_is_found_as_spelled_first() {
+        let s = Store::open_in_memory().unwrap();
+        let mut s = s;
+        let record = r#"{"items":[["/A.txt","name_clash"],["/a.txt","name_clash"],["/Docs","gone_here"]]}"#;
+        s.write(|o| o.meta_set(crate::unsynced::KEY, record)).unwrap();
+        let r = crate::unsynced::load(&s).unwrap();
+        assert_eq!(crate::unsynced::find(&r, "/a.txt").unwrap().path, "/a.txt");
+        assert_eq!(crate::unsynced::find(&r, "/A.txt").unwrap().path, "/A.txt");
+        assert!(crate::unsynced::find(&r, "/A.TXT").is_none(), "two spelled so in another case");
+        assert_eq!(crate::unsynced::find(&r, "/docs").unwrap().path, "/Docs");
     }
 
     #[test]
@@ -449,9 +572,11 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let record = r#"{"items":[["/gone.txt","gone_here"],["/big.iso","too_large"]],"more":false}"#;
         s.write(|o| o.meta_set(crate::unsynced::KEY, record)).unwrap();
-        let r = |p: &str, c| Request { path: p.into(), choice: c, name: None };
-        ask(&mut s, &[r("/gone.txt", Choice::Restore), r("/big.iso", Choice::Upload), r("/nope", Choice::Restore)])
-            .unwrap();
+        ask(
+            &mut s,
+            &[req("/gone.txt", Choice::Restore), req("/big.iso", Choice::Upload), req("/nope", Choice::Restore)],
+        )
+        .unwrap();
         let a = apply_queued(&mut s, false, &|_| false).unwrap();
         assert!(a.ops.is_empty());
         let why: Vec<&str> = a.log.iter().map(|e| e.detail.as_str()).collect();
@@ -467,24 +592,15 @@ mod tests {
         assert!(s.read(queued).unwrap().is_empty());
     }
 
-    /// A store with the synced folder (local item 1, `root` in OneDrive)
-    /// and, under it, a
-    /// folder `old` with `a.txt`: synced, then gone from this PC (their
-    /// local items aren't in the Local tree), still in OneDrive.
-    fn gone_here() -> Store {
-        use oneup_sync::{Base, NodeKind};
-        let mut s = Store::open_in_memory().unwrap();
-        let row = |id: &str, parent: Option<&str>, name: &str, kind| oneup_store::RemoteRow {
-            id: id.into(),
-            parent_id: parent.map(Into::into),
-            name: name.into(),
-            kind,
-            size: 0,
-            etag: Some("e1".into()),
-            qxh: None,
-            mtime_ms: None,
-        };
-        let base = |sid, parent, name: &str, kind, local: u128, remote: &str| Base {
+    fn base(
+        sid: Sid,
+        parent: Option<Sid>,
+        name: &str,
+        kind: oneup_sync::NodeKind,
+        local: u128,
+        remote: &str,
+    ) -> oneup_sync::Base {
+        oneup_sync::Base {
             sid,
             parent,
             name: name.into(),
@@ -495,6 +611,25 @@ mod tests {
             local_mtime: 0,
             remote: Some(RemoteId(remote.into())),
             remote_etag: "e1".into(),
+        }
+    }
+
+    /// A store with the synced folder (local item 1, `root` in OneDrive)
+    /// and, under it, a folder `old` with `a.txt`: synced, then gone from
+    /// this PC (their local items aren't in the Local tree), still in
+    /// OneDrive; and `old/b.txt`, gone from both.
+    fn gone_here() -> Store {
+        use oneup_sync::NodeKind;
+        let mut s = Store::open_in_memory().unwrap();
+        let row = |id: &str, parent: Option<&str>, name: &str, kind| oneup_store::RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: name.into(),
+            kind,
+            size: 0,
+            etag: Some("e1".into()),
+            qxh: None,
+            mtime_ms: None,
         };
         s.write(|o| {
             o.local_put(&oneup_store::LocalRow {
@@ -515,6 +650,7 @@ mod tests {
             o.synced_put(&base(ROOT, None, "", NodeKind::Folder, 1, "root"))?;
             o.synced_put(&base(1, Some(ROOT), "old", NodeKind::Folder, 5, "r1"))?;
             o.synced_put(&base(2, Some(1), "a.txt", NodeKind::File, 6, "r2"))?;
+            o.synced_put(&base(3, Some(1), "b.txt", NodeKind::File, 7, "r3"))?;
             let record = r#"{"items":[["/old","gone_here"],["/old/a.txt","gone_here"],["/x.iso","too_large"]]}"#;
             o.meta_set(crate::unsynced::KEY, record)
         })
@@ -522,18 +658,29 @@ mod tests {
         s
     }
 
+    /// What `oneup unsynced resolve` queues for `paths`.
+    fn prepared(s: &Store, paths: &[&str], choice: Choice) -> Prepared {
+        let record = crate::unsynced::load(s).unwrap();
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let items = select(&record, Some(choice), Some(&paths), false).unwrap();
+        prepare(s, &items, choice, None, false).unwrap()
+    }
+
     #[test]
     fn an_answer_notes_what_the_planner_acts_on_and_the_item_leaves_the_list() {
         use oneup_sync::{Seen, Trees};
         let mut s = gone_here();
-        let r = Request { path: "/OLD".into(), choice: Choice::DeleteInOnedrive, name: None };
-        ask(&mut s, &[r]).unwrap();
+        // Gone from both sides isn't counted: nothing to delete there.
+        let p = prepared(&s, &["/OLD", "/old/a.txt"], Choice::DeleteInOnedrive);
+        assert_eq!((p.asked.len(), p.items), (1, 2), "the folder answers for what's in it");
+        ask(&mut s, &p.asked).unwrap();
         // Still on this PC after all (it opens by its ID): refused.
         let a = apply_queued(&mut s, false, &|id| id == LocalId(5)).unwrap();
         assert_eq!(a.log[0].detail, "Delete in OneDrive: not done; it's on this PC");
         assert_eq!(crate::unsynced::load(&s).unwrap().items.len(), 3);
 
-        ask(&mut s, &[Request { path: "/old".into(), choice: Choice::DeleteInOnedrive, name: None }]).unwrap();
+        let asked = prepared(&s, &["/old"], Choice::DeleteInOnedrive).asked;
+        ask(&mut s, &asked).unwrap();
         let a = apply_queued(&mut s, false, &|_| false).unwrap();
         assert_eq!(a.log.len(), 1);
         assert_eq!((a.log[0].outcome, a.log[0].path.as_str()), (ActivityOutcome::Note, "/old"));
@@ -541,6 +688,7 @@ mod tests {
         s.read(|o| {
             assert_eq!(o.local(LocalId(5))?, Seen::Deleted);
             assert_eq!(o.local(LocalId(6))?, Seen::Deleted);
+            assert_eq!(o.local(LocalId(7))?, Seen::Missing, "gone from both: no evidence");
             assert!(o.dirty_scope()?.folders.contains(&1), "planned again");
             Ok(())
         })
@@ -551,11 +699,34 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_is_for_the_item_chosen_not_another_at_its_path_since() {
+        use oneup_sync::{NodeKind, Seen, Trees};
+        let mut s = gone_here();
+        let p = prepared(&s, &["/old"], Choice::DeleteInOnedrive);
+        assert_eq!(p.asked[0].id.as_deref(), Some("s:1"));
+        ask(&mut s, &p.asked).unwrap();
+        // Before the agent gets to it, another synced item is at that path.
+        s.write(|o| {
+            o.synced_remove(1)?;
+            o.synced_put(&base(9, Some(ROOT), "old", NodeKind::Folder, 8, "r1"))
+        })
+        .unwrap();
+        let a = apply_queued(&mut s, false, &|_| false).unwrap();
+        assert_eq!(a.log[0].detail, "Delete in OneDrive: not done; it changed since you chose; choose again");
+        assert_eq!(s.read(|o| o.local(LocalId(8))).unwrap(), Seen::Missing);
+        // An answer queued without saying which item (by an older version) too.
+        ask(&mut s, &[req("/old", Choice::DeleteInOnedrive)]).unwrap();
+        let a = apply_queued(&mut s, false, &|_| false).unwrap();
+        assert_eq!(a.log[0].outcome, ActivityOutcome::Failed);
+    }
+
+    #[test]
     fn restoring_drops_the_records_and_a_rename_waits_until_a_round_runs_it() {
         let mut s = gone_here();
-        ask(&mut s, &[Request { path: "/old".into(), choice: Choice::Restore, name: None }]).unwrap();
+        let asked = prepared(&s, &["/old"], Choice::Restore).asked;
+        ask(&mut s, &asked).unwrap();
         let a = apply_queued(&mut s, false, &|_| false).unwrap();
-        assert_eq!(a.log[0].detail, "you chose to restore it from OneDrive (2 items)");
+        assert_eq!(a.log[0].detail, "you chose to restore it from OneDrive (3 items)");
         s.read(|o| {
             assert!(o.synced_get(1)?.is_none() && o.synced_get(2)?.is_none());
             assert!(o.dirty_scope()?.folders.contains(&ROOT), "where it reads as new");
@@ -563,8 +734,8 @@ mod tests {
         })
         .unwrap();
 
-        let rename = Request { path: "/x".into(), choice: Choice::Rename, name: Some("y".into()) };
-        let other = Request { path: "/z".into(), choice: Choice::Rename, name: Some("w".into()) };
+        let rename = Request { name: Some("y".into()), ..req("/x", Choice::Rename) };
+        let other = Request { name: Some("w".into()), ..req("/z", Choice::Rename) };
         s.write(|o| save(o, &[rename.clone(), other.clone()])).unwrap();
         let op = |n: u128| Op::RenameLocal {
             local: oneup_sync::LocalPre { id: LocalId(n), stamp: None },
