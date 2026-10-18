@@ -15,7 +15,7 @@ A Synced row links one local file ID and one remote item ID. It also holds the a
 Each side reports one of three states for an item it used to have:
 
 * **Present**: the item still exists, possibly moved or changed.
-* **Deleted**: there is *explicit evidence*. That's a USN delete record, a delta `deleted` facet, the item's path in the user's Recycle Bin, an ancestor deleted with such evidence, or our own executor having removed or detached it.
+* **Deleted**: there is *explicit evidence*. That's a USN delete record, a delta `deleted` facet, the item's path in the user's Recycle Bin, the user's answer for the held item ([below](#answering-held-items)), an ancestor deleted with such evidence, or our own executor having removed or detached it.
 * **Missing**: the item is gone with no evidence, e.g. after a journal loss and rescan, or a mirror rebuild. **Missing never causes a deletion.** The item is held and reported (data-safety invariant 3).
 
 ## Merge rules (one Synced item)
@@ -46,6 +46,21 @@ Principles behind the table:
 * If a folder was deleted on one side but something must now go into it there (a new or changed file, an item moved into it), the folder is **re-created** ("resurrected") first. If its parent was deleted too, the walk goes up to the highest deleted ancestor, and later rounds work back down. Unchanged children still follow the deletion.
 * Moves that would put a folder inside itself (moved into each other on the two sides) are undone: one side's move is reverted rather than looping.
 * **A OneDrive folder that isn't empty when deleted.** The Remote tree doesn't list what the rules leave out by name (`__pycache__`, `node_modules`…), so a folder holding only those looks empty to the planner and isn't to Graph. Graph's refusal is `CloudError::NotEmpty` → `Skip::NotEmpty`, which waits for a change (something new in the folder marks it), and the folder is listed in `oneup unsynced` (`Why::NotEmpty`) with `oneup cloud prune` as the way to clear such leftovers.
+
+## Answering held items
+What can't sync until the user acts (`oneup_app::unsynced`) can be answered from the settings window or `oneup unsynced resolve`. The answer is queued in `meta` (`unsynced.resolve`, at most 1,000) and the agent nudged; the next round takes the queue before it plans (`oneup_app::resolve::apply_queued`), each answer checked against the state then, in its own transaction, and logged to the activity log (*Note* "resolve", or *Failed* with why). None of it touches user content: `oneup_exec::resolve` only changes what the planner reads, so what follows is planned, reviewed by the gate (circuit breakers included) and run with the usual preconditions.
+
+| Held as | Choice | What it changes | Then |
+|---|---|---|---|
+| Gone from this PC | Delete in OneDrive | local deletion noted for it and everything under it still gone (`local_gone`), folders marked | `DeleteRemote` with `If-Match`; a cloud edit since wins and comes back here |
+| | Restore | its Synced record and those under it dropped | the cloud item reads as new: downloaded |
+| | Keep in OneDrive (backup pairs) | local deletion noted | nothing: a backup keeps what this PC deletes |
+| Gone from OneDrive | Delete here | cloud deletion noted (`remote_gone`) | `RecycleLocal` into the version store; a local edit since is uploaded instead |
+| | Upload | Synced records dropped | the local item reads as new: uploaded |
+| Refused name, names differing by case | Rename | an `Op::RenameLocal` added to the round (after planning, before the gate) | renamed by ID, stamp checked, never over a name; then uploaded |
+| Too large, special item, name taken | Exclude | a rule (`filetree::set_sync`, as the Files page) | left out |
+
+A dropped record deletes nothing: the side that has the item sends it as new, and a name taken meanwhile is paired by content or kept as both. Each choice is refused if it no longer fits: the item came back, is gone from the other side too, or the folder it would go into is gone too (restore or upload that folder first). Deletions are noted only for items gone from the Local tree that don't open by their ID in the sync folder (`LocalFs::is_present`), or that the mirror doesn't have. A rename stays queued until a round runs it, since a round can end before running anything and a rename isn't planned again from marks. Answered items leave the record with what was held below them (`unsynced::answered`). A folder held as not empty has no choice: its contents are listed from the trees (`resolve::inside`), and its leftovers are the user's to look at.
 
 ## Name collisions
 After each item is decided, a resolve pass checks every operation that needs a free name, e.g. "create `b` in folder X", "move to `b`":
@@ -234,7 +249,7 @@ Seeds: `SIM_SEEDS=N` (default 200), `SIM_SEED=n` to replay one, `SIM_DEBUG=1` to
 Scenario tests pin the headline behaviours: first-sync adoption (identical files paired, different ones both kept); an atomic save updates the same cloud item (version history continues); a swap of two names renames rather than re-uploads; an edit beats a deletion; "missing without evidence" is held, never deleted; a record is forgotten only when both sides are deleted; a missing sync folder halts everything; a folder deleted in the cloud survives for a new local file; folders moved into each other don't loop.
 
 ## End-to-end tests (`crates/oneup-exec/tests/sync.rs`)
-A real temp folder goes through the real scanner, observer, planner, gate, effects and executor, with a fake cloud that enforces eTags and name conflicts. Rounds run until both sides are identical and a round changes nothing, and the store's invariants must hold. Besides the first sync, edits, deletions, renames, conflicts, the version store, busy files and parking, the `everyday_` tests take one scenario per thing people do in File Explorer and on the web.
+A real temp folder goes through the real scanner, observer, planner, gate, effects and executor, with a fake cloud that enforces eTags and name conflicts. Rounds run until both sides are identical and a round changes nothing, and the store's invariants must hold. Besides the first sync, edits, deletions, renames, conflicts, the version store, busy files and parking, the `everyday_` tests take one scenario per thing people do in File Explorer and on the web, and the `held_items_`/`chosen_` tests carry out each answer for a held item, with its refusals (still here, folder gone too, names taken or refused, a stamp changed after the choice) and a batch that trips the breaker.
 
 ## Limits
 * The simulation doesn't model a stale Remote tree (delta lag) or crashes in the middle of an effect: for example, between a replacing download moving the old file into the version store and renaming the new one into place. The old file is safe in the version store then, but whether the next rounds restore the new one cleanly is untested.
