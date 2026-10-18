@@ -1170,7 +1170,8 @@ impl Engine {
             // renames join this round's plan, for the gate like the rest.
             let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
             let fs = self.exec.local();
-            let mut chosen = crate::resolve::apply_queued(&mut store, backup, &|id| fs.is_present(id))?;
+            // "Can't tell" counts as here: nothing is noted gone on a doubt.
+            let mut chosen = crate::resolve::apply_queued(&mut store, backup, &|id| fs.presence(id) != Some(false))?;
             log_activity(&mut store, std::mem::take(&mut chosen.log))?;
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;

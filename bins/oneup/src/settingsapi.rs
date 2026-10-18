@@ -609,9 +609,10 @@ pub fn unsynced(dir: &Path) -> Result<Value> {
             let here = local
                 .as_ref()
                 .is_some_and(|l| std::fs::symlink_metadata(l.join(i.path.trim_start_matches('/'))).is_ok());
-            let waits = queued.iter().find(|q| q.path.eq_ignore_ascii_case(&i.path)).map(|q| q.choice.label());
+            let waits = queued.iter().find(|q| q.path == i.path).map(|q| q.choice.label());
+            let subject = store.read(|o| crate::resolve::subject(o, i)).ok().flatten();
             json!({ "path": i.path, "why": i.why.title(), "detail": i.why.label(), "kind": i.why.code(),
-                "choices": choices, "nested": nested, "here": here, "queued": waits })
+                "choices": choices, "nested": nested, "here": here, "queued": waits, "subject": subject })
         })
         .collect();
     Ok(json!({ "items": items, "more": r.more, "backup": backup }))
@@ -630,13 +631,26 @@ pub fn unsynced_inside(dir: &Path, path: &str) -> Result<Value> {
 /// `oneup unsynced resolve` works it out): how many items it concerns,
 /// folders' contents included, and the items refused now. `path`: one
 /// listed item; `None`: every item the choice fits.
-pub fn unsynced_preview(dir: &Path, path: Option<&str>, choice: &str, name: Option<&str>) -> Result<Value> {
+/// `subject`: for one item, which item the window listed
+/// (`resolve::subject`); refused if it's another now.
+pub fn unsynced_preview(
+    dir: &Path,
+    path: Option<&str>,
+    subject: Option<&str>,
+    choice: &str,
+    name: Option<&str>,
+) -> Result<Value> {
     let choice = crate::resolve::Choice::from_code(choice).with_context(|| format!("unknown choice: {choice}"))?;
     let store = crate::setup::open_store(dir, 1024)?;
     let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
     let record = crate::unsynced::load(&store)?;
     let paths = path.map(|p| vec![p.to_string()]);
     let items = crate::resolve::select(&record, Some(choice), paths.as_deref(), backup)?;
+    if let (Some(want), [item]) = (subject, items.as_slice())
+        && store.read(|o| crate::resolve::subject(o, item))?.as_deref() != Some(want)
+    {
+        bail!("{} changed since it was listed; look again", item.path);
+    }
     let p = crate::resolve::prepare(&store, &items, choice, name, backup)?;
     let tops: Vec<&str> = p.asked.iter().map(|r| r.path.as_str()).collect();
     Ok(json!({ "items": p.items, "tops": tops, "refused": p.refused, "code": p.code }))
@@ -901,7 +915,7 @@ mod tests {
             let record = r#"{"items":[["/old","gone_here"],["/old/a.txt","gone_here"],["/bad|name","invalid_name"]]}"#;
             s.write(|o| o.meta_set(crate::unsynced::KEY, record)).unwrap();
             let r = crate::resolve::Request {
-                path: "/OLD".into(),
+                path: "/old".into(),
                 choice: crate::resolve::Choice::Restore,
                 name: None,
                 id: None,
@@ -919,6 +933,11 @@ mod tests {
         assert_eq!(codes(1), ["delete-in-onedrive"]);
         assert_eq!((codes(2), &v["items"][2]["kind"]), (vec!["rename"], &json!("invalid_name")));
         assert_eq!(v["items"][0]["choices"][0]["deletes"], true);
+        // Not synced here, so nothing to bind to: the preview refuses an
+        // answer for an item other than the one listed.
+        assert_eq!(v["items"][0]["subject"], Value::Null);
+        let e = unsynced_preview(&dir, Some("/old"), Some("s:99"), "restore", None).unwrap_err();
+        assert!(format!("{e:#}").contains("changed since it was listed"), "{e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

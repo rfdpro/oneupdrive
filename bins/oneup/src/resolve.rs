@@ -98,7 +98,7 @@ impl Choice {
 
     /// Fits many items at once (`--all`, the window's "all" buttons).
     pub fn in_bulk(self) -> bool {
-        !matches!(self, Choice::Rename | Choice::Exclude)
+        self != Choice::Rename
     }
 }
 
@@ -160,15 +160,34 @@ fn save(o: &Ops<'_>, q: &[Request]) -> oneup_store::Result<()> {
 }
 
 /// Adds answers to the queue, replacing one waiting for the same item.
+/// Refused, adding none, if that would make more than [`MAX`] wait.
 pub fn ask(store: &mut Store, asked: &[Request]) -> Result<()> {
-    store.write(|o| {
+    let waiting = store.write(|o| {
         let mut q = queued(o)?;
         q.retain(|r| !asked.iter().any(|a| a.path == r.path));
+        if q.len() + asked.len() > MAX {
+            return Ok(Some(q.len()));
+        }
         q.extend(asked.iter().cloned());
-        q.truncate(MAX);
-        save(o, &q)
+        save(o, &q)?;
+        Ok(None)
     })?;
+    if let Some(n) = waiting {
+        anyhow::bail!("{n} answers wait already (at most {MAX}); let OneUpDrive carry them out first");
+    }
     Ok(())
+}
+
+/// Which item the record's `item` is now, as the window showed it: its
+/// Synced record, or for a name to change its file (ID, size and
+/// last-write time). `None` if it can't be found. An answer the window
+/// gives for an item is refused if this changed since it was listed.
+pub fn subject(o: &Ops<'_>, item: &Item) -> oneup_store::Result<Option<String>> {
+    if matches!(item.why, Why::NameClash | Why::InvalidName) {
+        let Some(l) = local_at(o, &item.path)? else { return Ok(None) };
+        return Ok(o.local_get(l.0)?.map(|r| format!("l:{:x}:{}:{}", r.file_id, r.size, r.mtime)));
+    }
+    Ok(record_of(o, item)?.map(|sid| format!("s:{sid}")))
 }
 
 /// The parts of a record path (`/docs/a.txt`).
@@ -409,7 +428,9 @@ pub fn select<'a>(
 ) -> Result<Vec<&'a Item>> {
     let Some(paths) = paths else {
         let Some(c) = choice.filter(|c| c.in_bulk()) else {
-            anyhow::bail!("--all needs --delete-in-onedrive, --keep-in-onedrive, --restore, --delete-here or --upload");
+            anyhow::bail!(
+                "--all needs --delete-in-onedrive, --keep-in-onedrive, --restore, --delete-here, --upload or --exclude"
+            );
         };
         return Ok(record.items.iter().filter(|i| choices(i.why, backup).contains(&c)).collect());
     };
@@ -551,6 +572,19 @@ mod tests {
         );
         s.write(|o| o.meta_set(KEY, "{nonsense")).unwrap();
         assert!(s.read(queued).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_full_queue_refuses_more_answers_and_keeps_what_waits() {
+        let mut s = Store::open_in_memory().unwrap();
+        let many: Vec<Request> = (0..MAX).map(|n| req(&format!("/f{n}"), Choice::Restore)).collect();
+        ask(&mut s, &many).unwrap();
+        assert!(ask(&mut s, &[req("/one-more", Choice::Restore)]).is_err());
+        // Replacing an answer that waits isn't one more.
+        ask(&mut s, &[req("/f7", Choice::DeleteInOnedrive)]).unwrap();
+        let q = s.read(queued).unwrap();
+        assert_eq!(q.len(), MAX);
+        assert!(!q.iter().any(|r| r.path == "/one-more"));
     }
 
     #[test]

@@ -949,7 +949,8 @@ struct ResolveArgs {
     /// Leave it out of sync (adds a rule)
     #[arg(long, group = "choice")]
     exclude: bool,
-    /// Go ahead with a deletion (without it, only shows what would be deleted)
+    /// Go ahead (without it, only shows what would be done; --exclude
+    /// needs none)
     #[arg(long)]
     yes: bool,
     #[command(flatten)]

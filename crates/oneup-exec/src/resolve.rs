@@ -63,6 +63,8 @@ pub enum Refused {
     NameTaken,
     #[error("OneDrive has another item of that name in its folder")]
     NameTakenThere,
+    #[error("it holds more than 100,000 items; choose folders inside it")]
+    TooMany,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -178,17 +180,34 @@ fn record(o: &Ops<'_>, sid: Sid) -> Result<Base> {
     }
 }
 
+/// At most this many records one answer may concern: what it walks, the
+/// IDs a deletion keeps until it's written, and the write transaction
+/// that holds the store meanwhile all stay bounded.
+pub const MAX_ITEMS: usize = 100_000;
+
 /// Calls `f` for `b` and every record below it, parents first, holding
-/// one folder's records at a time.
-fn walk(o: &Ops<'_>, b: Base, mut f: impl FnMut(&Base) -> Result<()>) -> Result<()> {
+/// one folder's records at a time; refused past [`MAX_ITEMS`].
+fn walk(o: &Ops<'_>, b: Base, f: impl FnMut(&Base) -> Result<()>) -> Result<()> {
+    walk_at_most(o, b, MAX_ITEMS, f)
+}
+
+fn walk_at_most(o: &Ops<'_>, b: Base, max: usize, mut f: impl FnMut(&Base) -> Result<()>) -> Result<()> {
+    let mut seen = 0;
+    let mut visit = |b: &Base| {
+        seen += 1;
+        if seen > max {
+            return Err(Error::Refused(Refused::TooMany));
+        }
+        f(b)
+    };
     let mut folders = std::collections::VecDeque::new();
-    f(&b)?;
+    visit(&b)?;
     if b.kind == NodeKind::Folder {
         folders.push_back(b.sid);
     }
     while let Some(sid) = folders.pop_front() {
         for k in o.synced_children(sid)? {
-            f(&k)?;
+            visit(&k)?;
             if k.kind == NodeKind::Folder {
                 folders.push_back(k.sid);
             }
@@ -356,5 +375,52 @@ fn gone_there_still_here(o: &Ops<'_>, b: &Base) -> Result<LocalId> {
     match b.local {
         Some(l) if o.local_get(l.0)?.is_some() => Ok(l),
         _ => Err(Refused::GoneHereToo.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use oneup_store::Store;
+
+    #[test]
+    fn a_walk_stops_past_its_limit() {
+        let mut s = Store::open_in_memory().unwrap();
+        let base = |sid, parent, kind| Base {
+            sid,
+            parent,
+            name: format!("n{sid}"),
+            kind,
+            size: 0,
+            hash: None,
+            local: None,
+            local_mtime: 0,
+            remote: None,
+            remote_etag: String::new(),
+        };
+        s.write(|o| {
+            o.synced_put(&base(ROOT, None, NodeKind::Folder))?;
+            o.synced_put(&base(1, Some(ROOT), NodeKind::Folder))?;
+            for sid in 2..6 {
+                o.synced_put(&base(sid, Some(1), NodeKind::File))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let count = |max| {
+            s.read(|o| {
+                let mut n = 0;
+                let b = o.synced_get(1)?.unwrap();
+                Ok(walk_at_most(o, b, max, |_| {
+                    n += 1;
+                    Ok(())
+                })
+                .map(|()| n))
+            })
+            .unwrap()
+        };
+        assert_eq!(count(5).ok(), Some(5));
+        assert!(matches!(count(4), Err(Error::Refused(Refused::TooMany))));
     }
 }

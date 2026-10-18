@@ -2939,32 +2939,52 @@
             }), list, cloud)));
         }
 
-        // Asks before anything is deleted, before a choice for many items,
-        // and for a new name; the rest are queued at once. What's asked
-        // about is worked out by OneUpDrive first (`unsynced_preview`): the
-        // items it concerns, folders' contents included, and a code for
-        // exactly those, which the answer then must still match (`--expect`).
+        // Every answer but an exclusion is worked out by OneUpDrive first
+        // (`unsynced_preview`), for the item as it was listed (its `subject`):
+        // the items it concerns, folders' contents included, and a code for
+        // exactly those, which it must still match when it's given
+        // (`--expect`). Deletions, a choice for many items and a new name are
+        // asked about first.
+        function preview(c, items, bulk, name = null) {
+            return call("unsynced_preview", {
+                root: L.root,
+                choice: c.code,
+                path: bulk ? undefined : items[0].path,
+                subject: bulk ? undefined : items[0].subject || undefined,
+                name: name === null ? undefined : name
+            }).then(pv => {
+                if (!pv.tops.length) throw new Error(pv.refused.join(" ") || "Nothing to do.");
+                return pv;
+            });
+        }
+
         async function resolveAsk(c, items, bulk) {
-            const rename = c.code === "rename";
-            if (!bulk && !c.deletes && !rename) return resolveGo(c, items, bulk);
+            const rename = c.code === "rename",
+                exclude = c.code === "exclude";
             const one = items[0];
+            if (!bulk && exclude) return resolveGo(c, items, false);
+            if (!bulk && !c.deletes && !rename) {
+                const pv = await preview(c, items, false).catch(e => {
+                    toast(e.message, true);
+                    return null;
+                });
+                return pv && resolveGo(c, items, false, null, pv.code);
+            }
             const li = t => el("li", {
                 textContent: t
             });
             const facts = [];
             let expect = null;
             if (rename) facts.push(li(one.path));
-            else {
-                const pv = await call("unsynced_preview", {
-                    root: L.root,
-                    choice: c.code,
-                    path: bulk ? undefined : one.path
-                }).catch(e => {
+            else if (exclude) {
+                facts.push(...items.slice(0, 5).map(i => li(i.path)));
+                if (items.length > 5) facts.push(li(`and ${(items.length - 5).toLocaleString()} more`));
+            } else {
+                const pv = await preview(c, items, bulk).catch(e => {
                     toast(e.message, true);
                     return null;
                 });
                 if (!pv) return;
-                if (!pv.tops.length) return toast(pv.refused.join(" ") || "Nothing to do.", true);
                 expect = pv.code;
                 facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
                 if (pv.tops.length > 5) facts.push(li(`and ${(pv.tops.length - 5).toLocaleString()} more`));
@@ -2983,7 +3003,17 @@
             go.disabled = false;
             go.onclick = async() => {
                 go.disabled = true;
-                const ok = await resolveGo(c, items, bulk, rename ? name.value.trim() : null, expect);
+                let code = expect;
+                if (rename) {
+                    // The name is checked, and bound, for the file listed.
+                    const pv = await preview(c, items, false, name.value.trim()).catch(e => {
+                        toast(e.message, true);
+                        return null;
+                    });
+                    if (!pv) return go.disabled = false;
+                    code = pv.code;
+                }
+                const ok = await resolveGo(c, items, bulk, rename ? name.value.trim() : null, code);
                 if (ok) $("#dlg-resolve").close();
                 else go.disabled = false;
             };

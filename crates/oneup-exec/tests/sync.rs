@@ -3566,7 +3566,7 @@ impl Sync {
     ) -> Result<usize, Refused> {
         let Self { obs, exec, extra, .. } = self;
         let fs = exec.local();
-        let present = |id| fs.is_present(id);
+        let present = |id| fs.presence(id) != Some(false);
         let done = obs.store_mut().try_write(|o| -> oneup_exec::resolve::Result<(usize, Option<Op>)> {
             let c = f(o, &present)?;
             let n = c.items();

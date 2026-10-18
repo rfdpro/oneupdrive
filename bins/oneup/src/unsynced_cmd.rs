@@ -72,17 +72,12 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         println!("Skipped {r}.");
     }
     let what = if p.asked.len() == 1 && p.items <= 1 { p.asked[0].path.clone() } else { format!("{} items", p.items) };
-    if choice.deletes() && !a.yes {
-        let to = if choice == Choice::DeleteHere {
-            "on this PC, into its kept copies (.oneup\\versions)"
-        } else {
-            "in OneDrive, into its recycle bin"
-        };
-        println!("Would delete {to}:");
+    if !a.yes {
+        println!("Would {}:", would(choice, a.name));
         for r in &p.asked {
             println!("  {}", r.path);
         }
-        println!("Add --yes to delete {what} (or --yes --expect {} to delete exactly these).", p.code);
+        println!("{}. Add --yes to go ahead, or --yes --expect {} for exactly these.", capital(&what), p.code);
         return Ok(());
     }
     resolve::ask(&mut store, &p.asked)?;
@@ -100,6 +95,24 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         println!("OneUpDrive isn't running; it does this when it starts (`oneup start`).");
     }
     Ok(())
+}
+
+/// What `choice` does, for "Would …:".
+fn would(choice: Choice, name: Option<&str>) -> String {
+    match choice {
+        Choice::DeleteInOnedrive => "delete in OneDrive, into its recycle bin".into(),
+        Choice::KeepInOnedrive => "keep in OneDrive (not synced back)".into(),
+        Choice::Restore => "restore from OneDrive".into(),
+        Choice::DeleteHere => "delete on this PC, into its kept copies (.oneup\\versions)".into(),
+        Choice::Upload => "upload again".into(),
+        Choice::Rename => format!("rename to {}", name.unwrap_or_default().trim()),
+        Choice::Exclude => "exclude".into(),
+    }
+}
+
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
 }
 
 /// What can be done about `i`, as options to type.

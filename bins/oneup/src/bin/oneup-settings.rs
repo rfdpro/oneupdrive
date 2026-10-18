@@ -546,8 +546,9 @@ mod win {
                 let (d, choice) = (dir.to_path_buf(), text(args, "choice"));
                 let path = args.get("path").and_then(Value::as_str).map(str::to_string);
                 let name = args.get("name").and_then(Value::as_str).map(str::to_string);
+                let subject = args.get("subject").and_then(Value::as_str).map(str::to_string);
                 tokio::task::spawn_blocking(move || {
-                    settingsapi::unsynced_preview(&d, path.as_deref(), &choice, name.as_deref())
+                    settingsapi::unsynced_preview(&d, path.as_deref(), subject.as_deref(), &choice, name.as_deref())
                 })
                 .await?
             }
