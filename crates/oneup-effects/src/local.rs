@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oneup_gate::{Approved, OldCopy};
 use oneup_ntfs::FileId;
 use oneup_ntfs::dirent::{DirEntry, FILE_ATTRIBUTE_REPARSE_POINT};
-use oneup_ntfs::win::{self, Handle, Volume};
+use oneup_ntfs::win::{self, Handle, Volume, WriteWatch};
 use oneup_rules::ENGINE_DIR;
 use oneup_sync::{Hash, LocalId, LocalPre, Op};
 
@@ -159,13 +159,66 @@ impl Drop for Staged {
     }
 }
 
-/// A local file opened for an upload. While this lives, nobody can write,
-/// rename or delete the file, so what is sent is exactly the checked stamp.
+/// A local file opened for an upload, at the checked stamp. Other programs
+/// may keep using it, writing included: a save must never fail because
+/// the file is being uploaded. Instead, every read through this fails with
+/// [`ChangedMeanwhile`] once anyone has written the file since it was
+/// opened, so a copy mixing two versions never completes an upload.
 #[derive(Debug)]
 pub struct UploadSource {
-    pub file: File,
+    file: File,
+    watch: WriteWatch,
     pub size: i64,
     pub mtime: i64,
+}
+
+impl UploadSource {
+    /// Whether nobody has written the file since it was opened: what was
+    /// read so far is the checked version.
+    pub fn unchanged(&self) -> bool {
+        !self.watch.broken()
+    }
+
+    pub fn rewind(&mut self) -> std::io::Result<()> {
+        use std::io::Seek as _;
+        self.file.rewind()
+    }
+}
+
+impl std::io::Read for UploadSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        if !self.unchanged() {
+            return Err(std::io::Error::other(ChangedMeanwhile));
+        }
+        Ok(n)
+    }
+}
+
+/// A planned file opened for reading at its checked stamp, watched for
+/// writes from the open on.
+struct OpenedToRead {
+    handle: Handle,
+    watch: WriteWatch,
+    size: i64,
+    mtime: i64,
+}
+
+impl OpenedToRead {
+    fn into_source(self) -> UploadSource {
+        UploadSource { file: self.handle.into_file(), watch: self.watch, size: self.size, mtime: self.mtime }
+    }
+}
+
+/// An [`UploadSource`]'s file was written while it was being read.
+#[derive(Debug, thiserror::Error)]
+#[error("the file changed while it was read")]
+pub struct ChangedMeanwhile;
+
+impl ChangedMeanwhile {
+    pub fn is(e: &std::io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
 }
 
 /// One sync folder, opened for changes after its identity check.
@@ -472,13 +525,13 @@ impl LocalFs {
         let Op::Upload { local, .. } = a.op() else {
             return Err(Error::WrongOp);
         };
-        let (h, size, mtime) = self.open_for_read(local)?;
+        let opened = self.open_for_read(local)?;
         // Reading a placeholder whose content isn't all here would ask the
         // cloud (ourselves) for it.
-        if self.on_demand && !self.fully_on_disk(&h, size) {
+        if self.on_demand && !self.fully_on_disk(&opened.handle, opened.size) {
             return Err(Error::NotOrdinary);
         }
-        Ok(UploadSource { file: h.into_file(), size, mtime })
+        Ok(opened.into_source())
     }
 
     /// The first `max` bytes of a file planned for upload, for the content
@@ -487,12 +540,12 @@ impl LocalFs {
     /// open elsewhere, or its content isn't all here).
     pub fn sample(&self, pre: &LocalPre, max: usize) -> Option<Vec<u8>> {
         use std::io::Read;
-        let (h, size, _) = self.open_for_read(pre).ok()?;
-        if self.on_demand && !self.fully_on_disk(&h, size) {
+        let opened = self.open_for_read(pre).ok()?;
+        if self.on_demand && !self.fully_on_disk(&opened.handle, opened.size) {
             return None;
         }
         let mut head = Vec::with_capacity(max);
-        h.into_file().take(max as u64).read_to_end(&mut head).ok()?;
+        opened.into_source().take(max as u64).read_to_end(&mut head).ok()?;
         Some(head)
     }
 
@@ -506,22 +559,22 @@ impl LocalFs {
             let hash = self.identity_hash(&h, size).ok_or(Error::NotOrdinary)?;
             return Ok(Done::Hashed { hash, size, mtime });
         }
-        let (handle, size, mtime) = self.open_for_read(pre)?;
+        let opened = self.open_for_read(pre)?;
+        let (size, mtime) = (opened.size, opened.mtime);
+        let handle = &opened.handle;
         if self.on_demand {
             // A placeholder whose identity vouches for its content is never
             // read (a dehydrated one would be downloaded from ourselves).
-            if let Some(hash) = self.identity_hash(&handle, size) {
+            if let Some(hash) = self.identity_hash(handle, size) {
                 return Ok(Done::Hashed { hash, size, mtime });
             }
-            if !self.fully_on_disk(&handle, size) {
+            if !self.fully_on_disk(handle, size) {
                 return Err(Error::NotOrdinary);
             }
         }
-        let file = handle.into_file();
         let mut buf = vec![0u8; 1 << 20];
-        let h = oneup_hash::hash_reader(&file, &mut buf)?;
-        // Writers are excluded while we hold the file, so this only fails
-        // if the file system lied about the size.
+        let h = oneup_hash::hash_reader(opened.into_source(), &mut buf)
+            .map_err(|e| if ChangedMeanwhile::is(&e) { Error::Changed } else { e.into() })?;
         if i64::try_from(h.len()).ok() != Some(size) {
             return Err(Error::Changed);
         }
@@ -853,8 +906,7 @@ impl LocalFs {
         Ok((h, entry, path))
     }
 
-    /// Opens a planned file for reading with writers excluded.
-    fn open_for_read(&self, pre: &LocalPre) -> Result<(Handle, i64, i64)> {
+    fn open_for_read(&self, pre: &LocalPre) -> Result<OpenedToRead> {
         let Some(stamp) = pre.stamp else {
             return Err(Error::WrongOp);
         };
@@ -863,13 +915,13 @@ impl LocalFs {
             // Opening it with data access would download it from ourselves.
             return Err(Error::NotOrdinary);
         }
-        let h = self.volume.open_for_upload(id)?;
+        let (h, watch, path) = self.volume.open_watched(id)?;
         let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
         check_placeholder(&entry, Some(stamp), self.on_demand)?;
-        if !self.is_inside(&long(&win::final_path(&h)?)) {
+        if !self.is_inside(&path) {
             return Err(Error::Outside);
         }
-        Ok((h, stamp.0, stamp.1))
+        Ok(OpenedToRead { handle: h, watch, size: stamp.0, mtime: stamp.1 })
     }
 
     /// Opens destination folder `id`, pinned in place for as long as the

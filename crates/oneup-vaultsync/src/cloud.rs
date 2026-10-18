@@ -279,9 +279,9 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
                 Ok((self.row(&r, Some(&r), &parent.0, name, size), Some(hash)))
             }
             Stored::Short { dir, name: full } => {
-                let holder = self.inner.mkdir(&RemoteId(storage), &dir).await?;
-                self.record(&[&holder])?;
-                self.put_small(&holder.id, NAME_FILE, full.as_bytes()).await?;
+                // One left without content by an upload cut short (the file
+                // was saved while read) is used again.
+                let holder = self.shell(&storage, &dir, Some(&full)).await?;
                 let (c, hash) = self.put_content(&holder.id, CONTENTS_FILE, None, size, src).await?;
                 self.set_node(
                     &holder.id,

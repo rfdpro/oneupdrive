@@ -682,7 +682,6 @@ impl<C: Cloud> Executor<C> {
         new: bool,
         alone: bool,
     ) -> Res<Option<(RemoteRow, Hash)>> {
-        use std::io::{Seek, SeekFrom};
         if !may_copy(self.cloud.can_copy(), new, src.size) || (src.size > READ_ALONE && !alone) {
             return Ok(None);
         }
@@ -691,8 +690,12 @@ impl<C: Cloud> Executor<C> {
             return Ok(None);
         }
         let mut buf = vec![0u8; 1 << 20];
-        let h = oneup_hash::hash_reader(&src.file, &mut buf).map_err(|e| Fail::Failed(e.to_string()))?;
-        src.file.seek(SeekFrom::Start(0)).map_err(|e| Fail::Failed(e.to_string()))?;
+        let h = match oneup_hash::hash_reader(&mut *src, &mut buf) {
+            Ok(h) => h,
+            Err(e) if oneup_effects::ChangedMeanwhile::is(&e) => return Err(Fail::Skip(Skip::Changed)),
+            Err(e) => return Err(Fail::Failed(e.to_string())),
+        };
+        src.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
         let hash = h.finalize();
         if i64::try_from(h.len()).ok() != Some(src.size) {
             return Err(Fail::Skip(Skip::Changed));
@@ -1295,7 +1298,6 @@ impl<C: Cloud> Executor<C> {
                 store.try_write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some()))?;
                 let mut src = self.fs.open_upload(a)?;
                 let (size, mtime) = (src.size, src.mtime);
-                // The file stays open (no writers) from here until recorded.
                 let (row, sent, sent_len, mark) = match self
                     .copy_instead(store, &mut src, to, name, replace.is_none(), alone)
                     .await?
@@ -1319,27 +1321,42 @@ impl<C: Cloud> Executor<C> {
                             },
                             None => None,
                         };
-                        let mut reader = Hashing::new(&mut src.file);
-                        let (row, sent) = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await?;
+                        let mut reader = Hashing::new(&mut src);
+                        let uploaded = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await;
+                        let (row, sent) = match uploaded {
+                            Err(CloudError::Io(e)) if oneup_effects::ChangedMeanwhile::is(&e) => {
+                                return Err(Fail::Skip(Skip::Changed));
+                            }
+                            r => r?,
+                        };
                         // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
                         (row, sent.unwrap_or_else(|| reader.hash.finalize()), reader.hash.len(), mark)
                     }
                 };
                 self.crash_point()?;
+                // Written after its last read: what was sent is one version,
+                // but the stamp no longer vouches for what's here, so the
+                // next round hashes the file again (a same-size write that
+                // kept the time would otherwise look synced).
+                let written = !src.unchanged();
                 drop(src);
+                let local_mtime = if written { STAMP_UNKNOWN } else { mtime };
                 store.try_write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?))?;
                 if row.qxh != Some(sent) || i64::try_from(sent_len).ok() != Some(size) || row.size != size {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }
                 store.try_write(|o| {
-                    o.local_hash_put(local.id.0, size, mtime, &sent)?;
-                    let b = file_base(*parent, name, size, sent, local.id, mtime, &row);
+                    if !written {
+                        o.local_hash_put(local.id.0, size, mtime, &sent)?;
+                    }
+                    let b = file_base(*parent, name, size, sent, local.id, local_mtime, &row);
                     link_row(o, *link, b)
                 })?;
                 // On demand: the file now is (or stays) a placeholder in sync
                 // with what was sent. Best effort: if it changed meanwhile,
                 // the next round sends it again.
                 if self.fs.on_demand()
+                    && !written
                     && let Some(mut v) = version(&row)
                 {
                     v.modified = mtime;
@@ -1823,6 +1840,10 @@ fn link_row(o: &Ops<'_>, link: Link, b: Base) -> Res {
     }
     Ok(())
 }
+
+/// A synced file's last-write time when it isn't known: no file has it,
+/// so the next round sees the file as changed and hashes it.
+const STAMP_UNKNOWN: i64 = 0;
 
 fn file_base(
     parent: Sid,

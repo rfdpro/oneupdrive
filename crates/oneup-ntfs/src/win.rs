@@ -10,14 +10,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_DELETE_PENDING, ERROR_FILE_EXISTS,
-    ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES,
-    ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION, HANDLE, WIN32_ERROR,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANNOT_GRANT_REQUESTED_OPLOCK, ERROR_DELETE_PENDING,
+    ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_INVALID_PARAMETER, ERROR_IO_PENDING,
+    ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES, ERROR_OPLOCK_NOT_GRANTED, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    HANDLE, STATUS_PENDING, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, ExtendedFileIdType, FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
-    FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_DISPOSITION_INFO_EX_FLAGS, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
     FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_INFO,
     FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
@@ -26,8 +27,12 @@ use windows::Win32::Storage::FileSystem::{
     FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumePathNameW,
     OPEN_EXISTING, OpenFileById, SetFileInformationByHandle,
 };
-use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, READ_USN_JOURNAL_DATA_V1, USN_JOURNAL_DATA_V2};
+use windows::Win32::System::IO::{CancelIoEx, DeviceIoControl, GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Ioctl::{
+    FSCTL_QUERY_USN_JOURNAL, FSCTL_REQUEST_OPLOCK, OPLOCK_LEVEL_CACHE_READ, READ_USN_JOURNAL_DATA_V1,
+    REQUEST_OPLOCK_CURRENT_VERSION, REQUEST_OPLOCK_INPUT_BUFFER, REQUEST_OPLOCK_INPUT_FLAG_REQUEST,
+    REQUEST_OPLOCK_OUTPUT_BUFFER, USN_JOURNAL_DATA_V2,
+};
 use windows::core::PCWSTR;
 
 use crate::FileId;
@@ -61,9 +66,15 @@ impl Error {
         self.is(&[ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_DELETE_PENDING])
     }
 
-    /// Another program has the item open in a way that excludes us.
+    /// Another program has the item open in a way that excludes us (or,
+    /// for [`Volume::open_watched`], mapped for writing).
     pub fn is_busy(&self) -> bool {
-        self.is(&[ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION])
+        self.is(&[
+            ERROR_SHARING_VIOLATION,
+            ERROR_LOCK_VIOLATION,
+            ERROR_OPLOCK_NOT_GRANTED,
+            ERROR_CANNOT_GRANT_REQUESTED_OPLOCK,
+        ])
     }
 
     /// The target name is taken.
@@ -205,6 +216,14 @@ pub fn open_path_for_dehydrated(path: &Path) -> Result<Handle> {
         DELETE.0 | FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         FILE_FLAG_BACKUP_SEMANTICS,
+    )
+}
+
+fn open_path_for_read(path: &Path, extra: FILE_FLAGS_AND_ATTRIBUTES) -> Result<Handle> {
+    open(
+        path,
+        FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT | extra,
     )
 }
 
@@ -405,26 +424,32 @@ impl Volume {
     /// checked is exactly what is then changed.
     ///
     /// Files are opened **exclusively** (no sharing at all): while we hold
-    /// the handle nobody can write, rename or delete the file, and if
+    /// the handle nobody can write, rename or delete the file (so hold it
+    /// only for the change itself, never across a transfer), and if
     /// anyone has it open already the open fails ([`Error::is_busy`]),
     /// which means "in use, try again later". Folders are shared for
     /// reading and writing (their children stay usable) but not for
     /// deletion, so nobody can move or delete the folder meanwhile.
     pub fn open_for_change(&self, id: FileId, folder: bool) -> Result<Handle> {
         // NTFS refuses to rename through a handle opened by ID ("invalid
-        // parameter", tested), so: find the item's current path by ID, open
-        // that path, and prove the handle is still the same item. If it
-        // was moved or replaced in between, the IDs differ and we report
-        // "not found", which callers treat as "changed, re-plan".
-        let path = {
-            let probe = self.open_by_id(id, FILE_READ_ATTRIBUTES.0)?;
-            let mut long = std::ffi::OsString::from(r"\\?\");
-            long.push(final_path(&probe)?.as_os_str());
-            PathBuf::from(long)
-        };
-        let h = open_path_for_change(&path, folder)?;
+        // parameter", tested).
+        self.open_through_path(id, |path| open_path_for_change(path, folder))
+    }
+
+    fn open_through_path(&self, id: FileId, open: impl FnOnce(&Path) -> Result<Handle>) -> Result<Handle> {
+        self.same_item(id, open(&self.current_path(id)?)?)
+    }
+
+    fn current_path(&self, id: FileId) -> Result<PathBuf> {
+        let probe = self.open_by_id(id, FILE_READ_ATTRIBUTES.0)?;
+        let mut long = std::ffi::OsString::from(r"\\?\");
+        long.push(final_path(&probe)?.as_os_str());
+        Ok(PathBuf::from(long))
+    }
+
+    fn same_item(&self, id: FileId, h: Handle) -> Result<Handle> {
         if file_id(&h)?.1 != id {
-            return Err(Error::Win32 { op: "open_for_change", source: ERROR_FILE_NOT_FOUND.into() });
+            return Err(Error::Win32 { op: "open_through_path", source: ERROR_FILE_NOT_FOUND.into() });
         }
         Ok(h)
     }
@@ -445,11 +470,17 @@ impl Volume {
         self.open_by_id_shared(id, FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ | FILE_SHARE_WRITE)
     }
 
-    /// Opens a file by ID to read its content for an upload: others may
-    /// keep reading it, but nobody can write, rename or delete it until the
-    /// handle is closed, so the bytes sent are the bytes that were checked.
-    pub fn open_for_upload(&self, id: FileId) -> Result<Handle> {
-        self.open_by_id_shared(id, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ)
+    /// Opens file `id` for reading as [`Volume::open_file_by_id`] does,
+    /// with a [`WriteWatch`] started before it, so any write after the open
+    /// breaks the watch. Also returns the path it was opened at (`\\?\`
+    /// form). Fails with [`Error::is_busy`] if some program has it mapped
+    /// for writing (writes through a mapping that exists already wouldn't
+    /// break the watch, and Windows doesn't grant it then).
+    pub fn open_watched(&self, id: FileId) -> Result<(Handle, WriteWatch, PathBuf)> {
+        let path = self.current_path(id)?;
+        let watch = WriteWatch::start(self.same_item(id, open_path_for_read(&path, FILE_FLAG_OVERLAPPED)?)?)?;
+        let h = self.same_item(id, open_path_for_read(&path, FILE_FLAGS_AND_ATTRIBUTES(0))?)?;
+        Ok((h, watch, path))
     }
 
     /// Opens a directory for listing by its file ID. Reparse points are opened
@@ -463,6 +494,9 @@ impl Volume {
 
     /// Opens a file by its ID for reading its contents (and attributes).
     /// Read-only and fully shared, so other programs are not disturbed.
+    /// Opened through its path: a handle opened by ID stops other programs
+    /// from replacing the file by renaming another over it (how many save),
+    /// whatever its sharing (measured).
     ///
     /// Caution: opening does not stop a cloud provider from downloading a
     /// dehydrated placeholder once its data is read. Not even
@@ -470,7 +504,7 @@ impl Volume {
     /// check [`attribute_tag`] on the returned handle and refuse to read cloud
     /// placeholders.
     pub fn open_file_by_id(&self, id: FileId) -> Result<Handle> {
-        self.open_by_id(id, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0)
+        self.open_through_path(id, |path| open_path_for_read(path, FILE_FLAGS_AND_ATTRIBUTES(0)))
     }
 
     fn open_by_id(&self, id: FileId, access: u32) -> Result<Handle> {
@@ -495,6 +529,115 @@ impl Volume {
             )
         };
         win("OpenFileById", h).map(Handle)
+    }
+}
+
+/// A read oplock on a file: Windows breaks it as soon as another handle
+/// writes the file, changes its size or maps it for writing, without
+/// making that program wait. It lets a file be read (for an upload, a
+/// hash) while its program saves it: rather than locking writers out,
+/// which fails their save with a sharing violation, the reader checks
+/// [`WriteWatch::broken`] after reading and drops what it read if the file
+/// changed.
+///
+/// Reads and read-only opens don't break it, so the reader's own handle
+/// can be any read-only open. Renames and deletes don't either: they leave
+/// the content open handles read unchanged.
+pub struct WriteWatch {
+    handle: Handle,
+    // Written by Windows when the oplock breaks, so boxed (a fixed
+    // address) and kept until the request has finished (see `Drop`).
+    overlapped: Box<OVERLAPPED>,
+    output: Box<REQUEST_OPLOCK_OUTPUT_BUFFER>,
+}
+
+// SAFETY: the OVERLAPPED's pointers are unused (null), the kernel handle
+// may be used from any thread, and once started the boxes are only read
+// (with volatile reads) until `Drop`, which needs `&mut`.
+unsafe impl Send for WriteWatch {}
+// SAFETY: as above; `&self` methods only read.
+unsafe impl Sync for WriteWatch {}
+
+impl WriteWatch {
+    fn start(handle: Handle) -> Result<Self> {
+        let mut me = Self {
+            handle,
+            overlapped: Box::default(),
+            output: Box::new(REQUEST_OPLOCK_OUTPUT_BUFFER {
+                StructureVersion: REQUEST_OPLOCK_CURRENT_VERSION as u16,
+                StructureLength: size_of::<REQUEST_OPLOCK_OUTPUT_BUFFER>() as u16,
+                ..Default::default()
+            }),
+        };
+        let input = REQUEST_OPLOCK_INPUT_BUFFER {
+            StructureVersion: REQUEST_OPLOCK_CURRENT_VERSION as u16,
+            StructureLength: size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u16,
+            RequestedOplockLevel: OPLOCK_LEVEL_CACHE_READ,
+            Flags: REQUEST_OPLOCK_INPUT_FLAG_REQUEST,
+        };
+        // SAFETY: the input is copied during the call; the output buffer
+        // and the OVERLAPPED are boxed and outlive the request (`Drop`
+        // cancels it and waits for it before they are freed).
+        let r = unsafe {
+            DeviceIoControl(
+                me.handle.raw(),
+                FSCTL_REQUEST_OPLOCK,
+                Some(std::ptr::from_ref(&input).cast::<c_void>()),
+                size_of::<REQUEST_OPLOCK_INPUT_BUFFER>() as u32,
+                Some(std::ptr::from_mut(&mut *me.output).cast::<c_void>()),
+                size_of::<REQUEST_OPLOCK_OUTPUT_BUFFER>() as u32,
+                None,
+                Some(std::ptr::from_mut(&mut *me.overlapped)),
+            )
+        };
+        // Granted: the request stays pending until the oplock breaks.
+        if let Err(e) = &r
+            && e.code() == ERROR_IO_PENDING.to_hresult()
+        {
+            return Ok(me);
+        }
+        // Finished at once: nothing to watch with. Windows doesn't update
+        // the OVERLAPPED when a request fails at once, so it may still say
+        // "pending" (seen with a file mapped for writing): `Drop` must not
+        // wait for it.
+        me.overlapped.Internal = 0;
+        Err(Error::Win32 {
+            op: "FSCTL_REQUEST_OPLOCK",
+            source: r.err().unwrap_or_else(|| ERROR_OPLOCK_NOT_GRANTED.into()),
+        })
+    }
+
+    /// Whether the file may have been written since the watch started.
+    pub fn broken(&self) -> bool {
+        // The request finishes only when the oplock breaks (or is lost).
+        self.overlapped_status() != STATUS_PENDING.0 as usize
+    }
+
+    fn overlapped_status(&self) -> usize {
+        // SAFETY: Windows writes `Internal` when the request finishes; a
+        // volatile read sees that write, as `HasOverlappedIoCompleted` does.
+        unsafe { std::ptr::read_volatile(&raw const self.overlapped.Internal) }
+    }
+}
+
+impl Drop for WriteWatch {
+    fn drop(&mut self) {
+        if self.broken() {
+            return;
+        }
+        let mut n = 0;
+        // SAFETY: cancels our own pending request, then waits until Windows
+        // is done with the boxed buffers, before they are freed.
+        unsafe {
+            let _ = CancelIoEx(self.handle.raw(), Some(&*self.overlapped));
+            let _ = GetOverlappedResult(self.handle.raw(), &*self.overlapped, &mut n, true);
+        }
+    }
+}
+
+impl std::fmt::Debug for WriteWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteWatch").field("broken", &self.broken()).finish()
     }
 }
 
@@ -764,6 +907,101 @@ mod tests {
         assert_eq!(vol.listed_in(top, "*", entries[1].file_id).unwrap(), None, "a pattern finds one entry at most");
         assert_eq!(vol.listed_in(top, "none", entries[0].file_id).unwrap(), None);
         drop((h, sub));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_watch_sees_writes_and_blocks_none() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = std::env::temp_dir().join(format!("oneup-ntfs-watch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vol = Volume::open_containing(&dir).unwrap();
+        let file = dir.join("doc.txt");
+        let watch_with_reader = |content: &[u8]| {
+            std::fs::write(&file, content).unwrap();
+            let id = id_of(&dir, "doc.txt");
+            let (r, w, _) = vol.open_watched(id).unwrap();
+            (w, r)
+        };
+
+        let (w, r) = watch_with_reader(b"hello");
+        let mut got = Vec::new();
+        (&*r.as_file()).read_to_end(&mut got).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello");
+        assert!(!w.broken());
+
+        // A save in place: opening for writing alone doesn't break it, the
+        // write does, and the writer isn't kept waiting.
+        let mut f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        assert!(!w.broken());
+        f.write_all(b"HELLO").unwrap();
+        assert!(w.broken());
+        drop((f, w, r));
+
+        let (w, r) = watch_with_reader(b"hello");
+        std::fs::OpenOptions::new().write(true).truncate(true).open(&file).unwrap();
+        assert!(w.broken());
+        drop((w, r));
+
+        // Setting its length breaks it, even to the length it has.
+        let (w, r) = watch_with_reader(b"hello");
+        let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        f.set_len(5).unwrap();
+        assert!(w.broken());
+        drop((f, w, r));
+
+        // An atomic save (write a temp file, rename it over) succeeds; the
+        // open file keeps its old content, so nothing needs to break.
+        let (w, r) = watch_with_reader(b"hello");
+        std::fs::write(dir.join("doc.tmp"), b"new").unwrap();
+        std::fs::rename(dir.join("doc.tmp"), &file).unwrap();
+        (&*r.as_file()).seek(SeekFrom::Start(0)).unwrap();
+        let mut got = Vec::new();
+        (&*r.as_file()).read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hello");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new");
+        drop((w, r));
+
+        let (w, r) = watch_with_reader(b"hello");
+        std::fs::remove_file(&file).unwrap();
+        drop((w, r));
+        assert!(!file.exists());
+
+        // A program that had it open for writing before: its later
+        // writes break it too.
+        std::fs::write(&file, b"hello").unwrap();
+        let mut held = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        let w = vol.open_watched(id_of(&dir, "doc.txt")).unwrap().1;
+        assert!(!w.broken());
+        held.write_all(b"HELLO").unwrap();
+        assert!(w.broken());
+        drop((w, held));
+
+        // Writes through a mapping made before the watch would go unseen,
+        // so a file mapped for writing can't be watched. One mapped after
+        // breaks it as soon as the mapping is made.
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
+            let map = |f: &std::fs::File| {
+                // SAFETY: a valid file handle; the mapping is closed below.
+                unsafe { CreateFileMappingW(HANDLE(f.as_raw_handle()), None, PAGE_READWRITE, 0, 0, None) }.unwrap()
+            };
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&file).unwrap();
+            let m = Handle(map(&f));
+            drop(f);
+            let err = vol.open_watched(id_of(&dir, "doc.txt")).unwrap_err();
+            assert!(err.is_busy(), "{err}");
+            drop(m);
+            let w = vol.open_watched(id_of(&dir, "doc.txt")).unwrap().1;
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(&file).unwrap();
+            assert!(!w.broken());
+            let m = Handle(map(&f));
+            assert!(w.broken());
+            drop((m, f, w));
+        }
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
