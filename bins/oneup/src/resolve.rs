@@ -21,6 +21,7 @@ use oneup_exec::resolve::{self as core, Change};
 use oneup_store::{ActivityEntry, ActivityOutcome, Ops, Store};
 use oneup_sync::{LocalId, Op, ROOT, RemoteId, Sid};
 use serde_json::{Value, json};
+use sha2::Digest;
 
 use crate::unsynced::{Item, Record, Why};
 
@@ -124,8 +125,10 @@ pub struct Request {
     pub choice: Choice,
     /// The new name, for a rename.
     pub name: Option<String>,
-    /// Which item it was when chosen ([`identity`]): an answer is carried
-    /// out only for that one, never for another that took its path since.
+    /// What it concerned when chosen (`oneup_exec::resolve::Change::
+    /// fingerprint`: every record, by its sid and linked IDs): it's carried
+    /// out only if it still concerns exactly those, never another item that
+    /// took the path since, nor more items inside a folder.
     pub id: Option<String>,
 }
 
@@ -226,18 +229,6 @@ fn record_of(o: &Ops<'_>, item: &Item) -> oneup_store::Result<Option<Sid>> {
     Ok(b.map(|b| b.sid))
 }
 
-/// Which item the record's `item` is now, for `choice`: its Synced
-/// record, or for a rename its local item with the size and last-write
-/// time it has (a file changed since the choice is the user's to look at
-/// again). `None` if it can't be found.
-pub fn identity(o: &Ops<'_>, item: &Item, choice: Choice) -> oneup_store::Result<Option<String>> {
-    if choice == Choice::Rename {
-        let Some(l) = local_at(o, &item.path)? else { return Ok(None) };
-        return Ok(o.local_get(l.0)?.map(|r| format!("l:{:x}:{}:{}", r.file_id, r.size, r.mtime)));
-    }
-    Ok(record_of(o, item)?.map(|sid| format!("s:{sid}")))
-}
-
 /// Works out `choice` for the record's `item` against the state now,
 /// changing nothing. `present`: whether a local item still opens by its ID
 /// in the sync folder (the agent asks the folder; the command line, which
@@ -333,10 +324,10 @@ pub fn apply_queued(store: &mut Store, backup: bool, present: &dyn Fn(LocalId) -
             let item = crate::unsynced::find(&record, &req.path);
             let outcome = match item {
                 None => Err("it isn't in the list any more".to_string()),
-                Some(item) if identity(o, item, req.choice)? != req.id => {
-                    Err("it changed since you chose; choose again".to_string())
-                }
                 Some(item) => match check(o, item, req.choice, req.name.as_deref(), backup, present)? {
+                    Ok(c) if Some(c.fingerprint()) != req.id => {
+                        Err("it changed since you chose; choose again".to_string())
+                    }
                     Ok(c) => {
                         let items = c.items();
                         Ok((items, c.commit(o)?))
@@ -402,6 +393,10 @@ pub struct Prepared {
     pub items: usize,
     /// Those refused now, and why.
     pub refused: Vec<String>,
+    /// Of all of it (16 hex digits): the same exactly when the same answers
+    /// would concern the same items. What the window showed is carried out
+    /// only if it still is (`--expect`).
+    pub code: String,
 }
 
 /// The listed items `choice` is for: those at `paths` (as the record
@@ -439,20 +434,24 @@ pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str
         }
     }
     let mut out = Prepared::default();
+    let mut code = sha2::Sha256::new();
+    code.update(choice.code().as_bytes());
     for i in tops {
-        let worked = store.read(|o| {
-            let id = identity(o, i, choice)?;
-            Ok(check(o, i, choice, name, backup, &|_| false)?.map(|c| (c.items(), id)))
-        })?;
+        let worked =
+            store.read(|o| Ok(check(o, i, choice, name, backup, &|_| false)?.map(|c| (c.items(), c.fingerprint()))))?;
         match worked {
             Ok((n, id)) => {
                 out.items += n;
+                code.update(i.path.as_bytes());
+                code.update([0]);
+                code.update(id.as_bytes());
                 let name = name.map(|n| n.trim().to_string());
-                out.asked.push(Request { path: i.path.clone(), choice, name, id });
+                out.asked.push(Request { path: i.path.clone(), choice, name, id: Some(id) });
             }
             Err(why) => out.refused.push(format!("{}: {why}", i.path)),
         }
     }
+    out.code = code.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(out)
 }
 
@@ -486,27 +485,27 @@ pub struct Contents {
 /// here, else in OneDrive, read from the trees as last seen (nothing is
 /// opened or listed); at most `limit` items.
 pub fn inside(o: &Ops<'_>, path: &str, limit: usize) -> oneup_store::Result<Contents> {
-    let (side, mut items) = if let Some(l) = local_at(o, path)? {
-        let kids = o.local_children(l.0)?.into_iter().map(|k| Inside {
-            folder: k.kind == oneup_store::LocalKind::Folder,
-            excluded: k.skip == oneup_store::Skip::Excluded,
-            name: k.name,
-        });
-        ("local", kids.collect::<Vec<_>>())
-    } else if let Some(r) = remote_at(o, path)? {
-        let kids = o.remote_children(&r.0)?.into_iter().map(|(k, excluded)| Inside {
-            folder: k.kind == oneup_store::Kind::Folder,
-            excluded,
-            name: k.name,
-        });
-        ("remote", kids.collect())
-    } else {
-        return Ok(Contents::default());
-    };
-    let total = items.len();
-    items.sort_by(|a, b| a.name.cmp(&b.name));
-    items.truncate(limit);
-    Ok(Contents { side, total, items })
+    if let Some(l) = local_at(o, path)? {
+        let (total, kids) = o.local_children_first(l.0, limit)?;
+        let items = kids
+            .into_iter()
+            .map(|k| Inside {
+                folder: k.kind == oneup_store::LocalKind::Folder,
+                excluded: k.skip == oneup_store::Skip::Excluded,
+                name: k.name,
+            })
+            .collect();
+        return Ok(Contents { side: "local", total, items });
+    }
+    if let Some(r) = remote_at(o, path)? {
+        let (total, kids) = o.remote_children_first(&r.0, limit)?;
+        let items = kids
+            .into_iter()
+            .map(|(k, excluded)| Inside { folder: k.kind == oneup_store::Kind::Folder, excluded, name: k.name })
+            .collect();
+        return Ok(Contents { side: "remote", total, items });
+    }
+    Ok(Contents::default())
 }
 
 #[cfg(test)]
@@ -703,7 +702,7 @@ mod tests {
         use oneup_sync::{NodeKind, Seen, Trees};
         let mut s = gone_here();
         let p = prepared(&s, &["/old"], Choice::DeleteInOnedrive);
-        assert_eq!(p.asked[0].id.as_deref(), Some("s:1"));
+        assert_eq!(p.asked[0].id.as_ref().map(String::len), Some(32));
         ask(&mut s, &p.asked).unwrap();
         // Before the agent gets to it, another synced item is at that path.
         s.write(|o| {
@@ -718,6 +717,34 @@ mod tests {
         ask(&mut s, &[req("/old", Choice::DeleteInOnedrive)]).unwrap();
         let a = apply_queued(&mut s, false, &|_| false).unwrap();
         assert_eq!(a.log[0].outcome, ActivityOutcome::Failed);
+    }
+
+    #[test]
+    fn a_folder_answer_is_for_what_it_held_when_chosen_not_more() {
+        let mut s = gone_here();
+        let p = prepared(&s, &["/old"], Choice::DeleteInOnedrive);
+        assert_eq!(p.items, 2);
+        // The same choice gives the same code; the window's preview relies on it.
+        assert_eq!(prepared(&s, &["/old"], Choice::DeleteInOnedrive).code, p.code);
+        ask(&mut s, &p.asked).unwrap();
+        // Before the agent gets to it, b.txt (gone from both sides when
+        // chosen) is back in OneDrive: deleting the folder would now take it
+        // too, which wasn't shown.
+        let row = oneup_store::RemoteRow {
+            id: "r3".into(),
+            parent_id: Some("r1".into()),
+            name: "b.txt".into(),
+            kind: oneup_store::Kind::File,
+            size: 0,
+            etag: Some("e1".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| o.upsert_item(&row, false)).unwrap();
+        assert_ne!(prepared(&s, &["/old"], Choice::DeleteInOnedrive).code, p.code);
+        let a = apply_queued(&mut s, false, &|_| false).unwrap();
+        assert_eq!(a.log[0].detail, "Delete in OneDrive: not done; it changed since you chose; choose again");
+        assert_eq!(crate::unsynced::load(&s).unwrap().items.len(), 3, "still listed");
     }
 
     #[test]

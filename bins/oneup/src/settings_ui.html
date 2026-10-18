@@ -2942,8 +2942,8 @@
         // Asks before anything is deleted, before a choice for many items,
         // and for a new name; the rest are queued at once. What's asked
         // about is worked out by OneUpDrive first (`unsynced_preview`): the
-        // items it concerns, folders' contents included, which the answer
-        // then must still be (`--expect`).
+        // items it concerns, folders' contents included, and a code for
+        // exactly those, which the answer then must still match (`--expect`).
         async function resolveAsk(c, items, bulk) {
             const rename = c.code === "rename";
             if (!bulk && !c.deletes && !rename) return resolveGo(c, items, bulk);
@@ -2965,14 +2965,14 @@
                 });
                 if (!pv) return;
                 if (!pv.tops.length) return toast(pv.refused.join(" ") || "Nothing to do.", true);
-                expect = pv.items;
+                expect = pv.code;
                 facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
                 if (pv.tops.length > 5) facts.push(li(`and ${(pv.tops.length - 5).toLocaleString()} more`));
                 if (pv.items > pv.tops.length) facts.push(li(`${plural(pv.items, "item")} in all`));
                 if (pv.refused.length) facts.push(li(`${pv.refused.length.toLocaleString()} skipped: ${pv.refused[0]}`));
             }
             if (DELETED_TO[c.code]) facts.push(li(DELETED_TO[c.code]));
-            $("#rs-title").textContent = bulk ? allLabel(c.label, expect) + "?" : rename ? "Rename" : c.label + "?";
+            $("#rs-title").textContent = bulk ? allLabel(c.label, items.length) + "?" : rename ? "Rename" : c.label + "?";
             $("#rs-facts").replaceChildren(...facts);
             $("#rs-name-box").hidden = !rename;
             $("#rs-busy").textContent = "";

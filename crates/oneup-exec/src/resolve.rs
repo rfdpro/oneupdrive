@@ -27,10 +27,16 @@
 //!
 //! Each is checked against the state now, and refused ([`Refused`]) if it
 //! no longer fits: the item came back, or is gone from the other side too,
-//! or the folder it would go into is missing.
+//! or the folder it would go into is missing. A [`Change`] has a
+//! fingerprint of every record it concerns, so a caller can tell that
+//! what it carries out is exactly what the user was shown.
+//!
+//! A folder's records are walked a folder at a time, keeping only the
+//! folders still to visit and, for a deletion, the items it notes.
 
 use oneup_store::{LocalKind, Ops};
 use oneup_sync::{Base, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, Sid};
+use sha2::{Digest, Sha256};
 
 /// Why a choice can't be carried out now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -72,50 +78,82 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// What a choice changes in the store, worked out without changing
 /// anything ([`Change::commit`] does).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
+pub struct Change {
+    what: What,
+    items: usize,
+    /// Of every record it concerns (sid and both linked IDs), in walk order.
+    fingerprint: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum What {
     /// Note these Synced items deleted on this PC.
     GoneHere(Vec<(Sid, LocalId)>),
     /// Note these Synced items deleted in OneDrive.
     GoneThere(Vec<(Sid, RemoteId)>),
-    /// Drop record `sid` with the `items` records at and below it, and
-    /// plan folder `folder` again, where it reads as new.
-    Forget { sid: Sid, items: usize, folder: Sid },
+    /// Drop record `sid` with the records below it, and plan folder
+    /// `folder` again, where it reads as new.
+    Forget { sid: Sid, folder: Sid },
     /// Run this in the next round.
     Rename(Op),
+}
+
+/// Fingerprints the records a change concerns.
+struct Print(Sha256);
+
+impl Print {
+    fn new(kind: &str) -> Self {
+        let mut h = Sha256::new();
+        h.update(kind.as_bytes());
+        Self(h)
+    }
+
+    fn record(&mut self, b: &Base) {
+        self.0.update(b.sid.to_le_bytes());
+        self.0.update(b.local.map_or(0, |l| l.0).to_le_bytes());
+        let r = b.remote.as_ref().map_or("", |r| r.0.as_str());
+        self.0.update((r.len() as u64).to_le_bytes());
+        self.0.update(r.as_bytes());
+    }
+
+    fn done(self, what: What, items: usize) -> Change {
+        Change { what, items, fingerprint: self.0.finalize().into() }
+    }
 }
 
 impl Change {
     /// How many items it concerns.
     pub fn items(&self) -> usize {
-        match self {
-            Change::GoneHere(v) => v.len(),
-            Change::GoneThere(v) => v.len(),
-            Change::Forget { items, .. } => *items,
-            Change::Rename(_) => 1,
-        }
+        self.items
+    }
+
+    /// The records it concerns, as 32 hex digits: the same exactly when it
+    /// would change the same items (as they're linked now) the same way.
+    pub fn fingerprint(&self) -> String {
+        self.fingerprint[..16].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Writes it, and marks what it concerns for planning. Returns the
     /// operation to add to the round, for a rename.
     pub fn commit(self, o: &Ops<'_>) -> oneup_store::Result<Option<Op>> {
-        match self {
-            Change::GoneHere(items) => {
+        match self.what {
+            What::GoneHere(items) => {
                 for (_, l) in &items {
                     o.note_local_deleted(l.0)?;
                 }
                 o.dirty_mark_synced(&items.iter().map(|(s, _)| *s).collect::<Vec<_>>())?;
             }
-            Change::GoneThere(items) => {
+            What::GoneThere(items) => {
                 for (_, r) in &items {
                     o.note_remote_deleted(&r.0)?;
                 }
                 o.dirty_mark_synced(&items.iter().map(|(s, _)| *s).collect::<Vec<_>>())?;
             }
-            Change::Forget { sid, folder, .. } => {
+            What::Forget { sid, folder } => {
                 o.synced_remove(sid)?;
                 o.dirty_mark_synced(&[folder])?;
             }
-            Change::Rename(op) => return Ok(Some(op)),
+            What::Rename(op) => return Ok(Some(op)),
         }
         Ok(None)
     }
@@ -140,18 +178,23 @@ fn record(o: &Ops<'_>, sid: Sid) -> Result<Base> {
     }
 }
 
-/// `b` and every record below it, parents first.
-fn subtree(o: &Ops<'_>, b: Base) -> oneup_store::Result<Vec<Base>> {
-    let mut out = vec![b];
-    let mut i = 0;
-    while i < out.len() {
-        if out[i].kind == NodeKind::Folder {
-            let kids = o.synced_children(out[i].sid)?;
-            out.extend(kids);
-        }
-        i += 1;
+/// Calls `f` for `b` and every record below it, parents first, holding
+/// one folder's records at a time.
+fn walk(o: &Ops<'_>, b: Base, mut f: impl FnMut(&Base) -> Result<()>) -> Result<()> {
+    let mut folders = std::collections::VecDeque::new();
+    f(&b)?;
+    if b.kind == NodeKind::Folder {
+        folders.push_back(b.sid);
     }
-    Ok(out)
+    while let Some(sid) = folders.pop_front() {
+        for k in o.synced_children(sid)? {
+            f(&k)?;
+            if k.kind == NodeKind::Folder {
+                folders.push_back(k.sid);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Record `sid` is gone from this PC and still in OneDrive: delete it in
@@ -160,15 +203,18 @@ fn subtree(o: &Ops<'_>, b: Base) -> oneup_store::Result<Vec<Base>> {
 pub fn delete_there(o: &Ops<'_>, sid: Sid, present: &dyn Fn(LocalId) -> bool) -> Result<Change> {
     let b = record(o, sid)?;
     gone_here_still_there(o, &b, present)?;
-    let mut items = Vec::new();
-    for b in subtree(o, b)? {
+    let (mut items, mut print) = (Vec::new(), Print::new("gone here"));
+    walk(o, b, |b| {
         if let Some(l) = b.local
-            && still(gone_here_still_there(o, &b, present))?
+            && still(gone_here_still_there(o, b, present))?
         {
+            print.record(b);
             items.push((b.sid, l));
         }
-    }
-    Ok(Change::GoneHere(items))
+        Ok(())
+    })?;
+    let n = items.len();
+    Ok(print.done(What::GoneHere(items), n))
 }
 
 /// Record `sid` is gone from OneDrive and still on this PC: delete it here,
@@ -177,15 +223,30 @@ pub fn delete_there(o: &Ops<'_>, sid: Sid, present: &dyn Fn(LocalId) -> bool) ->
 pub fn delete_here(o: &Ops<'_>, sid: Sid) -> Result<Change> {
     let b = record(o, sid)?;
     gone_there_still_here(o, &b)?;
-    let mut items = Vec::new();
-    for b in subtree(o, b)? {
-        if let Some(r) = b.remote.clone()
-            && still(gone_there_still_here(o, &b))?
+    let (mut items, mut print) = (Vec::new(), Print::new("gone there"));
+    walk(o, b, |b| {
+        if let Some(r) = &b.remote
+            && still(gone_there_still_here(o, b))?
         {
-            items.push((b.sid, r));
+            print.record(b);
+            items.push((b.sid, r.clone()));
         }
-    }
-    Ok(Change::GoneThere(items))
+        Ok(())
+    })?;
+    let n = items.len();
+    Ok(print.done(What::GoneThere(items), n))
+}
+
+/// Every record at and below `b`, for dropping: how many, fingerprinted.
+fn forget(o: &Ops<'_>, b: Base, kind: &str, folder: Sid) -> Result<Change> {
+    let sid = b.sid;
+    let (mut n, mut print) = (0, Print::new(kind));
+    walk(o, b, |b| {
+        print.record(b);
+        n += 1;
+        Ok(())
+    })?;
+    Ok(print.done(What::Forget { sid, folder }, n))
 }
 
 /// Whether a check passed: a refusal is `false`, a store error an error.
@@ -214,8 +275,7 @@ pub fn restore(o: &Ops<'_>, sid: Sid, present: &dyn Fn(LocalId) -> bool) -> Resu
         Some(l) if o.local_get(l.0)?.is_some() => {}
         _ => return Err(Refused::FolderGoneHere.into()),
     }
-    let items = subtree(o, b)?.len();
-    Ok(Change::Forget { sid, items, folder: folder.sid })
+    forget(o, b, "restore", folder.sid)
 }
 
 /// Record `sid` is gone from OneDrive and still on this PC: upload it
@@ -235,8 +295,7 @@ pub fn upload(o: &Ops<'_>, sid: Sid) -> Result<Change> {
         Some(r) if there(o, r)? => {}
         _ => return Err(Refused::FolderGoneThere.into()),
     }
-    let items = subtree(o, b)?.len();
-    Ok(Change::Forget { sid, items, folder: folder.sid })
+    forget(o, b, "upload", folder.sid)
 }
 
 /// Renames local item `id` to `name` in its folder. The name must be one
@@ -264,7 +323,13 @@ pub fn rename(o: &Ops<'_>, id: LocalId, name: &str) -> Result<Change> {
         return Err(Refused::NameTakenThere.into());
     }
     let stamp = (row.kind == LocalKind::File).then_some((row.size, row.mtime));
-    Ok(Change::Rename(Op::RenameLocal { local: LocalPre { id, stamp }, dir: LocalId(parent), name: name.to_string() }))
+    let mut print = Print::new("rename");
+    for x in [id.0, parent, row.size as u128, row.mtime as u128] {
+        print.0.update(x.to_le_bytes());
+    }
+    print.0.update(name.as_bytes());
+    let op = Op::RenameLocal { local: LocalPre { id, stamp }, dir: LocalId(parent), name: name.to_string() };
+    Ok(print.done(What::Rename(op), 1))
 }
 
 /// `b` is gone from this PC and still in OneDrive (what the planner holds

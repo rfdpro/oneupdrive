@@ -571,8 +571,8 @@ mod win {
                 } else {
                     a.push(text(args, "path").into());
                 }
-                if let Some(n) = args.get("expect").and_then(Value::as_u64) {
-                    a.extend(["--expect".into(), n.to_string().into()]);
+                if let Some(code) = args.get("expect").and_then(Value::as_str) {
+                    a.extend(["--expect".into(), code.into()]);
                 }
                 a.push(
                     if choice == "rename" { format!("--rename={}", text(args, "name")) } else { format!("--{choice}") }

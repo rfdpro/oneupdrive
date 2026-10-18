@@ -639,7 +639,7 @@ pub fn unsynced_preview(dir: &Path, path: Option<&str>, choice: &str, name: Opti
     let items = crate::resolve::select(&record, Some(choice), paths.as_deref(), backup)?;
     let p = crate::resolve::prepare(&store, &items, choice, name, backup)?;
     let tops: Vec<&str> = p.asked.iter().map(|r| r.path.as_str()).collect();
-    Ok(json!({ "items": p.items, "tops": tops, "refused": p.refused }))
+    Ok(json!({ "items": p.items, "tops": tops, "refused": p.refused, "code": p.code }))
 }
 
 /// The lists of the safety stops standing now (`crate::stoplist`), each

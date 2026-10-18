@@ -12,9 +12,9 @@ use oneup_store::Store;
 pub struct Ask<'a> {
     pub paths: &'a [String],
     pub all: bool,
-    /// How many items the caller was shown the choice would concern
-    /// (refused if that changed since).
-    pub expect: Option<usize>,
+    /// The code of what the caller was shown (`resolve::Prepared::code`):
+    /// refused if the choice concerns anything else now.
+    pub expect: Option<&'a str>,
     pub choice: Option<Choice>,
     pub name: Option<&'a str>,
     pub yes: bool,
@@ -39,7 +39,7 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         }
         return Ok(());
     };
-    if items.is_empty() && a.expect.is_none_or(|n| n == 0) {
+    if items.is_empty() && a.expect.is_none() {
         println!("Nothing to resolve.");
         return Ok(());
     }
@@ -60,10 +60,10 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         return Ok(());
     }
     let p = resolve::prepare(&store, &items, choice, a.name, backup)?;
-    if let Some(n) = a.expect
-        && n != p.items
+    if let Some(code) = a.expect
+        && code != p.code
     {
-        bail!("it concerns {} items now, not {n}: the list changed", p.items);
+        bail!("what this concerns changed since it was shown; look again");
     }
     if p.asked.is_empty() {
         bail!("{}", p.refused.join("\n"));
@@ -82,7 +82,7 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         for r in &p.asked {
             println!("  {}", r.path);
         }
-        println!("Add --yes to delete {what}.");
+        println!("Add --yes to delete {what} (or --yes --expect {} to delete exactly these).", p.code);
         return Ok(());
     }
     resolve::ask(&mut store, &p.asked)?;

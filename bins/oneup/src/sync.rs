@@ -1679,16 +1679,16 @@ fn add_extra(ops: &mut Vec<Op>, extra: Vec<Op>) {
         ops.extend(extra);
         return;
     }
-    let mut taken: Vec<(oneup_sync::Dir, String)> =
+    let mut taken: std::collections::HashSet<(oneup_sync::Dir, String)> =
         ops.iter().filter_map(|o| o.target().map(|(d, n)| (d, oneup_sync::fold(n)))).collect();
-    let busy: Vec<LocalId> = ops.iter().filter(|o| o.is_action()).filter_map(|o| o.subjects().1).collect();
+    let busy: std::collections::HashSet<LocalId> =
+        ops.iter().filter(|o| o.is_action()).filter_map(|o| o.subjects().1).collect();
     for e in extra {
         if let Op::RenameLocal { local, dir, name } = &e {
             let target = (oneup_sync::Dir::Local(*dir), oneup_sync::fold(name));
-            if busy.contains(&local.id) || taken.contains(&target) {
+            if busy.contains(&local.id) || !taken.insert(target) {
                 continue;
             }
-            taken.push(target);
         }
         ops.push(e);
     }
