@@ -369,6 +369,17 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     for r in failed {
         println!("  {}", oneup_app::backoff::describe(&r, now));
     }
+    // What can't sync until the user acts, and their answer if one waits
+    // (`oneup_app::resolve`).
+    let at = format!("/{rel}");
+    let record = oneup_app::unsynced::load(store)?;
+    if let Some(i) = record.items.iter().find(|i| i.path.eq_ignore_ascii_case(&at)) {
+        println!("  can't sync: {} (`oneup unsynced resolve` shows what you can do)", i.why.label());
+    }
+    let queued = store.read(oneup_app::resolve::queued)?;
+    if let Some(q) = queued.iter().find(|q| q.path.eq_ignore_ascii_case(&at)) {
+        println!("  your choice waits for the next round: {}", q.choice.label());
+    }
     let last = store.read(|o| o.activity_recent(Some(&format!("/{rel}")), 1))?;
     if let Some(e) = last.first() {
         println!("  last activity: {}", crate::activity::line(e, crate::activity::local_offset()));

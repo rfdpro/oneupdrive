@@ -542,6 +542,46 @@ mod win {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::unsynced(&d)).await?
             }
+            "unsynced_preview" => {
+                let (d, choice) = (dir.to_path_buf(), text(args, "choice"));
+                let path = args.get("path").and_then(Value::as_str).map(str::to_string);
+                let name = args.get("name").and_then(Value::as_str).map(str::to_string);
+                let subject = args.get("subject").and_then(Value::as_str).map(str::to_string);
+                tokio::task::spawn_blocking(move || {
+                    settingsapi::unsynced_preview(&d, path.as_deref(), subject.as_deref(), &choice, name.as_deref())
+                })
+                .await?
+            }
+            "unsynced_inside" => {
+                let (d, path) = (dir.to_path_buf(), text(args, "path"));
+                tokio::task::spawn_blocking(move || settingsapi::unsynced_inside(&d, &path)).await?
+            }
+            // A sync failure's button: `oneup unsynced resolve`, with the same
+            // checks as typed. The page asked before a deletion, so it goes
+            // ahead (`--yes`); a choice for every item of a kind says how many
+            // the page showed, refused if the list changed since.
+            "unsynced_resolve" => {
+                let choice = text(args, "choice");
+                if oneup_app::resolve::Choice::from_code(&choice).is_none() {
+                    bail!("unknown choice: {choice}");
+                }
+                let mut a: Vec<std::ffi::OsString> =
+                    vec!["--data-dir".into(), dir.into(), "unsynced".into(), "resolve".into()];
+                if flag(args, "all") {
+                    a.push("--all".into());
+                } else {
+                    a.push(text(args, "path").into());
+                }
+                if let Some(code) = args.get("expect").and_then(Value::as_str) {
+                    a.extend(["--expect".into(), code.into()]);
+                }
+                a.push(
+                    if choice == "rename" { format!("--rename={}", text(args, "name")) } else { format!("--{choice}") }
+                        .into(),
+                );
+                a.push("--yes".into());
+                Ok(Value::from(oneup(a).await?))
+            }
             "stops" => {
                 let (d, filter, limit) = (dir.to_path_buf(), text(args, "filter"), count(args, "limit", 500));
                 tokio::task::spawn_blocking(move || settingsapi::stops(&d, &filter, limit)).await?

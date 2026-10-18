@@ -580,13 +580,84 @@ pub fn activity(dir: &Path, rel: &str, limit: usize) -> Result<Value> {
         .collect())
 }
 
-/// What can't sync until the user changes it, as `oneup unsynced` lists it.
+/// What can't sync until the user changes it, as `oneup unsynced` lists it,
+/// with what can be done about each (`crate::resolve`): `choices`, and the
+/// answer that waits for the agent's next round, if one does. `nested`: a
+/// folder above it is listed for the same reason, and answers for it.
 pub fn unsynced(dir: &Path) -> Result<Value> {
+    use crate::resolve::{Choice, choices};
     let store = crate::setup::open_store(dir, 1024)?;
     let r = crate::unsynced::load(&store)?;
+    let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
+    let queued = store.read(crate::resolve::queued)?;
+    let local = store.read(|o| o.meta_get(crate::sync::KEY_LOCAL))?.map(std::path::PathBuf::from);
+    let tops: Vec<(String, crate::unsynced::Why)> =
+        r.items.iter().filter(|i| i.why.held()).map(|i| (format!("{}/", i.path.to_lowercase()), i.why)).collect();
+    let mut items: Vec<Value> = Vec::with_capacity(r.items.len());
+    for i in &r.items {
+        let lower = i.path.to_lowercase();
+        let nested = i.why.held() && tops.iter().any(|(t, w)| *w == i.why && lower.starts_with(t.as_str()));
+        // Which item the page shows: an answer from it is for that one only
+        // (`unsynced_preview`). Without one there's nothing to bind it to,
+        // so only an exclusion (a rule, by path) is offered.
+        let subject = store.read(|o| crate::resolve::subject(o, i))?;
+        let choices: Vec<Value> = choices(i.why, backup)
+            .iter()
+            .filter(|c| subject.is_some() || **c == Choice::Exclude)
+            // Bringing an item back into a folder that's gone too waits
+            // for that folder's answer.
+            .filter(|c| !(nested && matches!(c, Choice::Restore | Choice::Upload)))
+            .map(|c| json!({ "code": c.code(), "label": c.label(), "deletes": c.deletes(), "bulk": c.in_bulk() }))
+            .collect();
+        let here =
+            local.as_ref().is_some_and(|l| std::fs::symlink_metadata(l.join(i.path.trim_start_matches('/'))).is_ok());
+        let waits = queued.iter().find(|q| q.path == i.path).map(|q| q.choice.label());
+        items.push(json!({ "path": i.path, "why": i.why.title(), "detail": i.why.label(), "kind": i.why.code(),
+            "choices": choices, "nested": nested, "here": here, "queued": waits, "subject": subject }));
+    }
+    Ok(json!({ "items": items, "more": r.more, "backup": backup }))
+}
+
+/// What's inside a folder held as not empty (`crate::resolve::inside`).
+pub fn unsynced_inside(dir: &Path, path: &str) -> Result<Value> {
+    let store = crate::setup::open_store(dir, 1024)?;
+    let c = store.read(|o| crate::resolve::inside(o, path, 200))?;
     let items: Vec<Value> =
-        r.items.iter().map(|i| json!({ "path": i.path, "why": i.why.title(), "detail": i.why.label() })).collect();
-    Ok(json!({ "items": items, "more": r.more }))
+        c.items.iter().map(|k| json!({ "name": k.name, "folder": k.folder, "excluded": k.excluded })).collect();
+    Ok(json!({ "side": c.side, "total": c.total, "items": items }))
+}
+
+/// What a choice would do, before the window asks (`resolve::prepare`, as
+/// `oneup unsynced resolve` works it out): how many items it concerns,
+/// folders' contents included, and the items refused now. `path`: one
+/// listed item; `None`: every item the choice fits.
+/// `subject`: for one item, which item the window listed
+/// (`resolve::subject`), required; refused if it's another now or can't
+/// be told.
+pub fn unsynced_preview(
+    dir: &Path,
+    path: Option<&str>,
+    subject: Option<&str>,
+    choice: &str,
+    name: Option<&str>,
+) -> Result<Value> {
+    let choice = crate::resolve::Choice::from_code(choice).with_context(|| format!("unknown choice: {choice}"))?;
+    let store = crate::setup::open_store(dir, 1024)?;
+    let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
+    let record = crate::unsynced::load(&store)?;
+    let paths = path.map(|p| vec![p.to_string()]);
+    let items = crate::resolve::select(&record, Some(choice), paths.as_deref(), backup)?;
+    if let [item] = items.as_slice()
+        && path.is_some()
+    {
+        let now = store.read(|o| crate::resolve::subject(o, item))?;
+        if subject.is_none() || now.as_deref() != subject {
+            bail!("{} changed since it was listed; look again", item.path);
+        }
+    }
+    let p = crate::resolve::prepare(&store, &items, choice, name, backup)?;
+    let tops: Vec<&str> = p.asked.iter().map(|r| r.path.as_str()).collect();
+    Ok(json!({ "items": p.items, "tops": tops, "refused": p.refused, "code": p.code }))
 }
 
 /// The lists of the safety stops standing now (`crate::stoplist`), each
@@ -836,5 +907,77 @@ mod tests {
             (Some(OverflowPolicy::Keep), Some(true), Some(2.5), None)
         );
         assert!(versions_changes(&json!({ "overflow": "drop" })).is_err());
+    }
+
+    #[test]
+    fn sync_failures_come_with_their_choices_and_what_waits() {
+        use oneup_sync::{Base, LocalId, NodeKind, ROOT, RemoteId};
+        let dir = std::env::temp_dir().join(format!("oneup-settingsapi-unsynced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut s = crate::setup::open_store(&dir, 1024).unwrap();
+            let row = |id: &str, parent: Option<&str>, name: &str, kind| oneup_store::RemoteRow {
+                id: id.into(),
+                parent_id: parent.map(Into::into),
+                name: name.into(),
+                kind,
+                size: 0,
+                etag: Some("e1".into()),
+                qxh: None,
+                mtime_ms: None,
+            };
+            let base = |sid, parent, name: &str, local: u128, remote: &str| Base {
+                sid,
+                parent,
+                name: name.into(),
+                kind: NodeKind::Folder,
+                size: 0,
+                hash: None,
+                local: Some(LocalId(local)),
+                local_mtime: 0,
+                remote: Some(RemoteId(remote.into())),
+                remote_etag: "e1".into(),
+            };
+            s.write(|o| {
+                o.upsert_item(&row("root", None, "", oneup_store::Kind::Root), false)?;
+                o.upsert_item(&row("r1", Some("root"), "old", oneup_store::Kind::Folder), false)?;
+                o.synced_put(&base(ROOT, None, "", 1, "root"))?;
+                o.synced_put(&base(1, Some(ROOT), "old", 5, "r1"))?;
+                let record =
+                    r#"{"items":[["/old","gone_here"],["/old/a.txt","gone_here"],["/bad|name","invalid_name"]]}"#;
+                o.meta_set(crate::unsynced::KEY, record)
+            })
+            .unwrap();
+            let r = crate::resolve::Request {
+                path: "/old".into(),
+                choice: crate::resolve::Choice::Restore,
+                name: None,
+                id: None,
+            };
+            crate::resolve::ask(&mut s, &[r]).unwrap();
+        }
+        let v = unsynced(&dir).unwrap();
+        let codes = |i: usize| -> Vec<&str> {
+            v["items"][i]["choices"].as_array().unwrap().iter().map(|c| c["code"].as_str().unwrap()).collect()
+        };
+        assert_eq!(codes(0), ["delete-in-onedrive", "restore"]);
+        assert_eq!((&v["items"][0]["subject"], &v["items"][0]["queued"]), (&json!("s:1"), &json!("Restore")));
+        assert_eq!(v["items"][0]["choices"][0]["deletes"], true);
+        // Inside a folder gone too, and with no record of its own here:
+        // nothing to bind an answer to, so nothing is offered.
+        assert_eq!(v["items"][1]["nested"], true);
+        assert!(codes(1).is_empty());
+        assert_eq!((codes(2), &v["items"][2]["kind"]), (Vec::<&str>::new(), &json!("invalid_name")));
+        // The preview is for the item listed, which the page must say.
+        let refused = |subject| {
+            let e = unsynced_preview(&dir, Some("/old"), subject, "restore", None).unwrap_err();
+            assert!(format!("{e:#}").contains("changed since it was listed"), "{e:#}");
+        };
+        refused(Some("s:99"));
+        refused(None);
+        let pv = unsynced_preview(&dir, Some("/old"), Some("s:1"), "delete-in-onedrive", None).unwrap();
+        assert_eq!(pv["tops"], json!(["/old"]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

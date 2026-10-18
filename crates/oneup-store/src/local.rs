@@ -477,6 +477,22 @@ impl Ops<'_> {
         rows.map(|r| fix_local(r?)).collect()
     }
 
+    /// How many entries folder `parent_id` holds, and the first `limit` of
+    /// them by name: a look into a folder that may be large (the settings
+    /// window), without loading it whole.
+    pub fn local_children_first(&self, parent_id: u128, limit: usize) -> Result<(usize, Vec<LocalRow>)> {
+        let total: i64 = self
+            .c
+            .prepare_cached("SELECT count(*) FROM local_item WHERE parent_id = ?1")?
+            .query_row([blob(parent_id)], |r| r.get(0))?;
+        let mut st = self.c.prepare_cached(&format!(
+            "SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1 ORDER BY name LIMIT ?2"
+        ))?;
+        let rows = st.query_map(rusqlite::params![blob(parent_id), limit as i64], LocalRow::from_row)?;
+        let rows = rows.map(|r| fix_local(r?)).collect::<Result<_>>()?;
+        Ok((usize::try_from(total).unwrap_or(0), rows))
+    }
+
     /// The stored children of folder `parent_id` whose name is `name` as
     /// Windows compares names ([`oneup_sync::fold`]). Read through the
     /// parent index, loading only the matches (see `Ops::remote_named`).

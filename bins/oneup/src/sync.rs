@@ -1166,9 +1166,16 @@ impl Engine {
                 scope = Scope::All;
             }
             let window = recent.plus(*executed);
+            // The user's answers for what can't sync (`crate::resolve`):
+            // renames join this round's plan, for the gate like the rest.
+            let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
+            let fs = self.exec.local();
+            // "Can't tell" counts as here: nothing is noted gone on a doubt.
+            let mut chosen = crate::resolve::apply_queued(&mut store, backup, &|id| fs.presence(id) != Some(false))?;
+            log_activity(&mut store, std::mem::take(&mut chosen.log))?;
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;
-            let extra = match mode {
+            let mut extra = match mode {
                 _ if controls.pause_remote => Vec::new(),
                 crate::config::CloudCopies::Prune => {
                     self.set_offer(None);
@@ -1192,6 +1199,7 @@ impl Engine {
                     extra
                 }
             };
+            extra.extend(chosen.ops.iter().map(|(op, _)| op.clone()));
             let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra };
             let t = std::time::Instant::now();
             let Planned { review, problems, upto, suspicious, policy, synced, planning } =
@@ -1286,7 +1294,10 @@ impl Engine {
                     .approved
                     .into_iter()
                     .map(|a| {
-                        let l = describe_approved(o, &a);
+                        let mut l = describe_approved(o, &a);
+                        if chosen.ops.iter().any(|(op, _)| op == a.op()) {
+                            l.note = "as you chose".into();
+                        }
                         let l = if on_demand { on_demand_line(a.op(), l) } else { l };
                         (a, l)
                     })
@@ -1368,6 +1379,7 @@ impl Engine {
                     None => {}
                 }
             }
+            crate::resolve::ran(&mut store, &chosen.ops, &report)?;
             let mut log = print_round(n, &planned, &report);
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
@@ -1508,7 +1520,9 @@ impl Engine {
     ) -> Result<()> {
         use crate::unsynced::Why as U;
         let mut found: Vec<(String, U)> = problems.iter().map(|(p, w)| (p.clone(), U::from(*w))).collect();
-        found.extend(held);
+        // A synced item that can't sync any more (a refused name, too
+        // large) is held as missing on one side; why is the problem's.
+        found.extend(held.into_iter().filter(|(p, _)| !problems.iter().any(|(q, _)| q.eq_ignore_ascii_case(p))));
         let mut done: Vec<String> = Vec::new();
         // The report keeps the planned order (see `print_round`): one pass.
         let (mut d, mut s) = (report.done.iter().peekable(), report.skipped.iter().peekable());
@@ -1629,7 +1643,7 @@ fn plan_round<'a>(
             Scope::Dirty => dirty.folders,
         };
         let (mut ops, problems) = planning.plan(o, folders)?;
-        ops.extend(modes.extra);
+        add_extra(&mut ops, modes.extra);
         let problems = problems
             .into_iter()
             .map(|(id, name, why)| Ok((o.local_path_of(id.0)?.unwrap_or(name), why)))
@@ -1654,6 +1668,31 @@ fn plan_round<'a>(
     };
     let review = review_in(&policy, &cx, ops);
     Ok(Planned { review, problems, upto, suspicious, policy, synced, planning })
+}
+
+/// Adds `extra` (prunes, the renames the user chose) to a round's plan,
+/// after the planner's own resolve pass. A chosen rename that would meet
+/// what the plan does (the same item, or a name the plan needs in that
+/// folder, another chosen rename's included) waits for a later round: it
+/// stays queued (`crate::resolve::ran`) instead of being skipped there.
+fn add_extra(ops: &mut Vec<Op>, extra: Vec<Op>) {
+    if !extra.iter().any(|e| matches!(e, Op::RenameLocal { .. })) {
+        ops.extend(extra);
+        return;
+    }
+    let mut taken: std::collections::HashSet<(oneup_sync::Dir, String)> =
+        ops.iter().filter_map(|o| o.target().map(|(d, n)| (d, oneup_sync::fold(n)))).collect();
+    let busy: std::collections::HashSet<LocalId> =
+        ops.iter().filter(|o| o.is_action()).filter_map(|o| o.subjects().1).collect();
+    for e in extra {
+        if let Op::RenameLocal { local, dir, name } = &e {
+            let target = (oneup_sync::Dir::Local(*dir), oneup_sync::fold(name));
+            if busy.contains(&local.id) || !taken.insert(target) {
+                continue;
+            }
+        }
+        ops.push(e);
+    }
 }
 
 /// How a round plans: over the [`Parked`] view of the trees, with what
@@ -3171,6 +3210,38 @@ mod tests {
         assert_eq!(sent_file(&upload), Some(7));
         assert_eq!(sent_file(&Op::Hash(local)), Some(7));
         assert_eq!(sent_file(&Op::Forget(3)), None);
+    }
+
+    #[test]
+    fn a_chosen_rename_that_meets_the_plan_waits_for_a_later_round() {
+        use oneup_sync::{Link, LocalPre, RemotePre};
+        let pre = |id| LocalPre { id: LocalId(id), stamp: Some((1, 1)) };
+        let rename = |id, name: &str| Op::RenameLocal { local: pre(id), dir: LocalId(1), name: name.into() };
+        let download = Op::Download {
+            remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() },
+            to: LocalId(1),
+            parent: 0,
+            name: "Notes.txt".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let upload = Op::Upload {
+            local: pre(5),
+            to: RemoteId("root".into()),
+            parent: 0,
+            name: "five.txt".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let mut ops = vec![download, upload];
+        let extra = vec![
+            rename(4, "notes.txt"), // the plan downloads into that name
+            rename(5, "other.txt"), // the plan uploads that item
+            rename(6, "free.txt"),
+            rename(7, "FREE.txt"), // another chosen rename takes it first
+        ];
+        add_extra(&mut ops, extra);
+        assert_eq!(&ops[2..], [rename(6, "free.txt")]);
     }
 
     #[test]

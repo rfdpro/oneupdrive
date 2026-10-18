@@ -909,6 +909,28 @@ impl Ops<'_> {
         .collect()
     }
 
+    /// [`Ops::local_children_first`] for a cloud folder (with whether each
+    /// is excluded).
+    pub fn remote_children_first(&self, parent_id: &str, limit: usize) -> Result<(usize, Vec<(RemoteRow, bool)>)> {
+        let total: i64 = self
+            .c
+            .prepare_cached("SELECT count(*) FROM remote_item WHERE parent_id = ?1")?
+            .query_row([parent_id], |r| r.get(0))?;
+        let mut st = self.c.prepare_cached(&format!(
+            "SELECT {ITEM_COLS}, is_excluded FROM remote_item WHERE parent_id = ?1 ORDER BY name LIMIT ?2"
+        ))?;
+        let rows = st.query_map(rusqlite::params![parent_id, limit as i64], |r| {
+            Ok((RemoteRow::from_row(r)?, r.get::<_, i64>("is_excluded")? != 0))
+        })?;
+        let rows = rows
+            .map(|r| {
+                let (row, x) = r?;
+                Ok((fix_kind(row)?, x))
+            })
+            .collect::<Result<_>>()?;
+        Ok((usize::try_from(total).unwrap_or(0), rows))
+    }
+
     /// The stored children of cloud folder `parent_id` whose name is `name`
     /// as Windows and OneDrive compare names ([`oneup_sync::fold`]): one, or
     /// several where names that fold alike coexist in OneDrive. Read through

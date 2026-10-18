@@ -724,6 +724,63 @@
             color: var(--bad);
         }
 
+        /* Sync failures: what can be done about each */
+        #ls-table td.act {
+            white-space: nowrap;
+            text-align: right;
+        }
+
+        #ls-table td.item {
+            min-width: 220px;
+        }
+
+        #ls-table td.act .btn+.btn,
+        #ls-table tr.group td .btn {
+            margin-left: 6px;
+        }
+
+        #ls-table tr.group td .btn {
+            font-weight: 400;
+        }
+
+        #ls-table .ug-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        #ls-table .ug-head small {
+            font-weight: 400;
+            margin-top: 2px;
+        }
+
+        #ls-table .ug-act {
+            flex: none;
+        }
+
+        #ls-table .count {
+            margin-left: 8px;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 0 6px;
+            border-radius: 8px;
+            background: var(--panel);
+        }
+
+        #ls-table tr.inner td.item {
+            color: var(--muted);
+        }
+
+        #ls-table tr.inside td {
+            border-top: 0;
+            padding-top: 0;
+        }
+
+        #ls-table tr.inside .tag {
+            margin-left: 8px;
+        }
+
         .seg .count {
             margin-left: 6px;
             font-size: 11px;
@@ -2150,6 +2207,18 @@
             <div class="df"><span class="muted" id="rm-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rm-go">Stop syncing</button></div>
         </form>
     </dialog>
+    <dialog id="dlg-resolve">
+        <form method="dialog">
+            <div class="dh">
+                <h3 id="rs-title"></h3>
+            </div>
+            <div class="db">
+                <ul class="facts" id="rs-facts"></ul>
+                <div class="field" id="rs-name-box"><input type="text" id="rs-name" spellcheck="false" aria-label="New name"></div>
+            </div>
+            <div class="df"><span class="muted" id="rs-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rs-go"></button></div>
+        </form>
+    </dialog>
     <dialog id="dlg-recovery">
         <form method="dialog">
             <div class="dh">
@@ -2679,18 +2748,6 @@
             return r && r.local ? r.local.replace(/\\+$/, "") + rel.replace(/\//g, "\\").replace(/\\+$/, "") : null;
         }
 
-        function revealBtn(rel) {
-            const p = listPath(rel);
-            return el("td", {}, p ? el("button", {
-                className: "btn small",
-                textContent: "Show",
-                title: "Show it in File Explorer",
-                onclick: () => run(call("reveal", {
-                    path: p
-                }))
-            }) : null);
-        }
-
         // Column titles ending in a space are numbers (right-aligned).
         function setTable(head, rows) {
             $("#ls-table thead").replaceChildren(el("tr", {}, ...head.map(h => el("th", {
@@ -2739,8 +2796,7 @@
                 sum.textContent = !r.length ? "Nothing yet." : rows.length === r.length ? "" : `${n(rows.length)} of ${n(r.length)} shown.`;
                 if (r.length >= L.limit) moreBtn("Show older");
             } else if (L.tab === "unsynced") {
-                const rows = r.items.filter(i => has(i.path, i.why));
-                setTable(["Item", "Why", ""], rows.map(i => el("tr", {}, cell(i.path, null, "wrap path"), cell(i.why, i.detail), revealBtn(i.path))));
+                renderUnsynced(r, has);
                 sum.textContent = !r.items.length ? "No sync failures." :
                     `${n(r.items.length)}${r.more ? "+" : ""} items. Each is retried when it changes.`;
             } else if (L.tab === "excluded") {
@@ -2796,6 +2852,260 @@
                     (q ? ` ${n(matching)} match.` : "") + " Decide from the icon's menu." +
                     (unwritten ? ` ${n(unwritten)} more not listed (oneup sync --dry-run lists all).` : "");
                 if (matching > shown) moreBtn(`Show more (${n(shown)} of ${n(matching)})`);
+            }
+        }
+
+        // ---- sync failures: what can be done about each (`oneup unsynced
+        // resolve`, which the agent carries out in its next round)
+        const KINDS = ["gone_here", "gone_there", "not_empty", "name_clash", "invalid_name", "name_taken", "too_large", "special", "one_way"];
+        // Where a deletion goes.
+        const DELETED_TO = {
+            "delete-in-onedrive": "To OneDrive's recycle bin.",
+            "delete-here": "To kept copies on this PC (.oneup\\versions)."
+        };
+
+        // "Delete in OneDrive" -> "Delete all 18 in OneDrive".
+        function allLabel(label, n) {
+            const i = label.indexOf(" ");
+            const all = "all " + n.toLocaleString();
+            return i < 0 ? `${label} ${all}` : `${label.slice(0, i)} ${all}${label.slice(i)}`;
+        }
+
+        function smallBtn(text, onclick, cls = "") {
+            return el("button", {
+                className: "btn small " + cls,
+                textContent: text,
+                onclick
+            });
+        }
+
+        // Grouped by why, the reason said once at the top of the group. An
+        // item inside a folder held for the same reason (gone from one side)
+        // sits under it, named from there and without buttons: the folder's
+        // answer covers what's in it. A rename doesn't, so nothing nests there.
+        const NESTS = ["gone_here", "gone_there"];
+
+        function renderUnsynced(r, has) {
+            const shown = r.items.filter(i => has(i.path, i.why));
+            const rows = [];
+            for (const kind of KINDS) {
+                const group = shown.filter(i => i.kind === kind).map(i => ({
+                    i,
+                    lower: i.path.toLowerCase()
+                })).sort((a, b) => a.lower < b.lower ? -1 : a.lower > b.lower ? 1 : 0);
+                if (!group.length) continue;
+                const all = r.items.filter(i => i.kind === kind);
+                const act = el("div", {
+                    className: "ug-act"
+                });
+                // All of a kind at once: only while the whole kind is shown.
+                const top = all.find(i => !i.nested) || all[0];
+                if (all.length > 1 && group.length === all.length && !all.some(i => i.queued)) {
+                    for (const c of top.choices.filter(c => c.bulk)) act.append(smallBtn(allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
+                }
+                // The reason, without what the buttons beside it say.
+                const why = group[0].i.detail.split("; ")[0];
+                rows.push(el("tr", {
+                    className: "group"
+                }, el("td", {
+                    colSpan: 2
+                }, el("div", {
+                    className: "ug-head"
+                }, el("div", {}, group[0].i.why, el("span", {
+                    className: "count",
+                    textContent: group.length.toLocaleString()
+                }), el("small", {
+                    textContent: why.charAt(0).toUpperCase() + why.slice(1)
+                })), act))));
+                // Sorted by path, a folder comes before what's in it: the
+                // folders above each row are a stack.
+                const above = [];
+                for (const g of group) {
+                    while (above.length && !g.lower.startsWith(above[above.length - 1].lower + "/")) above.pop();
+                    const under = NESTS.includes(kind) && above.length ? above[above.length - 1].i : null;
+                    rows.push(unsyncedRow(g.i, under, under ? above.length : 0));
+                    above.push(g);
+                }
+            }
+            setTable(["Item", ""], rows);
+        }
+
+        function unsyncedRow(i, under, depth) {
+            const act = el("td", {
+                className: "act"
+            });
+            if (i.queued) act.append(el("span", {
+                className: "tag wait",
+                textContent: "Queued: " + i.queued
+            }));
+            else if (!under) {
+                for (const c of i.choices) act.append(smallBtn(c.label, () => resolveAsk(c, [i], false), c.deletes ? "danger" : ""));
+                if (i.kind === "not_empty") act.append(smallBtn("Contents", e => toggleInside(e.target.closest("tr"), i)));
+            }
+            const p = i.here && listPath(i.path);
+            if (p) {
+                const show = smallBtn("Show", () => run(call("reveal", {
+                    path: p
+                })));
+                show.title = "Show it in File Explorer";
+                act.append(show);
+            }
+            const name = el("td", {
+                className: "wrap path item",
+                textContent: under ? i.path.slice(under.path.length + 1) : i.path,
+                title: i.path
+            });
+            if (under) {
+                name.style.paddingLeft = `${16 + depth * 20}px`;
+                name.setAttribute("aria-label", i.path);
+            }
+            return el("tr", {
+                className: under ? "inner" : ""
+            }, name, act);
+        }
+
+        // What a folder held as not empty still holds (often what the
+        // rules leave out), under its row; click again to close.
+        async function toggleInside(row, i) {
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains("inside")) return next.remove();
+            const r = await call("unsynced_inside", {
+                root: L.root,
+                path: i.path
+            }).catch(e => {
+                toast(e.message, true);
+                return null;
+            });
+            if (!r) return;
+            const list = el("div", {
+                className: "app-file-list"
+            });
+            if (!r.items.length) list.append(el("div", {
+                className: "muted",
+                textContent: "Nothing listed."
+            }));
+            for (const k of r.items) list.append(el("div", {}, k.name + (k.folder ? "\\" : ""), k.excluded ? el("span", {
+                className: "tag",
+                textContent: "Excluded"
+            }) : null));
+            if (r.total > r.items.length) list.append(el("div", {
+                className: "muted",
+                textContent: `and ${(r.total - r.items.length).toLocaleString()} more`
+            }));
+            const cloud = r.side === "remote" ? smallBtn("Excluded in OneDrive", () => {
+                L.tab = "excluded";
+                $("#ls-filter").value = i.path;
+                loadList(true);
+            }) : null;
+            row.after(el("tr", {
+                className: "inside"
+            }, el("td", {
+                colSpan: 2
+            }, el("small", {
+                textContent: r.side === "remote" ? "In OneDrive" : "On this PC"
+            }), list, cloud)));
+        }
+
+        // Every answer but one exclusion is worked out by OneUpDrive first
+        // (`unsynced_preview`), for the item as it was listed (its `subject`):
+        // the items it concerns, folders' contents included, and a code for
+        // exactly those, which it must still match when it's given
+        // (`--expect`). Deletions, a choice for many items and a new name are
+        // asked about first.
+        function preview(c, items, bulk, name = null) {
+            return call("unsynced_preview", {
+                root: L.root,
+                choice: c.code,
+                path: bulk ? undefined : items[0].path,
+                subject: bulk ? undefined : items[0].subject || undefined,
+                name: name === null ? undefined : name
+            }).then(pv => {
+                if (!pv.tops.length) throw new Error(pv.refused.join(" ") || "Nothing to do.");
+                return pv;
+            });
+        }
+
+        async function resolveAsk(c, items, bulk) {
+            const rename = c.code === "rename",
+                exclude = c.code === "exclude";
+            const one = items[0];
+            if (!bulk && exclude) return resolveGo(c, items, false);
+            if (!bulk && !c.deletes && !rename) {
+                const pv = await preview(c, items, false).catch(e => {
+                    toast(e.message, true);
+                    return null;
+                });
+                return pv && resolveGo(c, items, false, null, pv.code);
+            }
+            const li = t => el("li", {
+                textContent: t
+            });
+            const facts = [];
+            let expect = null;
+            if (rename) facts.push(li(one.path));
+            else {
+                const pv = await preview(c, items, bulk).catch(e => {
+                    toast(e.message, true);
+                    return null;
+                });
+                if (!pv) return;
+                expect = pv.code;
+                facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
+                if (pv.tops.length > 5) facts.push(li(`and ${(pv.tops.length - 5).toLocaleString()} more`));
+                if (pv.items > pv.tops.length) facts.push(li(`${plural(pv.items, "item")} in all`));
+                if (pv.refused.length) facts.push(li(`${pv.refused.length.toLocaleString()} skipped: ${pv.refused[0]}`));
+            }
+            if (DELETED_TO[c.code]) facts.push(li(DELETED_TO[c.code]));
+            $("#rs-title").textContent = bulk ? allLabel(c.label, items.length) + "?" : rename ? "Rename" : c.label + "?";
+            $("#rs-facts").replaceChildren(...facts);
+            $("#rs-name-box").hidden = !rename;
+            $("#rs-busy").textContent = "";
+            const name = $("#rs-name");
+            if (rename) name.value = one.path.split("/").pop();
+            const go = $("#rs-go");
+            go.textContent = rename ? "Rename" : c.label.split(" ")[0];
+            go.disabled = false;
+            go.onclick = async() => {
+                go.disabled = true;
+                let code = expect;
+                if (rename) {
+                    // The name is checked, and bound, for the file listed.
+                    const pv = await preview(c, items, false, name.value.trim()).catch(e => {
+                        toast(e.message, true);
+                        return null;
+                    });
+                    if (!pv) return go.disabled = false;
+                    code = pv.code;
+                }
+                const ok = await resolveGo(c, items, bulk, rename ? name.value.trim() : null, code);
+                if (ok) $("#dlg-resolve").close();
+                else go.disabled = false;
+            };
+            $("#dlg-resolve").showModal();
+            if (rename) {
+                name.focus();
+                const dot = name.value.lastIndexOf(".");
+                name.setSelectionRange(0, dot > 0 ? dot : name.value.length);
+            }
+        }
+
+        async function resolveGo(c, items, bulk, name = null, expect = null) {
+            const args = {
+                root: L.root,
+                choice: c.code
+            };
+            if (bulk) args.all = true;
+            else args.path = items[0].path;
+            if (name !== null) args.name = name;
+            if (expect !== null) args.expect = expect;
+            try {
+                const out = await call("unsynced_resolve", args);
+                toast(out.trim().split("\n").pop());
+                loadList(false);
+                return true;
+            } catch (e) {
+                toast(e.message, true);
+                return false;
             }
         }
 

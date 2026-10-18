@@ -23,6 +23,8 @@
 //!   the next round plans from the new state without waiting for the change
 //!   journal or delta. When those report the same change later, applying it
 //!   again changes nothing.
+//! * The user's answers for held items ([`resolve`]) only change what the
+//!   planner reads; what they lead to runs as any planned operation does.
 //! * **Crash safety.** A crash between an effect and its record must not
 //!   leave anything that looks like a deletion without evidence (which would
 //!   be held forever) or, worse, evidence without a deletion. Most effects
@@ -51,6 +53,7 @@ pub mod graph;
 pub mod hydrate;
 #[cfg(windows)]
 pub mod placement;
+pub mod resolve;
 #[cfg(windows)]
 mod schedule;
 pub mod timing;

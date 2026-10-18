@@ -186,7 +186,31 @@ Of these, the ones you'd have to change before they can sync (a name OneDrive re
 oneup --data-dir … unsynced
 ```
 
-An item leaves the list once it syncs, once it's gone, or once you exclude it. Excluded items are never on it: they're left out on purpose. How File Explorer shows them is explained in [Choosing what syncs](excluding-files.md#sync-pending-in-explorer).
+An item leaves the list once it syncs, once it's gone, once you exclude it, or once you resolve it (below). Excluded items are never on it: they're left out on purpose. How File Explorer shows them is explained in [Choosing what syncs](excluding-files.md#sync-pending-in-explorer).
+
+### Resolving what can't sync
+The settings window's **Activity** page, **Sync failures** tab, has a button for each way to resolve an item; so does the command line. What you can do depends on why it can't sync:
+
+| Why | Choices |
+|---|---|
+| Gone from this PC (no recorded deletion) | **Delete in OneDrive** (into OneDrive's recycle bin), or **Restore** (download it again). In a backup pair: **Keep in OneDrive**. |
+| Gone from OneDrive (no recorded deletion) | **Delete here** (into the kept copies in `.oneup\versions`), or **Upload** (send it again). In a backup pair: **Upload**. |
+| Name not allowed, or names that differ only in capitals | **Rename** (to a name OneDrive allows, not taken here or in OneDrive). |
+| Too large, a hard link, or its name taken by a link | **Exclude** (leave it out with a rule), or change it in File Explorer. |
+| Folder not empty | **Contents** shows what it still holds (often items your rules leave out). Delete or move them yourself, or clear OneDrive's leftovers under **Excluded in OneDrive**. |
+| Backup only | Change it in File Explorer or on OneDrive's website. |
+
+A folder counts with everything in it. OneUpDrive carries your choice out in its next round, with the usual checks: if the item came back, or changed on the other side since, nothing is deleted (an edit wins over a deletion and is synced instead), and the activity log says why. Many deletions at once still make it stop and ask first (see [Safety stop](#safety-stop)).
+
+```powershell
+oneup --data-dir … unsynced resolve /docs/old.txt                        # what you can do about it
+oneup --data-dir … unsynced resolve /docs/old.txt --delete-in-onedrive   # shows what it would do
+oneup --data-dir … unsynced resolve /docs/old.txt --delete-in-onedrive --yes
+oneup --data-dir … unsynced resolve "/old notes." --rename "old notes" --yes
+oneup --data-dir … unsynced resolve --all --upload --yes                 # every item it fits
+```
+
+The other choices are `--restore`, `--delete-here`, `--keep-in-onedrive` and `--exclude`. Without `--yes` nothing is done: it shows what would be, and a code; `--yes --expect CODE` then goes ahead only if that's still exactly so. `--exclude` needs no `--yes`. One choice covers at most 100,000 items; for a larger folder, choose the folders inside it. `oneup explain PATH` says why an item can't sync and which choice is waiting.
 
 ## What happened to my file?
 OneUpDrive keeps a log of what sync did: every upload, download, move, rename, deletion and conflict copy, anything it had to skip or couldn't do, and the times it waited for you (safety stops, a full version store).

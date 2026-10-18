@@ -399,6 +399,18 @@ impl LocalFs {
         win::final_path(&h).is_ok_and(|p| self.is_inside(&long(&p)))
     }
 
+    /// [`LocalFs::is_present`] for a decision that needs certainty either
+    /// way: `Some(false)` only when the ID no longer exists or the item is
+    /// outside the sync folder (or in OneUpDrive's own), `None` when it
+    /// can't be told (access denied, a path that can't be read). Read-only.
+    pub fn presence(&self, id: LocalId) -> Option<bool> {
+        match self.volume.open_attributes_by_id(FileId(id.0)) {
+            Err(e) if e.is_not_found() => Some(false),
+            Err(_) => None,
+            Ok(h) => win::final_path(&h).ok().map(|p| self.is_inside(&long(&p))),
+        }
+    }
+
     /// The current name of the item with this ID, if it exists inside the
     /// sync folder (outside OneUpDrive's own folder). Read-only.
     pub fn name_of(&self, id: LocalId) -> Option<String> {
