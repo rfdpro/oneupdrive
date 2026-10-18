@@ -34,19 +34,32 @@
 //! rebuild the tree. A rescan records **no** evidence: whatever disappeared
 //! meanwhile reads as Missing (`data-safety.md` invariant 3).
 //!
+//! ## Delete records read ahead ([`SeenDeletes`])
+//! The agent's journal watcher reads every record as it's written, while
+//! the observer only runs between rounds. A long round on a busy disk (a
+//! build tree or a dependency folder deleted: hundreds of thousands of
+//! records) can wrap a small journal before the observer reads it, losing
+//! the delete records of synced items deleted meanwhile, so they would be
+//! held instead of deleted in OneDrive. The watcher keeps the delete
+//! records of items in the trees ([`remember_deletes`]), and after a
+//! rescan they're noted as evidence for the items the rescan didn't find
+//! ([`note_seen_deletes`]). They are the same USN delete records the
+//! observer would have applied; nothing is inferred from absence.
+//!
 //! ## Cost
 //! Proportional to the journal's records, not the tree: one indexed lookup
 //! per mentioned ID, and one open-by-ID per item inside the tree. Folders
 //! are listed only when they enter the tree. The journal is volume-wide, so
 //! activity elsewhere on the disk costs a lookup per record and nothing more.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Mutex;
 
 use oneup_ntfs::FileId;
 use oneup_ntfs::dirent::DirEntry;
 use oneup_ntfs::record::{UsnRecord, reason};
 use oneup_rules::ExcludeSet;
-use oneup_store::{LocalKind, Ops, Skip};
+use oneup_store::{LocalKind, Ops, Skip, Store};
 
 use crate::classify;
 
@@ -301,8 +314,191 @@ pub fn apply_records(
     Ok(())
 }
 
+/// The most delete records [`SeenDeletes`] keeps (32 bytes each, so at most
+/// 8 MiB). Only records of items in the trees are kept, and only until the
+/// observer has read past them; past this, the oldest go, and their items
+/// are held after a rescan as they would be without the log.
+const SEEN_MAX: usize = 1 << 18;
+
+/// Delete records of items in the trees, read by the journal watcher ahead
+/// of the observer (see the module docs). One per process
+/// ([`seen_deletes`]); a process without a watcher leaves it empty. File IDs
+/// belong to the volume, not the journal, so records from a journal since
+/// replaced still count: a rescan uses them all ([`note_seen_deletes`]).
+#[derive(Debug, Default)]
+pub struct SeenDeletes {
+    inner: Mutex<VecDeque<Segment>>,
+}
+
+/// One journal's records, oldest journal first.
+#[derive(Debug)]
+struct Segment {
+    journal_id: u64,
+    /// Where the observer has read this journal up to: older records are
+    /// its already.
+    floor: i64,
+    /// (USN of the record, file ID), oldest first.
+    ids: VecDeque<(i64, u128)>,
+}
+
+impl SeenDeletes {
+    pub const fn new() -> Self {
+        Self { inner: Mutex::new(VecDeque::new()) }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Segment>> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records that journal `journal_id` holds a delete record for `id` at
+    /// `usn`. A record the observer has read past already (a watcher's read
+    /// that lost the race with the observer) is refused.
+    pub fn saw(&self, journal_id: u64, usn: i64, id: u128) {
+        let mut s = self.lock();
+        let seg = segment(&mut s, journal_id);
+        if usn < seg.floor {
+            return;
+        }
+        seg.ids.push_back((usn, id));
+        // Past the bound, the oldest go first.
+        let mut total: usize = s.iter().map(|g| g.ids.len()).sum();
+        while total > SEEN_MAX {
+            let Some(oldest) = s.front_mut() else { break };
+            if oldest.ids.pop_front().is_none() && s.len() > 1 {
+                s.pop_front();
+                continue;
+            }
+            total -= 1;
+        }
+    }
+
+    /// Forgets journal `journal_id`'s records before `cursor`, and refuses
+    /// them from now on: the observer has read them.
+    pub fn trim(&self, journal_id: u64, cursor: i64) {
+        let mut s = self.lock();
+        let seg = segment(&mut s, journal_id);
+        seg.floor = seg.floor.max(cursor);
+        while seg.ids.front().is_some_and(|&(usn, _)| usn < seg.floor) {
+            seg.ids.pop_front();
+        }
+    }
+
+    /// Every record held, of any journal, oldest first: (journal, USN, ID).
+    pub fn pending(&self) -> Vec<(u64, i64, u128)> {
+        let s = self.lock();
+        s.iter().flat_map(|g| g.ids.iter().map(|&(usn, id)| (g.journal_id, usn, id))).collect()
+    }
+
+    /// Forgets `done` (from [`SeenDeletes::pending`]) once acted on, and
+    /// whatever came before them in their journals; what the watcher added
+    /// since stays. The floors stay too, so a late read of the same records
+    /// is still refused.
+    pub fn acknowledge(&self, done: &[(u64, i64, u128)]) {
+        let mut s = self.lock();
+        for g in s.iter_mut() {
+            let Some(last) = done.iter().filter(|d| d.0 == g.journal_id).map(|d| d.1).max() else { continue };
+            while g.ids.front().is_some_and(|&(usn, _)| usn <= last) {
+                g.ids.pop_front();
+            }
+        }
+    }
+
+    /// The IDs held from journal `journal_id`.
+    pub fn ids(&self, journal_id: u64) -> Vec<u128> {
+        let s = self.lock();
+        s.iter().filter(|g| g.journal_id == journal_id).flat_map(|g| g.ids.iter().map(|&(_, id)| id)).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.lock().iter().map(|g| g.ids.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Journal `journal_id`'s segment, made (as the newest) if there's none.
+/// Journals are replaced rarely; a handful of segments at most.
+fn segment(s: &mut VecDeque<Segment>, journal_id: u64) -> &mut Segment {
+    let i = match s.iter().position(|g| g.journal_id == journal_id) {
+        Some(i) => i,
+        None => {
+            s.push_back(Segment { journal_id, floor: 0, ids: VecDeque::new() });
+            s.len() - 1
+        }
+    };
+    &mut s[i]
+}
+
+static SEEN: SeenDeletes = SeenDeletes::new();
+
+/// This process's [`SeenDeletes`].
+pub fn seen_deletes() -> &'static SeenDeletes {
+    &SEEN
+}
+
+/// Keeps, in `seen`, the delete records among `records` (journal
+/// `journal_id`) of items in the Local or the Synced tree: evidence is only
+/// ever recorded for Synced items, but an item just uploaded is in the
+/// Local tree before its Synced row is written. One indexed lookup or two
+/// per delete record, in one read. Returns how many were kept.
+pub fn remember_deletes(
+    store: &Store,
+    seen: &SeenDeletes,
+    journal_id: u64,
+    records: &[UsnRecord],
+) -> oneup_store::Result<usize> {
+    let deletes: Vec<&UsnRecord> = records.iter().filter(|r| r.has(reason::FILE_DELETE)).collect();
+    if deletes.is_empty() {
+        return Ok(0);
+    }
+    let known = store.read(|o| {
+        let mut keep = Vec::new();
+        for r in deletes {
+            let id = r.file_id.0;
+            if o.synced_by_local(id)?.is_some() || o.local_get(id)?.is_some() {
+                keep.push((r.usn, id));
+            }
+        }
+        Ok(keep)
+    })?;
+    for &(usn, id) in &known {
+        seen.saw(journal_id, usn, id);
+    }
+    Ok(known.len())
+}
+
+/// After a rescan: notes deletion evidence for the items `seen` holds delete
+/// records of and that the rescan didn't find, then forgets those records
+/// (kept if the write fails, for the next rescan). An item it found is left
+/// alone: it's there. Only Synced items get evidence
+/// (`Ops::note_local_deleted`). Returns how many did.
+pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::Result<u64> {
+    let Some(root) = store.read(|o| o.local_root())? else { return Ok(0) };
+    let pending = seen.pending();
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let noted = store.write(|o| {
+        let mut noted = 0;
+        for &(_, _, id) in &pending {
+            // The root's own delete record isn't evidence for anything
+            // (a rescan wouldn't have opened without it anyway).
+            if id != root.root_file_id && o.local_get(id)?.is_none() && o.note_local_deleted(id)? {
+                noted += 1;
+            }
+        }
+        Ok(noted)
+    })?;
+    seen.acknowledge(&pending);
+    Ok(noted)
+}
+
 #[cfg(windows)]
 pub use driver::Observer;
+#[cfg(windows)]
+pub use driver::{JournalTail, Tailed};
 
 #[cfg(windows)]
 mod driver {
@@ -436,6 +632,11 @@ mod driver {
             Ok(())
         }
 
+        /// The journal (id, USN) the tree is current up to.
+        pub fn position(&self) -> (u64, i64) {
+            (self.journal_id, self.cursor)
+        }
+
         pub fn store(&self) -> &Store {
             &self.store
         }
@@ -448,6 +649,98 @@ mod driver {
         pub fn into_store(self) -> Store {
             self.store
         }
+    }
+
+    /// Reads a volume's change journal record by record from a position
+    /// on, for the agent's journal watcher. It never skips ahead by choice.
+    /// When the journal wrapped past its position anyway (the disk wrote
+    /// faster than it read), it goes on from the oldest record still kept;
+    /// when the journal was replaced, from the new journal's start. Either
+    /// way it says so ([`Tailed::lost`]): what was lost is held, as after
+    /// any journal loss.
+    #[derive(Debug)]
+    pub struct JournalTail {
+        volume: Volume,
+        journal_id: u64,
+        cursor: i64,
+        /// 64 KiB holds several hundred records.
+        buf: Vec<u8>,
+    }
+
+    /// One read of a [`JournalTail`].
+    #[derive(Debug, Default)]
+    pub struct Tailed {
+        pub records: Vec<UsnRecord>,
+        /// Records were lost before these (the journal wrapped past the
+        /// position, or was replaced).
+        pub lost: bool,
+    }
+
+    impl JournalTail {
+        /// Opens the journal of the volume holding `path` at `from` (a
+        /// journal ID and position, e.g. the observer's), or at the oldest
+        /// record kept if the journal no longer reaches back that far or
+        /// was replaced since. Without `from`, at its end.
+        pub fn open(path: &Path, from: Option<(u64, i64)>) -> win::Result<Self> {
+            let volume = Volume::open_containing(path)?;
+            let j = volume.query_journal()?;
+            let cursor = match from {
+                Some((id, usn)) if id == j.journal_id => usn.clamp(oldest(&j), j.next_usn),
+                // The journal was replaced since: all of the new one.
+                Some(_) => oldest(&j),
+                None => j.next_usn,
+            };
+            Ok(Self { volume, journal_id: j.journal_id, cursor, buf: vec![0u8; 64 * 1024] })
+        }
+
+        /// The journal and position the next read starts from.
+        pub fn position(&self) -> (u64, i64) {
+            (self.journal_id, self.cursor)
+        }
+
+        /// How many bytes of records are waiting to be read.
+        pub fn behind(&self) -> win::Result<i64> {
+            Ok(self.volume.query_journal()?.next_usn.saturating_sub(self.cursor))
+        }
+
+        /// The next records, up to a buffer's worth. With `wait`, blocks in
+        /// the kernel until there's at least one.
+        pub fn next(&mut self, wait: bool) -> win::Result<Tailed> {
+            // Checked first as well: a read from before the oldest record
+            // fails, but one from position 0 reads from the start silently.
+            let j = self.volume.query_journal()?;
+            let mut lost = false;
+            if j.journal_id != self.journal_id || self.cursor < oldest(&j) {
+                (self.journal_id, self.cursor, lost) = (j.journal_id, oldest(&j), true);
+            }
+            let mut retried = false;
+            let (next, records) = loop {
+                match self.volume.read_journal(self.journal_id, self.cursor, wait, &mut self.buf) {
+                    // A record that doesn't parse stops the read (and the
+                    // position) there, as it does the observer's.
+                    Ok((next, records)) => {
+                        let records = records.collect::<std::result::Result<Vec<_>, _>>()?;
+                        break (next, records);
+                    }
+                    // Wrapped or replaced meanwhile (a wait can be long):
+                    // once more from the oldest record. Anything else, or a
+                    // second failure, is the caller's.
+                    Err(e) => {
+                        let j = self.volume.query_journal()?;
+                        if retried || (j.journal_id == self.journal_id && self.cursor >= oldest(&j)) {
+                            return Err(e);
+                        }
+                        (self.journal_id, self.cursor, lost, retried) = (j.journal_id, oldest(&j), true, true);
+                    }
+                }
+            };
+            self.cursor = self.cursor.max(next);
+            Ok(Tailed { records, lost })
+        }
+    }
+
+    fn oldest(j: &win::JournalInfo) -> i64 {
+        j.first_usn.max(j.lowest_valid_usn)
     }
 
     /// A cloud placeholder folder read by ID, with the attributes its
@@ -471,6 +764,99 @@ mod driver {
                 tracing::debug!(error = %err, "a cloud folder's listing entry could not be read");
                 Stat::Unreadable
             }
+        }
+    }
+
+    /// The temp folder's volume journal; temp folders only.
+    #[cfg(test)]
+    mod tests {
+        #![allow(clippy::unwrap_used)]
+        use super::*;
+        use oneup_ntfs::record::reason;
+
+        fn temp(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("oneup-tail-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// Reads until caught up; the deleted IDs, and whether any read lost records.
+        fn drain(tail: &mut JournalTail) -> (Vec<u128>, bool) {
+            let (mut deleted, mut lost) = (Vec::new(), false);
+            while tail.behind().unwrap() > 0 {
+                let read = tail.next(false).unwrap();
+                lost |= read.lost;
+                deleted.extend(read.records.iter().filter(|r| r.has(reason::FILE_DELETE)).map(|r| r.file_id.0));
+                if read.records.is_empty() {
+                    break;
+                }
+            }
+            (deleted, lost)
+        }
+
+        fn file_id(path: &Path) -> u128 {
+            let dir = win::open_dir(path.parent().unwrap()).unwrap();
+            let (mut buf, mut out) = (vec![0u8; 64 * 1024], Vec::new());
+            win::list_dir(&dir, &mut buf, &mut out).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            out.iter().find(|e| e.name == name).unwrap().file_id.0
+        }
+
+        #[test]
+        fn a_backlog_larger_than_a_buffer_is_read_whole() {
+            let dir = temp("backlog");
+            let mut tail = JournalTail::open(&dir, None).unwrap();
+            // Hundreds of KiB of records ahead of the one that matters.
+            for i in 0..3000 {
+                let p = dir.join(format!("f{i}"));
+                std::fs::write(&p, b"x").unwrap();
+                std::fs::remove_file(&p).unwrap();
+            }
+            let last = dir.join("last.txt");
+            std::fs::write(&last, b"x").unwrap();
+            let id = file_id(&last);
+            std::fs::remove_file(&last).unwrap();
+            assert!(tail.behind().unwrap() > 64 * 1024, "more than one read waiting");
+            let (deleted, lost) = drain(&mut tail);
+            assert!(!lost);
+            assert!(deleted.contains(&id));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_position_the_journal_wrapped_past_goes_on_from_the_oldest_record() {
+            let dir = temp("wrapped");
+            let mut tail = JournalTail::open(&dir, None).unwrap();
+            let (journal_id, _) = tail.position();
+            // As if the disk outran the reads: a position before the oldest
+            // record kept.
+            tail.cursor = 8;
+            let read = tail.next(false).unwrap();
+            assert!(read.lost);
+            assert!(tail.position().1 > 8);
+            assert_eq!(tail.position().0, journal_id);
+            // Opening at such a position starts at the oldest record instead.
+            let tail = JournalTail::open(&dir, Some((journal_id, 8))).unwrap();
+            assert!(tail.position().1 > 8);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_replaced_journal_is_read_from_its_oldest_record() {
+            let dir = temp("other");
+            // Deleted before the tail opens, after the position it's given.
+            let f = dir.join("gone.txt");
+            std::fs::write(&f, b"x").unwrap();
+            let id = file_id(&f);
+            std::fs::remove_file(&f).unwrap();
+            let now = JournalTail::open(&dir, None).unwrap().position();
+            let mut tail = JournalTail::open(&dir, Some((now.0.wrapping_add(1), now.1))).unwrap();
+            assert_eq!(tail.position().0, now.0);
+            assert!(tail.position().1 < now.1, "{:?} {now:?}", tail.position());
+            let (deleted, _) = drain(&mut tail);
+            assert!(deleted.contains(&id), "the new journal's records are read");
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
@@ -665,6 +1051,157 @@ mod tests {
             s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), &records, &mut |_, _| Stat::Gone, &mut ch));
         assert!(matches!(r, Err(Error::NeedsRescan(Rescan::RootGone))));
         assert!(s.read(|o| o.local_get(4)).unwrap().is_some(), "the batch was rolled back");
+    }
+
+    const JOURNAL: u64 = 7;
+
+    /// [`tree`] as a rescan of journal [`JOURNAL`] leaves it after `gone`
+    /// were deleted while nothing read the journal: their rows dropped,
+    /// without evidence.
+    fn rescanned(gone: &[u128]) -> Store {
+        let mut s = tree();
+        s.write(|o| {
+            let root = oneup_store::LocalRoot {
+                path: r"C:\t".into(),
+                volume_serial: 1,
+                root_file_id: ROOT_ID,
+                rules: String::new(),
+                journal: Some((JOURNAL, 1000)),
+                started_at_ms: 0,
+                finished_at_ms: Some(1),
+                sync_root_provider: None,
+            };
+            // `local_begin` starts the Local tree over; what's left goes back.
+            o.local_begin(&root, &row(ROOT_ID, 0, "", LocalKind::Root))?;
+            let rows = [
+                row(2, ROOT_ID, "docs", LocalKind::Folder),
+                row(3, 2, "a.txt", LocalKind::File),
+                row(4, ROOT_ID, "b.txt", LocalKind::File),
+            ];
+            for r in rows.iter().filter(|r| !gone.contains(&r.file_id)) {
+                o.local_update(r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        s
+    }
+
+    fn seen(s: &Store, id: u128) -> Seen<oneup_sync::LocalNode> {
+        s.read(|o| o.local(LocalId(id))).unwrap()
+    }
+
+    #[test]
+    fn delete_records_read_ahead_are_evidence_after_a_rescan() {
+        // b.txt (synced) was deleted; the journal wrapped before the
+        // observer read it, but the watcher had.
+        let mut s = rescanned(&[4]);
+        assert_eq!(seen(&s, 4), Seen::Missing, "without the record: held");
+        let log = SeenDeletes::new();
+        let kept = remember_deletes(&s, &log, JOURNAL, &[rec(4, ROOT_ID, reason::FILE_DELETE | reason::CLOSE)]);
+        assert_eq!(kept.unwrap(), 1);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 1);
+        assert_eq!(seen(&s, 4), Seen::Deleted);
+        assert!(s.read(|o| o.check_invariants()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_synced_items_absent_after_the_rescan_get_evidence() {
+        let mut s = rescanned(&[3]);
+        let log = SeenDeletes::new();
+        let records = [
+            // a.txt: deleted, never synced, and gone from the trees.
+            rec(3, 2, reason::FILE_DELETE),
+            // Elsewhere on the disk.
+            rec(50, 49, reason::FILE_DELETE),
+            // Not a delete.
+            rec(4, ROOT_ID, reason::DATA_EXTEND | reason::CLOSE),
+            // docs: in the Local tree (kept), but not synced (no evidence).
+            rec(2, ROOT_ID, reason::FILE_DELETE),
+        ];
+        assert_eq!(remember_deletes(&s, &log, JOURNAL, &records).unwrap(), 1);
+        assert_eq!(log.ids(JOURNAL), [2]);
+        // Even if a record of a present item got in, the item is there.
+        log.saw(JOURNAL, 10, 4);
+        log.saw(JOURNAL, 11, ROOT_ID);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 0);
+        assert!(seen(&s, 4).present().is_some());
+        assert!(s.read(|o| o.check_invariants()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deletions_recorded_by_a_journal_since_replaced_are_evidence() {
+        // Read from the old journal; the rescan continues a new one. File
+        // IDs belong to the volume.
+        let mut s = rescanned(&[4]);
+        let log = SeenDeletes::new();
+        log.saw(JOURNAL - 1, 10, 4);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 1);
+        assert_eq!(seen(&s, 4), Seen::Deleted);
+        assert!(log.is_empty(), "acted on");
+    }
+
+    #[test]
+    fn a_file_deleted_while_its_upload_is_recorded_gets_evidence() {
+        // new.txt was uploaded; the user deleted it before the executor
+        // wrote its Synced row, and the journal wrapped before the observer
+        // read the delete.
+        let mut s = tree();
+        s.write(|o| o.local_update(&row(5, ROOT_ID, "new.txt", LocalKind::File))).unwrap();
+        let log = SeenDeletes::new();
+        assert_eq!(remember_deletes(&s, &log, JOURNAL, &[rec(5, ROOT_ID, reason::FILE_DELETE)]).unwrap(), 1);
+        // Then the Synced row, and a rescan that doesn't find it.
+        let mut s = rescanned(&[]);
+        let base = Base {
+            sid: 9,
+            parent: Some(ROOT),
+            name: "new.txt".into(),
+            kind: NodeKind::File,
+            size: 0,
+            hash: None,
+            local: Some(LocalId(5)),
+            local_mtime: 5,
+            remote: Some(RemoteId("r5".into())),
+            remote_etag: String::new(),
+        };
+        s.write(|o| o.synced_put(&base)).unwrap();
+        assert_eq!(seen(&s, 5), Seen::Missing);
+        assert_eq!(note_seen_deletes(&mut s, &log).unwrap(), 1);
+        assert_eq!(seen(&s, 5), Seen::Deleted);
+    }
+
+    #[test]
+    fn the_log_forgets_what_the_observer_read_and_stays_bounded() {
+        let log = SeenDeletes::new();
+        for usn in 0..10 {
+            log.saw(JOURNAL, usn, usn as u128);
+        }
+        log.trim(JOURNAL, 6);
+        assert_eq!(log.ids(JOURNAL), [6, 7, 8, 9]);
+        // A watcher's read that lost the race with the observer.
+        log.saw(JOURNAL, 5, 99);
+        assert_eq!(log.ids(JOURNAL), [6, 7, 8, 9], "already read by the observer");
+        for usn in 10..(SEEN_MAX as i64 + 10) {
+            log.saw(JOURNAL, usn, 1);
+        }
+        assert_eq!(log.len(), SEEN_MAX);
+        assert_eq!(log.ids(JOURNAL)[0], 1, "the oldest went first");
+        // Another journal keeps its own position; the bound is over all.
+        log.trim(JOURNAL + 1, 100);
+        log.saw(JOURNAL + 1, 50, 7);
+        assert!(log.ids(JOURNAL + 1).is_empty(), "before the observer's position there");
+        log.saw(JOURNAL + 1, 150, 8);
+        assert_eq!(log.len(), SEEN_MAX);
+        assert_eq!(log.ids(JOURNAL + 1), [8]);
+        let pending = log.pending();
+        assert_eq!(pending.len(), SEEN_MAX);
+        log.saw(JOURNAL + 1, 160, 9);
+        log.acknowledge(&pending);
+        assert_eq!(log.ids(JOURNAL + 1), [9], "added after the snapshot: kept");
+        log.acknowledge(&log.pending());
+        assert!(log.is_empty());
+        log.saw(JOURNAL, 5, 99);
+        assert!(log.is_empty(), "the positions outlive a take");
     }
 
     #[test]
