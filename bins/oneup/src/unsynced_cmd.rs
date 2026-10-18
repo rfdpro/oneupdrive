@@ -52,6 +52,11 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         }
     }
     if choice == Choice::Exclude {
+        if let Some(code) = a.expect
+            && code != resolve::prepare(&store, &items, choice, None, backup)?.code
+        {
+            bail!("what this concerns changed since it was shown; look again");
+        }
         for i in &items {
             let folder = pair.local.join(i.path.trim_start_matches('/')).is_dir();
             println!("{}", oneup_app::filetree::set_sync(dir, &i.path, folder, false)?);

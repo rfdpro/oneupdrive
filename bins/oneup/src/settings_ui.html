@@ -3006,7 +3006,7 @@
             }), list, cloud)));
         }
 
-        // Every answer but an exclusion is worked out by OneUpDrive first
+        // Every answer but one exclusion is worked out by OneUpDrive first
         // (`unsynced_preview`), for the item as it was listed (its `subject`):
         // the items it concerns, folders' contents included, and a code for
         // exactly those, which it must still match when it's given
@@ -3043,10 +3043,7 @@
             const facts = [];
             let expect = null;
             if (rename) facts.push(li(one.path));
-            else if (exclude) {
-                facts.push(...items.slice(0, 5).map(i => li(i.path)));
-                if (items.length > 5) facts.push(li(`and ${(items.length - 5).toLocaleString()} more`));
-            } else {
+            else {
                 const pv = await preview(c, items, bulk).catch(e => {
                     toast(e.message, true);
                     return null;

@@ -458,8 +458,12 @@ pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str
     let mut code = sha2::Sha256::new();
     code.update(choice.code().as_bytes());
     for i in tops {
-        let worked =
-            store.read(|o| Ok(check(o, i, choice, name, backup, &|_| false)?.map(|c| (c.items(), c.fingerprint()))))?;
+        // An exclusion is a rule for the path: its code is of the paths.
+        let worked = if choice == Choice::Exclude {
+            Ok((1, String::new()))
+        } else {
+            store.read(|o| Ok(check(o, i, choice, name, backup, &|_| false)?.map(|c| (c.items(), c.fingerprint()))))?
+        };
         match worked {
             Ok((n, id)) => {
                 out.items += n;
@@ -467,7 +471,8 @@ pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str
                 code.update([0]);
                 code.update(id.as_bytes());
                 let name = name.map(|n| n.trim().to_string());
-                out.asked.push(Request { path: i.path.clone(), choice, name, id: Some(id) });
+                let id = (!id.is_empty()).then_some(id);
+                out.asked.push(Request { path: i.path.clone(), choice, name, id });
             }
             Err(why) => out.refused.push(format!("{}: {why}", i.path)),
         }
@@ -585,6 +590,23 @@ mod tests {
         let q = s.read(queued).unwrap();
         assert_eq!(q.len(), MAX);
         assert!(!q.iter().any(|r| r.path == "/one-more"));
+    }
+
+    #[test]
+    fn excluding_many_is_bound_to_the_items_shown() {
+        let mut s = Store::open_in_memory().unwrap();
+        let set = |s: &mut Store, record: &str| s.write(|o| o.meta_set(crate::unsynced::KEY, record)).unwrap();
+        let code = |s: &Store| {
+            let record = crate::unsynced::load(s).unwrap();
+            let items = select(&record, Some(Choice::Exclude), None, false).unwrap();
+            prepare(s, &items, Choice::Exclude, None, false).unwrap()
+        };
+        set(&mut s, r#"{"items":[["/a.iso","too_large"],["/b.iso","too_large"]]}"#);
+        let shown = code(&s);
+        assert_eq!((shown.items, shown.asked.len()), (2, 2));
+        assert_eq!(code(&s).code, shown.code);
+        set(&mut s, r#"{"items":[["/a.iso","too_large"],["/b.iso","too_large"],["/c.iso","too_large"]]}"#);
+        assert_ne!(code(&s).code, shown.code, "one more since it was shown");
     }
 
     #[test]

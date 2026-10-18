@@ -926,7 +926,7 @@ struct ResolveArgs {
     all: bool,
     /// Go ahead only if the choice still concerns exactly the items it did
     /// when this code was shown (a run without --yes shows it)
-    #[arg(long, value_name = "CODE", conflicts_with = "exclude")]
+    #[arg(long, value_name = "CODE")]
     expect: Option<String>,
     /// Gone from this PC: delete it in OneDrive too, into its recycle bin
     #[arg(long, group = "choice")]
