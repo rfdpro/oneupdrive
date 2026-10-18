@@ -83,6 +83,9 @@ struct State {
     /// have finished, and how many did meanwhile.
     stall: Option<String>,
     finished_during_stall: Option<usize>,
+    /// The next upload, after reading its first bytes, has this file saved
+    /// in place with this content (its program saving it meanwhile).
+    saved_meanwhile: Option<(PathBuf, Vec<u8>)>,
     /// The next folder made with this name finds it taken: someone made it
     /// in OneDrive meanwhile (it then exists, empty).
     beaten: Option<String>,
@@ -371,8 +374,13 @@ impl Fake {
         size: i64,
         src: &mut (dyn Read + Send),
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
-        let mut content = Vec::new();
-        src.read_to_end(&mut content).map_err(|e| CloudError::Other(e.to_string()))?;
+        let mut content = vec![0u8; size.clamp(0, 2) as usize];
+        src.read_exact(&mut content)?;
+        if let Some((path, new)) = self.0.lock().unwrap().saved_meanwhile.take() {
+            // The save must not fail because the file is being uploaded.
+            std::fs::OpenOptions::new().write(true).truncate(true).open(path).unwrap().write_all(&new).unwrap();
+        }
+        src.read_to_end(&mut content)?;
         assert_eq!(content.len() as i64, size);
         let mut s = self.0.lock().unwrap();
         if s.full {
@@ -1413,6 +1421,25 @@ async fn a_cloud_deletion_of_an_open_file_waits_then_recycles() {
     s.settle().await;
     assert!(!s.p("open.txt").exists());
     assert_eq!(s.versions(), vec![b"in use".to_vec()]);
+}
+
+/// A program saving a file while it's being uploaded isn't stopped. The
+/// upload stops before it completes (no copy mixing the two versions
+/// reaches OneDrive), and the next round sends the saved version.
+#[tokio::test]
+async fn a_save_during_an_upload_goes_through_and_the_saved_version_is_sent() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("saved-meanwhile", cloud.clone());
+    write(&s.p("doc.txt"), b"first version");
+    cloud.0.lock().unwrap().saved_meanwhile = Some((s.p("doc.txt"), b"saved meanwhile".to_vec()));
+    let r = s.round().await;
+    assert!(r.skipped.iter().any(|(_, k)| *k == oneup_exec::Skip::Changed), "{r:?}");
+    assert!(cloud.0.lock().unwrap().saved_meanwhile.is_none(), "the upload began");
+    assert!(!cloud.tree().contains_key("/doc.txt"));
+    assert_eq!(std::fs::read(s.p("doc.txt")).unwrap(), b"saved meanwhile");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/doc.txt"].as_deref(), Some(&b"saved meanwhile"[..]));
+    assert!(!cloud.holds(b"first version") && !cloud.holds(b"fisaved meanwhile"));
 }
 
 #[tokio::test]

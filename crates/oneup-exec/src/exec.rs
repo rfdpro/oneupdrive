@@ -682,7 +682,6 @@ impl<C: Cloud> Executor<C> {
         new: bool,
         alone: bool,
     ) -> Res<Option<(RemoteRow, Hash)>> {
-        use std::io::{Seek, SeekFrom};
         if !may_copy(self.cloud.can_copy(), new, src.size) || (src.size > READ_ALONE && !alone) {
             return Ok(None);
         }
@@ -691,8 +690,12 @@ impl<C: Cloud> Executor<C> {
             return Ok(None);
         }
         let mut buf = vec![0u8; 1 << 20];
-        let h = oneup_hash::hash_reader(&src.file, &mut buf).map_err(|e| Fail::Failed(e.to_string()))?;
-        src.file.seek(SeekFrom::Start(0)).map_err(|e| Fail::Failed(e.to_string()))?;
+        let h = match oneup_hash::hash_reader(&mut *src, &mut buf) {
+            Ok(h) => h,
+            Err(e) if oneup_effects::ChangedMeanwhile::is(&e) => return Err(Fail::Skip(Skip::Changed)),
+            Err(e) => return Err(Fail::Failed(e.to_string())),
+        };
+        src.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
         let hash = h.finalize();
         if i64::try_from(h.len()).ok() != Some(src.size) {
             return Err(Fail::Skip(Skip::Changed));
@@ -1295,7 +1298,8 @@ impl<C: Cloud> Executor<C> {
                 store.try_write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some()))?;
                 let mut src = self.fs.open_upload(a)?;
                 let (size, mtime) = (src.size, src.mtime);
-                // The file stays open (no writers) from here until recorded.
+                // Reads from `src` fail once the file is written: an upload
+                // whose last bytes were read went out as one version.
                 let (row, sent, sent_len, mark) = match self
                     .copy_instead(store, &mut src, to, name, replace.is_none(), alone)
                     .await?
@@ -1319,8 +1323,19 @@ impl<C: Cloud> Executor<C> {
                             },
                             None => None,
                         };
-                        let mut reader = Hashing::new(&mut src.file);
-                        let (row, sent) = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await?;
+                        let mut reader = Hashing::new(&mut src);
+                        let uploaded = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await;
+                        let (row, sent) = match uploaded {
+                            // Written meanwhile (saved by its program): the
+                            // upload stopped before it completed; the next
+                            // round sends the new version. Only a read of the
+                            // file fails as I/O (a vault's encryption may not
+                            // keep the error's type, so the watch tells).
+                            Err(CloudError::Io(_)) if !reader.inner.unchanged() => {
+                                return Err(Fail::Skip(Skip::Changed));
+                            }
+                            r => r?,
+                        };
                         // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
                         (row, sent.unwrap_or_else(|| reader.hash.finalize()), reader.hash.len(), mark)
                     }

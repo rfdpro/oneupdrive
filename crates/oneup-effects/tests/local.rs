@@ -599,7 +599,7 @@ fn downloads_place_new_files_and_replace_only_the_planned_one() {
 }
 
 #[test]
-fn hashing_and_upload_reads_exclude_writers() {
+fn hashing_and_upload_reads_let_writers_in() {
     let r = Root::new("read");
     let fs = r.fs();
     std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
@@ -618,14 +618,44 @@ fn hashing_and_upload_reads_exclude_writers() {
         link: Link::New,
     });
     let mut src = fs.open_upload(&upload).unwrap();
-    // While it's being read, nobody can write it...
-    assert!(std::fs::OpenOptions::new().append(true).open(r.p("f.bin")).is_err());
-    // ...but others may read it too.
+    // Others may read it too.
     assert!(std::fs::File::open(r.p("f.bin")).is_ok());
     let mut s = String::new();
-    src.file.read_to_string(&mut s).unwrap();
+    src.read_to_string(&mut s).unwrap();
+    assert_eq!(s, "some bytes to hash");
+    assert!(src.unchanged());
+    drop(src);
+
+    // A program saving it in place while it's read isn't stopped; what
+    // was read is then refused.
+    let mut src = fs.open_upload(&upload).unwrap();
+    let mut head = [0u8; 4];
+    src.read_exact(&mut head).unwrap();
+    std::fs::OpenOptions::new().write(true).open(r.p("f.bin")).unwrap().write_all(b"SOME").unwrap();
+    let err = src.read_to_string(&mut String::new()).unwrap_err();
+    assert!(oneup_effects::ChangedMeanwhile::is(&err), "{err}");
+    assert!(!src.unchanged());
+    drop(src);
+
+    // Saving by renaming a new file over it isn't stopped either. The
+    // open file keeps the content that was checked.
+    std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let upload = approve(Op::Upload {
+        local: pre(&r.p("f.bin")),
+        to: RemoteId("root".into()),
+        parent: 0,
+        name: "f.bin".into(),
+        replace: None,
+        link: Link::New,
+    });
+    let mut src = fs.open_upload(&upload).unwrap();
+    std::fs::write(r.p("f.tmp"), b"new").unwrap();
+    std::fs::rename(r.p("f.tmp"), r.p("f.bin")).unwrap();
+    let mut s = String::new();
+    src.read_to_string(&mut s).unwrap();
     assert_eq!(s, "some bytes to hash");
     drop(src);
+    assert_eq!(std::fs::read(r.p("f.bin")).unwrap(), b"new");
 
     // Outside the sync folder: refused even with a matching stamp.
     let outside = r.dir.with_extension("outside.txt");
