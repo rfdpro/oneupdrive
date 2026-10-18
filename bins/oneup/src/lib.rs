@@ -36,6 +36,7 @@ pub mod problem;
 pub mod prune;
 #[cfg(windows)]
 pub mod recyclebin;
+pub mod resolve;
 pub mod rulefiles;
 pub mod settingsapi;
 pub mod setup;

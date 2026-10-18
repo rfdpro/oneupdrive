@@ -50,7 +50,7 @@ pub enum Why {
 }
 
 impl Why {
-    const ALL: [Why; 9] = [
+    pub const ALL: [Why; 9] = [
         Why::Special,
         Why::NameTaken,
         Why::InvalidName,
@@ -82,8 +82,12 @@ impl Why {
         }
     }
 
-    /// How it's saved.
-    fn code(self) -> &'static str {
+    pub fn from_code(s: &str) -> Option<Why> {
+        Why::ALL.into_iter().find(|w| w.code() == s)
+    }
+
+    /// How it's saved, and how the window and `oneup unsynced resolve` name it.
+    pub fn code(self) -> &'static str {
         match self {
             Why::Special => "special",
             Why::NameTaken => "name_taken",
@@ -161,7 +165,7 @@ pub fn load(store: &Store) -> Result<Record> {
         .into_iter()
         .flatten()
         .filter_map(|i| {
-            let why = Why::ALL.into_iter().find(|w| Some(w.code()) == i[1].as_str())?;
+            let why = Why::from_code(i[1].as_str()?)?;
             Some(Item { path: i[0].as_str()?.to_string(), why })
         })
         .collect();
@@ -223,6 +227,26 @@ pub fn update<'a>(
     Ok(())
 }
 
+/// Items the user answered (`crate::resolve`) leave the record, with what
+/// sync held below them: none of it is held any more. Planned again, an
+/// item that still can't sync comes back.
+pub fn answered(store: &mut Store, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let before = load(store)?;
+    let mut r = before.clone();
+    let below = |path: &str, top: &str| {
+        let (p, t) = (path.as_bytes(), top.trim_end_matches('/').as_bytes());
+        p.len() > t.len() && p[..t.len()].eq_ignore_ascii_case(t) && p[t.len()] == b'/'
+    };
+    r.items.retain(|i| !paths.iter().any(|p| i.path.eq_ignore_ascii_case(p) || (i.why.held() && below(&i.path, p))));
+    if r != before {
+        save(store, &r)?;
+    }
+    Ok(())
+}
+
 /// For the agent's status: how many, and whether there are more.
 pub fn count(r: &Record) -> Option<oneup_ipc::Unsynced> {
     (!r.items.is_empty()).then_some(oneup_ipc::Unsynced { count: r.items.len(), more: r.more })
@@ -241,6 +265,7 @@ pub fn show(store: &Store) -> Result<()> {
         }
         let more = if r.more { ", and more not listed" } else { "" };
         println!("{} items{more}. Each is tried again as soon as it changes.", r.items.len());
+        println!("`oneup unsynced resolve PATH` shows what you can do about one.");
     }
     println!(
         "Excluded items (your rules, `oneup rules`) aren't listed: they're left out on purpose. Explorer shows them as Sync pending, and the folders they're in too."

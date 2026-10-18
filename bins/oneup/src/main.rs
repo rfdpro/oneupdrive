@@ -30,6 +30,7 @@ mod pair;
 mod rules;
 mod settings;
 mod shellverb;
+mod unsynced_cmd;
 mod upload_bench;
 mod vault;
 
@@ -288,8 +289,13 @@ enum Cmd {
         profile: ProfileArg,
     },
     /// List what can't sync until you do something about it (hard links,
-    /// names OneDrive refuses, files over its size limit)
-    Unsynced(ProfileArg),
+    /// names OneDrive refuses, files over its size limit), or resolve it
+    Unsynced {
+        #[command(subcommand)]
+        cmd: Option<UnsyncedCmd>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Check the state database's internal consistency
     Verify(ProfileArg),
     /// Show where the initial enumeration spent its downloads (paths are shown locally only)
@@ -900,6 +906,71 @@ enum VaultCmd {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum UnsyncedCmd {
+    /// Resolve items `oneup unsynced` lists; without a choice, shows each
+    /// item's choices. OneUpDrive carries it out in its next round
+    Resolve(ResolveArgs),
+}
+
+#[derive(clap::Args)]
+#[command(group(clap::ArgGroup::new("choice")))]
+struct ResolveArgs {
+    /// Items as `oneup unsynced` lists them (or their full paths); a folder
+    /// counts with what's in it
+    paths: Vec<String>,
+    /// Every listed item the choice fits
+    #[arg(long, conflicts_with = "paths")]
+    all: bool,
+    /// With --all: go ahead only if this many items fit (the list may have
+    /// changed since it was shown)
+    #[arg(long, value_name = "N", requires = "all")]
+    expect: Option<usize>,
+    /// Gone from this PC: delete it in OneDrive too, into its recycle bin
+    #[arg(long, group = "choice")]
+    delete_in_onedrive: bool,
+    /// Gone from this PC, in a backup pair: leave it in OneDrive
+    #[arg(long, group = "choice")]
+    keep_in_onedrive: bool,
+    /// Gone from this PC: download it again from OneDrive
+    #[arg(long, group = "choice")]
+    restore: bool,
+    /// Gone from OneDrive: delete it on this PC too, into its kept copies
+    #[arg(long, group = "choice")]
+    delete_here: bool,
+    /// Gone from OneDrive: upload it again
+    #[arg(long, group = "choice")]
+    upload: bool,
+    /// A name OneDrive refuses, or one differing only in case: rename it
+    #[arg(long, group = "choice", value_name = "NAME")]
+    rename: Option<String>,
+    /// Leave it out of sync (adds a rule)
+    #[arg(long, group = "choice")]
+    exclude: bool,
+    /// Go ahead with a deletion (without it, only shows what would be deleted)
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    profile: ProfileArg,
+}
+
+impl ResolveArgs {
+    fn choice(&self) -> Option<oneup_app::resolve::Choice> {
+        use oneup_app::resolve::Choice as C;
+        [
+            (self.delete_in_onedrive, C::DeleteInOnedrive),
+            (self.keep_in_onedrive, C::KeepInOnedrive),
+            (self.restore, C::Restore),
+            (self.delete_here, C::DeleteHere),
+            (self.upload, C::Upload),
+            (self.rename.is_some(), C::Rename),
+            (self.exclude, C::Exclude),
+        ]
+        .into_iter()
+        .find_map(|(on, c)| on.then_some(c))
+    }
 }
 
 #[derive(Subcommand)]
@@ -1802,7 +1873,18 @@ async fn run() -> Result<()> {
         Cmd::Activity { path, limit, profile } => {
             activity::show(&open_store(&cli, profile.memory_profile)?, path.as_deref(), (*limit).max(1))
         }
-        Cmd::Unsynced(p) => oneup_app::unsynced::show(&open_store(&cli, p.memory_profile)?),
+        Cmd::Unsynced { cmd: None, profile } => oneup_app::unsynced::show(&open_store(&cli, profile.memory_profile)?),
+        Cmd::Unsynced { cmd: Some(UnsyncedCmd::Resolve(r)), .. } => {
+            let ask = unsynced_cmd::Ask {
+                paths: &r.paths,
+                all: r.all,
+                expect: r.expect,
+                choice: r.choice(),
+                name: r.rename.as_deref(),
+                yes: r.yes,
+            };
+            unsynced_cmd::resolve(&data_dir(&cli)?, open_store(&cli, r.profile.memory_profile)?, ask).await
+        }
         Cmd::Verify(p) => verify(&cli, p.memory_profile),
         Cmd::Diagnose { top, profile } => diagnose(&cli, *top, profile.memory_profile),
         Cmd::Sync(args) => {

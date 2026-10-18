@@ -1166,9 +1166,15 @@ impl Engine {
                 scope = Scope::All;
             }
             let window = recent.plus(*executed);
+            // The user's answers for what can't sync (`crate::resolve`):
+            // renames join this round's plan, for the gate like the rest.
+            let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
+            let fs = self.exec.local();
+            let mut chosen = crate::resolve::apply_queued(&mut store, backup, &|id| fs.is_present(id))?;
+            log_activity(&mut store, std::mem::take(&mut chosen.log))?;
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;
-            let extra = match mode {
+            let mut extra = match mode {
                 _ if controls.pause_remote => Vec::new(),
                 crate::config::CloudCopies::Prune => {
                     self.set_offer(None);
@@ -1192,6 +1198,7 @@ impl Engine {
                     extra
                 }
             };
+            extra.extend(chosen.ops.iter().map(|(op, _)| op.clone()));
             let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra };
             let t = std::time::Instant::now();
             let Planned { review, problems, upto, suspicious, policy, synced, planning } =
@@ -1368,6 +1375,7 @@ impl Engine {
                     None => {}
                 }
             }
+            crate::resolve::ran(&mut store, &chosen.ops, &report)?;
             let mut log = print_round(n, &planned, &report);
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
@@ -1508,7 +1516,9 @@ impl Engine {
     ) -> Result<()> {
         use crate::unsynced::Why as U;
         let mut found: Vec<(String, U)> = problems.iter().map(|(p, w)| (p.clone(), U::from(*w))).collect();
-        found.extend(held);
+        // A synced item that can't sync any more (a refused name, too
+        // large) is held as missing on one side; why is the problem's.
+        found.extend(held.into_iter().filter(|(p, _)| !problems.iter().any(|(q, _)| q.eq_ignore_ascii_case(p))));
         let mut done: Vec<String> = Vec::new();
         // The report keeps the planned order (see `print_round`): one pass.
         let (mut d, mut s) = (report.done.iter().peekable(), report.skipped.iter().peekable());
