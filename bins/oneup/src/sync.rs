@@ -1293,7 +1293,10 @@ impl Engine {
                     .approved
                     .into_iter()
                     .map(|a| {
-                        let l = describe_approved(o, &a);
+                        let mut l = describe_approved(o, &a);
+                        if chosen.ops.iter().any(|(op, _)| op == a.op()) {
+                            l.note = "as you chose".into();
+                        }
                         let l = if on_demand { on_demand_line(a.op(), l) } else { l };
                         (a, l)
                     })

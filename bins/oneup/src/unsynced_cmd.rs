@@ -66,7 +66,7 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
     }
     for i in &items {
         if !resolve::choices(i.why, backup).contains(&choice) {
-            bail!("{}: {} doesn't fit an item that's {}", i.path, choice.label(), i.why.title().to_lowercase());
+            bail!("{}: {} isn't offered for \"{}\"", i.path, choice.label(), i.why.title());
         }
     }
     if choice == Choice::Exclude {
@@ -86,6 +86,7 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         }
     }
     let mut asked = Vec::new();
+    let mut refused = Vec::new();
     let mut count = 0;
     for i in tops {
         match store.read(|o| resolve::check(o, i, choice, a.name, backup, &|_| false))? {
@@ -93,11 +94,20 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
                 count += c.items();
                 asked.push(Request { path: i.path.clone(), choice, name: a.name.map(|n| n.trim().to_string()) });
             }
-            Err(why) => println!("Skipped {}: {why}.", i.path),
+            Err(why) => refused.push(format!("{}: {why}", i.path)),
         }
     }
     if asked.is_empty() {
-        bail!("nothing to do");
+        bail!(
+            "{}",
+            refused.join(
+                "
+"
+            )
+        );
+    }
+    for r in &refused {
+        println!("Skipped {r}.");
     }
     let what = if asked.len() == 1 && count <= 1 { asked[0].path.clone() } else { format!("{count} items") };
     if choice.deletes() && !a.yes {

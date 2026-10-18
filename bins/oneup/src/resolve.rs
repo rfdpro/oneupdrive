@@ -236,7 +236,7 @@ pub fn check(
     present: &dyn Fn(LocalId) -> bool,
 ) -> oneup_store::Result<std::result::Result<Change, String>> {
     if !choices(item.why, backup).contains(&choice) || choice == Choice::Exclude {
-        return Ok(Err(format!("can't be done for an item that's {}", item.why.title().to_lowercase())));
+        return Ok(Err(format!("not offered for \"{}\"", item.why.title())));
     }
     let worked = if choice == Choice::Rename {
         let name = name.unwrap_or_default().trim();
@@ -459,7 +459,7 @@ mod tests {
             why,
             [
                 "Restore: not done; it isn't synced any more",
-                "Upload: not done; can't be done for an item that's too large",
+                "Upload: not done; not offered for \"Too large\"",
                 "Restore: not done; it isn't in the list any more",
             ]
         );

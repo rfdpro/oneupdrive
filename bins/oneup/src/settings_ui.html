@@ -730,6 +730,10 @@
             text-align: right;
         }
 
+        #ls-table td.item {
+            min-width: 220px;
+        }
+
         #ls-table td.act .btn+.btn,
         #ls-table tr.group td .btn {
             margin-left: 6px;
@@ -2889,7 +2893,8 @@
                 show.title = "Show it in File Explorer";
                 act.append(show);
             }
-            return el("tr", {}, cell(i.path, null, "wrap path"), cell(i.why, i.detail), act);
+            // The group above says what kind; the row, the rest.
+            return el("tr", {}, cell(i.path, null, "wrap path item"), cell(i.detail), act);
         }
 
         // What a folder held as not empty still holds (often what the
