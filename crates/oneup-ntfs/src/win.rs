@@ -214,8 +214,6 @@ pub fn open_path_for_dehydrated(path: &Path) -> Result<Handle> {
     )
 }
 
-/// Opens a file for reading its contents, fully shared, with `extra` flags.
-/// Reparse points are opened as themselves, never followed.
 fn open_path_for_read(path: &Path, extra: FILE_FLAGS_AND_ATTRIBUTES) -> Result<Handle> {
     open(
         path,
@@ -433,16 +431,10 @@ impl Volume {
         self.open_through_path(id, |path| open_path_for_change(path, folder))
     }
 
-    /// Opens item `id` with `open` at its current path, and proves the
-    /// handle is still that item. If it was moved or replaced in between,
-    /// the IDs differ and we report "not found", which callers treat as
-    /// "changed, re-plan".
     fn open_through_path(&self, id: FileId, open: impl FnOnce(&Path) -> Result<Handle>) -> Result<Handle> {
         self.same_item(id, open(&self.current_path(id)?)?)
     }
 
-    /// Item `id`'s current path, in `\\?\` form. The probe it opens by ID
-    /// is held only for the lookup.
     fn current_path(&self, id: FileId) -> Result<PathBuf> {
         let probe = self.open_by_id(id, FILE_READ_ATTRIBUTES.0)?;
         let mut long = std::ffi::OsString::from(r"\\?\");
@@ -450,7 +442,6 @@ impl Volume {
         Ok(PathBuf::from(long))
     }
 
-    /// `h`, if it is item `id`; "not found" otherwise.
     fn same_item(&self, id: FileId, h: Handle) -> Result<Handle> {
         if file_id(&h)?.1 != id {
             return Err(Error::Win32 { op: "open_through_path", source: ERROR_FILE_NOT_FOUND.into() });
@@ -914,10 +905,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Measured: the watch locks no writer out (a save in place and a save
-    /// by renaming over the file both succeed while it and a reader are
-    /// open), every kind of content change breaks it, reading doesn't, and
-    /// a file mapped for writing can't be watched.
     #[test]
     fn a_write_watch_sees_writes_and_blocks_none() {
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -933,7 +920,6 @@ mod tests {
             (w, r)
         };
 
-        // Reading (ours and others') leaves it unbroken.
         let (w, r) = watch_with_reader(b"hello");
         let mut got = Vec::new();
         (&*r.as_file()).read_to_end(&mut got).unwrap();
@@ -948,7 +934,6 @@ mod tests {
         assert!(w.broken());
         drop((f, w, r));
 
-        // Truncating breaks it.
         let (w, r) = watch_with_reader(b"hello");
         std::fs::OpenOptions::new().write(true).truncate(true).open(&file).unwrap();
         assert!(w.broken());
@@ -973,7 +958,6 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"new");
         drop((w, r));
 
-        // Deleting it succeeds too.
         let (w, r) = watch_with_reader(b"hello");
         std::fs::remove_file(&file).unwrap();
         drop((w, r));

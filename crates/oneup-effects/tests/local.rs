@@ -598,27 +598,28 @@ fn downloads_place_new_files_and_replace_only_the_planned_one() {
     assert!(matches!(fs.apply(&dl("z.txt", None)), Err(Error::WrongOp)));
 }
 
-#[test]
-fn hashing_and_upload_reads_let_writers_in() {
-    let r = Root::new("read");
-    let fs = r.fs();
-    std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
-    let p = pre(&r.p("f.bin"));
-    let Done::Hashed { hash, size, .. } = fs.apply(&approve(Op::Hash(p.clone()))).unwrap() else { panic!() };
-    let mut expect = oneup_hash::QuickXorHash::new();
-    expect.update(b"some bytes to hash");
-    assert_eq!((hash, size), (expect.finalize(), 18));
-
-    let upload = approve(Op::Upload {
-        local: p,
+fn upload_of(path: &Path) -> Approved {
+    approve(Op::Upload {
+        local: pre(path),
         to: RemoteId("root".into()),
         parent: 0,
         name: "f.bin".into(),
         replace: None,
         link: Link::New,
-    });
-    let mut src = fs.open_upload(&upload).unwrap();
-    // Others may read it too.
+    })
+}
+
+#[test]
+fn hashing_and_upload_reads_let_others_read() {
+    let r = Root::new("read");
+    let fs = r.fs();
+    std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let Done::Hashed { hash, size, .. } = fs.apply(&approve(Op::Hash(pre(&r.p("f.bin"))))).unwrap() else { panic!() };
+    let mut expect = oneup_hash::QuickXorHash::new();
+    expect.update(b"some bytes to hash");
+    assert_eq!((hash, size), (expect.finalize(), 18));
+
+    let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
     assert!(std::fs::File::open(r.p("f.bin")).is_ok());
     let mut s = String::new();
     src.read_to_string(&mut s).unwrap();
@@ -626,29 +627,34 @@ fn hashing_and_upload_reads_let_writers_in() {
     assert!(src.unchanged());
     drop(src);
 
-    // A program saving it in place while it's read isn't stopped; what
-    // was read is then refused.
-    let mut src = fs.open_upload(&upload).unwrap();
+    // Outside the sync folder: refused even with a matching stamp.
+    let outside = r.dir.with_extension("outside.txt");
+    std::fs::write(&outside, b"x").unwrap();
+    let err = fs.apply(&approve(Op::Hash(pre(&outside))));
+    std::fs::remove_file(&outside).unwrap();
+    assert!(matches!(err, Err(Error::Outside)), "{err:?}");
+}
+
+#[test]
+fn a_save_in_place_during_an_upload_read_goes_through_and_fails_the_read() {
+    let r = Root::new("read-saved");
+    let fs = r.fs();
+    std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
     let mut head = [0u8; 4];
     src.read_exact(&mut head).unwrap();
     std::fs::OpenOptions::new().write(true).open(r.p("f.bin")).unwrap().write_all(b"SOME").unwrap();
     let err = src.read_to_string(&mut String::new()).unwrap_err();
     assert!(oneup_effects::ChangedMeanwhile::is(&err), "{err}");
     assert!(!src.unchanged());
-    drop(src);
+}
 
-    // Saving by renaming a new file over it isn't stopped either. The
-    // open file keeps the content that was checked.
+#[test]
+fn a_save_by_rename_during_an_upload_read_goes_through_and_the_read_keeps_its_version() {
+    let r = Root::new("read-renamed");
+    let fs = r.fs();
     std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
-    let upload = approve(Op::Upload {
-        local: pre(&r.p("f.bin")),
-        to: RemoteId("root".into()),
-        parent: 0,
-        name: "f.bin".into(),
-        replace: None,
-        link: Link::New,
-    });
-    let mut src = fs.open_upload(&upload).unwrap();
+    let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
     std::fs::write(r.p("f.tmp"), b"new").unwrap();
     std::fs::rename(r.p("f.tmp"), r.p("f.bin")).unwrap();
     let mut s = String::new();
@@ -656,13 +662,6 @@ fn hashing_and_upload_reads_let_writers_in() {
     assert_eq!(s, "some bytes to hash");
     drop(src);
     assert_eq!(std::fs::read(r.p("f.bin")).unwrap(), b"new");
-
-    // Outside the sync folder: refused even with a matching stamp.
-    let outside = r.dir.with_extension("outside.txt");
-    std::fs::write(&outside, b"x").unwrap();
-    let err = fs.apply(&approve(Op::Hash(pre(&outside))));
-    std::fs::remove_file(&outside).unwrap();
-    assert!(matches!(err, Err(Error::Outside)), "{err:?}");
 }
 
 #[test]
