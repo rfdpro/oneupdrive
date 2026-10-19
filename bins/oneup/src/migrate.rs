@@ -467,10 +467,13 @@ pub fn leftovers(dir: &std::path::Path, store: &Store, clear: bool, undo: bool, 
         let c = lo::clear_now(dir, &local)?;
         if as_json {
             println!("{}", c.to_json());
-        } else if c.removed.is_empty() && c.changed.is_empty() {
+        } else if !c.happened() {
             println!("Nothing found.");
         } else {
             println!("{}", c.summary());
+        }
+        if c.failed.is_some() {
+            bail!("not all of the OneDrive app's leftovers were cleared");
         }
         return Ok(());
     }

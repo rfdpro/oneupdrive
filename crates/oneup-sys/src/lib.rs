@@ -10,6 +10,8 @@ pub enum Error {
     #[cfg(windows)]
     #[error("{op} failed: {source}")]
     Win32 { op: &'static str, source: windows::core::Error },
+    #[error("{op} failed: {source}")]
+    Io { op: &'static str, source: std::io::Error },
     #[error("not supported on this platform")]
     Unsupported,
 }
@@ -30,6 +32,8 @@ pub mod identity;
 pub mod in_use;
 #[cfg(windows)]
 pub mod known;
+#[cfg(windows)]
+pub mod mutex;
 #[cfg(windows)]
 pub mod processes;
 #[cfg(windows)]
@@ -202,11 +206,17 @@ pub mod pipe {
 
     /// The current user's SID, as a string (`S-1-5-21-…`).
     pub fn current_user_sid() -> std::io::Result<String> {
+        // SAFETY: the pseudo-handle of the current process is always valid.
+        user_sid_of(unsafe { GetCurrentProcess() })
+    }
+
+    /// The SID of the user running `process` (a handle with at least
+    /// limited query access), as a string.
+    pub(crate) fn user_sid_of(process: HANDLE) -> std::io::Result<String> {
         let mut token = HANDLE::default();
-        // SAFETY: the pseudo-handle of the current process is always valid;
-        // `token` is a valid out-pointer.
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-            .map_err(|e| io("OpenProcessToken", e))?;
+        // SAFETY: `process` is a valid process handle (the caller's
+        // promise); `token` is a valid out-pointer.
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.map_err(|e| io("OpenProcessToken", e))?;
         struct Owned(HANDLE);
         impl Drop for Owned {
             fn drop(&mut self) {
