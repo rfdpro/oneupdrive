@@ -36,6 +36,9 @@ crash-test = ["oneup-effects/crash-test"]
 [dev-dependencies]
 oneup-exec = { path = ".", features = ["crash-test"] }
 oneup-cfapi = { path = "../oneup-cfapi" }
+# The event hooks' burst test and benchmark (tests/sync.rs).
+oneup-hooks = { path = "../oneup-hooks" }
+oneup-ipc = { path = "../oneup-ipc" }
 oneup-plan = { path = "../oneup-plan" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 

@@ -1226,8 +1226,15 @@ impl Sync {
     /// records can reach the journal shortly after the call returns, so an
     /// idle round with the sides still differing waits and tries again.
     async fn settle(&mut self) -> usize {
+        self.settle_with(&|_, _| {}).await
+    }
+
+    /// [`Sync::settle`], handing each round's report to `seen` (as the
+    /// agent hands what a round did to its event feed).
+    async fn settle_with(&mut self, seen: &dyn Fn(&Sync, &Report)) -> usize {
         for n in 1..=40 {
             let report = self.round().await;
+            seen(self, &report);
             if n > 30 {
                 eprintln!("round {n}: {report:?}");
             }
@@ -4824,4 +4831,194 @@ async fn everyday_syncing_opens_no_file_by_id() {
     assert_eq!(t["/docs/report.txt"].as_deref(), Some(&b"report v2, saved by rename"[..]));
     assert_eq!(std::fs::read(s.p("theirs.txt")).unwrap(), b"theirs v2");
     assert_eq!(s.exec.local().opened_by_id(), before, "every file found by path");
+}
+
+// ---------------------------------------------------------------- hooks (F7)
+
+/// What a round did, as the agent's event feed has it (`oneup_app::events`):
+/// a `synced` event per item uploaded, by its path.
+fn hook_events(s: &Sync, r: &Report) -> Vec<oneup_ipc::Event> {
+    let paths: Vec<String> = s
+        .obs
+        .store()
+        .read(|o| {
+            Ok(r.done
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Upload { local, .. } => o.local_path_of(local.id.0).ok().flatten(),
+                    _ => None,
+                })
+                .collect())
+        })
+        .unwrap();
+    paths
+        .into_iter()
+        .map(|path| oneup_ipc::Event {
+            seq: 0,
+            at_ms: 0,
+            kind: oneup_ipc::EventKind::Synced,
+            path,
+            action: "upload".into(),
+            detail: String::new(),
+        })
+        .collect()
+}
+
+/// Per item: the runs a hook made, and the events folded into them.
+type Fired = Arc<Mutex<BTreeMap<String, (u32, u32)>>>;
+
+/// Starts nothing and reports success at once: for what the queue does,
+/// apart from what starting programs costs.
+struct NoProgram;
+
+impl oneup_hooks::Launch for NoProgram {
+    fn launch(&self, _: &Path, _: &[std::ffi::OsString], _: Duration) -> std::io::Result<oneup_hooks::Finished> {
+        Ok(oneup_hooks::Finished { exit_code: Some(0), timed_out: false, output: Vec::new(), truncated: false })
+    }
+}
+
+/// A hook on every `synced` event, counting its runs by item, and the runs
+/// that didn't end well. `launch`: the agent's (`Contained`, a real program
+/// each time) or [`NoProgram`].
+fn burst_hook(
+    root: &Path,
+    coalesce: Duration,
+    launch: Arc<dyn oneup_hooks::Launch>,
+) -> (oneup_hooks::Runner, Fired, Arc<Mutex<u32>>) {
+    let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
+    let spec = oneup_hooks::HookSpec {
+        coalesce,
+        per_minute: oneup_hooks::MAX_PER_MINUTE,
+        ..oneup_hooks::HookSpec::new(
+            "burst",
+            &[oneup_ipc::EventKind::Synced],
+            &cmd.to_string_lossy(),
+            &["/c", "exit", "0"],
+        )
+    };
+    let fired: Fired = Arc::default();
+    let bad = Arc::new(Mutex::new(0u32));
+    let (f, b) = (Arc::clone(&fired), Arc::clone(&bad));
+    let notes = move |n: oneup_hooks::Note| match n {
+        oneup_hooks::Note::Ran(r) => {
+            let ok = matches!(&r.result, Ok(x) if x.exit_code == Some(0));
+            if !ok {
+                *b.lock().unwrap() += 1;
+            }
+            let mut f = f.lock().unwrap();
+            let e = f.entry(r.event.path.to_lowercase()).or_default();
+            e.0 += 1;
+            e.1 += r.merged;
+        }
+        other => panic!("{other:?}"),
+    };
+    let settings = oneup_hooks::Settings {
+        hooks: vec![spec],
+        paused: false,
+        root: root.to_path_buf(),
+        places: oneup_hooks::program::Places::default(),
+    };
+    (oneup_hooks::Runner::start(settings, launch, Box::new(notes)), fired, bad)
+}
+
+/// A hook fires once per item however often the item changed before its
+/// run (here: every file uploaded, then half of them again a round later,
+/// within the hook's coalescing time), with the latest event, and the rounds
+/// never wait for it.
+#[tokio::test]
+async fn everyday_a_hook_fires_once_per_coalesced_change() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("hooks-coalesce", cloud.clone());
+    // Editing half the files at once replaces that many in OneDrive, which
+    // the mass stop would hold; this test is about the hook.
+    s.policy = Policy { max_count: 100_000, min_count: 100_000, ..Policy::default() };
+    // What it runs doesn't matter here (the benchmark below starts real
+    // programs); below-normal programs on a busy PC would only slow it.
+    let (runner, fired, bad) = burst_hook(&s.dir.0, Duration::from_secs(8), Arc::new(NoProgram));
+    let offer = |s: &Sync, r: &Report| runner.offer(&hook_events(s, r));
+    let n = 300;
+    for i in 0..n {
+        write(&s.p(&format!("d{}/f{i}.txt", i % 10)), b"one");
+    }
+    s.settle_with(&offer).await;
+    for i in (0..n).step_by(2) {
+        write(&s.p(&format!("d{}/f{i}.txt", i % 10)), b"two, longer");
+    }
+    s.settle_with(&offer).await;
+    assert!(runner.wait_idle(Duration::from_secs(120)), "{:?}", runner.backlog());
+    let fired = fired.lock().unwrap();
+    assert_eq!(fired.len(), n, "every file");
+    assert!(fired.values().all(|(runs, _)| *runs == 1), "once each");
+    assert_eq!(fired.values().filter(|(_, merged)| *merged > 0).count(), n / 2, "the second upload folded in");
+    assert_eq!(*bad.lock().unwrap(), 0);
+}
+
+/// The F7 exit benchmark: a 10,000-file burst (in ten waves of 1,000, so
+/// hooks run while later waves sync) with and without a hook that starts
+/// a program for every file. Sync time is measured over the rounds only,
+/// three runs each, alternating; the hook must slow sync by no more than
+/// 5% (medians). The last hooked run waits for every run and checks the
+/// hook fired once per file. Hooks run at below-normal priority, so on a
+/// busy PC they take far longer than the sync: that's the point. Run it
+/// alone, in release:
+/// `cargo test -p oneup-exec --release --test sync bench_hooks -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "benchmark: run explicitly"]
+async fn bench_hooks_under_a_10000_file_burst() {
+    const FILES: usize = 10_000;
+    const WAVES: usize = 10;
+    type Hook = (oneup_hooks::Runner, Fired, Arc<Mutex<u32>>);
+    async fn burst(tag: &str, with_hook: bool) -> (Duration, Option<Hook>) {
+        let cloud = Fake::new();
+        let mut s = Sync::new(tag, cloud.clone());
+        let hook =
+            with_hook.then(|| burst_hook(&s.dir.0, Duration::from_millis(500), Arc::new(oneup_hooks::Contained)));
+        let mut synced = Duration::ZERO;
+        for w in 0..WAVES {
+            for i in 0..FILES / WAVES {
+                write(&s.p(&format!("w{w}/d{}/f{i}.txt", i % 20)), format!("wave {w} file {i}").as_bytes());
+            }
+            let t = std::time::Instant::now();
+            match &hook {
+                Some((runner, ..)) => s.settle_with(&|s: &Sync, r: &Report| runner.offer(&hook_events(s, r))).await,
+                None => s.settle().await,
+            };
+            synced += t.elapsed();
+        }
+        (synced, hook)
+    }
+    let median = |mut v: Vec<Duration>| {
+        v.sort();
+        v[v.len() / 2]
+    };
+    let (mut without, mut with) = (Vec::new(), Vec::new());
+    for rep in 0..3 {
+        let (t, _) = burst(&format!("bench-plain-{rep}"), false).await;
+        eprintln!("run {rep}: without hooks: sync {:.2} s", t.as_secs_f64());
+        without.push(t);
+        let (t, hook) = burst(&format!("bench-hooks-{rep}"), true).await;
+        let (runner, fired, bad) = hook.unwrap();
+        let ran = fired.lock().unwrap().values().map(|(runs, _)| *runs).sum::<u32>();
+        eprintln!("run {rep}: with hooks:    sync {:.2} s; {ran} hook runs done meanwhile", t.as_secs_f64());
+        with.push(t);
+        if rep == 2 {
+            let waited = std::time::Instant::now();
+            assert!(runner.wait_idle(Duration::from_secs(4 * 3600)), "{:?}", runner.backlog());
+            let fired = fired.lock().unwrap();
+            eprintln!(
+                "all {} hook runs done {:.0} s after the sync",
+                fired.values().map(|(runs, _)| *runs).sum::<u32>(),
+                waited.elapsed().as_secs_f64()
+            );
+            assert_eq!(fired.len(), FILES, "every file");
+            assert!(fired.values().all(|(runs, _)| *runs == 1), "once each");
+            assert_eq!(*bad.lock().unwrap(), 0);
+        }
+        // Dropped: no more runs start.
+        drop(runner);
+    }
+    let (a, b) = (median(without), median(with));
+    let slower = b.as_secs_f64() / a.as_secs_f64() - 1.0;
+    eprintln!("median sync: without {:.2} s, with {:.2} s: {:+.1}%", a.as_secs_f64(), b.as_secs_f64(), slower * 100.0);
+    assert!(slower <= 0.05, "hooks slowed sync by {:.1}%", slower * 100.0);
 }
