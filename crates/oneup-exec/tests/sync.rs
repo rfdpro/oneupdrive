@@ -1034,12 +1034,8 @@ impl Sync {
         };
         let report = self.exec.run_following(store, r.approved, &count, may_run, &follow, self.follow_max).await;
         if let Some(w) = &mut self.stops.window {
-            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
-                match oneup_gate::Side::changed_by(op) {
-                    Some(Side::Local) => w.local += 1,
-                    Some(Side::Remote) => w.remote += 1,
-                    None => {}
-                }
+            for op in &report.done {
+                w.add_op(op, &[]);
             }
         }
         let followed = followed.into_inner().unwrap();

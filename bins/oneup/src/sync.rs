@@ -516,6 +516,17 @@ pub struct Engine {
     stops: std::sync::Mutex<Stops>,
 }
 
+/// What stop `i` of `review` lists this round: exactly the operations its
+/// items key (with its folders still to come, `Breaker::later`), not every
+/// operation held for its side.
+fn stop_ops(review: &oneup_gate::Review, i: usize) -> Vec<&Op> {
+    review
+        .lists
+        .get(i)
+        .map(|l| l.iter().filter_map(|&w| review.withheld.get(w)).map(|(op, _)| op).collect())
+        .unwrap_or_default()
+}
+
 /// Records the agent's safety window with a call's counts added
 /// ([`Engine::rounds`]).
 pub type Keep = dyn Fn(&mut Store, Recent) -> Result<()> + Send + Sync;
@@ -525,18 +536,30 @@ pub type Keep = dyn Fn(&mut Store, Recent) -> Result<()> + Send + Sync;
 fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId]) -> Recent {
     let mut r = executed;
     for op in approved.iter().map(Approved::op) {
-        if is_mass_sensitive(op) {
-            match Side::changed_by(op) {
-                Some(Side::Local) => r.local += 1,
-                Some(Side::Remote) => r.remote += 1,
-                None => {}
-            }
-        }
-        if oneup_gate::is_suspicious(op, suspicious) {
-            r.suspicious += 1;
-        }
+        r.add_op(op, suspicious);
     }
     r
+}
+
+/// Whether anything in a round could trip a stop (or a list is approved),
+/// so the gate needs the paths its lists show. Counted as the breakers
+/// count (`oneup_gate::weight`: a pruned folder is everything in it).
+fn may_trip(
+    policy: &oneup_gate::Policy,
+    ops: &[Op],
+    pending: &[Op],
+    recent: Recent,
+    approved: bool,
+    suspicious: bool,
+) -> bool {
+    let mass = ops
+        .iter()
+        .chain(pending)
+        .filter(|o| is_mass_sensitive(o))
+        .fold(0usize, |n, o| n.saturating_add(oneup_gate::weight(o)));
+    approved
+        || suspicious
+        || mass.saturating_add(recent.local.max(recent.remote)) > policy.min_count.min(policy.max_count)
 }
 
 /// Safety stops an engine raised, and what the user approved of them.
@@ -554,14 +577,18 @@ struct Stops {
     /// Items on the lists approved, sorted, until a sequence of rounds
     /// settles (everything on them done, or no longer planned).
     approved: Vec<ItemKey>,
-    /// Approval codes already turned into approved items, never used
-    /// again: an old code would otherwise approve the same items when they
-    /// come back (a file restored, then rewritten suspiciously again, has
-    /// the same key, since an upload's content stamp isn't in it). Only the
-    /// user's approvals add to it, so it stays small.
+    /// Of those, the ones whose operations the last round planned but
+    /// didn't run (held as a file that keeps changing, paused, waiting for
+    /// a decision or a retry, skipped): kept when the rounds settle, until
+    /// they run or are no longer planned.
+    waiting: Vec<ItemKey>,
+    /// Approval codes taken in by this call of the rounds: an approval
+    /// answers one raising of a stop, so a code isn't taken again in the
+    /// call; the caller drops it from its answers afterwards
+    /// ([`Engine::spent_answers`]), and a later raising of the same stop
+    /// needs (and takes) a new approval.
     spent: Vec<u64>,
-    /// Of those, the ones the caller hasn't dropped from its answers yet
-    /// ([`Engine::spent_answers`]).
+    /// Of those, the ones the caller hasn't dropped yet.
     to_drop: Vec<u64>,
 }
 
@@ -599,10 +626,42 @@ impl Stops {
         }
     }
 
-    /// A sequence of rounds settled: what was approved ran or no longer
-    /// applies, and no stop stands.
+    /// A call of the rounds begins: the caller has dropped the codes the
+    /// last one took in.
+    fn begin(&mut self) {
+        self.spent.clear();
+    }
+
+    /// A round ran: of the operations on approved lists (`listed`, with
+    /// the keys they matched), those in `done` ran, and their keys go; the
+    /// rest wait.
+    fn round_ended(&mut self, listed: Vec<(Op, Vec<ItemKey>)>, done: &[Op]) {
+        if listed.is_empty() {
+            self.waiting.clear();
+            return;
+        }
+        let mut by_op: std::collections::HashMap<String, Vec<ItemKey>> = std::collections::HashMap::new();
+        for (op, keys) in listed {
+            by_op.entry(format!("{op:?}")).or_default().extend(keys);
+        }
+        let mut ran: Vec<ItemKey> = Vec::new();
+        for op in done {
+            if let Some(keys) = by_op.remove(&format!("{op:?}")) {
+                ran.extend(keys);
+            }
+        }
+        ran.sort_unstable();
+        self.approved.retain(|k| ran.binary_search(k).is_err());
+        self.waiting = by_op.into_values().flatten().collect();
+        self.waiting.sort_unstable();
+        self.waiting.dedup();
+    }
+
+    /// A sequence of rounds settled: no stop stands, and of what was
+    /// approved, only what still waits stays approved.
     fn settled(&mut self) {
-        self.approved.clear();
+        let waiting = &self.waiting;
+        self.approved.retain(|k| waiting.binary_search(k).is_ok());
         self.raised.clear();
     }
 
@@ -1196,25 +1255,14 @@ impl Engine {
 
     /// Saves what each tripped stop holds back ([`crate::stoplist`]), once
     /// per stop: the agent plans again at every wake-up while one stands.
-    fn save_stop_lists(&self, store: &Store, review: &oneup_gate::Review, suspicious: &[LocalId]) {
+    fn save_stop_lists(&self, store: &Store, review: &oneup_gate::Review) {
         let codes: Vec<String> = review.breakers.iter().map(|b| format!("{:016x}", b.fingerprint.0)).collect();
         crate::stoplist::keep_only(&self.data_dir, &codes);
-        for (b, code) in review.breakers.iter().zip(&codes) {
+        for (i, (b, code)) in review.breakers.iter().zip(&codes).enumerate() {
             if crate::stoplist::path(&self.data_dir, code).exists() {
                 continue;
             }
-            let held: Vec<&Op> = review
-                .withheld
-                .iter()
-                .filter(|(op, w)| {
-                    *w == Withheld::Breaker(b.side)
-                        && match b.kind {
-                            BreakerKind::Mass => is_mass_sensitive(op),
-                            BreakerKind::Suspicious => oneup_gate::is_suspicious(op, suspicious),
-                        }
-                })
-                .map(|(op, _)| op)
-                .collect();
+            let held = stop_ops(review, i);
             let lines = store.read(|o| {
                 Ok(held
                     .iter()
@@ -1289,6 +1337,7 @@ impl Engine {
         let mut scope = first;
         let mut changed_rounds = 0;
         self.check_room(&mut store).await?;
+        self.stops_lock().begin();
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
             out.held_until = None;
@@ -1363,7 +1412,7 @@ impl Engine {
             };
             let controls = &controls;
             let t = std::time::Instant::now();
-            let Planned { review, problems, upto, suspicious, policy, synced, planning } =
+            let Planned { mut review, problems, upto, suspicious, policy, synced, planning } =
                 plan_round(&store, Some(self.exec.local()), scope, controls, window, &user_rules, modes, &listed)?;
             // Approved by their codes (`oneup sync --approve`): their lists
             // stay approved for the folders they empty in later rounds.
@@ -1394,7 +1443,7 @@ impl Engine {
                 if !mark.is_empty() {
                     store.write(|o| o.dirty_mark_synced(&mark))?;
                 }
-                self.save_stop_lists(&store, &review, &suspicious);
+                self.save_stop_lists(&store, &review);
                 out.breakers = review.breakers;
                 out.end = End::Stopped;
                 return Ok((store, out));
@@ -1514,6 +1563,7 @@ impl Engine {
                     (a, (op, l))
                 })
                 .unzip();
+            let listed_ops = std::mem::take(&mut review.listed);
             if let Some(keep) = keep {
                 // Counted before anything runs: a crash mid-round must not
                 // forget what it may have done.
@@ -1554,14 +1604,11 @@ impl Engine {
             let deferred = deferred || !report.not_run.is_empty();
             // Counted before anything below can fail: what ran must reach
             // the caller's safety window even if this call ends in an error.
-            executed.suspicious += report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
-            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
-                match Side::changed_by(op) {
-                    Some(Side::Local) => executed.local += 1,
-                    Some(Side::Remote) => executed.remote += 1,
-                    None => {}
-                }
+            for op in &report.done {
+                executed.add_op(op, &suspicious);
             }
+            // Approved changes that ran are done with; those that wait stay.
+            self.stops_lock().round_ended(listed_ops, &report.done);
             crate::resolve::ran(&mut store, &chosen.ops, &report)?;
             let mut log = print_round(n, &planned, &report);
             if !report.not_run.is_empty() {
@@ -1857,15 +1904,12 @@ fn plan_round<'a>(
     };
     // The paths a stop's list shows are part of what an approval covers.
     // Read only when something could trip or a list is approved.
-    let mass = ops.iter().filter(|o| is_mass_sensitive(o)).count() + pending.len();
-    let may_trip = !approved.is_empty()
-        || !suspicious.is_empty()
-        || mass + recent.local.max(recent.remote) > policy.min_count.min(policy.max_count);
-    let (paths, pending_paths) = if may_trip {
-        store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let (paths, pending_paths) =
+        if may_trip(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty()) {
+            store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let cx = GateContext {
         synced_items: synced,
         recent,
@@ -3209,6 +3253,13 @@ mod tests {
         let r = review(&s, &given);
         assert_eq!(r.breakers.len(), 1, "back again: a new stop");
         assert!(r.answered.is_empty());
+        // That new raising takes a new approval (the caller dropped the code
+        // after the call; the user gives it again).
+        s.begin();
+        assert_eq!(review(&s, &[]).breakers.len(), 1);
+        s.raise(&r.breakers);
+        s.answer(&given);
+        assert!(review(&s, &[]).breakers.is_empty(), "approved again");
 
         // The same when the gate matched the code (`oneup sync --approve`).
         let mut s = Stops::default();
@@ -3217,6 +3268,132 @@ mod tests {
         s.approve(&r.answered[0]);
         s.settled();
         assert_eq!(review(&s, &given).breakers.len(), 1);
+    }
+
+    /// An approved change that waits (a file that keeps changing, a pause)
+    /// stays approved when the rounds settle, until it runs; then it's done
+    /// with. One that's no longer planned goes when they settle.
+    #[test]
+    fn an_approved_change_that_waits_stays_approved_until_it_runs() {
+        let uploads: Vec<Op> = (1..=25u64)
+            .map(|i| Op::Upload {
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+                to: RemoteId("root".into()),
+                parent: 0,
+                name: format!("f{i}.docx"),
+                replace: Some(oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() }),
+                link: oneup_sync::Link::Existing(i),
+            })
+            .collect();
+        let bad: Vec<LocalId> = (1..=25).map(LocalId).collect();
+        for paused in [false, true] {
+            let p = oneup_gate::Policy { pause_remote: paused, ..oneup_gate::Policy::default() };
+            let review = |stops: &Stops| {
+                let cx = GateContext {
+                    synced_items: 100_000,
+                    suspicious: &bad,
+                    approved: &stops.approved,
+                    ..GateContext::default()
+                };
+                review_in(&p, &cx, uploads.clone())
+            };
+            let mut s = Stops::default();
+            let r = review(&s);
+            s.raise(&r.breakers);
+            s.answer(&[r.breakers[0].fingerprint.0]);
+            // Approved; held back (busy: after the gate; paused: by it):
+            // nothing ran, and the rounds settle.
+            let r = review(&s);
+            assert!(r.breakers.is_empty(), "paused {paused}");
+            assert_eq!(r.listed.len(), 25);
+            s.round_ended(r.listed, &[]);
+            s.settled();
+            // A later call: still approved, though no code is given.
+            s.begin();
+            let r = review(&s);
+            assert!(r.breakers.is_empty(), "paused {paused}: still approved");
+            // It runs (the pause over); then it's done with.
+            s.round_ended(r.listed, &uploads);
+            s.settled();
+            assert!(s.approved.is_empty());
+            assert_eq!(review(&s).breakers.len(), 1, "back again: a new stop");
+        }
+        // Approved, then no longer planned (the file restored): gone at settling.
+        let p = oneup_gate::Policy::default();
+        let cx = GateContext { synced_items: 100_000, suspicious: &bad, ..GateContext::default() };
+        let r = review_in(&p, &cx, uploads.clone());
+        let mut s = Stops::default();
+        s.raise(&r.breakers);
+        s.answer(&[r.breakers[0].fingerprint.0]);
+        s.round_ended(Vec::new(), &[]);
+        s.settled();
+        assert!(s.approved.is_empty());
+    }
+
+    /// With a mass stop and a content-guard stop together, and parts of each
+    /// approved earlier, the list saved for each stop is exactly what its
+    /// code approves.
+    #[test]
+    fn each_saved_stop_list_is_what_its_code_approves() {
+        let mut ops: Vec<Op> = (1..=25u64)
+            .map(|i| Op::Upload {
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+                to: RemoteId("root".into()),
+                parent: 0,
+                name: format!("f{i}.docx"),
+                replace: Some(oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() }),
+                link: oneup_sync::Link::Existing(i),
+            })
+            .collect();
+        ops.extend((100..130u64).map(|i| Op::DeleteRemote {
+            sid: i,
+            remote: oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() },
+        }));
+        let bad: Vec<LocalId> = (1..=25).map(LocalId).collect();
+        let mut approved: Vec<ItemKey> =
+            ops[..12].iter().map(|o| oneup_gate::item_key(BreakerKind::Suspicious, o, "")).collect();
+        approved.extend(ops[12..25].iter().map(|o| oneup_gate::item_key(BreakerKind::Mass, o, "")));
+        approved.sort_unstable();
+        let cx = GateContext { synced_items: 300, suspicious: &bad, approved: &approved, ..GateContext::default() };
+        let r = review_in(&oneup_gate::Policy::default(), &cx, ops);
+        assert_eq!(r.breakers.len(), 2);
+        for (i, b) in r.breakers.iter().enumerate() {
+            let mut shown: Vec<ItemKey> =
+                stop_ops(&r, i).into_iter().map(|op| oneup_gate::item_key(b.kind, op, "")).collect();
+            shown.sort_unstable();
+            assert_eq!(shown, b.items, "{:?}", b.kind);
+        }
+    }
+
+    /// A pruned folder counts as everything in it wherever the safety
+    /// window and the stops count: it makes the round read the paths its
+    /// list shows, its approval runs it, and the window records all of it.
+    #[test]
+    fn a_pruned_folder_counts_as_everything_in_it() {
+        let p = oneup_gate::Policy::default();
+        let prune = Op::PruneRemote {
+            remote: oneup_sync::RemotePre { id: RemoteId("big".into()), etag: "e".into() },
+            forget: vec![7],
+            items: 1000,
+            keep: Vec::new(),
+        };
+        assert!(may_trip(&p, std::slice::from_ref(&prune), &[], Recent::default(), false, false));
+        let shown = vec!["/node_modules/".to_string()];
+        let cx = GateContext { synced_items: 100_000, paths: &shown, ..GateContext::default() };
+        let b = review_in(&p, &cx, vec![prune.clone()]).breakers.remove(0);
+        assert_eq!(b.count, 1000);
+        let cx = GateContext { approved: &b.items, ..cx };
+        let r = review_in(&p, &cx, vec![prune.clone()]);
+        assert!(r.breakers.is_empty(), "approved where it was shown");
+        let reserve = reserved(Recent::default(), &r.approved, &[]);
+        assert_eq!(reserve.remote, 1000);
+        let mut store = Store::open_in_memory().unwrap();
+        crate::safetywindow::SafetyWindow::default().save_with(&mut store, reserve, 0).unwrap();
+        let (mut w, _) = crate::safetywindow::SafetyWindow::load(&store, 1).unwrap();
+        assert_eq!(w.recent(1).remote, 1000);
+        let mut done = Recent::default();
+        done.add_op(&prune, &[]);
+        assert_eq!(done.remote, 1000);
     }
 
     /// What a round may carry out is counted for the safety window before
