@@ -5,13 +5,13 @@
 #![allow(clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oneup_effects::LocalFs;
-use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, VersionMark, link_roots};
+use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, Source, VersionMark, link_roots};
 use oneup_gate::{Choice, Context, Decision, Overflow, OverflowOutcome, Policy, review_in};
 use oneup_local::observe::Observer;
 use oneup_local::{Config, Scan};
@@ -400,16 +400,14 @@ impl Fake {
         Ok(None)
     }
 
-    fn upload_now(
-        &self,
-        parent: &RemoteId,
-        name: &str,
-        replace: Option<&RemotePre>,
-        size: i64,
-        src: &mut (dyn Read + Send),
-    ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
-        let mut content = vec![0u8; size.clamp(0, 2) as usize];
-        src.read_exact(&mut content)?;
+    /// Reads an upload's `size` bytes as Graph does, through
+    /// [`Source::fill`]: the first two, then the rest (a save the test
+    /// asked for lands in between, or after the last byte).
+    async fn read_upload(&self, size: i64, src: &mut dyn Source) -> Result<Vec<u8>, CloudError> {
+        let size = usize::try_from(size).unwrap();
+        let first = size.min(2);
+        let (mut content, read) = src.fill(vec![0; first], first).await;
+        assert_eq!(read?, first, "the file ended early");
         let save = self.0.lock().unwrap().saved_meanwhile.take();
         let (now, last) = match save {
             Some(s) if s.after_last_byte => (None, Some(s)),
@@ -418,11 +416,23 @@ impl Fake {
         if let Some(s) = now {
             s.save();
         }
-        src.read_to_end(&mut content)?;
+        // One more than is left: a file longer than its size shows.
+        let (rest, read) = src.fill(vec![0; size - first + 1], size - first + 1).await;
+        content.extend_from_slice(&rest[..read?]);
         if let Some(s) = last {
             s.save();
         }
-        assert_eq!(content.len() as i64, size);
+        assert_eq!(content.len(), size);
+        Ok(content)
+    }
+
+    fn upload_now(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+        replace: Option<&RemotePre>,
+        content: Vec<u8>,
+    ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let mut s = self.0.lock().unwrap();
         if s.full {
             s.refused += 1;
@@ -492,10 +502,13 @@ impl Cloud for Fake {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let _t = self.transfer().await;
-        let done = self.upload_now(parent, name, replace, size, src);
+        let done = match self.read_upload(size, src).await {
+            Ok(content) => self.upload_now(parent, name, replace, content),
+            Err(e) => Err(e),
+        };
         self.answer().await;
         done
     }
@@ -3125,22 +3138,153 @@ async fn a_slow_transfer_holds_back_the_rest_of_the_round_by_at_most_a_window() 
     assert!(during <= before + 256 + oneup_graph::client::BATCH_MAX, "{during} finished behind it");
 }
 
-/// A file over 64 MiB is read whole, to look for its content in OneDrive,
-/// only when its upload runs alone. Whether it would was decided when it
-/// was taken in: one whose size reached OneDrive only afterwards (an
-/// earlier upload of the round) is uploaded, a fragment at a time.
-#[tokio::test]
-async fn a_large_upload_not_taken_in_alone_is_not_read_whole() {
+/// Files `big.bin` (the same on both sides, so the first round hashes it
+/// to pair the two), `up.txt` to upload and `down.txt` to download, and a
+/// hook that holds the hash on its blocking thread until `until` says so
+/// (or 20 s pass), then notes in the flag it returns that it let go.
+fn a_held_hash(
+    tag: &str,
+    until: impl Fn(&Fake, &Path) -> bool + Send + std::marker::Sync + 'static,
+) -> (Sync, Arc<std::sync::atomic::AtomicBool>) {
     let cloud = Fake::new();
-    let mut s = Sync::new("copy-alone", cloud.clone());
+    let s = Sync::on_disk(tag, cloud.clone());
+    write(&s.p("big.bin"), b"the same on both sides");
+    cloud.add("big.bin", Some(b"the same on both sides"));
+    write(&s.p("up.txt"), b"up");
+    cloud.add("down.txt", Some(b"down"));
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (dir, flag) = (s.dir.0.clone(), Arc::clone(&released));
+    s.exec.on_blocking(Some(Arc::new(move |op: &Op| {
+        if !matches!(op, Op::Hash(_)) {
+            return;
+        }
+        let give_up = std::time::Instant::now() + Duration::from_secs(20);
+        while !until(&cloud, &dir) && std::time::Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+    (s, released)
+}
+
+/// Whether `up.txt` reached OneDrive and `down.txt` this folder.
+fn up_and_down(cloud: &Fake, dir: &Path) -> bool {
+    cloud.0.lock().unwrap().child("root", "up.txt").is_some() && dir.join("down.txt").exists()
+}
+
+/// Reading a file whole (here, hashing it to pair it with OneDrive's copy
+/// of the same name) runs on a blocking thread. While it's held there, as a
+/// slow disk or a large file would hold it, the round's other operations
+/// go on: the upload and the download finish first. When it ran on the
+/// round's task, everything under way waited for it.
+#[tokio::test]
+async fn a_long_read_doesnt_hold_up_the_rest_of_the_round() {
+    let (mut s, released) = a_held_hash("long-read", up_and_down);
+    let started = std::time::Instant::now();
+    let r = s.round().await;
+    assert!(r.done.iter().any(|op| matches!(op, Op::Hash(_))), "{r:?}");
+    assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(started.elapsed() < Duration::from_secs(15), "the hash let go once the others were done, not at 20 s");
+    assert!(up_and_down(&s.cloud, &s.dir.0));
+    s.exec.on_blocking(None);
+    s.settle().await;
+    assert_eq!(local_tree(&s.dir.0), s.cloud.tree());
+}
+
+/// A round that halts (an injected crash, here right after the upload)
+/// while an effect runs on a blocking thread ends only once that effect
+/// has: nothing the round started changes the folder after it, nor while
+/// the next round settles the write-ahead records a crash leaves.
+#[tokio::test]
+async fn a_halted_round_ends_only_after_the_work_it_handed_to_a_blocking_thread() {
+    // Held past the crash: until the upload is in OneDrive, then a while.
+    let (mut s, released) = a_held_hash("halt-blocking", |cloud, _| {
+        let up = cloud.0.lock().unwrap().child("root", "up.txt").is_some();
+        if up {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        up
+    });
+    s.exec.crash_after(Some(0));
+    let r = s.attempt().await;
+    assert_eq!(r.halted.as_deref(), Some(CRASHED), "{r:?}");
+    assert!(!r.done.iter().any(|op| matches!(op, Op::Hash(_))), "the crash came first: {r:?}");
+    assert!(released.load(std::sync::atomic::Ordering::SeqCst), "the round waited for the hash");
+    s.exec.on_blocking(None);
+    let mut s = s.restart();
+    s.settle().await;
+    assert_eq!(local_tree(&s.dir.0), s.cloud.tree());
+}
+
+/// While another program writes the database (the settings window, a
+/// command), the round's own writes wait for it without blocking the task
+/// the round runs on, so what shares that task (the transfers under way,
+/// the agent's progress reports) goes on meanwhile. SQLite's own wait
+/// blocked it until the other write was done.
+#[tokio::test]
+async fn a_round_waits_for_a_busy_database_without_blocking_its_task() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("busy-db", cloud.clone());
+    cloud.add("down.txt", Some(b"down"));
+    write(&s.p("up.txt"), b"up");
+    let db = s.db.as_ref().unwrap().0.clone();
+    let held = Duration::from_millis(500);
+    // As the first operation starts, another connection takes the
+    // database for a while.
+    let taken = std::sync::Once::new();
+    let may_run = |_: &Op| {
+        taken.call_once(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let mut other = Store::open(&db, 1024).unwrap();
+                other
+                    .write(|_| {
+                        tx.send(()).unwrap();
+                        std::thread::sleep(held);
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            rx.recv().unwrap();
+        });
+        true
+    };
+    let ticks = AtomicUsize::new(0);
+    let started = std::time::Instant::now();
+    let r = tokio::select! {
+        r = s.attempt_checked(&may_run) => r,
+        () = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks.fetch_add(1, SeqCst);
+            }
+        } => unreachable!(),
+    };
+    assert!(r.halted.is_none() && r.failed.is_empty(), "{r:?}");
+    assert_eq!(r.done.len(), 2, "{r:?}");
+    assert!(started.elapsed() >= held, "the round waited for the other write");
+    let ticks = ticks.load(SeqCst);
+    assert!(ticks >= 10, "the task went on meanwhile: {ticks} ticks");
+}
+
+/// A large file is read whole, to look for its content in OneDrive, off
+/// the executor's task, so its upload doesn't have to run alone: one whose
+/// size reached OneDrive earlier in the round (the first upload, which the
+/// limit on large uploads runs first) is still found there, and copied.
+#[tokio::test]
+async fn a_large_upload_whose_content_reached_onedrive_earlier_in_the_round_is_copied() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("copy-large", cloud.clone());
     s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 1 });
     let big = vec![9u8; (64 << 20) + 1];
     write(&s.p("a.bin"), &big);
     write(&s.p("b.bin"), &big);
     s.settle().await;
     let st = cloud.0.lock().unwrap();
-    assert_eq!(st.copies, 0, "the second wasn't copied after reading it whole");
-    assert_eq!(st.uploaded, 2 * big.len() as u64);
+    assert_eq!(st.copies, 1, "the second was copied after reading it whole");
+    assert_eq!(st.uploaded, big.len() as u64);
 }
 
 /// Timing, on a network where every request takes 20 ms: a round of

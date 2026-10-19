@@ -7,6 +7,12 @@
 //!   operations keep the planner's order. Independent ones run
 //!   concurrently, up to the memory profile's limits; moves, renames and
 //!   removals of folders run alone (`claims_in` in `exec.rs`, `schedule.rs`).
+//! * **Disk work off the task.** The operations under way share one task.
+//!   Whatever reads a file (an upload's fragments, hashing, checking an old
+//!   copy before it's dropped) runs on a blocking thread (`blocking.rs`),
+//!   and writes to the store wait for another program's write without
+//!   blocking the task (`Db` in `exec.rs`), so a slow disk or a busy
+//!   database doesn't stall the transfers under way.
 //! * **New folders' contents in the same round.** Once an operation that
 //!   made a folder is recorded, the caller's planner and gate plan and
 //!   review what goes into it, and that runs after it in the same round
@@ -36,15 +42,18 @@
 //!   first. The same transaction saves which record is pending (in `meta`,
 //!   `exec.pending.<local file ID>`, one per item), and the final record
 //!   clears it. One left over (the operation failed, or the process died)
-//!   is settled right after the operation, before any other runs, or at the
-//!   start of the next run: if the folder shows the effect didn't happen, the
-//!   record is undone. `tests/sync.rs` crashes a round at every
+//!   is settled right after the operation, before it releases its claims,
+//!   or at the start of the next run: if the folder shows the effect didn't
+//!   happen, the record is undone. `tests/sync.rs` crashes a round at every
 //!   such point (feature `crash-test`) and restarts it.
 //! * A failed precondition **skips** the operation; the next round re-plans
 //!   it from fresh state. A failed identity check of the sync folder, or a
 //!   database error, **halts** the round; operations still under way are
-//!   dropped where they wait, as a crash would leave them.
+//!   dropped where they wait, as a crash would leave them, once what they
+//!   handed to a blocking thread has run to its end.
 
+#[cfg(windows)]
+mod blocking;
 pub mod cloud;
 #[cfg(windows)]
 mod exec;
@@ -58,9 +67,9 @@ pub mod resolve;
 mod schedule;
 pub mod timing;
 
-pub use cloud::{Cloud, CloudError, Meta, MetaDone, VersionMark};
+pub use cloud::{Cloud, CloudError, Meta, MetaDone, Source, VersionMark};
 #[cfg(all(windows, feature = "crash-test"))]
-pub use exec::CRASHED;
+pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]
 pub use exec::{Executor, FOLLOW_MAX, Follow, Report, Skip, link_roots};
 pub use graph::{GraphCloud, UploadMemory};

@@ -26,7 +26,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError, VersionMark};
+use oneup_exec::{Cloud, CloudError, Source, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::content::{Decryptor, Encryptor, encrypted_size};
@@ -64,6 +64,10 @@ impl<T: Read> Read for Hashed<T> {
         Ok(n)
     }
 }
+
+/// Read in place (see [`Source`]): the encryption reads its source as it
+/// goes, and a vault runs one operation at a time.
+impl<T: Read + Send> Source for Hashed<T> {}
 
 impl<T: Write> Write for Hashed<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -208,7 +212,7 @@ impl<C: Cloud> VaultCloud<C> {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> Result<(RemoteRow, Hash), CloudError> {
         let plain = u64::try_from(size).map_err(other)?;
         let enc_size = i64::try_from(encrypted_size(plain)).map_err(other)?;
@@ -246,7 +250,7 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> Result<(RemoteRow, Option<Hash>), CloudError> {
         if let Some(old) = replace {
             // A new version of the file's encrypted contents.

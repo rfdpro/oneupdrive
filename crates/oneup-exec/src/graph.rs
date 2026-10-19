@@ -6,7 +6,7 @@
 //! 507 (no room left) is [`CloudError::Full`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,7 @@ use oneup_graph::{DriveItem, FileVersion, Graph};
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
 
-use crate::cloud::{Cloud, CloudError, Meta, MetaDone, VersionMark};
+use crate::cloud::{Cloud, CloudError, Meta, MetaDone, Source, VersionMark};
 use crate::timing::Timings;
 
 /// The executor's view of a signed-in drive.
@@ -465,7 +465,7 @@ async fn send_session<S: Session>(
     sizer: &std::sync::Mutex<Sizer>,
     replace: Option<(&str, &str)>,
     total: u64,
-    src: &mut (dyn Read + Send),
+    src: &mut dyn Source,
 ) -> Result<DriveItem, CloudError> {
     let sizer = || sizer.lock().unwrap_or_else(|p| p.into_inner());
     let mut buf = Vec::new();
@@ -482,7 +482,9 @@ async fn send_session<S: Session>(
         if buf.len() < want {
             buf.resize(want, 0);
         }
-        let n = match fill(src, &mut buf[..want]) {
+        let (filled, read) = src.fill(std::mem::take(&mut buf), want).await;
+        buf = filled;
+        let n = match read {
             Ok(n) if n == want => n,
             Ok(_) => {
                 s.cancel().await;
@@ -490,7 +492,7 @@ async fn send_session<S: Session>(
             }
             Err(e) => {
                 s.cancel().await;
-                return Err(e);
+                return Err(CloudError::Io(e));
             }
         };
         let end = start + n as u64;
@@ -592,20 +594,6 @@ fn replaced_version<'a>(versions: &'a [FileVersion], base: &VersionMark) -> Opti
     }
 }
 
-/// Reads until `buf` is full or the source ends; returns the bytes read.
-fn fill(src: &mut (dyn Read + Send), buf: &mut [u8]) -> Result<usize, CloudError> {
-    let mut n = 0;
-    while n < buf.len() {
-        match src.read(&mut buf[n..]) {
-            Ok(0) => break,
-            Ok(k) => n += k,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(CloudError::Io(e)),
-        }
-    }
-    Ok(n)
-}
-
 impl Cloud for GraphCloud {
     /// Graph's own limiter paces the requests ([`oneup_graph::limiter`]).
     fn concurrent(&self) -> bool {
@@ -674,14 +662,14 @@ impl Cloud for GraphCloud {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let total = u64::try_from(size).map_err(|_| CloudError::Other("negative size".into()))?;
         let replace = replace.map(|p| (p.id.0.as_str(), p.etag.as_str()));
         let started = Instant::now();
         let item = if total as usize <= SIMPLE_UPLOAD_MAX {
-            let mut buf = vec![0u8; total as usize];
-            if fill(src, &mut buf)? != buf.len() {
+            let (buf, read) = src.fill(vec![0u8; total as usize], total as usize).await;
+            if read? != buf.len() {
                 return Err(short());
             }
             let item = self.graph.upload_small(&parent.0, name, replace, &buf).await.map_err(map)?;
