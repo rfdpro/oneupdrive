@@ -1643,7 +1643,25 @@ impl<C: Cloud> Executor<C> {
 
             // ------------------------------------------------ moves
             Op::MoveLocal { sid, local: _, to: _, parent, name } => {
-                store.write(|o| need(o.synced_get(*sid)?.is_some())).await?;
+                let listed = store
+                    .write(|o| {
+                        let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
+                        Ok::<_, Fail>(match b.remote {
+                            Some(r) => o.get_item(&r.0)?,
+                            None => None,
+                        })
+                    })
+                    .await?;
+                // This move takes the item where the listing has it in
+                // OneDrive: only while OneDrive still has it there. A listing
+                // behind the cloud can show it where it was before a move of
+                // ours, and following that would undo a move made here since.
+                if let Some(row) = listed
+                    && let Some(at) = &row.parent_id
+                {
+                    let still = self.cloud.is_at(&RemoteId(row.id.clone()), at, &row.name).await?;
+                    need(still != Some(false))?;
+                }
                 let Done::Placed { parent: dir, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
                 self.crash_point()?;
                 store

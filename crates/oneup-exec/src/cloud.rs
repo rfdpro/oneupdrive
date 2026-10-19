@@ -203,6 +203,20 @@ pub trait Cloud: Send + Sync {
         async { Err(CloudError::Other("this cloud can't re-read items".into())) }
     }
 
+    /// Whether item `id` is in folder `parent` under `name` in the cloud now
+    /// (`Some(false)` if it's gone; `None`: this cloud can't tell).
+    /// Read-only; for a move here that follows one in the cloud, which a
+    /// listing behind the cloud can show after it was undone.
+    fn is_at(
+        &self,
+        id: &RemoteId,
+        parent: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<bool>, CloudError>> + Send {
+        let _ = (id, parent, name);
+        async { Ok(None) }
+    }
+
     /// Some of folder `id`'s children as the cloud has them now (one page
     /// of a listing; empty: it has none). Read-only; for moving a folder
     /// in parts ([`CloudError::TooManyItems`]), which moves what it gets

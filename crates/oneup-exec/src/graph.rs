@@ -891,6 +891,11 @@ impl Cloud for GraphCloud {
         }
     }
 
+    async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
+        let now = self.item(id).await?;
+        Ok(Some(now.is_some_and(|r| r.parent_id.as_deref() == Some(parent) && r.name == name)))
+    }
+
     async fn children(&self, id: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
         let page = self.graph.page(&self.graph.children_url(&id.0)).await.map_err(map)?;
         Ok(page.value.iter().filter(|it| !it.is_deleted()).filter_map(oneup_remote::ingest::to_row).collect())

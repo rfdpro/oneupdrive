@@ -92,7 +92,16 @@ struct State {
     beaten: Option<String>,
     /// The next folder made with this name fails (a service error).
     mkdir_fails: Option<String>,
+    /// The listing lags behind the cloud (delta lag, [`Fake::lag`]): each
+    /// pull delivers what the pull before would have, so it can be older
+    /// than what our own requests just got back.
+    lagging: bool,
+    behind: Option<Listing>,
 }
+
+/// What one pull delivers: every live item (parents first), then the
+/// deletions since the pull before.
+type Listing = (Vec<RemoteRow>, Vec<String>);
 
 impl State {
     fn bump(&mut self) -> u64 {
@@ -141,6 +150,19 @@ impl State {
             }
         }
         n
+    }
+    /// What a pull delivers now (see [`Listing`]).
+    fn listing(&mut self) -> Listing {
+        let mut order = vec!["root".to_string()];
+        let mut i = 0;
+        while i < order.len() {
+            let p = order[i].clone();
+            order
+                .extend(self.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)).map(|(id, _)| id.clone()));
+            i += 1;
+        }
+        let rows = order.iter().map(|id| self.row(id)).collect();
+        (rows, std::mem::take(&mut self.deleted))
     }
     fn create(&mut self, parent: &str, name: &str, folder: bool, content: Vec<u8>) -> String {
         let id = format!("r{}", self.bump());
@@ -248,29 +270,46 @@ impl Fake {
     }
 
     /// What delta would deliver: every live item (parents first), then the
-    /// deletions since last time.
+    /// deletions since last time. While the listing lags, what the pull
+    /// before would have delivered instead.
     fn pull(&self, store: &mut Store) {
         let mut s = self.0.lock().unwrap();
-        let mut order = vec!["root".to_string()];
-        let mut i = 0;
-        while i < order.len() {
-            let p = order[i].clone();
-            order.extend(s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)).map(|(id, _)| id.clone()));
-            i += 1;
+        let now = s.listing();
+        let deliveries = match (s.lagging, s.behind.take()) {
+            (true, behind) => {
+                s.behind = Some(now);
+                behind.into_iter().collect()
+            }
+            (false, Some(behind)) => vec![behind, now],
+            (false, None) => vec![now],
+        };
+        drop(s);
+        for (rows, deleted) in deliveries {
+            store
+                .write(|o| {
+                    for r in &rows {
+                        o.upsert_item(r, false)?;
+                    }
+                    for id in &deleted {
+                        o.delete_subtree(id)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
         }
-        let rows: Vec<RemoteRow> = order.iter().map(|id| s.row(id)).collect();
-        let deleted = std::mem::take(&mut s.deleted);
-        store
-            .write(|o| {
-                for r in &rows {
-                    o.upsert_item(r, false)?;
-                }
-                for id in &deleted {
-                    o.delete_subtree(id)?;
-                }
-                Ok(())
-            })
-            .unwrap();
+    }
+
+    /// From now on the listing lags a pull behind the cloud (delta lag).
+    fn lag(&self) {
+        let mut s = self.0.lock().unwrap();
+        s.behind = Some(s.listing());
+        s.lagging = true;
+    }
+
+    /// The listing catches up: the next pull delivers what it held back,
+    /// then the cloud as it is.
+    fn catch_up(&self) {
+        self.0.lock().unwrap().lagging = false;
     }
 
     fn tree(&self) -> Tree {
@@ -582,6 +621,11 @@ impl Cloud for Fake {
             Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
         })
         .await
+    }
+
+    async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
+        let now = self.item(id).await?;
+        Ok(Some(now.is_some_and(|r| r.parent_id.as_deref() == Some(parent) && r.name == name)))
     }
 
     /// Every replacement is checked afterwards, as a large one over Graph.
@@ -1935,6 +1979,86 @@ async fn a_crash_inside_a_replacing_download_loses_nothing() {
         assert!(left.contains(&LeftAt::Placed(b"v2".to_vec())), "keep {keep}: {left:?}");
         assert!(left.len() >= 5, "keep {keep}: only {} crash points", left.len());
     }
+}
+
+/// OneDrive's listing lags a round behind the cloud (delta lag) while
+/// changes go both ways: every listing is older than what our own uploads,
+/// renames and deletions just got back, so rounds plan from a cloud that
+/// has moved on. Downloads and cloud changes planned from it are refused
+/// by their eTags, and whatever it moves here the next listing moves back.
+/// Nothing is lost, a deletion stays deleted, and once the listing catches
+/// up both sides agree.
+#[tokio::test]
+async fn a_listing_behind_the_cloud_loses_nothing() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("lag", cloud.clone());
+    write(&s.p("a.txt"), b"a v1");
+    write(&s.p("b.txt"), b"bee");
+    write(&s.p("docs/c.txt"), b"sea");
+    write(&s.p("docs/keep.txt"), b"keep");
+    cloud.add("d.txt", Some(b"d v1"));
+    cloud.add("e.txt", Some(b"e"));
+    s.settle().await;
+
+    cloud.lag();
+    write(&s.p("a.txt"), b"a v2");
+    std::fs::rename(s.p("b.txt"), s.p("b2.txt")).unwrap();
+    std::fs::remove_file(s.p("docs/c.txt")).unwrap();
+    write(&s.p("new.txt"), b"new");
+    write(&s.p("newdir/x.txt"), b"x");
+    cloud.edit("d.txt", b"d v2");
+    cloud.rename("e.txt", "e2.txt");
+    s.round().await;
+    // Edited and renamed here again while the listing shows a.txt from
+    // before the upload of "a v2", and b2.txt under its old name.
+    write(&s.p("a.txt"), b"a v3, longer");
+    std::fs::rename(s.p("b2.txt"), s.p("b3.txt")).unwrap();
+    for _ in 0..3 {
+        s.round().await;
+    }
+    cloud.catch_up();
+    s.settle().await;
+
+    let t = local_tree(&s.dir.0);
+    let here: Vec<&[u8]> = t.values().filter_map(|c| c.as_deref()).collect();
+    let versions = s.versions();
+    for c in [&b"a v1"[..], b"a v2", b"a v3, longer", b"bee", b"sea", b"keep", b"new", b"x", b"d v1", b"d v2", b"e"] {
+        let kept = here.contains(&c) || versions.iter().any(|v| v == c) || cloud.holds(c);
+        assert!(kept, "{:?} was lost", String::from_utf8_lossy(c));
+    }
+    for (path, c) in [("/b3.txt", &b"bee"[..]), ("/d.txt", b"d v2"), ("/e2.txt", b"e"), ("/new.txt", b"new")] {
+        assert_eq!(t.get(path).cloned().flatten().as_deref(), Some(c), "{path}: {:?}", names(&t));
+    }
+    assert!(here.contains(&&b"a v3, longer"[..]) && here.contains(&&b"keep"[..]) && here.contains(&&b"x"[..]));
+    assert!(!here.contains(&&b"sea"[..]) && !t.contains_key("/b.txt") && !t.contains_key("/b2.txt"), "{:?}", names(&t));
+}
+
+/// A file renamed here, renamed in OneDrive by the next round, then
+/// renamed here again while OneDrive's listing still shows it under its
+/// first name (delta lag): the round must not take that old name for a
+/// rename in OneDrive and follow it, which undid the second rename here
+/// and then in OneDrive too. It waits until OneDrive shows where the file
+/// is, and the second rename is sent.
+#[tokio::test]
+async fn a_listing_behind_our_own_rename_never_undoes_a_rename_here() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("lag-rename", cloud.clone());
+    write(&s.p("b.txt"), b"bee");
+    s.settle().await;
+
+    cloud.lag();
+    std::fs::rename(s.p("b.txt"), s.p("b2.txt")).unwrap();
+    s.round().await;
+    assert!(cloud.tree().contains_key("/b2.txt"), "{:?}", names(&cloud.tree()));
+    std::fs::rename(s.p("b2.txt"), s.p("b3.txt")).unwrap();
+    for _ in 0..3 {
+        s.round().await;
+        assert!(s.p("b3.txt").exists(), "{:?}", names(&local_tree(&s.dir.0)));
+    }
+    cloud.catch_up();
+    s.settle().await;
+    assert_eq!(names(&local_tree(&s.dir.0)), BTreeSet::from(["/b3.txt"]));
+    assert_eq!(names(&cloud.tree()), BTreeSet::from(["/b3.txt"]));
 }
 
 fn user_rules(lines: &[&str]) -> RuleSet {
