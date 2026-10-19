@@ -479,12 +479,27 @@ async fn agent(
         store.map_memory(memory.map_bytes)?;
     }
     let window = match window {
-        // A retry: what the failed attempt counted wasn't saved yet.
+        // A retry: what the failed attempt counted may not be saved yet.
+        // Nothing runs until it is.
         Some(w) => {
-            save_window(w, &mut store);
+            w.save(&mut store).context("can't record the safety window")?;
             w
         }
-        None => window.insert(SafetyWindow::load(&store, now_ms())?),
+        None => {
+            let (w, readable) = SafetyWindow::load(&store, now_ms())?;
+            if !readable {
+                // Counted as full for 15 minutes instead: every deletion,
+                // overwrite or move waits for approval meanwhile.
+                let detail = "the record of the last 15 minutes couldn't be read; every deletion, overwrite or move \
+                              needs approval for 15 minutes"
+                    .to_string();
+                tracing::warn!("{detail}");
+                println!("oneupd: {detail}");
+                w.save(&mut store).context("can't record the safety window")?;
+                sync::note(&mut store, "safety window", detail)?;
+            }
+            window.insert(w)
+        }
     };
     if store.read(|o| o.meta_get(KEY_PRESET))?.is_none() {
         anyhow::bail!("no exclusion choice recorded; run `oneup sync` once first");
@@ -579,20 +594,34 @@ async fn agent(
             let started = Instant::now();
             let mut executed = Recent::default();
             let recent = window.recent(now_ms());
+            // Each round records the window, with what it may do, before it
+            // changes anything (`sync::Keep`).
+            let base = window.clone();
+            let keep =
+                move |store: &mut Store, extra: Recent| -> Result<()> { Ok(base.save_with(store, extra, now_ms())?) };
             let rounds = watching_auto_pause(
-                engine.rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
-                    control.set_progress(p)
-                }),
+                engine.rounds(
+                    store,
+                    scope,
+                    &|| control.controls(),
+                    recent,
+                    &mut executed,
+                    MAX_ROUNDS,
+                    &|p| control.set_progress(p),
+                    Some(&keep),
+                ),
                 &settings,
                 control,
             )
             .await;
             // Before the error, if any: the retry must still count them.
             window.add(executed, now_ms());
+            // Approvals used are dropped: a code approves its list once.
+            control.forget_approvals(&engine.spent_answers());
             let (s, out) = rounds?;
             store = s;
             if executed != Recent::default() {
-                save_window(window, &mut store);
+                window.save(&mut store).context("can't record the safety window")?;
             }
             held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
@@ -1080,13 +1109,6 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-/// Saves the safety window; best effort (it's still kept in memory).
-fn save_window(w: &SafetyWindow, store: &mut Store) {
-    if let Err(e) = w.save(store) {
-        tracing::warn!(error = %e, "can't save the safety window; a restart would forget it");
     }
 }
 

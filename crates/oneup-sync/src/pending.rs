@@ -24,9 +24,18 @@ use crate::{Flow, Op};
 /// never named. Nothing for a one-way pair, which never deletes in the
 /// cloud and never changes this PC.
 ///
+/// `t` is the view the round planned over (what is deleted, and where);
+/// `all` is the same trees unfiltered, for what a folder holds: an item the
+/// view hides (excluded by the rules, or never synced by nature) is still
+/// in the folder, which then isn't emptied.
+///
 /// Cost: the folders above the plan's deletions and their children, which
 /// is the size of what is being deleted.
-pub fn pending_deletes<T: Trees + ?Sized>(t: &T, ops: &[Op], flow: Flow) -> Result<Vec<Op>, T::Error> {
+pub fn pending_deletes<T, A>(t: &T, all: &A, ops: &[Op], flow: Flow) -> Result<Vec<Op>, T::Error>
+where
+    T: Trees + ?Sized,
+    A: Trees<Error = T::Error> + ?Sized,
+{
     if flow == Flow::Backup {
         return Ok(Vec::new());
     }
@@ -37,7 +46,7 @@ pub fn pending_deletes<T: Trees + ?Sized>(t: &T, ops: &[Op], flow: Flow) -> Resu
     for side in [Gone::Cloud, Gone::Here] {
         let gone: HashSet<Sid> = ops.iter().filter_map(|o| side.deletes(o)).collect();
         if !gone.is_empty() {
-            out.extend(side.folders(t, &gone, &forgotten)?);
+            out.extend(side.folders(t, all, &gone, &forgotten)?);
         }
     }
     Ok(out)
@@ -72,12 +81,11 @@ impl Gone {
         }
     }
 
-    fn folders<T: Trees + ?Sized>(
-        self,
-        t: &T,
-        gone: &HashSet<Sid>,
-        forgotten: &HashSet<Sid>,
-    ) -> Result<Vec<Op>, T::Error> {
+    fn folders<T, A>(self, t: &T, all: &A, gone: &HashSet<Sid>, forgotten: &HashSet<Sid>) -> Result<Vec<Op>, T::Error>
+    where
+        T: Trees + ?Sized,
+        A: Trees<Error = T::Error> + ?Sized,
+    {
         // The folders above the deletions, each looked at once, stopping at
         // the first that won't be deleted (nothing above it can empty).
         let mut seen: HashSet<Sid> = gone.clone();
@@ -91,7 +99,7 @@ impl Gone {
                 if sid == ROOT || !seen.insert(sid) {
                     break;
                 }
-                let Some(c) = self.candidate(t, sid)? else { break };
+                let Some(c) = self.candidate(t, all, sid)? else { break };
                 order.push(sid);
                 found.insert(sid, c);
                 at = t.base(sid)?.and_then(|b| b.parent);
@@ -132,7 +140,11 @@ impl Gone {
     /// Synced folder `sid`, if it's deleted on this side with evidence and
     /// still where it was agreed on the other: the deletion the planner
     /// makes for it once empty, and what it holds.
-    fn candidate<T: Trees + ?Sized>(self, t: &T, sid: Sid) -> Result<Option<Candidate>, T::Error> {
+    fn candidate<T, A>(self, t: &T, all: &A, sid: Sid) -> Result<Option<Candidate>, T::Error>
+    where
+        T: Trees + ?Sized,
+        A: Trees<Error = T::Error> + ?Sized,
+    {
         let Some(b) = t.base(sid)? else { return Ok(None) };
         if b.kind != NodeKind::Folder {
             return Ok(None);
@@ -148,8 +160,8 @@ impl Gone {
                 if r.kind != NodeKind::Folder || remote_loc(t, &r)? != here {
                     return Ok(None);
                 }
-                for c in t.remote_children(&r.id)? {
-                    match t.base_by_remote(&c.id)? {
+                for c in all.remote_children(&r.id)? {
+                    match all.base_by_remote(&c.id)? {
                         Some(cb) => {
                             kids.insert(cb.sid);
                         }
@@ -163,8 +175,8 @@ impl Gone {
                 if l.kind != NodeKind::Folder || local_loc(t, &l)? != here {
                     return Ok(None);
                 }
-                for c in t.local_children(l.id)? {
-                    match t.base_by_local(c.id)? {
+                for c in all.local_children(l.id)? {
+                    match all.base_by_local(c.id)? {
                         Some(cb) => {
                             kids.insert(cb.sid);
                         }
@@ -174,7 +186,7 @@ impl Gone {
                 Op::RecycleLocal { sid, local: lpre(&l) }
             }
         };
-        kids.extend(t.base_children(sid)?.into_iter().map(|c| c.sid));
+        kids.extend(all.base_children(sid)?.into_iter().map(|c| c.sid));
         Ok(Some(Candidate { op, parent: b.parent, kids, keeps }))
     }
 }
@@ -311,7 +323,7 @@ mod tests {
 
         fn pending(&self) -> Vec<Op> {
             let ops = plan(self, crate::all_folders(self).unwrap()).unwrap();
-            pending_deletes(self, &ops, Flow::TwoWay).unwrap()
+            pending_deletes(self, self, &ops, Flow::TwoWay).unwrap()
         }
     }
 
@@ -348,10 +360,10 @@ mod tests {
         deleted.sort_unstable();
         assert_eq!(deleted, [11, 12, 13]);
         assert_eq!(
-            pending_deletes(&m, &ops, Flow::TwoWay).unwrap(),
+            pending_deletes(&m, &m, &ops, Flow::TwoWay).unwrap(),
             [cloud_folder(3), cloud_folder(2), cloud_folder(1)]
         );
-        assert!(pending_deletes(&m, &ops, Flow::Backup).unwrap().is_empty(), "a backup never deletes in the cloud");
+        assert!(pending_deletes(&m, &m, &ops, Flow::Backup).unwrap().is_empty(), "a backup never deletes in the cloud");
     }
 
     #[test]
@@ -412,6 +424,94 @@ mod tests {
             r.parent = Some(RemoteId("r20".into()));
         }
         assert_eq!(m.pending(), [cloud_folder(3)]);
+    }
+
+    /// A view hiding some items, as the planner's (`oneup_plan::Parked`)
+    /// hides what the rules exclude and what never syncs by nature: hidden
+    /// items read as missing and aren't listed.
+    struct Hiding<'a> {
+        m: &'a Mem,
+        local: HashSet<u128>,
+        remote: HashSet<String>,
+    }
+
+    impl Trees for Hiding<'_> {
+        type Error = Infallible;
+        fn base(&self, sid: Sid) -> Result<Option<Base>, Infallible> {
+            self.m.base(sid)
+        }
+        fn base_children(&self, sid: Sid) -> Result<Vec<Base>, Infallible> {
+            let hidden = |b: &Base| {
+                b.local.is_some_and(|l| self.local.contains(&l.0))
+                    || b.remote.as_ref().is_some_and(|r| self.remote.contains(&r.0))
+            };
+            Ok(self.m.base_children(sid)?.into_iter().filter(|b| !hidden(b)).collect())
+        }
+        fn base_by_local(&self, id: LocalId) -> Result<Option<Base>, Infallible> {
+            self.m.base_by_local(id)
+        }
+        fn base_by_remote(&self, id: &RemoteId) -> Result<Option<Base>, Infallible> {
+            self.m.base_by_remote(id)
+        }
+        fn local(&self, id: LocalId) -> Result<Seen<LocalNode>, Infallible> {
+            Ok(if self.local.contains(&id.0) { Seen::Missing } else { self.m.local(id)? })
+        }
+        fn remote(&self, id: &RemoteId) -> Result<Seen<RemoteNode>, Infallible> {
+            Ok(if self.remote.contains(&id.0) { Seen::Missing } else { self.m.remote(id)? })
+        }
+        fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>, Infallible> {
+            Ok(self.m.local_children(id)?.into_iter().filter(|n| !self.local.contains(&n.id.0)).collect())
+        }
+        fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>, Infallible> {
+            Ok(self.m.remote_children(id)?.into_iter().filter(|n| !self.remote.contains(&n.id.0)).collect())
+        }
+    }
+
+    /// A folder still holding something the planner's view hides isn't
+    /// emptied by the round's deletions: an excluded item (synced before
+    /// it was excluded) or one that never syncs by nature (`desktop.ini`,
+    /// an Office lock file). Neither is named, nor anything above it.
+    #[test]
+    fn folders_holding_hidden_items_are_never_named() {
+        // Deleted in OneDrive; `b` here still holds `b.log`, excluded since.
+        let mut m = tree();
+        m.put(14, Some(2), "b.log", false);
+        m.delete_in_cloud(&[1, 2, 3, 11, 12, 13]);
+        let view = Hiding { m: &m, local: [14].into(), remote: ["r14".to_string()].into() };
+        let ops = plan(&view, crate::all_folders(&view).unwrap()).unwrap();
+        assert_eq!(pending_deletes(&view, &m, &ops, Flow::TwoWay).unwrap(), [local_folder(3)]);
+        assert_eq!(
+            pending_deletes(&view, &view, &ops, Flow::TwoWay).unwrap(),
+            [local_folder(3), local_folder(2), local_folder(1)],
+            "the planner's own view would name them"
+        );
+
+        // `b` here holds `desktop.ini`, never synced.
+        let mut m = tree();
+        m.local.insert(
+            99,
+            LocalNode {
+                id: LocalId(99),
+                parent: Some(LocalId(2)),
+                name: "desktop.ini".into(),
+                kind: NodeKind::File,
+                size: 1,
+                mtime: 1,
+                hash: None,
+            },
+        );
+        m.delete_in_cloud(&[1, 2, 3, 11, 12, 13]);
+        let view = Hiding { m: &m, local: [99].into(), remote: HashSet::new() };
+        let ops = plan(&view, crate::all_folders(&view).unwrap()).unwrap();
+        assert_eq!(pending_deletes(&view, &m, &ops, Flow::TwoWay).unwrap(), [local_folder(3)]);
+
+        // The same in OneDrive: `b` there holds an item hidden here.
+        let mut m = tree();
+        m.put(14, Some(2), "b.log", false);
+        m.delete_here(&[1, 2, 3, 11, 12, 13]);
+        let view = Hiding { m: &m, local: HashSet::new(), remote: ["r14".to_string()].into() };
+        let ops = plan(&view, crate::all_folders(&view).unwrap()).unwrap();
+        assert_eq!(pending_deletes(&view, &m, &ops, Flow::TwoWay).unwrap(), [cloud_folder(3)]);
     }
 
     /// Run round by round, every folder named is deleted by the planner in
