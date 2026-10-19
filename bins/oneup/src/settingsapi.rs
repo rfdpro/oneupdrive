@@ -580,6 +580,16 @@ pub fn activity(dir: &Path, rel: &str, limit: usize) -> Result<Value> {
         .collect())
 }
 
+/// For each item, whether a folder above it is listed for the same reason
+/// (both held), the paths compared as Windows compares names.
+fn nested(items: &[crate::unsynced::Item]) -> Vec<bool> {
+    let tops: Vec<&crate::unsynced::Item> = items.iter().filter(|i| i.why.held()).collect();
+    items
+        .iter()
+        .map(|i| i.why.held() && tops.iter().any(|t| t.why == i.why && crate::resolve::below(&i.path, &t.path)))
+        .collect()
+}
+
 /// What can't sync until the user changes it, as `oneup unsynced` lists it,
 /// with what can be done about each (`crate::resolve`): `choices`, and the
 /// answer that waits for the agent's next round, if one does. `nested`: a
@@ -591,12 +601,9 @@ pub fn unsynced(dir: &Path) -> Result<Value> {
     let backup = crate::flow::get(&store)? == crate::flow::Flow::Backup;
     let queued = store.read(crate::resolve::queued)?;
     let local = store.read(|o| o.meta_get(crate::sync::KEY_LOCAL))?.map(std::path::PathBuf::from);
-    let tops: Vec<(String, crate::unsynced::Why)> =
-        r.items.iter().filter(|i| i.why.held()).map(|i| (format!("{}/", i.path.to_lowercase()), i.why)).collect();
+    let nested_all = nested(&r.items);
     let mut items: Vec<Value> = Vec::with_capacity(r.items.len());
-    for i in &r.items {
-        let lower = i.path.to_lowercase();
-        let nested = i.why.held() && tops.iter().any(|(t, w)| *w == i.why && lower.starts_with(t.as_str()));
+    for (i, &nested) in r.items.iter().zip(&nested_all) {
         // Which item the page shows: an answer from it is for that one only
         // (`unsynced_preview`). Without one there's nothing to bind it to,
         // so only an exclusion (a rule, by path) is offered.
@@ -819,6 +826,21 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn an_item_is_nested_under_a_folder_listed_for_the_same_reason_as_names_compare() {
+        use crate::unsynced::{Item, Why};
+        let item = |path: &str, why| Item { path: path.into(), why };
+        let items = [
+            item("/ΟΔΟΣ", Why::GoneHere),
+            item("/οδοσ/a", Why::GoneHere),
+            item("/οδοσ/b", Why::GoneThere),
+            item("/ΟΔΟΣx/c", Why::GoneHere),
+            item("/ſa", Why::GoneHere),
+            item("/Sa/d", Why::GoneHere),
+        ];
+        assert_eq!(nested(&items), [false, true, false, false, false, true]);
+    }
 
     #[test]
     fn agent_changes_are_checked_and_partial() {
