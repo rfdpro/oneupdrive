@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 use std::io::Seek as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
@@ -17,12 +19,19 @@ use oneup_sync::{
     conflict_candidate, fold,
 };
 
+use crate::blocking::{Jobs, OffTask, Settle};
 use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, VersionMark};
 use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
 /// The store, shared by the operations under way. Each use locks it for
 /// one synchronous read or transaction, never across an `.await`.
+///
+/// Writes don't wait inside SQLite for another connection's write (the
+/// hydration service, the settings window, a command), which would block
+/// the task every operation under way runs on, for up to
+/// [`oneup_store::BUSY_WAIT`]: they wait here instead ([`Db::write`]).
+/// Reads don't wait for writers (WAL).
 struct Db<'a>(std::sync::Mutex<&'a mut Store>);
 
 impl<'a> Db<'a> {
@@ -38,10 +47,31 @@ impl<'a> Db<'a> {
         self.lock().read(f)
     }
 
-    fn try_write<T, E: From<oneup_store::Error>>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T, E>) -> Result<T, E> {
-        self.lock().try_write(f)
+    /// Runs `f` in one write transaction, once no other connection is
+    /// writing: tries at once and, while one is, again after a pause that
+    /// grows to [`BUSY_PAUSE_MAX`], the task going on with the operations
+    /// under way meanwhile. Gives up, as SQLite would, after
+    /// [`oneup_store::BUSY_WAIT`].
+    async fn write<T, E: From<oneup_store::Error>>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T, E>) -> Result<T, E> {
+        let started = Instant::now();
+        let mut pause = Duration::from_millis(1);
+        let mut f = f;
+        loop {
+            let tried = self.lock().try_write_now(f);
+            match tried {
+                Ok(done) => return done,
+                Err((_, busy)) if started.elapsed() >= oneup_store::BUSY_WAIT => return Err(busy.into()),
+                Err((back, _)) => f = back,
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(BUSY_PAUSE_MAX);
+        }
     }
 }
+
+/// The longest pause between tries of a write while another connection
+/// writes ([`Db::write`]), as SQLite's own wait does.
+const BUSY_PAUSE_MAX: Duration = Duration::from_millis(100);
 
 /// How many operations, from the oldest not yet finished, the executor
 /// takes in to look for ones it can start. Behind one slow operation, the
@@ -253,7 +283,7 @@ fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
 /// that item), or takes or frees a name another one takes or frees. Also
 /// before one whose item the store doesn't have. Anything else is a group
 /// of its own; below 2 the caller runs them one by one.
-fn batch_of(store: &Db<'_>, ops: &[Approved], can_copy: bool) -> (usize, Claims) {
+fn batch_of(store: &Db<'_>, ops: &[Approved]) -> (usize, Claims) {
     let mut group = Held::default();
     let mut all = Claims::default();
     let mut n = 0;
@@ -262,7 +292,7 @@ fn batch_of(store: &Db<'_>, ops: &[Approved], can_copy: bool) -> (usize, Claims)
             a.op(),
             Op::MkdirRemote { .. } | Op::MoveRemote { .. } | Op::RenameRemote { .. } | Op::DeleteRemote { .. }
         );
-        let c = claims(store, a.op(), can_copy);
+        let c = claims(store, a.op());
         if n > 0 && (!meta || c.unknown || group.conflicts(&c)) {
             break;
         }
@@ -330,7 +360,9 @@ fn may_copy(can_copy: bool, new: bool, size: i64) -> bool {
 struct Unit {
     /// Where in the round they start.
     start: usize,
-    group: Vec<Approved>,
+    /// Shared with the blocking work an operation hands its effects to
+    /// ([`Executor::off_task`]).
+    group: Vec<Arc<Approved>>,
     claims: Claims,
 }
 
@@ -358,21 +390,18 @@ struct Place {
 /// What `op` touches ([`crate::schedule`]): what the operation names, and
 /// for an item it moves, renames or removes, where the store has it now.
 /// One whose item can't be read runs alone.
-fn claims(store: &Db<'_>, op: &Op, can_copy: bool) -> Claims {
-    store.read(|o| claims_in(o, op, can_copy)).unwrap_or_else(|e| {
+fn claims(store: &Db<'_>, op: &Op) -> Claims {
+    store.read(|o| claims_in(o, op)).unwrap_or_else(|e| {
         tracing::debug!(error = %e, "what an operation touches couldn't be read; it runs alone");
         Claims::unknown()
     })
 }
 
-/// Reading a file's whole content (hashing it) doesn't wait on the
-/// network, so the operations under way wait for it: a file larger than
-/// this is read with nothing else running.
-const READ_ALONE: i64 = 64 << 20;
-
-fn claims_in(o: &Ops<'_>, op: &Op, can_copy: bool) -> oneup_store::Result<Claims> {
+/// Reading a file, however large, doesn't make an operation run alone: it
+/// reads on a blocking thread ([`crate::blocking`]), so the operations
+/// under way go on meanwhile.
+fn claims_in(o: &Ops<'_>, op: &Op) -> oneup_store::Result<Claims> {
     use Node::{Local as L, Remote as R, Synced as S};
-    let big = |p: &LocalPre| p.stamp.is_some_and(|(size, _)| size > READ_ALONE);
     let dir = |d: Dir| match d {
         Dir::Local(id) => L(id),
         Dir::Remote(id) => R(id),
@@ -444,21 +473,9 @@ fn claims_in(o: &Ops<'_>, op: &Op, can_copy: bool) -> oneup_store::Result<Claims
     match op {
         // It removes a whole subtree in OneDrive.
         Op::PruneRemote { .. } => c.alone = true,
-        Op::Upload { local, replace, .. } => {
+        Op::Upload { local, .. } => {
             c.large = local.stamp.is_some_and(|(size, _)| usize::try_from(size).is_ok_and(|s| s > SIMPLE_UPLOAD_MAX));
-            if let Some((size, _)) = local.stamp
-                && may_copy(can_copy, replace.is_none(), size)
-                && big(local)
-            {
-                c.alone |= !o.remote_files_of_size(size, 1)?.is_empty();
-            }
         }
-        // Each reads a whole file: the old copy, to see whether it can go,
-        // or the file itself.
-        Op::Download { replace: Some(pre), .. }
-        | Op::RecycleLocal { local: pre, .. }
-        | Op::Hash(pre)
-        | Op::Dehydrate { local: pre, .. } => c.alone |= big(pre),
         _ => {}
     }
     Ok(c)
@@ -513,7 +530,8 @@ pub fn link_roots(o: &Ops<'_>, local_root: u128, remote_root: &str) -> oneup_sto
 }
 
 pub struct Executor<C> {
-    fs: LocalFs,
+    /// Shared with the blocking work effects run in ([`Executor::off_task`]).
+    fs: Arc<LocalFs>,
     cloud: C,
     /// The name-only folder rules the Local tree follows; they can change
     /// between rounds ([`Executor::set_rules`]).
@@ -522,23 +540,35 @@ pub struct Executor<C> {
     parallel: std::sync::Mutex<Parallel>,
     /// How long each kind of operation took ([`Executor::timed`]).
     timings: std::sync::Arc<Timings>,
+    /// Work under way on blocking threads ([`crate::blocking`]).
+    jobs: Arc<Jobs>,
     /// Crash points left to pass before the injected crash; negative: off.
     #[cfg(feature = "crash-test")]
     crash: std::sync::atomic::AtomicI64,
+    /// See [`Executor::on_blocking`].
+    #[cfg(feature = "crash-test")]
+    on_blocking: std::sync::Mutex<Option<BlockingHook>>,
 }
+
+/// See [`Executor::on_blocking`].
+#[cfg(feature = "crash-test")]
+pub type BlockingHook = Arc<dyn Fn(&Op) + Send + Sync>;
 
 impl<C: Cloud> Executor<C> {
     /// `rules`: the exclusion rules the Local tree was scanned with, so
     /// rows the executor writes match what the observer would write.
     pub fn new(fs: LocalFs, cloud: C, rules: ExcludeSet) -> Self {
         Self {
-            fs,
+            fs: Arc::new(fs),
             cloud,
             rules: std::sync::RwLock::new(rules),
             parallel: std::sync::Mutex::new(Parallel::for_profile("balanced")),
             timings: std::sync::Arc::default(),
+            jobs: Arc::default(),
             #[cfg(feature = "crash-test")]
             crash: std::sync::atomic::AtomicI64::new(-1),
+            #[cfg(feature = "crash-test")]
+            on_blocking: std::sync::Mutex::default(),
         }
     }
 
@@ -566,6 +596,47 @@ impl<C: Cloud> Executor<C> {
     #[cfg(feature = "crash-test")]
     pub fn crash_after(&self, n: Option<u32>) {
         self.crash.store(n.map_or(-1, i64::from), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test-only: every effect run on a blocking thread
+    /// ([`Executor::off_task`]) first calls `f` with its operation, on that
+    /// thread, so a test can hold it there as a slow disk would. `None`
+    /// turns it off.
+    #[cfg(feature = "crash-test")]
+    pub fn on_blocking(&self, f: Option<BlockingHook>) {
+        *self.on_blocking.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = f;
+    }
+
+    /// Runs effect `f` for `a` on a blocking thread ([`crate::blocking`]):
+    /// those that may read a whole file (hashing it, checking an old copy
+    /// before it's dropped or replaced, checking content before it's
+    /// freed), so the operations under way don't wait for the disk. It runs
+    /// to its end even if the round stops meanwhile, and the round waits
+    /// for it ([`Jobs::settled`]). A panic in it goes on as if it had
+    /// happened here.
+    async fn off_task<T: Send + 'static>(
+        &self,
+        a: &Arc<Approved>,
+        f: impl FnOnce(&LocalFs, &Approved) -> T + Send + 'static,
+    ) -> Res<T> {
+        let (fs, a) = (Arc::clone(&self.fs), Arc::clone(a));
+        #[cfg(feature = "crash-test")]
+        let hook = self.on_blocking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let job = self.jobs.run(move || {
+            #[cfg(feature = "crash-test")]
+            if let Some(hook) = hook {
+                hook(a.op());
+            }
+            f(&fs, &a)
+        });
+        match job.await {
+            Ok(out) => Ok(out),
+            Err(e) => match e.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                // Only while the runtime shuts down.
+                Err(_) => Err(Fail::Halt("a file operation didn't run: shutting down".into())),
+            },
+        }
     }
 
     /// A place where a killed process would leave the effects layer and the
@@ -640,12 +711,14 @@ impl<C: Cloud> Executor<C> {
             }
             tries += 1;
             file.rewind().map_err(|e| lost(e.to_string()))?;
-            let mut reader = Hashing::new(&mut *file);
+            // Read off the task, through a handle of its own (sharing the
+            // position just rewound).
+            let mut reader = OffTask::new(file.try_clone().map_err(|e| lost(e.to_string()))?, &self.jobs);
             match self.cloud.upload(to, &copy, None, size, &mut reader).await {
                 Ok((row, sent)) => {
                     let sent = sent.unwrap_or_else(|| reader.hash.finalize());
                     let read = reader.hash.len();
-                    store.try_write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?))?;
+                    store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
                     if row.qxh != Some(sent) || read != len || row.size != size {
                         return Err(lost("OneDrive's copy didn't match what was sent".into()));
                     }
@@ -659,51 +732,52 @@ impl<C: Cloud> Executor<C> {
         Err(lost("no free name".into()))
     }
 
-    /// For a new file (`new`) of at least `COPY_MIN` bytes: if OneDrive
-    /// already has a file with the same size and content, has OneDrive copy
-    /// it to `to/name` instead of uploading (server-side copy).
-    /// Reads the open file to hash it only when a cloud file of exactly its
-    /// size exists, and leaves it rewound for an upload otherwise. `None`:
-    /// upload it. The copy is verified: one whose content turned out
-    /// different (the source changed in between) is removed again, into
-    /// OneDrive's recycle bin, before uploading instead.
-    ///
-    /// A file over [`READ_ALONE`] is read whole only if the upload runs
-    /// `alone`: whether it would was decided when it was taken in, and a
-    /// file of its size may have reached OneDrive since (an earlier upload
-    /// of the round). It's then uploaded, which reads it a fragment at a
-    /// time.
+    /// For a new file (`new`) of at least `COPY_MIN` bytes, `size` bytes
+    /// long: if OneDrive already has a file with the same size and content,
+    /// has OneDrive copy it to `to/name` instead of uploading (server-side
+    /// copy). Reads the open file to hash it (off the task, like the
+    /// upload's reads) only when a cloud file of exactly its size exists,
+    /// and leaves it rewound for an upload otherwise. `None`: upload it.
+    /// The copy is verified: one whose content turned out different (the
+    /// source changed in between) is removed again, into OneDrive's recycle
+    /// bin, before uploading instead.
     async fn copy_instead(
         &self,
         store: &Db<'_>,
-        src: &mut oneup_effects::UploadSource,
+        src: &mut OffTask<oneup_effects::UploadSource>,
+        size: i64,
         to: &RemoteId,
         name: &str,
         new: bool,
-        alone: bool,
     ) -> Res<Option<(RemoteRow, Hash)>> {
-        if !may_copy(self.cloud.can_copy(), new, src.size) || (src.size > READ_ALONE && !alone) {
+        if !may_copy(self.cloud.can_copy(), new, size) {
             return Ok(None);
         }
-        let candidates = store.read(|o| o.remote_files_of_size(src.size, 16))?;
+        let candidates = store.read(|o| o.remote_files_of_size(size, 16))?;
         if candidates.is_empty() {
             return Ok(None);
         }
-        let mut buf = vec![0u8; 1 << 20];
-        let h = match oneup_hash::hash_reader(&mut *src, &mut buf) {
+        let read = src
+            .with(|file| {
+                let mut buf = vec![0u8; 1 << 20];
+                let h = oneup_hash::hash_reader(&mut *file, &mut buf)?;
+                file.rewind()?;
+                Ok::<_, std::io::Error>(h)
+            })
+            .await;
+        let h = match read.and_then(|r| r) {
             Ok(h) => h,
             Err(e) if oneup_effects::ChangedMeanwhile::is(&e) => return Err(Fail::Skip(Skip::Changed)),
             Err(e) => return Err(Fail::Failed(e.to_string())),
         };
-        src.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
         let hash = h.finalize();
-        if i64::try_from(h.len()).ok() != Some(src.size) {
+        if i64::try_from(h.len()).ok() != Some(size) {
             return Err(Fail::Skip(Skip::Changed));
         }
         let Some(source) = candidates.into_iter().find(|c| c.qxh == Some(hash)) else { return Ok(None) };
         let pre = RemotePre { id: RemoteId(source.id.clone()), etag: source.etag.clone().unwrap_or_default() };
         match self.cloud.copy(&pre, &hash, to, name).await {
-            Ok(row) if row.qxh == Some(hash) && row.size == src.size => Ok(Some((row, hash))),
+            Ok(row) if row.qxh == Some(hash) && row.size == size => Ok(Some((row, hash))),
             Ok(row) => {
                 // Not the content we have: remove what was just made.
                 tracing::warn!("a copy made in OneDrive had other content than this file; removing it and uploading");
@@ -752,7 +826,9 @@ impl<C: Cloud> Executor<C> {
     /// Operations finish in any order; the report lists them in the
     /// planner's order all the same, which callers rely on. A halt stops
     /// the round at once: operations still under way are dropped where
-    /// they wait, as a crash would leave them, and aren't reported.
+    /// they wait, as a crash would leave them, and aren't reported. Work
+    /// they handed to a blocking thread runs to its end first
+    /// ([`crate::blocking`]).
     pub async fn run_checked(
         &self,
         store: &mut Store,
@@ -787,9 +863,11 @@ impl<C: Cloud> Executor<C> {
             report.halted = Some(e.to_string());
             return report;
         }
+        // However the round ends, nothing it started is still running.
+        let _settle = Settle(&self.jobs);
         let db = Db::new(store);
         // Records left by a round that was cut short.
-        if let Err(Fail::Halt(m) | Fail::Failed(m)) = self.recover_all(&db) {
+        if let Err(Fail::Halt(m) | Fail::Failed(m)) = self.recover_all(&db).await {
             report.halted = Some(m);
             return report;
         }
@@ -808,20 +886,19 @@ impl<C: Cloud> Executor<C> {
         // the planner's order, as soon as everything before has finished.
         let mut reported = 0;
         let mut outcomes: VecDeque<Option<(Op, Res, Notes)>> = VecDeque::new();
-        let can_copy = self.cloud.can_copy();
         let mut next = 0;
         loop {
             // A run of independent cloud metadata changes goes in one batch;
             // each keeps its own precondition and outcome.
             let first_new = waiting.len();
             while next - reported < WINDOW && !pending.is_empty() {
-                let (n, claims) = batch_of(&db, pending.make_contiguous(), can_copy);
-                waiting.push_back(Unit { start: next, group: pending.drain(..n).collect(), claims });
+                let (n, claims) = batch_of(&db, pending.make_contiguous());
+                waiting.push_back(Unit { start: next, group: pending.drain(..n).map(Arc::new).collect(), claims });
                 next += n;
             }
             // On demand, a download is a placeholder: nothing is fetched.
             if waiting.len() > first_new && !self.fs.on_demand() {
-                let coming = coming_downloads(&db, waiting.range(first_new..).flat_map(|u| &u.group));
+                let coming = coming_downloads(&db, waiting.range(first_new..).flat_map(|u| &u.group).map(|a| &**a));
                 if !coming.is_empty() {
                     self.cloud.upcoming(&coming);
                 }
@@ -879,6 +956,9 @@ impl<C: Cloud> Executor<C> {
             }
         }
         drop(running);
+        // What the dropped operations handed to blocking threads ends
+        // before the round does.
+        self.jobs.settled().await;
         // After a halt: what finished, still in the planner's order.
         for (op, outcome, notes) in outcomes.into_iter().flatten() {
             record(&mut report, op, outcome, notes);
@@ -892,7 +972,7 @@ impl<C: Cloud> Executor<C> {
     fn follow(
         &self,
         store: &Db<'_>,
-        group: &[Approved],
+        group: &[Arc<Approved>],
         finished: &[(Res, Notes)],
         follow: &Follow<'_>,
         room: usize,
@@ -943,10 +1023,10 @@ impl<C: Cloud> Executor<C> {
         }
         match go.as_slice() {
             [] => {}
-            &[k] => out[k] = Some(self.single(store, &group[k], u.claims.alone, may_run).await),
+            &[k] => out[k] = Some(self.single(store, &group[k], may_run).await),
             _ => {
                 tracing::debug!(n = go.len(), "cloud changes sent in one batch");
-                let members: Vec<&Approved> = go.iter().map(|&k| &group[k]).collect();
+                let members: Vec<&Approved> = go.iter().map(|&k| &*group[k]).collect();
                 let started = std::time::Instant::now();
                 for (&k, r) in go.iter().zip(self.run_batch(store, &members).await) {
                     out[k] = Some((r, Notes::default()));
@@ -962,23 +1042,19 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// One operation on its own, then the settling of the write-ahead
-    /// record it left if it didn't finish: right after it, with no `.await`
-    /// in between, so no other operation runs first.
-    /// `alone`: it runs with nothing else ([`claims_in`]).
-    async fn single(
-        &self,
-        store: &Db<'_>,
-        a: &Approved,
-        alone: bool,
-        may_run: &(dyn Fn(&Op) -> bool + Sync),
-    ) -> (Res, Notes) {
+    /// record it left if it didn't finish: right after it, while it still
+    /// holds its claims, so nothing that touches its item or the name it
+    /// frees or takes, or changes a folder it works in, runs first. Others
+    /// may go on while it waits for the store: the settling reads only this
+    /// item.
+    async fn single(&self, store: &Db<'_>, a: &Arc<Approved>, may_run: &(dyn Fn(&Op) -> bool + Sync)) -> (Res, Notes) {
         let mut notes = Notes::default();
         let started = std::time::Instant::now();
-        let mut outcome = self.one(store, a, alone, &mut notes, may_run).await;
+        let mut outcome = self.one(store, a, &mut notes, may_run).await;
         self.timings.record(stage(a.op()), started);
         if let Some(key) = pending_key(a.op())
             && !matches!(outcome, Err(Fail::Halt(_)))
-            && let Err(e) = self.recover(store, &key)
+            && let Err(e) = self.recover(store, &key).await
         {
             outcome = Err(e);
         }
@@ -994,7 +1070,7 @@ impl<C: Cloud> Executor<C> {
         let mut metas = Vec::new();
         let mut sent = Vec::new();
         for (k, a) in group.iter().enumerate() {
-            match self.meta_pre(store, a.op()) {
+            match self.meta_pre(store, a.op()).await {
                 Ok(m) => {
                     metas.push(m);
                     sent.push(k);
@@ -1011,7 +1087,10 @@ impl<C: Cloud> Executor<C> {
             let res = match r {
                 Err(CloudError::TooManyItems) => self.move_in_parts(store, group[k].op(), m).await,
                 Err(e) => Err(e.into()),
-                Ok(done) => self.crash_point().and_then(|()| self.meta_post(store, group[k].op(), done)),
+                Ok(done) => match self.crash_point() {
+                    Ok(()) => self.meta_post(store, group[k].op(), done).await,
+                    Err(e) => Err(e),
+                },
             };
             halted = matches!(res, Err(Fail::Halt(_)));
             outcomes[k] = Some(res);
@@ -1021,20 +1100,20 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// The store-side precondition of a cloud metadata change, and what to send.
-    fn meta_pre(&self, store: &Db<'_>, op: &Op) -> Res<Meta> {
+    async fn meta_pre(&self, store: &Db<'_>, op: &Op) -> Res<Meta> {
         match op {
             Op::MkdirRemote { local, to, parent, name, link } => {
-                store.try_write(|o| {
-                    need(local_ok(o, local)? && link_ok(o, *link)? && o.synced_get(*parent)?.is_some())
-                })?;
+                store
+                    .write(|o| need(local_ok(o, local)? && link_ok(o, *link)? && o.synced_get(*parent)?.is_some()))
+                    .await?;
                 Ok(Meta::Mkdir { parent: to.clone(), name: name.clone() })
             }
             Op::MoveRemote { sid, remote, to, name, .. } => {
-                store.try_write(|o| need(o.synced_get(*sid)?.is_some()))?;
+                store.write(|o| need(o.synced_get(*sid)?.is_some())).await?;
                 Ok(Meta::Move { pre: remote.clone(), to: to.clone(), name: name.clone() })
             }
             Op::DeleteRemote { sid, remote } => {
-                store.try_write(|o| need(o.synced_get(*sid)?.is_some()))?;
+                store.write(|o| need(o.synced_get(*sid)?.is_some())).await?;
                 Ok(Meta::Delete { pre: remote.clone() })
             }
             // The eTag (`If-Match`) is the whole precondition: the item isn't
@@ -1047,13 +1126,15 @@ impl<C: Cloud> Executor<C> {
     }
 
     /// Records a cloud metadata change that was made.
-    fn meta_post(&self, store: &Db<'_>, op: &Op, done: MetaDone) -> Res {
+    async fn meta_post(&self, store: &Db<'_>, op: &Op, done: MetaDone) -> Res {
         match (op, done) {
             (Op::MkdirRemote { local, parent, name, link, .. }, MetaDone::Item(row)) => {
-                store.try_write(|o| {
-                    o.upsert_item(&row, false)?;
-                    link_row(o, *link, folder_base(*parent, name, local.id, &row))
-                })?;
+                store
+                    .write(|o| {
+                        o.upsert_item(&row, false)?;
+                        link_row(o, *link, folder_base(*parent, name, local.id, &row))
+                    })
+                    .await?;
                 if self.fs.on_demand()
                     && let Err(e) = self.fs.convert_folder(local.id, &folder_version(&row))
                 {
@@ -1067,22 +1148,24 @@ impl<C: Cloud> Executor<C> {
                 // decrypted item gets a new ID: the Synced row follows it,
                 // and so does an online-only file's identity.
                 let renewed = row.id != remote.id.0;
-                let local = store.try_write(|o| {
-                    o.upsert_item(&row, false)?;
-                    let Some(mut b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
-                    b.parent = Some(*parent);
-                    b.name.clone_from(name);
-                    b.remote_etag = row.etag.clone().unwrap_or_default();
-                    if renewed {
-                        b.remote = Some(RemoteId(row.id.clone()));
-                    }
-                    o.synced_put(&b)?;
-                    let local = match b.local {
-                        Some(l) if renewed => o.local_get(l.0)?,
-                        _ => None,
-                    };
-                    Ok::<_, Fail>(local)
-                })?;
+                let local = store
+                    .write(|o| {
+                        o.upsert_item(&row, false)?;
+                        let Some(mut b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
+                        b.parent = Some(*parent);
+                        b.name.clone_from(name);
+                        b.remote_etag = row.etag.clone().unwrap_or_default();
+                        if renewed {
+                            b.remote = Some(RemoteId(row.id.clone()));
+                        }
+                        o.synced_put(&b)?;
+                        let local = match b.local {
+                            Some(l) if renewed => o.local_get(l.0)?,
+                            _ => None,
+                        };
+                        Ok::<_, Fail>(local)
+                    })
+                    .await?;
                 if let Some(l) = local.filter(|l| l.kind == oneup_store::LocalKind::File)
                     && self.fs.on_demand()
                     && let Some(mut v) = version(&row)
@@ -1096,19 +1179,23 @@ impl<C: Cloud> Executor<C> {
                 }
                 Ok(())
             }
-            (Op::RenameRemote { .. }, MetaDone::Item(row)) => store.try_write(|o| Ok(o.upsert_item(&row, false)?)),
-            (Op::DeleteRemote { sid, remote }, MetaDone::Deleted) => store.try_write(|o| {
-                o.delete_subtree(&remote.id.0)?;
-                o.synced_remove(*sid)?;
-                Ok(())
-            }),
+            (Op::RenameRemote { .. }, MetaDone::Item(row)) => store.write(|o| Ok(o.upsert_item(&row, false)?)).await,
+            (Op::DeleteRemote { sid, remote }, MetaDone::Deleted) => {
+                store
+                    .write(|o| {
+                        o.delete_subtree(&remote.id.0)?;
+                        o.synced_remove(*sid)?;
+                        Ok(())
+                    })
+                    .await
+            }
             _ => Err(odd()),
         }
     }
 
     /// One cloud metadata change on its own: the same three steps.
     async fn meta_one(&self, store: &Db<'_>, op: &Op) -> Res {
-        let m = self.meta_pre(store, op)?;
+        let m = self.meta_pre(store, op).await?;
         let done = match &m {
             Meta::Mkdir { parent, name } => MetaDone::Item(self.cloud.mkdir(parent, name).await?),
             Meta::Move { pre, to, name } => match self.cloud.move_item(pre, to, name).await {
@@ -1121,7 +1208,7 @@ impl<C: Cloud> Executor<C> {
             }
         };
         self.crash_point()?;
-        self.meta_post(store, op, done)
+        self.meta_post(store, op, done).await
     }
 
     /// A move OneDrive refused because the folder has too many items below
@@ -1131,7 +1218,7 @@ impl<C: Cloud> Executor<C> {
         let Meta::Move { pre, to, name } = m else { return Err(CloudError::TooManyItems.into()) };
         tracing::info!("OneDrive won't move a folder this large in one request; moving its contents item by item");
         let row = self.rebuild(store, pre, to, name).await?;
-        self.meta_post(store, op, MetaDone::Item(row))
+        self.meta_post(store, op, MetaDone::Item(row)).await
     }
 
     /// Moves folder `pre` to `to/name` without moving it as a whole, which
@@ -1167,7 +1254,7 @@ impl<C: Cloud> Executor<C> {
         let mut page = self.cloud.children(&pre.id).await?;
         let made = self.cloud.mkdir(to, name).await?;
         self.crash_point()?;
-        store.try_write(|o| record_moved(o, &pre.id.0, &made))?;
+        store.write(|o| record_moved(o, &pre.id.0, &made)).await?;
         let into = RemoteId(made.id.clone());
         while !page.is_empty() {
             let mut moved = 0usize;
@@ -1196,7 +1283,7 @@ impl<C: Cloud> Executor<C> {
                         Err(e) => return Err(e.into()),
                         Ok(MetaDone::Deleted) => return Err(odd()),
                     };
-                    store.try_write(|o| record_moved(o, &c.id, &row))?;
+                    store.write(|o| record_moved(o, &c.id, &row)).await?;
                     moved += 1;
                 }
             }
@@ -1215,44 +1302,46 @@ impl<C: Cloud> Executor<C> {
         // web, say), not away, so its rows go without deletion evidence
         // (invariant 3): it reads as missing until the next listing brings
         // it where it is now. Unpruning drops the tombstones pruning leaves.
-        store.try_write(|o| {
-            o.prune_subtree(&pre.id.0, true)?;
-            o.unprune_subtree(&pre.id.0)?;
-            Ok::<_, Fail>(())
-        })?;
+        store
+            .write(|o| {
+                o.prune_subtree(&pre.id.0, true)?;
+                o.unprune_subtree(&pre.id.0)?;
+                Ok::<_, Fail>(())
+            })
+            .await?;
         self.cloud.item(&into).await?.ok_or(Fail::Skip(Skip::Changed))
     }
 
     /// Runs one operation, noting in `notes` what else a done one reports
-    /// (see [`Notes`]). `alone`: see [`Self::single`]; `may_run`: see
-    /// [`Self::run_checked`].
+    /// (see [`Notes`]). `may_run`: see [`Self::run_checked`].
     async fn one(
         &self,
         store: &Db<'_>,
-        a: &Approved,
-        alone: bool,
+        a: &Arc<Approved>,
         notes: &mut Notes,
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Res {
         match a.op() {
             // ------------------------------------------------ bookkeeping
             Op::Pair { local, remote, parent, name, kind, size, hash } => {
-                let row = store.try_write(|o| {
-                    need(local_ok(o, local)? && remote_ok(o, remote)? && o.synced_get(*parent)?.is_some())?;
-                    o.synced_insert(&Base {
-                        sid: 0,
-                        parent: Some(*parent),
-                        name: name.clone(),
-                        kind: *kind,
-                        size: *size,
-                        hash: *hash,
-                        local: Some(local.id),
-                        local_mtime: local.stamp.map_or(0, |s| s.1),
-                        remote: Some(remote.id.clone()),
-                        remote_etag: remote.etag.clone(),
-                    })?;
-                    Ok::<_, Fail>(o.get_item(&remote.id.0)?)
-                })?;
+                let row = store
+                    .write(|o| {
+                        need(local_ok(o, local)? && remote_ok(o, remote)? && o.synced_get(*parent)?.is_some())?;
+                        o.synced_insert(&Base {
+                            sid: 0,
+                            parent: Some(*parent),
+                            name: name.clone(),
+                            kind: *kind,
+                            size: *size,
+                            hash: *hash,
+                            local: Some(local.id),
+                            local_mtime: local.stamp.map_or(0, |s| s.1),
+                            remote: Some(remote.id.clone()),
+                            remote_etag: remote.etag.clone(),
+                        })?;
+                        Ok::<_, Fail>(o.get_item(&remote.id.0)?)
+                    })
+                    .await?;
                 // On demand: what was already here, the same as OneDrive's,
                 // becomes a placeholder in sync, as an upload or a download
                 // leaves it (else Explorer shows it pending forever, and it
@@ -1278,28 +1367,42 @@ impl<C: Cloud> Executor<C> {
                 }
                 Ok(())
             }
-            Op::Record(b) => store.try_write(|o| {
-                need(o.synced_get(b.sid)?.is_some())?;
-                o.synced_put(b)?;
-                Ok(())
-            }),
-            Op::Forget(sid) => store.try_write(|o| {
-                o.synced_remove(*sid)?;
-                Ok(())
-            }),
+            Op::Record(b) => {
+                store
+                    .write(|o| {
+                        need(o.synced_get(b.sid)?.is_some())?;
+                        o.synced_put(b)?;
+                        Ok(())
+                    })
+                    .await
+            }
+            Op::Forget(sid) => {
+                store
+                    .write(|o| {
+                        o.synced_remove(*sid)?;
+                        Ok(())
+                    })
+                    .await
+            }
             Op::Hash(pre) => {
-                let Done::Hashed { hash, size, mtime } = self.fs.apply(a)? else { return Err(odd()) };
+                let hashed = self.off_task(a, |fs, a| fs.apply(a)).await??;
+                let Done::Hashed { hash, size, mtime } = hashed else { return Err(odd()) };
                 self.crash_point()?;
-                store.try_write(|o| Ok(o.local_hash_put(pre.id.0, size, mtime, &hash)?))
+                store.write(|o| Ok(o.local_hash_put(pre.id.0, size, mtime, &hash)?)).await
             }
 
             // ------------------------------------------------ transfers
             Op::Upload { local, to, parent, name, replace, link } => {
-                store.try_write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some()))?;
-                let mut src = self.fs.open_upload(a)?;
-                let (size, mtime) = (src.size, src.mtime);
+                store.write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())).await?;
+                // Opened here, on the task's thread: the write watch it
+                // starts is a request Windows would cancel if the thread
+                // that made it ended, as a blocking thread does when idle.
+                // Only its reads run on blocking threads.
+                let opened = self.fs.open_upload(a)?;
+                let (size, mtime) = (opened.size, opened.mtime);
+                let mut src = OffTask::new(opened, &self.jobs);
                 let (row, sent, sent_len, mark) = match self
-                    .copy_instead(store, &mut src, to, name, replace.is_none(), alone)
+                    .copy_instead(store, &mut src, size, to, name, replace.is_none())
                     .await?
                 {
                     Some((row, hash)) => {
@@ -1321,8 +1424,7 @@ impl<C: Cloud> Executor<C> {
                             },
                             None => None,
                         };
-                        let mut reader = Hashing::new(&mut src);
-                        let uploaded = self.cloud.upload(to, name, replace.as_ref(), size, &mut reader).await;
+                        let uploaded = self.cloud.upload(to, name, replace.as_ref(), size, &mut src).await;
                         let (row, sent) = match uploaded {
                             Err(CloudError::Io(e)) if oneup_effects::ChangedMeanwhile::is(&e) => {
                                 return Err(Fail::Skip(Skip::Changed));
@@ -1330,7 +1432,7 @@ impl<C: Cloud> Executor<C> {
                             r => r?,
                         };
                         // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
-                        (row, sent.unwrap_or_else(|| reader.hash.finalize()), reader.hash.len(), mark)
+                        (row, sent.unwrap_or_else(|| src.hash.finalize()), src.hash.len(), mark)
                     }
                 };
                 self.crash_point()?;
@@ -1338,20 +1440,24 @@ impl<C: Cloud> Executor<C> {
                 // but the stamp no longer vouches for what's here, so the
                 // next round hashes the file again (a same-size write that
                 // kept the time would otherwise look synced).
-                let written = !src.unchanged();
+                // A read lost with its thread counts as written: nothing
+                // vouches for the file.
+                let written = !src.get().is_some_and(oneup_effects::UploadSource::unchanged);
                 drop(src);
                 let local_mtime = if written { STAMP_UNKNOWN } else { mtime };
-                store.try_write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?))?;
+                store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
                 if row.qxh != Some(sent) || i64::try_from(sent_len).ok() != Some(size) || row.size != size {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }
-                store.try_write(|o| {
-                    if !written {
-                        o.local_hash_put(local.id.0, size, mtime, &sent)?;
-                    }
-                    let b = file_base(*parent, name, size, sent, local.id, local_mtime, &row);
-                    link_row(o, *link, b)
-                })?;
+                store
+                    .write(|o| {
+                        if !written {
+                            o.local_hash_put(local.id.0, size, mtime, &sent)?;
+                        }
+                        let b = file_base(*parent, name, size, sent, local.id, local_mtime, &row);
+                        link_row(o, *link, b)
+                    })
+                    .await?;
                 // On demand: the file now is (or stays) a placeholder in sync
                 // with what was sent. Best effort: if it changed meanwhile,
                 // the next round sends it again.
@@ -1387,10 +1493,12 @@ impl<C: Cloud> Executor<C> {
             // Files On-Demand: a placeholder instead of the content (no
             // download, nothing written into the sync folder).
             Op::Download { remote, to, parent, name, replace, link } if self.fs.on_demand() => {
-                let (expected, synced) = store.try_write(|o| {
-                    need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
-                    Ok::<_, Fail>((o.get_item(&remote.id.0)?, synced_hash(o, *link)?))
-                })?;
+                let (expected, synced) = store
+                    .write(|o| {
+                        need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
+                        Ok::<_, Fail>((o.get_item(&remote.id.0)?, synced_hash(o, *link)?))
+                    })
+                    .await?;
                 let Some(expected) =
                     expected.filter(|r| r.kind == Kind::File && r.etag.as_deref().unwrap_or_default() == remote.etag)
                 else {
@@ -1401,25 +1509,40 @@ impl<C: Cloud> Executor<C> {
                 let Some(v) = version(&expected) else { return Err(Fail::Skip(Skip::Refused)) };
                 let placed = match replace {
                     None => self.fs.place_placeholder(a, &v)?,
-                    Some(_) => self.fs.replace_placeholder(a, &v, synced.as_ref())?,
+                    // Reads the old copy, to see whether it can go.
+                    Some(_) => {
+                        let new = v.clone();
+                        self.off_task(a, move |fs, a| fs.replace_placeholder(a, &new, synced.as_ref())).await??
+                    }
                 };
                 let Done::Placed { entry, kept, .. } = placed else { return Err(odd()) };
                 notes.kept_instead = replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                 self.crash_point()?;
-                store.try_write(|o| {
-                    let row = self.local_row(&entry, *to);
-                    o.local_update(&row)?;
-                    o.local_hash_put(row.file_id, row.size, row.mtime, &v.identity.hash)?;
-                    let b =
-                        file_base(*parent, name, row.size, v.identity.hash, LocalId(row.file_id), row.mtime, &expected);
-                    link_row(o, *link, b)
-                })
+                store
+                    .write(|o| {
+                        let row = self.local_row(&entry, *to);
+                        o.local_update(&row)?;
+                        o.local_hash_put(row.file_id, row.size, row.mtime, &v.identity.hash)?;
+                        let b = file_base(
+                            *parent,
+                            name,
+                            row.size,
+                            v.identity.hash,
+                            LocalId(row.file_id),
+                            row.mtime,
+                            &expected,
+                        );
+                        link_row(o, *link, b)
+                    })
+                    .await
             }
             Op::Download { remote, to, parent, name, replace, link } => {
-                let (expected, synced) = store.try_write(|o| {
-                    need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
-                    Ok::<_, Fail>((o.get_item(&remote.id.0)?, synced_hash(o, *link)?))
-                })?;
+                let (expected, synced) = store
+                    .write(|o| {
+                        need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
+                        Ok::<_, Fail>((o.get_item(&remote.id.0)?, synced_hash(o, *link)?))
+                    })
+                    .await?;
                 let Some(expected) =
                     expected.filter(|r| r.kind == Kind::File && r.etag.as_deref().unwrap_or_default() == remote.etag)
                 else {
@@ -1444,13 +1567,16 @@ impl<C: Cloud> Executor<C> {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }
                 if let Some(old) = replace {
-                    store.try_write(|o| {
-                        o.note_local_deleted(old.id.0)?;
-                        Ok::<_, Fail>(o.meta_set(&pending_of(old.id), &Pending::Evidence(old.id).encode())?)
-                    })?;
+                    store
+                        .write(|o| {
+                            o.note_local_deleted(old.id.0)?;
+                            Ok::<_, Fail>(o.meta_set(&pending_of(old.id), &Pending::Evidence(old.id).encode())?)
+                        })
+                        .await?;
                     self.crash_point()?;
                 }
-                let entry = match self.fs.place_download(a, staged, synced.as_ref()) {
+                let placed = self.off_task(a, move |fs, a| fs.place_download(a, staged, synced.as_ref())).await?;
+                let entry = match placed {
                     Ok(Done::Placed { entry, kept, .. }) => {
                         notes.kept_instead =
                             replace.is_some() && kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
@@ -1460,26 +1586,30 @@ impl<C: Cloud> Executor<C> {
                     Err(e) => return Err(e.into()),
                 };
                 self.crash_point()?;
-                store.try_write(|o| {
-                    if let Some(old) = replace {
-                        o.local_remove_subtree(old.id.0)?;
-                        o.meta_delete(&pending_of(old.id))?;
-                    }
-                    let row = self.local_row(&entry, *to);
-                    o.local_update(&row)?;
-                    o.local_hash_put(row.file_id, row.size, row.mtime, &digest)?;
-                    let b = file_base(*parent, name, row.size, digest, LocalId(row.file_id), row.mtime, &expected);
-                    link_row(o, *link, b)
-                })
+                store
+                    .write(|o| {
+                        if let Some(old) = replace {
+                            o.local_remove_subtree(old.id.0)?;
+                            o.meta_delete(&pending_of(old.id))?;
+                        }
+                        let row = self.local_row(&entry, *to);
+                        o.local_update(&row)?;
+                        o.local_hash_put(row.file_id, row.size, row.mtime, &digest)?;
+                        let b = file_base(*parent, name, row.size, digest, LocalId(row.file_id), row.mtime, &expected);
+                        link_row(o, *link, b)
+                    })
+                    .await
             }
             Op::MkdirRemote { .. } | Op::MoveRemote { .. } | Op::RenameRemote { .. } | Op::DeleteRemote { .. } => {
                 self.meta_one(store, a.op()).await
             }
             Op::MkdirLocal { remote, to: _, parent, name, link } => {
-                let row = store.try_write(|o| {
-                    need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
-                    Ok::<_, Fail>(o.get_item(&remote.id.0)?)
-                })?;
+                let row = store
+                    .write(|o| {
+                        need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
+                        Ok::<_, Fail>(o.get_item(&remote.id.0)?)
+                    })
+                    .await?;
                 let Some(row) = row.filter(|r| r.etag.as_deref().unwrap_or_default() == remote.etag) else {
                     return Err(Fail::Skip(Skip::Changed));
                 };
@@ -1490,61 +1620,71 @@ impl<C: Cloud> Executor<C> {
                 };
                 let Done::Placed { parent: dir, entry, .. } = placed else { return Err(odd()) };
                 self.crash_point()?;
-                store.try_write(|o| {
-                    let local = self.local_row(&entry, dir);
-                    o.local_update(&local)?;
-                    link_row(o, *link, folder_base(*parent, name, LocalId(local.file_id), &row))
-                })
+                store
+                    .write(|o| {
+                        let local = self.local_row(&entry, dir);
+                        o.local_update(&local)?;
+                        link_row(o, *link, folder_base(*parent, name, LocalId(local.file_id), &row))
+                    })
+                    .await
             }
 
             // ------------------------------------------------ moves
             Op::MoveLocal { sid, local: _, to: _, parent, name } => {
-                store.try_write(|o| need(o.synced_get(*sid)?.is_some()))?;
+                store.write(|o| need(o.synced_get(*sid)?.is_some())).await?;
                 let Done::Placed { parent: dir, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
                 self.crash_point()?;
-                store.try_write(|o| {
-                    o.local_update(&self.local_row(&entry, dir))?;
-                    let Some(mut b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
-                    b.parent = Some(*parent);
-                    b.name.clone_from(name);
-                    o.synced_put(&b)?;
-                    Ok(())
-                })
+                store
+                    .write(|o| {
+                        o.local_update(&self.local_row(&entry, dir))?;
+                        let Some(mut b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
+                        b.parent = Some(*parent);
+                        b.name.clone_from(name);
+                        o.synced_put(&b)?;
+                        Ok(())
+                    })
+                    .await
             }
             Op::RenameLocal { .. } => {
                 let Done::Placed { parent: dir, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
                 self.crash_point()?;
-                store.try_write(|o| Ok(o.local_update(&self.local_row(&entry, dir))?))
+                store.write(|o| Ok(o.local_update(&self.local_row(&entry, dir))?)).await
             }
             Op::ConflictCopy { sid, local, name, .. } => {
                 // Detach first (see the crate docs): the renamed copy must
                 // never be taken for a rename of the Synced item.
-                store.try_write(|o| {
-                    let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
-                    need(b.local == Some(local.id))?;
-                    o.synced_put(&Base { local: None, ..b })?;
-                    let p = Pending::Detached { sid: *sid, local: local.id, name: name.clone() };
-                    Ok(o.meta_set(&pending_of(local.id), &p.encode())?)
-                })?;
+                store
+                    .write(|o| {
+                        let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
+                        need(b.local == Some(local.id))?;
+                        o.synced_put(&Base { local: None, ..b })?;
+                        let p = Pending::Detached { sid: *sid, local: local.id, name: name.clone() };
+                        Ok(o.meta_set(&pending_of(local.id), &p.encode())?)
+                    })
+                    .await?;
                 self.crash_point()?;
                 let Done::Placed { parent, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
                 self.crash_point()?;
-                store.try_write(|o| {
-                    o.local_update(&self.local_row(&entry, parent))?;
-                    Ok(o.meta_delete(&pending_of(local.id))?)
-                })
+                store
+                    .write(|o| {
+                        o.local_update(&self.local_row(&entry, parent))?;
+                        Ok(o.meta_delete(&pending_of(local.id))?)
+                    })
+                    .await
             }
 
             // ------------------------------------------------ deletions
             Op::RecycleLocal { sid, local } => {
-                let synced = store.try_write(|o| {
-                    let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
-                    o.note_local_deleted(local.id.0)?;
-                    o.meta_set(&pending_of(local.id), &Pending::Evidence(local.id).encode())?;
-                    Ok::<_, Fail>(b.hash)
-                })?;
+                let synced = store
+                    .write(|o| {
+                        let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
+                        o.note_local_deleted(local.id.0)?;
+                        o.meta_set(&pending_of(local.id), &Pending::Evidence(local.id).encode())?;
+                        Ok::<_, Fail>(b.hash)
+                    })
+                    .await?;
                 self.crash_point()?;
-                match self.fs.recycle(a, synced.as_ref()) {
+                match self.off_task(a, move |fs, a| fs.recycle(a, synced.as_ref())).await? {
                     Ok(Done::Recycled { kept }) => {
                         notes.kept_instead = kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                     }
@@ -1552,11 +1692,13 @@ impl<C: Cloud> Executor<C> {
                     Err(e) => return Err(e.into()),
                 }
                 self.crash_point()?;
-                store.try_write(|o| {
-                    o.local_remove_subtree(local.id.0)?;
-                    o.synced_remove(*sid)?;
-                    Ok(o.meta_delete(&pending_of(local.id))?)
-                })
+                store
+                    .write(|o| {
+                        o.local_remove_subtree(local.id.0)?;
+                        o.synced_remove(*sid)?;
+                        Ok(o.meta_delete(&pending_of(local.id))?)
+                    })
+                    .await
             }
             Op::PruneRemote { remote, forget, keep, .. } => {
                 // Only once the copy here is complete (data-safety.md invariant 1).
@@ -1566,19 +1708,23 @@ impl<C: Cloud> Executor<C> {
                 // The Synced rows go first (see the operation's docs): after
                 // a crash here, nothing is left that could later read as a
                 // cloud deletion to bring to this PC.
-                store.try_write(|o| {
-                    for sid in forget {
-                        o.synced_remove(*sid)?;
-                    }
-                    Ok::<_, Fail>(())
-                })?;
+                store
+                    .write(|o| {
+                        for sid in forget {
+                            o.synced_remove(*sid)?;
+                        }
+                        Ok::<_, Fail>(())
+                    })
+                    .await?;
                 self.crash_point()?;
                 self.cloud.prune(remote).await?;
                 self.crash_point()?;
-                store.try_write(|o| {
-                    o.delete_subtree(&remote.id.0)?;
-                    Ok::<_, Fail>(())
-                })?;
+                store
+                    .write(|o| {
+                        o.delete_subtree(&remote.id.0)?;
+                        Ok::<_, Fail>(())
+                    })
+                    .await?;
                 // Placeholders here no longer have a OneDrive copy behind
                 // them: ordinary files from now on. Best effort (the content
                 // is here either way).
@@ -1594,19 +1740,23 @@ impl<C: Cloud> Executor<C> {
             Op::Dehydrate { local, hash } => {
                 // Only the cloud's current version is freed: its content is
                 // then exactly what OneDrive holds (`data-safety.md` invariant 1).
-                let current = store.try_write(|o| {
-                    let Some(b) = o.synced_by_local(local.id.0)? else { return Ok::<_, Fail>(false) };
-                    let Some(r) = b.remote else { return Ok(false) };
-                    Ok(o.get_item(&r.0)?.is_some_and(|row| row.qxh == Some(*hash)) && b.hash == Some(*hash))
-                })?;
+                let current = store
+                    .write(|o| {
+                        let Some(b) = o.synced_by_local(local.id.0)? else { return Ok::<_, Fail>(false) };
+                        let Some(r) = b.remote else { return Ok(false) };
+                        Ok(o.get_item(&r.0)?.is_some_and(|row| row.qxh == Some(*hash)) && b.hash == Some(*hash))
+                    })
+                    .await?;
                 need(current)?;
-                let Done::Freed { entry } = self.fs.free_up(a)? else { return Err(odd()) };
+                let Done::Freed { entry } = self.off_task(a, |fs, a| fs.free_up(a)).await?? else { return Err(odd()) };
                 self.crash_point()?;
-                store.try_write(|o| {
-                    let Some(row) = o.local_get(local.id.0)? else { return Ok(()) };
-                    let parent = row.parent_id.map(LocalId).unwrap_or(self.fs.root_id());
-                    Ok(o.local_update(&self.local_row(&entry, parent))?)
-                })
+                store
+                    .write(|o| {
+                        let Some(row) = o.local_get(local.id.0)? else { return Ok(()) };
+                        let parent = row.parent_id.map(LocalId).unwrap_or(self.fs.root_id());
+                        Ok(o.local_update(&self.local_row(&entry, parent))?)
+                    })
+                    .await
             }
             Op::Hold { .. } => Err(Fail::Failed("a held item can't be executed".into())),
         }
@@ -1624,8 +1774,8 @@ impl<C: Cloud> Executor<C> {
     /// undone; if it did, the record stands and the change journal reports
     /// the rest. Whether it happened is read from the folder itself, which,
     /// unlike the journal, can't lag behind.
-    fn recover(&self, store: &Db<'_>, key: &str) -> Res {
-        let Some(p) = store.try_write(|o| Ok::<_, Fail>(o.meta_get(key)?))? else { return Ok(()) };
+    async fn recover(&self, store: &Db<'_>, key: &str) -> Res {
+        let Some(p) = store.write(|o| Ok::<_, Fail>(o.meta_get(key)?)).await? else { return Ok(()) };
         let pending = Pending::decode(&p);
         let undo = match &pending {
             // Recycling and replacing take the item out of the folder.
@@ -1635,29 +1785,31 @@ impl<C: Cloud> Executor<C> {
             None => false,
         };
         tracing::debug!(undo, "settling an unfinished write-ahead record");
-        store.try_write(|o| {
-            match pending {
-                Some(Pending::Evidence(id)) if undo => o.unnote_local_deleted(id.0)?,
-                Some(Pending::Detached { sid, local, .. }) if undo => {
-                    if let Some(b) = o.synced_get(sid)?
-                        && b.local.is_none()
-                        && o.synced_by_local(local.0)?.is_none()
-                    {
-                        o.synced_put(&Base { local: Some(local), ..b })?;
+        store
+            .write(|o| {
+                match pending {
+                    Some(Pending::Evidence(id)) if undo => o.unnote_local_deleted(id.0)?,
+                    Some(Pending::Detached { sid, local, .. }) if undo => {
+                        if let Some(b) = o.synced_get(sid)?
+                            && b.local.is_none()
+                            && o.synced_by_local(local.0)?.is_none()
+                        {
+                            o.synced_put(&Base { local: Some(local), ..b })?;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
-            Ok(o.meta_delete(key)?)
-        })
+                Ok(o.meta_delete(key)?)
+            })
+            .await
     }
 
     /// Settles every record a round that was cut short left, including
     /// one under [`PENDING`] itself, where versions that ran one operation
     /// at a time kept theirs.
-    fn recover_all(&self, store: &Db<'_>) -> Res {
+    async fn recover_all(&self, store: &Db<'_>) -> Res {
         for (key, _) in store.read(|o| o.meta_under(PENDING))? {
-            self.recover(store, &key)?;
+            self.recover(store, &key).await?;
         }
         Ok(())
     }
@@ -1962,7 +2114,7 @@ mod tests {
 
     /// Whether `b` has to wait for `a` (or either runs alone).
     fn waits(o: &Ops<'_>, a: &Op, b: &Op) -> bool {
-        let (ca, cb) = (claims_in(o, a, true).unwrap(), claims_in(o, b, true).unwrap());
+        let (ca, cb) = (claims_in(o, a).unwrap(), claims_in(o, b).unwrap());
         let mut held = Held::default();
         held.add(&ca);
         ca.alone || cb.alone || held.conflicts(&cb)
@@ -2053,7 +2205,7 @@ mod tests {
                     parent: ROOT,
                     name: "y".into(),
                 };
-                assert!(claims_in(o, &mv, true)?.alone);
+                assert!(claims_in(o, &mv)?.alone);
                 assert!(waits(o, &c, &mv) && waits(o, &mv, &c));
                 Ok(())
             })
@@ -2076,7 +2228,7 @@ mod tests {
                     replace: None,
                     link: Link::New,
                 };
-                assert!(!claims_in(o, &recycle, true)?.alone);
+                assert!(!claims_in(o, &recycle)?.alone);
                 assert!(waits(o, &recycle, &arrive));
                 // A rename that frees b.txt, and one that takes it.
                 let free_b = Op::RenameLocal { local: lpre(12), dir: LocalId(10), name: "c.txt".into() };
@@ -2092,23 +2244,44 @@ mod tests {
     }
 
     #[test]
-    fn forgetting_or_recycling_a_folder_or_hashing_a_large_file_runs_alone() {
+    fn forgetting_or_recycling_a_folder_runs_alone_but_reading_a_large_file_does_not() {
         let mut store = Store::open_in_memory().unwrap();
         let (x, a, _) = tree(&mut store);
         store
+            .write(|o| {
+                // OneDrive has a file the size of the large one: an upload
+                // of it reads it whole to see whether it can be a copy.
+                o.upsert_item(&RemoteRow { size: 1 << 40, ..remote("rbig", Some("rx"), "big", Kind::File) }, false)
+            })
+            .unwrap();
+        store
             .read(|o| {
-                assert!(claims_in(o, &Op::Forget(x), true)?.alone);
-                assert!(!claims_in(o, &Op::Forget(a), true)?.alone);
+                assert!(claims_in(o, &Op::Forget(x))?.alone);
+                assert!(!claims_in(o, &Op::Forget(a))?.alone);
                 assert!(
-                    claims_in(o, &Op::RecycleLocal { sid: x, local: LocalPre { id: LocalId(10), stamp: None } }, true)?
-                        .alone
+                    claims_in(o, &Op::RecycleLocal { sid: x, local: LocalPre { id: LocalId(10), stamp: None } })?.alone
                 );
                 // Something the store doesn't have.
-                assert!(claims_in(o, &Op::Forget(999), true)?.alone);
-                // Reading a large file whole holds up everything else.
-                let size = |n| LocalPre { id: LocalId(11), stamp: Some((n, 1)) };
-                assert!(!claims_in(o, &Op::Hash(size(READ_ALONE)), true)?.alone);
-                assert!(claims_in(o, &Op::Hash(size(READ_ALONE + 1)), true)?.alone);
+                assert!(claims_in(o, &Op::Forget(999))?.alone);
+                // Reading a large file whole holds nothing else up: it's
+                // read on a blocking thread (`crate::blocking`).
+                let big = LocalPre { id: LocalId(11), stamp: Some((1 << 40, 1)) };
+                let reads = [
+                    Op::Hash(big.clone()),
+                    Op::RecycleLocal { sid: a, local: big.clone() },
+                    Op::Dehydrate { local: big.clone(), hash: [0; 20] },
+                    Op::Upload {
+                        local: big,
+                        to: RemoteId("rx".into()),
+                        parent: x,
+                        name: "copy of big".into(),
+                        replace: None,
+                        link: Link::New,
+                    },
+                ];
+                for op in reads {
+                    assert!(!claims_in(o, &op)?.alone, "{op:?}");
+                }
                 Ok(())
             })
             .unwrap();

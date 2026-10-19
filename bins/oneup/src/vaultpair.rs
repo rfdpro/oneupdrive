@@ -434,7 +434,7 @@ impl Cloud for PairCloud {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn std::io::Read + Send),
+        src: &mut dyn oneup_exec::Source,
     ) -> Result<(RemoteRow, Option<Hash>), CloudError> {
         match self {
             PairCloud::Plain(c) => c.upload(parent, name, replace, size, src).await,

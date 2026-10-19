@@ -17,6 +17,7 @@
 
 use std::io::{Read, Write};
 
+use futures_util::future::BoxFuture;
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
 
@@ -90,7 +91,8 @@ pub trait Cloud: Send + Sync {
         out: &mut (dyn Write + Send),
     ) -> impl Future<Output = Result<Option<Hash>, CloudError>> + Send;
 
-    /// Uploads `size` bytes from `src` as `name` in folder `parent`. With
+    /// Uploads `size` bytes from `src` as `name` in folder `parent`, read
+    /// through [`Source::fill`] where the cloud can (see [`Source`]). With
     /// `replace`, as a new version of that item (which keeps its ID and
     /// history) provided its eTag still matches; without, only if the name
     /// is free. Returns the item as the cloud now has it, with its hash,
@@ -102,7 +104,7 @@ pub trait Cloud: Send + Sync {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> impl Future<Output = Result<(RemoteRow, Option<Hash>), CloudError>> + Send;
 
     /// Before replacing file `pre` with `size` bytes: the version it holds
@@ -226,6 +228,44 @@ pub trait Cloud: Send + Sync {
     }
 }
 
+/// What an upload reads its content from ([`Cloud::upload`]).
+///
+/// A file's content is read where it doesn't hold anything else up: the
+/// executor's sources ([`Source::fill`]) read on a blocking thread, so a
+/// slow disk, or a large fragment, doesn't stall the operations under way,
+/// which share one task. Through `Read`, they read in place: a cloud that
+/// transforms the content on the way (a vault, which encrypts it) reads
+/// that way, and runs one operation at a time ([`Cloud::concurrent`]).
+pub trait Source: Read + Send {
+    /// Reads into `buf[..want]` until it's full or the source ends, and
+    /// returns `buf` with how many bytes were read. By default in place.
+    ///
+    /// # Panics
+    /// If `want` is more than `buf.len()`.
+    fn fill(&mut self, mut buf: Vec<u8>, want: usize) -> BoxFuture<'_, (Vec<u8>, std::io::Result<usize>)> {
+        let read = read_full(self, &mut buf[..want]);
+        Box::pin(std::future::ready((buf, read)))
+    }
+}
+
+impl Source for &[u8] {}
+
+impl Source for std::fs::File {}
+
+/// Reads until `buf` is full or `src` ends; returns the bytes read.
+pub fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match src.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
 /// Passes bytes through while computing their QuickXorHash, so content is
 /// verified without being read twice.
 pub(crate) struct Hashing<T> {
@@ -236,14 +276,6 @@ pub(crate) struct Hashing<T> {
 impl<T> Hashing<T> {
     pub fn new(inner: T) -> Self {
         Self { inner, hash: oneup_hash::QuickXorHash::new() }
-    }
-}
-
-impl<T: Read> Read for Hashing<T> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hash.update(&buf[..n]);
-        Ok(n)
     }
 }
 

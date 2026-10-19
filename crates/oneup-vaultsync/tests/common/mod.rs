@@ -3,7 +3,7 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -101,7 +101,7 @@ impl Cloud for Fake {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn oneup_exec::Source,
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let mut content = Vec::new();
         src.read_to_end(&mut content)?;

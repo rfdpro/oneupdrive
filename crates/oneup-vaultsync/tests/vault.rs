@@ -185,6 +185,7 @@ async fn a_long_name_upload_cut_short_can_be_sent_again() {
             Err(std::io::Error::other("changed while read"))
         }
     }
+    impl oneup_exec::Source for CutShort {}
     let mut s = setup();
     s.refresh().await;
     let root = RemoteId(s.vault.root.clone());
