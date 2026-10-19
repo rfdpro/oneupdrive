@@ -215,7 +215,6 @@ pub fn key_line(key: &Masterkey) -> Zeroizing<String> {
 /// straight from its handle. Rust's own `stdin()` keeps a buffer for the
 /// life of the process, which would hold the keys long after they're used.
 pub fn key_from_stdin() -> Result<Masterkey> {
-    use std::io::Read as _;
     #[cfg(windows)]
     let handle = {
         use std::os::windows::io::AsHandle as _;
@@ -226,7 +225,14 @@ pub fn key_from_stdin() -> Result<Masterkey> {
         use std::os::fd::AsFd as _;
         std::io::stdin().as_fd().try_clone_to_owned()
     };
-    let mut input = std::fs::File::from(handle.context("reading the vault's keys")?);
+    read_key_line(&mut std::fs::File::from(handle.context("reading the vault's keys")?))
+}
+
+/// One [`key_line`] from `input`, read into a fixed, zeroed-on-drop buffer
+/// (no buffered reader or growing string keeps a copy). The line must end
+/// with its newline: input that stops before it (the sender died mid-write)
+/// is refused rather than guessed at.
+fn read_key_line(input: &mut impl std::io::Read) -> Result<Masterkey> {
     let mut line = Zeroizing::new([0u8; KEY_LINE_LEN + 1]);
     let mut n = 0;
     while n < line.len() && !line[..n].contains(&b'\n') {
@@ -236,6 +242,9 @@ pub fn key_from_stdin() -> Result<Masterkey> {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e).context("reading the vault's keys"),
         }
+    }
+    if !line[..n].contains(&b'\n') {
+        bail!("no vault keys on standard input");
     }
     keys_from_line(&line[..n])
 }
@@ -875,5 +884,64 @@ mod tests {
         assert!(super::keys_from_line(&[b'g'; 128]).is_err());
         assert!(super::keys_from_line(&line.as_bytes()[..100]).is_err());
         assert!(super::keys_from_line("é".repeat(64).as_bytes()).is_err());
+    }
+
+    /// A reader that hands out its data in steps: `Ok(bytes)` gives at most
+    /// that many bytes (one call each), `Err(kind)` fails that call once.
+    struct Steps {
+        data: Vec<u8>,
+        at: usize,
+        steps: std::collections::VecDeque<Result<usize, std::io::ErrorKind>>,
+    }
+
+    impl std::io::Read for Steps {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let max = match self.steps.pop_front() {
+                Some(Err(kind)) => return Err(kind.into()),
+                Some(Ok(max)) => max,
+                None => usize::MAX,
+            };
+            let n = buf.len().min(max).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    fn steps(data: &[u8], steps: Vec<Result<usize, std::io::ErrorKind>>) -> Steps {
+        Steps { data: data.to_vec(), at: 0, steps: steps.into() }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_agent_reads_its_key_line_however_the_pipe_delivers_it() {
+        use std::io::ErrorKind::{BrokenPipe, Interrupted};
+        let key = oneup_vault::key::Masterkey::generate().unwrap();
+        let line = super::key_line(&key);
+        let bytes = line.as_bytes();
+
+        // One byte at a time, with interruptions along the way (retried).
+        let mut one = Vec::new();
+        for i in 0..bytes.len() {
+            if i % 10 == 0 {
+                one.push(Err(Interrupted));
+            }
+            one.push(Ok(1));
+        }
+        let got = super::read_key_line(&mut steps(bytes, one)).unwrap();
+        assert_eq!(*got.export(), *key.export());
+        // All at once.
+        assert_eq!(*super::read_key_line(&mut steps(bytes, vec![])).unwrap().export(), *key.export());
+
+        // Ends before its newline: half a line, or all the hex but no newline.
+        assert!(super::read_key_line(&mut steps(&bytes[..64], vec![])).is_err());
+        assert!(super::read_key_line(&mut steps(&bytes[..128], vec![])).is_err());
+        assert!(super::read_key_line(&mut steps(b"", vec![])).is_err());
+        // Another I/O error: returned, not retried, no panic.
+        let e = super::read_key_line(&mut steps(bytes, vec![Ok(5), Err(BrokenPipe)])).err().unwrap();
+        assert!(e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == BrokenPipe)));
+        // Too much on the line: refused.
+        let long = [&bytes[..128], b"00\n"].concat();
+        assert!(super::read_key_line(&mut steps(&long, vec![])).is_err());
     }
 }
