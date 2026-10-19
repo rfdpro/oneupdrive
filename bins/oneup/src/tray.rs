@@ -673,9 +673,11 @@ pub fn render(look: Look, size: u32) -> Vec<u8> {
 
 /// A name for the single-instance lock of `data_dir`'s tray.
 pub fn instance_name(data_dir: &std::path::Path) -> String {
-    // FNV-1a over the lower-cased path: the same folder, however it's typed.
+    // FNV-1a over the path folded as Windows compares names: the same
+    // folder, however it's typed. (Only processes of one version need to
+    // agree on it.)
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in data_dir.to_string_lossy().to_lowercase().trim_end_matches('\\').bytes() {
+    for b in oneup_sync::fold(data_dir.to_string_lossy().trim_end_matches('\\')).bytes() {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     format!("OneUpDrive-tray-{h:016x}")
@@ -957,6 +959,15 @@ mod tests {
         let a = instance_name(std::path::Path::new(r"C:\Users\x\AppData\Local\OneUpDrive-test"));
         assert_eq!(a, instance_name(std::path::Path::new(r"c:\users\X\appdata\local\oneupdrive-test\")));
         assert_ne!(a, instance_name(std::path::Path::new(r"C:\Users\x\AppData\Local\OneUpDrive")));
+        // Beyond ASCII too, as Windows compares names: a word-final sigma
+        // is a sigma; the Kelvin sign isn't k.
+        let greek = instance_name(std::path::Path::new(r"D:\Data\ΟΔΟΣ"));
+        assert_eq!(greek, instance_name(std::path::Path::new(r"d:\data\οδος\")));
+        assert_eq!(greek, instance_name(std::path::Path::new(r"D:\DATA\οδοσ")));
+        assert_ne!(
+            instance_name(std::path::Path::new("D:\\\u{212A}it")),
+            instance_name(std::path::Path::new(r"D:\kit"))
+        );
     }
 
     #[test]
