@@ -3,3 +3,5 @@
 .env
 # Never commit tokens or local spike output
 /spike-out
+# SBOMs from `cargo cyclonedx`
+*.cdx.json

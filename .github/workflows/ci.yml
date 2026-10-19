@@ -35,3 +35,38 @@ jobs:
           --skip what_downloads_an_online_only_file_from_the_providers_process
           --skip on_demand_placeholders_follow_both_sides
           --skip control_pipes_admit_only_the_current_user
+
+  supply-chain:
+    # cargo-deny-action runs in a Linux container. deny.toml and the SBOM
+    # both name the Windows target, so they see the same dependencies as a
+    # Windows build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: License lists match
+        run: |
+          python3 - <<'EOF'
+          import sys, tomllib
+          with open("packaging/about.toml", "rb") as f:
+              about = tomllib.load(f)["accepted"]
+          with open("deny.toml", "rb") as f:
+              deny = tomllib.load(f)["licenses"]["allow"]
+          if about != deny:
+              sys.exit(f"packaging/about.toml accepted:\n  {about}\ndeny.toml allow:\n  {deny}\nThey must match.")
+          EOF
+      - name: cargo deny (licenses, advisories, duplicates, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+      # CycloneDX SBOMs of what ships: the programs (bins/oneup, which pulls
+      # in every library crate) and the Explorer extension.
+      - name: SBOM
+        run: cargo cyclonedx --format json --spec-version 1.5 --target x86_64-pc-windows-msvc --no-build-deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            bins/oneup/oneup.cdx.json
+            crates/oneup-shellext/oneup-shellext.cdx.json
+          if-no-files-found: error
