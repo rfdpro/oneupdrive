@@ -450,6 +450,16 @@ impl Store {
         Self::init(Connection::open_in_memory()?, 2048)
     }
 
+    /// Another connection to the same database file, for a reader on
+    /// another thread. `None` for an in-memory database, which no other
+    /// connection can reach.
+    pub fn reopen(&self, cache_kib: u32) -> Result<Option<Self>> {
+        match self.conn.path() {
+            Some(p) if !p.is_empty() => Ok(Some(Self::open(Path::new(p), cache_kib)?)),
+            _ => Ok(None),
+        }
+    }
+
     fn init(mut conn: Connection, cache_kib: u32) -> Result<Self> {
         conn.busy_timeout(BUSY_WAIT)?;
         // Names compared the way the rest of the engine compares them

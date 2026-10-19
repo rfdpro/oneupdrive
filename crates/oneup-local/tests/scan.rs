@@ -443,6 +443,7 @@ fn verify_hashes_only_unchanged_ordinary_files() {
     assert_eq!(v.hash(&rows["edited.txt"]), Checked::Changed);
     assert_eq!(v.hash(&rows["gone.txt"]), Checked::Changed);
     assert_eq!(v.hash(&rows["link"]), Checked::NotOrdinary);
+    assert_eq!(v.opened_by_id(), 1, "found by path, in their folders; only the deleted one looked up by ID");
     // A placeholder as the scan recorded it is refused without being opened.
     let placeholder = oneup_store::LocalRow { reparse_tag: 0x9000_101A, ..rows["same.txt"].clone() };
     assert_eq!(v.hash(&placeholder), Checked::NotOrdinary);
@@ -454,6 +455,14 @@ fn verify_hashes_only_unchanged_ordinary_files() {
     assert_eq!(v.read_small(&placeholder, 64), Small::Checked(Checked::NotOrdinary));
     assert_eq!(v.read_small(&rows["link"], 64), Small::Checked(Checked::NotOrdinary));
     assert_eq!(snapshot(&t.path), before, "verifying must not change anything");
+
+    // Moved since the scan, unchanged: found by ID, and hashed. A program
+    // that has it open for writing, without writing, doesn't stop that.
+    std::fs::rename(t.path.join("same.txt"), target.join("same.txt")).unwrap();
+    let writer = std::fs::OpenOptions::new().read(true).write(true).open(target.join("same.txt")).unwrap();
+    assert_eq!(v.hash(&rows["same.txt"]), Checked::Hash(qxh(b"hello world")));
+    assert_eq!(v.opened_by_id(), 2);
+    drop(writer);
 
     // The scan describes this folder only: a different identity is refused.
     let other = oneup_store::LocalRoot { root_file_id: sum.root.root_file_id ^ 1, ..sum.root.clone() };

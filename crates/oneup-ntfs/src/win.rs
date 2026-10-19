@@ -256,11 +256,26 @@ pub struct JournalInfo {
 
 /// A volume opened with the minimum access needed for the unprivileged
 /// change journal (`FILE_TRAVERSE`). Works without administrator rights.
+///
+/// ## Opening items by ID
+/// While a file is open through a handle opened **by file ID**, even one
+/// with attribute access only and sharing everything, a program that saves
+/// it by renaming another file over it fails with *access denied*
+/// (measured, `a_rename_over_save_and_the_handles_we_hold`). Through a
+/// handle opened by path, a rename with POSIX semantics goes through; a
+/// classic one (`MoveFileEx`, `cmd`'s `move`) fails while *any* handle on
+/// the file is open, so only not opening the file at all (reading its
+/// folder's listing) disturbs no one. Folder handles, by ID or by path,
+/// stop no save inside them. So files are found by path wherever the
+/// caller knows where to expect them (`hint`s, from the state database),
+/// and opened by ID only when that path no longer leads to them.
 #[derive(Debug)]
 pub struct Volume {
     handle: Handle,
     /// A directory handle on the same volume, used as the `OpenFileById` hint.
     hint: Handle,
+    /// Items opened by ID to be found or read ([`Volume::opened_by_id`]).
+    by_id: std::sync::atomic::AtomicU64,
 }
 
 impl Volume {
@@ -270,7 +285,13 @@ impl Volume {
         let device = format!(r"\\.\{}", root.to_string_lossy().trim_end_matches('\\'));
         let handle = open(Path::new(&device), FILE_TRAVERSE.0, FILE_FLAGS_AND_ATTRIBUTES(0))?;
         let hint = open(&root, FILE_READ_ATTRIBUTES.0, FILE_FLAG_BACKUP_SEMANTICS)?;
-        Ok(Self { handle, hint })
+        Ok(Self { handle, hint, by_id: std::sync::atomic::AtomicU64::new(0) })
+    }
+
+    /// How many times an item had to be opened by ID to be found or read
+    /// (see the type's docs): for tests and diagnostics.
+    pub fn opened_by_id(&self) -> u64 {
+        self.by_id.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn query_journal(&self) -> Result<JournalInfo> {
@@ -341,12 +362,25 @@ impl Volume {
         Ok(parse_read_buffer(filled)?)
     }
 
-    /// Opens a file or directory by ID without following reparse points and
-    /// returns its current normalized path. `None` if it no longer exists or
-    /// isn't accessible.
-    pub fn path_of(&self, id: FileId) -> Option<PathBuf> {
-        let h = self.open_by_id(id, FILE_READ_ATTRIBUTES.0).ok()?;
+    /// The current normalized path of the file or folder `id`, found at
+    /// `hint` if it's there ([`Volume::open_attributes`]). `None` if it no
+    /// longer exists or isn't accessible.
+    pub fn path_of(&self, id: FileId, hint: Option<&Path>) -> Option<PathBuf> {
+        let h = self.open_attributes(id, hint).ok()?;
         final_path(&h).ok()
+    }
+
+    /// `\\?\` path of the entry `name` in folder `parent`: where to expect
+    /// an item the state database records there, as a `hint`. Only the
+    /// folder is opened (by ID: folder handles stop no save inside them).
+    pub fn child_path(&self, parent: FileId, name: &str) -> Option<PathBuf> {
+        if name.is_empty() || name == "." || name == ".." || name.contains(['\\', '/']) {
+            return None;
+        }
+        let dir = self.open_by_id(parent, FILE_READ_ATTRIBUTES.0).ok()?;
+        let mut long = std::ffi::OsString::from(r"\\?\");
+        long.push(final_path(&dir).ok()?.as_os_str());
+        Some(PathBuf::from(long).join(name))
     }
 
     /// The current metadata of the file or folder with this ID, in the same
@@ -361,8 +395,11 @@ impl Volume {
     ///
     /// The name is the last component of the path Windows used to open the
     /// item. For a file with several hard links that is one of its names.
+    ///
+    /// Opens the item by ID (see the type's docs): for when its name is
+    /// unknown and can't be looked up in its folder's listing.
     pub fn stat_by_id(&self, id: FileId) -> Result<Option<DirEntry>> {
-        let h = match self.open_by_id(id, FILE_READ_ATTRIBUTES.0) {
+        let h = match self.probe_by_id(id) {
             Ok(h) => h,
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
@@ -430,18 +467,25 @@ impl Volume {
     /// which means "in use, try again later". Folders are shared for
     /// reading and writing (their children stay usable) but not for
     /// deletion, so nobody can move or delete the folder meanwhile.
-    pub fn open_for_change(&self, id: FileId, folder: bool) -> Result<Handle> {
+    ///
+    /// Found at `hint` if it's there ([`Volume::open_attributes`]).
+    pub fn open_for_change(&self, id: FileId, folder: bool, hint: Option<&Path>) -> Result<Handle> {
         // NTFS refuses to rename through a handle opened by ID ("invalid
         // parameter", tested).
-        self.open_through_path(id, |path| open_path_for_change(path, folder))
+        self.open_through_path(id, hint, |path| open_path_for_change(path, folder))
     }
 
-    fn open_through_path(&self, id: FileId, open: impl FnOnce(&Path) -> Result<Handle>) -> Result<Handle> {
-        self.same_item(id, open(&self.current_path(id)?)?)
+    fn open_through_path(
+        &self,
+        id: FileId,
+        hint: Option<&Path>,
+        open: impl FnOnce(&Path) -> Result<Handle>,
+    ) -> Result<Handle> {
+        self.same_item(id, open(&self.current_path(id, hint)?)?)
     }
 
-    fn current_path(&self, id: FileId) -> Result<PathBuf> {
-        let probe = self.open_by_id(id, FILE_READ_ATTRIBUTES.0)?;
+    fn current_path(&self, id: FileId, hint: Option<&Path>) -> Result<PathBuf> {
+        let probe = self.open_attributes(id, hint)?;
         let mut long = std::ffi::OsString::from(r"\\?\");
         long.push(final_path(&probe)?.as_os_str());
         Ok(PathBuf::from(long))
@@ -454,9 +498,28 @@ impl Volume {
         Ok(h)
     }
 
-    /// Opens any item by ID for reading its attributes and path only. Fully
-    /// shared, so it disturbs nobody.
-    pub fn open_attributes_by_id(&self, id: FileId) -> Result<Handle> {
+    /// Opens item `id` for reading its attributes and path only, fully
+    /// shared. `hint` is where the caller expects it (from the state
+    /// database): it's opened there, by path, and kept only if it is that
+    /// item. Otherwise (no hint, or the item was renamed or moved since)
+    /// it's opened by ID, the only way left to find it, though a save by
+    /// rename over it fails while that handle is open (see the type's
+    /// docs). The handle is opened as the by-ID one would be: attribute
+    /// access only (a cloud placeholder isn't downloaded), reparse points
+    /// as themselves.
+    pub fn open_attributes(&self, id: FileId, hint: Option<&Path>) -> Result<Handle> {
+        if let Some(path) = hint
+            && let Ok(h) = open(path, FILE_READ_ATTRIBUTES.0, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            && file_id(&h).is_ok_and(|(_, found)| found == id)
+        {
+            return Ok(h);
+        }
+        self.probe_by_id(id)
+    }
+
+    /// Opens item `id` by ID for its attributes and path, counted.
+    fn probe_by_id(&self, id: FileId) -> Result<Handle> {
+        self.by_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.open_by_id(id, FILE_READ_ATTRIBUTES.0)
     }
 
@@ -470,14 +533,26 @@ impl Volume {
         self.open_by_id_shared(id, FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ | FILE_SHARE_WRITE)
     }
 
-    /// Opens file `id` for reading as [`Volume::open_file_by_id`] does,
-    /// with a [`WriteWatch`] started before it, so any write after the open
-    /// breaks the watch. Also returns the path it was opened at (`\\?\`
-    /// form). Fails with [`Error::is_busy`] if some program has it mapped
-    /// for writing (writes through a mapping that exists already wouldn't
-    /// break the watch, and Windows doesn't grant it then).
-    pub fn open_watched(&self, id: FileId) -> Result<(Handle, WriteWatch, PathBuf)> {
-        let path = self.current_path(id)?;
+    /// Opens file `id` for reading its contents (and attributes), with a
+    /// [`WriteWatch`] started before it, so any write after the open breaks
+    /// the watch. Also returns the path it was opened at (`\\?\` form).
+    /// Fails with [`Error::is_busy`] if some program has it mapped for
+    /// writing (writes through a mapping that exists already wouldn't break
+    /// the watch, and Windows doesn't grant it then).
+    ///
+    /// Read-only and fully shared, so other programs are not disturbed.
+    /// Opened through its path, found at `hint` if it's there
+    /// ([`Volume::open_attributes`]): a handle opened by ID would stop
+    /// other programs from replacing the file by renaming another over it
+    /// (how many save) for as long as it's open.
+    ///
+    /// Caution: opening does not stop a cloud provider from downloading a
+    /// dehydrated placeholder once its data is read. Not even
+    /// `FILE_FLAG_OPEN_NO_RECALL` stops it (measured). Callers must
+    /// check [`attribute_tag`] on the returned handle and refuse to read cloud
+    /// placeholders.
+    pub fn open_watched(&self, id: FileId, hint: Option<&Path>) -> Result<(Handle, WriteWatch, PathBuf)> {
+        let path = self.current_path(id, hint)?;
         let watch = WriteWatch::start(self.same_item(id, open_path_for_read(&path, FILE_FLAG_OVERLAPPED)?)?)?;
         let h = self.same_item(id, open_path_for_read(&path, FILE_FLAGS_AND_ATTRIBUTES(0))?)?;
         Ok((h, watch, path))
@@ -487,24 +562,11 @@ impl Volume {
     /// as themselves, never followed.
     ///
     /// Opening by ID rather than by path means a scan is unaffected by paths
-    /// longer than `MAX_PATH` and by folders renamed while it runs.
+    /// longer than `MAX_PATH` and by folders renamed while it runs. A
+    /// folder handle stops no save inside the folder, by rename or not
+    /// (measured), unlike a file's handle opened by ID.
     pub fn open_dir_by_id(&self, id: FileId) -> Result<Handle> {
         self.open_by_id(id, FILE_LIST_DIRECTORY.0)
-    }
-
-    /// Opens a file by its ID for reading its contents (and attributes).
-    /// Read-only and fully shared, so other programs are not disturbed.
-    /// Opened through its path: a handle opened by ID stops other programs
-    /// from replacing the file by renaming another over it (how many save),
-    /// whatever its sharing (measured).
-    ///
-    /// Caution: opening does not stop a cloud provider from downloading a
-    /// dehydrated placeholder once its data is read. Not even
-    /// `FILE_FLAG_OPEN_NO_RECALL` stops it (measured). Callers must
-    /// check [`attribute_tag`] on the returned handle and refuse to read cloud
-    /// placeholders.
-    pub fn open_file_by_id(&self, id: FileId) -> Result<Handle> {
-        self.open_through_path(id, |path| open_path_for_read(path, FILE_FLAGS_AND_ATTRIBUTES(0)))
     }
 
     fn open_by_id(&self, id: FileId, access: u32) -> Result<Handle> {
@@ -879,7 +941,7 @@ mod tests {
         assert!(entries[1].is_dir());
 
         let vol = Volume::open_containing(&dir).unwrap();
-        let resolved = vol.path_of(entries[0].file_id).unwrap();
+        let resolved = vol.path_of(entries[0].file_id, None).unwrap();
         assert!(resolved.ends_with("a.txt"), "{resolved:?}");
 
         // Stat by ID agrees with the listing (same shape, same values).
@@ -921,7 +983,7 @@ mod tests {
         let watch_with_reader = |content: &[u8]| {
             std::fs::write(&file, content).unwrap();
             let id = id_of(&dir, "doc.txt");
-            let (r, w, _) = vol.open_watched(id).unwrap();
+            let (r, w, _) = vol.open_watched(id, None).unwrap();
             (w, r)
         };
 
@@ -972,7 +1034,7 @@ mod tests {
         // writes break it too.
         std::fs::write(&file, b"hello").unwrap();
         let mut held = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
-        let w = vol.open_watched(id_of(&dir, "doc.txt")).unwrap().1;
+        let w = vol.open_watched(id_of(&dir, "doc.txt"), None).unwrap().1;
         assert!(!w.broken());
         held.write_all(b"HELLO").unwrap();
         assert!(w.broken());
@@ -991,10 +1053,10 @@ mod tests {
             let f = std::fs::OpenOptions::new().read(true).write(true).open(&file).unwrap();
             let m = Handle(map(&f));
             drop(f);
-            let err = vol.open_watched(id_of(&dir, "doc.txt")).unwrap_err();
+            let err = vol.open_watched(id_of(&dir, "doc.txt"), None).unwrap_err();
             assert!(err.is_busy(), "{err}");
             drop(m);
-            let w = vol.open_watched(id_of(&dir, "doc.txt")).unwrap().1;
+            let w = vol.open_watched(id_of(&dir, "doc.txt"), None).unwrap().1;
             let f = std::fs::OpenOptions::new().read(true).write(true).open(&file).unwrap();
             assert!(!w.broken());
             let m = Handle(map(&f));
@@ -1021,7 +1083,7 @@ mod tests {
         let id = id_of(&dir, "doc.txt");
 
         // Started here, checked and broken from another thread.
-        let w = vol.open_watched(id).unwrap().1;
+        let w = vol.open_watched(id, None).unwrap().1;
         let w = std::thread::spawn(move || {
             assert!(!w.broken());
             w
@@ -1037,7 +1099,7 @@ mod tests {
 
         // Started on a thread that then ended.
         let dir = std::env::temp_dir().join(format!("oneup-ntfs-watch-threads-{}", std::process::id()));
-        let w = std::thread::scope(|s| s.spawn(|| vol.open_watched(id).unwrap().1).join().unwrap());
+        let w = std::thread::scope(|s| s.spawn(|| vol.open_watched(id, None).unwrap().1).join().unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(w.broken(), "the request ended with its thread");
         drop(w);
@@ -1052,6 +1114,71 @@ mod tests {
         entries.into_iter().find(|e| e.name == name).unwrap().file_id
     }
 
+    /// Which of the handles we hold a save by renaming a new file over the
+    /// old one survives. Two kinds of rename: with POSIX semantics (Rust's
+    /// `std::fs::rename`), and the classic one, from another program
+    /// (`cmd`'s `move /y`, which is `MoveFileEx`).
+    #[test]
+    fn a_rename_over_save_and_the_handles_we_hold() {
+        let dir = std::env::temp_dir().join(format!("oneup-ntfs-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (doc, tmp) = (dir.join("doc.txt"), dir.join("doc.tmp"));
+        std::fs::write(&doc, b"v0").unwrap();
+        let vol = Volume::open_containing(&dir).unwrap();
+        let posix = || {
+            std::fs::write(&tmp, b"posix").unwrap();
+            let ok = std::fs::rename(&tmp, &doc).is_ok();
+            let _ = std::fs::remove_file(&tmp);
+            ok
+        };
+        let classic = || {
+            std::fs::write(&tmp, b"classic").unwrap();
+            let out = std::process::Command::new("cmd.exe")
+                .current_dir(&dir)
+                .args(["/c", "move", "/y", "doc.tmp", "doc.txt"])
+                .output()
+                .unwrap();
+            let ok = out.status.success() && !tmp.exists() && std::fs::read(&doc).unwrap() == b"classic";
+            let _ = std::fs::remove_file(&tmp);
+            ok
+        };
+        assert!(posix() && classic(), "nothing held");
+
+        // Found at the path where it's expected: no by-ID open, and a POSIX
+        // save goes through. A classic one fails while any handle on the
+        // file is open, however it was opened.
+        let at = vol.child_path(file_id(&open_dir(&dir).unwrap()).unwrap().1, "doc.txt").unwrap();
+        let h = vol.open_attributes(id_of(&dir, "doc.txt"), Some(&at)).unwrap();
+        assert_eq!(vol.opened_by_id(), 0);
+        assert!(posix());
+        drop(h);
+        let h = vol.open_attributes(id_of(&dir, "doc.txt"), Some(&at)).unwrap();
+        assert!(!classic());
+        drop(h);
+
+        // Opened by ID (no hint, or one leading elsewhere): neither goes through.
+        let h = vol.open_attributes(id_of(&dir, "doc.txt"), None).unwrap();
+        assert_eq!(vol.opened_by_id(), 1);
+        assert!(!posix());
+        assert!(!classic());
+        drop(h);
+        std::fs::write(dir.join("other.txt"), b"x").unwrap();
+        let h = vol.open_attributes(id_of(&dir, "doc.txt"), Some(&dir.join("other.txt"))).unwrap();
+        assert_eq!(vol.opened_by_id(), 2, "a hint that leads to another item isn't taken");
+        assert_eq!(file_id(&h).unwrap().1, id_of(&dir, "doc.txt"));
+        drop(h);
+
+        // The folder handles the observer and the effects hold, by ID: both
+        // go through. Reading the file's entry in the listing opens no file.
+        let top = file_id(&open_dir(&dir).unwrap()).unwrap().1;
+        let (listing, pinned) = (vol.open_dir_by_id(top).unwrap(), vol.open_dir_pinned(top).unwrap());
+        assert!(vol.listed_in(top, "doc.txt", id_of(&dir, "doc.txt")).unwrap().is_some());
+        assert!(posix() && classic());
+        drop((listing, pinned));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn change_handles_are_exclusive_and_never_replace() {
         let dir = std::env::temp_dir().join(format!("oneup-ntfs-change-{}", std::process::id()));
@@ -1063,7 +1190,7 @@ mod tests {
         let a = id_of(&dir, "a.txt");
 
         // Exclusive: while we hold it, nobody else can open the file...
-        let h = vol.open_for_change(a, false).unwrap();
+        let h = vol.open_for_change(a, false, None).unwrap();
         let other = std::fs::OpenOptions::new().read(true).open(dir.join("a.txt"));
         assert_eq!(other.unwrap_err().raw_os_error(), Some(32), "sharing violation expected");
         // ...and it reads like a stat.
@@ -1083,14 +1210,14 @@ mod tests {
 
         // Busy: a file someone else has open can't be opened for change.
         let held = std::fs::File::open(dir.join("b.txt")).unwrap();
-        let err = vol.open_for_change(id_of(&dir, "b.txt"), false).unwrap_err();
+        let err = vol.open_for_change(id_of(&dir, "b.txt"), false, None).unwrap_err();
         assert!(err.is_busy(), "{err}");
         drop(held);
 
         // Folders can be moved while their children are in use for reading.
         let sub = id_of(&dir, "sub");
         let reader = std::fs::File::open(dir.join("sub").join("moved.txt")).unwrap();
-        let h = vol.open_for_change(sub, true).unwrap();
+        let h = vol.open_for_change(sub, true, None).unwrap();
         let r = rename_handle(&h, &dir.join("sub2"));
         drop((h, reader));
         // NTFS refuses to rename a folder with open children unless they
@@ -1100,7 +1227,7 @@ mod tests {
         }
 
         // Unknown IDs report "not found".
-        assert!(vol.open_for_change(FileId(u128::MAX - 7), false).unwrap_err().is_not_found());
+        assert!(vol.open_for_change(FileId(u128::MAX - 7), false, None).unwrap_err().is_not_found());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

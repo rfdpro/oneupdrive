@@ -46,7 +46,7 @@ mod ondemand;
 pub mod release;
 
 #[cfg(windows)]
-pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Staged, UploadSource};
+pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource};
 #[cfg(windows)]
 pub use ondemand::{EXCLUDED_MARK, Version};
 pub use oneup_ntfs::dirent::DirEntry;

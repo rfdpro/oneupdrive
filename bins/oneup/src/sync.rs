@@ -326,6 +326,7 @@ async fn prepare(
     let first_use = store.read(|o| o.meta_get(KEY_MARKER))?.is_none();
     let mut fs = LocalFs::open(Path::new(&root.path), root.volume_serial, root.root_file_id, &token, first_use)
         .context("opening the sync folder")?;
+    locate_from(&mut fs, &store)?;
     store.write(|o| o.meta_set(KEY_MARKER, "1"))?;
     if opts.on_demand && !fs.on_demand() {
         // Before any round, so nothing is downloaded in full on the way.
@@ -397,8 +398,24 @@ pub fn open_paired(store: &Store) -> Result<LocalFs> {
     }
     let token = store.read(|o| o.meta_get(KEY_TOKEN))?.context("pairing token missing")?;
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
-    LocalFs::open(Path::new(&root.path), root.volume_serial, root.root_file_id, &token, false)
-        .context("opening the sync folder")
+    let mut fs = LocalFs::open(Path::new(&root.path), root.volume_serial, root.root_file_id, &token, false)
+        .context("opening the sync folder")?;
+    locate_from(&mut fs, store)?;
+    Ok(fs)
+}
+
+/// Lets the effects find items where the Local tree has them
+/// (`LocalFs::set_locator`), through a database connection of their own:
+/// they run on the executor's tasks, which don't hold the engine's.
+fn locate_from(fs: &mut LocalFs, store: &Store) -> Result<()> {
+    if let Some(reader) = store.reopen(256)? {
+        let reader = std::sync::Mutex::new(reader);
+        fs.set_locator(Box::new(move |id| {
+            let reader = reader.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reader.read(|o| o.local_path_of(id.0)).ok().flatten()
+        }));
+    }
+    Ok(())
 }
 
 /// The executor stopped a round because something is fundamentally wrong

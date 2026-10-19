@@ -40,7 +40,7 @@ impl LocalFs {
         if !self.on_demand() {
             return Ok(None);
         }
-        let probe = self.volume().open_attributes_by_id(id).map_err(|_| Error::Changed)?;
+        let probe = self.volume().open_attributes(id, self.hint(id).as_deref()).map_err(|_| Error::Changed)?;
         let entry = win::stat_handle(&probe, id)?.ok_or(Error::Changed)?;
         let dehydrated = entry.attributes & oneup_ntfs::dirent::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
             && entry.attributes & oneup_ntfs::dirent::FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -125,7 +125,7 @@ impl LocalFs {
         }
         let id = FileId(pre.id.0);
         let path = {
-            let probe = self.volume().open_attributes_by_id(id).map_err(|_| Error::Changed)?;
+            let probe = self.volume().open_attributes(id, self.hint(id).as_deref()).map_err(|_| Error::Changed)?;
             long(&win::final_path(&probe)?)
         };
         let h = win::open_path_for_placeholder(&path, pre.stamp.is_none())?;
@@ -480,7 +480,9 @@ impl LocalFs {
     /// Where the folder `id` is, if it's a folder inside the sync folder
     /// (by attributes, through an attribute-only handle).
     fn folder_path(&self, id: u128) -> Result<Option<PathBuf>> {
-        let Ok(probe) = self.volume().open_attributes_by_id(FileId(id)) else { return Ok(None) };
+        let Ok(probe) = self.volume().open_attributes(FileId(id), self.hint(FileId(id)).as_deref()) else {
+            return Ok(None);
+        };
         let Some(entry) = win::stat_handle(&probe, FileId(id))? else { return Ok(None) };
         if !entry.is_dir() {
             return Ok(None);

@@ -236,6 +236,25 @@ pub struct LocalFs {
     /// (Files On-Demand): our placeholders are items like any other, and
     /// cloud content arrives as placeholders (`ondemand.rs`).
     on_demand: bool,
+    locator: Locate,
+}
+
+/// Where the state database last saw a local item: its path relative to
+/// the sync folder, `/`-separated (`/a/b.txt`; `/` for the folder itself).
+/// The effects find items there by path, and by ID only if it no longer
+/// leads to them: while a file is open through a handle opened by ID, a
+/// program saving it by renaming another file over it fails
+/// (`win::Volume`'s docs). Only a hint: what is found there is used only if
+/// its file ID is the item's.
+pub type Locator = Box<dyn Fn(LocalId) -> Option<String> + Send + Sync>;
+
+#[derive(Default)]
+struct Locate(Option<Locator>);
+
+impl std::fmt::Debug for Locate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Locate(Some)" } else { "Locate(None)" })
+    }
 }
 
 impl LocalFs {
@@ -280,6 +299,7 @@ impl LocalFs {
             engine,
             seq: AtomicU64::new(0),
             on_demand,
+            locator: Locate::default(),
         };
         match std::fs::read_to_string(fs.engine.join(MARKER)) {
             Ok(_) => {}
@@ -347,6 +367,34 @@ impl LocalFs {
         LocalId(self.root_id.0)
     }
 
+    /// Lets the effects find items where the state database last saw them
+    /// ([`Locator`]). Without one, every item is found by ID.
+    pub fn set_locator(&mut self, locator: Locator) {
+        self.locator = Locate(Some(locator));
+    }
+
+    /// How many items had to be opened by ID to be found: for tests and
+    /// diagnostics.
+    pub fn opened_by_id(&self) -> u64 {
+        self.volume.opened_by_id()
+    }
+
+    /// Where item `id` is expected ([`Locator`]), as a full path, if a
+    /// locator knows it.
+    pub(crate) fn hint(&self, id: FileId) -> Option<PathBuf> {
+        let rel = (self.locator.0.as_ref()?)(LocalId(id.0))?;
+        let mut path = self.root.clone();
+        for part in rel.split('/').filter(|p| !p.is_empty()) {
+            // Names from the store are single components; anything else
+            // isn't a usable hint (`\\?\` paths aren't normalised).
+            if part == "." || part == ".." || part.contains('\\') {
+                return None;
+            }
+            path.push(part);
+        }
+        Some(path)
+    }
+
     /// Whether the sync folder is in Files On-Demand mode (see `ondemand.rs`).
     pub fn on_demand(&self) -> bool {
         self.on_demand
@@ -395,7 +443,7 @@ impl LocalFs {
     /// Whether the item with this ID still exists inside the sync folder
     /// (outside OneUpDrive's own folder). Read-only.
     pub fn is_present(&self, id: LocalId) -> bool {
-        let Ok(h) = self.volume.open_attributes_by_id(FileId(id.0)) else { return false };
+        let Ok(h) = self.volume.open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()) else { return false };
         win::final_path(&h).is_ok_and(|p| self.is_inside(&long(&p)))
     }
 
@@ -404,7 +452,7 @@ impl LocalFs {
     /// outside the sync folder (or in OneUpDrive's own), `None` when it
     /// can't be told (access denied, a path that can't be read). Read-only.
     pub fn presence(&self, id: LocalId) -> Option<bool> {
-        match self.volume.open_attributes_by_id(FileId(id.0)) {
+        match self.volume.open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()) {
             Err(e) if e.is_not_found() => Some(false),
             Err(_) => None,
             Ok(h) => win::final_path(&h).ok().map(|p| self.is_inside(&long(&p))),
@@ -414,7 +462,7 @@ impl LocalFs {
     /// The current name of the item with this ID, if it exists inside the
     /// sync folder (outside OneUpDrive's own folder). Read-only.
     pub fn name_of(&self, id: LocalId) -> Option<String> {
-        let h = self.volume.open_attributes_by_id(FileId(id.0)).ok()?;
+        let h = self.volume.open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()).ok()?;
         let p = long(&win::final_path(&h).ok()?);
         if !self.is_inside(&p) {
             return None;
@@ -908,7 +956,7 @@ impl LocalFs {
         if let Some((h, entry, path)) = self.open_if_dehydrated(pre)? {
             return Ok((h, entry, path));
         }
-        let h = self.volume.open_for_change(id, pre.stamp.is_none())?;
+        let h = self.volume.open_for_change(id, pre.stamp.is_none(), self.hint(id).as_deref())?;
         let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
         check_placeholder(&entry, pre.stamp, self.on_demand)?;
         let path = long(&win::final_path(&h)?);
@@ -927,7 +975,7 @@ impl LocalFs {
             // Opening it with data access would download it from ourselves.
             return Err(Error::NotOrdinary);
         }
-        let (h, watch, path) = self.volume.open_watched(id)?;
+        let (h, watch, path) = self.volume.open_watched(id, self.hint(id).as_deref())?;
         let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
         check_placeholder(&entry, Some(stamp), self.on_demand)?;
         if !self.is_inside(&path) {
