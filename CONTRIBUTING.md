@@ -21,7 +21,7 @@ The tests run on temp folders and an in-memory OneDrive; nothing touches a real 
 The repo uses LF line endings (`.gitattributes`); if your editor writes CRLF, run `cargo fmt` and check `git diff`.
 
 ### Nightly runs
-`.github/workflows/nightly.yml` runs every night (and by hand from the Actions tab) what is too long for CI: the sync simulation (`crates/oneup-sync/tests/sim.rs`) and the mirror simulation (`crates/oneup-remote/tests/mirror.rs`) over millions and tens of thousands of seeds, and each fuzz target for half an hour. Each night takes the next window of seeds. A failure opens an issue titled *Nightly run failed* (or comments on the open one) with the failing seed or fuzz input and the command that replays it.
+`.github/workflows/nightly.yml` runs every night (and by hand from the Actions tab) what is too long for CI: the sync simulation (`crates/oneup-sync/tests/sim.rs`) and the mirror simulation (`crates/oneup-remote/tests/mirror.rs`) over millions of seeds, and each fuzz target for half an hour. Each night takes the next window of seeds. A failure opens an issue titled *Nightly run failed* (or comments on the open one) with the failing seed or fuzz input and the command that replays it.
 
 **Replaying a simulation seed.** The issue gives the command; for example:
 ```powershell
@@ -29,7 +29,7 @@ $env:SIM_SEED = "123457"; $env:SIM_DEBUG = "1"
 cargo test --release -p oneup-sync --test sim random_histories_converge_without_losing_edits
 Remove-Item Env:SIM_SEED, Env:SIM_DEBUG
 ```
-`SIM_SEED` runs that one seed, whatever its number. The simulations also read `SIM_SEEDS` (how many), `SIM_SEED_FROM` (the first) and, in `oneup-sync`, `SIM_STORE=0` (skip the SQLite comparison, which makes a run about 200× slower). To run a range split across processes as the nightly job does: `.github/scripts/sim.ps1 -Package oneup-sync -Test sim -Name <test> -From 1 -Count 100000` (PowerShell 7).
+`SIM_SEED` runs that one seed, whatever its number. The simulations also read `SIM_SEEDS` (how many), `SIM_SEED_FROM` (the first) and, in `oneup-sync`, `SIM_STORE=0` (skip the SQLite comparison, which makes a run about 200× slower); in `oneup-remote`, `SIM_DB=memory` keeps each seed's database in memory instead of a file, about ten times faster. To run a range split across processes as the nightly job does: `.github/scripts/sim.ps1 -Package oneup-sync -Test sim -Name <test> -From 1 -Count 100000` (PowerShell 7).
 
 **Fuzzing.** The targets are in `fuzz/` (its own Cargo workspace): `usn_records`, `delta_page`, `push_frames`, `vault_decode` and `rules`, each documented at the top of its file. cargo-fuzz needs the nightly toolchain, and on Windows the AddressSanitizer runtime from the Visual Studio Build Tools (the *C++ AddressSanitizer* component) on `PATH`, so run it from a *Developer PowerShell for VS*:
 ```powershell
