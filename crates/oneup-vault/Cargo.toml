@@ -20,7 +20,7 @@ aes-kw = { version = "0.2", features = ["alloc"] }
 aes-siv = "0.7"
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
-base64 = "0.22"
+base64 = "0.23"
 data-encoding = "2"
 getrandom = "0.3"
 hmac = "0.12"

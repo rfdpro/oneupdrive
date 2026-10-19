@@ -9,7 +9,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 # Push notifications (`push`): WebSocket over rustls, trusting Windows' own
 # certificate store.
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
