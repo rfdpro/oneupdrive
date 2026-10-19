@@ -25,6 +25,8 @@ pub mod authenticode;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
+pub mod contained;
+#[cfg(windows)]
 pub mod hello;
 #[cfg(windows)]
 pub mod identity;
@@ -478,6 +480,19 @@ pub mod priority {
                 std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
             )
             .map_err(std::io::Error::other)
+        }
+    }
+
+    /// Background mode for the calling thread alone (lower CPU, disk and
+    /// memory priority): for threads that only start and watch other
+    /// programs, so they never compete with the sync work in the process.
+    pub fn set_thread_background() -> std::io::Result<()> {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+        // SAFETY: the pseudo-handle of the current thread needs no closing.
+        match unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } {
+            // Already in background mode (ERROR_THREAD_MODE_ALREADY_BACKGROUND).
+            Err(e) if e.code().0 as u32 & 0xFFFF == 400 => Ok(()),
+            r => r.map_err(std::io::Error::other),
         }
     }
 }
