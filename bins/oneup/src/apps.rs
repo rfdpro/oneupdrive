@@ -121,7 +121,7 @@ fn run(dir: &Path, root: &Path, rx: &Receiver<u128>) {
     let Ok(mut store) = crate::setup::open_store(dir, 1024) else { return };
     let top = root.to_path_buf();
     let root = comparable(root);
-    let own = format!("{root}\\{}", oneup_rules::ENGINE_DIR.to_lowercase());
+    let own = format!("{root}\\{}", oneup_sync::fold(oneup_rules::ENGINE_DIR));
     let mut seen: HashMap<u128, Instant> = HashMap::new();
     let mut waiting: VecDeque<Waiting> = VecDeque::new();
     let mut done = Counted::default();
@@ -173,7 +173,7 @@ fn run(dir: &Path, root: &Path, rx: &Receiver<u128>) {
                             at_ms: crate::sync::now_ms(),
                             app: String::new(),
                             kind: UseKind::Changed,
-                            path: relative(&path, root.len()).unwrap_or_default(),
+                            path: relative(&path, &root).unwrap_or_default(),
                             bytes: meta.map_or(0, |m| i64::try_from(m.len()).unwrap_or(0)),
                         };
                         match choose(&open, &closed_by(id, since)) {
@@ -262,20 +262,23 @@ fn choose(open: &[String], closed: &[String]) -> Option<String> {
     all.find(|e| !is_reader(e)).or(first).cloned()
 }
 
-/// `path` relative to the synced folder (`/docs/a.txt`), whose
-/// [`comparable`] form is `root_len` bytes long (the caller checked that
-/// the path is inside it).
-fn relative(path: &Path, root_len: usize) -> Option<String> {
+/// `path` relative to the synced folder `root` (its [`comparable`] form;
+/// the caller checked that the path is inside it), `/docs/a.txt`, in the
+/// path's own spelling. Cut by characters, as the fold keeps each one
+/// character: a cut at the folded form's length in bytes could split a
+/// character or land in the wrong place.
+fn relative(path: &Path, root: &str) -> Option<String> {
     let s = path.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    let rest = s.get(root_len..)?;
+    let rest = oneup_sync::strip_folded_prefix(s, root)?;
     Some(format!("/{}", rest.trim_start_matches('\\').replace('\\', "/")))
 }
 
-/// `\\?\C:\X\` → `c:\x`, for prefix checks.
+/// `\\?\C:\X\` → `C:\X`, folded as Windows compares names, for prefix
+/// checks.
 fn comparable(p: &Path) -> String {
     let s = p.to_string_lossy();
-    s.strip_prefix(r"\\?\").unwrap_or(&s).trim_end_matches('\\').to_lowercase()
+    oneup_sync::fold(s.strip_prefix(r"\\?\").unwrap_or(&s).trim_end_matches('\\'))
 }
 
 fn hour_now() -> i64 {
@@ -396,10 +399,20 @@ mod tests {
     #[test]
     fn files_are_named_relative_to_the_synced_folder() {
         let root = comparable(Path::new(r"\\?\C:\Users\X\OneDrive"));
-        assert_eq!(root, r"c:\users\x\onedrive");
-        let rel = |p: &str| relative(Path::new(p), root.len());
+        assert_eq!(root, r"C:\USERS\X\ONEDRIVE");
+        let rel = |p: &str| relative(Path::new(p), &root);
         assert_eq!(rel(r"\\?\C:\Users\X\OneDrive\Docs\Plan B.docx").as_deref(), Some("/Docs/Plan B.docx"));
         assert_eq!(rel(r"C:\Users\X\OneDrive\a.txt").as_deref(), Some("/a.txt"));
+        // Where folding changes a character's length in bytes (`ſ` is two,
+        // `S` one), the cut is still at the end of the folder's name.
+        let root = comparable(Path::new(r"D:\Sync\ſam\Ωδή"));
+        let rel = |p: &str| relative(Path::new(p), &root);
+        assert_eq!(rel(r"D:\SYNC\SAM\ΩΔΉ\Notes\a.txt").as_deref(), Some("/Notes/a.txt"));
+        assert_eq!(rel(r"d:\sync\ſam\ωδή\é.txt").as_deref(), Some("/é.txt"));
+        // The Kelvin sign (three bytes) stays as it is, and isn't k.
+        let root = comparable(Path::new("C:\\\u{212A}it"));
+        assert_eq!(relative(Path::new("C:\\\u{212A}it\\b"), &root).as_deref(), Some("/b"));
+        assert_eq!(relative(Path::new(r"C:\kit\b"), &root), None);
     }
 
     /// The files each program used come back newest first, per program,

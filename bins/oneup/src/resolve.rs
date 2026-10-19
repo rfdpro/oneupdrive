@@ -483,8 +483,9 @@ pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str
 
 /// Whether record path `path` is inside folder `top`.
 pub fn below(path: &str, top: &str) -> bool {
-    let (p, t) = (path.as_bytes(), top.trim_end_matches('/').as_bytes());
-    p.len() > t.len() && p[..t.len()].eq_ignore_ascii_case(t) && p[t.len()] == b'/'
+    // Folded as names compare; a byte cut could split a character or
+    // miss where folding changes a character's length.
+    oneup_sync::strip_folded_prefix(path, top.trim_end_matches('/')).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// An item inside a folder held as not empty ([`inside`]).
@@ -538,6 +539,21 @@ pub fn inside(o: &Ops<'_>, path: &str, limit: usize) -> oneup_store::Result<Cont
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn inside_a_folder_is_told_as_names_compare() {
+        assert!(below("/Docs/a.txt", "/docs"));
+        assert!(below("/Docs/a.txt", "/docs/"));
+        assert!(!below("/Docs", "/docs"));
+        assert!(!below("/Docsx/a", "/docs"));
+        // Greek final sigma folds like sigma; the Kelvin sign isn't k.
+        assert!(below("/ΟΔΟΣ/a", "/οδος"));
+        assert!(!below("/\u{212A}it/a", "/kit"));
+        // Folding makes 'ſ' (2 bytes) 'S' (1 byte): a byte cut would land
+        // in the wrong place.
+        assert!(below("/ſa/b", "/Sa"));
+        assert!(below("/éa/b", "/ÉA"));
+    }
 
     #[test]
     fn each_kind_offers_what_resolves_it_and_a_backup_never_changes_this_pc() {

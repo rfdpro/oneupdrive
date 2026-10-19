@@ -56,6 +56,7 @@ fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
         rules.cloud = config::CloudCopies::from_name(m)
             .with_context(|| format!("`{m}`: OneDrive's copies of excluded items can be keep, prune or pull"))?;
     }
+    // Preset names are OneUpDrive's own ASCII words, not file names.
     for name in &c.on {
         let p = preset(name).with_context(|| format!("no preset called `{name}` (see `oneup rules`)"))?;
         if !rules.presets.iter().any(|x| x.eq_ignore_ascii_case(p.name)) {
@@ -203,7 +204,7 @@ pub async fn pause_folder(data_dir: &Path, store: &Store, path: &str, pause: boo
         bail!("that's the whole synced folder: use `oneup pause` without --folder");
     }
     let mut rules = config::load_rules(data_dir, store)?;
-    let same = |p: &String| p.trim_matches(['/', '\\']).replace('\\', "/").eq_ignore_ascii_case(&rel);
+    let same = |p: &String| oneup_sync::same_name(&p.trim_matches(['/', '\\']).replace('\\', "/"), &rel);
     let had = rules.paused.iter().any(same);
     if pause && !had {
         rules.paused.push(rel.clone());
@@ -269,7 +270,7 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
         {
             problems.push(format!("{} ignored: {p}", Path::new(&dir_rel).join(".oneupignore").display()));
         }
-        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| c.name.eq_ignore_ascii_case(part));
+        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| oneup_sync::same_name(&c.name, part));
     }
     if row.as_ref().is_some_and(|r| r.skip == Skip::Excluded) && skipped_at.is_none() && !parts.is_empty() {
         skipped_at = Some(rel.to_string());
@@ -290,7 +291,7 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
         println!("  note: {p}");
     }
     // Built-in reasons first: no rule can change them.
-    let engine = parts.first().is_some_and(|p| p.eq_ignore_ascii_case(ENGINE_DIR));
+    let engine = parts.first().is_some_and(|p| oneup_sync::same_name(p, ENGINE_DIR));
     let builtin = if engine {
         Some("OneUpDrive's own folder (version store and staging); never synced".to_string())
     } else if !is_dir && names::not_synced(name).is_some() {
@@ -373,11 +374,11 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     // (`oneup_app::resolve`).
     let at = format!("/{rel}");
     let record = oneup_app::unsynced::load(store)?;
-    if let Some(i) = record.items.iter().find(|i| i.path.eq_ignore_ascii_case(&at)) {
+    if let Some(i) = record.items.iter().find(|i| oneup_sync::same_name(&i.path, &at)) {
         println!("  can't sync: {} (`oneup unsynced resolve` shows what you can do)", i.why.label());
     }
     let queued = store.read(oneup_app::resolve::queued)?;
-    if let Some(q) = queued.iter().find(|q| q.path.eq_ignore_ascii_case(&at)) {
+    if let Some(q) = queued.iter().find(|q| oneup_sync::same_name(&q.path, &at)) {
         println!("  your choice waits for the next round: {}", q.choice.label());
     }
     let last = store.read(|o| o.activity_recent(Some(&format!("/{rel}")), 1))?;

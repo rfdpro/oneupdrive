@@ -36,7 +36,7 @@ impl std::fmt::Display for Problem {
 pub fn find(o: &Ops<'_>, dir: u128) -> oneup_store::Result<Option<LocalRow>> {
     Ok(o.local_children(dir)?
         .into_iter()
-        .find(|r| r.kind == LocalKind::File && r.name.eq_ignore_ascii_case(IGNORE_FILE)))
+        .find(|r| r.kind == LocalKind::File && oneup_sync::same_name(&r.name, IGNORE_FILE)))
 }
 
 /// Rule files read before, by file ID with the size and last-write time

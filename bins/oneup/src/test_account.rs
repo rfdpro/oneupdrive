@@ -41,10 +41,10 @@ pub fn default_dir() -> Result<PathBuf> {
 pub fn same_dir(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
-        _ => {
-            a.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase()
-                == b.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase()
-        }
+        _ => oneup_sync::same_name(
+            a.to_string_lossy().trim_end_matches(['\\', '/']),
+            b.to_string_lossy().trim_end_matches(['\\', '/']),
+        ),
     }
 }
 
@@ -113,6 +113,13 @@ pub fn is_same_drive(drive: &str, personal: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_that_are_not_there_compare_as_names_do() {
+        let p = |s: &str| std::path::PathBuf::from(s);
+        assert!(same_dir(&p(r"Z:\oneup-none\ΟΔΟΣ"), &p(r"z:\ONEUP-NONE\οδος\")));
+        assert!(!same_dir(&p("Z:\\oneup-none\\\u{212A}it"), &p(r"Z:\oneup-none\kit")), "the Kelvin sign isn't k");
+    }
 
     #[test]
     fn marker_round_trips_and_rejects_incomplete_files() {

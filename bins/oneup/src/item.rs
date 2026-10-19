@@ -57,7 +57,7 @@ impl Item {
             let row = store
                 .read(|o| o.local_children(id))?
                 .into_iter()
-                .find(|c| c.name.eq_ignore_ascii_case(part))
+                .find(|c| oneup_sync::same_name(&c.name, part))
                 .with_context(|| format!("/{rel} isn't known to OneUpDrive yet"))?;
             folder = row.kind != oneup_store::LocalKind::File;
             id = row.file_id;

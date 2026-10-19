@@ -195,7 +195,7 @@ use oneup_graph::Graph;
 fn find(main: &Path, name: &str) -> Result<Entry> {
     vaultpair::list(main)
         .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name) || e.remote.eq_ignore_ascii_case(name))
+        .find(|e| oneup_sync::same_name(&e.name, name) || oneup_sync::same_name(&e.remote, name))
         .with_context(|| format!("no vault called {name} here (`oneup vault list`)"))
 }
 

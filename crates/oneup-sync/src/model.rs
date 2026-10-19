@@ -203,6 +203,16 @@ pub fn fold(name: &str) -> String {
     name.chars().map(fold_char).collect()
 }
 
+/// Whether `a` and `b` are one name (or path), as [`fold`] compares them,
+/// without building either folded string.
+pub fn same_name(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        // What the fold does to ASCII, without a character at a time.
+        return a.eq_ignore_ascii_case(b);
+    }
+    a.chars().map(fold_char).eq(b.chars().map(fold_char))
+}
+
 /// [`fold`] for one character.
 pub fn fold_char(c: char) -> char {
     let mut up = c.to_uppercase();
@@ -277,6 +287,24 @@ mod tests {
         assert_eq!(strip_folded_prefix("/\u{212A}/a", "/k"), None, "the Kelvin sign isn't k");
         assert_eq!(strip_folded_prefix("/a", "/a/b"), None);
         assert_eq!(strip_folded_prefix("/a", ""), Some("/a"));
+    }
+
+    #[test]
+    fn same_name_agrees_with_comparing_folded_names() {
+        for (a, b) in [
+            ("Report.DOCX", "report.docx"),
+            ("ΟΔΟΣ", "οδος"),
+            ("οδος", "οδοσ"),
+            ("\u{212A}it", "kit"),
+            ("İx", "ix"),
+            ("ß", "SS"),
+            ("a", "ab"),
+            ("", ""),
+        ] {
+            assert_eq!(same_name(a, b), fold(a) == fold(b), "{a} {b}");
+        }
+        assert!(same_name("ΟΔΟΣ", "οδος"));
+        assert!(!same_name("\u{212A}it", "kit"), "the Kelvin sign isn't k");
     }
 
     #[test]

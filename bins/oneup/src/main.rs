@@ -1450,8 +1450,9 @@ async fn run() -> Result<()> {
                 let s = oneup_app::apps::summary(&dir, 90)?;
                 let apps = s["apps"].as_array().cloned().unwrap_or_default();
                 let found = apps.iter().find(|a| {
+                    // A program's display name ("Word") isn't a file name.
                     a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(which))
-                        || a["exe"].as_str().is_some_and(|e| e.eq_ignore_ascii_case(which))
+                        || a["exe"].as_str().is_some_and(|e| oneup_sync::same_name(e, which))
                 });
                 Some(found.and_then(|a| a["exe"].as_str()).unwrap_or(which).to_string())
             };
@@ -1543,13 +1544,13 @@ async fn run() -> Result<()> {
                 if p == "/" {
                     bail!("give a folder, like /Office");
                 }
-                if !a.folders.iter().any(|f| f.eq_ignore_ascii_case(&p)) {
+                if !a.folders.iter().any(|f| oneup_sync::same_name(f, &p)) {
                     a.folders.push(p);
                 }
             }
             for p in remove {
                 let p = norm(p);
-                a.folders.retain(|f| !f.eq_ignore_ascii_case(&p));
+                a.folders.retain(|f| !oneup_sync::same_name(f, &p));
             }
             if let Some(t) = top_files {
                 a.top_files = t.on();
