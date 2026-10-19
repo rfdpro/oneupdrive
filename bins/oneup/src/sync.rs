@@ -169,10 +169,8 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
     // A new pairing of the OneDrive app's old folder keeps the choices made
     // there (`crate::carryover`), before anything is listed or planned.
     let mut carried = false;
-    if !opts.dry_run
-        && store.read(|o| o.meta_get(KEY_LOCAL))?.is_none()
-        && let Some(said) = crate::carryover::apply(&opts.data_dir, &mut store, &opts.local, &opts.remote)?
-    {
+    let new_pair = !opts.dry_run && store.read(|o| o.meta_get(KEY_LOCAL))?.is_none();
+    if new_pair && let Some(said) = crate::carryover::apply(&opts.data_dir, &mut store, &opts.local, &opts.remote)? {
         println!("{said}");
         carried = true;
     }
@@ -180,6 +178,11 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
     if carried {
         // Paired now: the app's choices are used.
         crate::carryover::mark_applied(&opts.data_dir)?;
+    }
+    if new_pair && let Some(said) = crate::appleftovers::after_move_over(&opts.data_dir, &opts.local) {
+        // The OneDrive app's folder is OneUpDrive's now: what the app left
+        // in the registry goes.
+        println!("{said}");
     }
     if opts.pair_only {
         println!("Ready: the background agent does the syncing from here.");

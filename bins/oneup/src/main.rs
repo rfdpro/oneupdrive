@@ -802,6 +802,20 @@ enum MigrateCmd {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// What the OneDrive app left in the registry after moving over: its
+    /// empty personal account settings and its "OneDrive - Personal"
+    /// navigation-pane entry. Moving over clears them; this shows them
+    Leftovers {
+        /// Clear them now (a backup goes to the data folder)
+        #[arg(long, conflicts_with = "undo")]
+        clear: bool,
+        /// Put back what was last cleared
+        #[arg(long)]
+        undo: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1728,6 +1742,9 @@ async fn run() -> Result<()> {
         }
         Cmd::Migrate(MigrateCmd::Check { json, profile }) => {
             migrate::check(&data_dir(&cli)?, &open_store(&cli, profile.memory_profile)?, *json)
+        }
+        Cmd::Migrate(MigrateCmd::Leftovers { clear, undo, json }) => {
+            migrate::leftovers(&data_dir(&cli)?, &open_store(&cli, MemoryProfile::Balanced)?, *clear, *undo, *json)
         }
         Cmd::Migrate(MigrateCmd::FinishUnlink { step, yes, wait_minutes, json, profile }) => {
             use oneup_app::moveover::Step;

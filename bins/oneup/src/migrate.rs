@@ -434,3 +434,56 @@ fn print(c: &Check) {
     println!("  oneup start");
     println!("(or the settings window's Set up page, which walks through all of this).");
 }
+
+/// `oneup migrate leftovers [--clear | --undo]`: the OneDrive app's
+/// leftovers after moving over (`oneup_app::appleftovers`).
+pub fn leftovers(dir: &std::path::Path, store: &Store, clear: bool, undo: bool, as_json: bool) -> Result<()> {
+    use oneup_app::appleftovers as lo;
+    if undo {
+        let u = lo::undo_now(dir)?;
+        if as_json {
+            println!(
+                "{}",
+                json!({
+                    "restored": u.as_ref().map(|u| u.restored.iter().map(|l| l.name()).collect::<Vec<_>>()),
+                    "values": u.as_ref().map(|u| u.values),
+                })
+            );
+        } else {
+            match u {
+                None => println!("Nothing to undo."),
+                Some(u) => {
+                    println!("Put back: {}.", u.restored.iter().map(|l| l.label()).collect::<Vec<_>>().join(", "))
+                }
+            }
+        }
+        return Ok(());
+    }
+    let local = oneup_app::sync::pairing(store)?.local;
+    if !lo::is_app_folder(&local) {
+        bail!("{} isn't the OneDrive app's folder: nothing was moved over", local.display());
+    }
+    if clear {
+        let c = lo::clear_now(dir, &local)?;
+        if as_json {
+            println!("{}", c.to_json());
+        } else if c.removed.is_empty() && c.changed.is_empty() {
+            println!("Nothing found.");
+        } else {
+            println!("{}", c.summary());
+        }
+        return Ok(());
+    }
+    let found = lo::pending(&local)?;
+    if as_json {
+        println!("{}", json!({ "found": found.iter().map(|l| l.name()).collect::<Vec<_>>() }));
+    } else if found.is_empty() {
+        println!("Nothing found.");
+    } else {
+        for l in &found {
+            println!("{}", l.label());
+        }
+        println!("Clear them with `oneup migrate leftovers --clear`.");
+    }
+    Ok(())
+}
