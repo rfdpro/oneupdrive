@@ -9,7 +9,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-# `aes`, `ghash` and `polyval` are here only for their `zeroize` features,
+# `aes`, `cmac`, `ghash` and `polyval` are here only for their `zeroize` features,
 # which wipe the AES key schedules (AES-256's first round keys are the raw
 # key) and the GHASH/POLYVAL keys when a cipher is dropped. The AEAD crates
 # don't forward the feature, so it's enabled on each underlying crate; feature
@@ -18,6 +18,8 @@ aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { version = "0.10", features = ["zeroize"] }
 aes-kw = { version = "0.2", features = ["alloc"] }
 aes-siv = "0.7"
+# Likewise for the CMAC state inside AES-SIV.
+cmac = { version = "0.7", features = ["zeroize"] }
 ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
 base64 = "0.23"

@@ -38,7 +38,9 @@ pub fn recovery_key(key: &Masterkey) -> Zeroizing<String> {
     bytes.extend_from_slice(raw.as_ref());
     bytes.extend_from_slice(&check(&raw));
     let text = Zeroizing::new(data_encoding::BASE32_NOPAD.encode(&bytes));
-    let mut out = Zeroizing::new(String::from(PREFIX));
+    // Sized up front: a string that grows leaves its old buffer unwiped.
+    let mut out = Zeroizing::new(String::with_capacity(PREFIX.len() + text.len() + text.len().div_ceil(4)));
+    out.push_str(PREFIX);
     for chunk in text.as_bytes().chunks(4) {
         out.push('-');
         out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
@@ -49,17 +51,14 @@ pub fn recovery_key(key: &Masterkey) -> Zeroizing<String> {
 /// The keys in a recovery key, if it is one and has no typo.
 pub fn from_recovery_key(text: &str) -> Result<Masterkey> {
     let bad = || Error::Malformed("that isn't a OneUpDrive recovery key".into());
-    let clean: Zeroizing<String> = Zeroizing::new(
-        text.chars()
-            .filter(|c| !c.is_whitespace() && *c != '-')
-            .map(|c| match c.to_ascii_uppercase() {
-                '0' => 'O',
-                '1' => 'I',
-                '8' => 'B',
-                c => c,
-            })
-            .collect(),
-    );
+    // Sized up front (never longer than the text): see `recovery_key`.
+    let mut clean = Zeroizing::new(String::with_capacity(text.len()));
+    clean.extend(text.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| match c.to_ascii_uppercase() {
+        '0' => 'O',
+        '1' => 'I',
+        '8' => 'B',
+        c => c,
+    }));
     let body = clean.strip_prefix("OUDI").ok_or_else(bad)?;
     let bytes = Zeroizing::new(data_encoding::BASE32_NOPAD.decode(body.as_bytes()).map_err(|_| bad())?);
     if bytes.len() != 68 {
@@ -67,7 +66,9 @@ pub fn from_recovery_key(text: &str) -> Result<Masterkey> {
     }
     let mut raw = Zeroizing::new([0u8; 64]);
     raw.copy_from_slice(&bytes[..64]);
-    if check(&raw) != bytes[64..] {
+    // Not secret-dependent in a way that matters (the person typing it has
+    // the key), but compared in constant time all the same.
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(&check(&raw)[..], &bytes[64..])) {
         return Err(Error::Malformed("the recovery key has a typo (its check doesn't match)".into()));
     }
     Ok(Masterkey::import(&raw))
@@ -83,6 +84,7 @@ mod tests {
         let key = Masterkey::generate().unwrap();
         let text = recovery_key(&key);
         assert!(text.starts_with("OUD1-"));
+        assert_eq!(text.len(), text.capacity(), "sized exactly, never regrown");
         let back = from_recovery_key(&text).unwrap();
         assert_eq!(*back.export(), *key.export());
         // Lower case, spaces instead of dashes, look-alike digits.

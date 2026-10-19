@@ -441,7 +441,11 @@ mod win {
             }
             "vault_add" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
-                let (remote, local, password) = (s("remote"), s("local"), s("password"));
+                let (remote, local) = (s("remote"), s("local"));
+                // As typed: spaces at either end are part of a password.
+                let password = zeroize::Zeroizing::new(
+                    args.get("password").and_then(Value::as_str).unwrap_or_default().to_string(),
+                );
                 if remote.is_empty() || local.is_empty() || password.is_empty() {
                     bail!("fill in the vault's OneDrive folder, a folder on this PC and the password");
                 }
@@ -462,7 +466,9 @@ mod win {
             "vault_create" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
                 let (remote, local) = (s("remote"), s("local"));
-                let password = args.get("password").and_then(Value::as_str).unwrap_or_default().to_string();
+                let password = zeroize::Zeroizing::new(
+                    args.get("password").and_then(Value::as_str).unwrap_or_default().to_string(),
+                );
                 if remote.is_empty() || local.is_empty() {
                     bail!("fill in the new vault's OneDrive folder and a folder on this PC");
                 }
@@ -484,7 +490,8 @@ mod win {
             }
             "vault_password" => {
                 let e = vault(dir, args)?;
-                let new = args.get("new").and_then(Value::as_str).unwrap_or_default().to_string();
+                let new =
+                    zeroize::Zeroizing::new(args.get("new").and_then(Value::as_str).unwrap_or_default().to_string());
                 let key = match args.get("recovery").and_then(Value::as_str).filter(|r| !r.trim().is_empty()) {
                     Some(r) => vaultpair::keys_from_recovery(dir, &graph(dir)?, &e, r).await?,
                     None => vault_keys(dir, &e, args).await?,

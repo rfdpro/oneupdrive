@@ -69,21 +69,29 @@ fn fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
-/// Encrypts everything from `input` to `output`; returns the content size.
-pub fn encrypt(key: &Masterkey, mut input: impl Read, mut output: impl Write) -> Result<u64> {
+/// A new file's header: a random nonce, and a random content key, made in
+/// the buffer it's encrypted in (no other copy of it), then encrypted with
+/// the vault's key. Returns the nonce, the content cipher and the header.
+fn new_header(key: &Masterkey) -> Result<([u8; NONCE], Aes256Gcm, [u8; HEADER_LEN])> {
     let header_nonce: [u8; NONCE] = random()?;
-    let content_key: Zeroizing<[u8; 32]> = Zeroizing::new(random()?);
     let mut payload = Zeroizing::new([0u8; 40]);
     payload[..8].copy_from_slice(&RESERVED);
-    payload[8..].copy_from_slice(content_key.as_ref());
+    crate::fill_random(&mut payload[8..])?;
+    let gcm = Aes256Gcm::new((&payload[8..]).into());
     let tag = Aes256Gcm::new(key.enc().into())
         .encrypt_in_place_detached(Nonce::from_slice(&header_nonce), b"", payload.as_mut())
         .map_err(|_| Error::Malformed("header encryption".into()))?;
-    output.write_all(&header_nonce)?;
-    output.write_all(payload.as_ref())?;
-    output.write_all(&tag)?;
+    let mut header = [0u8; HEADER_LEN];
+    header[..NONCE].copy_from_slice(&header_nonce);
+    header[NONCE..NONCE + 40].copy_from_slice(payload.as_ref());
+    header[NONCE + 40..].copy_from_slice(&tag);
+    Ok((header_nonce, gcm, header))
+}
 
-    let gcm = Aes256Gcm::new(content_key.as_ref().into());
+/// Encrypts everything from `input` to `output`; returns the content size.
+pub fn encrypt(key: &Masterkey, mut input: impl Read, mut output: impl Write) -> Result<u64> {
+    let (header_nonce, gcm, header) = new_header(key)?;
+    output.write_all(&header)?;
     let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
     let mut total = 0u64;
     for n in 0u64.. {
@@ -171,21 +179,12 @@ pub struct Encryptor<R> {
 
 impl<R: Read> Encryptor<R> {
     pub fn new(key: &Masterkey, input: R) -> Result<Self> {
-        let header_nonce: [u8; NONCE] = random()?;
-        let content_key: Zeroizing<[u8; 32]> = Zeroizing::new(random()?);
-        let mut payload = Zeroizing::new([0u8; 40]);
-        payload[..8].copy_from_slice(&RESERVED);
-        payload[8..].copy_from_slice(content_key.as_ref());
-        let tag = Aes256Gcm::new(key.enc().into())
-            .encrypt_in_place_detached(Nonce::from_slice(&header_nonce), b"", payload.as_mut())
-            .map_err(|_| Error::Malformed("header encryption".into()))?;
+        let (header_nonce, gcm, header) = new_header(key)?;
         let mut out = Zeroizing::new(Vec::with_capacity(CHUNK_LEN));
-        out.extend_from_slice(&header_nonce);
-        out.extend_from_slice(payload.as_ref());
-        out.extend_from_slice(&tag);
+        out.extend_from_slice(&header);
         Ok(Self {
             input,
-            gcm: Aes256Gcm::new(content_key.as_ref().into()),
+            gcm,
             header_nonce,
             out,
             at: 0,
@@ -321,16 +320,26 @@ impl<W: Write> Decryptor<W> {
 
 impl<W: Write> Write for Decryptor<W> {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        if self.gcm.is_none() {
-            if self.buf.len() < HEADER_LEN {
-                return Ok(data.len());
+        // Taken in pieces that fit the buffer: growing it would move it,
+        // and leave the old allocation, with the plaintext of chunks
+        // decrypted in place there, unwiped. After each piece at most a
+        // chunk stays, so there's always room for more.
+        let mut rest = data;
+        while !rest.is_empty() {
+            let room = self.buf.capacity() - self.buf.len();
+            let (now, later) = rest.split_at(room.min(rest.len()));
+            self.buf.extend_from_slice(now);
+            rest = later;
+            if self.gcm.is_none() {
+                if self.buf.len() < HEADER_LEN {
+                    continue;
+                }
+                self.header().map_err(std::io::Error::other)?;
             }
-            self.header().map_err(std::io::Error::other)?;
-        }
-        // A whole chunk stays buffered until more arrives or `finish`.
-        while self.buf.len() > CHUNK_LEN {
-            self.chunk(CHUNK_LEN).map_err(std::io::Error::other)?;
+            // A whole chunk stays buffered until more arrives or `finish`.
+            while self.buf.len() > CHUNK_LEN {
+                self.chunk(CHUNK_LEN).map_err(std::io::Error::other)?;
+            }
         }
         Ok(data.len())
     }
@@ -444,6 +453,20 @@ mod tests {
             let (len, out) = d.finish().unwrap();
             assert_eq!((len, out), (n as u64, data), "{n}");
         }
+    }
+
+    #[test]
+    fn streaming_decryption_never_regrows_its_buffer() {
+        // One big write (a download arriving in large pieces) must not move
+        // the buffer that held decrypted chunks.
+        let k = key();
+        let data = vec![4u8; 5 * CHUNK + 3];
+        let enc = encrypt_bytes(&k, &data).unwrap();
+        let mut d = Decryptor::new(&k, Vec::new());
+        let cap = d.buf.capacity();
+        d.write_all(&enc).unwrap();
+        assert_eq!(d.buf.capacity(), cap);
+        assert_eq!(d.finish().unwrap().1, data);
     }
 
     #[test]

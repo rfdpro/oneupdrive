@@ -74,9 +74,13 @@ pub fn secret(name: &str, challenge: &[u8], create: bool) -> Result<[u8; 32], He
     let buffer = signed.Result().map_err(other)?;
     let mut bytes = windows::core::Array::<u8>::new();
     CryptographicBuffer::CopyToByteArray(&buffer, &mut bytes).map_err(other)?;
-    let digest = Sha256::digest(bytes.as_slice());
+    let mut digest = Sha256::digest(bytes.as_slice());
+    // The signature is as good as the secret (the secret is its hash): both
+    // wiped. The WinRT buffer it came in can't be.
+    zeroize::Zeroize::zeroize(&mut bytes[..]);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
+    zeroize::Zeroize::zeroize(&mut digest[..]);
     Ok(out)
 }
 
