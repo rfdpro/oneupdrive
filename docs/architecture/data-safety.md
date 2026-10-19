@@ -12,7 +12,7 @@ Never losing user data comes before every other goal. The rules below are enforc
 5. **Compare-and-swap execution.** Immediately before acting, open the item by file ID and re-check it on that handle: a file's size and last-write time, or that a folder is still a folder. Any drift ⇒ abort the operation and re-plan.
 6. **Verify every transfer.** Downloads are hashed before they're placed; uploads compare the server's QuickXorHash and confirm the file didn't change mid-upload. Reading a file never locks its program out: an upload watches for writes instead (a read oplock), and one written meanwhile stops before it commits.
 7. **Crash consistency.** Write-ahead intent records (fsync'd) → do → mark done. Recovery replays or rolls back idempotently.
-8. **Circuit breakers** in both directions. Mass delete/move/overwrite above thresholds (count and percentage) pauses that direction and asks the user, showing a preview.
+8. **Circuit breakers** in both directions. Mass delete/move/overwrite above thresholds (count and percentage) pauses that direction and asks the user, showing a preview. An approval covers exactly the items on that list (and the folders their deletions empty, each deleted with evidence); anything not on it needs a stop of its own. The background agent counts what it carried out in the last 15 minutes on top of each round, and keeps that count across restarts.
 9. **Conflicts keep both copies.** No last-writer-wins on content, ever.
 10. **Safe defaults.** The first sync shows a preview before anything changes; `--dry-run` everywhere; `oneup panic` stops all destructive operations at once.
 
