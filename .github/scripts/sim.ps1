@@ -29,6 +29,10 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+if ($From -lt 1 -or $Count -lt 1 -or $Processes -lt 1) {
+    throw "-From, -Count and -Processes must be at least 1 (got $From, $Count, $Processes)"
+}
+
 # SIM_SEED makes a simulation run that one seed, whatever its range: every
 # process would repeat it while the summary claimed the whole range.
 if ($env:SIM_SEED) { throw "SIM_SEED is set ($env:SIM_SEED); unset it to run a range" }
@@ -48,10 +52,13 @@ New-Item -ItemType Directory -Force $LogDir | Out-Null
 $per = [UInt64][Math]::Ceiling($Count / $Processes)
 $runs = @()
 $start = Get-Date
+$end = $From + $Count # one past the last seed
 for ($i = 0; $i -lt $Processes; $i++) {
     $first = $From + [UInt64]$i * $per
-    $n = [Math]::Min($per, $From + $Count - $first)
-    if ($first -ge $From + $Count -or $n -le 0) { break }
+    # Fewer seeds than processes leaves the last ones nothing to run. The
+    # check comes first: the remainder below is unsigned.
+    if ($first -ge $end) { break }
+    $n = [Math]::Min($per, $end - $first)
     # Children inherit the environment as it is when they start.
     $env:SIM_SEED_FROM = "$first"
     $env:SIM_SEEDS = "$n"
