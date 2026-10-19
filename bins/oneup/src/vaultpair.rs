@@ -165,7 +165,8 @@ fn hello_name(dir: &Path) -> Result<String> {
 #[cfg(windows)]
 pub fn save_key_hello(dir: &Path, key: &Masterkey) -> Result<()> {
     let challenge = oneup_vault::sealed::new_challenge()?;
-    let secret = Zeroizing::new(oneup_sys::hello::secret(&hello_name(dir)?, &challenge, true)?);
+    let mut secret = Zeroizing::new([0u8; 32]);
+    oneup_sys::hello::secret(&hello_name(dir)?, &challenge, true, &mut secret)?;
     let blob = oneup_vault::sealed::seal(key, &secret, &challenge)?;
     crate::ownfile::write(&dir.join(HELLO_FILE), &blob)?;
     Ok(())
@@ -177,7 +178,8 @@ pub fn save_key_hello(dir: &Path, key: &Masterkey) -> Result<()> {
 pub fn load_key_hello(dir: &Path) -> Result<Option<Masterkey>> {
     let Ok(blob) = std::fs::read(dir.join(HELLO_FILE)) else { return Ok(None) };
     let challenge = oneup_vault::sealed::challenge(&blob)?;
-    let secret = Zeroizing::new(oneup_sys::hello::secret(&hello_name(dir)?, &challenge, false)?);
+    let mut secret = Zeroizing::new([0u8; 32]);
+    oneup_sys::hello::secret(&hello_name(dir)?, &challenge, false, &mut secret)?;
     Ok(Some(oneup_vault::sealed::open(&blob, &secret)?))
 }
 

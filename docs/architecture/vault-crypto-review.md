@@ -75,7 +75,7 @@ AES-SIV proves a name came from a key holder, not that it is a name. Attacker B 
 * The NFC password, the recovery key text (both ways) and the agent's hex key line are built in strings sized up front, so no reallocation leaves a partial copy; `key_line` no longer makes a temporary string per byte.
 * `key_from_stdin` read through `std::io::stdin()`, whose 8 KiB buffer lives for the life of the process. It now reads straight from a duplicate of the handle into a zeroed fixed buffer, and parses bytes (a 128-byte line of non-ASCII text used to panic on a char boundary). The line must end with its newline (input that stops early is refused, not guessed at). Tests: `vaultpair::tests::keys_go_to_the_agent_as_one_exact_line`, and `the_agent_reads_its_key_line_however_the_pipe_delivers_it` (one byte at a time, interrupted reads retried, end of input before the newline, another I/O error returned, an over-long line).
 * CLI passwords and recovery keys (`rpassword`) and the settings window's copies are `Zeroizing<String>`.
-* `hello::secret` wipes the signature bytes and the digest after use (the signature is as good as the secret).
+* `hello::secret` wipes the signature bytes and the digest after use (the signature is as good as the secret), and writes the secret into the caller's `Zeroizing` buffer instead of returning it by value.
 * The recovery key's 32-bit check is compared with `subtle`. It isn't an oracle (whoever types the key has the keys), so this is hygiene.
 
 ### V-10 Decrypted names in the log (Low, fixed)

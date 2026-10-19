@@ -3,8 +3,10 @@
 //!
 //! Windows Hello keeps a private key (in the TPM where there is one) per
 //! credential name, and signs only after the person proves it's them. The
-//! signature of a fixed challenge (RSA PKCS #1 v1.5, deterministic) hashed
-//! with SHA-256 is the secret: the same every time, and impossible to get
+//! signature of a fixed challenge hashed with SHA-256 is the secret: the
+//! same every time, provided the signature is deterministic (RSA PKCS #1
+//! v1.5; an assumption Microsoft doesn't document, see V-19 in
+//! `docs/architecture/vault-crypto-review.md`), and impossible to get
 //! without Windows Hello on this PC for this user. The secret is never
 //! stored; what it protects is (by the caller, encrypted with it).
 
@@ -52,8 +54,10 @@ fn other(e: windows::core::Error) -> HelloError {
 
 /// The secret for credential `name` (see the module docs). `create`: make
 /// the credential first (replacing one of that name); otherwise it must
-/// exist. Shows Windows Hello's prompt and waits for the person.
-pub fn secret(name: &str, challenge: &[u8], create: bool) -> Result<[u8; 32], HelloError> {
+/// exist. Shows Windows Hello's prompt and waits for the person. Written
+/// into the caller's `out` (which should wipe itself, e.g. `Zeroizing`), so
+/// returning it leaves no copy behind.
+pub fn secret(name: &str, challenge: &[u8], create: bool, out: &mut [u8; 32]) -> Result<(), HelloError> {
     use sha2::{Digest, Sha256};
     if !KeyCredentialManager::IsSupportedAsync().and_then(|op| op.join()).unwrap_or(false) {
         return Err(HelloError::NotAvailable);
@@ -78,10 +82,9 @@ pub fn secret(name: &str, challenge: &[u8], create: bool) -> Result<[u8; 32], He
     // The signature is as good as the secret (the secret is its hash): both
     // wiped. The WinRT buffer it came in can't be.
     zeroize::Zeroize::zeroize(&mut bytes[..]);
-    let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     zeroize::Zeroize::zeroize(&mut digest[..]);
-    Ok(out)
+    Ok(())
 }
 
 /// Removes credential `name` (nothing if there's none).
