@@ -26,17 +26,20 @@
 //! Nothing is cleared while the OneDrive app runs (`OneDrive.exe` among
 //! this user's processes): it is the only program that writes these keys,
 //! and it could link the personal account again meanwhile. One clear or
-//! undo runs at a time (a lock file in the data folder). The keys found are
-//! written to a new backup in the data folder first (never over another).
-//! Then, for each key in turn: the folder must still be free of other sync
-//! programs, the key exactly as found, and, checked last, the app still not
-//! running; otherwise that key is left.
+//! undo runs at a time for this Windows user, whichever data folder it's
+//! for, since they all share the user's registry ([`USER_LOCK`]). The keys
+//! found are written to a new backup in the data folder first (never over
+//! another). Then, for each key in turn: the folder must still be free of
+//! other sync programs, the key exactly as found, and, checked last, the
+//! app still not running; otherwise that key is left. An error partway
+//! stops there, and what was removed before it is still reported and
+//! noted in the activity log.
 //!
 //! The registry has no compare-and-delete, so a window remains between
 //! that last check and the removal (one `RegDeleteTreeW` call away). For
-//! the app to write a key
-//! inside it, it would have to start and link the account within that
-//! moment. Should it happen, the backup holds the key as found, and
+//! the app to write a key inside it, it would have to start and link the
+//! account within that moment. Should it happen, the backup holds the key
+//! as found, and
 //! [`undo`] (`oneup migrate leftovers --undo`) puts back what is missing
 //! without changing anything there, so the app's own new values stay.
 //!
@@ -67,8 +70,8 @@ const ACCOUNT_VALUES: [&str; 6] = ["UserFolder", "cid", "UserEmail", "UserName",
 /// Backups, in the data folder: `onedrive-app-leftovers-<ms>.json`.
 const BACKUPS: &str = "backups";
 const PREFIX: &str = "onedrive-app-leftovers-";
-/// Held while clearing or putting back.
-const LOCK: &str = "onedrive-app-leftovers.lock";
+/// A backup being written.
+const TEMP: &str = ".tmp";
 
 /// One leftover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,23 +230,38 @@ pub struct Cleared {
     /// took the folder meanwhile: left.
     pub changed: Vec<Leftover>,
     pub backup: Option<PathBuf>,
+    /// What stopped it partway (what was removed before stays listed).
+    pub failed: Option<String>,
 }
 
 impl Cleared {
+    /// Anything to tell: removed, left or failed.
+    pub fn happened(&self) -> bool {
+        !self.removed.is_empty() || !self.changed.is_empty() || self.failed.is_some()
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "removed": self.removed.iter().map(|l| l.name()).collect::<Vec<_>>(),
             "changed": self.changed.iter().map(|l| l.name()).collect::<Vec<_>>(),
             "backup": self.backup.as_ref().map(|b| b.to_string_lossy().into_owned()),
+            "failed": self.failed,
         })
     }
 
     /// For the activity log and the command line.
     pub fn summary(&self) -> String {
         let list = |ls: &[Leftover]| ls.iter().map(|l| l.label()).collect::<Vec<_>>().join(", ");
-        let mut s = format!("Removed {}.", list(&self.removed));
+        let mut s = if self.removed.is_empty() {
+            "Removed nothing.".to_string()
+        } else {
+            format!("Removed {}.", list(&self.removed))
+        };
         if !self.changed.is_empty() {
             s.push_str(&format!(" Skipped (changed, or the OneDrive app started): {}.", list(&self.changed)));
+        }
+        if let Some(why) = &self.failed {
+            s.push_str(&format!(" Stopped: {why}."));
         }
         if let Some(b) = &self.backup {
             s.push_str(&format!(" Backup: {}", b.display()));
@@ -260,7 +278,16 @@ pub trait Conditions {
     fn app_running(&self) -> std::io::Result<bool>;
     /// No other sync program holds the folder.
     fn released(&self) -> bool;
+    /// The name of the lock that keeps one clear or undo at a time for
+    /// this Windows user ([`USER_LOCK`]; tests use their own).
+    fn lock_name(&self) -> &str;
 }
+
+/// One clear or undo at a time for this Windows user, whichever data folder
+/// it's for: they all share the user's registry. A named mutex per user
+/// rather than a file: no file in any data folder to agree on, and Windows
+/// lets go of it when the process holding it ends.
+pub const USER_LOCK: &str = "OneUpDrive-app-leftovers";
 
 /// This PC: the OneDrive app's main program among this user's processes,
 /// and the folder's sync root.
@@ -275,15 +302,20 @@ impl Conditions for ThisPc<'_> {
     fn released(&self) -> bool {
         oneup_cfapi::other_sync_root(self.folder).is_none()
     }
+    fn lock_name(&self) -> &str {
+        USER_LOCK
+    }
 }
 
 /// Clears what [`review`] picks, after a backup in `data_dir`, one change
-/// at a time (a lock in the data folder). Refused while the OneDrive app
+/// at a time for this user ([`USER_LOCK`]). Refused while the OneDrive app
 /// runs. Just before each key goes, the folder must still be released, the
 /// key as found and backed up, and then the app still not running; a key
-/// for which any of that fails is left.
+/// for which any of that fails is left. An error once a backup is made
+/// stops there and is returned in [`Cleared::failed`], with what was
+/// removed before it, so that's never lost.
 pub fn clear(reg: &dyn Registry, cond: &dyn Conditions, data_dir: &Path, folder: &Path) -> Result<Cleared> {
-    let _lock = lock(data_dir)?;
+    let _lock = lock(cond.lock_name())?;
     if cond.app_running()? {
         anyhow::bail!("{APP_RUNNING}");
     }
@@ -295,37 +327,54 @@ pub fn clear(reg: &dyn Registry, cond: &dyn Conditions, data_dir: &Path, folder:
     let backup = save_backup(data_dir, &found, &picked)?;
     let mut done = Cleared { backup: Some(backup), ..Cleared::default() };
     for l in picked {
-        let key = l.key();
-        // The checks closest to the removal come last: the key compared,
-        // then whether the app (the only writer of these keys) started.
-        let still = cond.released() && reg.tree(&key)?.as_ref() == found.get(l) && !cond.app_running()?;
-        if !still {
-            done.changed.push(l);
-            continue;
+        match remove_one(reg, cond, &found, l) {
+            Ok(true) => {
+                tracing::info!(leftover = l.name(), "removed a OneDrive app leftover");
+                done.removed.push(l);
+            }
+            Ok(false) => done.changed.push(l),
+            Err(e) => {
+                done.failed = Some(format!("{e:#}"));
+                break;
+            }
         }
-        reg.remove_tree(&key).with_context(|| format!("removing {}", l.label()))?;
-        tracing::info!(leftover = l.name(), "removed a OneDrive app leftover");
-        done.removed.push(l);
     }
     Ok(done)
+}
+
+/// Removes leftover `l` if it still may go (see [`clear`]); `false` if it
+/// was left.
+fn remove_one(reg: &dyn Registry, cond: &dyn Conditions, found: &Found, l: Leftover) -> Result<bool> {
+    let key = l.key();
+    // The checks closest to the removal come last: the key compared, then
+    // whether the app (the only writer of these keys) started.
+    let still = cond.released()
+        && reg.tree(&key).with_context(|| format!("reading {}", l.label()))?.as_ref() == found.get(l)
+        && !cond.app_running().context("looking for the OneDrive app")?;
+    if still {
+        reg.remove_tree(&key).with_context(|| format!("removing {}", l.label()))?;
+    }
+    Ok(still)
+}
+
+/// [`clear`], then the activity log noted of whatever happened, partway
+/// or not.
+pub fn clear_noted(reg: &dyn Registry, cond: &dyn Conditions, data_dir: &Path, folder: &Path) -> Result<Cleared> {
+    let c = clear(reg, cond, data_dir, folder)?;
+    if c.happened() {
+        note(data_dir, "cleared OneDrive app leftovers", c.summary());
+    }
+    Ok(c)
 }
 
 /// Why [`clear`] refuses while the app runs, and what to do.
 pub const APP_RUNNING: &str = "the OneDrive app is running; quit it (its icon in the corner of the taskbar > Settings > Quit OneDrive), then run \
      `oneup migrate leftovers --clear`";
 
-/// One clear or undo at a time, across the agent's step and the command
-/// line. Windows lets go of the file if the process ends.
-fn lock(data_dir: &Path) -> Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    let dir = data_dir.join(BACKUPS);
-    std::fs::create_dir_all(&dir).context("creating the backups folder")?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .open(dir.join(LOCK))
+/// Takes the per-user lock called `name` ([`USER_LOCK`]).
+fn lock(name: &str) -> Result<oneup_sys::mutex::Held> {
+    oneup_sys::mutex::try_lock(name)
+        .context("taking the lock for the OneDrive app's leftovers")?
         .context("the OneDrive app's leftovers are being cleared or put back already")
 }
 
@@ -340,8 +389,8 @@ pub struct Undone {
 
 /// Puts the newest backup back (keys and values that are missing; nothing
 /// there is changed) and marks it used. `None` without one.
-pub fn undo(reg: &dyn Registry, data_dir: &Path) -> Result<Option<Undone>> {
-    let _lock = lock(data_dir)?;
+pub fn undo(reg: &dyn Registry, lock_name: &str, data_dir: &Path) -> Result<Option<Undone>> {
+    let _lock = lock(lock_name)?;
     let Some(path) = newest_backup(data_dir)? else { return Ok(None) };
     let text = std::fs::read(&path).context("reading the newest backup")?;
     let v: Value = serde_json::from_slice(&text).context("reading the newest backup")?;
@@ -380,10 +429,9 @@ fn save_backup(data_dir: &Path, found: &Found, picked: &[Leftover]) -> Result<Pa
     let bytes = serde_json::to_vec_pretty(&json!({ "at_ms": at, "keys": keys }))?;
     // Written in full and flushed under a temporary name, then linked to
     // its own: a link never replaces a file, and a reader never sees half
-    // of one.
-    let tmp = dir.join(format!("{PREFIX}{}-{at}.tmp", std::process::id()));
+    // of one. A temporary file left by a crash is passed over, not reused.
+    let (tmp, mut f) = new_temp(&dir).context("writing the backup")?;
     let written = (|| {
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(&bytes)?;
         f.sync_all()?;
         drop(f);
@@ -398,6 +446,25 @@ fn save_backup(data_dir: &Path, found: &Found, picked: &[Leftover]) -> Result<Pa
     })();
     let _ = std::fs::remove_file(&tmp);
     written.context("writing the backup")
+}
+
+/// A new temporary file in `dir`, never one that's there: named by this
+/// process, the time and a count, the count going up past any taken name.
+fn new_temp(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    new_temp_from(dir, &format!("{PREFIX}{}-{stamp}", std::process::id()))
+}
+
+fn new_temp_from(dir: &Path, stem: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for n in 0..1000u32 {
+        let tmp = dir.join(format!("{stem}-{n}{TEMP}"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("no free name for a temporary file"))
 }
 
 /// Every backup in the data folder: its number, whether it was put back,
@@ -482,13 +549,10 @@ pub fn pending(local: &Path) -> Result<Vec<Leftover>> {
 /// [`clear`] on this Windows user's registry for the app's old folder
 /// `local`, then Explorer told and the activity log noted.
 pub fn clear_now(data_dir: &Path, local: &Path) -> Result<Cleared> {
-    let c = clear(&UserRegistry, &ThisPc { folder: local }, data_dir, local)?;
+    let c = clear_noted(&UserRegistry, &ThisPc { folder: local }, data_dir, local)?;
     if c.removed.iter().any(|l| *l != Leftover::Account) {
         // Explorer reads its namespaces again.
         oneup_sys::assoc::changed();
-    }
-    if !c.removed.is_empty() || !c.changed.is_empty() {
-        note(data_dir, "cleared OneDrive app leftovers", c.summary());
     }
     Ok(c)
 }
@@ -496,7 +560,7 @@ pub fn clear_now(data_dir: &Path, local: &Path) -> Result<Cleared> {
 /// [`undo`] on this Windows user's registry, then Explorer told and the
 /// activity log noted.
 pub fn undo_now(data_dir: &Path) -> Result<Option<Undone>> {
-    let u = undo(&UserRegistry, data_dir)?;
+    let u = undo(&UserRegistry, USER_LOCK, data_dir)?;
     if let Some(u) = &u {
         oneup_sys::assoc::changed();
         let list = u.restored.iter().map(|l| l.label()).collect::<Vec<_>>().join(", ");
@@ -514,7 +578,7 @@ pub fn after_move_over(data_dir: &Path, local: &Path) -> Option<String> {
         return None;
     }
     match clear_now(data_dir, local) {
-        Ok(c) if c.removed.is_empty() && c.changed.is_empty() => None,
+        Ok(c) if !c.happened() => None,
         Ok(c) => Some(format!("OneDrive app leftovers: {}", c.summary())),
         Err(e) => {
             // The error can name the data folder: details at debug only.
@@ -558,6 +622,9 @@ mod tests {
         keys: RefCell<Keys>,
         /// Called after each read.
         on_read: RefCell<Meanwhile>,
+        /// Removals so far, and the one that fails (counted from 1).
+        removals: Cell<usize>,
+        fail_removal: Cell<Option<usize>>,
     }
 
     impl Registry for Fake {
@@ -569,6 +636,10 @@ mod tests {
             Ok(got)
         }
         fn remove_tree(&self, key: &str) -> std::io::Result<()> {
+            self.removals.set(self.removals.get() + 1);
+            if self.fail_removal.get() == Some(self.removals.get()) {
+                return Err(std::io::Error::other("access denied"));
+            }
             self.keys.borrow_mut().remove(key);
             Ok(())
         }
@@ -714,11 +785,19 @@ mod tests {
     struct Cond {
         running: Rc<Cell<bool>>,
         released: Rc<Cell<bool>>,
+        /// Each test its own lock: tests run side by side.
+        lock: String,
     }
 
     impl Cond {
         fn quiet() -> Cond {
-            Cond { running: Rc::new(Cell::new(false)), released: Rc::new(Cell::new(true)) }
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Cond {
+                running: Rc::new(Cell::new(false)),
+                released: Rc::new(Cell::new(true)),
+                lock: format!("OneUpDrive-test-leftovers-{}-{n}", std::process::id()),
+            }
         }
     }
 
@@ -728,6 +807,9 @@ mod tests {
         }
         fn released(&self) -> bool {
             self.released.get()
+        }
+        fn lock_name(&self) -> &str {
+            &self.lock
         }
     }
 
@@ -767,8 +849,9 @@ mod tests {
     fn clearing_backs_up_removes_and_undo_puts_back() {
         let dir = temp("clear");
         let fake = fake_with_leftovers();
+        let cond = Cond::quiet();
         let before = fake.keys.borrow().clone();
-        let c = clear(&fake, &Cond::quiet(), &dir, &folder()).unwrap();
+        let c = clear(&fake, &cond, &dir, &folder()).unwrap();
         assert_eq!(c.removed, Leftover::ALL);
         assert!(c.changed.is_empty());
         let keys: Vec<String> = fake.keys.borrow().keys().cloned().collect();
@@ -787,7 +870,7 @@ mod tests {
         );
 
         // Clearing again finds nothing, and makes no backup.
-        let again = clear(&fake, &Cond::quiet(), &dir, &folder()).unwrap();
+        let again = clear(&fake, &cond, &dir, &folder()).unwrap();
         assert!(again.removed.is_empty() && again.backup.is_none());
 
         // The app made an empty Personal key again meanwhile: undo adds
@@ -795,7 +878,7 @@ mod tests {
         fake.keys
             .borrow_mut()
             .insert(Leftover::Account.key(), Tree { values: vec![dword("LastSignInResult", 7)], keys: vec![] });
-        let u = undo(&fake, &dir).unwrap().unwrap();
+        let u = undo(&fake, &cond.lock, &dir).unwrap().unwrap();
         assert_eq!(u.restored, Leftover::ALL);
         let after = fake.keys.borrow().clone();
         assert_eq!(after[&Leftover::PaneClass.key()], before[&Leftover::PaneClass.key()]);
@@ -805,7 +888,7 @@ mod tests {
         assert!(account.values.contains(&sz("OneDriveDeviceId", "device")));
         assert_eq!(account.key("USQInformation"), unlinked_account().key("USQInformation"));
         // Used up: a second undo has nothing.
-        assert!(undo(&fake, &dir).unwrap().is_none());
+        assert!(undo(&fake, &cond.lock, &dir).unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -894,15 +977,68 @@ mod tests {
     }
 
     #[test]
-    fn one_clear_or_undo_at_a_time() {
-        let dir = temp("lock");
+    fn one_clear_or_undo_at_a_time_for_every_data_folder() {
+        // Two data folders, one user's registry: a clear for the first
+        // (here, its lock held by another thread) keeps the second's out.
+        let (first, second) = (temp("lock-first"), temp("lock-second"));
         let fake = fake_with_leftovers();
-        let held = lock(&dir).unwrap();
-        assert!(clear(&fake, &Cond::quiet(), &dir, &folder()).is_err());
-        assert!(undo(&fake, &dir).is_err());
+        let cond = Cond::quiet();
+        let (took, wait) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let other = {
+            let name = cond.lock.clone();
+            std::thread::spawn(move || {
+                let held = lock(&name).unwrap();
+                took.send(()).unwrap();
+                released.recv().unwrap();
+                drop(held);
+            })
+        };
+        wait.recv().unwrap();
+        let e = clear(&fake, &cond, &second, &folder()).unwrap_err();
+        assert!(e.to_string().contains("already"), "{e}");
+        assert!(undo(&fake, &cond.lock, &first).is_err());
         assert_eq!(fake.keys.borrow().len(), 5, "nothing removed");
-        drop(held);
-        assert_eq!(clear(&fake, &Cond::quiet(), &dir, &folder()).unwrap().removed, Leftover::ALL);
+        assert!(backup_files(&second).is_empty());
+        release.send(()).unwrap();
+        other.join().unwrap();
+        assert_eq!(clear(&fake, &cond, &second, &folder()).unwrap().removed, Leftover::ALL);
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    #[test]
+    fn a_removal_that_fails_keeps_what_went_before_and_is_noted() {
+        let dir = temp("fails");
+        let fake = fake_with_leftovers();
+        fake.fail_removal.set(Some(2));
+        let c = clear_noted(&fake, &Cond::quiet(), &dir, &folder()).unwrap();
+        assert_eq!(c.removed, [Leftover::PaneEntry]);
+        assert!(c.failed.as_deref().is_some_and(|f| f.contains("access denied")), "{c:?}");
+        assert!(c.backup.as_ref().is_some_and(|b| b.is_file()));
+        let keys = fake.keys.borrow();
+        assert!(!keys.contains_key(&Leftover::PaneEntry.key()));
+        assert!(keys.contains_key(&Leftover::PaneClass.key()) && keys.contains_key(&Leftover::Account.key()));
+        drop(keys);
+        let summary = c.summary();
+        assert!(summary.starts_with("Removed the \"OneDrive - Personal\" navigation-pane entry."), "{summary}");
+        assert!(summary.contains("Stopped:"), "{summary}");
+        // The activity log has it, removal and failure alike.
+        let store = crate::setup::open_store(&dir, 1024).unwrap();
+        let log = store.read(|o| o.activity_recent(None, 10)).unwrap();
+        assert!(log.iter().any(|e| e.action == "cleared OneDrive app leftovers" && e.detail == summary), "{log:?}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_temporary_file_left_by_a_crash_is_passed_over() {
+        let dir = temp("stale");
+        std::fs::write(dir.join(format!("x-0{TEMP}")), "stale").unwrap();
+        std::fs::write(dir.join(format!("x-1{TEMP}")), "stale").unwrap();
+        let (path, _f) = new_temp_from(&dir, "x").unwrap();
+        assert_eq!(path, dir.join(format!("x-2{TEMP}")));
+        assert_eq!(std::fs::read_to_string(dir.join(format!("x-0{TEMP}"))).unwrap(), "stale");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -945,7 +1081,7 @@ mod tests {
             "tree": tree_to_json(&unlinked_account()) }] });
         std::fs::write(dir.join(BACKUPS).join(format!("{PREFIX}5.json")), v.to_string()).unwrap();
         let fake = Fake::default();
-        assert!(undo(&fake, &dir).is_err());
+        assert!(undo(&fake, &Cond::quiet().lock, &dir).is_err());
         assert!(fake.keys.borrow().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
