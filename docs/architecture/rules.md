@@ -23,6 +23,8 @@ Semantics are git's:
 * **The last matching rule wins.** Rules from a deeper `.oneupignore` come after those from higher up, so they win.
 * **Nothing inside an excluded folder can be re-included.** `node_modules/` followed by `!node_modules/keep.js` keeps nothing. This is what lets enumeration skip excluded folders without listing them (below), and it's git's documented behaviour.
 
+**No rule can make matching slow.** `.oneupignore` files sync from OneDrive, so their text is untrusted: a rule with several `**` is matched in time proportional to its parts times the path's depth (`oneup-rules/src/pattern.rs`), not by trying every way to split the path, which grows exponentially with the number of `**`. Names match in linear time ([`NameGlob`](../../crates/oneup-rules/src/glob.rs)). The `rules` fuzz target checks this nightly.
+
 ### Where rules come from (lowest precedence first)
 1. **Presets** the user turned on, in a fixed order. Offered, never imposed: nothing is on unless the user chose it.
    * `dev`: `node_modules/`, `.venv/`, `venv/`, `__pycache__/`, `site-packages/`, `.git/`, `target/`, `.next/`, `.cache/`, `.tox/`, `.mypy_cache/`, `.pytest_cache/`, `.gradle/`.

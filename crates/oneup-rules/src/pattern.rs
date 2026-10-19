@@ -117,18 +117,60 @@ impl Rule {
 /// Matches segments against path parts. `**` matches any number of parts,
 /// except at the end, where it needs at least one (`a/**` is what's
 /// *inside* `a`, as in git).
+///
+/// Rule lines come from `.oneupignore` files, which sync from OneDrive, so
+/// no arrangement of `**`s may make this slow. Trying every split, as
+/// [`anchored_one_deep`] does, is exponential in the number of `**`s (12
+/// against a 60-folder path ran for minutes), so with more than one the
+/// match goes through [`anchored_table`], which is O(segments × parts).
+/// With at most one (nearly every real rule), trying every split is linear
+/// and allocates nothing, which matters when every item is checked against
+/// every rule.
 fn anchored(segs: &[Seg], path: &[&str]) -> bool {
+    if segs.iter().filter(|s| matches!(s, Seg::Deep)).count() <= 1 {
+        anchored_one_deep(segs, path)
+    } else {
+        anchored_table(segs, path)
+    }
+}
+
+/// [`anchored`] by trying every split at each `**`.
+fn anchored_one_deep(segs: &[Seg], path: &[&str]) -> bool {
     match segs.split_first() {
         None => path.is_empty(),
         Some((Seg::Deep, rest)) => {
             let min = usize::from(rest.is_empty());
-            (min..=path.len()).any(|skip| anchored(rest, &path[skip..]))
+            (min..=path.len()).any(|skip| anchored_one_deep(rest, &path[skip..]))
         }
         Some((Seg::Name(g), rest)) => match path.split_first() {
-            Some((first, more)) => g.matches(first) && anchored(rest, more),
+            Some((first, more)) => g.matches(first) && anchored_one_deep(rest, more),
             None => false,
         },
     }
+}
+
+/// [`anchored`] in one pass per segment, from the last: `next[j]` says
+/// whether the segments after the current one match `path[j..]`.
+fn anchored_table(segs: &[Seg], path: &[&str]) -> bool {
+    let n = path.len();
+    // No segments left: only the empty rest of the path matches.
+    let mut next: Vec<bool> = (0..=n).map(|j| j == n).collect();
+    let mut any = vec![false; n + 2];
+    for (i, seg) in segs.iter().enumerate().rev() {
+        next = match seg {
+            Seg::Deep => {
+                // Skip at least `min` parts, then the rest must match:
+                // `next[k]` for some `k >= j + min`, a suffix OR.
+                let min = usize::from(i + 1 == segs.len());
+                for j in (0..=n).rev() {
+                    any[j] = next[j] || any[j + 1];
+                }
+                (0..=n).map(|j| any[j + min]).collect()
+            }
+            Seg::Name(g) => (0..=n).map(|j| j < n && next[j + 1] && g.matches(path[j])).collect(),
+        };
+    }
+    next[0]
 }
 
 #[cfg(test)]
@@ -197,5 +239,49 @@ mod tests {
         assert!(r("!app/node_modules/").could_match_name("node_modules"));
         assert!(r("!a/**").could_match_name("anything"));
         assert!(!r("!a/keep").could_match_name("node_modules"));
+    }
+
+    /// Rules come from `.oneupignore` files, which sync from OneDrive: no
+    /// line may make matching slow, whatever its `**`s and however deep
+    /// the path.
+    #[test]
+    fn many_double_stars_match_quickly() {
+        let rule = r(&format!("{}x", "**/a/".repeat(12)));
+        let deep = vec!["a"; 60];
+        let t = std::time::Instant::now();
+        assert!(!rule.matches(&deep, false));
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "took {:?}", t.elapsed());
+    }
+
+    /// Both ways of matching `**` agree, on every rule and path built from
+    /// a few parts.
+    #[test]
+    fn double_star_table_agrees_with_trying_every_split() {
+        let parts = ["**", "a", "b", "*"];
+        let mut rules = vec![Vec::new()];
+        for _ in 0..4 {
+            let longer: Vec<Vec<&str>> = rules
+                .iter()
+                .flat_map(|r: &Vec<&str>| parts.iter().map(move |p| [r.clone(), vec![*p]].concat()))
+                .collect();
+            rules.extend(longer);
+        }
+        rules.sort();
+        rules.dedup();
+        let mut paths = vec![Vec::new()];
+        for _ in 0..5 {
+            let longer: Vec<Vec<&str>> =
+                paths.iter().flat_map(|p: &Vec<&str>| ["a", "b"].map(|x| [p.clone(), vec![x]].concat())).collect();
+            paths.extend(longer);
+        }
+        paths.sort();
+        paths.dedup();
+        for rule in rules.iter().filter(|r| !r.is_empty()) {
+            let segs: Vec<Seg> =
+                rule.iter().map(|s| if *s == "**" { Seg::Deep } else { Seg::Name(NameGlob::new(s)) }).collect();
+            for path in &paths {
+                assert_eq!(anchored_table(&segs, path), anchored_one_deep(&segs, path), "{rule:?} vs {path:?}");
+            }
+        }
     }
 }
