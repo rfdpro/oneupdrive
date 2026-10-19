@@ -10,6 +10,8 @@
 
 **Data folder**: where OneUpDrive keeps its settings, records and log (`%LOCALAPPDATA%\OneUpDrive`). Each account has its own. It is not your synced folder.
 
+**Duplicates**: files with the same content, in OneDrive or on this PC. OneUpDrive lists them and removes the copies you choose once you approve, never the last copy. See [Duplicates](files-on-demand.md#duplicates).
+
 **Exclude** (also *rule*, *preset*): leave a file or folder out of syncing. Excluding alone deletes nothing. The one exception is the optional **prune** setting, which removes OneDrive's copies of excluded items into OneDrive's recycle bin once they are on this PC ([details](excluding-files.md#what-happens-to-onedrives-copies)). A *preset* is a ready-made list of rules, such as `dev`. See [Choosing what syncs](excluding-files.md).
 
 **Files On-Demand**: files show in File Explorer with their real names but download only when you open them. See [Files On-Demand](files-on-demand.md).

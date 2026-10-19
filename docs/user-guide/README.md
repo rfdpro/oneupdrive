@@ -14,7 +14,7 @@ Welcome! This guide is for everyone, not just developers.
 **How it works**
 * [Syncing in depth](syncing.md): what happens to deleted and conflicting files, safety stops, the ransomware guard, getting files back
 * [Choosing what syncs](excluding-files.md): leaving out `node_modules`, temp files, huge videos…
-* [Files On-Demand and freeing space](files-on-demand.md): online-only files, freeing space by itself, your largest files
+* [Files On-Demand and freeing space](files-on-demand.md): online-only files, freeing space by itself, your largest files, duplicates
 * [Finding files](search.md): search all of OneDrive by name, online-only files too, from the window, a hotkey or `oneup find`
 * [More folders, backups, shared folders and accounts](folders.md): any folder with any OneDrive folder, one-way backups, your Desktop and Documents, folders others shared, several accounts
 * [Earlier versions and sharing](versions-and-sharing.md): getting an older version back, sharing links

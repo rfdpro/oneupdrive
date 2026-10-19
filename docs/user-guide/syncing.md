@@ -159,6 +159,9 @@ When you delete a folder with folders inside, OneDrive deletes the files first a
 
 `oneupd` also counts what it did in the **last 15 minutes**, so a mass deletion that happens slowly still triggers the stop. Restarting `oneupd` or the PC doesn't reset this count. If its record can't be read, `oneupd` says so and asks before every deletion, overwrite or move for the next 15 minutes. The message then says how many came before (including changes you already approved). `oneupd` keeps running but changes nothing until you answer. If the list is what you meant, run `oneup approve CODE` (`oneup status` shows the code again). To look first, open the list `oneupd` saves for each stop: `safety-stops\CODE.txt` in its data folder (`%LOCALAPPDATA%\OneUpDrive`), one line per item with what would happen to it. The icon in the notification area tells you too, and **Review…** in its menu answers. Once you approve, the stop is no longer shown, even while a large batch is still being carried out.
 
+### Removing duplicates
+Removing duplicate copies you chose ([Duplicates](files-on-demand.md#duplicates)) is a safety stop of its own, every time, however few copies: nothing goes until you approve that list. It holds nothing else back: sync goes on meanwhile.
+
 ### The content guard (ransomware)
 Ransomware encrypts your files where they are, keeping their names, so a sync app would dutifully send every scrambled file to OneDrive. Before sending an edited file, OneUpDrive looks at its first few kilobytes: a `.docx` must still look like a Word document, a `.pdf` like a PDF, a `.txt` like text, and so on for common types. If more than **20** edited files (within 15 minutes) suddenly don't, it stops and asks before sending any of them:
 
