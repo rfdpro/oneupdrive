@@ -807,3 +807,65 @@ fn rotation_makes_room_by_removing_the_oldest() {
     assert!(fs.make_room(&rotate, 26).unwrap().is_empty());
     assert_eq!(fs.versions().unwrap().len(), 1);
 }
+
+/// With a locator, items are found by path where the state database has
+/// them, never opened by ID; a path leading to another item is never acted
+/// on: the item is then found by ID.
+#[test]
+fn items_are_found_where_the_store_has_them_and_only_there() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let r = Root::new("locate");
+    let mut fs = r.fs();
+    let paths: Arc<Mutex<HashMap<LocalId, String>>> = Arc::default();
+    let known = Arc::clone(&paths);
+    fs.set_locator(Box::new(move |id| known.lock().unwrap().get(&id).cloned()));
+    std::fs::create_dir(r.p("sub")).unwrap();
+    std::fs::write(r.p("f.bin"), b"the planned file").unwrap();
+    std::fs::write(r.p("other.bin"), b"another file!!!!").unwrap();
+    let (f, other) = (id(&r.p("f.bin")), id(&r.p("other.bin")));
+    let hash = |fs: &LocalFs| match fs.apply(&approve(Op::Hash(pre(&r.p("f.bin"))))).unwrap() {
+        Done::Hashed { hash, .. } => hash,
+        _ => panic!(),
+    };
+
+    paths.lock().unwrap().insert(f, "/f.bin".into());
+    assert_eq!(hash(&fs), qxh(b"the planned file"));
+    let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
+    src.read_to_string(&mut String::new()).unwrap();
+    drop(src);
+    assert!(fs.is_present(f) && fs.presence(f) == Some(true));
+    assert_eq!(fs.name_of(f).as_deref(), Some("f.bin"));
+    assert_eq!(fs.opened_by_id(), 0, "found where the store has it");
+
+    // The store is behind: its path leads to another file of the same size.
+    paths.lock().unwrap().insert(f, "/other.bin".into());
+    assert_eq!(hash(&fs), qxh(b"the planned file"), "the planned file, not the one at the path");
+    assert_eq!(fs.opened_by_id(), 1);
+    let sub = id(&r.p("sub"));
+    let mv = fs.apply(&approve(Op::MoveLocal {
+        sid: 1,
+        local: pre(&r.p("f.bin")),
+        to: sub,
+        parent: 0,
+        name: "f.bin".into(),
+    }));
+    assert!(mv.is_ok(), "{mv:?}");
+    assert!(r.p("sub/f.bin").exists() && r.p("other.bin").exists() && !r.p("f.bin").exists());
+    assert_eq!(std::fs::read(r.p("other.bin")).unwrap(), b"another file!!!!");
+    assert_eq!(fs.name_of(other).as_deref(), Some("other.bin"));
+
+    // Paths that aren't one name per level are no hint; a path to nothing
+    // isn't taken for the item being gone.
+    for bad in ["/../f.bin", "/sub/./f.bin", r"/sub\f.bin"] {
+        paths.lock().unwrap().insert(f, bad.into());
+        let before = fs.opened_by_id();
+        assert_eq!(fs.name_of(f).as_deref(), Some("f.bin"), "{bad}");
+        assert_eq!(fs.opened_by_id(), before + 1, "{bad}");
+    }
+    paths.lock().unwrap().insert(f, "/f.bin".into());
+    assert_eq!(fs.presence(f), Some(true));
+    std::fs::remove_file(r.p("sub/f.bin")).unwrap();
+    paths.lock().unwrap().insert(f, "/sub/f.bin".into());
+    assert_eq!(fs.presence(f), Some(false));
+}

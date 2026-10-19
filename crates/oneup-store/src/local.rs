@@ -477,6 +477,16 @@ impl Ops<'_> {
         rows.map(|r| fix_local(r?)).collect()
     }
 
+    /// How many entries folder `parent_id` holds, counting no further than
+    /// `limit` (so a large folder costs `limit` index entries, not all).
+    pub fn local_child_count_upto(&self, parent_id: u128, limit: usize) -> Result<usize> {
+        let n: i64 = self
+            .c
+            .prepare_cached("SELECT count(*) FROM (SELECT 1 FROM local_item WHERE parent_id = ?1 LIMIT ?2)")?
+            .query_row(rusqlite::params![blob(parent_id), i64::try_from(limit).unwrap_or(i64::MAX)], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// How many entries folder `parent_id` holds, and the first `limit` of
     /// them by name: a look into a folder that may be large (the settings
     /// window), without loading it whole.
@@ -708,6 +718,28 @@ mod tests {
             finished_at_ms: None,
             sync_root_provider: Some("OneDrive".into()),
         }
+    }
+
+    #[test]
+    fn child_counts_stop_at_the_limit_and_a_second_connection_reads_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Store::open(&dir.join("state.db"), 1024).unwrap();
+        scanned(&mut s);
+        s.read(|o| {
+            assert_eq!(o.local_child_count_upto(2, 10)?, 2);
+            assert_eq!(o.local_child_count_upto(2, 1)?, 1, "never counts past the limit");
+            assert_eq!(o.local_child_count_upto(3, 10)?, 0);
+            Ok(())
+        })
+        .unwrap();
+        let reader = s.reopen(256).unwrap().unwrap();
+        s.write(|o| o.local_put(&row(9, Some(2), "late.txt", LocalKind::File)).map(|_| ())).unwrap();
+        assert_eq!(reader.read(|o| o.local_path_of(9)).unwrap().as_deref(), Some("/a/late.txt"));
+        assert!(Store::open_in_memory().unwrap().reopen(256).unwrap().is_none());
+        drop((s, reader));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// root(1) / a(2) / { f(3), node_modules(4, excluded) }, plus a link(5)

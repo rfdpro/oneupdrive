@@ -856,7 +856,13 @@ impl Sync {
     fn start(dir: &Path, store: Store, cloud: &Fake) -> (Observer, Executor<Fake>) {
         let rules = ExcludeSet::none();
         let root = store.read(|o| o.local_root()).unwrap().unwrap();
-        let fs = LocalFs::open(dir, root.volume_serial, root.root_file_id, "test-token", true).unwrap();
+        let mut fs = LocalFs::open(dir, root.volume_serial, root.root_file_id, "test-token", true).unwrap();
+        // As the app does: the effects find items where the Local tree has
+        // them, through their own connection (a database on disk only).
+        if let Some(reader) = store.reopen(256).unwrap() {
+            let reader = std::sync::Mutex::new(reader);
+            fs.set_locator(Box::new(move |id| reader.lock().unwrap().read(|o| o.local_path_of(id.0)).unwrap()));
+        }
         let obs = Observer::open(store, Config::new(rules.clone())).unwrap();
         (obs, Executor::new(fs, cloud.clone(), rules))
     }
@@ -3957,4 +3963,34 @@ async fn deletions_chosen_for_many_held_items_still_trip_the_circuit_breaker() {
     assert_eq!(r.breakers.len(), 1, "{:?}", r.breakers);
     assert!(!r.approved.iter().any(|a| matches!(a.op(), Op::DeleteRemote { .. })));
     assert!(cloud.tree().contains_key("/big/f0.txt"));
+}
+
+/// Edits, saves by rename, renames here and new versions from OneDrive sync
+/// without opening any file by ID: while a file is open that way, a program
+/// saving it by renaming another file over it fails. The executor finds
+/// files where the Local tree has them.
+#[tokio::test]
+async fn everyday_syncing_opens_no_file_by_id() {
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("everyday-by-path", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    write(&s.p("docs/report.txt"), b"report v1");
+    write(&s.p("docs/plan.txt"), b"plan");
+    cloud.add("theirs.txt", Some(b"theirs v1"));
+    s.settle().await;
+    let before = s.exec.local().opened_by_id();
+
+    write(&s.p("notes.txt"), b"v2, edited in place");
+    write(&s.p("docs/report.tmp"), b"report v2, saved by rename");
+    std::fs::rename(s.p("docs/report.tmp"), s.p("docs/report.txt")).unwrap();
+    std::fs::rename(s.p("docs/plan.txt"), s.p("docs/plan v2.txt")).unwrap();
+    cloud.edit("theirs.txt", b"theirs v2");
+    s.settle().await;
+
+    let t = cloud.tree();
+    assert!(t.contains_key("/docs/plan v2.txt"), "{:?}", names(&t));
+    assert_eq!(t["/notes.txt"].as_deref(), Some(&b"v2, edited in place"[..]));
+    assert_eq!(t["/docs/report.txt"].as_deref(), Some(&b"report v2, saved by rename"[..]));
+    assert_eq!(std::fs::read(s.p("theirs.txt")).unwrap(), b"theirs v2");
+    assert_eq!(s.exec.local().opened_by_id(), before, "every file found by path");
 }

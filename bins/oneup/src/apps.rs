@@ -119,6 +119,7 @@ fn run(dir: &Path, root: &Path, rx: &Receiver<u128>) {
     use std::os::windows::fs::MetadataExt as _;
     let Ok(volume) = oneup_ntfs::win::Volume::open_containing(root) else { return };
     let Ok(mut store) = crate::setup::open_store(dir, 1024) else { return };
+    let top = root.to_path_buf();
     let root = comparable(root);
     let own = format!("{root}\\{}", oneup_rules::ENGINE_DIR.to_lowercase());
     let mut seen: HashMap<u128, Instant> = HashMap::new();
@@ -141,7 +142,15 @@ fn run(dir: &Path, root: &Path, rx: &Receiver<u128>) {
             let now = Instant::now();
             if seen.get(&id).is_none_or(|t| now.duration_since(*t) > QUIET) {
                 seen.insert(id, now);
-                if let Some(path) = volume.path_of(oneup_ntfs::FileId(id)) {
+                // Where the Local tree has it, so the file isn't opened by ID
+                // (a save by rename over it would fail meanwhile), unless
+                // it isn't there (new, or not caught up yet).
+                let hint = store
+                    .read(|o| o.local_path_of(id))
+                    .ok()
+                    .flatten()
+                    .map(|rel| rel.split('/').filter(|p| !p.is_empty()).fold(top.clone(), |p, part| p.join(part)));
+                if let Some(path) = volume.path_of(oneup_ntfs::FileId(id), hint.as_deref()) {
                     let p = comparable(&path);
                     // Attributes only (no data access, so nothing is
                     // downloaded): a file that went online-only since the

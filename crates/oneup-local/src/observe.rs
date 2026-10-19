@@ -10,9 +10,18 @@
 //!   links, that's recorded as evidence (`note_local_deleted`); it is the
 //!   only thing that ever is. The item's own record is required: a folder
 //!   delete is evidence for that folder, not for rows still stored below it.
-//! * Any other record means "look again": the item is read *by file ID*
-//!   ([`Volume::stat_by_id`]), because unprivileged records carry no names
-//!   (measured). Its parent comes from the record. Then:
+//! * Any other record means "look again". Its parent comes from the
+//!   record, but unprivileged records carry no names (measured), so the
+//!   item is read from its parent's listing without being opened ([`Lookup`]:
+//!   while a file is open, some programs can't save it by renaming another
+//!   file over it, see `win::Volume`). It's looked up there under its
+//!   stored name, then under names other items of that folder gave up in
+//!   the same batch (a save by rename leaves the new file with the old
+//!   one's name), each one lookup in the folder's index; failing those, a
+//!   folder of at most [`LIST_WHOLE_MAX`] entries is listed whole, once per
+//!   batch. Only an item with a new name in a larger folder is opened, by
+//!   file ID ([`Volume::stat_by_id`]). Not in the record's folder any more:
+//!   it moved or went since, and its later record says so. Then:
 //!   - parent in the tree (a listed folder): the item is stored or updated,
 //!     which covers creates, edits, renames and moves within the tree;
 //!     a folder that is new to the tree is queued and listed with the
@@ -47,9 +56,11 @@
 //! observer would have applied; nothing is inferred from absence.
 //!
 //! ## Cost
-//! Proportional to the journal's records, not the tree: one indexed lookup
-//! per mentioned ID, and one open-by-ID per item inside the tree. Folders
-//! are listed only when they enter the tree. The journal is volume-wide, so
+//! Proportional to the journal's records, not the tree: a few indexed
+//! lookups per mentioned ID, and per item inside the tree a lookup or two
+//! in its folder's index (or a share of one whole listing of a folder of at
+//! most [`LIST_WHOLE_MAX`] entries per batch). Folders are listed only when
+//! they enter the tree or for such a lookup. The journal is volume-wide, so
 //! activity elsewhere on the disk costs a lookup per record and nothing more.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -135,20 +146,53 @@ pub struct Changes {
     pub unreadable: u64,
     /// Folders queued for listing because they entered the tree.
     pub folders_queued: u64,
+    /// Items that had to be opened by ID to be read: a new name in a
+    /// folder too large to list whole (see the module docs).
+    pub opened_by_id: u64,
     /// Folders whose children changed (old and new parents, and folders
     /// that entered the tree). The sync engine plans exactly these.
     pub dirty: BTreeSet<u128>,
 }
 
-/// What reading an item by file ID found.
+/// What reading an item a record mentions found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stat {
     Found(DirEntry),
-    /// No such item (any more). If it was deleted, its delete record follows.
+    /// No such item (any more), or not in the record's folder now. If it
+    /// was deleted, its delete record follows; if it moved, its record of
+    /// the move does.
     Gone,
     /// It exists but couldn't be read.
     Unreadable,
 }
+
+/// An item to read, with what the store knows that lets it be read from
+/// its folder's listing, without opening it (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lookup {
+    pub id: FileId,
+    /// The folder the record places it in (a listed folder of the tree).
+    pub parent: FileId,
+    /// Names to look up in `parent`, most likely first: its stored name,
+    /// then names that items of `parent` gave up in the same batch (a save
+    /// that renames a new file over the old one, or moves the old one
+    /// aside first, leaves the new file with the old one's name).
+    pub names: Vec<String>,
+    /// Whether `parent` is small enough to list whole when no name finds
+    /// the item ([`LIST_WHOLE_MAX`]).
+    pub list_whole: bool,
+}
+
+/// The most entries a folder may hold to be listed whole for an item none
+/// of whose [`Lookup::names`] finds it (a new name). Listed once per batch,
+/// for all of its items that need it. A larger folder's item is opened by
+/// ID instead: listing it per batch would cost more than the folder's
+/// changes, and that open is brief.
+pub const LIST_WHOLE_MAX: usize = 4096;
+
+/// At most this many [`Lookup::names`] are tried: each is one lookup in the
+/// folder's index.
+const NAMES_MAX: usize = 8;
 
 /// Whether `id` is a stored folder whose contents are listed, i.e. a place
 /// in the tree that children can occupy.
@@ -156,9 +200,6 @@ fn listed_folder(o: &Ops<'_>, id: u128) -> Result<bool> {
     Ok(o.local_get(id)?.is_some_and(|r| matches!(r.kind, LocalKind::Folder | LocalKind::Root) && r.skip == Skip::None))
 }
 
-/// Applies one batch of journal records to the Local tree (see the module
-/// docs). Pure apart from `stat`, which reads an item's current metadata,
-/// so it can be tested with made-up records.
 /// What [`reapply_rules`] changed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Reapplied {
@@ -213,13 +254,15 @@ pub fn reapply_rules(o: &Ops<'_>, rules: &ExcludeSet) -> oneup_store::Result<Opt
     Ok(Some(done))
 }
 
+/// Applies one batch of journal records to the Local tree (see the module
+/// docs). Pure apart from `stat`, which reads an item's current metadata,
+/// so it can be tested with made-up records.
 pub fn apply_records(
     o: &Ops<'_>,
     root_id: u128,
     rules: &ExcludeSet,
     records: &[UsnRecord],
-    // (item, its parent per the record)
-    stat: &mut dyn FnMut(FileId, FileId) -> Stat,
+    stat: &mut dyn FnMut(&Lookup) -> Stat,
     ch: &mut Changes,
 ) -> Result<()> {
     // Last record per ID, in the order those last records were written:
@@ -231,6 +274,8 @@ pub fn apply_records(
     }
     let mut order: Vec<usize> = last.into_values().collect();
     order.sort_unstable();
+    let freed = freed_names(o, records)?;
+    let mut small: HashMap<u128, bool> = HashMap::new();
 
     for r in order.into_iter().map(|i| &records[i]) {
         let id = r.file_id.0;
@@ -273,7 +318,25 @@ pub fn apply_records(
             }
             continue;
         }
-        let entry = match stat(r.file_id, r.parent_id) {
+        let mut names: Vec<String> = known.iter().map(|k| k.name.clone()).collect();
+        for n in freed.get(&parent).into_iter().flatten().rev() {
+            if names.len() >= NAMES_MAX {
+                break;
+            }
+            if !names.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        // Counted once per folder and batch, and never past the bound.
+        let list_whole = match small.get(&parent) {
+            Some(&s) => s,
+            None => {
+                let s = o.local_child_count_upto(parent, LIST_WHOLE_MAX + 1)? <= LIST_WHOLE_MAX;
+                small.insert(parent, s);
+                s
+            }
+        };
+        let entry = match stat(&Lookup { id: r.file_id, parent: r.parent_id, names, list_whole }) {
             Stat::Found(e) if !e.name.is_empty() => e,
             Stat::Found(_) | Stat::Unreadable => {
                 ch.unreadable += 1;
@@ -312,6 +375,25 @@ pub fn apply_records(
         }
     }
     Ok(())
+}
+
+/// The stored names that items deleted or renamed in `records` gave up, by
+/// folder, in record order: as the store had them before the batch. One
+/// indexed lookup per such item.
+fn freed_names(o: &Ops<'_>, records: &[UsnRecord]) -> Result<HashMap<u128, Vec<String>>> {
+    let mut freed: HashMap<u128, Vec<String>> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in records.iter().filter(|r| r.has(reason::FILE_DELETE) || r.has(reason::RENAME_OLD_NAME)) {
+        if !seen.insert(r.file_id.0) {
+            continue;
+        }
+        if let Some(row) = o.local_get(r.file_id.0)?
+            && let Some(parent) = row.parent_id
+        {
+            freed.entry(parent).or_default().push(row.name);
+        }
+    }
+    Ok(freed)
 }
 
 /// The most delete records [`SeenDeletes`] keeps (32 bytes each, so at most
@@ -510,9 +592,10 @@ mod driver {
     use oneup_ntfs::win::{self, Volume};
     use oneup_store::{LocalRoot, Store};
 
-    use super::{Changes, Error, Rescan, Result, Stat, apply_records};
+    use super::{Changes, Error, Lookup, Rescan, Result, Stat, apply_records};
     use crate::classify;
     use crate::scan::{Config, Progress, list_queued};
+    use std::collections::HashMap;
 
     /// Brings a finished scan up to date from the change journal.
     pub struct Observer {
@@ -607,19 +690,17 @@ mod driver {
                 }
                 ch.records += records.len() as u64;
                 let (volume, rules, root_id) = (&self.volume, &self.cfg.rules, self.root.root_file_id);
-                let mut stat = |id: FileId, parent: FileId| match volume.stat_by_id(id) {
-                    Ok(Some(e)) => as_listed(volume, parent, e),
-                    Ok(None) => Stat::Gone,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "changed item could not be read");
-                        Stat::Unreadable
-                    }
-                };
+                let by_id = volume.opened_by_id();
+                // Whole listings, per folder, for this batch only.
+                let mut listings: HashMap<u128, Option<Vec<DirEntry>>> = HashMap::new();
+                let buf = &mut self.buf;
+                let mut stat = |l: &Lookup| read_item(volume, l, &mut listings, buf);
                 self.store.try_write(|o| {
                     apply_records(o, root_id, rules, &records, &mut stat, &mut ch)?;
                     o.local_set_journal_cursor(next)?;
                     Ok::<_, Error>(())
                 })?;
+                ch.opened_by_id += self.volume.opened_by_id() - by_id;
                 self.cursor = next;
                 self.drain_queue()?;
             }
@@ -741,6 +822,56 @@ mod driver {
 
     fn oldest(j: &win::JournalInfo) -> i64 {
         j.first_usn.max(j.lowest_valid_usn)
+    }
+
+    /// Reads the item `l` names from its folder's listing, so the item
+    /// itself is never opened: while a file is open, some programs can't
+    /// save it by renaming another file over it (`win::Volume`'s docs).
+    /// First its likely names, each one lookup in the folder's index
+    /// (`Volume::listed_in`), then the whole listing of a small folder
+    /// (once per batch, in `listings`). Only an item with a new name in a
+    /// large folder is opened, by ID: nothing else tells its name.
+    fn read_item(
+        volume: &Volume,
+        l: &Lookup,
+        listings: &mut HashMap<u128, Option<Vec<DirEntry>>>,
+        buf: &mut [u8],
+    ) -> Stat {
+        for name in &l.names {
+            match volume.listed_in(l.parent, name, l.id) {
+                Ok(Some(e)) => return Stat::Found(e),
+                Ok(None) => {}
+                // The folder itself went: so did the item, from there.
+                Err(e) if e.is_not_found() => return Stat::Gone,
+                Err(e) => {
+                    tracing::debug!(error = %e, "a changed item's folder could not be read");
+                    return Stat::Unreadable;
+                }
+            }
+        }
+        if l.list_whole {
+            let listed = listings.entry(l.parent.0).or_insert_with(|| {
+                let mut out = Vec::new();
+                match volume.open_dir_by_id(l.parent).and_then(|h| win::list_dir(&h, buf, &mut out)) {
+                    Ok(()) => Some(out),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "a changed item's folder could not be listed");
+                        None
+                    }
+                }
+            });
+            if let Some(entries) = listed {
+                return entries.iter().find(|e| e.file_id == l.id).map_or(Stat::Gone, |e| Stat::Found(e.clone()));
+            }
+        }
+        match volume.stat_by_id(l.id) {
+            Ok(Some(e)) => as_listed(volume, l.parent, e),
+            Ok(None) => Stat::Gone,
+            Err(e) => {
+                tracing::debug!(error = %e, "changed item could not be read");
+                Stat::Unreadable
+            }
+        }
     }
 
     /// A cloud placeholder folder read by ID, with the attributes its
@@ -944,14 +1075,23 @@ mod tests {
 
     /// Applies `records` with a fake file system holding `live` entries.
     fn apply(s: &mut Store, records: &[UsnRecord], live: &[DirEntry]) -> Changes {
+        apply_seen(s, records, live).0
+    }
+
+    /// [`apply`], also returning what each read was told.
+    fn apply_seen(s: &mut Store, records: &[UsnRecord], live: &[DirEntry]) -> (Changes, Vec<Lookup>) {
         let mut ch = Changes::default();
-        let mut stat = |id: FileId, _| match live.iter().find(|e| e.file_id == id) {
-            Some(e) => Stat::Found(e.clone()),
-            None => Stat::Gone,
+        let mut asked = Vec::new();
+        let mut stat = |l: &Lookup| {
+            asked.push(l.clone());
+            match live.iter().find(|e| e.file_id == l.id) {
+                Some(e) => Stat::Found(e.clone()),
+                None => Stat::Gone,
+            }
         };
         s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), records, &mut stat, &mut ch)).unwrap();
         assert!(s.read(|o| o.check_invariants()).unwrap().is_empty());
-        ch
+        (ch, asked)
     }
 
     fn path(s: &Store, id: u128) -> Option<String> {
@@ -976,6 +1116,53 @@ mod tests {
         assert_eq!(s.read(|o| o.local_get(4)).unwrap().map(|r| r.size), Some(9));
         assert_eq!((ch.created, ch.updated, ch.deleted), (1, 2, 0));
         assert_eq!(ch.dirty, [ROOT_ID, 2].into());
+    }
+
+    #[test]
+    fn items_are_looked_up_under_their_stored_and_freed_names() {
+        let mut s = tree();
+        // An edit; a save that renamed new file 6 over b.txt (4); a save
+        // that moved a.txt (3) aside to `~old` first, then renamed 7 in.
+        let (_, asked) = apply_seen(
+            &mut s,
+            &[
+                rec(2, ROOT_ID, reason::BASIC_INFO_CHANGE),
+                rec(6, ROOT_ID, reason::FILE_CREATE),
+                rec(4, ROOT_ID, reason::FILE_DELETE),
+                rec(6, ROOT_ID, reason::RENAME_NEW_NAME),
+                rec(3, 2, reason::RENAME_OLD_NAME),
+                rec(3, 2, reason::RENAME_NEW_NAME),
+                rec(7, 2, reason::RENAME_NEW_NAME),
+                rec(3, 2, reason::FILE_DELETE),
+                rec(8, ROOT_ID, reason::FILE_CREATE),
+            ],
+            &[entry(2, "docs", DIR, 0), entry(6, "b.txt", 0, 2), entry(7, "a.txt", 0, 3), entry(8, "new.txt", 0, 1)],
+        );
+        let names = |id: u128| asked.iter().find(|l| l.id.0 == id).map(|l| l.names.clone()).unwrap();
+        assert_eq!(names(2)[0], "docs", "its stored name first");
+        assert_eq!(names(6), ["b.txt"], "the name b.txt gave up");
+        assert_eq!(names(7), ["a.txt"]);
+        assert!(names(8).contains(&"b.txt".to_string()) && asked.iter().all(|l| l.list_whole));
+        assert_eq!(path(&s, 6).as_deref(), Some("/b.txt"));
+        assert_eq!(path(&s, 7).as_deref(), Some("/docs/a.txt"));
+    }
+
+    #[test]
+    fn a_large_folder_is_not_listed_whole() {
+        let mut s = tree();
+        s.write(|o| {
+            for i in 0..=LIST_WHOLE_MAX as u128 {
+                o.local_update(&row(1000 + i, 2, &format!("f{i}"), LocalKind::File))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let (_, asked) = apply_seen(
+            &mut s,
+            &[rec(9, 2, reason::FILE_CREATE), rec(10, ROOT_ID, reason::FILE_CREATE)],
+            &[entry(9, "n9", 0, 1), entry(10, "n10", 0, 1)],
+        );
+        assert_eq!(asked.iter().map(|l| (l.id.0, l.list_whole)).collect::<Vec<_>>(), [(9, false), (10, true)]);
     }
 
     #[test]
@@ -1047,8 +1234,7 @@ mod tests {
         let mut s = tree();
         let mut ch = Changes::default();
         let records = [rec(4, ROOT_ID, reason::FILE_DELETE), rec(ROOT_ID, 0, reason::FILE_DELETE)];
-        let r =
-            s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), &records, &mut |_, _| Stat::Gone, &mut ch));
+        let r = s.try_write(|o| apply_records(o, ROOT_ID, &ExcludeSet::dev(), &records, &mut |_| Stat::Gone, &mut ch));
         assert!(matches!(r, Err(Error::NeedsRescan(Rescan::RootGone))));
         assert!(s.read(|o| o.local_get(4)).unwrap().is_some(), "the batch was rolled back");
     }
@@ -1216,7 +1402,7 @@ mod tests {
                 ROOT_ID,
                 &ExcludeSet::dev(),
                 &[rec(3, 2, reason::CLOSE)],
-                &mut |_, _| Stat::Unreadable,
+                &mut |_| Stat::Unreadable,
                 &mut ch,
             )
         })
