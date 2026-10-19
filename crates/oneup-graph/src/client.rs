@@ -1200,7 +1200,9 @@ mod tests {
     #[tokio::test]
     async fn a_download_that_stops_receiving_fails_instead_of_hanging() {
         let mut g = graph();
-        g.stall = Duration::from_millis(300);
+        // Long enough for a loopback request to be answered while the
+        // crate's other tests run in parallel (300 ms wasn't).
+        g.stall = Duration::from_millis(1500);
         let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_vec(), vec![], Duration::ZERO).await;
         let mut out = Vec::new();
         let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await;
@@ -1211,13 +1213,13 @@ mod tests {
     #[tokio::test]
     async fn a_slow_download_that_keeps_moving_completes() {
         let mut g = graph();
-        g.stall = Duration::from_millis(300);
-        // Ten bytes, 100 ms apart: much longer in total than the stall limit.
-        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".to_vec();
-        let url = serve(head, vec![b"x"; 10], Duration::from_millis(100)).await;
+        g.stall = Duration::from_millis(1500);
+        // Six bytes, 500 ms apart: twice the stall limit in total.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n".to_vec();
+        let url = serve(head, vec![b"x"; 6], Duration::from_millis(500)).await;
         let mut out = Vec::new();
         let n = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap().unwrap();
-        assert_eq!((n, out.as_slice()), (10, b"xxxxxxxxxx".as_slice()));
+        assert_eq!((n, out.as_slice()), (6, b"xxxxxx".as_slice()));
     }
 
     #[tokio::test]
