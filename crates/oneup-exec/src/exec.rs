@@ -476,6 +476,9 @@ fn claims_in(o: &Ops<'_>, op: &Op) -> oneup_store::Result<Claims> {
         Op::Upload { local, .. } => {
             c.large = local.stamp.is_some_and(|(size, _)| usize::try_from(size).is_ok_and(|s| s > SIMPLE_UPLOAD_MAX));
         }
+        // Reads a whole file as fast as the disk allows: how many at once
+        // has a limit of its own (`Parallel::hashes`).
+        Op::Hash(_) => c.hash = true,
         _ => {}
     }
     Ok(c)
@@ -912,7 +915,7 @@ impl<C: Cloud> Executor<C> {
                 let ready = if c.alone {
                     held.units == 0 && k == 0
                 } else {
-                    !held.conflicts(c) && !earlier.conflicts(c) && !(c.large && held.large >= limits.large_uploads)
+                    !held.conflicts(c) && !earlier.conflicts(c) && held.has_room(c, limits)
                 };
                 if !ready {
                     if c.alone {
@@ -2280,7 +2283,10 @@ mod tests {
                     },
                 ];
                 for op in reads {
-                    assert!(!claims_in(o, &op)?.alone, "{op:?}");
+                    let c = claims_in(o, &op)?;
+                    assert!(!c.alone, "{op:?}");
+                    // Hashing keeps to its own limit instead.
+                    assert_eq!(c.hash, matches!(op, Op::Hash(_)), "{op:?}");
                 }
                 Ok(())
             })
