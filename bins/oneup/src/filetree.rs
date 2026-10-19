@@ -10,6 +10,7 @@
 //! folder that's left out is stored as one row (its contents aren't
 //! tracked), so its contents aren't listed.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -300,34 +301,22 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
             return Ok(json!({ "rel": rel, "state": state, "why": why, "items": [], "untracked": true }));
         }
     }
-    let locals: Vec<LocalRow> = match &row {
-        Some(r) => store.read(|o| o.local_children(r.file_id))?,
-        None => Vec::new(),
+    let (locals, links): (Vec<LocalRow>, HashMap<u128, Option<String>>) = match &row {
+        Some(r) => (
+            store.read(|o| o.local_children(r.file_id))?,
+            store.read(|o| o.local_children_links(r.file_id))?.into_iter().collect(),
+        ),
+        None => (Vec::new(), HashMap::new()),
     };
-    let remotes: Vec<(RemoteRow, bool)> = match remote_at(&store, &parts, steps)? {
-        Some(id) => store.read(|o| o.remote_children(&id))?,
-        None => Vec::new(),
+    let (remotes, rlinks): (Vec<(RemoteRow, bool)>, HashSet<String>) = match remote_at(&store, &parts, steps)? {
+        Some(id) => (
+            store.read(|o| o.remote_children(&id))?,
+            store.read(|o| o.remote_children_linked(&id))?.into_iter().collect(),
+        ),
+        None => (Vec::new(), HashSet::new()),
     };
-    // Each item here with its Synced row, if it has one: whether it's
-    // synced, and with which item in OneDrive.
-    let mut links = std::collections::HashMap::new();
-    let mut here = Vec::new();
-    for l in locals {
-        if parts.is_empty() && oneup_sync::same_name(&l.name, ENGINE_DIR) {
-            continue;
-        }
-        if let Some(b) = store.read(|o| o.synced_by_local(l.file_id))? {
-            links.insert(l.file_id, b.remote.map(|r| r.0));
-        }
-        here.push(l);
-    }
-    // And each item in OneDrive that has one.
-    let mut rlinks = std::collections::HashSet::new();
-    for (r, _) in &remotes {
-        if store.read(|o| o.synced_by_remote(&r.id))?.is_some() {
-            rlinks.insert(r.id.clone());
-        }
-    }
+    let here: Vec<LocalRow> =
+        locals.into_iter().filter(|l| !(parts.is_empty() && oneup_sync::same_name(&l.name, ENGINE_DIR))).collect();
     let rows = merge(
         here,
         remotes,
@@ -339,13 +328,9 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
     );
     let total = rows.len();
     let mut items = Vec::new();
-    for (l, r) in rows {
-        let name =
-            l.as_ref().map(|l| l.name.clone()).or_else(|| r.as_ref().map(|r| r.0.name.clone())).unwrap_or_default();
-        let folder = l.as_ref().map_or_else(
-            || r.as_ref().is_some_and(|r| r.0.kind == Kind::Folder),
-            |l| matches!(l.kind, LocalKind::Folder | LocalKind::Root),
-        );
+    for row in first_rows(rows, MAX_LISTED) {
+        let (name, folder) = (row_name(&row).to_string(), row_is_folder(&row));
+        let (l, r) = row;
         let link = l.as_ref().is_some_and(|l| l.kind == LocalKind::Link);
         let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
         let synced = match (&l, &r) {
@@ -379,13 +364,36 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
             "remote_id": r.as_ref().map(|r| r.0.id.clone()),
         }));
     }
-    items.sort_by(|a, b| {
-        let key =
-            |v: &Value| (!v["folder"].as_bool().unwrap_or(false), v["name"].as_str().unwrap_or("").to_lowercase());
-        key(a).cmp(&key(b))
-    });
-    items.truncate(MAX_LISTED);
     Ok(json!({ "rel": rel, "items": items, "more": total.saturating_sub(MAX_LISTED), "untracked": false }))
+}
+
+type Row = (Option<LocalRow>, Option<(RemoteRow, bool)>);
+
+/// The first `max` rows as listed, folders first, then by name. Cut before
+/// any work per row (a rule verdict, a file's attributes), so a huge folder
+/// costs no more than that.
+fn first_rows(mut rows: Vec<Row>, max: usize) -> Vec<Row> {
+    rows.sort_by_cached_key(|row| (!row_is_folder(row), row_name(row).to_lowercase()));
+    rows.truncate(max);
+    rows
+}
+
+/// A row's name: this PC's, else OneDrive's.
+fn row_name(row: &Row) -> &str {
+    match row {
+        (Some(l), _) => &l.name,
+        (None, Some(r)) => &r.0.name,
+        (None, None) => "",
+    }
+}
+
+/// Whether a row is a folder: as on this PC, else as in OneDrive.
+fn row_is_folder(row: &Row) -> bool {
+    match row {
+        (Some(l), _) => matches!(l.kind, LocalKind::Folder | LocalKind::Root),
+        (None, Some(r)) => r.0.kind == Kind::Folder,
+        (None, None) => false,
+    }
 }
 
 /// The total size of everything inside each folder of the folder at `rel`
@@ -711,6 +719,42 @@ mod tests {
         );
         assert!(super::steps_from(&serde_json::json!([{ "l": "x" }])).is_err());
         assert!(super::steps_from(&serde_json::Value::Null).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rows_are_ordered_and_cut_before_anything_else() {
+        use oneup_store::{Kind, LocalKind, LocalRow, RemoteRow, Skip};
+        let local = |name: &str, kind| LocalRow {
+            file_id: 1,
+            parent_id: None,
+            name: name.into(),
+            name_lossy: false,
+            kind,
+            size: 0,
+            mtime: 0,
+            attributes: 0,
+            reparse_tag: 0,
+            skip: Skip::None,
+        };
+        let remote = |name: &str, kind| RemoteRow {
+            id: name.into(),
+            parent_id: None,
+            name: name.into(),
+            kind,
+            size: 0,
+            etag: None,
+            qxh: None,
+            mtime_ms: None,
+        };
+        let rows: Vec<super::Row> = vec![
+            (Some(local("b.txt", LocalKind::File)), None),
+            (None, Some((remote("Zeta", Kind::Folder), false))),
+            (Some(local("a.txt", LocalKind::File)), Some((remote("a.txt", Kind::File), false))),
+            (Some(local("alpha", LocalKind::Folder)), None),
+        ];
+        let names = |rows: Vec<super::Row>| rows.iter().map(|r| super::row_name(r).to_string()).collect::<Vec<_>>();
+        assert_eq!(names(super::first_rows(rows.clone(), 10)), ["alpha", "Zeta", "a.txt", "b.txt"]);
+        assert_eq!(names(super::first_rows(rows, 3)), ["alpha", "Zeta", "a.txt"]);
     }
 
     /// Two OneDrive folders whose names fold alike, both listed and opened

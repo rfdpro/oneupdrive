@@ -318,6 +318,28 @@ impl Ops<'_> {
         row.map(fix_base).transpose()
     }
 
+    /// The children of local folder `parent` that have a Synced row, each
+    /// with the cloud item it links (if any): one query, by the parent and
+    /// link indexes.
+    pub fn local_children_links(&self, parent: u128) -> Result<Vec<(u128, Option<String>)>> {
+        let mut st = self.c.prepare_cached(
+            "SELECT l.file_id, s.remote_id FROM local_item l JOIN synced_item s ON s.local_id = l.file_id
+             WHERE l.parent_id = ?1",
+        )?;
+        let rows = st.query_map([blob(parent)], |r| Ok((id_from_blob(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// The children of cloud folder `parent` that have a Synced row: one
+    /// query, by the parent and link indexes.
+    pub fn remote_children_linked(&self, parent: &str) -> Result<Vec<String>> {
+        let mut st = self.c.prepare_cached(
+            "SELECT r.id FROM remote_item r JOIN synced_item s ON s.remote_id = r.id WHERE r.parent_id = ?1",
+        )?;
+        let rows = st.query_map([parent], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     pub fn synced_by_remote(&self, id: &str) -> Result<Option<Base>> {
         let row = self
             .c
@@ -735,6 +757,28 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_folders_links_come_in_one_query_per_side() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            // Unlinked on both sides, and one linked inside `d`.
+            o.local_put(&lrow(4, Some(1), "new", LocalKind::File))?;
+            o.upsert_item(&rrow("n", Some("root"), "new", Kind::File), false)?;
+            o.local_put(&lrow(5, Some(3), "in", LocalKind::File))?;
+            o.upsert_item(&rrow("i", Some("d"), "in", Kind::File), false)?;
+            o.synced_insert(&base(0, Some(2), "in", NodeKind::File, 5, "i")).map(|_| ())
+        })
+        .unwrap();
+        let mut local = s.read(|o| o.local_children_links(1)).unwrap();
+        local.sort();
+        assert_eq!(local, [(2, Some("f".to_string())), (3, Some("d".to_string()))]);
+        let mut remote = s.read(|o| o.remote_children_linked("root")).unwrap();
+        remote.sort();
+        assert_eq!(remote, ["d", "f"]);
+        assert_eq!(s.read(|o| o.remote_children_linked("d")).unwrap(), ["i"]);
     }
 
     /// A file restored from the Recycle Bin before its deletion reached
