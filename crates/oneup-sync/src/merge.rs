@@ -59,12 +59,12 @@ fn remote_changed(b: &Base, r: &RemoteNode) -> bool {
 
 /// Where a local item is now, as an agreed location (parent `sid`, name).
 /// `None` if its parent isn't synced yet (it was moved into a new folder).
-fn local_loc<T: Trees + ?Sized>(t: &T, n: &LocalNode) -> Result<Option<(Sid, String)>, T::Error> {
+pub(crate) fn local_loc<T: Trees + ?Sized>(t: &T, n: &LocalNode) -> Result<Option<(Sid, String)>, T::Error> {
     let Some(p) = n.parent else { return Ok(None) };
     Ok(t.base_by_local(p)?.filter(|b| b.kind == NodeKind::Folder).map(|b| (b.sid, n.name.clone())))
 }
 
-fn remote_loc<T: Trees + ?Sized>(t: &T, n: &RemoteNode) -> Result<Option<(Sid, String)>, T::Error> {
+pub(crate) fn remote_loc<T: Trees + ?Sized>(t: &T, n: &RemoteNode) -> Result<Option<(Sid, String)>, T::Error> {
     let Some(p) = &n.parent else { return Ok(None) };
     Ok(t.base_by_remote(p)?.filter(|b| b.kind == NodeKind::Folder).map(|b| (b.sid, n.name.clone())))
 }

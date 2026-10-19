@@ -20,6 +20,7 @@
 mod merge;
 pub mod model;
 pub mod op;
+mod pending;
 mod resolve;
 
 pub use merge::{conflict_candidate, conflict_name};
@@ -28,6 +29,7 @@ pub use model::{
     strip_folded_prefix,
 };
 pub use op::{Dir, HoldReason, Link, LocalPre, Op, RemotePre, Vacates};
+pub use pending::pending_deletes;
 
 /// Plans one round over the given Synced folders (each folder's *children*
 /// are decided). A full pass passes every Synced folder ([`all_folders`]);
