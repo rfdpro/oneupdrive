@@ -1,0 +1,186 @@
+name: Nightly
+
+# Long runs that don't fit in CI: the sync and mirror simulations over many
+# more seeds, and each fuzz target for a fixed time. A failure opens an
+# issue (or comments on the open one) naming the failing seed or the
+# fuzzer's crash input; CONTRIBUTING.md says how to replay either.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  sim:
+    name: sim ${{ matrix.name }}
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      # Sizing, measured locally on release builds, one process each:
+      #   oneup-sync converge, SIM_STORE=0: 10,000 seeds in 8.9 s, ~1,100/s
+      #   oneup-sync backups,  SIM_STORE=0: 10,000 seeds in 4.6 s, ~2,150/s
+      #   oneup-sync converge, store check: 500 seeds in 103 s, ~4.9/s
+      #   oneup-sync backups,  store check: 500 seeds in 83 s, ~6/s
+      #   oneup-remote mirror:              200 seeds in 78 s, ~2.6/s; it
+      #     waits on its on-disk databases (4.4 s CPU in 15 s), so processes
+      #     run side by side: 8 at once gave ~12/s.
+      # A runner has 4 cores; assume each is half as fast:
+      #   converge: 4,000,000 / (4 x 550/s)   = ~30 min
+      #   backups:  4,000,000 / (4 x 1,075/s) = ~16 min
+      #   converge with the store check: 20,000 / (4 x 2.4/s) = ~35 min
+      #   backups with the store check:  20,000 / (4 x 3/s)   = ~28 min
+      #   mirror: 4 jobs x 12,000 seeds, 8 processes each at ~4/s = ~50 min
+      #     (millions would take days: each seed rebuilds a database on disk)
+      # Each job prints its real rate in the run summary; adjust here if one
+      # gets near its timeout.
+      matrix:
+        include:
+          - { name: converge, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 4000000, shard: 0, shards: 1, store: "0", procs: 4 }
+          - { name: backups, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 4000000, shard: 0, shards: 1, store: "0", procs: 4 }
+          - { name: converge-store, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 20000, shard: 0, shards: 1, store: "1", procs: 4 }
+          - { name: backups-store, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 20000, shard: 0, shards: 1, store: "1", procs: 4 }
+          - { name: mirror-1, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 0, shards: 4, store: "", procs: 8 }
+          - { name: mirror-2, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 1, shards: 4, store: "", procs: 8 }
+          - { name: mirror-3, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 2, shards: 4, store: "", procs: 8 }
+          - { name: mirror-4, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 3, shards: 4, store: "", procs: 8 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-sim
+      # Every night takes the next window of seeds, so coverage adds up
+      # instead of repeating; a failing seed replays alone with SIM_SEED.
+      - name: Simulate
+        shell: pwsh
+        env:
+          SIM_STORE: ${{ matrix.store }}
+          RUN: ${{ github.run_number }}
+        run: |
+          $count = [UInt64]${{ matrix.count }}
+          $from = 1 + ([UInt64]$env:RUN - 1) * $count * ${{ matrix.shards }} + $count * ${{ matrix.shard }}
+          ./.github/scripts/sim.ps1 -Package ${{ matrix.package }} -Test ${{ matrix.test }} `
+            -Name ${{ matrix.fn }} -From $from -Count $count -Processes ${{ matrix.procs }} -LogDir sim-logs
+      - name: Keep the failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-failures-sim-${{ matrix.name }}
+          path: sim-logs/failures.txt
+          if-no-files-found: ignore
+
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [usn_records, delta_page, push_frames, vault_decode, rules]
+    env:
+      # Per target, in seconds. libFuzzer fails an input that takes longer
+      # than -timeout or uses more than -rss_limit_mb.
+      FUZZ_SECONDS: "1800"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      # libFuzzer on MSVC builds with AddressSanitizer, whose runtime DLL is
+      # in the MSVC tools folder: this puts it on PATH.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: nightly-fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # The corpus a target grew on earlier nights, so each night starts
+      # where the last one stopped. Seeds in fuzz/seeds are always added.
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force fuzz/corpus/${{ matrix.target }} | Out-Null
+          cargo +nightly fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- `
+            -max_total_time=$env:FUZZ_SECONDS -timeout=10 -rss_limit_mb=2048 -print_final_stats=1
+          if ($LASTEXITCODE -ne 0) {
+            New-Item -ItemType Directory -Force fuzz/artifacts/${{ matrix.target }} | Out-Null
+            Get-ChildItem fuzz/artifacts/${{ matrix.target }} -File | ForEach-Object {
+              "fuzz target ``${{ matrix.target }}``: input ``$($_.Name)`` (artifact ``fuzz-${{ matrix.target }}``). Replay: ``cargo +nightly fuzz run ${{ matrix.target }} fuzz/artifacts/${{ matrix.target }}/$($_.Name)``"
+            } | Add-Content fuzz/artifacts/failures.txt
+            exit 1
+          }
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+      - name: Keep the failure note
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-failures-fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/failures.txt
+          if-no-files-found: ignore
+
+  report:
+    needs: [sim, fuzz]
+    # Only for main: a run started by hand on a branch reports in its log.
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true # none if every failing job died before its tests ran
+        with:
+          pattern: nightly-failures-*
+          path: failures
+          merge-multiple: false
+      - name: Open or update the issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const lines = [];
+            if (fs.existsSync('failures')) {
+              for (const dir of fs.readdirSync('failures')) {
+                const file = path.join('failures', dir, 'failures.txt');
+                if (fs.existsSync(file)) {
+                  lines.push(...fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map(l => `* ${l}`));
+                }
+              }
+            }
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `Nightly run [#${context.runNumber}](${run}) on \`${context.sha.slice(0, 7)}\` failed.`,
+              '',
+              ...(lines.length ? lines : ['* No seed or input was recorded (a job failed to build, or timed out); see the run.']),
+              '',
+              'Replaying is described in CONTRIBUTING.md (Nightly runs).',
+            ].join('\n');
+            const title = 'Nightly run failed';
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', creator: 'github-actions[bot]',
+            });
+            const existing = open.find(i => i.title === title && !i.pull_request);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
+            }
