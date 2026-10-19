@@ -1005,6 +1005,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A watch is read and dropped on any thread (the executor reads an
+    /// upload's source on blocking threads), but it lasts only as long as
+    /// the thread that started it: Windows cancels a thread's pending
+    /// requests when it ends, and the watch then reads as broken.
+    #[test]
+    fn a_write_watch_works_across_threads_but_ends_with_the_thread_that_started_it() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("oneup-ntfs-watch-threads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let vol = Volume::open_containing(&dir).unwrap();
+        let file = dir.join("doc.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let id = id_of(&dir, "doc.txt");
+
+        // Started here, checked and broken from another thread.
+        let w = vol.open_watched(id).unwrap().1;
+        let w = std::thread::spawn(move || {
+            assert!(!w.broken());
+            w
+        })
+        .join()
+        .unwrap();
+        assert!(!w.broken());
+        let watched = std::thread::spawn(move || {
+            std::fs::OpenOptions::new().write(true).open(dir.join("doc.txt")).unwrap().write_all(b"HELLO").unwrap();
+            w.broken()
+        });
+        assert!(watched.join().unwrap());
+
+        // Started on a thread that then ended.
+        let dir = std::env::temp_dir().join(format!("oneup-ntfs-watch-threads-{}", std::process::id()));
+        let w = std::thread::scope(|s| s.spawn(|| vol.open_watched(id).unwrap().1).join().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(w.broken(), "the request ended with its thread");
+        drop(w);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn id_of(dir: &Path, name: &str) -> FileId {
         let h = open_dir(dir).unwrap();
         let mut buf = vec![0u8; 64 * 1024];
