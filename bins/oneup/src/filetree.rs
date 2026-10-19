@@ -216,18 +216,21 @@ fn step<T, I: PartialEq + ?Sized>(
 }
 
 /// A folder's items on this PC and in OneDrive side by side, one row per
-/// item: an item here goes with the one in OneDrive it's synced with
-/// (`link`: that one's ID), else with the one spelled the same, else with
-/// one whose name folds alike (as Windows and OneDrive compare names), in
-/// turn. Names on one side that fold alike (OneDrive may keep both) each
-/// get a row.
+/// item. An item with a Synced row (`link`: `Some`, with its partner's ID
+/// if it has one; `rlinked` for an item in OneDrive) goes only with its
+/// partner, and stands alone if the partner isn't in this folder (moved
+/// elsewhere, or gone): a name says nothing about it. The others go with
+/// one spelled the same, else with one whose name folds alike (as Windows
+/// and OneDrive compare names), in turn. Names on one side that fold alike
+/// (OneDrive may keep both) each get a row.
 fn merge<'k, L, R>(
     locals: Vec<L>,
     remotes: Vec<R>,
     lname: impl Fn(&L) -> &str,
     rname: impl Fn(&R) -> &str,
-    link: impl Fn(&L) -> Option<&'k str>,
+    link: impl Fn(&L) -> Option<Option<&'k str>>,
     rid: impl Fn(&R) -> &str,
+    rlinked: impl Fn(&R) -> bool,
 ) -> Vec<(Option<L>, Option<R>)> {
     use std::collections::{HashMap, VecDeque};
     let mut remotes: Vec<Option<R>> = remotes.into_iter().map(Some).collect();
@@ -236,15 +239,19 @@ fn merge<'k, L, R>(
     let mut rows = Vec::new();
     let mut left = Vec::new();
     for l in locals {
-        match link(&l).and_then(|id| by_id.get(id)).and_then(|&i| remotes[i].take()) {
-            Some(r) => rows.push((Some(l), Some(r))),
+        match link(&l) {
+            Some(partner) => {
+                let r = partner.and_then(|id| by_id.get(id)).and_then(|&i| remotes[i].take());
+                rows.push((Some(l), r));
+            }
             None => left.push(l),
         }
     }
     let mut exact: HashMap<String, usize> = HashMap::new();
     let mut alike: HashMap<String, VecDeque<usize>> = HashMap::new();
     for (i, r) in remotes.iter().enumerate() {
-        if let Some(r) = r {
+        // Linked with an item that isn't here: never matched by name.
+        if let Some(r) = r.as_ref().filter(|r| !rlinked(r)) {
             exact.insert(rname(r).to_string(), i);
             alike.entry(oneup_sync::fold(rname(r))).or_default().push_back(i);
         }
@@ -314,13 +321,21 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
         }
         here.push(l);
     }
+    // And each item in OneDrive that has one.
+    let mut rlinks = std::collections::HashSet::new();
+    for (r, _) in &remotes {
+        if store.read(|o| o.synced_by_remote(&r.id))?.is_some() {
+            rlinks.insert(r.id.clone());
+        }
+    }
     let rows = merge(
         here,
         remotes,
         |l| &l.name,
         |r| &r.0.name,
-        |l| links.get(&l.file_id).and_then(|r| r.as_deref()),
+        |l| links.get(&l.file_id).map(|r| r.as_deref()),
         |r| &r.0.id,
+        |r| rlinks.contains(&r.0.id),
     );
     let total = rows.len();
     let mut items = Vec::new();
@@ -335,7 +350,7 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
         let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
         let synced = match (&l, &r) {
             (Some(l), _) if links.contains_key(&l.file_id) => true,
-            (_, Some(r)) => store.read(|o| o.synced_by_remote(&r.0.id))?.is_some(),
+            (_, Some(r)) => rlinks.contains(&r.0.id),
             _ => false,
         };
         let verdict = set.verdict(&child, folder);
@@ -609,28 +624,31 @@ mod tests {
         assert_eq!(super::clean("/a//b/./"), "a/b");
     }
 
-    /// `merge` of plain names; `links` pairs a local name with the remote
-    /// one it's synced with (remote IDs are their names here).
+    /// `merge` of plain names (remote IDs are their names here). `links`:
+    /// items here with the one in OneDrive they're synced with; `elsewhere`:
+    /// items in OneDrive synced with an item here that isn't in this folder.
     fn merged(
         locals: &[&'static str],
         remotes: &[&'static str],
         links: &[(&str, &'static str)],
+        elsewhere: &[&str],
     ) -> Vec<(Option<&'static str>, Option<&'static str>)> {
-        let link = |l: &&str| links.iter().find(|(a, _)| a == l).map(|(_, r)| *r);
-        super::merge(locals.to_vec(), remotes.to_vec(), |l| l, |r| r, link, |r| r)
+        let link = |l: &&str| links.iter().find(|(a, _)| a == l).map(|(_, r)| Some(*r));
+        let rlinked = |r: &&str| links.iter().any(|(_, x)| x == r) || elsewhere.contains(r);
+        super::merge(locals.to_vec(), remotes.to_vec(), |l| l, |r| r, link, |r| r, rlinked)
     }
 
     #[test]
     fn names_that_fold_alike_on_one_side_each_get_a_row() {
-        let got = merged(&["λογος", "ΛΟΓΟΣ"], &["λογοσ", "λογος"], &[]);
+        let got = merged(&["λογος", "ΛΟΓΟΣ"], &["λογοσ", "λογος"], &[], &[]);
         // The same spelling first, then one that folds alike.
         assert_eq!(got, [(Some("λογος"), Some("λογος")), (Some("ΛΟΓΟΣ"), Some("λογοσ"))]);
         // One here, two in OneDrive that fold alike: the other gets its own
         // row, under its own name.
-        let got = merged(&["λογος"], &["λογοσ", "λογος"], &[]);
+        let got = merged(&["λογος"], &["λογοσ", "λογος"], &[], &[]);
         assert_eq!(got, [(Some("λογος"), Some("λογος")), (None, Some("λογοσ"))]);
         // Only alike: paired in order, the rest alone.
-        let got = merged(&["Kit"], &["KIT", "\u{212A}it"], &[]);
+        let got = merged(&["Kit"], &["KIT", "\u{212A}it"], &[], &[]);
         assert_eq!(got, [(Some("Kit"), Some("KIT")), (None, Some("\u{212A}it"))]);
     }
 
@@ -638,11 +656,30 @@ mod tests {
     fn an_item_goes_with_the_one_it_is_synced_with_before_any_name() {
         // Synced with the other spelling (a rename not sent yet): the link
         // wins over the same name.
-        let got = merged(&["λογος"], &["λογος", "λογοσ"], &[("λογος", "λογοσ")]);
+        let got = merged(&["λογος"], &["λογος", "λογοσ"], &[("λογος", "λογοσ")], &[]);
         assert_eq!(got, [(Some("λογος"), Some("λογοσ")), (None, Some("λογος"))]);
-        // A link to something not listed here: by name as usual.
-        let got = merged(&["a"], &["A"], &[("a", "elsewhere")]);
-        assert_eq!(got, [(Some("a"), Some("A"))]);
+    }
+
+    #[test]
+    fn an_item_moved_in_from_another_folder_never_pairs_by_name() {
+        // Moved here on this PC (its OneDrive partner is still in the old
+        // folder): it stands alone, beside the unrelated `a` in OneDrive.
+        let got = merged(&["a"], &["A"], &[("a", "elsewhere")], &[]);
+        assert_eq!(got, [(Some("a"), None), (None, Some("A"))]);
+        // Synced, its partner gone: alone too.
+        let link = |_: &&str| Some(None);
+        let got = super::merge(vec!["a"], vec!["a"], |l| l, |r| r, link, |r| r, |_| false);
+        assert_eq!(got, [(Some("a"), None), (None, Some("a"))]);
+        // Moved here in OneDrive (its partner on this PC is still in the
+        // old folder): not paired with the new `a` here.
+        let got = merged(&["a"], &["a"], &[], &["a"]);
+        assert_eq!(got, [(Some("a"), None), (None, Some("a"))]);
+        // Both ways at once: each alone, never merged with the other's tree.
+        let got = merged(&["a", "b"], &["a", "b"], &[("a", "x")], &["b"]);
+        assert_eq!(got, [(Some("a"), None), (Some("b"), None), (None, Some("a")), (None, Some("b"))]);
+        // Unlinked items beside them still pair by name.
+        let got = merged(&["a", "c"], &["a", "C"], &[], &["a"]);
+        assert_eq!(got, [(Some("a"), None), (Some("c"), Some("C")), (None, Some("a"))]);
     }
 
     #[test]
