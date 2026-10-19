@@ -407,6 +407,28 @@ impl Volume {
         stat_handle(&h, id)
     }
 
+    /// [`Volume::stat_by_id`], only if the item is in folder `parent` now
+    /// (its path is in that folder's): `Ok(None)` if it isn't (it moved
+    /// since, or went). Compared by path, so it holds for names that aren't
+    /// valid Unicode too. A file with several hard links is found under the
+    /// one Windows opens it by.
+    pub fn stat_in(&self, id: FileId, parent: FileId) -> Result<Option<DirEntry>> {
+        let h = match self.probe_by_id(id) {
+            Ok(h) => h,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let dir = match self.open_by_id(parent, FILE_READ_ATTRIBUTES.0) {
+            Ok(d) => d,
+            Err(e) if e.is_not_found() => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if final_path(&h)?.parent() != Some(final_path(&dir)?.as_path()) {
+            return Ok(None);
+        }
+        stat_handle(&h, id)
+    }
+
     /// Item `id`, named `name`, as folder `parent`'s listing reports it.
     /// That can differ from what a handle on the item reports: Microsoft
     /// documents `FILE_ATTRIBUTE_RECALL_ON_OPEN` (a placeholder folder whose
@@ -888,8 +910,19 @@ pub fn file_id(h: &Handle) -> Result<(u64, FileId)> {
 /// Lists one directory using large batched `FileIdExtdDirectoryInfo` reads.
 /// `buf` is reused across calls so enumeration allocates almost nothing.
 pub fn list_dir(dir: &Handle, buf: &mut [u8], out: &mut Vec<DirEntry>) -> Result<()> {
+    list_dir_upto(dir, buf, out, usize::MAX).map(|_| ())
+}
+
+/// [`list_dir`], stopping once more than `max` entries are in `out`
+/// (counting those it had already). Returns whether the listing is whole:
+/// `false` if it stopped early, so a large folder costs at most `max`
+/// entries and a buffer's worth.
+pub fn list_dir_upto(dir: &Handle, buf: &mut [u8], out: &mut Vec<DirEntry>, max: usize) -> Result<bool> {
     let mut class = FileIdExtdDirectoryRestartInfo;
     loop {
+        if out.len() > max {
+            return Ok(false);
+        }
         // SAFETY: `buf` is valid and writable for `buf.len()` bytes.
         let r = unsafe {
             GetFileInformationByHandleEx(dir.raw(), class, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32)
@@ -898,7 +931,7 @@ pub fn list_dir(dir: &Handle, buf: &mut [u8], out: &mut Vec<DirEntry>) -> Result
         match r {
             Ok(()) => out.extend(parse_dir_buffer(buf)?.into_iter().filter(|e| !e.is_dot())),
             Err(e) if e.code() == ERROR_NO_MORE_FILES.to_hresult() || e.code() == ERROR_HANDLE_EOF.to_hresult() => {
-                return Ok(());
+                return Ok(true);
             }
             Err(source) => return Err(Error::Win32 { op: "GetFileInformationByHandleEx(dir)", source }),
         }
@@ -950,6 +983,15 @@ mod tests {
         assert_eq!(st.attributes, entries[0].attributes);
         assert!(vol.stat_by_id(entries[1].file_id).unwrap().unwrap().is_dir());
         assert_eq!(vol.stat_by_id(FileId(u128::MAX - 7)).unwrap(), None);
+        // Only in the folder it's in.
+        let top = file_id(&h).unwrap().1;
+        assert_eq!(vol.stat_in(entries[0].file_id, top).unwrap().map(|e| e.name), Some("a.txt".into()));
+        assert_eq!(vol.stat_in(entries[0].file_id, entries[1].file_id).unwrap(), None);
+        // A listing that stops past a bound says so.
+        let (mut some, mut all) = (Vec::new(), Vec::new());
+        assert!(!list_dir_upto(&h, &mut buf, &mut some, 0).unwrap());
+        assert!(list_dir_upto(&h, &mut buf, &mut all, 2).unwrap());
+        assert_eq!(all.len(), 2);
 
         // Open `sub` by ID and list it; then check its attributes via the handle.
         std::fs::write(dir.join("sub").join("b.txt"), b"x").unwrap();

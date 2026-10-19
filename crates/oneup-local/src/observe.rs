@@ -19,9 +19,11 @@
 //!   the same batch (a save by rename leaves the new file with the old
 //!   one's name), each one lookup in the folder's index; failing those, a
 //!   folder of at most [`LIST_WHOLE_MAX`] entries is listed whole, once per
-//!   batch. Only an item with a new name in a larger folder is opened, by
-//!   file ID ([`Volume::stat_by_id`]). Not in the record's folder any more:
-//!   it moved or went since, and its later record says so. Then:
+//!   batch (stopping past that many: the folder may have filled since). Only
+//!   an item with a new name in a larger folder is opened, by file ID
+//!   ([`Volume::stat_in`]), and only if still in the record's folder. Not
+//!   in the record's folder any more: it moved or went since, it's left as
+//!   it was (never taken for deleted), and its later record says so. Then:
 //!   - parent in the tree (a listed folder): the item is stored or updated,
 //!     which covers creates, edits, renames and moves within the tree;
 //!     a folder that is new to the tree is queued and listed with the
@@ -185,7 +187,8 @@ pub struct Lookup {
 
 /// The most entries a folder may hold to be listed whole for an item none
 /// of whose [`Lookup::names`] finds it (a new name). Listed once per batch,
-/// for all of its items that need it. A larger folder's item is opened by
+/// for all of its items that need it. The live listing stops past this many
+/// entries as well (the store's count can be behind). A larger folder's item is opened by
 /// ID instead: listing it per batch would cost more than the folder's
 /// changes, and that open is brief.
 pub const LIST_WHOLE_MAX: usize = 4096;
@@ -592,7 +595,7 @@ mod driver {
     use oneup_ntfs::win::{self, Volume};
     use oneup_store::{LocalRoot, Store};
 
-    use super::{Changes, Error, Lookup, Rescan, Result, Stat, apply_records};
+    use super::{Changes, Error, LIST_WHOLE_MAX, Lookup, Rescan, Result, Stat, apply_records};
     use crate::classify;
     use crate::scan::{Config, Progress, list_queued};
     use std::collections::HashMap;
@@ -850,10 +853,17 @@ mod driver {
             }
         }
         if l.list_whole {
+            // The store's count can be behind the folder (filled since):
+            // the listing stops past the bound too, and the folder then
+            // counts as large for the rest of the batch.
             let listed = listings.entry(l.parent.0).or_insert_with(|| {
                 let mut out = Vec::new();
-                match volume.open_dir_by_id(l.parent).and_then(|h| win::list_dir(&h, buf, &mut out)) {
-                    Ok(()) => Some(out),
+                match volume
+                    .open_dir_by_id(l.parent)
+                    .and_then(|h| win::list_dir_upto(&h, buf, &mut out, LIST_WHOLE_MAX))
+                {
+                    Ok(true) => Some(out),
+                    Ok(false) => None,
                     Err(e) => {
                         tracing::debug!(error = %e, "a changed item's folder could not be listed");
                         None
@@ -864,7 +874,10 @@ mod driver {
                 return entries.iter().find(|e| e.file_id == l.id).map_or(Stat::Gone, |e| Stat::Found(e.clone()));
             }
         }
-        match volume.stat_by_id(l.id) {
+        // Only if it's still in the record's folder: one that moved since
+        // has a later record, which places it; stored here, it would be
+        // planned in the wrong folder meanwhile.
+        match volume.stat_in(l.id, l.parent) {
             Ok(Some(e)) => as_listed(volume, l.parent, e),
             Ok(None) => Stat::Gone,
             Err(e) => {
@@ -970,6 +983,31 @@ mod driver {
             // Opening at such a position starts at the oldest record instead.
             let tail = JournalTail::open(&dir, Some((journal_id, 8))).unwrap();
             assert!(tail.position().1 > 8);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An item opened by ID (a new name in a large folder) that moved
+        /// to another folder after its record was written is not taken to
+        /// be in the record's folder: its later record places it.
+        #[test]
+        fn an_item_read_by_id_counts_only_in_the_records_folder() {
+            let dir = temp("moved");
+            std::fs::create_dir_all(dir.join("a")).unwrap();
+            std::fs::create_dir_all(dir.join("b")).unwrap();
+            std::fs::write(dir.join("b").join("new.txt"), b"x").unwrap();
+            let volume = Volume::open_containing(&dir).unwrap();
+            let (a, b) = (FileId(file_id(&dir.join("a"))), FileId(file_id(&dir.join("b"))));
+            let id = FileId(file_id(&dir.join("b").join("new.txt")));
+            let read = |parent| {
+                let l = Lookup { id, parent, names: Vec::new(), list_whole: false };
+                read_item(&volume, &l, &mut HashMap::new(), &mut vec![0u8; 64 * 1024])
+            };
+            // The record said `a`; it's in `b` now. Opened by ID, it's
+            // found, but not in `a`: not stored there, and not deleted.
+            assert!(volume.stat_by_id(id).unwrap().is_some());
+            assert_eq!(read(a), Stat::Gone);
+            assert!(matches!(read(b), Stat::Found(e) if e.name == "new.txt"));
+            assert_eq!(volume.opened_by_id(), 3);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
