@@ -41,6 +41,10 @@ pub enum Error {
     Vault(#[from] oneup_vault::Error),
     #[error("the vault's folder isn't in the cloud listing")]
     NoVault,
+    /// The keys don't sign the vault's configuration: the vault in OneDrive
+    /// was replaced, or the keys came from another vault.
+    #[error("these keys don't open the vault in OneDrive (was it replaced?); unlock it again with its password")]
+    WrongKeys,
     #[error("reading the vault: {0}")]
     Fetch(String),
 }

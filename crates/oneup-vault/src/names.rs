@@ -68,7 +68,23 @@ pub fn decrypt_name(key: &Masterkey, encrypted: &str, parent: &str) -> Result<St
         .decode(body.trim_end_matches('='))
         .map_err(|_| Error::Malformed(format!("{encrypted:?} isn't Base64url")))?;
     let plain = siv(key).decrypt([parent.as_bytes()], &bytes).map_err(|_| Error::Tampered("a name"))?;
-    String::from_utf8(plain).map_err(|_| Error::Malformed("a name isn't UTF-8".into()))
+    let name = String::from_utf8(plain).map_err(|_| Error::Malformed("a name isn't UTF-8".into()))?;
+    // Authentic, but not one name: no app on any system makes these, only
+    // someone with the vault's key crafting them, and a path component
+    // that isn't one could reach outside its folder.
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        return Err(Error::Malformed("a name isn't a valid file name".into()));
+    }
+    Ok(name)
+}
+
+/// The stored name of a shortened entry: Base64url of the SHA-1 of its
+/// full encrypted name, then `.c9s`. Readers check a `.c9s` folder's name
+/// against its `name.c9s` with it: the name is authenticated, but which
+/// folder holds it isn't, so a `name.c9s` copied into another entry's
+/// folder would otherwise show that entry twice.
+pub fn shortened(encrypted: &str) -> String {
+    format!("{}{SHORT_EXT}", B64URL.encode(Sha1::digest(encrypted.as_bytes())))
 }
 
 /// How an entry with this encrypted name is stored in its folder.
@@ -85,8 +101,7 @@ impl Stored {
         if encrypted.len() <= threshold {
             return Stored::Full(encrypted);
         }
-        let dir = format!("{}{SHORT_EXT}", B64URL.encode(Sha1::digest(encrypted.as_bytes())));
-        Stored::Short { dir, name: encrypted }
+        Stored::Short { dir: shortened(&encrypted), name: encrypted }
     }
 
     /// The name in the folder.
@@ -119,6 +134,21 @@ mod tests {
         assert!(matches!(decrypt_name(&k, &e, ROOT_DIR_ID), Err(Error::Tampered(_))));
         // Normalised: both spellings of "é" are one name.
         assert_eq!(encrypt_name(&k, "caf\u{e9}", "p").unwrap(), encrypt_name(&k, "cafe\u{301}", "p").unwrap());
+    }
+
+    #[test]
+    fn authentic_names_that_are_paths_are_refused() {
+        // Made with the key (as a hostile key holder could), so they pass
+        // authentication; they still aren't names.
+        let k = key();
+        for bad in ["", ".", "..", "a/b", "../x", "nul\0byte"] {
+            let siv = siv(&k).encrypt([b"p".as_slice()], bad.as_bytes()).unwrap();
+            let e = format!("{}{EXT}", B64URL.encode(siv));
+            assert!(matches!(decrypt_name(&k, &e, "p"), Err(Error::Malformed(_))), "{bad:?}");
+        }
+        // A backslash is an ordinary character on macOS and Linux; Windows
+        // refuses it when creating the file (`oneup_effects::name`).
+        assert_eq!(decrypt_name(&k, &encrypt_name(&k, "a\\b", "p").unwrap(), "p").unwrap(), "a\\b");
     }
 
     #[test]

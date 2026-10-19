@@ -196,3 +196,40 @@ async fn a_long_name_upload_cut_short_can_be_sent_again() {
     let got = decrypted(&s.pairs, &s.vc, &s.vault.root).await;
     assert_eq!(got.get(&format!("/{long}")), Some(&Some(b"saved".to_vec())), "{got:?}");
 }
+
+/// Keys that don't sign the vault's configuration (remembered keys of a
+/// vault since replaced in OneDrive, or another vault's) stop the view
+/// before anything is read or written with them.
+#[tokio::test]
+async fn keys_that_dont_sign_the_vaults_configuration_are_refused() {
+    let mut s = setup();
+    s.refresh().await;
+    let other = oneup_vaultsync::Vault {
+        key: std::sync::Arc::new(oneup_vault::key::Masterkey::generate().unwrap()),
+        ..s.vault.clone()
+    };
+    let mut cache = oneup_vaultsync::project::Cache::default();
+    assert!(matches!(project(&s.src, &other, &mut cache).await, Err(oneup_vaultsync::Error::WrongKeys)));
+
+    // The vault replaced in OneDrive: a new configuration, signed with new
+    // keys, as a new version of the file.
+    let cfg_id = {
+        let st = s.cloud.0.lock().unwrap();
+        st.child(&s.vault.root, oneup_vault::config::FILE).unwrap()
+    };
+    let new_key = oneup_vault::key::Masterkey::generate().unwrap();
+    let row = {
+        let mut st = s.cloud.0.lock().unwrap();
+        let e = st.bump();
+        let it = st.items.get_mut(&cfg_id).unwrap();
+        it.content = oneup_vault::config::Config::new().unwrap().sign(&new_key).unwrap().into_bytes();
+        it.etag = e;
+        st.row(&cfg_id)
+    };
+    s.listing.lock().unwrap().write(|o| o.upsert_item(&row, false)).unwrap();
+    assert!(matches!(project(&s.src, &s.vault, &mut cache).await, Err(oneup_vaultsync::Error::WrongKeys)));
+
+    // No configuration at all: refused too.
+    s.listing.lock().unwrap().write(|o| o.delete_subtree(&cfg_id).map(|_| ())).unwrap();
+    assert!(project(&s.src, &s.vault, &mut cache).await.is_err());
+}

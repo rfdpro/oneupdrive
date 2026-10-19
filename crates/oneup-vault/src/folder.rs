@@ -178,9 +178,13 @@ impl Folder {
     fn short_entry(&self, dir: &Dir, path: &Path) -> Result<Option<Entry>> {
         let name = String::from_utf8(read_small(&path.join(names::NAME_FILE))?)
             .map_err(|_| Error::Malformed("name.c9s isn't text".into()))?;
+        let name = name.trim();
+        if path.file_name().and_then(|n| n.to_str()) != Some(names::shortened(name).as_str()) {
+            return Err(Error::Malformed("name.c9s doesn't belong to its folder".into()));
+        }
         let contents = path.join(names::CONTENTS_FILE);
         let is_file = contents.is_file();
-        self.entry(dir, name.trim(), path, if is_file { &contents } else { path }, is_file)
+        self.entry(dir, name, path, if is_file { &contents } else { path }, is_file)
     }
 
     /// `node`: the entry's file or folder; `data`: a file's contents.
@@ -358,6 +362,24 @@ mod tests {
         assert_eq!(again, b"hello vault");
         // And a vault isn't created over anything.
         assert!(Folder::create_with(&root, "pw", cheap).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_long_name_copied_into_another_entry_is_reported_not_trusted() {
+        let root = temp("long-copy");
+        let v = Folder::create_with(&root, "pw", cheap).unwrap();
+        let (a, b) = ("a".repeat(180), "b".repeat(180));
+        v.create_file(&Dir::root(), &a, &b"1"[..]).unwrap();
+        v.create_file(&Dir::root(), &b, &b"2"[..]).unwrap();
+        // b's name.c9s replaced with a's, by someone else at the storage level.
+        let from = v.find(&a).unwrap().unwrap().stored.parent().unwrap().join(names::NAME_FILE);
+        let to = v.find(&b).unwrap().unwrap().stored.parent().unwrap().join(names::NAME_FILE);
+        fs::write(&to, fs::read(&from).unwrap()).unwrap();
+        let l = v.list(&Dir::root()).unwrap();
+        let listed: Vec<_> = l.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(listed, [a.as_str()], "a once, not twice");
+        assert_eq!(l.problems.len(), 1);
         fs::remove_dir_all(&root).unwrap();
     }
 

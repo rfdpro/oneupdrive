@@ -1,6 +1,10 @@
 //! The decrypted view of a vault (see the crate docs).
 //!
-//! [`project`] walks the vault from its top folder: each folder's entries
+//! [`project`] first checks the keys against the vault's signed
+//! configuration (`vault.cryptomator`), so keys that belong to another
+//! vault (remembered ones, after the vault in OneDrive was replaced) never
+//! encrypt anything into it. Then it walks the vault from its top folder:
+//! each folder's entries
 //! are in the storage folder `d/XX/…` named after the folder's ID, each
 //! entry's name decrypts with that ID, and a folder's ID is in its
 //! `dir.c9r`. The small files (`dir.c9r`, a long name's `name.c9s`) are
@@ -19,6 +23,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use oneup_store::{Kind, RemoteRow, Store};
+use oneup_vault::config::{self, Config};
 use oneup_vault::content::content_size;
 use oneup_vault::names::{self, CONTENTS_FILE, DIR_FILE, DIR_ID_BACKUP, NAME_FILE, SHORT_EXT, SYMLINK_FILE};
 
@@ -57,7 +62,8 @@ impl Cache {
 
 /// The decrypted view: rows for the vault pair's Remote tree (parents
 /// before children), how each maps to encrypted items, and what couldn't be
-/// read.
+/// read. Problems name the encrypted items, never decrypted names: they
+/// end up in the agent's log.
 #[derive(Debug, Default)]
 pub struct Projection {
     pub rows: Vec<RemoteRow>,
@@ -85,6 +91,7 @@ fn storage(src: &impl Source, vault: &Vault, d: Option<&RemoteRow>, dir_id: &str
 pub async fn project(src: &impl Source, vault: &Vault, cache: &mut Cache) -> Result<Projection> {
     let top = src.item(&vault.root)?.ok_or(Error::NoVault)?;
     let top_children = src.children(&top.id)?;
+    check_keys(src, vault, cache, &top_children).await?;
     let d = named(&top_children, "d").filter(|r| r.kind == Kind::Folder).cloned();
     let mut out = Projection::default();
     out.rows.push(RemoteRow {
@@ -135,6 +142,11 @@ pub async fn project(src: &impl Source, vault: &Vault, cache: &mut Cache) -> Res
                         dir_id: e.dir_id.clone(),
                         storage: None,
                     };
+                    if let Some(c) = &e.content
+                        && content_size(u64::try_from(c.size).unwrap_or(0)).is_none()
+                    {
+                        out.problems.push(format!("{}: not a valid encrypted file", entry.name));
+                    }
                     out.rows.push(match &e.content {
                         Some(c) => RemoteRow {
                             id: entry.id.clone(),
@@ -169,15 +181,27 @@ pub async fn project(src: &impl Source, vault: &Vault, cache: &mut Cache) -> Res
             }
         }
     }
-    // A file whose encrypted size is impossible can't be shown.
-    out.rows.retain(|r| {
-        let ok = r.size >= 0;
-        if !ok {
-            out.problems.push(format!("{}: not a valid encrypted file", r.name));
-        }
-        ok
-    });
+    // A file whose encrypted size is impossible can't be shown (reported
+    // above).
+    out.rows.retain(|r| r.size >= 0);
     Ok(out)
+}
+
+/// Checks the vault's keys against its configuration (read once per
+/// version), and that names are still shortened as this pair stores them.
+async fn check_keys(src: &impl Source, vault: &Vault, cache: &mut Cache, top: &[RemoteRow]) -> Result<()> {
+    let item = named(top, config::FILE)
+        .filter(|r| r.kind == Kind::File)
+        .ok_or_else(|| Error::Fetch(format!("the vault's {} is missing", config::FILE)))?;
+    let token = cache.text(src, item, 16 * 1024).await?;
+    let c = Config::verify(&token, &vault.key).map_err(|e| match e {
+        oneup_vault::Error::Tampered(_) => Error::WrongKeys,
+        other => other.into(),
+    })?;
+    if c.shortening_threshold != vault.threshold {
+        return Err(Error::Fetch("the vault's name shortening changed; add the vault again".into()));
+    }
+    Ok(())
 }
 
 /// One decrypted entry.
@@ -208,7 +232,13 @@ async fn entry_of(
         let Some(n) = named(&inside, NAME_FILE).filter(|r| r.kind == Kind::File) else {
             return Err(Error::Fetch("a long name's name.c9s is missing".into()));
         };
-        (cache.text(src, n, 4096).await?, Some(inside))
+        let encrypted = cache.text(src, n, 4096).await?;
+        // See `names::shortened`: a name.c9s from another entry would show
+        // that entry twice.
+        if names::shortened(&encrypted) != item.name {
+            return Err(Error::Fetch("a long name's name.c9s doesn't belong to its folder".into()));
+        }
+        (encrypted, Some(inside))
     } else {
         (item.name.clone(), None)
     };
@@ -231,10 +261,10 @@ async fn entry_of(
         return Ok(Some(Entry { name, long, content: Some(c.clone()), dir_id: None }));
     }
     if named(&inside, SYMLINK_FILE).is_some() {
-        return Err(Error::Fetch(format!("{name:?} is a symbolic link, which isn't synced")));
+        return Err(Error::Fetch("a symbolic link, which isn't synced".into()));
     }
     // Being created (its dir.c9r not there yet), or damaged.
-    Err(Error::Fetch(format!("{name:?} is incomplete")))
+    Err(Error::Fetch("incomplete".into()))
 }
 
 /// What [`apply`] changed.
