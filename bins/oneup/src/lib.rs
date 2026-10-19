@@ -6,6 +6,8 @@
 //! tools must stay separate from the agent.
 
 pub mod accounts;
+#[cfg(windows)]
+pub mod appleftovers;
 pub mod apps;
 pub mod autopause;
 pub mod backoff;
