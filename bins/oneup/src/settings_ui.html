@@ -2047,6 +2047,9 @@
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
             <p class="note">Memory and priority apply after a restart.</p>
+            <h3>Memory and hashing</h3>
+            <div class="card" id="tune"></div>
+            <p class="note">Empty uses the default. Applies after a restart.</p>
             <h3>File changes</h3>
             <div class="card">
                 <div class="row">
@@ -2494,6 +2497,7 @@
             setupState(s);
             fillOffice(s);
             $("#autostart").checked = s.autostart;
+            fillTuning(s);
             $$("[data-agent]").forEach(e => {
                 const v = s.agent[e.dataset.agent];
                 e.type === "checkbox" ? e.checked = !!v : e.value = v ?? "";
@@ -2515,6 +2519,39 @@
             section: "autostart",
             value: e.target.checked
         }), e.target.checked ? "Starts with Windows" : "Won't start with Windows").catch(() => e.target.checked = !e.target.checked);
+
+        // Memory and hashing: the memory profile's numbers, each settable;
+        // empty is the default (sent as null).
+        function fillTuning(s) {
+            const box = $("#tune");
+            box.textContent = "";
+            for (const t of s.tuning || []) {
+                const row = document.createElement("div");
+                row.className = "row";
+                const label = document.createElement("div");
+                label.className = "label";
+                const name = document.createElement("b");
+                name.textContent = t.label;
+                const range = document.createElement("small");
+                range.textContent = `${t.min} to ${t.max}, default ${t.default}`;
+                label.append(name, range);
+                const input = document.createElement("input");
+                Object.assign(input, { type: "number", min: t.min, max: t.max, step: 1, placeholder: String(t.default) });
+                input.value = t.value ?? "";
+                input.setAttribute("aria-label", t.label);
+                input.onchange = () => {
+                    const v = input.value.trim();
+                    run(call("save", {
+                        section: "agent",
+                        value: {
+                            [t.key]: v === "" ? null : Number(v)
+                        }
+                    }), "Saved").catch(() => load());
+                };
+                row.append(label, input);
+                box.append(row);
+            }
+        }
 
         function saveField(e, section, key) {
             const v = e.type === "checkbox" ? e.checked : e.type === "number" ? Number(e.value) : e.value.trim();

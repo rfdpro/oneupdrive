@@ -248,6 +248,12 @@ async fn run(args: Args) -> Result<()> {
             false
         }
     };
+    // What config.toml sets instead of the memory profile's, in the log.
+    let set: Vec<String> =
+        settings.tuned().iter().filter(|t| t.set.is_some()).map(|t| format!("{} {}", t.knob.name(), t.value)).collect();
+    if !set.is_empty() {
+        println!("oneupd: memory profile {}, with {}", settings.memory, set.join(", "));
+    }
     let cache_kib = settings.cache_kib();
     let memory = Memory { cache_kib, map_bytes: Memory::map_bytes(cache_kib, !settings.background && priority_set) };
     // Before the hydration service and the program tracker open their own

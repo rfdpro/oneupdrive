@@ -55,7 +55,7 @@ The numbers on the tabs count sync failures and waiting safety stops.
 Upload and download limits (and the hours they apply), and pausing by itself: on metered connections, with battery saver on, during games and presentations, and in quiet hours.
 
 ## General
-Starting at sign-in, the taskbar icon, memory use and background priority (these two apply when OneUpDrive next starts), file changes (**Timeout highly active files**), **Update shortcuts to use OneUpDrive folder** (see [Shortcuts to your old OneDrive folder](getting-started.md#shortcuts-to-your-old-onedrive-folder)), and updates: install automatically, whether to get preview versions, and **Check now**.
+Starting at sign-in, the taskbar icon, memory use and background priority, **Memory and hashing** (each number the memory profile sets, and how many files are hashed at once; empty is the default; see [Syncing in depth](syncing.md#how-it-uses-your-pc)) (these apply when OneUpDrive next starts), file changes (**Timeout highly active files**), **Update shortcuts to use OneUpDrive folder** (see [Shortcuts to your old OneDrive folder](getting-started.md#shortcuts-to-your-old-onedrive-folder)), and updates: install automatically, whether to get preview versions, and **Check now**.
 
 ## Accounts
 The Microsoft accounts on this PC, each with its own settings window (**Open settings**), and **Add account…**. This window's account has **Sign out…** (syncing stops until you sign in again; your files stay) or **Sign in…**. See [More folders, backups, shared folders and accounts](folders.md#more-than-one-account).

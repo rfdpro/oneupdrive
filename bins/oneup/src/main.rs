@@ -211,6 +211,8 @@ enum Cmd {
         /// Developers only: show and allow experimental options (off by default)
         #[arg(long, value_enum, hide = true)]
         experimental: Option<Toggle>,
+        #[command(flatten)]
+        tuning: settings::TuningArgs,
     },
     /// Show or change freeing up space by itself (with Files On-Demand)
     Space {
@@ -1395,6 +1397,7 @@ async fn run() -> Result<()> {
             busy_max_s,
             compact_database,
             experimental,
+            tuning,
         } => {
             let changes = settings::Changes {
                 upload_kib: *upload_kib,
@@ -1415,6 +1418,7 @@ async fn run() -> Result<()> {
                 busy_max_s: *busy_max_s,
                 compact_database: compact_database.map(Toggle::on),
                 experimental: experimental.map(Toggle::on),
+                tuning: tuning.clone(),
             };
             settings::run(&data_dir(&cli)?, &changes).await
         }

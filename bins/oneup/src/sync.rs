@@ -762,17 +762,17 @@ impl Engine {
         data_dir: &Path,
         vault: Option<Arc<crate::vaultpair::VaultRemote>>,
     ) -> Self {
-        // Uploads hold up to a fragment in memory; the profile bounds it.
-        let memory = crate::config::load_agent(data_dir).map(|a| a.memory).unwrap_or_default();
+        // Uploads hold up to a fragment in memory; the profile bounds it,
+        // unless [agent] sets it.
+        let agent = crate::config::load_agent(data_dir).unwrap_or_default();
         let timings = Arc::new(oneup_exec::Timings::default());
-        let plain = GraphCloud::with_memory(Arc::clone(&graph), oneup_exec::UploadMemory::for_profile(&memory))
-            .timed(Arc::clone(&timings));
+        let plain = GraphCloud::with_memory(Arc::clone(&graph), agent.upload_memory()).timed(Arc::clone(&timings));
         let cloud = match &vault {
             Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
             None => crate::vaultpair::PairCloud::Plain(plain),
         };
         let exec = Executor::new(fs, cloud, rules.clone()).timed(Arc::clone(&timings));
-        exec.set_parallel(oneup_exec::Parallel::for_profile(&memory));
+        exec.set_parallel(agent.parallel());
         Self {
             exec,
             timings,
