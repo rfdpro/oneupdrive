@@ -745,6 +745,70 @@ async fn randomized_simulation_converges_every_round() {
     }
 }
 
+/// Where one seed keeps the mirror's database. Each run opens it afresh,
+/// as the agent does after a restart, so it must outlive every `Store`.
+///
+/// `SIM_DB=memory` keeps it in memory: a shared-cache SQLite database,
+/// alive while `_keep` holds a connection to it. Every reopen still goes
+/// through `Store::open` and sees what the last run committed; what only
+/// a file shows (WAL files, on-disk layout) is left to the default, on
+/// disk, which is several times slower because each seed creates and
+/// reopens a database file a dozen times.
+enum SimDb {
+    Disk(std::path::PathBuf),
+    Memory { uri: std::path::PathBuf, _keep: Store },
+}
+
+impl SimDb {
+    fn new(seed: u64) -> Self {
+        if std::env::var("SIM_DB").is_ok_and(|v| v == "memory") {
+            SimDb::memory(&format!("sim-{seed}"))
+        } else {
+            SimDb::Disk(temp_db(&format!("sim-{seed}")))
+        }
+    }
+
+    fn memory(tag: &str) -> Self {
+        // A URI (rusqlite opens with SQLITE_OPEN_URI). The name is per
+        // process, and seeds in one process run one at a time.
+        let uri = std::path::PathBuf::from(format!("file:oneup-{tag}?mode=memory&cache=shared"));
+        let keep = Store::open(&uri, 1024).unwrap();
+        SimDb::Memory { uri, _keep: keep }
+    }
+
+    fn open(&self) -> Store {
+        match self {
+            SimDb::Disk(path) => Store::open(path, 1024).unwrap(),
+            SimDb::Memory { uri, .. } => Store::open(uri, 1024).unwrap(),
+        }
+    }
+}
+
+impl Drop for SimDb {
+    fn drop(&mut self) {
+        if let SimDb::Disk(path) = self
+            && let Some(dir) = path.parent()
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// The in-memory lane is only worth its seeds if a reopened store holds
+/// what the last run committed, as a file does.
+#[tokio::test(flavor = "multi_thread")]
+async fn in_memory_sim_db_keeps_its_contents_across_reopens() {
+    let fake = Arc::new(Fake::new(5, false));
+    populate(&fake);
+    let db = SimDb::memory("reopen-check");
+    let m = mirror(&fake, db.open(), ExcludeSet::dev());
+    assert!(m.run().await.unwrap().fresh);
+    drop(m);
+    let again = mirror(&fake, db.open(), ExcludeSet::dev());
+    assert_eq!(actual(&again), expected(&fake, &ExcludeSet::dev()), "before running again");
+    assert!(!again.run().await.unwrap().fresh, "a reopened store resumes");
+}
+
 /// One seed of [`randomized_simulation_converges_every_round`].
 async fn simulate(seed: u64) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -755,7 +819,7 @@ async fn simulate(seed: u64) {
             random_mutation(i, &mut rng);
         }
     });
-    let path = temp_db(&format!("sim-{seed}"));
+    let db = SimDb::new(seed);
     let rules = if rng.below(4) == 0 { ExcludeSet::none() } else { ExcludeSet::dev() };
     // Vary the split strategy: fixed depth, size-based deep listing, or delta-everything.
     let list_depth = rng.below(3) as u32;
@@ -796,18 +860,18 @@ async fn simulate(seed: u64) {
         if rng.below(3) == 0 {
             fake.served.store(0, SeqCst);
             fake.fail_after.store(rng.below(8) as i64, SeqCst);
-            let mf = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
+            let mf = mirror_with(&fake, db.open(), cfg.clone());
             let r = mf.run().await;
             debug_dump(&mf, &format!("after failing run ({:?})", r.err()));
             drop(mf);
             fake.fail_after.store(-1, SeqCst);
         }
-        let m = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
+        let m = mirror_with(&fake, db.open(), cfg.clone());
         m.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round}: {e}"));
         debug_dump(&m, &format!("after run 1 of round {round}"));
         // "during enumeration" changes only fire on a fresh cursor, so run
         // once more to pick up anything made after the last cursor.
-        let m2 = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
+        let m2 = mirror_with(&fake, db.open(), cfg.clone());
         drop(m);
         m2.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round} (2nd): {e}"));
         if actual(&m2) != expected(&fake, &rules) {
@@ -836,7 +900,6 @@ trace:
             }
         });
     }
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
