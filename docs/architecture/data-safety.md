@@ -35,4 +35,4 @@ A bounded, configurable local version store (`oneup versions`, `oneup restore`),
 
 * Destructive filesystem and network calls live in **one** crate (`oneup-effects`), behind typed tokens that the safety gate (`oneup-gate`) issues. The planner can't call them, and nothing else can create the tokens.
 * The planner and the safety gate are pure (no I/O), so they are deterministic and run under simulation ([sync-engine.md § Simulation](sync-engine.md#simulation-cratesoneup-synctestssimrs)).
-* Changes to the safety gate or the effects layer need two maintainer reviews, and no release ships with an open data-safety issue.
+* Changes to the safety gate or the effects layer need two reviews: the maintainer's and, while there is one maintainer, an independent model review recorded in the PR ([CONTRIBUTING.md](../../CONTRIBUTING.md#what-we-look-for-in-a-pr)). No release ships with an open data-safety issue.
