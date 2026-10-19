@@ -28,28 +28,37 @@ jobs:
       #   oneup-sync backups,  SIM_STORE=0: 10,000 seeds in 4.6 s, ~2,150/s
       #   oneup-sync converge, store check: 500 seeds in 103 s, ~4.9/s
       #   oneup-sync backups,  store check: 500 seeds in 83 s, ~6/s
-      #   oneup-remote mirror:              200 seeds in 78 s, ~2.6/s; it
-      #     waits on its on-disk databases (4.4 s CPU in 15 s), so processes
-      #     run side by side: 8 at once gave ~12/s.
+      #   oneup-remote mirror, SIM_DB=memory: 500 seeds in 19 s, ~27/s, all
+      #     CPU (19.4 s CPU in 19.4 s)
+      #   oneup-remote mirror, on disk: 200 seeds in 78 s, ~2.6/s; it waits
+      #     on its database files (4.4 s CPU in 15 s), so processes run side
+      #     by side: 8 at once gave ~12/s.
       # A runner has 4 cores; assume each is half as fast:
       #   converge: 4,000,000 / (4 x 550/s)   = ~30 min
       #   backups:  4,000,000 / (4 x 1,075/s) = ~16 min
       #   converge with the store check: 20,000 / (4 x 2.4/s) = ~35 min
       #   backups with the store check:  20,000 / (4 x 3/s)   = ~28 min
-      #   mirror: 4 jobs x 12,000 seeds, 8 processes each at ~4/s = ~50 min
-      #     (millions would take days: each seed rebuilds a database on disk)
+      #   mirror in memory: 8 jobs x 250,000 = 2,000,000 seeds;
+      #     250,000 / (4 x 13.5/s) = ~77 min each
+      #   mirror on disk (what only a file shows: WAL, reopening the file):
+      #     12,000 seeds, 8 processes at ~4/s = ~50 min
       # Each job prints its real rate in the run summary; adjust here if one
       # gets near its timeout.
       matrix:
         include:
-          - { name: converge, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 4000000, shard: 0, shards: 1, store: "0", procs: 4 }
-          - { name: backups, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 4000000, shard: 0, shards: 1, store: "0", procs: 4 }
-          - { name: converge-store, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 20000, shard: 0, shards: 1, store: "1", procs: 4 }
-          - { name: backups-store, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 20000, shard: 0, shards: 1, store: "1", procs: 4 }
-          - { name: mirror-1, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 0, shards: 4, store: "", procs: 8 }
-          - { name: mirror-2, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 1, shards: 4, store: "", procs: 8 }
-          - { name: mirror-3, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 2, shards: 4, store: "", procs: 8 }
-          - { name: mirror-4, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 3, shards: 4, store: "", procs: 8 }
+          - { name: converge, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 4000000, shard: 0, shards: 1, store: "0", db: "", procs: 4 }
+          - { name: backups, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 4000000, shard: 0, shards: 1, store: "0", db: "", procs: 4 }
+          - { name: converge-store, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 20000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
+          - { name: backups-store, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 20000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
+          - { name: mirror-memory-1, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 0, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-2, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 1, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-3, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 2, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-4, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 3, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-5, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 4, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-6, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 5, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-7, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 6, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-8, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 7, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-disk, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 0, shards: 1, store: "", db: "", procs: 8 }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,6 +71,7 @@ jobs:
         shell: pwsh
         env:
           SIM_STORE: ${{ matrix.store }}
+          SIM_DB: ${{ matrix.db }}
           RUN: ${{ github.run_number }}
         run: |
           $count = [UInt64]${{ matrix.count }}

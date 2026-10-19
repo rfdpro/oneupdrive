@@ -6,7 +6,9 @@ Runs one simulation test over a range of seeds, split across processes.
 Builds the test binary once (release), then runs it in -Processes processes
 at the same time, each over its own slice of [From, From + Count), using the
 simulations' SIM_SEED_FROM / SIM_SEEDS variables. Other SIM_* variables
-(SIM_STORE) pass through from the environment.
+(SIM_STORE, SIM_DB) pass through from the environment.
+
+Refuses to run with SIM_SEED set, or unless -Name names exactly one test.
 
 A failing seed is printed by the test itself ("replay with SIM_SEED=n");
 those lines are collected into <LogDir>/failures.txt, with the command that
@@ -27,11 +29,20 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# SIM_SEED makes a simulation run that one seed, whatever its range: every
+# process would repeat it while the summary claimed the whole range.
+if ($env:SIM_SEED) { throw "SIM_SEED is set ($env:SIM_SEED); unset it to run a range" }
+
 $exe = cargo test --release -p $Package --test $Test --no-run --message-format=json |
     ForEach-Object { $_ | ConvertFrom-Json } |
     Where-Object { $_.reason -eq 'compiler-artifact' -and $_.executable -and $_.target.name -eq $Test } |
     Select-Object -Last 1 -ExpandProperty executable
 if ($LASTEXITCODE -ne 0 -or -not $exe) { throw "building $Package's $Test test failed" }
+
+# libtest passes when a name matches no test, so a renamed test would
+# "pass" without running a single seed.
+$listed = @(& $exe --list --exact $Name | Where-Object { $_ -match ': test$' })
+if ($listed.Count -ne 1) { throw "expected one test named $Name in $Package's $Test, found $($listed.Count)" }
 
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $per = [UInt64][Math]::Ceiling($Count / $Processes)
@@ -55,7 +66,9 @@ $runs.Process | Wait-Process
 $secs = ((Get-Date) - $start).TotalSeconds
 
 $failed = $runs | Where-Object { $_.Process.ExitCode -ne 0 }
-$store = if ($env:SIM_STORE) { "`$env:SIM_STORE='$($env:SIM_STORE)'; " } else { '' }
+$store = ''
+if ($env:SIM_STORE) { $store += "`$env:SIM_STORE='$($env:SIM_STORE)'; " }
+if ($env:SIM_DB) { $store += "`$env:SIM_DB='$($env:SIM_DB)'; " }
 $summary = "{0} {1}: seeds {2}..{3}, {4} processes, {5:N1} s ({6:N0} seeds/s)" -f `
     $Package, $Name, $From, ($From + $Count - 1), $runs.Count, $secs, ($Count / [Math]::Max($secs, 0.001))
 Write-Host $summary
