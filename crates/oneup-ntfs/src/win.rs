@@ -377,10 +377,11 @@ impl Volume {
         if name.is_empty() || name == "." || name == ".." || name.contains(['\\', '/']) {
             return None;
         }
+        use std::os::windows::ffi::OsStringExt as _;
         let dir = self.open_by_id(parent, FILE_READ_ATTRIBUTES.0).ok()?;
-        let mut long = std::ffi::OsString::from(r"\\?\");
-        long.push(final_path(&dir).ok()?.as_os_str());
-        Some(PathBuf::from(long).join(name))
+        // Unit for unit (`final_path_wide`): a folder name with an unpaired
+        // surrogate stays that folder's.
+        Some(PathBuf::from(std::ffi::OsString::from_wide(&final_path_wide(&dir).ok()?)).join(name))
     }
 
     /// The current metadata of the file or folder with this ID, in the same
@@ -423,7 +424,14 @@ impl Volume {
             Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
-        if final_path(&h)?.parent() != Some(final_path(&dir)?.as_path()) {
+        // Unit for unit, as Windows normalized both (`final_path_wide`).
+        const SEP: u16 = b'\\' as u16;
+        let (item, mut folder) = (final_path_wide(&h)?, final_path_wide(&dir)?);
+        if folder.last() == Some(&SEP) {
+            folder.pop(); // a volume's root, `\\?\C:\`
+        }
+        let Some(cut) = item.iter().rposition(|&c| c == SEP) else { return Ok(None) };
+        if item[..cut] != folder[..] {
             return Ok(None);
         }
         stat_handle(&h, id)
@@ -877,6 +885,15 @@ pub fn attribute_tag(h: &Handle) -> Result<(u32, u32)> {
 
 /// The normalized path of an open handle (`\\?\C:\...` prefix stripped).
 pub fn final_path(h: &Handle) -> Result<PathBuf> {
+    let s = String::from_utf16_lossy(&final_path_wide(h)?);
+    Ok(PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)))
+}
+
+/// The normalized path of an open handle as Windows gives it (`\\?\`
+/// form), unit for unit. Names may hold unpaired surrogates, which a
+/// conversion to a string would merge (each becomes U+FFFD), so paths are
+/// compared in this form.
+fn final_path_wide(h: &Handle) -> Result<Vec<u16>> {
     let mut buf = vec![0u16; 512];
     loop {
         // SAFETY: `buf` is a valid writable buffer of the given length.
@@ -885,8 +902,8 @@ pub fn final_path(h: &Handle) -> Result<PathBuf> {
             return Err(Error::Win32 { op: "GetFinalPathNameByHandleW", source: windows::core::Error::from_thread() });
         }
         if n < buf.len() {
-            let s = String::from_utf16_lossy(&buf[..n]);
-            return Ok(PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)));
+            buf.truncate(n);
+            return Ok(buf);
         }
         buf.resize(n + 1, 0);
     }
@@ -1219,6 +1236,39 @@ mod tests {
         assert!(posix() && classic());
         drop((listing, pinned));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two folders whose names differ only in an unpaired surrogate (legal
+    /// on NTFS) read the same once converted to a string: telling which one
+    /// holds an item must not convert.
+    #[test]
+    fn folders_differing_in_an_unpaired_surrogate_are_told_apart() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let dir = std::env::temp_dir().join(format!("oneup-ntfs-surrogate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (one, two) =
+            (std::ffi::OsString::from_wide(&[0x61, 0xD800]), std::ffi::OsString::from_wide(&[0x61, 0xDC00]));
+        std::fs::create_dir(dir.join(&one)).unwrap();
+        std::fs::create_dir(dir.join(&two)).unwrap();
+        std::fs::write(dir.join(&two).join("f.txt"), b"x").unwrap();
+        let vol = Volume::open_containing(&dir).unwrap();
+        let id = |p: &Path| file_id(&open(p, FILE_READ_ATTRIBUTES.0, FILE_FLAG_BACKUP_SEMANTICS).unwrap()).unwrap().1;
+        let (a, b, f) = (id(&dir.join(&one)), id(&dir.join(&two)), id(&dir.join(&two).join("f.txt")));
+        assert_eq!(final_path(&vol.open_by_id(a, FILE_READ_ATTRIBUTES.0).unwrap()).unwrap(), {
+            final_path(&vol.open_by_id(b, FILE_READ_ATTRIBUTES.0).unwrap()).unwrap()
+        });
+        assert_eq!(vol.stat_in(f, a).unwrap(), None, "not in the other folder");
+        assert!(vol.stat_in(f, b).unwrap().is_some());
+        assert_eq!(vol.child_path(b, "f.txt").unwrap(), long_of(&dir.join(&two).join("f.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `p` in the `\\?\` form Windows normalizes to.
+    fn long_of(p: &Path) -> PathBuf {
+        use std::os::windows::ffi::OsStringExt as _;
+        let h = open(p, FILE_READ_ATTRIBUTES.0, FILE_FLAG_BACKUP_SEMANTICS).unwrap();
+        PathBuf::from(std::ffi::OsString::from_wide(&final_path_wide(&h).unwrap()))
     }
 
     #[test]
