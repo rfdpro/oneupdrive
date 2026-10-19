@@ -201,7 +201,7 @@ async fn show_details(
     let (rules, _) = oneup_app::rulefiles::load(data_dir, store, &mut Default::default())?;
     let found = prune::candidates(store, &rules, Scope::All, brings)?;
     let want = format!("/{}", path.trim_matches(['/', '\\']).replace('\\', "/"));
-    let Some(c) = found.iter().find(|c| c.path.eq_ignore_ascii_case(&want)) else {
+    let Some(c) = found.iter().find(|c| oneup_sync::same_name(&c.path, &want)) else {
         bail!("{want} isn't one of the excluded items in OneDrive (`oneup cloud prune` lists them)");
     };
     if !c.folder {

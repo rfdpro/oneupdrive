@@ -120,7 +120,7 @@ pub fn new_name(main: &Path, remote: &str) -> String {
     let taken = list(main);
     (1..)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-        .find(|n| taken.iter().all(|e| !e.name.eq_ignore_ascii_case(n)) && !main.join(VAULTS).join(n).exists())
+        .find(|n| taken.iter().all(|e| !oneup_sync::same_name(&e.name, n)) && !main.join(VAULTS).join(n).exists())
         .unwrap_or(base)
 }
 
@@ -294,7 +294,7 @@ fn children(main: &Store, root: &str) -> Result<Vec<RemoteRow>> {
 /// [`unlock`] from the vault folder's listed items (no database held while
 /// waiting on OneDrive).
 async fn unlock_in(graph: &Arc<Graph>, kids: Vec<RemoteRow>, password: &str) -> Result<(Masterkey, usize)> {
-    let find = |n: &str| kids.iter().find(|r| r.name.eq_ignore_ascii_case(n)).cloned();
+    let find = |n: &str| kids.iter().find(|r| oneup_sync::same_name(&r.name, n)).cloned();
     let cfg = find(oneup_vault::config::FILE).context("this OneDrive folder isn't a vault (no vault.cryptomator)")?;
     let cloud = GraphCloud::new(Arc::clone(graph));
     let token = String::from_utf8(fetch(&cloud, &cfg).await?).context("vault.cryptomator isn't text")?;
@@ -771,7 +771,7 @@ pub async fn create(
 async fn config_token(graph: &Arc<Graph>, kids: &[RemoteRow]) -> Result<String> {
     let cfg = kids
         .iter()
-        .find(|r| r.name.eq_ignore_ascii_case(oneup_vault::config::FILE))
+        .find(|r| oneup_sync::same_name(&r.name, oneup_vault::config::FILE))
         .context("this OneDrive folder isn't a vault (no vault.cryptomator)")?;
     String::from_utf8(fetch(&GraphCloud::new(Arc::clone(graph)), cfg).await?).context("vault.cryptomator isn't text")
 }
@@ -812,7 +812,7 @@ pub async fn set_password(main: &Path, graph: Arc<Graph>, e: &Entry, key: &Maste
     oneup_vault::config::Config::verify(&token, key)?;
     let file = kids
         .iter()
-        .find(|r| r.name.eq_ignore_ascii_case(oneup_vault::key::FILE))
+        .find(|r| oneup_sync::same_name(&r.name, oneup_vault::key::FILE))
         .context("the vault's masterkey.cryptomator is missing")?;
     let json = key.to_file(password)?;
     let pre = RemotePre { id: RemoteId(file.id.clone()), etag: file.etag.clone().unwrap_or_default() };

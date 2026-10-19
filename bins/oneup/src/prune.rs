@@ -123,7 +123,7 @@ impl Here {
     /// if this PC has a folder of that name there.
     fn unlisted(&mut self, o: &Ops<'_>, parent: u128, name: &str) {
         let found = o.local_children(parent).ok().and_then(|kids| {
-            kids.into_iter().find(|l| l.kind == LocalKind::Folder && l.name.eq_ignore_ascii_case(name))
+            kids.into_iter().find(|l| l.kind == LocalKind::Folder && oneup_sync::same_name(&l.name, name))
         });
         match found {
             Some(l) => self.keep.push(LocalPre { id: LocalId(l.file_id), stamp: None }),

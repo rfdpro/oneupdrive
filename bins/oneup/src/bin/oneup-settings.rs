@@ -211,7 +211,7 @@ mod win {
         let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
         vaultpair::list(dir)
             .into_iter()
-            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .find(|e| oneup_sync::same_name(&e.name, name))
             .with_context(|| format!("no vault called {name}"))
     }
 

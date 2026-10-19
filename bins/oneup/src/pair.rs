@@ -110,7 +110,7 @@ pub async fn shared(graph: &oneup_graph::Graph) -> Result<()> {
 /// The shared folder called `name` (as `oneup pair shared` lists it).
 pub async fn find_shared(graph: &oneup_graph::Graph, name: &str) -> Result<oneup_graph::SharedFolder> {
     let found = graph.shared_folders().await?;
-    let mut hits: Vec<_> = found.into_iter().filter(|f| f.name.eq_ignore_ascii_case(name)).collect();
+    let mut hits: Vec<_> = found.into_iter().filter(|f| oneup_sync::same_name(&f.name, name)).collect();
     match hits.len() {
         0 => bail!("no folder called {name} is shared with you (`oneup pair shared` lists them)"),
         1 => Ok(hits.remove(0)),

@@ -143,7 +143,7 @@ pub fn list(main: &Path) -> Vec<Entry> {
 pub fn find(main: &Path, name: &str) -> Result<Entry> {
     list(main)
         .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name) || e.remote.eq_ignore_ascii_case(name))
+        .find(|e| oneup_sync::same_name(&e.name, name) || oneup_sync::same_name(&e.remote, name))
         .with_context(|| format!("no folder pair called {name} here (`oneup pair list`)"))
 }
 
@@ -186,7 +186,7 @@ fn new_name(main: &Path, label: &str) -> String {
     let taken = list(main);
     (1..)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-        .find(|n| taken.iter().all(|e| !e.name.eq_ignore_ascii_case(n)) && !main.join(PAIRS).join(n).exists())
+        .find(|n| taken.iter().all(|e| !oneup_sync::same_name(&e.name, n)) && !main.join(PAIRS).join(n).exists())
         .unwrap_or(base)
 }
 
@@ -381,7 +381,7 @@ pub async fn add(main: &Path, http: reqwest::Client, auth: Arc<oneup_graph::Auth
                 Some(o) => format!("{} (shared by {o})", s.name),
                 None => format!("{} (shared)", s.name),
             };
-            if list(main).iter().any(|e| e.remote.eq_ignore_ascii_case(&label)) {
+            if list(main).iter().any(|e| oneup_sync::same_name(&e.remote, &label)) {
                 bail!("{label} is already synced here");
             }
             (

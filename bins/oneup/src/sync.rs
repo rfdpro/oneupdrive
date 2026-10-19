@@ -1539,7 +1539,7 @@ impl Engine {
         let mut found: Vec<(String, U)> = problems.iter().map(|(p, w)| (p.clone(), U::from(*w))).collect();
         // A synced item that can't sync any more (a refused name, too
         // large) is held as missing on one side; why is the problem's.
-        found.extend(held.into_iter().filter(|(p, _)| !problems.iter().any(|(q, _)| q.eq_ignore_ascii_case(p))));
+        found.extend(held.into_iter().filter(|(p, _)| !problems.iter().any(|(q, _)| oneup_sync::same_name(q, p))));
         let mut done: Vec<String> = Vec::new();
         // The report keeps the planned order (see `print_round`): one pass.
         let (mut d, mut s) = (report.done.iter().peekable(), report.skipped.iter().peekable());

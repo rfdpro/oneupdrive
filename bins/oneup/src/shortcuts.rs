@@ -267,7 +267,7 @@ fn walk(w: &mut Walk<'_>, dir: &Path, depth: usize) {
             }
             continue;
         }
-        if !path.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")) {
+        if !path.extension().is_some_and(|x| oneup_sync::same_name(&x.to_string_lossy(), "lnk")) {
             continue;
         }
         let Some(Target { path: target, working_dir, dead }) = target_of(w.reader, &path) else { continue };

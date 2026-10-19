@@ -96,7 +96,7 @@ pub fn add(name: &str) -> Result<PathBuf> {
     if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')) {
         bail!("use letters, digits, spaces, - and _ in the name");
     }
-    if list().iter().any(|a| a.name.eq_ignore_ascii_case(name)) {
+    if list().iter().any(|a| oneup_sync::same_name(&a.name, name)) {
         bail!("there's already an account called {name}");
     }
     let dir = local_app_data()?.join(format!("{PREFIX}{}", name.replace(' ', "-")));
