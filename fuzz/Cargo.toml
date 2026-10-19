@@ -10,6 +10,11 @@ license = "MIT"
 cargo-fuzz = true
 
 [dependencies]
+# A development tool, never built into anything OneUpDrive ships, and
+# outside the main workspace that cargo-deny and cargo-about check. So the
+# shipping licence allow-list doesn't cover it: libfuzzer-sys is
+# "(MIT OR Apache-2.0) AND NCSA", NCSA being LLVM's libFuzzer licence,
+# a permissive BSD-style licence with no GPL terms.
 libfuzzer-sys = "0.4"
 oneup-graph = { path = "../crates/oneup-graph" }
 oneup-ntfs = { path = "../crates/oneup-ntfs" }
