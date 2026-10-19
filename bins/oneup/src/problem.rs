@@ -58,7 +58,7 @@ impl Kind {
     }
 
     /// Title, what happened, and what to do.
-    fn words(self) -> (&'static str, &'static str, &'static str) {
+    pub fn words(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Kind::Setup => (
                 "Nothing to sync yet",
@@ -257,6 +257,55 @@ pub fn load_stopped(data_dir: &Path) -> Option<Problem> {
 /// Forgets why the agent last stopped (it's starting again).
 pub fn clear_stopped(data_dir: &Path) {
     let _ = std::fs::remove_file(data_dir.join(STOPPED_FILE));
+    // Normally gone already: the launcher removes it ([`start_requested`]).
+    // Left over, it no longer counts ([`stale_stop_note`]), and `oneup
+    // problems` says so; the agent syncs all the same.
+    if let Err(e) = start_requested(data_dir) {
+        tracing::warn!(
+            error = %e,
+            "couldn't delete {ASKED_FILE} in this agent's data folder; it's ignored from now on, \
+             delete it by hand (`oneup problems` shows where)"
+        );
+    }
+}
+
+/// In the data folder: the agent was asked to stop (the `stop` call: `oneup
+/// stop`, the icon, the settings window, locking a vault; or a pair added
+/// without starting it), until a start is asked for. An extra pair or vault
+/// that isn't running without it should be (it starts with the main
+/// agent), so the problems list names it.
+pub const ASKED_FILE: &str = "agent-stopped-as-asked";
+
+/// A start was asked for (`launch::start_agent`, before anything else, so
+/// a start that then fails leaves the agent listed as not running): the
+/// last stop no longer explains why it isn't running. A note that can't be
+/// removed is an error, so the start fails rather than leave a stale one.
+pub fn start_requested(data_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(data_dir.join(ASKED_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Notes that the agent was asked to stop (our own file).
+pub fn note_asked_to_stop(data_dir: &Path) -> std::io::Result<()> {
+    crate::ownfile::write(&data_dir.join(ASKED_FILE), b"")
+}
+
+/// Whether the agent was last asked to stop (and hasn't started since).
+pub fn asked_to_stop(data_dir: &Path) -> bool {
+    data_dir.join(ASKED_FILE).is_file() && !stale_stop_note(data_dir)
+}
+
+/// Whether the note that the agent was asked to stop is older than its
+/// last start (the pipe's name, written at every start), so left over from
+/// before it: the start couldn't delete it. It doesn't count then.
+pub fn stale_stop_note(data_dir: &Path) -> bool {
+    let modified = |f: &str| std::fs::metadata(data_dir.join(f)).and_then(|m| m.modified()).ok();
+    match (modified(ASKED_FILE), modified(oneup_ipc::PIPE_FILE)) {
+        (Some(note), Some(started)) => note < started,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

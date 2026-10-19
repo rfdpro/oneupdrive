@@ -35,7 +35,9 @@ Which programs changed and opened files in your synced folder, over the last day
 * Counts are kept for 90 days, and the latest 5,000 files used, all on this PC only. **Track which programs use my files** turns it off.
 
 ## Activity
-The lists the OneUpDrive icon's menu points to, one tab each. Type in the box to show only the items whose name or folder matches; **Refresh** reads the list again (it also follows syncing by itself). With more than one synced folder, choose which one at the top right.
+At the top, while anything needs you: one line per item, with what to do (the same list as `oneup problems`, see [When something goes wrong](troubleshooting.md#everything-that-needs-you)).
+
+Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the box to show only the items whose name or folder matches; **Refresh** reads the list again (it also follows syncing by itself). With more than one synced folder, choose which one at the top right.
 
 * **Recent**: what OneUpDrive did lately, newest first, with whether it went through (*Done*, *Skipped*, *Failed*, *Waiting*). **Problems only** hides the rest; **Show older** goes further back.
 * **Sync failures**: items that won't sync until you do something about them, grouped by why, with a button for each way to resolve one (see [Syncing in depth](syncing.md#resolving-what-cant-sync)): **Delete in OneDrive** or **Restore** for items gone from this PC, **Delete here** or **Upload** for items gone from OneDrive, **Rename** for a name OneDrive doesn't allow, **Exclude** for a file over 250 GB or a hard link, **Contents** for a folder that can't be deleted because it isn't empty. The heading of a group says why once and resolves all its items at once. Items inside a listed folder are shown under it: the folder's buttons cover them. You're asked before anything is deleted. **Show** opens an item in File Explorer. A choice shows as *Queued* until OneUpDrive carries it out, then the item leaves the list. Excluded items aren't listed.

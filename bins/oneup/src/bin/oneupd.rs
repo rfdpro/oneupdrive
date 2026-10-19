@@ -292,10 +292,14 @@ async fn run(args: Args) -> Result<()> {
     let stop = Arc::new(Stop { flag: AtomicBool::new(false), notify: Notify::new() });
     {
         // `oneup stop` works like Ctrl+C: after the current round.
-        let (stop, control) = (Arc::clone(&stop), Arc::clone(&control));
+        let (stop, control, dir) = (Arc::clone(&stop), Arc::clone(&control), dir.clone());
         tokio::spawn(async move {
             control.stop.notified().await;
             println!("oneupd: stopping after the current round (asked by `oneup stop`)");
+            // Not running on purpose: `oneup problems` leaves it out.
+            if let Err(e) = problem::note_asked_to_stop(&dir) {
+                tracing::warn!(error = %e, "couldn't note that oneupd was asked to stop");
+            }
             stop.flag.store(true, Relaxed);
             stop.notify.notify_one();
         });

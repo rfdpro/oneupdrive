@@ -224,6 +224,8 @@ pub async fn add(
     if start {
         crate::agent::start_with(&added.entry.dir, Some(&added.key)).await?;
     } else {
+        // Not running on purpose until something starts it.
+        oneup_app::problem::note_asked_to_stop(&added.entry.dir)?;
         println!("`oneup vault unlock {}` starts syncing it.", added.entry.name);
     }
     Ok(())
@@ -258,7 +260,12 @@ pub async fn new(
         added.entry.name
     );
     show_recovery(&added.key);
-    if start { crate::agent::start_with(&added.entry.dir, Some(&added.key)).await } else { Ok(()) }
+    if start {
+        crate::agent::start_with(&added.entry.dir, Some(&added.key)).await
+    } else {
+        // Not running on purpose until something starts it.
+        Ok(oneup_app::problem::note_asked_to_stop(&added.entry.dir)?)
+    }
 }
 
 /// The keys of a synced vault: remembered, or from its password.
