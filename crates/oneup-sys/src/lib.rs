@@ -951,29 +951,49 @@ mod tests {
     #[test]
     fn a_registry_tree_is_read_whole_and_put_back_without_overwriting() {
         use super::user_registry::{self as reg, RawValue, Tree};
-        let key = format!(r"Software\OneUpDrive-test-tree-{}", std::process::id());
-        assert_eq!(reg::tree(&key).unwrap(), None);
-        let sz = |s: &str| s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        /// Removes the scratch key however the test ends.
+        struct Scratch(String);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = reg::remove_key(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(format!(r"Software\OneUpDrive-test-tree-{}-{nanos}", std::process::id()));
+        let key = scratch.0.as_str();
+        assert_eq!(reg::tree(key).unwrap(), None);
+        let wide = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let sz = |s: &str| wide(&format!("{s}\0"));
         let v = |name: &str, kind: u32, data: Vec<u8>| RawValue { name: name.into(), kind, data };
         let big = vec![7u8; 10_000];
         let want = Tree {
-            values: vec![v("", 1, sz("Default")), v("Big", 3, big), v("n", 4, 5u32.to_le_bytes().to_vec())],
+            values: vec![
+                v("", 1, sz("Default")),
+                v("Big", 3, big),
+                // Kept as stored: not expanded, every string of the list.
+                v("Expand", 2, sz(r"%LOCALAPPDATA%\x")),
+                v("Multi", 7, wide("one\0two\0\0")),
+                v("n", 4, 5u32.to_le_bytes().to_vec()),
+            ],
             keys: vec![
                 ("Empty".into(), Tree::default()),
+                // A default value with no bytes at all.
+                ("EmptyDefault".into(), Tree { values: vec![v("", 1, Vec::new())], keys: vec![] }),
                 ("Sub".into(), Tree { values: vec![v("q", 11, 9u64.to_le_bytes().to_vec())], keys: vec![] }),
             ],
         };
-        assert_eq!(reg::restore_missing(&key, &want).unwrap(), 4);
-        let got = reg::tree(&key).unwrap().unwrap();
+        assert_eq!(reg::restore_missing(key, &want).unwrap(), 7);
+        let got = reg::tree(key).unwrap().unwrap();
         assert_eq!(got, want);
         assert_eq!(got.text("").as_deref(), Some("Default"));
+        assert_eq!(got.text("Expand").as_deref(), Some(r"%LOCALAPPDATA%\x"));
         assert_eq!(got.text("n"), None, "a number isn't text");
         // Putting back again sets nothing, and a value changed since stays.
-        reg::set(&key, "", "Changed").unwrap();
-        assert_eq!(reg::restore_missing(&key, &want).unwrap(), 0);
-        assert_eq!(reg::get(&key, "").unwrap().as_deref(), Some("Changed"));
-        reg::remove_key(&key).unwrap();
-        assert_eq!(reg::tree(&key).unwrap(), None);
+        reg::set(key, "", "Changed").unwrap();
+        assert_eq!(reg::restore_missing(key, &want).unwrap(), 0);
+        assert_eq!(reg::get(key, "").unwrap().as_deref(), Some("Changed"));
+        reg::remove_key(key).unwrap();
+        assert_eq!(reg::tree(key).unwrap(), None);
     }
 
     #[tokio::test]
