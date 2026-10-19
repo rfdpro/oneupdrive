@@ -20,7 +20,8 @@
 //!    is also planned from a store holding a copy of the world, and the two
 //!    plans must be identical (`oneup_store::synced`'s `Trees` impl).
 //!
-//! `SIM_SEEDS=N` runs more seeds (default 200), `SIM_SEED=n` replays one,
+//! `SIM_SEEDS=N` runs more seeds (default 200), `SIM_SEED_FROM=k` starts at
+//! seed `k` instead of 1 (to split a long run), `SIM_SEED=n` replays one,
 //! `SIM_DEBUG=1` prints each round's operations, `SIM_STORE=0` skips check 4
 //! (for long runs: it multiplies the run time).
 
@@ -997,12 +998,22 @@ fn assert_converged(w: &World, must_survive: &BTreeSet<Content>) {
     assert_eq!(w.bases.len(), w.local.len(), "Synced rows vs local items");
 }
 
+/// The seeds to run: `SIM_SEED` alone if set (whatever the range), else
+/// `SIM_SEEDS` of them (default 200) from `SIM_SEED_FROM` (default 1).
+fn seeds() -> std::ops::RangeInclusive<u64> {
+    let var = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    if let Some(only) = var("SIM_SEED") {
+        return only..=only;
+    }
+    let from = var("SIM_SEED_FROM").unwrap_or(1).max(1);
+    let count = var("SIM_SEEDS").unwrap_or(200);
+    from..=from.saturating_add(count).saturating_sub(1)
+}
+
 #[test]
 fn random_histories_converge_without_losing_edits() {
-    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let only: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
     let debug = std::env::var("SIM_DEBUG").is_ok();
-    for seed in (1..=seeds).filter(|s| only.is_none_or(|o| o == *s)) {
+    for seed in seeds() {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut w = World::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1034,10 +1045,8 @@ fn random_histories_converge_without_losing_edits() {
 /// it's held as one-way (a folder of the same name in the cloud).
 #[test]
 fn backups_send_this_pc_and_never_change_it() {
-    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let only: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
     let debug = std::env::var("SIM_DEBUG").is_ok();
-    for seed in (1..=seeds).filter(|s| only.is_none_or(|o| o == *s)) {
+    for seed in seeds() {
         let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
         let mut w = World::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -717,103 +717,126 @@ fn random_mutation(i: &mut Inner, rng: &mut Rng) {
     }
 }
 
+/// The seeds to run: `SIM_SEED` alone if set (whatever the range), else
+/// `SIM_SEEDS` of them (default 60, which keeps CI fast) from
+/// `SIM_SEED_FROM` (default 1).
+fn seeds() -> std::ops::RangeInclusive<u64> {
+    let var = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    if let Some(only) = var("SIM_SEED") {
+        return only..=only;
+    }
+    let from = var("SIM_SEED_FROM").unwrap_or(1).max(1);
+    let count = var("SIM_SEEDS").unwrap_or(60);
+    from..=from.saturating_add(count).saturating_sub(1)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn randomized_simulation_converges_every_round() {
-    // More seeds locally with SIM_SEEDS=N; 60 keeps CI fast.
-    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
-    let only: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
-    for seed in (1..=seeds).filter(|s| only.is_none_or(|o| o == *s)) {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let fake = Arc::new(Fake::new(1 + rng.below(6), rng.below(2) == 0));
-        populate(&fake);
+    for seed in seeds() {
+        // On its own task, so a failure anywhere in the seed (not only the
+        // checks that name it) still says which seed to replay.
+        if let Err(e) = tokio::spawn(simulate(seed)).await {
+            eprintln!("simulation failed for seed {seed}; replay with SIM_SEED={seed}");
+            match e.try_into_panic() {
+                Ok(p) => std::panic::resume_unwind(p),
+                Err(e) => panic!("seed {seed}: {e}"),
+            }
+        }
+    }
+}
+
+/// One seed of [`randomized_simulation_converges_every_round`].
+async fn simulate(seed: u64) {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let fake = Arc::new(Fake::new(1 + rng.below(6), rng.below(2) == 0));
+    populate(&fake);
+    fake.with(|i| {
+        for _ in 0..40 {
+            random_mutation(i, &mut rng);
+        }
+    });
+    let path = temp_db(&format!("sim-{seed}"));
+    let rules = if rng.below(4) == 0 { ExcludeSet::none() } else { ExcludeSet::dev() };
+    // Vary the split strategy: fixed depth, size-based deep listing, or delta-everything.
+    let list_depth = rng.below(3) as u32;
+    // Hints: none, correct (and growing stale as later rounds mutate the
+    // drive), pure garbage, or both mixed. None of them may change the result.
+    let hint = match rng.below(4) {
+        0 => None,
+        1 => Some(SplitHint::from_excluded_paths(excluded_paths(&fake, &rules))),
+        2 => Some(SplitHint::from_excluded_paths(random_paths(&mut rng))),
+        _ => {
+            let mut h = SplitHint::from_excluded_paths(excluded_paths(&fake, &rules));
+            h.add(random_paths(&mut rng));
+            Some(h)
+        }
+    };
+    let cfg = Config {
+        list_depth,
+        max_list_depth: list_depth + rng.below(5) as u32,
+        split_bytes: [0, 30, 100, i64::MAX][rng.below(4)],
+        rules: rules.clone(),
+        max_tasks: 1 + rng.below(6),
+        hint: hint.map(Arc::new),
+    };
+    for round in 0..6 {
+        // Sometimes change things while the enumeration/catch-up runs.
+        let n_during = rng.below(4);
+        let seed_during = rng.next();
         fake.with(|i| {
-            for _ in 0..40 {
-                random_mutation(i, &mut rng);
-            }
+            i.during_enumeration.push(Box::new(move |i: &mut Inner| {
+                let mut r = Rng(seed_during | 1);
+                for _ in 0..n_during {
+                    random_mutation(i, &mut r);
+                }
+            }));
         });
-        let path = temp_db(&format!("sim-{seed}"));
-        let rules = if rng.below(4) == 0 { ExcludeSet::none() } else { ExcludeSet::dev() };
-        // Vary the split strategy: fixed depth, size-based deep listing, or delta-everything.
-        let list_depth = rng.below(3) as u32;
-        // Hints: none, correct (and growing stale as later rounds mutate the
-        // drive), pure garbage, or both mixed. None of them may change the result.
-        let hint = match rng.below(4) {
-            0 => None,
-            1 => Some(SplitHint::from_excluded_paths(excluded_paths(&fake, &rules))),
-            2 => Some(SplitHint::from_excluded_paths(random_paths(&mut rng))),
-            _ => {
-                let mut h = SplitHint::from_excluded_paths(excluded_paths(&fake, &rules));
-                h.add(random_paths(&mut rng));
-                Some(h)
-            }
-        };
-        let cfg = Config {
-            list_depth,
-            max_list_depth: list_depth + rng.below(5) as u32,
-            split_bytes: [0, 30, 100, i64::MAX][rng.below(4)],
-            rules: rules.clone(),
-            max_tasks: 1 + rng.below(6),
-            hint: hint.map(Arc::new),
-        };
-        for round in 0..6 {
-            // Sometimes change things while the enumeration/catch-up runs.
-            let n_during = rng.below(4);
-            let seed_during = rng.next();
-            fake.with(|i| {
-                i.during_enumeration.push(Box::new(move |i: &mut Inner| {
-                    let mut r = Rng(seed_during | 1);
-                    for _ in 0..n_during {
-                        random_mutation(i, &mut r);
-                    }
-                }));
-            });
-            fake.with(|i| i.trace.push(format!("== round {round}")));
-            // Sometimes fail part-way, then resume.
-            if rng.below(3) == 0 {
-                fake.served.store(0, SeqCst);
-                fake.fail_after.store(rng.below(8) as i64, SeqCst);
-                let mf = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
-                let r = mf.run().await;
-                debug_dump(&mf, &format!("after failing run ({:?})", r.err()));
-                drop(mf);
-                fake.fail_after.store(-1, SeqCst);
-            }
-            let m = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
-            m.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round}: {e}"));
-            debug_dump(&m, &format!("after run 1 of round {round}"));
-            // "during enumeration" changes only fire on a fresh cursor, so run
-            // once more to pick up anything made after the last cursor.
-            let m2 = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
-            drop(m);
-            m2.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round} (2nd): {e}"));
-            if actual(&m2) != expected(&fake, &rules) {
-                let trace = fake.with(|i| {
-                    i.trace.join(
-                        "
+        fake.with(|i| i.trace.push(format!("== round {round}")));
+        // Sometimes fail part-way, then resume.
+        if rng.below(3) == 0 {
+            fake.served.store(0, SeqCst);
+            fake.fail_after.store(rng.below(8) as i64, SeqCst);
+            let mf = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
+            let r = mf.run().await;
+            debug_dump(&mf, &format!("after failing run ({:?})", r.err()));
+            drop(mf);
+            fake.fail_after.store(-1, SeqCst);
+        }
+        let m = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
+        m.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round}: {e}"));
+        debug_dump(&m, &format!("after run 1 of round {round}"));
+        // "during enumeration" changes only fire on a fresh cursor, so run
+        // once more to pick up anything made after the last cursor.
+        let m2 = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
+        drop(m);
+        m2.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round} (2nd): {e}"));
+        if actual(&m2) != expected(&fake, &rules) {
+            let trace = fake.with(|i| {
+                i.trace.join(
+                    "
 ",
-                    )
-                });
-                let (got, want) = (actual(&m2), expected(&fake, &rules));
-                panic!(
-                    "seed {seed} round {round} cfg {cfg:?}
+                )
+            });
+            let (got, want) = (actual(&m2), expected(&fake, &rules));
+            panic!(
+                "seed {seed} round {round} cfg {cfg:?}
 missing: {:?}
 unexpected: {:?}
 trace:
 {trace}",
-                    want.difference(&got).collect::<Vec<_>>(),
-                    got.difference(&want).collect::<Vec<_>>()
-                );
-            }
-            drop(m2);
-            fake.with(|i| {
-                i.during_enumeration.clear();
-                for _ in 0..rng.below(15) + 1 {
-                    random_mutation(i, &mut rng);
-                }
-            });
+                want.difference(&got).collect::<Vec<_>>(),
+                got.difference(&want).collect::<Vec<_>>()
+            );
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        drop(m2);
+        fake.with(|i| {
+            i.during_enumeration.clear();
+            for _ in 0..rng.below(15) + 1 {
+                random_mutation(i, &mut rng);
+            }
+        });
     }
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
