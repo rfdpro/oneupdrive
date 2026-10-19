@@ -115,6 +115,15 @@ fn unstaged(name: &str) -> Option<&str> {
     (i > 0 && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| &name[..i])
 }
 
+/// `name` without any staging suffixes: the name the item is meant to have.
+pub(crate) fn real_name(name: &str) -> &str {
+    let mut n = name;
+    while let Some(real) = unstaged(n) {
+        n = real;
+    }
+    n
+}
+
 /// `name (conflict N).ext`, with N chosen so the folded result isn't in
 /// `taken` (which it then joins).
 pub fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -> String {
@@ -130,8 +139,10 @@ pub fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -
 
 /// The `n`th name [`conflict_name`] tries: `name (conflict N).ext`. For a
 /// caller that asks whether each is taken instead of listing every name
-/// in the folder first.
+/// in the folder first. An item under a staging name gets a conflict name
+/// of its real name: the staging suffix isn't an extension.
 pub fn conflict_candidate(name: &str, kind: NodeKind, n: u32) -> String {
+    let name = real_name(name);
     let (stem, ext) = match (kind, name.rfind('.')) {
         // A leading dot (".gitignore") is part of the stem, not an extension.
         (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
@@ -714,5 +725,20 @@ mod tests {
         assert_eq!(unstaged("a.oneup-staging-x"), None);
         assert_eq!(unstaged(".oneup-staging-1"), None, "no real name left");
         assert_eq!(unstaged("plain.txt"), None);
+        assert_eq!(real_name("b.oneup-staging-1.oneup-staging-2"), "b");
+        assert_eq!(real_name("plain.txt"), "plain.txt");
+    }
+
+    /// An item still under a staging name can need a conflict name (a
+    /// listing behind the cloud moved it back and forth, simulation seed
+    /// 3727). The name is the real one's: the staging suffix isn't taken for
+    /// the extension, which would leave `Report.docx (conflict 1)` once the
+    /// suffix is dropped, a file Windows no longer opens as a document.
+    #[test]
+    fn conflict_names_of_staging_names_are_the_real_names() {
+        let mut taken = BTreeSet::new();
+        let name = |n: &str, taken: &mut BTreeSet<String>| conflict_name(n, NodeKind::File, taken);
+        assert_eq!(name("Report.docx.oneup-staging-1", &mut taken), "Report (conflict 1).docx");
+        assert_eq!(name("b.oneup-staging-1.oneup-staging-2", &mut taken), "b (conflict 1)");
     }
 }
