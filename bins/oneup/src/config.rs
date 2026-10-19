@@ -826,6 +826,105 @@ pub fn save_search(data_dir: &Path, s: &Search) -> Result<()> {
     )
 }
 
+/// `[hooks]` and the `[[hook]]` list: programs the agent starts on sync
+/// events (`crate::hooks`, `docs/architecture/hooks.md`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Hooks {
+    /// `[hooks] paused`: none start, none are queued.
+    pub paused: bool,
+    pub list: Vec<oneup_hooks::HookSpec>,
+}
+
+/// Reads the hooks. A hook whose shape is wrong is still listed (the agent
+/// says why it doesn't run it); only a value of the wrong type, or a name
+/// used twice, is an error for the whole list.
+pub fn load_hooks(data_dir: &Path) -> Result<Hooks> {
+    use oneup_hooks::HookSpec;
+    use std::time::Duration;
+    let mut h = Hooks::default();
+    let Some(doc) = read_doc(data_dir)? else { return Ok(h) };
+    if let Some(t) = section(&doc, "hooks")? {
+        h.paused = match t.get("paused") {
+            Some(v) => v.as_bool().with_context(|| format!("{FILE}: hooks.paused must be true or false"))?,
+            None => false,
+        };
+    }
+    let tables = match doc.get("hook") {
+        None => return Ok(h),
+        Some(Item::ArrayOfTables(a)) => a,
+        Some(_) => bail!("{FILE}: each hook is a [[hook]] section"),
+    };
+    for (i, t) in tables.iter().enumerate() {
+        let at = || format!("{FILE}: hook {}", i + 1);
+        let text = |key: &str| -> Result<Option<String>> {
+            t.get(key)
+                .map(|v| v.as_str().map(str::to_owned).with_context(|| format!("{}: {key} must be text", at())))
+                .transpose()
+        };
+        let on: Vec<String> = match t.get("on") {
+            Some(v) if v.is_str() => vec![v.as_str().unwrap_or_default().to_string()],
+            Some(_) => strings(t, "on").with_context(at)?.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut kinds = Vec::new();
+        for k in &on {
+            let names: Vec<&str> = oneup_ipc::EventKind::ALL.iter().map(|k| k.name()).collect();
+            kinds.push(
+                oneup_ipc::EventKind::from_name(k)
+                    .with_context(|| format!("{}: no event {k:?}; use {}", at(), names.join(", ")))?,
+            );
+        }
+        let secs = |key: &str, default: Duration| -> Result<Duration> {
+            Ok(number(t, key).with_context(at)?.map_or(default, Duration::from_secs))
+        };
+        let name = text("name")?.unwrap_or_default();
+        let spec = HookSpec {
+            name: name.trim().to_string(),
+            on: kinds,
+            paths: strings(t, "paths").with_context(at)?.unwrap_or_default(),
+            program: text("program")?.unwrap_or_default(),
+            args: strings(t, "args").with_context(at)?.unwrap_or_default(),
+            timeout: secs("timeout_s", oneup_hooks::DEFAULT_TIMEOUT)?,
+            per_minute: number(t, "per_minute")
+                .with_context(at)?
+                .map_or(oneup_hooks::DEFAULT_PER_MINUTE, |n| u32::try_from(n).unwrap_or(u32::MAX)),
+            coalesce: secs("coalesce_s", oneup_hooks::DEFAULT_COALESCE)?,
+            enabled: match t.get("enabled") {
+                Some(v) => v.as_bool().with_context(|| format!("{}: enabled must be true or false", at()))?,
+                None => true,
+            },
+        };
+        if !spec.name.is_empty() && h.list.iter().any(|o| o.name.eq_ignore_ascii_case(&spec.name)) {
+            bail!("{}: the name {:?} is used twice", at(), spec.name);
+        }
+        h.list.push(spec);
+    }
+    Ok(h)
+}
+
+/// Turns one hook on or off, by name, keeping everything else in the file.
+pub fn set_hook_enabled(data_dir: &Path, name: &str, on: bool) -> Result<()> {
+    let mut doc = read_doc(data_dir)?.with_context(|| format!("no hook called {name:?}"))?;
+    let Some(Item::ArrayOfTables(tables)) = doc.get_mut("hook") else { bail!("no hook called {name:?}") };
+    let t = tables
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()).is_some_and(|n| n.trim().eq_ignore_ascii_case(name.trim())))
+        .with_context(|| format!("no hook called {name:?}"))?;
+    t["enabled"] = value(on);
+    let p = path(data_dir);
+    crate::ownfile::write(&p, doc.to_string().as_bytes()).with_context(|| format!("writing {}", p.display()))
+}
+
+/// Pauses or resumes every hook (`[hooks] paused`).
+pub fn set_hooks_paused(data_dir: &Path, paused: bool) -> Result<()> {
+    save(
+        data_dir,
+        "hooks",
+        "# Hooks: programs OneUpDrive starts on sync events (each is a [[hook]] section).\n",
+        vec![("paused", value(paused))],
+    )
+}
+
 /// Checks a rule the user typed: it must be one rule line.
 pub fn check_rule(line: &str) -> Result<()> {
     if line.contains(['\n', '\r']) {
@@ -1052,6 +1151,60 @@ mod tests {
         let games_only = Agent { pause_on_full_screen: true, pause_on_full_screen_video: false, ..Agent::default() };
         save_agent(&d, &games_only).unwrap();
         assert_eq!(load_agent(&d).unwrap(), games_only);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn hooks_are_read_and_turned_on_and_off_in_place() {
+        let d = tmp("hooks");
+        assert_eq!(load_hooks(&d).unwrap(), Hooks::default());
+        std::fs::write(
+            path(&d),
+            r#"[agent]
+tray_icon = false
+
+# my hook
+[[hook]]
+name = "thumbs"
+on = ["synced", "conflict"]
+paths = ["/Photos/"]
+program = 'C:\Tools\thumb.exe'
+args = ["{path}"]
+timeout_s = 30
+
+[[hook]]
+name = "note"
+on = "safety_stop"
+program = "notify.exe"
+"#,
+        )
+        .unwrap();
+        let h = load_hooks(&d).unwrap();
+        assert!(!h.paused);
+        assert_eq!(h.list.len(), 2);
+        let t = &h.list[0];
+        assert_eq!((t.name.as_str(), t.program.as_str(), t.timeout.as_secs()), ("thumbs", r"C:\Tools\thumb.exe", 30));
+        assert_eq!(t.on, [oneup_ipc::EventKind::Synced, oneup_ipc::EventKind::Conflict]);
+        assert_eq!((t.paths.as_slice(), t.per_minute, t.enabled), (&["/Photos/".to_string()][..], 60, true));
+        assert_eq!(h.list[1].on, [oneup_ipc::EventKind::SafetyStop]);
+
+        set_hook_enabled(&d, "THUMBS", false).unwrap();
+        set_hooks_paused(&d, true).unwrap();
+        let h = load_hooks(&d).unwrap();
+        assert!(h.paused && !h.list[0].enabled && h.list[1].enabled);
+        let text = std::fs::read_to_string(path(&d)).unwrap();
+        assert!(text.contains("# my hook") && text.contains("tray_icon = false"), "{text}");
+        assert!(set_hook_enabled(&d, "nope", true).is_err());
+
+        for bad in [
+            "[[hook]]\nname = \"a\"\non = [\"deleted\"]\n",
+            "[[hook]]\nname = \"a\"\ntimeout_s = -1\n",
+            "[[hook]]\nname = \"a\"\n[[hook]]\nname = \"A\"\n",
+            "hook = 1\n",
+        ] {
+            std::fs::write(path(&d), bad).unwrap();
+            assert!(load_hooks(&d).is_err(), "{bad}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

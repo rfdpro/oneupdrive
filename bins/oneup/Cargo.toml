@@ -45,6 +45,7 @@ oneup-exec = { path = "../../crates/oneup-exec" }
 oneup-gate = { path = "../../crates/oneup-gate" }
 oneup-graph = { path = "../../crates/oneup-graph" }
 oneup-hash = { path = "../../crates/oneup-hash" }
+oneup-hooks = { path = "../../crates/oneup-hooks" }
 oneup-ipc = { path = "../../crates/oneup-ipc" }
 oneup-local = { path = "../../crates/oneup-local" }
 oneup-ntfs = { path = "../../crates/oneup-ntfs" }

@@ -15,11 +15,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use oneup_gate::{Breaker, Overflow, OverflowOutcome, Side};
 use oneup_ipc::{
-    Activity, Answer, Call, Direction, INVALID_PARAMS, LastRun, NO_SUCH_BATCH, PauseState, RpcError, SafetyStop, Status,
+    Activity, Answer, Call, Direction, EventKind, Events, INVALID_PARAMS, LastRun, NO_SUCH_BATCH, PauseState, RpcError,
+    SafetyStop, Status,
 };
 use oneup_sync::Op;
 use tokio::sync::Notify;
 
+use crate::events::{Feed, New};
 use crate::sync::{Answers, Controls, Offer};
 
 /// In the data folder: the agent's pause (JSON), while there is one.
@@ -81,6 +83,8 @@ pub struct Control {
     stopping: AtomicBool,
     /// The status revision, for clients that watch it (`Call::Watch`).
     rev: tokio::sync::watch::Sender<u64>,
+    /// What happened, for `oneup watch` and hooks (`Call::Events`).
+    pub events: Arc<Feed>,
 }
 
 struct Shared {
@@ -118,6 +122,8 @@ struct Shared {
     cloud_full: Option<oneup_ipc::Problem>,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
+    /// The sides paused when that was last told as an event, and why.
+    paused_told: (bool, bool, Option<String>),
 }
 
 fn code(f: u64) -> String {
@@ -181,6 +187,7 @@ impl Control {
                 retrying: None,
                 cloud_full: None,
                 shown: None,
+                paused_told: (pause.local, pause.remote, None),
             }),
             pause_file,
             wake: Notify::new(),
@@ -188,6 +195,7 @@ impl Control {
             stop: Notify::new(),
             stopping: AtomicBool::new(false),
             rev: tokio::sync::watch::Sender::new(0),
+            events: Arc::new(Feed::new()),
         }
     }
 
@@ -197,11 +205,45 @@ impl Control {
     fn publish(&self, s: &mut Shared) {
         let (local, remote) = paused_sides(s);
         self.live.set(local, remote);
+        self.tell_pause(s, local, remote);
         let now = Status { rev: 0, ..self.status(s) };
         if s.shown.as_ref() != Some(&now) {
             s.shown = Some(now);
             self.rev.send_modify(|r| *r += 1);
         }
+    }
+
+    /// A pause beginning or ending, as an event: which sides, and why if
+    /// the agent paused by itself.
+    fn tell_pause(&self, s: &mut Shared, local: bool, remote: bool) {
+        // Events are English data, like the activity log.
+        let english = crate::l10n::Locale::english();
+        let now = (local, remote, s.auto_pause.as_ref().map(|r| r.said(&english)));
+        if s.paused_told == now {
+            return;
+        }
+        let sides = |l: bool, r: bool| match (l, r) {
+            (true, true) => "both directions",
+            (true, false) => "changes to this PC",
+            (false, true) => "changes to OneDrive",
+            (false, false) => "",
+        };
+        let (was_l, was_r, _) = s.paused_told;
+        let mut news = Vec::new();
+        let (began_l, began_r) = (local && !was_l, remote && !was_r);
+        if began_l || began_r || (now.2.is_some() && now.2 != s.paused_told.2) {
+            let detail = match &now.2 {
+                Some(why) => format!("{}; by itself: {why}", sides(local, remote)),
+                None => sides(local, remote).to_string(),
+            };
+            news.push(New::about_sync(EventKind::Paused, detail));
+        }
+        let (ended_l, ended_r) = (was_l && !local, was_r && !remote);
+        if ended_l || ended_r {
+            news.push(New::about_sync(EventKind::Resumed, sides(ended_l, ended_r)));
+        }
+        s.paused_told = now;
+        self.events.push(news);
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -308,6 +350,12 @@ impl Control {
         if p.is_some() {
             s.activity = Activity::Retrying;
         }
+        // Once a spell, as the activity log notes it.
+        if let Some(new) = &p
+            && s.problem.as_ref().is_none_or(|old| old.kind != new.kind)
+        {
+            self.events.push(vec![New::about_sync(EventKind::Problem, format!("{}: {}", new.kind, new.title))]);
+        }
         s.problem = p;
         self.publish(&mut s);
     }
@@ -394,7 +442,14 @@ impl Control {
                 || prune_offer.as_ref().is_some_and(|o| &o.code == c)
         });
         if let Some(p) = s.problem.take() {
+            self.events.push(vec![New::about_sync(EventKind::Resolved, format!("{}: {}", p.kind, p.title))]);
             s.resolved = Some(p);
+        }
+        if new_stops {
+            // What and where, never the code that approves it.
+            self.events.push(
+                breakers.iter().map(|b| New::about_sync(EventKind::SafetyStop, crate::sync::breaker_what(b))).collect(),
+            );
         }
         self.publish(&mut s);
         Recorded { new_stops, new_overflow, new_offer }
@@ -448,7 +503,7 @@ impl Control {
         let mut wake = true;
         match call {
             // `serve` answers a watch itself; here it is a status.
-            Call::Status | Call::Watch { .. } => wake = false,
+            Call::Status | Call::Watch { .. } | Call::Events { .. } => wake = false,
             Call::SyncNow => {}
             Call::SyncFirst { path } => {
                 // Bounded: a client can't grow the agent's memory.
@@ -559,6 +614,14 @@ impl oneup_ipc::Handler for Control {
 
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.rev.subscribe())
+    }
+
+    fn events(&self, since: Option<u64>) -> Result<Events, RpcError> {
+        Ok(self.events.page(since))
+    }
+
+    fn event_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.events.subscribe())
     }
 }
 
@@ -686,6 +749,70 @@ mod tests {
         assert_eq!(rev(&c), r1);
         c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
         assert!(rev(&c) > r1);
+    }
+
+    /// Pauses, problems and safety stops reach the event feed (for `oneup
+    /// watch` and hooks) once each, and a stop's event never carries the
+    /// code that approves it.
+    #[test]
+    fn what_happens_to_sync_itself_becomes_events_once() {
+        let c = control(None);
+        let kinds = |c: &Control| -> Vec<(EventKind, String)> {
+            c.events.page(Some(0)).items.into_iter().map(|e| (e.kind, e.detail)).collect()
+        };
+        c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
+        c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
+        c.set_auto_pause(Some(crate::autopause::Reason { key: "on a metered connection", hours: None }));
+        c.set_auto_pause(None);
+        c.call(Call::Resume { direction: Direction::Both }, 0).unwrap();
+        let p = |kind: &str| oneup_ipc::Problem {
+            kind: kind.into(),
+            title: "Offline".into(),
+            detail: String::new(),
+            action: String::new(),
+            technical: String::new(),
+            since_ms: 0,
+            attempts: 1,
+            retry_ms: None,
+        };
+        c.set_problem(Some(p("offline")));
+        c.set_problem(Some(p("offline")));
+        let breaker = Breaker {
+            side: Side::Local,
+            count: 300,
+            recent: 0,
+            synced_items: 1000,
+            fingerprint: oneup_gate::Fingerprint(0x1234_5678_9abc_def0),
+            kind: oneup_gate::BreakerKind::Mass,
+            at_least: false,
+            items: Vec::new(),
+            later: Vec::new(),
+            sids: Vec::new(),
+        };
+        c.record(1, None, std::slice::from_ref(&breaker), None, None);
+        c.record(2, None, std::slice::from_ref(&breaker), None, None);
+        let got = kinds(&c);
+        let names: Vec<EventKind> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            names,
+            [
+                EventKind::Paused,
+                EventKind::Paused,
+                EventKind::Resumed,
+                EventKind::Resumed,
+                EventKind::Problem,
+                EventKind::Resolved,
+                EventKind::SafetyStop,
+            ],
+            "{got:?}"
+        );
+        assert_eq!(got[0].1, "changes to OneDrive");
+        assert!(got[1].1.contains("by itself: on a metered connection"), "{got:?}");
+        // Its own pause over, this PC's side goes again; the user's pause
+        // of the other side stands until resumed.
+        assert_eq!((got[2].1.as_str(), got[3].1.as_str()), ("changes to this PC", "changes to OneDrive"));
+        assert!(got[6].1.contains("300 items on this PC"), "{got:?}");
+        assert!(got.iter().all(|(_, d)| !d.contains("123456789abcdef0")), "no approval code");
     }
 
     #[test]
