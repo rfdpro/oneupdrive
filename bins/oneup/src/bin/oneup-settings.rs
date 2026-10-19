@@ -303,7 +303,8 @@ mod win {
             }
             "tree" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
-                tokio::task::spawn_blocking(move || oneup_app::filetree::list(&d, &rel)).await?
+                let steps = oneup_app::filetree::steps_from(&args["steps"])?;
+                tokio::task::spawn_blocking(move || oneup_app::filetree::list(&d, &rel, &steps)).await?
             }
             "remove_preview" => {
                 // What stopping a folder's sync would take away from this PC.
@@ -321,7 +322,8 @@ mod win {
             }
             "tree_sizes" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
-                tokio::task::spawn_blocking(move || oneup_app::filetree::sizes(&d, &rel)).await?
+                let steps = oneup_app::filetree::steps_from(&args["steps"])?;
+                tokio::task::spawn_blocking(move || oneup_app::filetree::sizes(&d, &rel, &steps)).await?
             }
             "tree_find" => {
                 let (d, q) = (dir.to_path_buf(), text(args, "q"));
