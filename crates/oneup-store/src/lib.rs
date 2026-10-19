@@ -512,6 +512,37 @@ impl Store {
         Ok(out)
     }
 
+    /// [`Store::try_write`] without waiting for another connection's write:
+    /// if one holds the database now, nothing runs and `Err` hands `f` back
+    /// with the busy error ([`Error::is_busy`]), so the caller can wait its
+    /// own way. The executor waits without holding up the operations under
+    /// way, which [`BUSY_WAIT`] inside SQLite would.
+    pub fn try_write_now<T, E, F>(&mut self, f: F) -> std::result::Result<std::result::Result<T, E>, (F, Error)>
+    where
+        E: From<Error>,
+        F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
+    {
+        let begun = self
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .and_then(|()| rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate));
+        // Back before anything else runs on this connection.
+        let restored = self.conn.busy_timeout(BUSY_WAIT);
+        let tx = match (begun, restored) {
+            (Ok(tx), Ok(())) => tx,
+            (Err(e), _) => {
+                let e = Error::from(e);
+                return if e.is_busy() { Err((f, e)) } else { Ok(Err(e.into())) };
+            }
+            (Ok(_), Err(e)) => return Ok(Err(Error::from(e).into())),
+        };
+        let out = match f(&Ops { c: &tx }) {
+            Ok(out) => out,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(tx.commit().map(|()| out).map_err(|e| Error::from(e).into()))
+    }
+
     /// Reads this connection's pages through a memory map of up to `bytes`
     /// of the file, instead of one system call per 4 KiB page: a walk of a
     /// large tree measured no read calls and a fifth less time this way.
@@ -1419,6 +1450,40 @@ mod tests {
         assert_eq!(s.read(|o| o.meta_get("a")).unwrap().as_deref(), Some("300"));
         assert_eq!(s.read(|o| o.meta_get("b")).unwrap().as_deref(), Some("300"));
         drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// While another connection writes, a write that doesn't wait runs
+    /// nothing and hands its work back at once; reads go on meanwhile, and
+    /// the connection still waits its full time for ordinary writes.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_write_that_doesnt_wait_hands_its_work_back_while_another_writes() {
+        let path = std::env::temp_dir().join(format!("oneup-store-now-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        let other = Store::open(&path, 1024).unwrap();
+        other.conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO meta (key, value) VALUES ('other', '1');").unwrap();
+        let started = std::time::Instant::now();
+        let ran = std::cell::Cell::new(false);
+        let work = |o: &Ops<'_>| -> Result<()> {
+            ran.set(true);
+            o.meta_set("mine", "1")
+        };
+        let Err((work, e)) = s.try_write_now(work) else { panic!("the database is held") };
+        assert!(e.is_busy(), "{e}");
+        assert!(!ran.get());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "didn't wait");
+        assert_eq!(s.read(|o| o.meta_get("mine")).unwrap(), None, "reads go on");
+        other.conn.execute_batch("COMMIT").unwrap();
+        s.try_write_now(work).ok().unwrap().unwrap();
+        assert!(ran.get());
+        assert_eq!(s.read(|o| o.meta_get("other")).unwrap().as_deref(), Some("1"));
+        let waits: i64 = s.conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        assert_eq!(waits, i64::try_from(BUSY_WAIT.as_millis()).unwrap(), "ordinary writes still wait");
+        drop((s, other));
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
