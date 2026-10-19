@@ -89,9 +89,9 @@ impl Graph {
     }
 }
 
-/// What one text frame means to us.
+/// What one text frame means to us ([`classify`]).
 #[derive(Debug, Clone, PartialEq)]
-enum Frame {
+pub enum Frame {
     /// Engine.IO open; the server pings every `ping` and gives up after
     /// `ping + timeout` without a pong.
     Open {
@@ -111,7 +111,11 @@ enum Frame {
     Other,
 }
 
-fn classify(text: &str) -> Frame {
+/// Reads one Engine.IO text frame as the server sent it. Pure and total:
+/// any text gives a [`Frame`] (unknown or malformed frames are
+/// [`Frame::Other`], an open packet with unreadable JSON gets the protocol's
+/// default timings), which is what lets the fuzz target call it directly.
+pub fn classify(text: &str) -> Frame {
     let mut chars = text.chars();
     match chars.next() {
         Some('0') => {
