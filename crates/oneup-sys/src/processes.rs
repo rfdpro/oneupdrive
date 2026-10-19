@@ -61,6 +61,22 @@ fn inside(exe: &Path, dir: &Path) -> bool {
 
 /// The processes whose executable is inside `dir` (any depth).
 pub fn inside_dir(dir: &Path) -> Result<Vec<Process>> {
+    Ok(all()?.into_iter().filter(|p| inside(&p.exe, dir)).collect())
+}
+
+/// The processes whose executable is called `file_name` (compared as
+/// Windows compares ASCII names; `file_name` is a program's name, like
+/// `OneDrive.exe`).
+pub fn named(file_name: &str) -> Result<Vec<Process>> {
+    Ok(all()?
+        .into_iter()
+        .filter(|p| p.exe.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(file_name)))
+        .collect())
+}
+
+/// Every process whose executable can be asked (this user's, and those that
+/// allow limited queries).
+fn all() -> Result<Vec<Process>> {
     let mut pids = vec![0u32; 4096];
     loop {
         let mut got = 0u32;
@@ -79,7 +95,7 @@ pub fn inside_dir(dir: &Path) -> Result<Vec<Process>> {
         .into_iter()
         .filter_map(|pid| {
             let exe = image(&open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)?;
-            inside(&exe, dir).then_some(Process { pid, exe })
+            Some(Process { pid, exe })
         })
         .collect())
 }
@@ -120,6 +136,8 @@ mod tests {
         let found = inside_dir(&system).unwrap();
         let p = found.iter().find(|p| p.pid == child.id()).expect("found by its folder").clone();
         assert!(p.exe.to_string_lossy().to_lowercase().ends_with("cmd.exe"));
+        assert!(named("CMD.EXE").unwrap().iter().any(|q| q.pid == p.pid), "found by its name");
+        assert!(!named("cmd").unwrap().iter().any(|q| q.pid == p.pid), "a whole name");
         assert!(!inside_dir(&std::env::temp_dir()).unwrap().iter().any(|q| q.pid == p.pid));
         // Another executable under that ID: left alone.
         let wrong = Process { pid: p.pid, exe: system.join("notepad.exe") };
