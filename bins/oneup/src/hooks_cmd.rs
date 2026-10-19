@@ -16,6 +16,7 @@ fn line(e: &Event, offset: time::UtcOffset) -> String {
         (false, false) => format!("  ({}; {})", e.action, e.detail),
     };
     let path = &e.path;
+    let what = if path.is_empty() { what.trim_start() } else { &what };
     format!("{}  {:<12}{path}{what}", crate::activity::when(e.at_ms, offset), e.kind.name())
 }
 
