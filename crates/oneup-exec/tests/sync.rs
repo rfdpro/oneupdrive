@@ -12,7 +12,10 @@ use std::time::Duration;
 
 use oneup_effects::LocalFs;
 use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, Source, VersionMark, link_roots};
-use oneup_gate::{Choice, Context, Decision, Overflow, OverflowOutcome, Policy, review_in};
+use oneup_gate::{
+    Breaker, Choice, Context, Decision, ItemKey, Overflow, OverflowOutcome, Policy, Recent, Side, is_mass_sensitive,
+    review_in,
+};
 use oneup_local::observe::Observer;
 use oneup_local::{Config, Scan};
 use oneup_plan::{Parked, names};
@@ -796,6 +799,34 @@ struct Sync {
     /// Added to the next round's plan, as the agent adds the renames the
     /// user chose (`oneup_exec::resolve`).
     extra: Vec<Op>,
+    /// Safety stops, as the agent handles them (`oneup_app::sync`).
+    stops: Stops,
+}
+
+/// Safety stops in the harness, as the agent handles them: a tripped round
+/// runs nothing and marks its list's folders for planning; an approved
+/// list's items stay approved; with `window`, what ran is counted like the
+/// agent's safety window.
+#[derive(Default)]
+struct Stops {
+    /// Stops may trip (otherwise a round asserts none does).
+    allowed: bool,
+    /// The next round plans every folder (as the agent's first does).
+    full_next: bool,
+    window: Option<Recent>,
+    approved: Vec<ItemKey>,
+    /// The last round's stops.
+    raised: Vec<Breaker>,
+}
+
+impl Stops {
+    /// The user approves the stops standing.
+    fn approve(&mut self) {
+        for b in std::mem::take(&mut self.raised) {
+            self.approved.extend(b.items);
+        }
+        self.approved.sort_unstable();
+    }
 }
 
 impl Sync {
@@ -850,6 +881,7 @@ impl Sync {
             follow: true,
             follow_max: oneup_exec::FOLLOW_MAX,
             extra: Vec::new(),
+            stops: Stops::default(),
         }
     }
 
@@ -886,6 +918,7 @@ impl Sync {
             follow,
             follow_max,
             extra,
+            stops,
         } = self;
         drop((obs, exec));
         let store = Store::open(&db.as_ref().expect("restart needs a database on disk").0, 4096).unwrap();
@@ -906,6 +939,7 @@ impl Sync {
             follow,
             follow_max,
             extra,
+            stops,
         }
     }
 
@@ -937,20 +971,39 @@ impl Sync {
         // Only the folders the store marked dirty are planned, as the
         // background agent does; `settle` checks a full plan agrees.
         let fingerprint = self.rules.fingerprint();
-        let all = fingerprint != self.planned_rules;
+        let all = fingerprint != self.planned_rules || std::mem::take(&mut self.stops.full_next);
         let rules = &self.rules;
         let pull = self.pull;
-        let (scope, mut ops) = store
+        let (scope, mut ops, pending) = store
             .read(|o| {
                 let scope = o.dirty_scope()?;
                 let folders = if all { all_folders(&Parked::with_rules(o, rules))? } else { scope.folders.clone() };
-                Ok((scope, plan_in(o, rules, pull, folders)?))
+                let ops = plan_in(o, rules, pull, folders)?;
+                let pending =
+                    oneup_sync::pending_deletes(&Parked::with_rules(o, rules), &ops, oneup_sync::Flow::TwoWay)?;
+                Ok((scope, ops, pending))
             })
             .unwrap();
         ops.extend(extra);
-        let cx = Context { room: self.room, decisions: &self.decisions, ..Context::default() };
+        let cx = Context {
+            room: self.room,
+            decisions: &self.decisions,
+            recent: self.stops.window.unwrap_or_default(),
+            approved: &self.stops.approved,
+            pending: &pending,
+            ..Context::default()
+        };
         let r = review_in(&self.policy, &cx, ops);
-        assert!(r.breakers.is_empty(), "{:?}", r.breakers);
+        assert!(self.stops.allowed || r.breakers.is_empty(), "{:?}", r.breakers);
+        if !r.breakers.is_empty() {
+            // Nothing runs; the marks stay, and the list's folders are
+            // marked so every round plans all of it.
+            let sids: Vec<oneup_sync::Sid> = r.breakers.iter().flat_map(|b| b.sids.clone()).collect();
+            store.write(|o| o.dirty_mark_synced(&sids)).unwrap();
+            self.stops.raised = r.breakers;
+            return Report::default();
+        }
+        self.stops.raised.clear();
         self.overflow = r.overflow.clone();
         let awaiting = r.overflow.as_ref().is_some_and(|o| o.outcome == OverflowOutcome::Held);
         let planned = r.approved.len();
@@ -976,6 +1029,15 @@ impl Sync {
             approved
         };
         let report = self.exec.run_following(store, r.approved, &count, may_run, &follow, self.follow_max).await;
+        if let Some(w) = &mut self.stops.window {
+            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
+                match oneup_gate::Side::changed_by(op) {
+                    Some(Side::Local) => w.local += 1,
+                    Some(Side::Remote) => w.remote += 1,
+                    None => {}
+                }
+            }
+        }
         let followed = followed.into_inner().unwrap();
         let (planned, order) = (planned + followed.len(), [order, followed].concat());
         // Progress counts every operation once, batched or not.
@@ -2743,6 +2805,122 @@ async fn everyday_deleting_a_folder_tree_here_deletes_it_in_onedrive_recoverably
     for c in [&b"fn main() {}"[..], b"pub fn util() {}", b"readme"] {
         assert!(cloud.holds(c), "OneDrive's recycle bin keeps {}", String::from_utf8_lossy(c));
     }
+}
+
+/// Small limits, so a few deletions trip a safety stop.
+fn strict() -> Policy {
+    Policy { max_count: 5, min_count: 2, ..Policy::default() }
+}
+
+/// Reads the change journal until a full plan has `n` deletions, moves and
+/// replacements (its records can land a moment after the change).
+fn wait_for_journal(s: &mut Sync, n: usize) {
+    for _ in 0..50 {
+        s.obs.catch_up().unwrap();
+        let found = s
+            .obs
+            .store()
+            .read(|o| {
+                let p = Parked::new(o);
+                Ok(plan(&p, all_folders(&p)?)?.iter().filter(|op| is_mass_sensitive(op)).count())
+            })
+            .unwrap();
+        if found == n {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("the journal never showed {n} changes");
+}
+
+/// Rounds until one changes nothing, asserting no safety stop trips.
+async fn without_another_stop(s: &mut Sync) {
+    for _ in 0..12 {
+        let r = s.attempt().await;
+        assert!(s.stops.raised.is_empty(), "another safety stop: {:?}", s.stops.raised);
+        assert!(r.failed.is_empty() && r.halted.is_none(), "{r:?}");
+        if r.is_idle() {
+            return;
+        }
+    }
+    panic!("not settled");
+}
+
+/// A deleted folder tree is deleted in OneDrive a level per round (a
+/// folder only once it's empty). One safety stop lists all of it, folders
+/// included, and one approval lets every level go, however many there are,
+/// counted on top of the safety window.
+#[tokio::test]
+async fn everyday_an_emptied_folder_tree_takes_one_safety_stop() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-one-stop", cloud.clone());
+    write(&s.p("old/a.txt"), b"a");
+    write(&s.p("old/one/b.txt"), b"b");
+    write(&s.p("old/one/two/c.txt"), b"c");
+    write(&s.p("old/one/two/three/d.txt"), b"d");
+    write(&s.p("keep.txt"), b"keep");
+    s.settle().await;
+    s.policy = strict();
+    s.stops = Stops { allowed: true, window: Some(Recent::default()), ..Stops::default() };
+
+    std::fs::remove_dir_all(s.p("old")).unwrap();
+    wait_for_journal(&mut s, 4);
+    let r = s.attempt().await;
+    assert!(r.done.is_empty(), "a tripped round changes nothing");
+    let b = &s.stops.raised[0];
+    assert_eq!((b.side, b.count, b.later.len()), (Side::Remote, 8, 4), "4 files, then 4 folders");
+    s.stops.approve();
+    without_another_stop(&mut s).await;
+    assert_eq!(names(&cloud.tree()), BTreeSet::from(["/keep.txt"]));
+    assert_eq!(s.stops.window.unwrap().remote, 8);
+    for c in [&b"a"[..], b"b", b"c", b"d"] {
+        assert!(cloud.holds(c), "OneDrive's recycle bin keeps {}", String::from_utf8_lossy(c));
+    }
+}
+
+/// A safety stop raised by a full pass (the agent's first round), for
+/// deletions the dirty marks don't cover: approving it runs its whole list
+/// in the next round, which plans only marked folders. A file rewritten
+/// meanwhile doesn't change what was approved.
+#[tokio::test]
+async fn everyday_approving_a_full_pass_stop_runs_its_whole_list() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-full-pass-stop", cloud.clone());
+    for d in ["x", "y", "z"] {
+        for f in ["1", "2", "3"] {
+            write(&s.p(&format!("{d}/{f}.txt")), format!("{d}{f}").as_bytes());
+        }
+    }
+    write(&s.p("data.json"), b"{\"v\":1}");
+    s.settle().await;
+    s.policy = strict();
+    s.stops.allowed = true;
+
+    for d in ["x", "y", "z"] {
+        for f in ["1", "2", "3"] {
+            std::fs::remove_file(s.p(&format!("{d}/{f}.txt"))).unwrap();
+        }
+    }
+    write(&s.p("data.json"), b"{\"v\":2}");
+    // The deletions are read, but their marks are gone (as for evidence
+    // noted while the agent was stopped): only a full pass finds them.
+    wait_for_journal(&mut s, 10);
+    s.obs.store_mut().write(|o| o.dirty_clear(i64::MAX).map(drop)).unwrap();
+    s.stops.full_next = true;
+    s.attempt().await;
+    let b = &s.stops.raised[0];
+    assert_eq!(b.count, 10, "9 deletions and the edit");
+
+    // Rewritten while the user reads the list.
+    write(&s.p("data.json"), b"{\"v\":3, \"longer\": true}");
+    s.stops.approve();
+    let r = s.attempt().await;
+    assert!(s.stops.raised.is_empty(), "{:?}", s.stops.raised);
+    assert_eq!(r.done.iter().filter(|op| matches!(op, Op::DeleteRemote { .. })).count(), 9, "{r:?}");
+    without_another_stop(&mut s).await;
+    let t = cloud.tree();
+    assert_eq!(t.get("/data.json"), Some(&Some(b"{\"v\":3, \"longer\": true}".to_vec())));
+    assert!(t.keys().all(|k| !k.ends_with(".txt")), "{:?}", names(&t));
 }
 
 /// File Explorer's Delete moves the item into the Recycle Bin: the change
