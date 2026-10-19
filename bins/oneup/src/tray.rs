@@ -126,7 +126,7 @@ fn problem_notice(title: &str, p: &Problem) -> Notice {
 }
 
 /// `12 items`, `1,000 items or more`.
-fn unsynced_count(u: &oneup_ipc::Unsynced) -> String {
+pub(crate) fn unsynced_count(u: &oneup_ipc::Unsynced) -> String {
     let n = if u.count == 1 { "1 item".to_string() } else { format!("{} items", count(u.count as u64)) };
     if u.more { format!("{n} or more") } else { n }
 }
@@ -152,7 +152,7 @@ fn count(n: u64) -> String {
 }
 
 /// A time left, roughly: "about 25 min", "about 2 h 10 min".
-fn time_left(ms: u64) -> String {
+pub(crate) fn time_left(ms: u64) -> String {
     let min = ms.div_ceil(60_000);
     match min {
         0 | 1 => "less than a minute".into(),
@@ -270,7 +270,7 @@ fn note(label: impl Into<String>) -> Item {
 }
 
 /// The notification for a new safety stop.
-fn stop_notice(st: &oneup_ipc::SafetyStop) -> Notice {
+pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop) -> Notice {
     if st.kind == "content" {
         return Notice {
             title: "Files may be encrypted".into(),

@@ -69,6 +69,13 @@ enum Cmd {
     Plan(PlanArgs),
     /// Show what the background agent is doing, and what the local mirror and the last scan contain
     Status(ProfileArg),
+    /// List everything that needs your attention: safety stops, sync
+    /// failures, problems, pauses, conflicts (this folder, its pairs and vaults)
+    Problems {
+        /// As JSON, for scripts
+        #[arg(long)]
+        json: bool,
+    },
     /// Pause the background agent (oneupd): nothing syncs until `oneup resume`
     /// (or the time given with --for). Kept if oneupd restarts
     Pause {
@@ -1268,6 +1275,7 @@ async fn run() -> Result<()> {
             agent::status(&data_dir(&cli)?).await?;
             status(&cli, p.memory_profile)
         }
+        Cmd::Problems { json } => oneup_app::problems::show(&data_dir(&cli)?, *json).await,
         Cmd::Pause { folder: Some(f), .. } => {
             rules::pause_folder(&data_dir(&cli)?, &open_store(&cli, MemoryProfile::Balanced)?, f, true).await
         }

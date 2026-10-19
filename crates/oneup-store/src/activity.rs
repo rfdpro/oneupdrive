@@ -135,6 +135,26 @@ impl Ops<'_> {
         };
         Ok(rows)
     }
+
+    /// The latest `limit` entries that did `action` (done, not skipped or
+    /// failed) at `since_ms` or later, newest first; with `before`, only
+    /// those older than that sequence number (the next page). Reads the
+    /// table from the newest entry back (no index on the action): for a
+    /// command someone runs, not for anything that runs by itself.
+    pub fn activity_done(&self, action: &str, since_ms: i64, before: Option<i64>, limit: usize) -> Result<Vec<Entry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(self
+            .c
+            .prepare_cached(&format!(
+                "SELECT {COLS} FROM activity WHERE action = ?1 AND outcome = ?2 AND at_ms >= ?3 AND seq < ?4
+                 ORDER BY seq DESC LIMIT ?5"
+            ))?
+            .query_map(
+                rusqlite::params![action, Outcome::Done.code(), since_ms, before.unwrap_or(i64::MAX), limit],
+                entry,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +187,25 @@ mod tests {
         // Names compare case-insensitively, as on Windows.
         assert_eq!(s.read(|o| o.activity_recent(Some("/DOCS"), 10)).unwrap().len(), 2);
         assert_eq!(s.read(|o| o.activity_recent(None, 1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn done_entries_of_one_action_since_a_time() {
+        let mut s = Store::open_in_memory().unwrap();
+        let keep = |at, outcome| Entry { action: "keep both".into(), outcome, ..e(at, "/a.txt") };
+        s.write(|o| {
+            o.activity_add(&[keep(1, Outcome::Done), e(2, "/b"), keep(3, Outcome::Failed), keep(4, Outcome::Done)])
+        })
+        .unwrap();
+        let got = s.read(|o| o.activity_done("keep both", 0, None, 10)).unwrap();
+        assert_eq!(got.iter().map(|e| e.at_ms).collect::<Vec<_>>(), [4, 1]);
+        assert_eq!(s.read(|o| o.activity_done("keep both", 2, None, 10)).unwrap().len(), 1);
+        let first = s.read(|o| o.activity_done("keep both", 0, None, 1)).unwrap();
+        assert_eq!(first[0].at_ms, 4);
+        // The next page starts after the last entry of this one.
+        let next = s.read(|o| o.activity_done("keep both", 0, Some(first[0].seq), 1)).unwrap();
+        assert_eq!(next[0].at_ms, 1);
+        assert!(s.read(|o| o.activity_done("keep both", 0, Some(next[0].seq), 1)).unwrap().is_empty());
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub mod ownfile;
 pub mod pairs;
 pub mod priority;
 pub mod problem;
+#[cfg(windows)]
+pub mod problems;
 pub mod prune;
 #[cfg(windows)]
 pub mod recyclebin;

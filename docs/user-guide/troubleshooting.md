@@ -14,6 +14,20 @@ OneUpDrive tells you about a problem in plain words, says whether it deals with 
 * **The activity log** (settings window, **Activity**) notes when a problem began and when it cleared.
 * `oneup status` prints the same, with the technical text last.
 
+### Everything that needs you
+`oneup problems` lists, in one place, everything waiting for you, for the main folder and every other folder pair and vault, most pressing first:
+
+* nothing set up yet, or not signed in;
+* OneUpDrive not running, or stopped by a problem; another folder pair or a vault that should run with it but doesn't (not one you stopped, nor a locked vault);
+* a problem below (its kind: sign-in needed, OneDrive full, disk full…);
+* safety stops and a full version store, with the code to answer them;
+* pauses, yours or by itself, and paused folders;
+* items that can't sync, and items that failed and wait to be tried again;
+* excluded items still in OneDrive;
+* files changed on both sides in the last 7 days whose second copy is still there (OneDrive's version kept the name; compare the two and delete the one you don't need). The newest 100 are listed; a line says when there are more, or when older ones weren't checked.
+
+Each line says what to do. `oneup problems --json` gives the same for scripts: each item's `kind`, `title`, `detail`, `action`, the `code` an answer takes, the `pair` (none for the main folder) and its `data_dir`, and `more_conflicts` when not all files changed on both sides are listed (`conflicts_not_checked` when older ones weren't looked at). It works whether or not OneUpDrive is running. The settings window shows the same list at the top of its **Activity** page.
+
 OneUpDrive tries again by itself after a minute, then waits twice as long each time, up to 30 minutes. Once it has synced again, the next problem starts over at a minute. Fixing the cause and selecting **Retry now** is quicker.
 
 ## The problems

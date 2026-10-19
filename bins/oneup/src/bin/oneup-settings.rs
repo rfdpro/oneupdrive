@@ -725,6 +725,12 @@ mod win {
             "status" => Ok(agent(dir, Call::Status).await.unwrap_or(Value::Null)),
             // Why the agent stopped, if an error stopped it.
             "stopped" => Ok(json!(oneup_app::problem::load_stopped(dir))),
+            // Everything that needs the user, as `oneup problems` lists it.
+            "problems" => {
+                let all: Vec<Value> =
+                    oneup_app::problems::list(dir).await.iter().map(oneup_app::problems::Item::to_json).collect();
+                Ok(json!({ "problems": all }))
+            }
             "save" => {
                 let section = args.get("section").and_then(Value::as_str).unwrap_or_default();
                 settingsapi::save(dir, section, args.get("value").unwrap_or(&Value::Null))?;

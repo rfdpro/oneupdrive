@@ -2417,6 +2417,18 @@ struct Line {
     note: String,
 }
 
+/// The activity log's action for a conflict copy (`Op::ConflictCopy`: this
+/// PC's version renamed, OneDrive's taking its name), and its note. The
+/// problems list (`crate::problems`) finds the copies by these.
+pub const CONFLICT_ACTION: &str = "keep both";
+const CONFLICT_NOTE: &str = "changed on both sides";
+
+/// The name a conflict copy got, in the folder of the entry's path, from
+/// its activity-log detail.
+pub fn conflict_copy_name(detail: &str) -> Option<&str> {
+    detail.strip_prefix("-> ")?.strip_suffix(CONFLICT_NOTE)?.strip_suffix("; ")
+}
+
 impl Line {
     fn new(action: &'static str, path: String, note: &str) -> Self {
         Self { action, path, folder: false, to: None, note: note.into() }
@@ -2491,9 +2503,7 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
         }
         Op::MoveLocal { local, to, name, .. } => moved("move", lp(local.id.0), join(&lp(to.0), name), "on this PC"),
         Op::RenameLocal { local, name, .. } => moved("rename", lp(local.id.0), name.clone(), "freeing the name"),
-        Op::ConflictCopy { local, name, .. } => {
-            moved("keep both", lp(local.id.0), name.clone(), "changed on both sides")
-        }
+        Op::ConflictCopy { local, name, .. } => moved(CONFLICT_ACTION, lp(local.id.0), name.clone(), CONFLICT_NOTE),
         Op::DeleteRemote { remote, .. } => Line::new("delete", rp(&remote.id), "to OneDrive's recycle bin"),
         Op::Dehydrate { local, .. } => Line::new("free up", lp(local.id.0), ""),
         Op::PruneRemote { remote, .. } => {
@@ -3068,6 +3078,15 @@ impl Totals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The problems list reads conflict copies' names back from the log.
+    #[test]
+    fn a_conflict_copys_name_is_read_back_from_its_log_entry() {
+        let name = "a (conflict; this PC).txt";
+        let line = Line { to: Some(name.into()), ..Line::new(CONFLICT_ACTION, "/docs/a.txt".into(), CONFLICT_NOTE) };
+        assert_eq!(conflict_copy_name(&line.detail()), Some(name));
+        assert_eq!(conflict_copy_name("-> b.txt; renamed"), None);
+    }
 
     /// After the journal lost track (simulated: the saved position moved
     /// before its oldest record), the same folder is looked through again

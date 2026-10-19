@@ -1904,6 +1904,8 @@
         <!-- Activity: what sync did, and the lists the icon's menu opens here -->
         <section class="page" id="lists">
             <h2>Activity</h2>
+            <!-- Everything that needs you, as `oneup problems` lists it -->
+            <div class="card" id="attn" hidden></div>
             <div class="ls-bar">
                 <div class="seg" id="ls-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="log" aria-pressed="true">Recent</button>
@@ -2368,6 +2370,7 @@
             if (page === "accounts") loadAccounts();
             if (page === "general" && !scSearched) loadShortcuts();
             if (page === "lists") loadList(true);
+            if (page === "lists") loadAttention();
         }
         $$("nav button").forEach(b => b.onclick = () => show(b.dataset.page));
         document.addEventListener("click", e => {
@@ -2519,6 +2522,26 @@
             section: "autostart",
             value: e.target.checked
         }), e.target.checked ? "Starts with Windows" : "Won't start with Windows").catch(() => e.target.checked = !e.target.checked);
+
+        // Needs attention: one row per item of `oneup problems`.
+        async function loadAttention() {
+            const box = $("#attn");
+            try {
+                const r = await call("problems");
+                box.replaceChildren(...r.problems.map(p => el("div", {
+                    className: "row"
+                }, el("div", {
+                    className: "label"
+                }, el("b", {
+                    textContent: (p.pair ? p.pair + ": " : "") + p.title
+                }), el("small", {
+                    textContent: p.detail + " " + p.action
+                })))));
+                box.hidden = !r.problems.length;
+            } catch {
+                box.hidden = true;
+            }
+        }
 
         // Memory and hashing: the memory profile's numbers, each settable;
         // empty is the default (sent as null).

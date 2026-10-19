@@ -39,6 +39,8 @@ pub async fn add(main: &Path, http: reqwest::Client, auth: Arc<oneup_graph::Auth
     if a.start {
         crate::agent::start(&e.dir).await
     } else {
+        // Not running on purpose until something starts it.
+        oneup_app::problem::note_asked_to_stop(&e.dir)?;
         println!("`oneup start` starts syncing it (with everything else).");
         Ok(())
     }

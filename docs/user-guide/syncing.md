@@ -58,6 +58,7 @@ While `oneupd` runs, these commands talk to it directly. Use the same `--data-di
 
 ```powershell
 oneup --data-dir … status                  # what it's doing, and anything waiting for you
+oneup --data-dir … problems                # only what needs you, for every folder pair (--json for scripts)
 oneup --data-dir … pause                   # nothing syncs until you resume
 oneup --data-dir … pause --for 2h          # resumes by itself after 2 hours (also 30m, 1d)
 oneup --data-dir … pause --only local      # OneDrive's changes wait; yours are still sent
