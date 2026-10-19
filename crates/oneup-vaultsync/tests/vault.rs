@@ -233,3 +233,62 @@ async fn keys_that_dont_sign_the_vaults_configuration_are_refused() {
     s.listing.lock().unwrap().write(|o| o.delete_subtree(&cfg_id).map(|_| ())).unwrap();
     assert!(project(&s.src, &s.vault, &mut cache).await.is_err());
 }
+
+/// Entries the view now refuses (an authentic name that is a path, a
+/// long-name folder that doesn't match its `name.c9s`) are reported, and
+/// their rows stay: their encrypted items are still listed, and absence
+/// from the view is never taken as a deletion.
+#[tokio::test]
+async fn refused_entries_keep_their_rows_and_produce_no_deletions() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let bad = ["..", "a/b", "", "nul\0byte"];
+    let long = format!("{}.txt", "long name ".repeat(25));
+    for i in 0..bad.len() {
+        s.vc.upload(&root, &format!("f{i}.txt"), None, 1, &mut &b"x"[..]).await.unwrap();
+    }
+    s.vc.upload(&root, &long, None, 4, &mut &b"long"[..]).await.unwrap();
+    let base = s.refresh().await;
+    assert_eq!(base.changed, bad.len() + 1);
+    let ids: Vec<String> = (0..bad.len()).map(|i| s.id(&format!("/f{i}.txt")).0).collect();
+    let long_id = s.id(&format!("/{long}")).0;
+    let before: Vec<RemoteRow> = s.pairs.read(|o| o.all_items()).unwrap().into_iter().map(|(r, _)| r).collect();
+
+    // Renamed at the storage level, by someone holding the key: each file
+    // to the encryption of a refused name, the long name's folder to a
+    // name its name.c9s doesn't hash to.
+    let rename = |s: &Setup, id: &str, name: &str| {
+        let row = {
+            let mut st = s.cloud.0.lock().unwrap();
+            let e = st.bump();
+            let it = st.items.get_mut(id).unwrap();
+            it.name = name.to_string();
+            it.etag = e;
+            st.row(id)
+        };
+        s.listing.lock().unwrap().write(|o| o.upsert_item(&row, false)).unwrap();
+    };
+    for (id, name) in ids.iter().zip(bad) {
+        rename(&s, id, &oneup_vault::names::encrypt_name(&s.vault.key, name, "").unwrap());
+    }
+    rename(&s, &long_id, &oneup_vault::names::shortened("someone else's name.c9r"));
+
+    let mut cache = oneup_vaultsync::project::Cache::default();
+    let p = project(&s.src, &s.vault, &mut cache).await.unwrap();
+    assert_eq!(p.problems.len(), bad.len() + 1, "{:?}", p.problems);
+    let said = |what: &str| p.problems.iter().filter(|m| m.contains(what)).count();
+    assert_eq!(said("isn't a valid file name"), bad.len(), "{:?}", p.problems);
+    assert_eq!(said("doesn't belong to its folder"), 1, "{:?}", p.problems);
+    assert!(
+        p.problems.iter().all(|m| !m.contains("a/b") && !m.contains(long.as_str())),
+        "no decrypted names: {:?}",
+        p.problems
+    );
+    let applied = apply(&mut s.pairs, &s.src, &p).unwrap();
+    assert_eq!((applied.removed, applied.kept), (0, bad.len() + 1));
+    // Every row is still there, unchanged: nothing for the planner to read
+    // as a deletion.
+    let after: Vec<RemoteRow> = s.pairs.read(|o| o.all_items()).unwrap().into_iter().map(|(r, _)| r).collect();
+    assert_eq!(after, before);
+}
