@@ -40,6 +40,7 @@ pub mod prune;
 pub mod recyclebin;
 pub mod resolve;
 pub mod rulefiles;
+pub mod safetywindow;
 pub mod settingsapi;
 pub mod setup;
 #[cfg(windows)]

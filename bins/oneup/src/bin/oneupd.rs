@@ -30,7 +30,8 @@
 //!
 //! **Safety.** Everything `oneup sync` guarantees holds (same gate, same
 //! effects layer). In addition, the safety stops count what the agent did
-//! in the last [`WINDOW`], so a mass deletion trickling in as many small
+//! in the last 15 minutes ([`oneup_app::safetywindow`], kept in the state
+//! store across restarts), so a mass deletion trickling in as many small
 //! rounds still trips them ([`oneup_gate::Recent`]). A tripped stop changes
 //! nothing and waits for the user's `oneup approve CODE`; later rounds
 //! change nothing either while it stands. Removed files that don't fit in
@@ -45,7 +46,6 @@
 //! only, like `oneup sync`. One process per data folder (`sync.lock`). Ctrl+C stops after the current
 //! round; a second Ctrl+C stops at once.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -57,6 +57,7 @@ use oneup_app::autopause;
 use oneup_app::busy::Busy;
 use oneup_app::control::{Control, now_ms};
 use oneup_app::problem;
+use oneup_app::safetywindow::SafetyWindow;
 use oneup_app::setup::{self, DirLock, KEY_PRESET};
 use oneup_app::sync::{self, Answers, Asker, End, Halted, Scope};
 use oneup_gate::Recent;
@@ -65,8 +66,6 @@ use oneup_ipc::{Activity, LastRun};
 use oneup_store::Store;
 use tokio::sync::Notify;
 
-/// How far back the safety stops look (see the module docs).
-const WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Rounds per wake-up before the agent pauses briefly and starts over.
 const MAX_ROUNDS: usize = 20;
 /// After a journal wake-up, how long to let a burst of changes (a program
@@ -343,8 +342,9 @@ async fn run(args: Args) -> Result<()> {
     // ---- run; on an error, start over after a growing pause
     let mut pause = ERROR_FIRST;
     // Outlives each attempt: a mass deletion trickling in must still trip
-    // the stops when an error restarts the rounds in between.
-    let mut window = Window::default();
+    // the stops when an error restarts the rounds in between. Read from the
+    // store by the first attempt, so a restart doesn't forget it either.
+    let mut window: Option<SafetyWindow> = None;
     loop {
         let started = Instant::now();
         match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window).await {
@@ -461,7 +461,8 @@ impl Memory {
 
 /// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
 /// database each time, so a retry starts from a clean state, except the
-/// safety window (`window`), which the caller keeps across retries.
+/// safety window (`window`), which the caller keeps across retries (`None`
+/// until the first attempt reads it from the store).
 #[allow(clippy::too_many_arguments)]
 async fn agent(
     dir: &Path,
@@ -471,12 +472,20 @@ async fn agent(
     control: &Control,
     memory: Memory,
     key: Option<&oneup_vault::key::Masterkey>,
-    window: &mut Window,
+    window: &mut Option<SafetyWindow>,
 ) -> Result<()> {
     let mut store = setup::open_store(dir, memory.cache_kib)?;
     if memory.map_bytes > 0 {
         store.map_memory(memory.map_bytes)?;
     }
+    let window = match window {
+        // A retry: what the failed attempt counted wasn't saved yet.
+        Some(w) => {
+            save_window(w, &mut store);
+            w
+        }
+        None => window.insert(SafetyWindow::load(&store, now_ms())?),
+    };
     if store.read(|o| o.meta_get(KEY_PRESET))?.is_none() {
         anyhow::bail!("no exclusion choice recorded; run `oneup sync` once first");
     }
@@ -569,7 +578,7 @@ async fn agent(
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
             let mut executed = Recent::default();
-            let recent = window.recent();
+            let recent = window.recent(now_ms());
             let rounds = watching_auto_pause(
                 engine.rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
                     control.set_progress(p)
@@ -579,9 +588,12 @@ async fn agent(
             )
             .await;
             // Before the error, if any: the retry must still count them.
-            window.add(executed);
+            window.add(executed, now_ms());
             let (s, out) = rounds?;
             store = s;
+            if executed != Recent::default() {
+                save_window(window, &mut store);
+            }
             held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
             // Failed items waiting their turn (`oneup_app::backoff`); the
@@ -1071,24 +1083,10 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Mass-sensitive operations carried out in the last [`WINDOW`].
-#[derive(Default)]
-struct Window {
-    done: VecDeque<(Instant, Recent)>,
-}
-
-impl Window {
-    fn add(&mut self, r: Recent) {
-        if r.local + r.remote + r.suspicious > 0 {
-            self.done.push_back((Instant::now(), r));
-        }
-    }
-
-    fn recent(&mut self) -> Recent {
-        while self.done.front().is_some_and(|(t, _)| t.elapsed() > WINDOW) {
-            self.done.pop_front();
-        }
-        self.done.iter().fold(Recent::default(), |a, (_, r)| a.plus(*r))
+/// Saves the safety window; best effort (it's still kept in memory).
+fn save_window(w: &SafetyWindow, store: &mut Store) {
+    if let Err(e) = w.save(store) {
+        tracing::warn!(error = %e, "can't save the safety window; a restart would forget it");
     }
 }
 
@@ -1107,18 +1105,6 @@ mod tests {
         assert_eq!(error_pause(pause, false, Duration::from_secs(1)), ERROR_MAX, "still failing at once");
         assert_eq!(error_pause(pause, true, Duration::from_secs(1)), ERROR_FIRST, "rounds finished meanwhile");
         assert_eq!(error_pause(pause, false, ERROR_MAX), ERROR_FIRST, "ran a long while");
-    }
-
-    /// What the stops count adds up across calls of the rounds (the agent
-    /// keeps one window across retries, `run`).
-    #[test]
-    fn the_safety_window_adds_up_what_ran() {
-        let mut w = Window::default();
-        w.add(Recent { local: 190, remote: 0, suspicious: 0 });
-        w.add(Recent::default());
-        w.add(Recent { local: 5, remote: 2, suspicious: 1 });
-        assert_eq!(w.recent(), Recent { local: 195, remote: 2, suspicious: 1 });
-        assert_eq!(w.done.len(), 2, "nothing done, nothing kept");
     }
 
     #[test]
