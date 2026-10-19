@@ -270,6 +270,14 @@ fn remote_node(r: &Row<'_>) -> rusqlite::Result<RemoteNode> {
     })
 }
 
+/// [`Ops::local_children_links`] (its plan is checked by
+/// `children_queries_use_the_parent_indexes`, as the next one's).
+const LOCAL_CHILDREN_LINKS: &str = "SELECT l.file_id, s.remote_id FROM local_item l
+     JOIN synced_item s ON s.local_id = l.file_id WHERE l.parent_id = ?1";
+/// [`Ops::remote_children_linked`].
+const REMOTE_CHILDREN_LINKED: &str =
+    "SELECT r.id FROM remote_item r JOIN synced_item s ON s.remote_id = r.id WHERE r.parent_id = ?1";
+
 impl Ops<'_> {
     pub fn synced_get(&self, sid: Sid) -> Result<Option<Base>> {
         let row = self
@@ -322,10 +330,7 @@ impl Ops<'_> {
     /// with the cloud item it links (if any): one query, by the parent and
     /// link indexes.
     pub fn local_children_links(&self, parent: u128) -> Result<Vec<(u128, Option<String>)>> {
-        let mut st = self.c.prepare_cached(
-            "SELECT l.file_id, s.remote_id FROM local_item l JOIN synced_item s ON s.local_id = l.file_id
-             WHERE l.parent_id = ?1",
-        )?;
+        let mut st = self.c.prepare_cached(LOCAL_CHILDREN_LINKS)?;
         let rows = st.query_map([blob(parent)], |r| Ok((id_from_blob(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
@@ -333,9 +338,7 @@ impl Ops<'_> {
     /// The children of cloud folder `parent` that have a Synced row: one
     /// query, by the parent and link indexes.
     pub fn remote_children_linked(&self, parent: &str) -> Result<Vec<String>> {
-        let mut st = self.c.prepare_cached(
-            "SELECT r.id FROM remote_item r JOIN synced_item s ON s.remote_id = r.id WHERE r.parent_id = ?1",
-        )?;
+        let mut st = self.c.prepare_cached(REMOTE_CHILDREN_LINKED)?;
         let rows = st.query_map([parent], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
@@ -1077,7 +1080,14 @@ pub(crate) mod tests {
     #[test]
     fn children_queries_use_the_parent_indexes() {
         let s = Store::open_in_memory().unwrap();
-        for sql in [base_children_sql(), local_children_sql(), remote_children_sql(), SYNCED_HAS_CHILDREN.into()] {
+        for sql in [
+            base_children_sql(),
+            local_children_sql(),
+            remote_children_sql(),
+            SYNCED_HAS_CHILDREN.into(),
+            LOCAL_CHILDREN_LINKS.into(),
+            REMOTE_CHILDREN_LINKED.into(),
+        ] {
             let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let plan: Vec<String> =
                 st.query_map([rusqlite::types::Null], |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
