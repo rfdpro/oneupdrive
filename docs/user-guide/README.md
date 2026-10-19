@@ -17,7 +17,7 @@ Welcome! This guide is for everyone, not just developers.
 * [More folders, backups, shared folders and accounts](folders.md): any folder with any OneDrive folder, one-way backups, your Desktop and Documents, folders others shared, several accounts
 * [Earlier versions and sharing](versions-and-sharing.md): getting an older version back, sharing links
 * [Office](office.md): AutoSave and editing together in Word, Excel and PowerPoint
-* [Encrypted vaults](vaults.md): folders only you can read, compatible with Cryptomator
+* [Encrypted vaults](vaults.md): folders only you can read, compatible with Cryptomator (experimental)
 * [Moving over from the OneDrive app](migrating-from-onedrive.md): switching without re-downloading everything
 
 * [When something goes wrong](troubleshooting.md): what each problem means, and how to fix it if retrying doesn't

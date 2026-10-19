@@ -2,10 +2,12 @@
 
 A **vault** is a folder whose files are encrypted on your PC before they reach OneDrive, so that nobody but you, Microsoft included, can read them. OneUpDrive uses the same vault format as [Cryptomator](https://cryptomator.org/), a free and widely used app, so your vaults also open in Cryptomator on your phone, a Mac or Linux.
 
+**Vaults are experimental.** OneUpDrive's encryption code has had a review by its own developers ([the findings](../architecture/vault-crypto-review.md)), but not yet one by an outside security expert. Until then, don't make a vault the only copy of anything you can't afford to lose.
+
 ## What a vault protects, and what it doesn't
 * **Protected:** what's in your files, and their names and folder names.
 * **Not hidden:** how many files there are, roughly how big each is, and when they changed.
-* Someone with access to your OneDrive could still delete vault files, or put back an older copy of one. They couldn't read or change what's inside without it showing as damaged.
+* Someone with access to your OneDrive could still delete vault files, put back an older copy of one, swap the contents of two files, or cut a file short at a multiple of 32 KB, without it showing. They couldn't read what's inside, or change it any other way without it showing as damaged.
 * While a vault is unlocked on your PC, its files are readable there like any others. Turn on BitLocker (or Device Encryption) to protect your disk.
 * **Your password is the key.** Forget it, and only the vault's **recovery key** (below) can open it again: not OneUpDrive, not Cryptomator, not Microsoft. Write the password down somewhere safe, and keep the recovery key too.
 
@@ -38,7 +40,7 @@ oneup vault remove Vault --yes                # stop syncing it for good
 * `/Vault` is the vault's folder in OneDrive: the one with `vault.cryptomator` in it. Make the vault with Cryptomator (or `oneup vault create`, below) first.
 * The folder on this PC must be **new or empty**, and outside every other synced folder. OneUpDrive refuses one that overlaps: a decrypted file must never be uploaded as it is.
 * **Online-only by default.** Files show with their names and sizes but take no space until a program opens one; only then is it downloaded and decrypted. With `--full-files`, every file is kept decrypted on this PC instead.
-* **Unlocking:** a vault syncs only while it's unlocked. Signing out of Windows locks it again. With `--remember` (on `add` or `unlock`), its keys are kept on this PC, protected by your Windows sign-in, so it unlocks by itself when OneUpDrive starts. `oneup vault lock Vault --forget` forgets them again.
+* **Unlocking:** a vault syncs only while it's unlocked. Signing out of Windows locks it again. With `--remember` (on `add` or `unlock`), its keys are kept on this PC, protected by your Windows sign-in, so it unlocks by itself when OneUpDrive starts. Any program running under your Windows account can read them, just as it can read the vault's decrypted files. `oneup vault lock Vault --forget` forgets them again.
 * If the vault is inside a folder you already sync, that folder leaves the vault's encrypted files alone from then on (`oneup explain` says so). Copies of them already on this PC stay as they are.
 * **Removing** a vault stops syncing it. The vault in OneDrive stays, and so do the files in the folder that were on this PC. Online-only files leave the folder; they are still in the vault.
 * Renaming and moving work for any name, including very long ones (Cryptomator keeps those in a folder of their own; OneUpDrive rebuilds that the way Cryptomator would).
