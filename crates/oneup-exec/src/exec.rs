@@ -162,6 +162,10 @@ enum Fail {
 
 impl From<FxError> for Fail {
     fn from(e: FxError) -> Self {
+        #[cfg(feature = "crash-test")]
+        if oneup_effects::Crashed::is(&e) {
+            return Fail::Halt(CRASHED.into());
+        }
         match e {
             FxError::Changed => Fail::Skip(Skip::Changed),
             FxError::Busy => Fail::Skip(Skip::Busy),
@@ -545,9 +549,6 @@ pub struct Executor<C> {
     timings: std::sync::Arc<Timings>,
     /// Work under way on blocking threads ([`crate::blocking`]).
     jobs: Arc<Jobs>,
-    /// Crash points left to pass before the injected crash; negative: off.
-    #[cfg(feature = "crash-test")]
-    crash: std::sync::atomic::AtomicI64,
     /// See [`Executor::on_blocking`].
     #[cfg(feature = "crash-test")]
     on_blocking: std::sync::Mutex<Option<BlockingHook>>,
@@ -568,8 +569,6 @@ impl<C: Cloud> Executor<C> {
             parallel: std::sync::Mutex::new(Parallel::for_profile("balanced")),
             timings: std::sync::Arc::default(),
             jobs: Arc::default(),
-            #[cfg(feature = "crash-test")]
-            crash: std::sync::atomic::AtomicI64::new(-1),
             #[cfg(feature = "crash-test")]
             on_blocking: std::sync::Mutex::default(),
         }
@@ -594,11 +593,13 @@ impl<C: Cloud> Executor<C> {
     /// Test-only: the round stops at the crash point after `n` others have
     /// passed, as if the process had been killed there, and reports
     /// [`CRASHED`] as its halt. Crash points are right after each effect
-    /// (before its record) and right after each write-ahead record (before
-    /// its effect). `None` turns it off.
+    /// (before its record), right after each write-ahead record (before its
+    /// effect), and between the steps of effects that take several (one
+    /// count, kept by the effects layer: `LocalFs::crash_after`). `None`
+    /// turns it off.
     #[cfg(feature = "crash-test")]
     pub fn crash_after(&self, n: Option<u32>) {
-        self.crash.store(n.map_or(-1, i64::from), std::sync::atomic::Ordering::Relaxed);
+        self.fs.crash_after(n);
     }
 
     /// Test-only: every effect run on a blocking thread
@@ -625,6 +626,14 @@ impl<C: Cloud> Executor<C> {
         let (fs, a) = (Arc::clone(&self.fs), Arc::clone(a));
         #[cfg(feature = "crash-test")]
         let hook = self.on_blocking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        // An armed crash runs it here instead, unless a test holds it on its
+        // thread: the effect's own crash points (`LocalFs::crash_after`) then
+        // count in the same order every run, between the round's others, so
+        // crash point n is always the same place.
+        #[cfg(feature = "crash-test")]
+        if self.fs.crash_armed() && hook.is_none() {
+            return Ok(f(&fs, &a));
+        }
         let job = self.jobs.run(move || {
             #[cfg(feature = "crash-test")]
             if let Some(hook) = hook {
@@ -647,7 +656,7 @@ impl<C: Cloud> Executor<C> {
     /// no withdrawal.
     fn crash_point(&self) -> Res {
         #[cfg(feature = "crash-test")]
-        if self.crash.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        if self.fs.crash_now() {
             return Err(Fail::Halt(CRASHED.into()));
         }
         Ok(())

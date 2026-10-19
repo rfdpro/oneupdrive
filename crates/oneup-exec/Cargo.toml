@@ -28,10 +28,10 @@ tracing = "0.1"
 
 [features]
 # Test-only: `Executor::crash_after` stops a round as if the process had
-# been killed, and `Executor::on_blocking` holds work on its blocking thread
-# as a slow disk would (tests/sync.rs turns it on; production builds never
-# do).
-crash-test = []
+# been killed, between effects and records and inside effects, and
+# `Executor::on_blocking` holds work on its blocking thread as a slow
+# disk would (tests/sync.rs turns it on; production builds never do).
+crash-test = ["oneup-effects/crash-test"]
 
 [dev-dependencies]
 oneup-exec = { path = ".", features = ["crash-test"] }

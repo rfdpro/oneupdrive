@@ -19,5 +19,11 @@ oneup-sys = { path = "../oneup-sys" }
 thiserror = "2"
 tracing = "0.1"
 
+[features]
+# Test-only: `LocalFs::crash_after` stops an effect part-way, as if the
+# process had been killed there (`oneup-exec`'s `crash-test` turns it on;
+# production builds never do).
+crash-test = []
+
 [lints]
 workspace = true
