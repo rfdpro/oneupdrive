@@ -37,7 +37,7 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 cargo +nightly fuzz run rules fuzz/corpus/rules fuzz/seeds/rules -- -max_total_time=300
 ```
-`fuzz/seeds/` holds small hand-made inputs (committed); `fuzz/corpus/` is what the fuzzer grows (not committed). To replay a crash from a nightly run, download the `fuzz-<target>` artifact from the run and pass the file instead of the folders: `cargo +nightly fuzz run rules crash-<hash>`. A crash fixed in the library gets a regression test next to the code, not only the fuzz input.
+`fuzz/seeds/` holds small hand-made inputs (committed); `fuzz/corpus/` is what the fuzzer grows (not committed). To replay a crash from a nightly run, download the `fuzz-<target>` artifact from the run and pass the file instead of the folders: `cargo +nightly fuzz run rules crash-<hash>`. A crash fixed in the library gets a regression test next to the code, not only the fuzz input. The fuzz workspace is a development tool that is never shipped, so it sits outside the licence allow-list: `libfuzzer-sys` bundles LLVM's libFuzzer under the NCSA licence, which is permissive (BSD-style, no GPL terms).
 
 ### Signing in from a development build
 Release builds have the project's client ID built in; a development build needs your own app registration. In the [Microsoft Entra admin center](https://entra.microsoft.com), register an app for *personal Microsoft accounts only*, with the redirect URI `http://localhost` (platform *Public client/native*) and the delegated Microsoft Graph permissions `Files.ReadWrite`, `Files.ReadWrite.All`, `offline_access` and `User.Read`. No client secret: OneUpDrive is a public client. Then:
