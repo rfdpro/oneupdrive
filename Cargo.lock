@@ -1251,6 +1251,7 @@ dependencies = [
  "oneup-gate",
  "oneup-graph",
  "oneup-hash",
+ "oneup-hooks",
  "oneup-ipc",
  "oneup-local",
  "oneup-ntfs",
@@ -1314,6 +1315,8 @@ dependencies = [
  "oneup-gate",
  "oneup-graph",
  "oneup-hash",
+ "oneup-hooks",
+ "oneup-ipc",
  "oneup-local",
  "oneup-plan",
  "oneup-remote",
@@ -1362,6 +1365,20 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "proptest",
+]
+
+[[package]]
+name = "oneup-hooks"
+version = "0.1.0"
+dependencies = [
+ "oneup-cfapi",
+ "oneup-ipc",
+ "oneup-local",
+ "oneup-rules",
+ "oneup-sync",
+ "oneup-sys",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

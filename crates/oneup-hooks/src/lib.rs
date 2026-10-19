@@ -1,0 +1,321 @@
+//! Event hooks (`docs/architecture/hooks.md`): programs the user names in
+//! `config.toml`, started by the agent when sync events match (an event
+//! kind and, for items, a path rule), with the event as arguments.
+//!
+//! * [`HookSpec`]: one hook as configured, and the checks its shape must
+//!   pass ([`HookSpec::check`]).
+//! * [`program`]: where its program is. One that lives in a synced folder
+//!   (ours or another sync app's) is refused, at load and again right
+//!   before each start: a change in OneDrive must never become code running
+//!   on the PC.
+//! * [`Runner`]: the queue. Coalesced per hook and path, rate-limited per
+//!   hook, bounded, run on background threads in contained processes
+//!   (`oneup_sys::contained`), so a storm of events can't grow memory
+//!   without limit or slow sync down.
+//!
+//! What a hook gets: the event's kind, the item's path (full and relative),
+//! what was done and a short detail, as arguments only. Never file
+//! contents, tokens, approval codes or OneUpDrive's own environment
+//! variables.
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::time::Duration;
+
+use oneup_ipc::{Event, EventKind};
+
+pub mod program;
+mod runner;
+
+pub use runner::{Contained, Finished, Launch, MAX_PENDING, Note, Ran, Runner, Settings, check};
+
+/// At most this many hooks.
+pub const MAX_HOOKS: usize = 32;
+/// Defaults and limits for a hook's settings.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+pub const DEFAULT_PER_MINUTE: u32 = 60;
+pub const MAX_PER_MINUTE: u32 = 6000;
+pub const DEFAULT_COALESCE: Duration = Duration::from_secs(2);
+pub const MAX_COALESCE: Duration = Duration::from_secs(3600);
+
+/// One hook, as `config.toml` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookSpec {
+    /// Unique among the hooks; how the user refers to it.
+    pub name: String,
+    /// The kinds of events that start it.
+    pub on: Vec<EventKind>,
+    /// Rules in the exclusion rules' syntax (`/Photos/`, `*.docx`): only
+    /// items they match start it. Empty: every item, and the events that
+    /// aren't about an item (pauses, problems, safety stops).
+    pub paths: Vec<String>,
+    /// A full path, or a bare program name looked up on `PATH`.
+    pub program: String,
+    /// Arguments, with templates ([`TEMPLATES`]).
+    pub args: Vec<String>,
+    /// Ended (with everything it started) after this long.
+    pub timeout: Duration,
+    /// Started at most this often (a burst of up to a tenth of a minute's
+    /// worth goes at once).
+    pub per_minute: u32,
+    /// Waits this long after the last event for the same item, so a burst
+    /// of changes to one file starts it once.
+    pub coalesce: Duration,
+    pub enabled: bool,
+}
+
+impl HookSpec {
+    /// A hook with the default settings.
+    pub fn new(name: &str, on: &[EventKind], program: &str, args: &[&str]) -> Self {
+        Self {
+            name: name.into(),
+            on: on.to_vec(),
+            paths: Vec::new(),
+            program: program.into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            timeout: DEFAULT_TIMEOUT,
+            per_minute: DEFAULT_PER_MINUTE,
+            coalesce: DEFAULT_COALESCE,
+            enabled: true,
+        }
+    }
+
+    /// Whether its shape is right (the program's place is checked by
+    /// [`program::check`]).
+    pub fn check(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("a hook needs a name".into());
+        }
+        if self.on.is_empty() {
+            return Err("`on` needs at least one event".into());
+        }
+        if self.program.trim().is_empty() {
+            return Err("`program` is empty".into());
+        }
+        for p in &self.paths {
+            if oneup_rules::Rule::parse(p).is_none() || p.contains(['\n', '\r']) {
+                return Err(format!("`{p}` isn't a path rule"));
+            }
+        }
+        if self.timeout.is_zero() || self.timeout > MAX_TIMEOUT {
+            return Err(format!("timeout_s must be from 1 to {}", MAX_TIMEOUT.as_secs()));
+        }
+        if !(1..=MAX_PER_MINUTE).contains(&self.per_minute) {
+            return Err(format!("per_minute must be from 1 to {MAX_PER_MINUTE}"));
+        }
+        if self.coalesce > MAX_COALESCE {
+            return Err(format!("coalesce_s must be at most {}", MAX_COALESCE.as_secs()));
+        }
+        for a in &self.args {
+            templates_in(a)?;
+        }
+        check_interpreter(&self.program, &self.args)
+    }
+
+    /// Whether `e` starts it.
+    fn matches(&self, rules: Option<&oneup_rules::RuleSet>, e: &Event) -> bool {
+        if !self.on.contains(&e.kind) {
+            return false;
+        }
+        match rules {
+            None => true,
+            Some(r) => e.kind.has_path() && !e.path.is_empty() && r.excludes(&e.path, false),
+        }
+    }
+}
+
+/// The templates an argument may hold (`{{` is a plain `{`).
+pub const TEMPLATES: [&str; 5] = ["{event}", "{path}", "{relpath}", "{action}", "{detail}"];
+
+/// Templates whose text comes from names and messages that a change in
+/// OneDrive can set (a file someone shared with you can be called
+/// anything).
+const FROM_THE_CLOUD: [&str; 3] = ["{path}", "{relpath}", "{detail}"];
+
+/// The templates in `arg`, or why it's wrong (an unknown or unclosed one).
+fn templates_in(arg: &str) -> Result<Vec<&'static str>, String> {
+    let mut found = Vec::new();
+    let mut rest = arg;
+    while let Some(i) = rest.find('{') {
+        let tail = &rest[i..];
+        if let Some(after) = tail.strip_prefix("{{") {
+            rest = after;
+            continue;
+        }
+        let Some(t) = TEMPLATES.iter().find(|t| tail.starts_with(**t)) else {
+            return Err(format!("unknown template in `{arg}`; use {}", TEMPLATES.join(", ")));
+        };
+        found.push(*t);
+        rest = &tail[t.len()..];
+    }
+    Ok(found)
+}
+
+/// Programs that read their arguments as commands: `cmd.exe` and batch
+/// files (`a&b.txt` runs `b.txt`), and PowerShell unless it runs a script
+/// file (`-File`), whose arguments then stay plain text. Given a name from
+/// OneDrive, they could run something a change in OneDrive chose; refused
+/// when an argument carries one.
+fn check_interpreter(program: &str, args: &[String]) -> Result<(), String> {
+    let carries = |a: &String| FROM_THE_CLOUD.iter().any(|t| a.contains(t));
+    let Some(first) = args.iter().position(carries) else { return Ok(()) };
+    let file =
+        Path::new(program.trim()).file_name().map(|f| f.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let stem = file.trim_end_matches(".exe");
+    let ext = Path::new(&file).extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    if stem == "cmd" || ext == "bat" || ext == "cmd" {
+        return Err(
+            "cmd.exe and batch files read their arguments as commands, and a name from OneDrive could run one; \
+             run a program, or powershell.exe -File script.ps1"
+                .into(),
+        );
+    }
+    if stem == "powershell" || stem == "pwsh" {
+        let before = &args[..first];
+        let file_flag = before.iter().position(|a| {
+            let a = a.to_ascii_lowercase();
+            a == "-file" || a == "-f" || a == "/file"
+        });
+        let command = before.iter().any(|a| {
+            let a = a.to_ascii_lowercase();
+            ["-command", "-c", "-encodedcommand", "-e", "-ec", "/command", "/c"].contains(&a.as_str())
+        });
+        if file_flag.is_none() || command {
+            return Err(format!(
+                "{file} reads its arguments as commands unless it runs a script: put -File script.ps1 before {}",
+                FROM_THE_CLOUD.iter().find(|t| args[first].contains(**t)).copied().unwrap_or("{path}")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a hook's templates stand for, for one event.
+pub struct Fill<'a> {
+    pub event: &'a Event,
+    /// The synced folder on this PC, for full paths.
+    pub root: &'a Path,
+}
+
+impl Fill<'_> {
+    /// The arguments for the program, templates replaced.
+    pub fn args(&self, args: &[String]) -> Vec<OsString> {
+        args.iter().map(|a| self.arg(a)).collect()
+    }
+
+    fn arg(&self, a: &str) -> OsString {
+        let rel = self.event.path.trim_start_matches('/');
+        let full = || {
+            if rel.is_empty() {
+                String::new()
+            } else {
+                let p = self.root.join(rel.replace('/', "\\"));
+                oneup_local::coexist::plain(&p).to_string_lossy().into_owned()
+            }
+        };
+        let mut out = String::new();
+        let mut rest = a;
+        while let Some(i) = rest.find('{') {
+            out.push_str(&rest[..i]);
+            let tail = &rest[i..];
+            if let Some(after) = tail.strip_prefix("{{") {
+                out.push('{');
+                rest = after;
+                continue;
+            }
+            match TEMPLATES.iter().find(|t| tail.starts_with(**t)) {
+                Some(t) => {
+                    match *t {
+                        "{event}" => out.push_str(self.event.kind.name()),
+                        "{path}" => out.push_str(&full()),
+                        "{relpath}" => out.push_str(rel),
+                        "{action}" => out.push_str(&self.event.action),
+                        _ => out.push_str(&self.event.detail),
+                    }
+                    rest = &tail[t.len()..];
+                }
+                // Checked at load; kept as written otherwise.
+                None => {
+                    out.push('{');
+                    rest = &tail[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        OsString::from(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn event(kind: EventKind, path: &str) -> Event {
+        Event { seq: 1, at_ms: 0, kind, path: path.into(), action: "upload".into(), detail: "new version".into() }
+    }
+
+    #[test]
+    fn templates_become_the_events_text() {
+        let e = event(EventKind::Synced, "/Photos/a b.jpg");
+        let f = Fill { event: &e, root: Path::new(r"\\?\C:\Sync") };
+        let out = f.args(&["{event}".into(), "{path}".into(), "--rel={relpath}".into(), "{action}: {detail}".into()]);
+        assert_eq!(out, ["synced", r"C:\Sync\Photos\a b.jpg", "--rel=Photos/a b.jpg", "upload: new version"]);
+        assert_eq!(f.args(&["{{{event}}".into()]), ["{synced}"]);
+        assert!(templates_in("{{x}").is_ok());
+        // Events about sync itself have no path.
+        let e = event(EventKind::Paused, "");
+        assert_eq!(Fill { event: &e, root: Path::new(r"C:\Sync") }.args(&["{path}".into()]), [""]);
+    }
+
+    #[test]
+    fn a_hooks_shape_is_checked() {
+        let ok = HookSpec::new("thumbs", &[EventKind::Synced], r"C:\Tools\thumb.exe", &["{path}"]);
+        assert_eq!(ok.check(), Ok(()));
+        let bad = |f: &dyn Fn(&mut HookSpec)| {
+            let mut h = ok.clone();
+            f(&mut h);
+            h.check().unwrap_err()
+        };
+        assert!(bad(&|h| h.on.clear()).contains("on"));
+        assert!(bad(&|h| h.args = vec!["{file}".into()]).contains("unknown template"));
+        assert!(bad(&|h| h.args = vec!["{path".into()]).contains("unknown template"));
+        assert!(bad(&|h| h.timeout = Duration::ZERO).contains("timeout_s"));
+        assert!(bad(&|h| h.per_minute = 0).contains("per_minute"));
+        assert!(bad(&|h| h.paths = vec!["  ".into()]).contains("path rule"));
+        assert!(bad(&|h| h.name = " ".into()).contains("name"));
+    }
+
+    /// A file in OneDrive can be named `a&calc.exe&.txt`: given to cmd.exe,
+    /// that name runs a program. Such hooks are refused; plain programs and
+    /// PowerShell running a script file get names as plain text.
+    #[test]
+    fn programs_that_read_arguments_as_commands_cant_get_names_from_onedrive() {
+        let hook = |program: &str, args: &[&str]| HookSpec::new("h", &[EventKind::Synced], program, args).check();
+        assert!(hook(r"C:\Windows\System32\cmd.exe", &["/c", "echo", "{path}"]).unwrap_err().contains("cmd.exe"));
+        assert!(hook("CMD", &["/c", "{relpath}"]).is_err());
+        assert!(hook(r"C:\Tools\notify.bat", &["{detail}"]).is_err());
+        assert!(hook("powershell.exe", &["-Command", "Write-Host {path}"]).unwrap_err().contains("-File"));
+        assert!(hook("pwsh", &["{path}"]).is_err());
+        assert!(hook("powershell.exe", &["-File", "-Command", "{path}"]).is_err());
+        assert_eq!(hook("powershell.exe", &["-NoProfile", "-File", r"C:\Tools\a.ps1", "{path}"]), Ok(()));
+        // Our own words are safe anywhere.
+        assert_eq!(hook("cmd.exe", &["/c", "echo", "{event}", "{action}"]), Ok(()));
+        assert_eq!(hook(r"C:\Tools\thumb.exe", &["{path}"]), Ok(()));
+    }
+
+    #[test]
+    fn hooks_match_kinds_and_paths() {
+        let mut h = HookSpec::new("h", &[EventKind::Synced, EventKind::Paused], "x.exe", &[]);
+        assert!(h.matches(None, &event(EventKind::Synced, "/a.txt")));
+        assert!(h.matches(None, &event(EventKind::Paused, "")));
+        assert!(!h.matches(None, &event(EventKind::Failure, "/a.txt")));
+        h.paths = vec!["/Photos/".into(), "*.docx".into()];
+        let rules = oneup_rules::RuleSet::new(&[] as &[String], &h.paths).unwrap();
+        assert!(h.matches(Some(&rules), &event(EventKind::Synced, "/photos/2024/a.jpg")));
+        assert!(h.matches(Some(&rules), &event(EventKind::Synced, "/work/b.DOCX")));
+        assert!(!h.matches(Some(&rules), &event(EventKind::Synced, "/work/b.txt")));
+        assert!(!h.matches(Some(&rules), &event(EventKind::Paused, "")), "path rules: items only");
+    }
+}
