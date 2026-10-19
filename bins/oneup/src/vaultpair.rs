@@ -19,7 +19,6 @@
 //! see `rulefiles`), and a vault's folder may not overlap any synced
 //! folder: decrypted files must never be uploaded as they are.
 
-use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -195,22 +194,68 @@ pub fn forget_hello(dir: &Path) -> Result<bool> {
     }
 }
 
-/// The keys as one line of hex, for handing them to the agent.
+/// The length of [`key_line`]: 64 bytes in hex and a newline.
+const KEY_LINE_LEN: usize = 129;
+
+/// The keys as one line of hex, for handing them to the agent. Written
+/// into a string of its final size, so a string that grows leaves no
+/// partial copy behind.
 pub fn key_line(key: &Masterkey) -> Zeroizing<String> {
-    Zeroizing::new(key.export().iter().map(|b| format!("{b:02x}")).collect::<String>() + "\n")
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut line = Zeroizing::new(String::with_capacity(KEY_LINE_LEN));
+    for b in key.export().iter() {
+        line.push(char::from(HEX[usize::from(b >> 4)]));
+        line.push(char::from(HEX[usize::from(b & 15)]));
+    }
+    line.push('\n');
+    line
 }
 
-/// The agent's side of [`key_line`]: one line from standard input.
+/// The agent's side of [`key_line`]: one line from standard input, read
+/// straight from its handle. Rust's own `stdin()` keeps a buffer for the
+/// life of the process, which would hold the keys long after they're used.
 pub fn key_from_stdin() -> Result<Masterkey> {
-    let mut line = Zeroizing::new(String::new());
-    std::io::stdin().lock().read_line(&mut line).context("reading the vault's keys")?;
-    let hex = line.trim();
+    use std::io::Read as _;
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::io::AsHandle as _;
+        std::io::stdin().as_handle().try_clone_to_owned()
+    };
+    #[cfg(not(windows))]
+    let handle = {
+        use std::os::fd::AsFd as _;
+        std::io::stdin().as_fd().try_clone_to_owned()
+    };
+    let mut input = std::fs::File::from(handle.context("reading the vault's keys")?);
+    let mut line = Zeroizing::new([0u8; KEY_LINE_LEN + 1]);
+    let mut n = 0;
+    while n < line.len() && !line[..n].contains(&b'\n') {
+        match input.read(&mut line[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("reading the vault's keys"),
+        }
+    }
+    keys_from_line(&line[..n])
+}
+
+/// The keys in a [`key_line`].
+fn keys_from_line(line: &[u8]) -> Result<Masterkey> {
+    let end = line.iter().position(|&b| b == b'\n').unwrap_or(line.len());
+    let hex = line[..end].strip_suffix(b"\r").unwrap_or(&line[..end]);
     if hex.len() != 128 {
         bail!("no vault keys on standard input");
     }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(anyhow::anyhow!("the vault keys aren't hex")),
+    };
     let mut raw = Zeroizing::new([0u8; 64]);
-    for (i, b) in raw.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).context("the vault keys aren't hex")?;
+    for (b, pair) in raw.iter_mut().zip(hex.as_chunks::<2>().0) {
+        *b = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Ok(Masterkey::import(&raw))
 }
@@ -813,5 +858,22 @@ mod tests {
         assert!(same_remote("/ΟΔΟΣ", "/οδοσ"), "final sigma folds as sigma");
         assert!(!same_remote("/\u{212A}it", "/kit"), "the Kelvin sign is its own letter");
         assert!(!same_remote("/Vault", "/Vault2"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn keys_go_to_the_agent_as_one_exact_line() {
+        let key = oneup_vault::key::Masterkey::generate().unwrap();
+        let line = super::key_line(&key);
+        assert_eq!((line.len(), line.capacity()), (super::KEY_LINE_LEN, super::KEY_LINE_LEN));
+        let back = super::keys_from_line(line.as_bytes()).unwrap();
+        assert_eq!(*back.export(), *key.export());
+        let crlf = line.trim_end().to_uppercase() + "\r\n";
+        assert_eq!(*super::keys_from_line(crlf.as_bytes()).unwrap().export(), *key.export());
+        // Not hex, too short, or non-ASCII of the right length: refused, never a panic.
+        assert!(super::keys_from_line(b"").is_err());
+        assert!(super::keys_from_line(&[b'g'; 128]).is_err());
+        assert!(super::keys_from_line(&line.as_bytes()[..100]).is_err());
+        assert!(super::keys_from_line("é".repeat(64).as_bytes()).is_err());
     }
 }

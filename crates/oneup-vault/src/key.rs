@@ -28,10 +28,31 @@ const SALT_LEN: usize = 8;
 const MAX_SCRYPT_BYTES: u64 = 1 << 30;
 
 /// The two keys. Zeroed when dropped.
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+///
+/// Boxed: moving a `Masterkey` (returning it, putting it in an `Arc`) then
+/// moves a pointer. Moving the keys themselves copies their bytes and can
+/// leave copies on the stack that nothing wipes.
 pub struct Masterkey {
+    keys: Box<Keys>,
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct Keys {
     enc: [u8; 32],
     mac: [u8; 32],
+}
+
+// Wiped by `Keys`, in place on the heap.
+impl ZeroizeOnDrop for Masterkey {}
+
+impl Clone for Masterkey {
+    fn clone(&self) -> Self {
+        // Copied heap to heap, not through a value on the stack.
+        let mut k = Self::zeroed();
+        k.keys.enc.copy_from_slice(&self.keys.enc);
+        k.keys.mac.copy_from_slice(&self.keys.mac);
+        k
+    }
 }
 
 impl std::fmt::Debug for Masterkey {
@@ -63,7 +84,11 @@ fn kek(password: &str, salt: &[u8], cost: u64, block_size: u32) -> Result<Zeroiz
     }
     let params = scrypt::Params::new(cost.trailing_zeros() as u8, block_size, 1, 32)
         .map_err(|e| Error::Malformed(format!("scrypt parameters: {e}")))?;
-    let pw: Zeroizing<String> = Zeroizing::new(password.nfc().collect());
+    // Room for the longest NFC form up front (NFC grows text at most
+    // threefold, UAX #15): a string that grows reallocates and leaves the
+    // old, unwiped buffer behind.
+    let mut pw = Zeroizing::new(String::with_capacity(password.len().saturating_mul(3)));
+    pw.extend(password.nfc());
     let mut out = Zeroizing::new([0u8; 32]);
     scrypt::scrypt(pw.as_bytes(), salt, &params, out.as_mut()).map_err(|e| Error::Malformed(format!("scrypt: {e}")))?;
     Ok(out)
@@ -80,14 +105,21 @@ fn b64(field: &str, s: &str) -> Result<Vec<u8>> {
 }
 
 impl Masterkey {
+    fn zeroed() -> Self {
+        Self { keys: Box::new(Keys { enc: [0u8; 32], mac: [0u8; 32] }) }
+    }
+
     /// A new random masterkey.
     pub fn generate() -> Result<Self> {
-        Ok(Self { enc: random()?, mac: random()? })
+        let mut key = Self::zeroed();
+        crate::fill_random(&mut key.keys.enc)?;
+        crate::fill_random(&mut key.keys.mac)?;
+        Ok(key)
     }
 
     /// For tests: a masterkey from given keys.
     pub fn from_keys(enc: [u8; 32], mac: [u8; 32]) -> Self {
-        Self { enc, mac }
+        Self { keys: Box::new(Keys { enc, mac }) }
     }
 
     /// Both keys (encryption, then MAC), for keeping the vault unlocked
@@ -101,21 +133,21 @@ impl Masterkey {
     pub fn import(raw: &[u8; 64]) -> Self {
         // Copied straight into the zeroed-on-drop key, not through
         // temporaries that would linger on the stack.
-        let mut key = Self { enc: [0u8; 32], mac: [0u8; 32] };
-        key.enc.copy_from_slice(&raw[..32]);
-        key.mac.copy_from_slice(&raw[32..]);
+        let mut key = Self::zeroed();
+        key.keys.enc.copy_from_slice(&raw[..32]);
+        key.keys.mac.copy_from_slice(&raw[32..]);
         key
     }
 
     pub(crate) fn enc(&self) -> &[u8; 32] {
-        &self.enc
+        &self.keys.enc
     }
 
     /// Encryption key, then MAC key: what signs the vault configuration.
     pub(crate) fn raw(&self) -> Zeroizing<[u8; 64]> {
         let mut r = Zeroizing::new([0u8; 64]);
-        r[..32].copy_from_slice(&self.enc);
-        r[32..].copy_from_slice(&self.mac);
+        r[..32].copy_from_slice(&self.keys.enc);
+        r[32..].copy_from_slice(&self.keys.mac);
         r
     }
 
@@ -123,8 +155,8 @@ impl Masterkey {
     /// S2V, then K2 for CTR).
     pub(crate) fn siv(&self) -> Zeroizing<[u8; 64]> {
         let mut r = Zeroizing::new([0u8; 64]);
-        r[..32].copy_from_slice(&self.mac);
-        r[32..].copy_from_slice(&self.enc);
+        r[..32].copy_from_slice(&self.keys.mac);
+        r[32..].copy_from_slice(&self.keys.enc);
         r
     }
 
@@ -149,9 +181,9 @@ impl Masterkey {
             scrypt_salt: B64.encode(salt),
             scrypt_cost_param: cost,
             scrypt_block_size: block_size,
-            primary_master_key: B64.encode(wrap(&self.enc)?),
-            hmac_master_key: B64.encode(wrap(&self.mac)?),
-            version_mac: B64.encode(version_mac(&self.mac, LEGACY_VERSION).finalize().into_bytes()),
+            primary_master_key: B64.encode(wrap(&self.keys.enc)?),
+            hmac_master_key: B64.encode(wrap(&self.keys.mac)?),
+            version_mac: B64.encode(version_mac(&self.keys.mac, LEGACY_VERSION).finalize().into_bytes()),
         };
         serde_json::to_vec_pretty(&f).map_err(|e| Error::Malformed(e.to_string()))
     }
@@ -173,11 +205,11 @@ impl Masterkey {
             aes_kw::KekAes256::new(kek.as_ref().into()).unwrap(&wrapped, out).map_err(|_| Error::WrongPassword)?;
             Ok(())
         };
-        let mut key = Self { enc: [0u8; 32], mac: [0u8; 32] };
-        unwrap("primaryMasterKey", &f.primary_master_key, &mut key.enc)?;
-        unwrap("hmacMasterKey", &f.hmac_master_key, &mut key.mac)?;
+        let mut key = Self::zeroed();
+        unwrap("primaryMasterKey", &f.primary_master_key, &mut key.keys.enc)?;
+        unwrap("hmacMasterKey", &f.hmac_master_key, &mut key.keys.mac)?;
         let given = b64("versionMac", &f.version_mac)?;
-        version_mac(&key.mac, f.version)
+        version_mac(&key.keys.mac, f.version)
             .verify_slice(&given)
             .map_err(|_| Error::Tampered("the masterkey's version"))?;
         if f.version != LEGACY_VERSION {
@@ -197,7 +229,7 @@ mod tests {
         let k = Masterkey::generate().unwrap();
         let file = k.to_file_with("correct horse", 1024, 8).unwrap();
         let back = Masterkey::from_file(&file, "correct horse").unwrap();
-        assert_eq!((back.enc, back.mac), (k.enc, k.mac));
+        assert_eq!(*back.export(), *k.export());
         assert!(matches!(Masterkey::from_file(&file, "wrong"), Err(Error::WrongPassword)));
         let json: serde_json::Value = serde_json::from_slice(&file).unwrap();
         assert_eq!(json["version"], 999);
@@ -237,6 +269,27 @@ mod tests {
         wiped::<aes::Aes256>();
         wiped::<aes::Aes256Enc>();
         wiped::<aes::Aes256Dec>();
+        // And AES-SIV's CMAC state (the `cmac` crate's `zeroize` feature).
+        wiped::<cmac::CmacCore<aes::Aes256>>();
+        wiped::<Masterkey>();
+    }
+
+    #[test]
+    fn clones_and_exports_hold_the_same_keys() {
+        let k = Masterkey::generate().unwrap();
+        assert_ne!(*k.export(), [0u8; 64]);
+        assert_eq!(*k.clone().export(), *k.export());
+        assert_eq!(*Masterkey::import(&k.export()).export(), *k.export());
+        assert_eq!(&k.siv()[..32], &k.export()[32..], "SIV: MAC key first");
+    }
+
+    #[test]
+    fn scrypt_matches_rfc_7914() {
+        // RFC 7914 §12, the first vector (P = "", S = "", N = 16, r = 1,
+        // p = 1): its first 32 bytes, all a KEK uses (PBKDF2's first block
+        // doesn't depend on the output length).
+        let k = kek("", b"", 16, 1).unwrap();
+        assert_eq!(*k, hex::<32>("77D6576238657B203B19CA42C18A0497F16B4844E3074AE8DFDFFA3FEDE21442"));
     }
 
     #[test]
