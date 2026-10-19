@@ -1583,7 +1583,7 @@ async fn run() -> Result<()> {
             let dir = data_dir(&cli)?;
             let v = match find {
                 Some(q) => oneup_app::filetree::find(&dir, q, 50)?,
-                None => oneup_app::filetree::list(&dir, rel)?,
+                None => oneup_app::filetree::list(&dir, rel, &[])?,
             };
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())

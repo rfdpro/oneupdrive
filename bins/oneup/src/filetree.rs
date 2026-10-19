@@ -10,7 +10,6 @@
 //! folder that's left out is stored as one row (its contents aren't
 //! tracked), so its contents aren't listed.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -40,11 +39,47 @@ pub fn rule_for(rel: &str, folder: bool) -> String {
     format!("/{body}{}", if folder { "/" } else { "" })
 }
 
+/// One folder on the way down to the one listed, as an earlier listing
+/// gave it: the IDs of its rows on this PC and in OneDrive (`None`: not on
+/// that side). Folders whose names fold alike are told apart by these;
+/// names alone can't.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Step {
+    pub local: Option<u128>,
+    pub remote: Option<String>,
+}
+
+/// [`Step`]s as the window sends them: `[{ "l": "<id>" | null, "r":
+/// "<id>" | null }, …]`, one per folder from the top.
+pub fn steps_from(v: &Value) -> Result<Vec<Step>> {
+    let Some(list) = v.as_array() else { return Ok(Vec::new()) };
+    list.iter()
+        .map(|s| {
+            let local = match s["l"].as_str() {
+                Some(id) => Some(id.parse().context("a folder's ID on this PC isn't a number")?),
+                None => None,
+            };
+            Ok(Step { local, remote: s["r"].as_str().map(str::to_string) })
+        })
+        .collect()
+}
+
+/// Checks that `steps` (if any) name each folder of `parts`.
+fn check_steps(parts: &[&str], steps: &[Step]) -> Result<()> {
+    if !steps.is_empty() && steps.len() != parts.len() {
+        bail!("the window's folder IDs don't match its path; list the folder again");
+    }
+    Ok(())
+}
+
 /// The rules that apply inside the folder at `parts` (config, folders
 /// synced on their own, folders left to the OneDrive app, and every
 /// `.oneupignore` on the way down), and that folder's Local row if it's
-/// on this PC and listed.
-fn rules_at(data_dir: &Path, store: &Store, parts: &[&str]) -> Result<(RuleSet, Option<LocalRow>)> {
+/// on this PC and listed. With `steps`, each folder on the way is the one
+/// with that ID in its parent (none if it isn't there any more); without,
+/// the one with that name.
+fn rules_at(data_dir: &Path, store: &Store, parts: &[&str], steps: &[Step]) -> Result<(RuleSet, Option<LocalRow>)> {
+    check_steps(parts, steps)?;
     let root = store.read(|o| o.local_root())?.context("this folder hasn't been looked at yet")?;
     let mut set = config::load_rules(data_dir, store)?.rule_set()?;
     crate::rulefiles::add_separate(data_dir, store, &mut set)?;
@@ -62,24 +97,28 @@ fn rules_at(data_dir: &Path, store: &Store, parts: &[&str]) -> Result<(RuleSet, 
             let _ = crate::rulefiles::add(&mut set, &mut verifier, &parts[..i].join("/"), &f);
         }
         let Some(part) = parts.get(i) else { break };
-        row = pick(store.read(|o| o.local_children(dir.file_id))?, |c| &c.name, part);
+        let want = steps.get(i).map_or(Want::Name(part), |s| Want::Id(s.local.as_ref()));
+        row = step(store.read(|o| o.local_children(dir.file_id))?, |c| &c.name, |c| &c.file_id, want);
     }
     Ok((set, row))
 }
 
-/// The cloud folder at `parts` below the pair's OneDrive folder.
-fn remote_at(store: &Store, parts: &[&str]) -> Result<Option<String>> {
+/// The cloud folder at `parts` below the pair's OneDrive folder (found as
+/// in [`rules_at`]).
+fn remote_at(store: &Store, parts: &[&str], steps: &[Step]) -> Result<Option<String>> {
+    check_steps(parts, steps)?;
     let root = store.read(|o| o.local_root())?.context("this folder hasn't been looked at yet")?;
     let Some(mut cur) = store.read(|o| o.synced_by_local(root.root_file_id))?.and_then(|b| b.remote) else {
         return Ok(None);
     };
-    for part in parts {
+    for (i, part) in parts.iter().enumerate() {
         let folders: Vec<RemoteRow> = store
             .read(|o| o.remote_children(&cur.0))?
             .into_iter()
             .filter_map(|(r, excluded)| (r.kind == Kind::Folder && !excluded).then_some(r))
             .collect();
-        match pick(folders, |r| &r.name, part) {
+        let want = steps.get(i).map_or(Want::Name(part), |s| Want::Id(s.remote.as_deref()));
+        match step(folders, |r| &r.name, |r| r.id.as_str(), want) {
             Some(r) => cur = oneup_sync::RemoteId(r.id),
             None => return Ok(None),
         }
@@ -152,36 +191,78 @@ fn pick<T>(items: Vec<T>, name: impl Fn(&T) -> &str, part: &str) -> Option<T> {
     if alike.len() == 1 { alike.pop() } else { None }
 }
 
-/// Rows merged by folded name, as Windows and OneDrive compare names; the
-/// number tells apart names on one side that fold alike (OneDrive may keep
-/// both), each getting a row.
-struct Merged<L, R> {
-    rows: BTreeMap<(String, usize), (Option<L>, Option<R>)>,
-    // Rows taken so far per folded name, on each side.
-    taken: std::collections::HashMap<String, (usize, usize)>,
+/// How a path step is found.
+#[derive(Debug, Clone, Copy)]
+enum Want<'a, I: ?Sized> {
+    /// By name ([`pick`]).
+    Name(&'a str),
+    /// By the ID an earlier listing gave (`None`: it had none on this side).
+    Id(Option<&'a I>),
 }
 
-impl<L, R> Merged<L, R> {
-    fn new() -> Self {
-        Self { rows: BTreeMap::new(), taken: std::collections::HashMap::new() }
+/// The item among `items` (one folder's) that `want` names. By ID, only
+/// that one: one that's gone isn't replaced by another with a like name.
+fn step<T, I: PartialEq + ?Sized>(
+    items: Vec<T>,
+    name: impl Fn(&T) -> &str,
+    id: impl Fn(&T) -> &I,
+    want: Want<'_, I>,
+) -> Option<T> {
+    match want {
+        Want::Name(part) => pick(items, name, part),
+        Want::Id(Some(want)) => items.into_iter().find(|t| id(t) == want),
+        Want::Id(None) => None,
     }
+}
 
-    fn slot(&mut self, name: &str, local: bool) -> &mut (Option<L>, Option<R>) {
-        let key = oneup_sync::fold(name);
-        let n = self.taken.entry(key.clone()).or_default();
-        let side = if local { &mut n.0 } else { &mut n.1 };
-        let at = *side;
-        *side += 1;
-        self.rows.entry((key, at)).or_insert((None, None))
+/// A folder's items on this PC and in OneDrive side by side, one row per
+/// item: an item here goes with the one in OneDrive it's synced with
+/// (`link`: that one's ID), else with the one spelled the same, else with
+/// one whose name folds alike (as Windows and OneDrive compare names), in
+/// turn. Names on one side that fold alike (OneDrive may keep both) each
+/// get a row.
+fn merge<'k, L, R>(
+    locals: Vec<L>,
+    remotes: Vec<R>,
+    lname: impl Fn(&L) -> &str,
+    rname: impl Fn(&R) -> &str,
+    link: impl Fn(&L) -> Option<&'k str>,
+    rid: impl Fn(&R) -> &str,
+) -> Vec<(Option<L>, Option<R>)> {
+    use std::collections::{HashMap, VecDeque};
+    let mut remotes: Vec<Option<R>> = remotes.into_iter().map(Some).collect();
+    let by_id: HashMap<String, usize> =
+        remotes.iter().enumerate().filter_map(|(i, r)| r.as_ref().map(|r| (rid(r).to_string(), i))).collect();
+    let mut rows = Vec::new();
+    let mut left = Vec::new();
+    for l in locals {
+        match link(&l).and_then(|id| by_id.get(id)).and_then(|&i| remotes[i].take()) {
+            Some(r) => rows.push((Some(l), Some(r))),
+            None => left.push(l),
+        }
     }
-
-    fn local(&mut self, name: &str, l: L) {
-        self.slot(name, true).0 = Some(l);
+    let mut exact: HashMap<String, usize> = HashMap::new();
+    let mut alike: HashMap<String, VecDeque<usize>> = HashMap::new();
+    for (i, r) in remotes.iter().enumerate() {
+        if let Some(r) = r {
+            exact.insert(rname(r).to_string(), i);
+            alike.entry(oneup_sync::fold(rname(r))).or_default().push_back(i);
+        }
     }
-
-    fn remote(&mut self, name: &str, r: R) {
-        self.slot(name, false).1 = Some(r);
+    let mut still = Vec::new();
+    for l in left {
+        match exact.get(lname(&l)).and_then(|&i| remotes[i].take()) {
+            Some(r) => rows.push((Some(l), Some(r))),
+            None => still.push(l),
+        }
     }
+    for l in still {
+        let queue = alike.get_mut(&oneup_sync::fold(lname(&l)));
+        let r = queue.and_then(|q| std::iter::from_fn(|| q.pop_front()).find_map(|i| remotes[i].take()));
+        rows.push((Some(l), r));
+    }
+    rows.extend(remotes.into_iter().flatten().map(|r| (None, Some(r))));
+    rows
 }
 
 /// The pair's folders and modes.
@@ -193,14 +274,16 @@ pub fn pair_info(store: &Store) -> Result<(PathBuf, String, bool)> {
 }
 
 /// The folder at `rel` in data folder `data_dir`'s synced folder: its
-/// items (folders first, then by name) with their state.
-pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
+/// items (folders first, then by name) with their state, and the IDs of
+/// each item's rows (`local_id`, `remote_id`), which the window sends back
+/// as `steps` (see [`rules_at`]; empty: by name).
+pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
     oneup_cfapi::expose_placeholders()?;
     let rel = clean(rel);
     let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     let store = crate::setup::open_store(data_dir, 4 * 1024)?;
     let (local_root, _, on_demand) = pair_info(&store)?;
-    let (set, row) = rules_at(data_dir, &store, &parts)?;
+    let (set, row) = rules_at(data_dir, &store, &parts, steps)?;
     // The folder itself: left out (or inside a left-out one) means its
     // contents aren't tracked.
     if !parts.is_empty() {
@@ -214,24 +297,34 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
         Some(r) => store.read(|o| o.local_children(r.file_id))?,
         None => Vec::new(),
     };
-    let remotes: Vec<(RemoteRow, bool)> = match remote_at(&store, &parts)? {
+    let remotes: Vec<(RemoteRow, bool)> = match remote_at(&store, &parts, steps)? {
         Some(id) => store.read(|o| o.remote_children(&id))?,
         None => Vec::new(),
     };
-    let mut merged: Merged<LocalRow, (RemoteRow, bool)> = Merged::new();
+    // Each item here with its Synced row, if it has one: whether it's
+    // synced, and with which item in OneDrive.
+    let mut links = std::collections::HashMap::new();
+    let mut here = Vec::new();
     for l in locals {
-        if parts.is_empty() && l.name.eq_ignore_ascii_case(ENGINE_DIR) {
+        if parts.is_empty() && oneup_sync::same_name(&l.name, ENGINE_DIR) {
             continue;
         }
-        merged.local(&l.name.clone(), l);
+        if let Some(b) = store.read(|o| o.synced_by_local(l.file_id))? {
+            links.insert(l.file_id, b.remote.map(|r| r.0));
+        }
+        here.push(l);
     }
-    for r in remotes {
-        merged.remote(&r.0.name.clone(), r);
-    }
-    let by_name = merged.rows;
-    let total = by_name.len();
+    let rows = merge(
+        here,
+        remotes,
+        |l| &l.name,
+        |r| &r.0.name,
+        |l| links.get(&l.file_id).and_then(|r| r.as_deref()),
+        |r| &r.0.id,
+    );
+    let total = rows.len();
     let mut items = Vec::new();
-    for (_, (l, r)) in by_name {
+    for (l, r) in rows {
         let name =
             l.as_ref().map(|l| l.name.clone()).or_else(|| r.as_ref().map(|r| r.0.name.clone())).unwrap_or_default();
         let folder = l.as_ref().map_or_else(
@@ -241,7 +334,7 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
         let link = l.as_ref().is_some_and(|l| l.kind == LocalKind::Link);
         let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
         let synced = match (&l, &r) {
-            (Some(l), _) if store.read(|o| o.synced_by_local(l.file_id))?.is_some() => true,
+            (Some(l), _) if links.contains_key(&l.file_id) => true,
             (_, Some(r)) => store.read(|o| o.synced_by_remote(&r.0.id))?.is_some(),
             _ => false,
         };
@@ -267,6 +360,8 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
             "why": why,
             "placement": place,
             "path": l.is_some().then(|| shown(&path)),
+            "local_id": l.as_ref().map(|l| l.file_id.to_string()),
+            "remote_id": r.as_ref().map(|r| r.0.id.clone()),
         }));
     }
     items.sort_by(|a, b| {
@@ -278,43 +373,30 @@ pub fn list(data_dir: &Path, rel: &str) -> Result<Value> {
     Ok(json!({ "rel": rel, "items": items, "more": total.saturating_sub(MAX_LISTED), "untracked": false }))
 }
 
-/// The total size of everything inside each folder of the folder at `rel`,
-/// by name: this PC's copy where it has one (online-only files count at
-/// their full size), else OneDrive's. A left-out folder isn't tracked
-/// inside, so it has no total. Asked for after [`list`], as it reads the
-/// whole subtree.
-pub fn sizes(data_dir: &Path, rel: &str) -> Result<Value> {
+/// The total size of everything inside each folder of the folder at `rel`
+/// (found as in [`list`]), by the IDs [`list`] gives: `{"local": {id:
+/// bytes}, "remote": {id: bytes}}`. The window shows this PC's copy where
+/// it has one (online-only files count at their full size), else
+/// OneDrive's. A left-out folder isn't tracked inside, so it has no total.
+/// Asked for after [`list`], as it reads the whole subtree.
+pub fn sizes(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
     let rel = clean(rel);
     let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     let store = crate::setup::open_store(data_dir, 4 * 1024)?;
-    let (_, row) = rules_at(data_dir, &store, &parts)?;
-    let mut out = serde_json::Map::new();
-    if let Some(remote) = remote_at(&store, &parts)? {
-        let totals = store.read(|o| o.remote_folder_totals(&remote))?;
-        let names: std::collections::HashMap<String, String> = store
-            .read(|o| o.remote_children(&remote))?
-            .into_iter()
-            .map(|(r, _)| (r.id, r.name.to_lowercase()))
-            .collect();
-        for (id, bytes) in totals {
-            if let Some(n) = names.get(&id) {
-                out.insert(n.clone(), Value::from(bytes));
-            }
+    let (_, row) = rules_at(data_dir, &store, &parts, steps)?;
+    let mut remote = serde_json::Map::new();
+    if let Some(id) = remote_at(&store, &parts, steps)? {
+        for (id, bytes) in store.read(|o| o.remote_folder_totals(&id))? {
+            remote.insert(id, Value::from(bytes));
         }
     }
+    let mut local = serde_json::Map::new();
     if let Some(r) = row {
-        let names: std::collections::HashMap<u128, String> = store
-            .read(|o| o.local_children(r.file_id))?
-            .into_iter()
-            .map(|c| (c.file_id, c.name.to_lowercase()))
-            .collect();
         for (id, bytes) in store.read(|o| o.local_folder_totals(r.file_id))? {
-            if let Some(n) = names.get(&id) {
-                out.insert(n.clone(), Value::from(bytes));
-            }
+            local.insert(id.to_string(), Value::from(bytes));
         }
     }
-    Ok(Value::Object(out))
+    Ok(json!({ "local": local, "remote": remote }))
 }
 
 /// Items whose name contains `needle`, on this PC or in OneDrive: up to
@@ -336,24 +418,27 @@ pub fn find(data_dir: &Path, needle: &str, limit: usize) -> Result<Value> {
     for l in store.read(|o| o.local_find(needle, limit))? {
         if let Some(p) = store.read(|o| o.local_path_of(l.file_id))? {
             let rel = clean(&p);
-            if rel.split('/').next().is_some_and(|f| f.eq_ignore_ascii_case(ENGINE_DIR)) {
+            if rel.split('/').next().is_some_and(|f| oneup_sync::same_name(f, ENGINE_DIR)) {
                 continue;
             }
-            if seen.insert(rel.to_lowercase()) {
+            if seen.insert(oneup_sync::fold(&rel)) {
                 out.push(json!({ "rel": rel, "folder": l.kind != LocalKind::File }));
             }
         }
     }
     for r in store.read(|o| o.remote_find(needle, limit))? {
         let Some(p) = store.read(|o| o.path_of(&r.id))? else { continue };
-        // Only what's inside this pair's OneDrive folder.
-        let Some(rest) = p.get(base_path.len()..).filter(|_| {
-            base.is_some() && p.to_lowercase().starts_with(&base_path.to_lowercase()) && p.len() > base_path.len()
-        }) else {
+        // Only what's inside this pair's OneDrive folder, cut by
+        // characters as names fold (a cut in bytes could split one).
+        let Some(rest) = base
+            .as_ref()
+            .and_then(|_| oneup_sync::strip_folded_prefix(&p, &base_path))
+            .filter(|rest| !rest.is_empty() && (base_path.ends_with('/') || rest.starts_with('/')))
+        else {
             continue;
         };
         let rel = clean(rest);
-        if seen.insert(rel.to_lowercase()) {
+        if seen.insert(oneup_sync::fold(&rel)) {
             out.push(json!({ "rel": rel, "folder": r.kind == Kind::Folder }));
         }
     }
@@ -384,7 +469,7 @@ pub fn rule_files(data_dir: &Path) -> Result<Vec<String>> {
 fn verdict(data_dir: &Path, store: &Store, rel: &str, folder: bool) -> Result<Verdict> {
     let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
     let parent = &parts[..parts.len().saturating_sub(1)];
-    let (set, _) = rules_at(data_dir, store, parent)?;
+    let (set, _) = rules_at(data_dir, store, parent, &[])?;
     Ok(set.verdict(rel, folder))
 }
 
@@ -401,7 +486,7 @@ pub fn set_sync(data_dir: &Path, rel: &str, folder: bool, on: bool) -> Result<St
     let mut rules = config::load_rules(data_dir, &store)?;
     let exact = rule_for(&rel, folder);
     let exception = format!("!{exact}");
-    let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b);
+    let same = |a: &str, b: &str| oneup_sync::same_name(a.trim(), b);
     let before = rules.clone();
     if on {
         rules.exclude.retain(|r| !same(r, &exact));
@@ -468,7 +553,7 @@ pub fn set_paused(data_dir: &Path, rel: &str, on: bool) -> Result<String> {
     }
     let store = crate::setup::open_store(data_dir, 1024)?;
     let mut rules = config::load_rules(data_dir, &store)?;
-    let same = |p: &String| clean(p).eq_ignore_ascii_case(&rel);
+    let same = |p: &String| oneup_sync::same_name(&clean(p), &rel);
     if on && !rules.paused.iter().any(same) {
         rules.paused.push(rel.clone());
     } else if !on {
@@ -482,9 +567,9 @@ pub fn set_paused(data_dir: &Path, rel: &str, on: bool) -> Result<String> {
 pub fn order(data_dir: &Path, rel: &str, folder: bool) -> Result<&'static str> {
     let (first, last) = config::load_priority(data_dir)?;
     let r = rule_for(rel, folder);
-    Ok(if first.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+    Ok(if first.iter().any(|x| oneup_sync::same_name(x, &r)) {
         "first"
-    } else if last.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+    } else if last.iter().any(|x| oneup_sync::same_name(x, &r)) {
         "last"
     } else {
         "normal"
@@ -495,8 +580,8 @@ pub fn order(data_dir: &Path, rel: &str, folder: bool) -> Result<&'static str> {
 pub fn set_order(data_dir: &Path, rel: &str, folder: bool, which: &str) -> Result<()> {
     let (mut first, mut last) = config::load_priority(data_dir)?;
     let r = rule_for(rel, folder);
-    first.retain(|x| !x.eq_ignore_ascii_case(&r));
-    last.retain(|x| !x.eq_ignore_ascii_case(&r));
+    first.retain(|x| !oneup_sync::same_name(x, &r));
+    last.retain(|x| !oneup_sync::same_name(x, &r));
     match which {
         "first" => first.push(r),
         "last" => last.push(r),
@@ -524,17 +609,145 @@ mod tests {
         assert_eq!(super::clean("/a//b/./"), "a/b");
     }
 
+    /// `merge` of plain names; `links` pairs a local name with the remote
+    /// one it's synced with (remote IDs are their names here).
+    fn merged(
+        locals: &[&'static str],
+        remotes: &[&'static str],
+        links: &[(&str, &'static str)],
+    ) -> Vec<(Option<&'static str>, Option<&'static str>)> {
+        let link = |l: &&str| links.iter().find(|(a, _)| a == l).map(|(_, r)| *r);
+        super::merge(locals.to_vec(), remotes.to_vec(), |l| l, |r| r, link, |r| r)
+    }
+
     #[test]
     fn names_that_fold_alike_on_one_side_each_get_a_row() {
-        let mut m: super::Merged<&str, &str> = super::Merged::new();
-        for name in ["λογος", "ΛΟΓΟΣ"] {
-            m.local(name, name);
-        }
-        for name in ["λογοσ", "λογος"] {
-            m.remote(name, name);
-        }
-        let got: Vec<_> = m.rows.into_values().collect();
-        assert_eq!(got, [(Some("λογος"), Some("λογοσ")), (Some("ΛΟΓΟΣ"), Some("λογος"))]);
+        let got = merged(&["λογος", "ΛΟΓΟΣ"], &["λογοσ", "λογος"], &[]);
+        // The same spelling first, then one that folds alike.
+        assert_eq!(got, [(Some("λογος"), Some("λογος")), (Some("ΛΟΓΟΣ"), Some("λογοσ"))]);
+        // One here, two in OneDrive that fold alike: the other gets its own
+        // row, under its own name.
+        let got = merged(&["λογος"], &["λογοσ", "λογος"], &[]);
+        assert_eq!(got, [(Some("λογος"), Some("λογος")), (None, Some("λογοσ"))]);
+        // Only alike: paired in order, the rest alone.
+        let got = merged(&["Kit"], &["KIT", "\u{212A}it"], &[]);
+        assert_eq!(got, [(Some("Kit"), Some("KIT")), (None, Some("\u{212A}it"))]);
+    }
+
+    #[test]
+    fn an_item_goes_with_the_one_it_is_synced_with_before_any_name() {
+        // Synced with the other spelling (a rename not sent yet): the link
+        // wins over the same name.
+        let got = merged(&["λογος"], &["λογος", "λογοσ"], &[("λογος", "λογοσ")]);
+        assert_eq!(got, [(Some("λογος"), Some("λογοσ")), (None, Some("λογος"))]);
+        // A link to something not listed here: by name as usual.
+        let got = merged(&["a"], &["A"], &[("a", "elsewhere")]);
+        assert_eq!(got, [(Some("a"), Some("A"))]);
+    }
+
+    #[test]
+    fn a_path_step_by_id_takes_only_that_item() {
+        use super::{Want, step};
+        let items = vec![("λογος", 1u128), ("λογοσ", 2)];
+        let by = |want| step(items.clone(), |t| t.0, |t| &t.1, want);
+        assert_eq!(by(Want::Id(Some(&2))), Some(("λογοσ", 2)));
+        assert_eq!(by(Want::Id(Some(&1))), Some(("λογος", 1)));
+        // Gone since it was listed: not another with a like name.
+        assert_eq!(by(Want::Id(Some(&3))), None);
+        // Not on this side when listed: none, though a name folds alike.
+        assert_eq!(by(Want::Id(None)), None);
+        // By name: as before.
+        assert_eq!(by(Want::Name("λογοσ")), Some(("λογοσ", 2)));
+        assert_eq!(by(Want::Name("ΛΟΓΟΣ")), None);
+    }
+
+    #[test]
+    fn steps_come_from_the_window_as_text_ids() {
+        let v = serde_json::json!([{ "l": "340282366920938463463374607431768211455", "r": null }, { "l": null, "r": "A!1" }]);
+        let got = super::steps_from(&v).unwrap();
+        assert_eq!(
+            got,
+            [
+                super::Step { local: Some(u128::MAX), remote: None },
+                super::Step { local: None, remote: Some("A!1".into()) }
+            ]
+        );
+        assert!(super::steps_from(&serde_json::json!([{ "l": "x" }])).is_err());
+        assert!(super::steps_from(&serde_json::Value::Null).unwrap().is_empty());
+    }
+
+    /// Two OneDrive folders whose names fold alike, both listed and opened
+    /// by their IDs.
+    #[test]
+    fn cloud_folders_whose_names_fold_alike_each_open() {
+        use oneup_store::{Kind, LocalKind, LocalRoot, LocalRow, RemoteRow, Skip, Store};
+        use oneup_sync::{LocalId, NodeKind, ROOT, RemoteId};
+        let mut s = Store::open_in_memory().unwrap();
+        let row = |id: &str, parent: Option<&str>, name: &str, kind| RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: name.into(),
+            kind,
+            size: 0,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| {
+            let root = LocalRow {
+                file_id: 1,
+                parent_id: None,
+                name: String::new(),
+                name_lossy: false,
+                kind: LocalKind::Root,
+                size: 0,
+                mtime: 0,
+                attributes: 0x10,
+                reparse_tag: 0,
+                skip: Skip::None,
+            };
+            let info = LocalRoot {
+                path: r"C:\Sync".into(),
+                volume_serial: 1,
+                root_file_id: 1,
+                rules: String::new(),
+                journal: None,
+                started_at_ms: 0,
+                finished_at_ms: Some(0),
+                sync_root_provider: None,
+            };
+            o.local_begin(&info, &root)?;
+            o.upsert_item(&row("root", None, "", Kind::Root), false)?;
+            o.upsert_item(&row("r1", Some("root"), "λογος", Kind::Folder), false)?;
+            o.upsert_item(&row("r2", Some("root"), "λογοσ", Kind::Folder), false)?;
+            o.upsert_item(&row("x", Some("root"), "left out", Kind::Folder), true)?;
+            o.synced_put(&oneup_sync::Base {
+                sid: ROOT,
+                parent: None,
+                name: String::new(),
+                kind: NodeKind::Folder,
+                size: 0,
+                hash: None,
+                local: Some(LocalId(1)),
+                local_mtime: 0,
+                remote: Some(RemoteId("root".into())),
+                remote_etag: "e".into(),
+            })
+        })
+        .unwrap();
+        let at = |part: &str, remote: Option<&str>| {
+            let steps = [super::Step { local: None, remote: remote.map(Into::into) }];
+            super::remote_at(&s, &[part], &steps).unwrap()
+        };
+        assert_eq!(at("λογος", Some("r1")).as_deref(), Some("r1"));
+        assert_eq!(at("λογος", Some("r2")).as_deref(), Some("r2"), "by ID, whatever the name");
+        assert_eq!(at("λογοσ", Some("gone")), None);
+        assert_eq!(at("left out", Some("x")), None, "an excluded folder isn't listed inside");
+        // Without IDs, by name: the exact spelling, never a guess.
+        assert_eq!(super::remote_at(&s, &["λογοσ"], &[]).unwrap().as_deref(), Some("r2"));
+        assert_eq!(super::remote_at(&s, &["ΛΟΓΟΣ"], &[]).unwrap(), None);
+        // IDs that don't match the path are refused.
+        assert!(super::remote_at(&s, &["a", "b"], &[super::Step::default()]).is_err());
     }
 
     #[test]

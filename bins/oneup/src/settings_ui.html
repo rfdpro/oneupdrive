@@ -3647,15 +3647,33 @@
             }).catch(() => null);
             setView(F.view, true);
         }
+        function stepsTo(rel) {
+            // The IDs of each folder on the way to `rel`, as listed: folders
+            // whose names fold alike are told apart by these, not by name.
+            const out = [];
+            let cur = "";
+            for (const p of rel ? rel.split("/") : []) {
+                cur = cur ? cur + "/" + p : p;
+                const n = F.nodes.get(cur);
+                if (!n) return [];
+                out.push({
+                    l: n.local_id ?? null,
+                    r: n.remote_id ?? null
+                });
+            }
+            return out;
+        }
         async function loadChildren(rel) {
             const n = F.nodes.get(rel);
             if (!n) return;
             n.loading = true;
             if (F.view === "all") renderTree();
+            const steps = stepsTo(rel);
             try {
                 const r = await call("tree", {
                     root: F.root.id,
-                    rel
+                    rel,
+                    steps
                 });
                 n.untracked = r.untracked;
                 n.more = r.more;
@@ -3679,12 +3697,15 @@
             const root = F.root.id;
             call("tree_sizes", {
                 root,
-                rel
+                rel,
+                steps
             }).then(t => {
                 if (!F.root || F.root.id !== root) return;
                 for (const c of n.children || []) {
                     const cn = F.nodes.get(c);
-                    if (cn && cn.folder) cn.total = t[cn.name.toLowerCase()];
+                    if (!cn || !cn.folder) continue;
+                    // This PC's copy where it has one, else OneDrive's.
+                    cn.total = cn.local_id != null && t.local[cn.local_id] != null ? t.local[cn.local_id] : t.remote[cn.remote_id];
                 }
                 if (F.view === "all" && !F.q) renderTree();
             }).catch(() => {});
