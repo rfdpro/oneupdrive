@@ -1,0 +1,63 @@
+[package]
+name = "oneup-fuzz"
+version = "0.0.0"
+publish = false
+description = "cargo-fuzz targets for OneUpDrive's parsers of untrusted input"
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oneup-graph = { path = "../crates/oneup-graph" }
+oneup-ntfs = { path = "../crates/oneup-ntfs" }
+oneup-remote = { path = "../crates/oneup-remote" }
+oneup-rules = { path = "../crates/oneup-rules" }
+oneup-store = { path = "../crates/oneup-store" }
+oneup-vault = { path = "../crates/oneup-vault" }
+serde_json = "1"
+
+# Its own workspace: cargo-fuzz needs a nightly toolchain and sanitizer flags
+# that the main workspace must never see.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "usn_records"
+path = "fuzz_targets/usn_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delta_page"
+path = "fuzz_targets/delta_page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "push_frames"
+path = "fuzz_targets/push_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_decode"
+path = "fuzz_targets/vault_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules"
+path = "fuzz_targets/rules.rs"
+test = false
+doc = false
+bench = false
