@@ -393,3 +393,82 @@ fn a_new_name_in_a_large_folder_is_read_by_id() {
     assert_eq!(observed, expected);
     assert_eq!(by_id, 1, "the new name only; the edited file is found by its stored name");
 }
+
+/// A folder the store has as small but that has filled since (thousands
+/// of files at once) isn't listed whole: the listing stops past the bound,
+/// and its new items are read one by one, as in any large folder.
+#[test]
+fn a_folder_that_filled_since_its_scan_is_not_listed_whole() {
+    let t = Tmp::new("filled");
+    std::fs::create_dir_all(t.at("grow")).unwrap();
+    let store = scan(&t.0);
+    let n = oneup_local::observe::LIST_WHOLE_MAX + 50;
+    for i in 0..n {
+        t.file(&format!("grow/f{i:05}"), b"");
+    }
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+    let expected = view(&scan(&t.0));
+    let (mut observed, mut by_id) = (View::new(), 0);
+    for _ in 0..50 {
+        by_id += obs.catch_up().unwrap().opened_by_id;
+        observed = view(obs.store());
+        if observed == expected {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(by_id, n as u64, "none found by listing the whole folder");
+}
+
+/// A file a program keeps open for writing across a catch-up: its folder's
+/// listing may still show the size and time from before the writes until
+/// the program closes it. Its close record brings the row up to date.
+#[test]
+fn a_file_written_across_a_catch_up_is_right_after_its_writer_closes_it() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let t = Tmp::new("writer");
+    t.file("docs/log.txt", b"start\r\n");
+    let store = scan(&t.0);
+    let docs = id_of(&view(&store), "/docs");
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+
+    // Another program (not this test's executable) appends and keeps the
+    // file open until told to close it.
+    let script = format!(
+        "$f = [IO.File]::Open('{}', 'Open', 'ReadWrite', 'ReadWrite'); [void]$f.Seek(0, 'End'); \
+         $b = [byte[]]::new(5000); $f.Write($b, 0, $b.Length); $f.Flush(); \
+         [Console]::Out.WriteLine('written'); [Console]::Out.Flush(); [void][Console]::In.ReadLine(); $f.Close()",
+        t.at("docs/log.txt").display()
+    );
+    let mut writer = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(writer.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "written");
+    std::thread::sleep(Duration::from_millis(200));
+    obs.catch_up().unwrap();
+    let during = view(obs.store())["/docs/log.txt"].2;
+
+    writer.stdin.take().unwrap().write_all(b"\r\n").unwrap();
+    assert!(writer.wait().unwrap().success());
+    let expected = view(&scan(&t.0));
+    assert_eq!(expected["/docs/log.txt"].2, 7 + 5000);
+    let (mut observed, mut dirty) = (View::new(), false);
+    for _ in 0..50 {
+        let ch = obs.catch_up().unwrap();
+        dirty |= ch.dirty.contains(&docs);
+        observed = view(obs.store());
+        if observed == expected && dirty {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("size stored while the writer had it open: {during}");
+    assert_eq!(observed, expected, "as a fresh scan sees it");
+    assert!(dirty, "the folder is planned again after the close");
+}
