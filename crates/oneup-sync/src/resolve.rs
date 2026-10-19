@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::merge::{STAGING, conflict_name, lpre};
+use crate::merge::{STAGING, conflict_name, lpre, real_name};
 use crate::model::{LocalId, NodeKind, RemoteId, Trees, fold};
 use crate::op::{Dir, Op, Vacates};
 
@@ -72,6 +72,9 @@ impl<T: Trees + ?Sized> Names<'_, T> {
 
     fn staging_name(&mut self, dir: &Dir, name: &str) -> Result<String, T::Error> {
         let taken = self.unavailable(dir)?;
+        // Of the real name: an item still under a staging name (its move
+        // not finished yet) never gets one staging suffix on another.
+        let name = real_name(name);
         let mut n = 1u32;
         loop {
             let candidate = format!("{name}{STAGING}{n}");
