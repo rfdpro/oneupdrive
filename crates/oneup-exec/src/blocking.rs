@@ -91,6 +91,13 @@ impl Drop for Counted {
 /// A round holds one so that, ended any way, nothing it started still
 /// runs; one that ends normally waits with [`Jobs::settled`] first, so this
 /// finds nothing left.
+///
+/// Dropped under way, it blocks the dropping thread, which may be the only
+/// thread of a current-thread runtime. That can't deadlock: the work runs
+/// on the blocking pool's own threads and never waits for the runtime (no
+/// job awaits anything, takes the store or calls back into the task), and
+/// work the pool drops unrun gives its count back as it's dropped.
+/// (`a_round_dropped_while_it_recycles_a_file_waits_for_the_recycling`.)
 pub(crate) struct Settle<'a>(pub &'a Jobs);
 
 impl Drop for Settle<'_> {

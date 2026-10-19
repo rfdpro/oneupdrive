@@ -3216,6 +3216,62 @@ async fn a_halted_round_ends_only_after_the_work_it_handed_to_a_blocking_thread(
     assert_eq!(local_tree(&s.dir.0), s.cloud.tree());
 }
 
+/// A round dropped while it recycles a file on a blocking thread (the
+/// caller stopped waiting for it) doesn't let go until the recycling is
+/// done, so the next round's settling of write-ahead records never runs
+/// beside it. The wait blocks the dropping thread, which here is the only
+/// thread of a current-thread runtime (the test's): the recycling runs on
+/// the blocking pool and needs nothing from that thread, so it can't
+/// deadlock. Afterwards the record the round left is settled, the deletion
+/// stays, and the content is still in the version store or OneDrive.
+#[tokio::test]
+async fn a_round_dropped_while_it_recycles_a_file_waits_for_the_recycling() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("drop-recycle", cloud.clone());
+    write(&s.p("gone.txt"), b"deleted in OneDrive");
+    s.settle().await;
+    cloud.delete("gone.txt");
+    let (started, finished) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let (began, ended) = (Arc::clone(&started), Arc::clone(&finished));
+    s.exec.on_blocking(Some(Arc::new(move |op: &Op| {
+        if matches!(op, Op::RecycleLocal { .. }) {
+            began.store(true, SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            ended.store(true, SeqCst);
+        }
+    })));
+    tokio::select! {
+        r = s.attempt() => panic!("the round ended before it was dropped: {r:?}"),
+        () = async {
+            while !started.load(SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // `select!` drops the round before it runs this branch's body.
+            assert!(!finished.load(SeqCst), "dropped while recycling");
+        } => {}
+    }
+    assert!(finished.load(SeqCst), "dropping the round waited for the recycling");
+    s.exec.on_blocking(None);
+    let pending = s.obs.store().read(|o| o.meta_under("exec.pending")).unwrap();
+    assert_eq!(pending.len(), 1, "the round left its write-ahead record: {pending:?}");
+    assert!(!s.p("gone.txt").exists(), "the recycling was done");
+
+    let mut s = s.restart();
+    s.obs.catch_up().unwrap();
+    let store = s.obs.store_mut();
+    let r = s.exec.run(store, Vec::new()).await;
+    assert!(r.halted.is_none(), "{r:?}");
+    assert_eq!(store.read(|o| o.meta_under("exec.pending")).unwrap(), vec![]);
+    let problems = store.read(|o| o.check_invariants()).unwrap();
+    assert!(problems.is_empty(), "{problems:?}");
+    s.settle().await;
+    assert!(!s.p("gone.txt").exists(), "the deletion stays");
+    let content = &b"deleted in OneDrive"[..];
+    assert!(s.versions().iter().any(|v| v == content) || s.cloud.holds(content), "the content was lost");
+    assert_eq!(local_tree(&s.dir.0), s.cloud.tree());
+}
+
 /// While another program writes the database (the settings window, a
 /// command), the round's own writes wait for it without blocking the task
 /// the round runs on, so what shares that task (the transfers under way,
