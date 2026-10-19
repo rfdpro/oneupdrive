@@ -95,6 +95,17 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "hold_busy_files": a.busy.on,
             "busy_quiet_s": a.busy.quiet.as_secs(),
         },
+        // The memory profile's numbers and the files hashed at once, for
+        // the General page's Memory and hashing section: `value` null is
+        // the default.
+        "tuning": a.tuned().iter().map(|t| json!({
+            "key": t.knob.key,
+            "label": t.knob.label,
+            "min": t.knob.min,
+            "max": t.knob.max,
+            "default": t.default,
+            "value": t.set,
+        })).collect::<Vec<_>>(),
         "autostart": autostart,
         "rules": {
             "presets": presets,
@@ -359,6 +370,26 @@ pub fn agent_with(mut a: Agent, v: &Value) -> Result<Agent> {
         if let Some(b) = flag(k)? {
             *f = b;
         }
+    }
+    // A number, or null for the default (the memory profile's).
+    let tuned = |k: &str| -> Result<Option<Option<u64>>> {
+        match v.get(k) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(x) => x.as_u64().map(|n| Some(Some(n))).with_context(|| format!("{k}: expected a whole number")),
+        }
+    };
+    for key in config::OVERRIDE_KEYS {
+        if let Some(n) = tuned(key)? {
+            a.set_override(key, n)?;
+        }
+    }
+    let hashing = config::HASH_FILES_AT_ONCE;
+    if let Some(n) = tuned(hashing.key)? {
+        a.hash_files_at_once = match n {
+            Some(n) => hashing.check(n)?,
+            None => Agent::default().hash_files_at_once,
+        };
     }
     if let Some(n) = num("busy_quiet_s")? {
         a.busy.quiet = std::time::Duration::from_secs(n);
@@ -856,6 +887,21 @@ mod tests {
         assert_eq!(a.busy.quiet.as_secs(), 900);
         assert_eq!(a.busy.max.as_secs(), 900, "the longest wait follows a longer quiet time");
         assert!(agent_with(Agent::default(), &json!({ "busy_quiet_s": 0 })).is_err());
+        // The memory profile's numbers: set, back to the profile's (null),
+        // and checked like config.toml.
+        let a = agent_with(Agent::default(), &json!({ "operations_at_once": 4, "hash_files_at_once": 2 })).unwrap();
+        assert_eq!((a.overrides.operations_at_once, a.hash_files_at_once), (Some(4), 2));
+        let a = agent_with(a, &json!({ "operations_at_once": null, "hash_files_at_once": null })).unwrap();
+        assert_eq!(a, Agent::default());
+        for bad in [
+            json!({ "database_cache_mib": 0 }),
+            json!({ "upload_fragment_mib": 60 }),
+            json!({ "hash_files_at_once": 17 }),
+            json!({ "large_uploads_at_once": "2" }),
+            json!({ "operations_at_once": 2.5 }),
+        ] {
+            assert!(agent_with(Agent::default(), &bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

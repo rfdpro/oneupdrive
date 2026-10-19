@@ -1,5 +1,6 @@
 //! `oneup settings`: how the background agent uses this PC (`config.toml`
-//! `[agent]`, `rules.md` § User controls): bandwidth caps, memory profile, priority.
+//! `[agent]`, `rules.md` § User controls): bandwidth caps, memory profile
+//! and its numbers, hashing, priority.
 
 use std::path::Path;
 
@@ -31,6 +32,54 @@ pub struct Changes {
     pub compact_database: Option<bool>,
     /// `[dev] experimental` (`config::load_experimental`).
     pub experimental: Option<bool>,
+    pub tuning: TuningArgs,
+}
+
+/// A number instead of the memory profile's, or `profile` for the
+/// profile's again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Override(pub Option<u64>);
+
+pub fn parse_override(s: &str) -> Result<Override, String> {
+    match s.trim() {
+        "profile" => Ok(Override(None)),
+        n => n.parse().map(|n| Override(Some(n))).map_err(|_| "expected a whole number or `profile`".into()),
+    }
+}
+
+/// `oneup settings`' numbers for memory and hashing (`config::Overrides`).
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct TuningArgs {
+    /// Database cache in MiB instead of the memory profile's (1 to 1024), or `profile`
+    #[arg(long, value_name = "MIB|profile", value_parser = parse_override)]
+    pub database_cache_mib: Option<Override>,
+    /// Operations at once (transfers and the rest) instead of the memory profile's (1 to 32), or `profile`
+    #[arg(long, value_name = "N|profile", value_parser = parse_override)]
+    pub operations_at_once: Option<Override>,
+    /// Uploads over 4 MiB at once instead of the memory profile's (1 to 8), or `profile`
+    #[arg(long, value_name = "N|profile", value_parser = parse_override)]
+    pub large_uploads_at_once: Option<Override>,
+    /// Largest upload fragment in MiB instead of the memory profile's (2 to 59), or `profile`
+    #[arg(long, value_name = "MIB|profile", value_parser = parse_override)]
+    pub upload_fragment_mib: Option<Override>,
+    /// Files hashed at once, to compare them with OneDrive's (1 to 16; default 1)
+    #[arg(long, value_name = "N")]
+    pub hash_files_at_once: Option<u64>,
+}
+
+impl TuningArgs {
+    /// The overrides given, by `config.toml` key.
+    fn overrides(&self) -> impl Iterator<Item = (&'static str, Override)> {
+        config::OVERRIDE_KEYS
+            .into_iter()
+            .zip([
+                self.database_cache_mib,
+                self.operations_at_once,
+                self.large_uploads_at_once,
+                self.upload_fragment_mib,
+            ])
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+    }
 }
 
 pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
@@ -89,6 +138,12 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
     if let Some(b) = c.compact_database {
         a.compact_database = b;
     }
+    for (key, Override(n)) in c.tuning.overrides() {
+        a.set_override(key, n)?;
+    }
+    if let Some(n) = c.tuning.hash_files_at_once {
+        a.hash_files_at_once = config::HASH_FILES_AT_ONCE.check(n)?;
+    }
     match c.cap_hours.as_deref() {
         Some("always" | "off" | "") => a.cap_hours = None,
         Some(q) => {
@@ -109,13 +164,16 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
         config::save_agent(data_dir, &a)?;
         println!("Saved in {}.", config::path(data_dir).display());
         let restart = a.memory != before.memory
+            || a.overrides != before.overrides
+            || a.hash_files_at_once != before.hash_files_at_once
             || a.background != before.background
             || a.compact_database != before.compact_database;
         if crate::agent::nudge(data_dir).await {
             println!("The background agent applies the caps and automatic pauses now.");
             if restart {
                 println!(
-                    "The memory profile, priority and compacting the database apply when it next starts                      (`oneup stop`, `oneup start`)."
+                    "Memory, hashing, priority and compacting the database apply when it next starts \
+                     (`oneup stop`, `oneup start`)."
                 );
             }
         }
@@ -132,7 +190,14 @@ fn show(a: &Agent) {
     if a.upload_kib + a.download_kib > 0 {
         println!("  caps apply      {}", a.cap_hours.as_deref().map_or("always".to_string(), |h| format!("{h} only")));
     }
-    println!("  memory profile  {} ({} MiB database cache)", a.memory, a.cache_kib() / 1024);
+    println!("  memory profile  {}", a.memory);
+    for t in a.tuned() {
+        let set = if t.set.is_some() { format!("  (set; default {})", t.default) } else { String::new() };
+        let indent = if t.knob.key == config::HASH_FILES_AT_ONCE.key { "  " } else { "    " };
+        let label = t.knob.name();
+        let width = 34 - indent.len();
+        println!("{indent}{label:<width$}{}{set}", t.value);
+    }
     println!(
         "  priority        {}",
         if a.background {

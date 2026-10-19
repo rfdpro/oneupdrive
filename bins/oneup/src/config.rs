@@ -144,6 +144,82 @@ pub struct Agent {
     /// Compact the database at the agent's start when free pages are most
     /// of it (`crate::sync::compact`).
     pub compact_database: bool,
+    /// What the memory profile sets, set here instead.
+    pub overrides: Overrides,
+    /// Files read whole to hash them at once (`oneup_exec::Parallel::hashes`).
+    pub hash_files_at_once: u32,
+}
+
+/// The numbers the memory profile sets, each of which `[agent]` can set
+/// itself; `None`: the profile's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Overrides {
+    pub database_cache_mib: Option<u32>,
+    pub operations_at_once: Option<u32>,
+    pub large_uploads_at_once: Option<u32>,
+    pub upload_fragment_mib: Option<u32>,
+}
+
+/// A number in `[agent]`, with its bounds: the same checks for
+/// `config.toml`, `oneup settings` and the settings window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Knob {
+    pub key: &'static str,
+    /// For people (the settings window, `oneup settings`).
+    pub label: &'static str,
+    pub min: u32,
+    pub max: u32,
+}
+
+impl Knob {
+    /// The label inside a sentence: lower case, the unit as it is.
+    pub fn name(&self) -> String {
+        let mut s = self.label.to_string();
+        s[..1].make_ascii_lowercase();
+        s
+    }
+
+    pub fn check(&self, n: u64) -> Result<u32> {
+        match u32::try_from(n) {
+            Ok(v) if (self.min..=self.max).contains(&v) => Ok(v),
+            _ => bail!("{} must be from {} to {}", self.key, self.min, self.max),
+        }
+    }
+}
+
+/// SQLite's page cache. The agent also maps four times this much of the
+/// database while it runs at normal priority.
+pub const DATABASE_CACHE_MIB: Knob =
+    Knob { key: "database_cache_mib", label: "Database cache (MiB)", min: 1, max: 1024 };
+/// Transfers and other operations under way. The Graph client's requests in
+/// flight follow it, and stop at 32 (`oneup_exec::Parallel::requests`).
+pub const OPERATIONS_AT_ONCE: Knob = Knob { key: "operations_at_once", label: "Operations at once", min: 1, max: 32 };
+/// Each holds up to a fragment in memory: 8 of the largest is about 480 MiB.
+pub const LARGE_UPLOADS_AT_ONCE: Knob =
+    Knob { key: "large_uploads_at_once", label: "Large uploads at once", min: 1, max: 8 };
+/// The largest upload fragment. Graph takes multiples of 320 KiB up to just
+/// under 60 MiB, and the fragment sizer goes no lower than 1.25 MiB
+/// (`oneup_graph::fragment`).
+pub const UPLOAD_FRAGMENT_MIB: Knob =
+    Knob { key: "upload_fragment_mib", label: "Largest upload fragment (MiB)", min: 2, max: 59 };
+/// Each reads a file from disk as fast as the disk allows.
+pub const HASH_FILES_AT_ONCE: Knob = Knob { key: "hash_files_at_once", label: "Files hashed at once", min: 1, max: 16 };
+
+/// The keys of [`Overrides`], in the order they're shown.
+pub const OVERRIDE_KEYS: [&str; 4] =
+    ["database_cache_mib", "operations_at_once", "large_uploads_at_once", "upload_fragment_mib"];
+
+/// A number the agent runs with, and where it comes from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tuned {
+    pub knob: Knob,
+    /// What applies, in the knob's unit.
+    pub value: f64,
+    /// What it is without a value of its own (the memory profile's).
+    pub default: f64,
+    /// The value set in `[agent]`, if any (`value` can differ: a fragment
+    /// is rounded down to whole units).
+    pub set: Option<u32>,
 }
 
 impl Default for Agent {
@@ -163,6 +239,8 @@ impl Default for Agent {
             track_apps: true,
             busy: crate::busy::Settings::default(),
             compact_database: true,
+            overrides: Overrides::default(),
+            hash_files_at_once: oneup_exec::Parallel::HASHES as u32,
         }
     }
 }
@@ -173,14 +251,85 @@ pub const MEMORY_PROFILES: &[(&str, u32)] =
 
 impl Agent {
     /// The Graph client's request limiter for the agent and `oneup sync`,
-    /// sized by the memory profile (`oneup_exec::Parallel::requests`).
+    /// sized by the operations at once (`oneup_exec::Parallel::requests`).
     pub fn requests(&self) -> std::sync::Arc<oneup_graph::Aimd> {
-        let (start, most) = oneup_exec::Parallel::for_profile(&self.memory).requests();
+        let (start, most) = self.parallel().requests();
         oneup_graph::Aimd::new(start, most)
     }
 
+    /// The database cache: the profile's unless set.
     pub fn cache_kib(&self) -> u32 {
-        MEMORY_PROFILES.iter().find(|(n, _)| *n == self.memory).map_or(16 * 1024, |(_, k)| *k)
+        match self.overrides.database_cache_mib {
+            Some(m) => m.saturating_mul(1024),
+            None => MEMORY_PROFILES.iter().find(|(n, _)| *n == self.memory).map_or(16 * 1024, |(_, k)| *k),
+        }
+    }
+
+    /// How many operations run at once: the profile's unless set.
+    pub fn parallel(&self) -> oneup_exec::Parallel {
+        let p = oneup_exec::Parallel::for_profile(&self.memory);
+        let o = &self.overrides;
+        let or = |set: Option<u32>, profile: usize| set.map_or(profile, |n| n as usize);
+        oneup_exec::Parallel {
+            ops: or(o.operations_at_once, p.ops),
+            large_uploads: or(o.large_uploads_at_once, p.large_uploads),
+            hashes: self.hash_files_at_once.max(1) as usize,
+        }
+    }
+
+    /// How much memory an upload may hold: the profile's unless set.
+    pub fn upload_memory(&self) -> oneup_exec::UploadMemory {
+        match self.overrides.upload_fragment_mib {
+            Some(m) => oneup_exec::UploadMemory { fragment: (m as usize) << 20 },
+            None => oneup_exec::UploadMemory::for_profile(&self.memory),
+        }
+    }
+
+    /// Every number the memory profile sets, and the files hashed at once,
+    /// as the agent runs with them.
+    pub fn tuned(&self) -> Vec<Tuned> {
+        let profile = Agent { overrides: Overrides::default(), ..self.clone() };
+        let o = &self.overrides;
+        // Fragments are whole 320 KiB units, so the profiles' aren't whole
+        // MiB: shown to a tenth.
+        let fragment = |a: &Agent| {
+            let bytes = oneup_graph::fragment::Sizer::new(a.upload_memory().fragment).max_bytes();
+            (bytes as f64 / f64::from(1 << 20) * 10.0).round() / 10.0
+        };
+        let (now, then) = (self.parallel(), profile.parallel());
+        let row = |knob, value: f64, default: f64, set: Option<u32>| Tuned { knob, value, default, set };
+        vec![
+            row(
+                DATABASE_CACHE_MIB,
+                f64::from(self.cache_kib() / 1024),
+                f64::from(profile.cache_kib() / 1024),
+                o.database_cache_mib,
+            ),
+            row(OPERATIONS_AT_ONCE, now.ops as f64, then.ops as f64, o.operations_at_once),
+            row(LARGE_UPLOADS_AT_ONCE, now.large_uploads as f64, then.large_uploads as f64, o.large_uploads_at_once),
+            row(UPLOAD_FRAGMENT_MIB, fragment(self), fragment(&profile), o.upload_fragment_mib),
+            row(
+                HASH_FILES_AT_ONCE,
+                f64::from(self.hash_files_at_once),
+                oneup_exec::Parallel::HASHES as f64,
+                (self.hash_files_at_once as usize != oneup_exec::Parallel::HASHES).then_some(self.hash_files_at_once),
+            ),
+        ]
+    }
+
+    /// Sets (`Some`) or clears (`None`: the profile's) the override `key`,
+    /// checked against its bounds.
+    pub fn set_override(&mut self, key: &str, n: Option<u64>) -> Result<()> {
+        let o = &mut self.overrides;
+        let (knob, slot) = match key {
+            "database_cache_mib" => (DATABASE_CACHE_MIB, &mut o.database_cache_mib),
+            "operations_at_once" => (OPERATIONS_AT_ONCE, &mut o.operations_at_once),
+            "large_uploads_at_once" => (LARGE_UPLOADS_AT_ONCE, &mut o.large_uploads_at_once),
+            "upload_fragment_mib" => (UPLOAD_FRAGMENT_MIB, &mut o.upload_fragment_mib),
+            _ => bail!("{key}: not a memory setting"),
+        };
+        *slot = n.map(|n| knob.check(n)).transpose()?;
+        Ok(())
     }
 }
 
@@ -222,6 +371,11 @@ fn number(t: &Table, key: &str) -> Result<Option<u64>> {
 /// missing), in place where a key exists so the comments around it stay,
 /// and writes the file: whole, flushed, then renamed into place.
 fn save(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Item)>) -> Result<()> {
+    save_or_remove(data_dir, name, intro, entries.into_iter().map(|(k, v)| (k, Some(v))).collect())
+}
+
+/// [`save`], removing the keys given `None` (a setting back to its default).
+fn save_or_remove(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Option<Item>)>) -> Result<()> {
     let existing = read_doc(data_dir)?;
     let fresh = existing.is_none();
     let mut doc = existing.unwrap_or_default();
@@ -232,9 +386,11 @@ fn save(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Item)>) ->
     }
     let t = doc[name].as_table_mut().with_context(|| format!("[{name}] must be a section"))?;
     for (key, v) in entries {
-        match t.get_mut(key) {
-            Some(item) => *item = v,
-            None => _ = t.insert(key, v),
+        match (t.get_mut(key), v) {
+            (Some(item), Some(v)) => *item = v,
+            (None, Some(v)) => _ = t.insert(key, v),
+            (Some(_), None) => _ = t.remove(key),
+            (None, None) => {}
         }
     }
     let p = path(data_dir);
@@ -277,6 +433,14 @@ pub fn load_rules(data_dir: &Path, store: &Store) -> Result<Rules> {
     };
     rules.rule_set()?; // unknown presets are reported here, not later
     Ok(rules)
+}
+
+/// `[pause] folders` alone, without the store [`load_rules`] needs (the
+/// problems list); a file that can't be read has none.
+pub fn paused_folders(data_dir: &Path) -> Vec<String> {
+    let doc = read_doc(data_dir).ok().flatten();
+    let t = doc.as_ref().and_then(|d| section(d, "pause").ok().flatten());
+    t.and_then(|t| strings(t, "folders").ok().flatten()).unwrap_or_default()
 }
 
 /// Writes `rules` into `config.toml`, keeping everything else in the file
@@ -368,6 +532,14 @@ pub fn load_agent(data_dir: &Path) -> Result<Agent> {
     if let Some(b) = flag("compact_database")? {
         a.compact_database = b;
     }
+    for key in OVERRIDE_KEYS {
+        if let Some(n) = number(t, key)? {
+            a.set_override(key, Some(n)).with_context(|| format!("{FILE}: [agent]"))?;
+        }
+    }
+    if let Some(n) = number(t, HASH_FILES_AT_ONCE.key)? {
+        a.hash_files_at_once = HASH_FILES_AT_ONCE.check(n).with_context(|| format!("{FILE}: [agent]"))?;
+    }
     if let Some(q) = t.get("cap_hours") {
         let q = q.as_str().with_context(|| format!("{FILE}: cap_hours must be a string like \"09:00-18:00\""))?;
         if !q.is_empty() {
@@ -405,31 +577,41 @@ pub fn check_busy(b: &crate::busy::Settings) -> Result<()> {
 
 pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
     let n = |v: u64| value(i64::try_from(v).unwrap_or(i64::MAX));
-    save(
-        data_dir,
-        "agent",
-        "# How the background agent uses this PC. Caps in KiB/s, 0 = none.\n",
-        vec![
-            ("upload_kib_per_s", n(a.upload_kib)),
-            ("download_kib_per_s", n(a.download_kib)),
-            ("memory_profile", value(a.memory.as_str())),
-            ("background", value(a.background)),
-            ("pause_on_metered", value(a.pause_on_metered)),
-            ("pause_on_battery_saver", value(a.pause_on_battery_saver)),
-            ("pause_on_full_screen", value(a.pause_on_full_screen)),
-            ("pause_on_full_screen_video", value(a.pause_on_full_screen_video)),
-            ("quiet_hours", value(a.quiet_hours.as_deref().unwrap_or(""))),
-            ("cap_hours", value(a.cap_hours.as_deref().unwrap_or(""))),
-            ("tray_icon", value(a.tray_icon)),
-            ("track_apps", value(a.track_apps)),
-            ("hold_busy_files", value(a.busy.on)),
-            ("busy_changes", value(i64::from(a.busy.changes))),
-            ("busy_window_s", n(a.busy.window.as_secs())),
-            ("busy_quiet_s", n(a.busy.quiet.as_secs())),
-            ("busy_max_s", n(a.busy.max.as_secs())),
-            ("compact_database", value(a.compact_database)),
-        ],
-    )
+    let mut entries: Vec<(&str, Option<Item>)> = vec![
+        ("upload_kib_per_s", n(a.upload_kib)),
+        ("download_kib_per_s", n(a.download_kib)),
+        ("memory_profile", value(a.memory.as_str())),
+        ("background", value(a.background)),
+        ("pause_on_metered", value(a.pause_on_metered)),
+        ("pause_on_battery_saver", value(a.pause_on_battery_saver)),
+        ("pause_on_full_screen", value(a.pause_on_full_screen)),
+        ("pause_on_full_screen_video", value(a.pause_on_full_screen_video)),
+        ("quiet_hours", value(a.quiet_hours.as_deref().unwrap_or(""))),
+        ("cap_hours", value(a.cap_hours.as_deref().unwrap_or(""))),
+        ("tray_icon", value(a.tray_icon)),
+        ("track_apps", value(a.track_apps)),
+        ("hold_busy_files", value(a.busy.on)),
+        ("busy_changes", value(i64::from(a.busy.changes))),
+        ("busy_window_s", n(a.busy.window.as_secs())),
+        ("busy_quiet_s", n(a.busy.quiet.as_secs())),
+        ("busy_max_s", n(a.busy.max.as_secs())),
+        ("compact_database", value(a.compact_database)),
+        ("hash_files_at_once", value(i64::from(a.hash_files_at_once))),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, Some(v)))
+    .collect::<Vec<_>>();
+    // Unset: the memory profile's, so the key goes.
+    let o = &a.overrides;
+    for (key, v) in OVERRIDE_KEYS.into_iter().zip([
+        o.database_cache_mib,
+        o.operations_at_once,
+        o.large_uploads_at_once,
+        o.upload_fragment_mib,
+    ]) {
+        entries.push((key, v.map(|v| value(i64::from(v)))));
+    }
+    save_or_remove(data_dir, "agent", "# How the background agent uses this PC. Caps in KiB/s, 0 = none.\n", entries)
 }
 
 /// The `[space]` section: freeing up space by itself, with Files
@@ -747,6 +929,61 @@ mod tests {
             std::fs::write(path(&d), format!("[agent]\n{bad}\n")).unwrap();
             assert!(load_agent(&d).is_err(), "{bad}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The memory profile's numbers can be set one by one; what isn't set
+    /// stays the profile's, and setting one back to the profile's removes
+    /// its key.
+    #[test]
+    fn memory_overrides_and_hashing_round_trip_and_are_checked() {
+        let d = tmp("overrides");
+        let profile = Agent { memory: "minimal".into(), ..Agent::default() };
+        let mut a = profile.clone();
+        a.set_override("database_cache_mib", Some(200)).unwrap();
+        a.set_override("operations_at_once", Some(12)).unwrap();
+        a.set_override("upload_fragment_mib", Some(20)).unwrap();
+        a.hash_files_at_once = 3;
+        save_agent(&d, &a).unwrap();
+        let read = load_agent(&d).unwrap();
+        assert_eq!(read, a);
+        assert_eq!(read.cache_kib(), 200 * 1024);
+        assert_eq!(read.parallel(), oneup_exec::Parallel { ops: 12, large_uploads: 1, hashes: 3 });
+        assert_eq!(read.upload_memory().fragment, 20 << 20);
+        let tuned = read.tuned();
+        let row = |key: &str| *tuned.iter().find(|t| t.knob.key == key).unwrap();
+        assert_eq!((row("database_cache_mib").value, row("database_cache_mib").default), (200.0, 4.0));
+        assert_eq!((row("operations_at_once").set, row("large_uploads_at_once").set), (Some(12), None));
+        assert_eq!(row("upload_fragment_mib").default, 10.0, "minimal's 32 units of 320 KiB");
+        assert_eq!((row("hash_files_at_once").value, row("hash_files_at_once").set), (3.0, Some(3)));
+
+        // Back to the profile's: the key goes, the rest stays.
+        let mut back = read.clone();
+        back.set_override("database_cache_mib", None).unwrap();
+        save_agent(&d, &back).unwrap();
+        let text = std::fs::read_to_string(path(&d)).unwrap();
+        assert!(!text.contains("database_cache_mib") && text.contains("operations_at_once = 12"), "{text}");
+        assert_eq!(load_agent(&d).unwrap().cache_kib(), profile.cache_kib());
+        assert_eq!(Agent::default().parallel(), oneup_exec::Parallel::for_profile("balanced"));
+
+        for bad in [
+            "database_cache_mib = 0",
+            "database_cache_mib = 1025",
+            "operations_at_once = 33",
+            "large_uploads_at_once = 9",
+            "upload_fragment_mib = 1",
+            "upload_fragment_mib = 60",
+            "hash_files_at_once = 0",
+            "hash_files_at_once = 17",
+            "operations_at_once = -1",
+            "operations_at_once = \"8\"",
+        ] {
+            std::fs::write(path(&d), format!("[agent]\n{bad}\n")).unwrap();
+            let e = load_agent(&d).expect_err(bad);
+            let key = bad.split(' ').next().unwrap();
+            assert!(format!("{e:#}").contains(key), "{bad}: {e:#}");
+        }
+        assert!(Agent::default().set_override("memory_profile", Some(1)).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
