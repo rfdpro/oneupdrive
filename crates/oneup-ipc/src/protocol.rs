@@ -69,11 +69,24 @@ pub enum Call {
     Watch {
         since: u64,
     },
+    /// The events after `since` (an [`Event::seq`]), waiting for one (up to
+    /// [`crate::WATCH_MAX`]) if there are none yet; `None`: none, only where
+    /// the feed is now. Answered with [`Events`], not a status
+    /// ([`crate::Client::events`]).
+    Events {
+        since: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 struct WatchParams {
     since: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EventsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,6 +123,7 @@ impl Call {
             Call::SyncFirst { .. } => "sync_first",
             Call::Stop => "stop",
             Call::Watch { .. } => "watch",
+            Call::Events { .. } => "events",
         }
     }
 
@@ -123,6 +137,7 @@ impl Call {
             Call::Answer { code, answer } => serde_json::to_value(AnswerParams { code: code.clone(), answer: *answer }),
             Call::SyncFirst { path } => serde_json::to_value(PathParams { path: path.clone() }),
             Call::Watch { since } => serde_json::to_value(WatchParams { since: *since }),
+            Call::Events { since } => serde_json::to_value(EventsParams { since: *since }),
         };
         v.unwrap_or(Value::Null)
     }
@@ -142,6 +157,11 @@ impl Call {
             "watch" => {
                 let WatchParams { since } = p(params)?;
                 Call::Watch { since }
+            }
+            "events" => {
+                // No params at all reads as "from now".
+                let EventsParams { since } = if params.is_null() { EventsParams { since: None } } else { p(params)? };
+                Call::Events { since }
             }
             "pause" => {
                 let PauseParams { direction, minutes } = p(params)?;
@@ -383,6 +403,95 @@ pub struct Retrying {
     pub next_ms: i64,
 }
 
+/// What happened, for `oneup watch`, hooks and scripts
+/// (`docs/architecture/hooks.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// An item was uploaded, downloaded, made, moved, renamed or removed.
+    Synced,
+    /// Changed on both sides: both versions were kept.
+    Conflict,
+    /// An operation on an item failed.
+    Failure,
+    /// A safety stop tripped and waits for the user.
+    SafetyStop,
+    /// Sync paused (the user's pause or the agent's own), or resumed.
+    Paused,
+    Resumed,
+    /// A problem began, or cleared.
+    Problem,
+    Resolved,
+}
+
+impl EventKind {
+    pub const ALL: [EventKind; 8] = [
+        EventKind::Synced,
+        EventKind::Conflict,
+        EventKind::Failure,
+        EventKind::SafetyStop,
+        EventKind::Paused,
+        EventKind::Resumed,
+        EventKind::Problem,
+        EventKind::Resolved,
+    ];
+
+    /// As written in `config.toml` and shown (`safety_stop`).
+    pub fn name(self) -> &'static str {
+        match self {
+            EventKind::Synced => "synced",
+            EventKind::Conflict => "conflict",
+            EventKind::Failure => "failure",
+            EventKind::SafetyStop => "safety_stop",
+            EventKind::Paused => "paused",
+            EventKind::Resumed => "resumed",
+            EventKind::Problem => "problem",
+            EventKind::Resolved => "resolved",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// Whether events of this kind are about one item (and have a path).
+    pub fn has_path(self) -> bool {
+        matches!(self, EventKind::Synced | EventKind::Conflict | EventKind::Failure)
+    }
+}
+
+/// One thing that happened. Never file contents, tokens or approval codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// Goes up by one per event while the agent runs (from 1; a restarted
+    /// agent starts again).
+    pub seq: u64,
+    pub at_ms: i64,
+    pub kind: EventKind,
+    /// The item, relative to the synced folder (`/docs/a.txt`); empty for
+    /// events about sync itself.
+    #[serde(default)]
+    pub path: String,
+    /// What was done (`upload`, `download`, `move`, ...), for items.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action: String,
+    /// Why, or what else to know, in a few words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A page of events ([`Call::Events`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Events {
+    /// Pass as `since` for the next page.
+    pub next: u64,
+    /// Events after `since` were dropped before they were read (the agent
+    /// keeps the latest few thousand), or the agent restarted.
+    #[serde(default)]
+    pub missed: bool,
+    pub items: Vec<Event>,
+}
+
 // ------------------------------------------------------------- JSON-RPC
 
 pub const PARSE_ERROR: i64 = -32700;
@@ -417,11 +526,12 @@ pub(crate) struct Request {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Response {
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>"))]
+pub(crate) struct Response<T = Status> {
     pub jsonrpc: String,
     pub id: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Status>,
+    pub result: Option<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
 }
@@ -447,7 +557,7 @@ pub(crate) fn decode(line: &str) -> (Value, Result<Call, RpcError>) {
     (req.id, call)
 }
 
-pub(crate) fn reply(id: Value, outcome: Result<Status, RpcError>) -> Response {
+pub(crate) fn reply<T>(id: Value, outcome: Result<T, RpcError>) -> Response<T> {
     let (result, error) = match outcome {
         Ok(s) => (Some(s), None),
         Err(e) => (None, Some(e)),
@@ -493,6 +603,8 @@ mod tests {
             Call::SyncFirst { path: "docs/a b.txt".into() },
             Call::Stop,
             Call::Watch { since: 42 },
+            Call::Events { since: Some(7) },
+            Call::Events { since: None },
             Call::Pause { direction: Direction::Both, minutes: Some(120) },
             Call::Pause { direction: Direction::Local, minutes: None },
             Call::Resume { direction: Direction::Remote },

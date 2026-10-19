@@ -26,8 +26,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub use protocol::{
-    Activity, Answer, Call, Direction, INVALID_PARAMS, INVALID_REQUEST, LastRun, METHOD_NOT_FOUND, NO_SUCH_BATCH,
-    Overflow, PARSE_ERROR, PauseState, Problem, Progress, PruneOffer, Retrying, RpcError, SafetyStop, Status, Unsynced,
+    Activity, Answer, Call, Direction, Event, EventKind, Events, INVALID_PARAMS, INVALID_REQUEST, LastRun,
+    METHOD_NOT_FOUND, NO_SUCH_BATCH, Overflow, PARSE_ERROR, PauseState, Problem, Progress, PruneOffer, Retrying,
+    RpcError, SafetyStop, Status, Unsynced,
 };
 
 /// In the data folder: the name of the running agent's pipe.
@@ -56,6 +57,29 @@ pub trait Handler: Send + Sync + 'static {
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         None
     }
+
+    /// Answers [`Call::Events`] at once (after [`serve`] waited for one);
+    /// the page must fit in a [`MAX_LINE`] reply. By default the agent has
+    /// no events.
+    fn events(&self, since: Option<u64>) -> Result<Events, RpcError> {
+        let _ = since;
+        Err(RpcError::new(METHOD_NOT_FOUND, "this agent has no events"))
+    }
+
+    /// The newest event's [`Event::seq`], updated with each new one.
+    fn event_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+}
+
+/// Answers a [`Call::Events`]: once there is an event after `since`, or
+/// after [`WATCH_MAX`]; at once for `None`.
+async fn events(handler: &dyn Handler, since: Option<u64>) -> Result<Events, RpcError> {
+    if let (Some(since), Some(mut rx)) = (since, handler.event_changes()) {
+        // A closed channel (the agent stopping) answers at once.
+        let _ = tokio::time::timeout(WATCH_MAX, rx.wait_for(|n| *n != since)).await;
+    }
+    handler.events(since)
 }
 
 /// Answers a [`Call::Watch`]: once the revision isn't `since` any more, or
@@ -103,11 +127,12 @@ pub async fn serve<S: AsyncRead + AsyncWrite + Unpin>(stream: S, handler: &dyn H
         if let Ok(c) = &call {
             tracing::debug!(method = c.method(), "control call");
         }
-        let outcome = match call {
-            Ok(Call::Watch { since }) => watch(handler, since).await,
-            other => other.and_then(|c| handler.handle(c)),
+        let out = match call {
+            Ok(Call::Events { since }) => serde_json::to_vec(&protocol::reply(id, events(handler, since).await)),
+            Ok(Call::Watch { since }) => serde_json::to_vec(&protocol::reply(id, watch(handler, since).await)),
+            other => serde_json::to_vec(&protocol::reply(id, other.and_then(|c| handler.handle(c)))),
         };
-        let mut out = serde_json::to_vec(&protocol::reply(id, outcome)).map_err(std::io::Error::other)?;
+        let mut out = out.map_err(std::io::Error::other)?;
         out.push(b'\n');
         w.write_all(&out).await?;
         w.flush().await?;
@@ -143,8 +168,22 @@ impl<S: AsyncRead + AsyncWrite> Client<S> {
         Self { r: BufReader::new(r), w, next: 1 }
     }
 
-    /// Makes a call and returns the agent's status after it.
+    /// Makes a call and returns the agent's status after it. Not for
+    /// [`Call::Events`] ([`Client::events`]).
     pub async fn call(&mut self, call: &Call) -> Result<Status, ClientError> {
+        if matches!(call, Call::Events { .. }) {
+            return Err(ClientError::Protocol("events are read with Client::events".into()));
+        }
+        self.request(call).await
+    }
+
+    /// The events after `since` (waiting for one, up to [`WATCH_MAX`]);
+    /// `None`: where the feed is now, without waiting.
+    pub async fn events(&mut self, since: Option<u64>) -> Result<Events, ClientError> {
+        self.request(&Call::Events { since }).await
+    }
+
+    async fn request<T: serde::de::DeserializeOwned>(&mut self, call: &Call) -> Result<T, ClientError> {
         let id = self.next;
         self.next += 1;
         let mut line = serde_json::to_vec(&protocol::request(id, call)).map_err(std::io::Error::other)?;
@@ -152,7 +191,10 @@ impl<S: AsyncRead + AsyncWrite> Client<S> {
         self.w.write_all(&line).await?;
         self.w.flush().await?;
         let mut buf = Vec::new();
-        let wait = if matches!(call, Call::Watch { .. }) { WATCH_MAX + REPLY_TIMEOUT } else { REPLY_TIMEOUT };
+        let wait = match call {
+            Call::Watch { .. } | Call::Events { .. } => WATCH_MAX + REPLY_TIMEOUT,
+            _ => REPLY_TIMEOUT,
+        };
         match tokio::time::timeout(wait, read_line(&mut self.r, &mut buf)).await {
             Err(_) => return Err(ClientError::Timeout),
             Ok(Ok(false)) => return Err(ClientError::Protocol("the connection closed".into())),
@@ -160,7 +202,7 @@ impl<S: AsyncRead + AsyncWrite> Client<S> {
                 r?;
             }
         }
-        let resp: protocol::Response =
+        let resp: protocol::Response<T> =
             serde_json::from_slice(&buf).map_err(|e| ClientError::Protocol(e.to_string()))?;
         if resp.id != id {
             return Err(ClientError::Protocol("reply to another call".into()));
@@ -401,6 +443,85 @@ mod tests {
         assert!(matches!(e, ClientError::Rpc(RpcError { code: METHOD_NOT_FOUND, .. })), "{e}");
         drop(c);
         server.await.unwrap().unwrap();
+    }
+
+    /// A handler with an event feed the test adds to.
+    struct Feed(Mutex<Vec<Event>>, tokio::sync::watch::Sender<u64>);
+
+    impl Handler for Feed {
+        fn handle(&self, _: Call) -> Result<Status, RpcError> {
+            Ok(status(PauseState::default()))
+        }
+        fn events(&self, since: Option<u64>) -> Result<Events, RpcError> {
+            let all = self.0.lock().unwrap();
+            let next = all.last().map_or(0, |e| e.seq);
+            let items = match since {
+                None => Vec::new(),
+                Some(s) => all.iter().filter(|e| e.seq > s).cloned().collect(),
+            };
+            Ok(Events { next, missed: false, items })
+        }
+        fn event_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.1.subscribe())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn events_are_read_from_where_the_client_was_and_waited_for() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let h = std::sync::Arc::new(Feed(Mutex::new(Vec::new()), tokio::sync::watch::Sender::new(0)));
+        let server = {
+            let h = std::sync::Arc::clone(&h);
+            tokio::spawn(async move { serve(b, h.as_ref()).await })
+        };
+        let mut c = Client::new(a);
+        // From now: at once, and nothing.
+        let first = c.events(None).await.unwrap();
+        assert_eq!((first.next, first.items.len()), (0, 0));
+        let add = {
+            let h = std::sync::Arc::clone(&h);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                h.0.lock().unwrap().push(Event {
+                    seq: 1,
+                    at_ms: 5,
+                    kind: EventKind::Synced,
+                    path: "/a.txt".into(),
+                    action: "upload".into(),
+                    detail: String::new(),
+                });
+                h.1.send_replace(1);
+            })
+        };
+        let t = tokio::time::Instant::now();
+        let page = c.events(Some(first.next)).await.unwrap();
+        assert_eq!(t.elapsed().as_secs(), 3, "waited for the event");
+        assert_eq!((page.next, page.items[0].path.as_str()), (1, "/a.txt"));
+        add.await.unwrap();
+        // The status call can't be used for events, nor the reverse.
+        assert!(matches!(c.call(&Call::Events { since: None }).await, Err(ClientError::Protocol(_))));
+        assert_eq!(c.call(&Call::Status).await.unwrap().version, "test");
+        drop(c);
+        server.await.unwrap().unwrap();
+        // An agent without events says so.
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let fake = Fake(Mutex::new(PauseState::default()));
+        let server = tokio::spawn(async move { serve(b, &fake).await });
+        let mut c = Client::new(a);
+        let e = c.events(Some(0)).await.unwrap_err();
+        assert!(matches!(e, ClientError::Rpc(RpcError { code: METHOD_NOT_FOUND, .. })), "{e}");
+        drop(c);
+        server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn event_kinds_have_one_name_each() {
+        for k in EventKind::ALL {
+            assert_eq!(EventKind::from_name(k.name()), Some(k));
+            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::Value::from(k.name()));
+        }
+        assert_eq!(EventKind::from_name(" Safety_Stop "), Some(EventKind::SafetyStop));
+        assert_eq!(EventKind::from_name("deleted"), None);
     }
 
     #[tokio::test]
