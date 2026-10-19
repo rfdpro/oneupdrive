@@ -27,6 +27,9 @@ These come from experiments with the Windows Cloud Files API that reproduced rea
 15. **A Files On-Demand folder that stops being ours halts.** If OneUpDrive's sync-root registration disappears without OneUpDrive removing it (another program unregistered the folder), Windows will have removed the online-only placeholders. The folder then fails its identity check, so those removals are never sent to OneDrive as deletions.
 16. **Another program's sync root is released only through the gate.** Finishing a stalled unlinking of the OneDrive app (`oneup migrate finish-unlink`) unregisters the app's root, which removes its online-only placeholders. It runs only with the gate's `release` token: a fresh scan and listing show every online-only item in OneDrive, the app is stopped and has removed its account, its choices are recorded, and the person agreed. The effect re-checks the registration and the app's processes immediately before acting.
 
+### Hooks
+17. **A change in the cloud never becomes code that runs.** A hook's program, and any file its literal arguments name, must be outside every folder OneUpDrive syncs (every data folder's pairs and vaults) and every folder another sync app registered or manages, compared as written and with links followed, case-insensitively. It's checked when the hooks load and again immediately before each start. Programs that read their arguments as commands (`cmd.exe`, batch files, PowerShell without `-File`) never get names from the cloud. Hooks are separate programs started contained, and change nothing through OneUpDrive: their file changes are ordinary changes, like any program's ([hooks.md](hooks.md)).
+
 ## Recovery
 
 A bounded, configurable local version store (`oneup versions`, `oneup restore`), the activity log (`oneup activity`), plus OneDrive's own version history and recycle bin.
