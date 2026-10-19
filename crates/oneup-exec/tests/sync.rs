@@ -974,23 +974,27 @@ impl Sync {
         let all = fingerprint != self.planned_rules || std::mem::take(&mut self.stops.full_next);
         let rules = &self.rules;
         let pull = self.pull;
-        let (scope, mut ops, pending) = store
+        let (scope, ops, pending, paths, pending_paths) = store
             .read(|o| {
                 let scope = o.dirty_scope()?;
                 let folders = if all { all_folders(&Parked::with_rules(o, rules))? } else { scope.folders.clone() };
-                let ops = plan_in(o, rules, pull, folders)?;
+                let mut ops = plan_in(o, rules, pull, folders)?;
+                // What a folder holds, unfiltered, as `oneup_app::sync` reads it.
                 let pending =
-                    oneup_sync::pending_deletes(&Parked::with_rules(o, rules), &ops, oneup_sync::Flow::TwoWay)?;
-                Ok((scope, ops, pending))
+                    oneup_sync::pending_deletes(&Parked::with_rules(o, rules), o, &ops, oneup_sync::Flow::TwoWay)?;
+                ops.extend(extra);
+                let (paths, pending_paths) = (shown_paths(o, &ops)?, shown_paths(o, &pending)?);
+                Ok((scope, ops, pending, paths, pending_paths))
             })
             .unwrap();
-        ops.extend(extra);
         let cx = Context {
             room: self.room,
             decisions: &self.decisions,
             recent: self.stops.window.unwrap_or_default(),
             approved: &self.stops.approved,
             pending: &pending,
+            paths: &paths,
+            pending_paths: &pending_paths,
             ..Context::default()
         };
         let r = review_in(&self.policy, &cx, ops);
@@ -2807,6 +2811,20 @@ async fn everyday_deleting_a_folder_tree_here_deletes_it_in_onedrive_recoverably
     }
 }
 
+/// The paths a stop's list shows for deletions, as `oneup_app::sync` keys
+/// them: where the item is now on the side it's deleted from.
+fn shown_paths(o: &oneup_store::Ops<'_>, ops: &[Op]) -> oneup_store::Result<Vec<String>> {
+    ops.iter()
+        .map(|op| {
+            Ok(match op {
+                Op::DeleteRemote { remote, .. } => o.path_of(&remote.id.0)?.unwrap_or_default(),
+                Op::RecycleLocal { local, .. } => o.local_path_of(local.id.0)?.unwrap_or_default(),
+                _ => String::new(),
+            })
+        })
+        .collect()
+}
+
 /// Small limits, so a few deletions trip a safety stop.
 fn strict() -> Policy {
     Policy { max_count: 5, min_count: 2, ..Policy::default() }
@@ -2876,6 +2894,65 @@ async fn everyday_an_emptied_folder_tree_takes_one_safety_stop() {
     for c in [&b"a"[..], b"b", b"c", b"d"] {
         assert!(cloud.holds(c), "OneDrive's recycle bin keeps {}", String::from_utf8_lossy(c));
     }
+}
+
+/// A stop's list names each item where it was shown. A folder above the
+/// items moved in OneDrive between `status` and `approve`: the same items,
+/// now elsewhere, aren't what was approved, and need a stop of their own.
+#[tokio::test]
+async fn everyday_an_approval_doesnt_follow_items_moved_elsewhere() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-stop-moved", cloud.clone());
+    for f in ["1", "2", "3"] {
+        write(&s.p(&format!("old/{f}.txt")), f.as_bytes());
+    }
+    s.settle().await;
+    s.policy = strict();
+    s.stops.allowed = true;
+
+    for f in ["1", "2", "3"] {
+        std::fs::remove_file(s.p(&format!("old/{f}.txt"))).unwrap();
+    }
+    wait_for_journal(&mut s, 3);
+    s.attempt().await;
+    assert_eq!(s.stops.raised[0].count, 3);
+    let shown = s.stops.raised[0].fingerprint;
+
+    cloud.rename("old", "critical");
+    s.stops.approve();
+    let r = s.attempt().await;
+    assert!(r.done.is_empty(), "{r:?}");
+    assert_eq!(s.stops.raised.len(), 1, "a stop of their own");
+    assert_ne!(s.stops.raised[0].fingerprint, shown);
+    assert!(cloud.tree().contains_key("/critical/1.txt"));
+}
+
+/// A folder deleted in OneDrive that still holds a file here which never
+/// syncs (an Office lock file) isn't listed as emptied, and removing it is
+/// refused while the file is there: nothing in it is recycled.
+#[tokio::test]
+async fn everyday_a_folder_holding_a_parked_file_isnt_listed_or_emptied() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-stop-parked", cloud.clone());
+    for f in ["1", "2", "3"] {
+        write(&s.p(&format!("old/{f}.txt")), f.as_bytes());
+    }
+    write(&s.p("old/~$draft.docx"), b"office lock");
+    s.settle().await;
+    s.policy = strict();
+    s.stops.allowed = true;
+
+    cloud.delete("old");
+    s.attempt().await;
+    let b = &s.stops.raised[0];
+    assert_eq!((b.side, b.count), (Side::Local, 3), "{b:?}");
+    assert!(b.later.is_empty(), "the folder isn't emptied: {:?}", b.later);
+    s.stops.approve();
+    for _ in 0..4 {
+        s.attempt().await;
+    }
+    assert!(s.p("old/~$draft.docx").exists(), "kept where it was");
+    assert!(!s.p("old/1.txt").exists());
 }
 
 /// A safety stop raised by a full pass (the agent's first round), for

@@ -245,6 +245,15 @@ impl Control {
         }
     }
 
+    /// Drops approval codes the rounds have used: each approves its list
+    /// once (`sync::Engine::spent_answers`).
+    pub fn forget_approvals(&self, codes: &[u64]) {
+        if codes.is_empty() {
+            return;
+        }
+        self.lock().answers.approve.retain(|c| !codes.contains(c));
+    }
+
     /// The paths asked to go first have been dealt with (a round settled).
     pub fn clear_first(&self) {
         self.lock().first.clear();
@@ -708,6 +717,9 @@ mod tests {
         let s = answer("00000000000000AB", Answer::Approve).unwrap();
         assert_eq!((s.checked_ms, s.last.unwrap().done), (Some(9), 3));
         assert_eq!(c.controls().answers.approve, vec![0xab]);
+        // Once the rounds used it, it approves nothing more.
+        c.forget_approvals(&[0xab]);
+        assert!(c.controls().answers.approve.is_empty());
         // Answered: no longer waiting, though the rounds carrying it out
         // haven't ended (nor when one under way trips it once more).
         assert!(s.safety_stops.is_empty());

@@ -881,7 +881,7 @@ fn round_flow(w: &mut World, rng: Option<&mut Rng>, debug: bool, flow: Flow) -> 
     }
     // Folders a safety stop lists to delete later are deleted with evidence
     // on that side, and are folders (`pending_deletes`).
-    for op in oneup_sync::pending_deletes(&snap, &ops, flow).unwrap_or_default() {
+    for op in oneup_sync::pending_deletes(&snap, &snap, &ops, flow).unwrap_or_default() {
         let (sid, gone) = match &op {
             Op::DeleteRemote { sid, .. } => {
                 (*sid, snap.bases[sid].local.is_none_or(|l| snap.local_gone.contains(&l.0)))
