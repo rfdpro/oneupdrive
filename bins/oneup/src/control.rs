@@ -382,7 +382,11 @@ impl Control {
         // Kept while the agent still reports them: a round already under
         // way when the answer came can trip the same stop once more.
         s.prune_offer = offer;
-        let Shared { answered, stops, overflow, prune_offer, .. } = &mut *s;
+        let Shared { answered, stops, overflow, prune_offer, answers, .. } = &mut *s;
+        // An approval answers the stop it was given for while that stands:
+        // one the rounds didn't take in (the list changed meanwhile) isn't
+        // kept for an identical list some later raising shows.
+        answers.approve.retain(|f| stops.iter().any(|st| st.code == code(*f)));
         answered.retain(|c| {
             stops.iter().any(|st| &st.code == c)
                 || overflow.as_ref().is_some_and(|o| o.waiting && &o.code == c)
@@ -739,7 +743,14 @@ mod tests {
         assert_eq!(c.record(10, last(), &[], Some(&done), None), rec(false, true));
         assert_eq!(answer("00000000000000cd", Answer::Keep).unwrap_err().code, NO_SUCH_BATCH);
         // The same stop tripping again later is a new question.
-        assert_eq!(c.record(11, None, &[breaker], None, None), rec(true, false));
+        assert_eq!(c.record(11, None, std::slice::from_ref(&breaker), None, None), rec(true, false));
         assert_eq!(c.snapshot().safety_stops.len(), 1);
+        // An approval the rounds never took in goes once its stop no longer
+        // stands: it doesn't approve an identical list raised later.
+        answer("00000000000000AB", Answer::Approve).unwrap();
+        c.record(12, None, std::slice::from_ref(&breaker), None, None);
+        assert_eq!(c.controls().answers.approve, vec![0xab], "kept while it stands");
+        c.record(13, None, &[], None, None);
+        assert!(c.controls().answers.approve.is_empty(), "dropped once it no longer stands");
     }
 }

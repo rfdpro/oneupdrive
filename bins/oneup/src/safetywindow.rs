@@ -4,76 +4,94 @@
 //!
 //! Kept in the state store (`meta` [`KEY`]), so restarting the agent, or
 //! the PC, doesn't reset what the stops count: a mass deletion trickling in
-//! would otherwise get a fresh allowance after every restart. Bounded: what
-//! is older than [`WINDOW_MS`] is dropped, and at most [`MAX_ENTRIES`] are
-//! kept (the oldest merge into the next, which only keeps their counts a
-//! little longer).
+//! would otherwise get a fresh allowance after every restart. Counts are
+//! kept per minute ([`BUCKET_MS`]): a minute's counts go once the last
+//! moment of that minute is [`WINDOW_MS`] old, so nothing is forgotten
+//! early, nothing lasts more than a minute longer, and at most 16 minutes
+//! are kept however busy the agent is. A minute later than now (the clock
+//! was set back) is counted as now's, on every look.
 //!
 //! Never lower than what ran: the agent records each round's count before
 //! the round runs (`oneup_app::sync::Keep`), and a saved window it can't
 //! read counts as full for [`WINDOW_MS`] ([`UNREADABLE`]), so every
 //! deletion, overwrite or move waits for approval meanwhile.
 
-use std::collections::VecDeque;
+use std::collections::BTreeMap;
 
 use oneup_gate::Recent;
 use oneup_store::Store;
 
 /// How far back the safety stops look.
 pub const WINDOW_MS: i64 = 15 * 60 * 1000;
-/// Entries kept at most (one per sequence of rounds that changed anything).
-pub const MAX_ENTRIES: usize = 64;
-/// In `meta`: `at_ms,local,remote,suspicious` per entry, `;` between them.
+/// The window's counts are kept per this long.
+pub const BUCKET_MS: i64 = 60 * 1000;
+/// In `meta`: `minute_ms,local,remote,suspicious` per minute, `;` between.
 pub const KEY: &str = "safety.window";
 /// What each count of a window that can't be read is taken to be: more
-/// than any limit, so the stops trip on anything.
+/// than any limit, so the stops trip on anything. Also the most a count
+/// is kept as; a saved count above it can't be ours, so it's unreadable.
 pub const UNREADABLE: usize = 1_000_000_000;
 
-/// Mass-sensitive operations carried out recently, by when (Unix ms).
+/// Mass-sensitive operations carried out recently, by the minute they were
+/// carried out in (its start, Unix ms).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SafetyWindow {
-    done: VecDeque<(i64, Recent)>,
+    done: BTreeMap<i64, Recent>,
+}
+
+/// The start of the minute `ms` is in.
+fn bucket(ms: i64) -> i64 {
+    ms.div_euclid(BUCKET_MS) * BUCKET_MS
+}
+
+/// Counts as kept: never above [`UNREADABLE`].
+fn capped(r: Recent) -> Recent {
+    Recent {
+        local: r.local.min(UNREADABLE),
+        remote: r.remote.min(UNREADABLE),
+        suspicious: r.suspicious.min(UNREADABLE),
+    }
 }
 
 impl SafetyWindow {
     /// The window as saved, at `now_ms`, and whether it could be read.
     /// None saved (never, or nothing in the last 15 minutes) is an empty
     /// window. One that can't be read in full counts as full from now on
-    /// ([`UNREADABLE`]), never as less than it held. An entry stamped later
-    /// than `now_ms` (the clock was set back) counts as just done, so it
-    /// neither expires early nor lasts forever.
+    /// ([`UNREADABLE`]), never as less than it held: anything but minutes
+    /// exactly as [`save`](Self::save) writes them, or a count above
+    /// [`UNREADABLE`].
     pub fn load(store: &Store, now_ms: i64) -> oneup_store::Result<(Self, bool)> {
         let Some(saved) = store.read(|o| o.meta_get(KEY))? else { return Ok((Self::default(), true)) };
         let parsed: Option<Vec<(i64, Recent)>> =
             if saved.is_empty() { Some(Vec::new()) } else { saved.split(';').map(parse).collect() };
-        let Some(mut done) = parsed else {
+        let mut w = Self::default();
+        let Some(done) = parsed else {
             let full = Recent { local: UNREADABLE, remote: UNREADABLE, suspicious: UNREADABLE };
-            return Ok((Self { done: [(now_ms, full)].into() }, false));
+            w.add(full, now_ms);
+            return Ok((w, false));
         };
-        for (at, _) in &mut done {
-            *at = (*at).min(now_ms);
+        for (at, r) in done {
+            let e = w.done.entry(bucket(at)).or_default();
+            *e = capped(e.plus(r));
         }
-        done.sort_by_key(|(at, _)| *at);
-        let mut w = Self { done: done.into() };
         w.trim(now_ms);
         Ok((w, true))
     }
 
-    /// Adds what a sequence of rounds carried out at `now_ms`.
+    /// Adds what was carried out at `now_ms`.
     pub fn add(&mut self, r: Recent, now_ms: i64) {
-        if r.local + r.remote + r.suspicious == 0 {
+        self.trim(now_ms);
+        if r == Recent::default() {
             return;
         }
-        // Kept in time order, whatever the clock did meanwhile.
-        let at = self.done.back().map_or(now_ms, |(last, _)| now_ms.max(*last));
-        self.done.push_back((at, r));
-        self.trim(now_ms);
+        let e = self.done.entry(bucket(now_ms)).or_default();
+        *e = capped(e.plus(r));
     }
 
     /// What the window holds at `now_ms`.
     pub fn recent(&mut self, now_ms: i64) -> Recent {
         self.trim(now_ms);
-        self.done.iter().fold(Recent::default(), |a, (_, r)| a.plus(*r))
+        self.done.values().fold(Recent::default(), |a, r| a.plus(*r))
     }
 
     /// Saves the window with `extra` added at `now_ms` (a sequence of
@@ -96,23 +114,26 @@ impl SafetyWindow {
         store.write(|o| if text.is_empty() { o.meta_delete(KEY) } else { o.meta_set(KEY, &text) })
     }
 
+    /// Minutes later than now's (the clock was set back) count as now's;
+    /// a minute goes once its last moment is [`WINDOW_MS`] old.
     fn trim(&mut self, now_ms: i64) {
-        while self.done.front().is_some_and(|(at, _)| now_ms.saturating_sub(*at) > WINDOW_MS) {
-            self.done.pop_front();
-        }
-        while self.done.len() > MAX_ENTRIES {
-            if let (Some((_, a)), Some((_, b))) = (self.done.pop_front(), self.done.front_mut()) {
-                *b = a.plus(*b);
+        let now = bucket(now_ms);
+        let future: Vec<i64> = self.done.range(now.saturating_add(1)..).map(|(at, _)| *at).collect();
+        for at in future {
+            if let Some(r) = self.done.remove(&at) {
+                let e = self.done.entry(now).or_default();
+                *e = capped(e.plus(r));
             }
         }
+        self.done.retain(|at, _| now_ms < at.saturating_add(BUCKET_MS).saturating_add(WINDOW_MS));
     }
 }
 
-/// One entry exactly as [`SafetyWindow::save`] writes it.
+/// One minute exactly as [`SafetyWindow::save`] writes it.
 fn parse(entry: &str) -> Option<(i64, Recent)> {
     let f: Vec<&str> = entry.split(',').collect();
     let [at, local, remote, suspicious] = f.as_slice() else { return None };
-    let n = |s: &str| s.parse::<usize>().ok();
+    let n = |s: &str| s.parse::<usize>().ok().filter(|n| *n <= UNREADABLE);
     Some((at.parse().ok()?, Recent { local: n(local)?, remote: n(remote)?, suspicious: n(suspicious)? }))
 }
 
@@ -137,7 +158,8 @@ mod tests {
         w.add(r(5, 2, 1), 2 * MIN);
         assert_eq!(w.recent(3 * MIN), r(195, 2, 1));
         assert_eq!(w.done.len(), 2, "nothing done, nothing kept");
-        assert_eq!(w.recent(16 * MIN), r(5, 2, 1), "the first is over 15 minutes old");
+        assert_eq!(w.recent(15 * MIN), r(195, 2, 1), "never early");
+        assert_eq!(w.recent(16 * MIN), r(5, 2, 1), "the first minute is over 15 minutes old");
         assert_eq!(w.recent(18 * MIN), Recent::default());
     }
 
@@ -161,9 +183,9 @@ mod tests {
         let store = Store::open(&db, 1024).unwrap();
         let mut w = SafetyWindow::load(&store, t0 + 5 * MIN).unwrap().0;
         assert_eq!(w.recent(t0 + 5 * MIN), r(150, 40, 12));
-        // Still only for 15 minutes.
-        let mut w2 = SafetyWindow::load(&store, t0 + 15 * MIN + 1).unwrap().0;
-        assert_eq!(w2.recent(t0 + 15 * MIN + 1), r(0, 40, 12));
+        // Still only for 15 minutes (counted by the minute: up to 16).
+        let mut w2 = SafetyWindow::load(&store, t0 + 16 * MIN + 1).unwrap().0;
+        assert_eq!(w2.recent(t0 + 16 * MIN + 1), r(0, 40, 12));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -174,8 +196,35 @@ mod tests {
         for i in 0..1000 {
             w.add(r(1, 0, 0), i);
         }
-        assert_eq!(w.done.len(), MAX_ENTRIES);
-        assert_eq!(w.recent(1000), r(1000, 0, 0), "merged, not dropped");
+        assert_eq!(w.done.len(), 1, "one minute");
+        assert_eq!(w.recent(1000), r(1000, 0, 0));
+    }
+
+    /// Steady activity for longer than the window: what it counts is the
+    /// last 15 to 16 minutes, never more, however long it goes on.
+    #[test]
+    fn steady_activity_is_counted_for_15_minutes_only() {
+        let mut w = SafetyWindow::default();
+        let end = 30 * MIN;
+        for t in (0..end).step_by(10_000) {
+            w.add(r(1, 0, 0), t);
+        }
+        let now = end - 10_000;
+        let n = w.recent(now).local;
+        assert!((90..=96).contains(&n), "{n}");
+        assert!(w.done.len() <= 17);
+    }
+
+    /// The clock set back while the agent runs: what was stamped later is
+    /// counted as now's, and goes 15 minutes from now, not from then.
+    #[test]
+    fn a_clock_set_back_while_running_doesnt_stretch_the_window() {
+        let mut w = SafetyWindow::default();
+        let (ten, nine) = (10 * 60 * MIN, 9 * 60 * MIN);
+        w.add(r(100, 0, 0), ten);
+        w.add(r(1, 0, 0), nine);
+        assert_eq!(w.recent(nine), r(101, 0, 0));
+        assert_eq!(w.recent(nine + 16 * MIN), Recent::default());
     }
 
     #[test]
@@ -198,7 +247,16 @@ mod tests {
     fn an_unreadable_window_counts_as_full() {
         let mut store = Store::open_in_memory().unwrap();
         let full = r(UNREADABLE, UNREADABLE, UNREADABLE);
-        for bad in ["garbage;5,1,2,3", "5,1,2,3;7,x,1,1", "5,1,2", "5,1,2,3,4", "5,-1,2,3", " 5,1,2,3"] {
+        for bad in [
+            "garbage;5,1,2,3",
+            "5,1,2,3;7,x,1,1",
+            "5,1,2",
+            "5,1,2,3,4",
+            "5,-1,2,3",
+            " 5,1,2,3",
+            "5,18446744073709551615,0,0",
+            "5,1000000001,0,0",
+        ] {
             store.write(|o| o.meta_set(KEY, bad)).unwrap();
             let (mut w, readable) = SafetyWindow::load(&store, 10).unwrap();
             assert!(!readable, "{bad}");
@@ -216,7 +274,11 @@ mod tests {
             let (mut again, readable) = SafetyWindow::load(&store, 10 + MIN).unwrap();
             assert!(readable);
             assert_eq!(again.recent(10 + MIN), full, "still full after a restart");
-            assert_eq!(again.recent(10 + 16 * MIN), Recent::default(), "for 15 minutes");
+            assert_eq!(again.recent(16 * MIN), Recent::default(), "for 15 minutes");
+            // More on top of a full window stays readable.
+            again.add(full, 10 + 2 * MIN);
+            again.save(&mut store).unwrap();
+            assert!(SafetyWindow::load(&store, 10 + 2 * MIN).unwrap().1);
         }
         // Saved by this version, read back the same.
         let mut w = SafetyWindow::default();

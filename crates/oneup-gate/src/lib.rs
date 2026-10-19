@@ -303,11 +303,29 @@ impl Recent {
         }
     }
 
+    /// Both added up (never wrapping: a count at its limit stays there).
     pub fn plus(self, o: Recent) -> Recent {
         Recent {
-            local: self.local + o.local,
-            remote: self.remote + o.remote,
-            suspicious: self.suspicious + o.suspicious,
+            local: self.local.saturating_add(o.local),
+            remote: self.remote.saturating_add(o.remote),
+            suspicious: self.suspicious.saturating_add(o.suspicious),
+        }
+    }
+
+    /// Adds `op` as carried out: its weight ([`weight`]) on the side it
+    /// changes if it's mass-sensitive, and one suspicious upload if it's in
+    /// `suspicious`. Every count the safety window keeps goes through this,
+    /// so a pruned folder counts as everything in it.
+    pub fn add_op(&mut self, op: &Op, suspicious: &[LocalId]) {
+        if is_mass_sensitive(op) {
+            match Side::changed_by(op) {
+                Some(Side::Local) => self.local = self.local.saturating_add(weight(op)),
+                Some(Side::Remote) => self.remote = self.remote.saturating_add(weight(op)),
+                None => {}
+            }
+        }
+        if is_suspicious(op, suspicious) {
+            self.suspicious = self.suspicious.saturating_add(1);
         }
     }
 }
@@ -383,6 +401,16 @@ pub struct Review {
     /// ([`Context::approvals`]): they run, and the caller keeps their items
     /// approved for the rounds that follow (the folders they empty).
     pub answered: Vec<Breaker>,
+    /// For each of [`breakers`](Self::breakers), the operations on its list
+    /// this round, as places in [`withheld`](Self::withheld): what its list
+    /// shows, exactly the operations its items key (with
+    /// [`Breaker::later`]).
+    pub lists: Vec<Vec<usize>>,
+    /// The round's operations on lists the user approved (before, or by
+    /// code now), withheld or not, with the keys they matched: the caller
+    /// keeps those keys approved while such an operation waits (a file that
+    /// keeps changing, a pause), and lets them go once it ran.
+    pub listed: Vec<(Op, Vec<ItemKey>)>,
     pub overflow: Option<Overflow>,
     /// Bytes the approved operations will move into the version store (the
     /// files whose old copy is kept), so the caller can make room first.
@@ -450,13 +478,32 @@ pub fn review(policy: &Policy, synced_items: u64, approvals: &[Approval], ops: V
 pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     let mut out = Review::default();
     let mut breakers = Vec::new();
-    let listed = |kind, (op, path): Item<'_>| is_listed(kind, op, path, cx.approved);
+    // Each tripped list's operations, by their place in `ops`.
+    let mut lists: Vec<Vec<usize>> = Vec::new();
+    // Each operation's keys on lists approved before or answered now.
+    let mut on_lists: Vec<Vec<ItemKey>> = vec![Vec::new(); ops.len()];
     let path = |i: usize| cx.paths.get(i).map_or("", String::as_str);
-    let items: Vec<Item<'_>> = ops.iter().enumerate().map(|(i, o)| (o, path(i))).collect();
-    let pending: Vec<Item<'_>> =
-        cx.pending.iter().enumerate().map(|(i, o)| (o, cx.pending_paths.get(i).map_or("", String::as_str))).collect();
+    let items: Vec<Item<'_>> = ops.iter().enumerate().map(|(i, o)| (i, o, path(i))).collect();
+    let pending: Vec<Item<'_>> = cx
+        .pending
+        .iter()
+        .enumerate()
+        .map(|(i, o)| (i, o, cx.pending_paths.get(i).map_or("", String::as_str)))
+        .collect();
+    let listed = |kind, (_, op, path): Item<'_>| is_listed(kind, op, path, cx.approved);
+    for (i, op, p) in items.iter().copied() {
+        for kind in [BreakerKind::Mass, BreakerKind::Suspicious] {
+            let relevant = match kind {
+                BreakerKind::Mass => is_mass_sensitive(op),
+                BreakerKind::Suspicious => is_suspicious(op, cx.suspicious),
+            };
+            if relevant && let Some(k) = listed_key(kind, op, p, cx.approved) {
+                on_lists[i].push(k);
+            }
+        }
+    }
     for side in [Side::Local, Side::Remote] {
-        let on_side = |(o, _): &Item<'_>| Side::changed_by(o) == Some(side) && is_mass_sensitive(o);
+        let on_side = |(_, o, _): &Item<'_>| Side::changed_by(o) == Some(side) && is_mass_sensitive(o);
         let batch: Vec<Item<'_>> = items.iter().copied().filter(on_side).collect();
         if batch.is_empty() {
             continue;
@@ -465,8 +512,8 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
             pending.iter().copied().filter(on_side).filter(|i| !listed(BreakerKind::Mass, *i)).collect();
         // The whole tree is judged when its contents go, its folders
         // included, rather than a level at a time.
-        let weighed: usize = batch.iter().map(|(o, _)| weight(o)).sum::<usize>() + later.len();
-        let n = weighed + cx.recent.on(side);
+        let weighed = weigh(&batch).saturating_add(later.len());
+        let n = weighed.saturating_add(cx.recent.on(side));
         let too_many = n > policy.max_count
             || (n > policy.min_count
                 && (n as u128) * 100 > u128::from(policy.max_percent) * u128::from(cx.synced_items));
@@ -476,31 +523,48 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         if !too_many || rest.is_empty() {
             continue;
         }
-        let approved: usize = on_list.iter().map(|(o, _)| weight(o)).sum();
-        let b = breaker(BreakerKind::Mass, side, cx, &rest, later, approved);
+        let b = breaker(BreakerKind::Mass, side, cx, &rest, later, weigh(&on_list));
         if cx.approvals.contains(&Approval { side, fingerprint: b.fingerprint }) {
+            for (i, o, p) in &rest {
+                on_lists[*i].push(item_key(BreakerKind::Mass, o, p));
+            }
             out.answered.push(b);
         } else {
+            lists.push(rest.iter().map(|(i, _, _)| *i).collect());
             breakers.push(b);
         }
     }
 
     // The content guard: uploads of files that don't look like their type.
     if policy.max_suspicious > 0 && !cx.suspicious.is_empty() {
-        let batch: Vec<Item<'_>> = items.iter().copied().filter(|(o, _)| is_suspicious(o, cx.suspicious)).collect();
-        if !batch.is_empty() && batch.len() + cx.recent.suspicious > policy.max_suspicious {
+        let batch: Vec<Item<'_>> = items.iter().copied().filter(|(_, o, _)| is_suspicious(o, cx.suspicious)).collect();
+        if !batch.is_empty() && batch.len().saturating_add(cx.recent.suspicious) > policy.max_suspicious {
             let (on_list, rest): (Vec<Item<'_>>, Vec<Item<'_>>) =
                 batch.into_iter().partition(|i| listed(BreakerKind::Suspicious, *i));
             if !rest.is_empty() {
                 let b = breaker(BreakerKind::Suspicious, Side::Remote, cx, &rest, Vec::new(), on_list.len());
                 if cx.approvals.contains(&Approval { side: Side::Remote, fingerprint: b.fingerprint }) {
+                    for (i, o, p) in &rest {
+                        on_lists[*i].push(item_key(BreakerKind::Suspicious, o, p));
+                    }
                     out.answered.push(b);
                 } else {
+                    lists.push(rest.iter().map(|(i, _, _)| *i).collect());
                     breakers.push(b);
                 }
             }
         }
     }
+    // Which operations each tripped list holds: they're all withheld (a
+    // tripped list's operations never run), placed below.
+    let mut in_list: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
+    for (l, list) in lists.iter().enumerate() {
+        for i in list {
+            in_list[*i].push(l);
+        }
+    }
+    let mut held_lists: Vec<Vec<usize>> = vec![Vec::new(); lists.len()];
+    drop(items);
 
     // The overflow batch, only when local changes can run at all this round
     // (otherwise there is nothing to decide yet).
@@ -524,12 +588,9 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         }
     }
 
-    // Whether each operation is on an approved list, before `ops` is taken.
-    let on_lists: Vec<(bool, bool)> =
-        items.iter().map(|i| (listed(BreakerKind::Mass, *i), listed(BreakerKind::Suspicious, *i))).collect();
-    drop(items);
-    for (op, (mass_listed, suspicious_listed)) in ops.into_iter().zip(on_lists) {
+    for (i, (op, keys)) in ops.into_iter().zip(on_lists).enumerate() {
         let side = Side::changed_by(&op);
+        let lists_of = std::mem::take(&mut in_list[i]);
         let in_batch = store_size(policy, &op).is_some();
         let why = if matches!(op, Op::Hold { .. }) {
             Some(Withheld::Held)
@@ -541,23 +602,23 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
             Some(Withheld::Paused(Side::Local))
         } else if side == Some(Side::Remote) && policy.pause_remote {
             Some(Withheld::Paused(Side::Remote))
-        } else if is_mass_sensitive(&op)
-            && !mass_listed
-            && breakers.iter().any(|b| b.kind == BreakerKind::Mass && Some(b.side) == side)
-        {
-            side.map(Withheld::Breaker)
-        } else if is_suspicious(&op, cx.suspicious)
-            && !suspicious_listed
-            && breakers.iter().any(|b| b.kind == BreakerKind::Suspicious)
-        {
-            Some(Withheld::Breaker(Side::Remote))
+        } else if let Some(&l) = lists_of.first() {
+            Some(Withheld::Breaker(breakers[l].side))
         } else if held_overflow && in_batch {
             Some(Withheld::Overflow)
         } else {
             None
         };
+        if !keys.is_empty() {
+            out.listed.push((op.clone(), keys));
+        }
         match why {
-            Some(w) => out.withheld.push((op, w)),
+            Some(w) => {
+                for l in lists_of {
+                    held_lists[l].push(out.withheld.len());
+                }
+                out.withheld.push((op, w));
+            }
             None => {
                 let old = match &op {
                     Op::Download { replace: Some(_), .. } if !policy.keep_replaced => OldCopy::DropIfSynced,
@@ -572,6 +633,7 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         }
     }
     out.breakers = breakers;
+    out.lists = held_lists;
     out
 }
 
@@ -610,8 +672,14 @@ fn malformed(op: &Op) -> bool {
     }
 }
 
-/// An operation and the path its stop's list shows for it.
-type Item<'a> = (&'a Op, &'a str);
+/// An operation, by its place in the plan, and the path its stop's list
+/// shows for it.
+type Item<'a> = (usize, &'a Op, &'a str);
+
+/// The weight of `items` for the breakers ([`weight`]), never wrapping.
+fn weigh(items: &[Item<'_>]) -> usize {
+    items.iter().fold(0usize, |n, (_, o, _)| n.saturating_add(weight(o)))
+}
 
 /// A tripped (or answered) list: the round's operations `rest` that no
 /// approved list covers, and the folder deletions `later` to follow.
@@ -625,13 +693,13 @@ fn breaker(
     later: Vec<Item<'_>>,
     approved: usize,
 ) -> Breaker {
-    let mut items: Vec<ItemKey> = rest.iter().map(|(o, p)| item_key(kind, o, p)).collect();
+    let mut items: Vec<ItemKey> = rest.iter().map(|(_, o, p)| item_key(kind, o, p)).collect();
     // A folder's eTag changes with anything inside it, so a folder still to
     // be emptied is listed without it (see `is_listed`).
-    items.extend(later.iter().map(|(o, p)| folder_key(kind, o, p)));
+    items.extend(later.iter().map(|(_, o, p)| folder_key(kind, o, p)));
     items.sort_unstable();
     items.dedup();
-    let mut sids: Vec<Sid> = rest.iter().chain(&later).filter_map(|(o, _)| listed_sid(o)).collect();
+    let mut sids: Vec<Sid> = rest.iter().chain(&later).filter_map(|(_, o, _)| listed_sid(o)).collect();
     sids.sort_unstable();
     sids.dedup();
     let tag: &[u8] = match kind {
@@ -641,15 +709,16 @@ fn breaker(
     Breaker {
         kind,
         side,
-        count: rest.iter().map(|(o, _)| weight(o)).sum::<usize>() + later.len(),
+        count: weigh(rest).saturating_add(later.len()),
         recent: match kind {
             BreakerKind::Mass => cx.recent.on(side),
             BreakerKind::Suspicious => cx.recent.suspicious,
-        } + approved,
+        }
+        .saturating_add(approved),
         synced_items: cx.synced_items,
         fingerprint: fingerprint(tag, &items),
         items,
-        later: later.into_iter().map(|(o, _)| o.clone()).collect(),
+        later: later.into_iter().map(|(_, o, _)| o.clone()).collect(),
         sids,
     }
 }
@@ -702,11 +771,21 @@ fn folder_key(kind: BreakerKind, op: &Op, path: &str) -> ItemKey {
 /// be emptied first ([`folder_key`]); folder keys only ever come from such
 /// folders, so a file's deletion matches with its eTag only.
 fn is_listed(kind: BreakerKind, op: &Op, path: &str, approved: &[ItemKey]) -> bool {
+    listed_key(kind, op, path, approved).is_some()
+}
+
+/// The key by which `op` is on an approved list of `kind`, if it is.
+fn listed_key(kind: BreakerKind, op: &Op, path: &str, approved: &[ItemKey]) -> Option<ItemKey> {
     if approved.is_empty() {
-        return false;
+        return None;
     }
-    let has = |k: ItemKey| approved.binary_search(&k).is_ok();
-    has(item_key(kind, op, path)) || (matches!(op, Op::DeleteRemote { .. }) && has(folder_key(kind, op, path)))
+    let has = |k: &ItemKey| approved.binary_search(k).is_ok();
+    let key = item_key(kind, op, path);
+    if has(&key) {
+        return Some(key);
+    }
+    let folder = folder_key(kind, op, path);
+    (matches!(op, Op::DeleteRemote { .. }) && has(&folder)).then_some(folder)
 }
 
 /// SHA-256 over the kind, the path and the operation as debug-printed, cut to 128
@@ -1199,6 +1278,81 @@ mod tests {
         };
         assert_eq!(later(&at), 0);
         assert_eq!(later(&moved), 1);
+    }
+
+    /// With a mass stop and a content-guard stop standing together, and
+    /// parts of each approved earlier, each stop's list (what the user
+    /// reads) is exactly what its code approves: no operation another list
+    /// holds, or one already approved under this kind.
+    #[test]
+    fn each_stop_lists_exactly_what_its_code_approves() {
+        let p = Policy::default();
+        let mut ops: Vec<Op> = (1..=25).map(upload_over).collect();
+        ops.extend((100..130).map(delete_remote));
+        let bad: Vec<LocalId> = (1..=25).map(LocalId).collect();
+        // Uploads 1-12 approved by an earlier content-guard stop, 13-25 by
+        // an earlier mass stop.
+        let mut approved: Vec<ItemKey> = ops[..12].iter().map(|o| item_key(BreakerKind::Suspicious, o, "")).collect();
+        approved.extend(ops[12..25].iter().map(|o| item_key(BreakerKind::Mass, o, "")));
+        approved.sort_unstable();
+        let cx = Context { synced_items: 300, suspicious: &bad, approved: &approved, ..Context::default() };
+        let r = review_in(&p, &cx, ops.clone());
+        assert_eq!(r.breakers.len(), 2);
+        assert_eq!(r.lists.len(), 2);
+        for (b, list) in r.breakers.iter().zip(&r.lists) {
+            let mut shown: Vec<ItemKey> = list.iter().map(|&w| item_key(b.kind, &r.withheld[w].0, "")).collect();
+            shown.sort_unstable();
+            assert_eq!(shown, b.items, "{:?}", b.kind);
+            assert_eq!(b.count, list.len());
+        }
+        let mass = r.breakers.iter().position(|b| b.kind == BreakerKind::Mass).unwrap();
+        assert_eq!(r.lists[mass].len(), 30 + 12, "the deletions and the uploads not approved as mass changes");
+        let guard = 1 - mass;
+        assert_eq!(r.lists[guard].len(), 13, "the uploads not approved by the content guard");
+        // Every withheld upload is on at least one list, each once.
+        assert_eq!(r.withheld.len(), 55);
+    }
+
+    /// Counts never wrap: a window or a pruned folder at the limit of
+    /// what fits still trips the stop, never passes it.
+    #[test]
+    fn counts_never_wrap() {
+        let p = Policy::default();
+        let recent = Recent { local: usize::MAX, remote: usize::MAX, suspicious: usize::MAX };
+        assert_eq!(recent.plus(recent), recent);
+        let cx = Context { synced_items: 10, recent, ..Context::default() };
+        assert_eq!(review_in(&p, &cx, vec![delete_remote(1)]).breakers.len(), 1);
+        let huge = Op::PruneRemote { remote: rpre(9), forget: vec![9], items: u64::MAX, keep: Vec::new() };
+        let r = review_in(&p, &cx, vec![huge.clone(), delete_remote(1)]);
+        assert_eq!(r.breakers[0].count, usize::MAX);
+        let mut done = Recent::default();
+        done.add_op(&huge, &[]);
+        done.add_op(&huge, &[]);
+        assert_eq!(done.remote, usize::MAX);
+        let mut few = Recent::default();
+        few.add_op(&Op::PruneRemote { remote: rpre(9), forget: vec![9], items: 1000, keep: Vec::new() }, &[]);
+        assert_eq!(few, Recent { remote: 1000, ..Recent::default() }, "a pruned folder counts as all it holds");
+    }
+
+    /// The round's operations on approved lists are reported with the keys
+    /// they matched, approved or held, so the caller can keep those keys
+    /// while they wait.
+    #[test]
+    fn operations_on_approved_lists_are_reported_with_their_keys() {
+        let p = Policy::default();
+        let ops: Vec<Op> = (0..30).map(recycle).collect();
+        let b = review(&p, 100, &[], ops.clone()).breakers.remove(0);
+        let cx = Context { synced_items: 100, approved: &b.items, ..Context::default() };
+        let paused = Policy { pause_local: true, ..p.clone() };
+        let r = review_in(&paused, &cx, ops.clone());
+        assert_eq!(r.listed.len(), 30, "held by the pause, still on the list");
+        let mut keys: Vec<ItemKey> = r.listed.iter().flat_map(|(_, k)| k.clone()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, b.items);
+        // Answered by its code: the same.
+        let r = review(&p, 100, &[Approval { side: Side::Local, fingerprint: b.fingerprint }], ops);
+        assert_eq!(r.listed.len(), 30);
+        assert!(review(&p, 100, &[], vec![recycle(1)]).listed.is_empty(), "nothing approved, nothing listed");
     }
 
     fn folder_delete(i: u128, etag: &str) -> Op {
