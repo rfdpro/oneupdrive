@@ -1,6 +1,6 @@
 # The agent's control API
 
-A running `oneupd` must be controllable without stopping it: pause and resume, answering a safety stop or a full version store, and showing what it's doing. `crates/oneup-ipc` holds the protocol, pipe and client; `bins/oneup/src/control.rs` the agent's state and handler; `bins/oneup/src/agent.rs` the CLI commands. Clients are `oneup status/pause/resume/approve/keep/discard/sync-now/stop`, the tray, the settings window and Explorer's status flyout publisher, all thin clients over the same calls.
+A running `oneupd` must be controllable without stopping it: pause and resume, answering a safety stop or a full version store, and showing what it's doing and what happened. `crates/oneup-ipc` holds the protocol, pipe and client; `bins/oneup/src/control.rs` the agent's state and handler; `bins/oneup/src/agent.rs` the CLI commands. Clients are `oneup status/pause/resume/approve/keep/discard/sync-now/stop/watch`, the tray, the settings window, Explorer's status flyout publisher and the PowerShell module (`packaging/powershell`), all thin clients over the same calls.
 
 ## Transport and who may connect
 JSON-RPC 2.0 over a Windows **named pipe**, one JSON object per line (UTF-8, `\n`-terminated, at most 64 KiB).
@@ -13,7 +13,7 @@ Only the user who runs the agent, on this PC, can connect:
 **Bounded:** at most 8 connections are served at once (more are closed), an idle connection is closed after 60 s, and a client waits 30 s for a reply. Calls only read and change in-memory state, then wake the agent's loop, so a call never waits for a sync round, and the loop picks up a change within milliseconds.
 
 ## Calls
-Every call returns the agent's **status** after it took effect.
+Every call but `events` returns the agent's **status** after it took effect.
 
 | Method | Params | Effect |
 |---|---|---|
@@ -25,6 +25,7 @@ Every call returns the agent's **status** after it took effect.
 | `sync_first` | `path` | Puts the path first in the agent's transfers until a round settles ([rules.md § User controls](rules.md#user-controls)) |
 | `stop` | none | The agent ends after its current round (`activity: stopping` until then), like Ctrl+C |
 | `watch` | `since`: a status `rev` | Waits until the status's `rev` differs from `since` (at once if it already does), or 50 s at most, then returns it. Long-polling: a client follows the agent without polling |
+| `events` | `since`: an event's `seq` (optional) | Returns **events**, not the status: `{next, missed, items}`, the events after `since`, waiting for one as `watch` waits (50 s at most); without `since`, at once, none, and `next` is where the feed is now. `missed`: some were dropped before they were read, or the agent restarted. A page fits in one reply line; read on from `next`. `oneup watch` and scripts use it ([hooks.md](hooks.md#the-event-feed)) |
 
 Errors follow JSON-RPC: `-32700` parse error, `-32600` invalid request, `-32601` unknown method, `-32602` invalid params, and `1` = **no such batch**: the code doesn't match anything the agent is waiting for right now.
 

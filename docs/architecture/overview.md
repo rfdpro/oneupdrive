@@ -23,6 +23,7 @@ This page explains how OneUpDrive works in plain terms. Each section links to th
 | `oneup-exec` | The executor, hydration service and placement pass |
 | `oneup-cfapi` | The Cloud Files provider ([files-on-demand.md](files-on-demand.md)) |
 | `oneup-ipc` | The control API |
+| `oneup-hooks` | Event hooks: the user's programs started on sync events, contained ([hooks.md](hooks.md)) |
 | `oneup-vault`, `oneup-vaultsync` | Cryptomator vaults and vault pairs ([vaults.md](vaults.md)) |
 | `oneup-sys`, `oneup-shellext` | Windows helpers; the Explorer extension |
 
@@ -58,6 +59,9 @@ The agent counts which programs open online-only files (Windows names them in ea
 
 ## Languages and accessibility
 What the window, the tray and the command line say is looked up by its English text in a catalogue for the user's display language, with English wherever a translation is missing; numbers and dates follow the regional format ([localisation.md](localisation.md)). The settings window works from the keyboard and with a screen reader, and follows Windows' contrast themes ([settings-window.md § Accessibility](settings-window.md#accessibility)).
+
+## Scripts and hooks
+The agent's events (synced, conflict, failure, safety stop, paused/resumed, problem) are a feed: `oneup watch` and scripts read it over the control channel, and hooks start the user's programs on them, in the background, bounded and contained. A program in a synced folder never runs as a hook, so a change in the cloud can't become code on the PC ([hooks.md](hooks.md)).
 
 ## Data safety
 No deletion without explicit evidence, every change checked against the latest state right before it happens, every transfer verified by hash, circuit breakers on mass changes and on edited files that look encrypted, and both copies kept on conflict. The full list of invariants: [data-safety.md](data-safety.md).

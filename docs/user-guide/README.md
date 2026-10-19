@@ -21,6 +21,7 @@ Welcome! This guide is for everyone, not just developers.
 * [Office](office.md): AutoSave and editing together in Word, Excel and PowerPoint
 * [Encrypted vaults](vaults.md): folders only you can read, compatible with Cryptomator (experimental)
 * [Moving over from the OneDrive app](migrating-from-onedrive.md): switching without re-downloading everything
+* [Scripts and hooks](hooks.md): watching what OneUpDrive does, starting your own programs when something happens, PowerShell
 
 **When you need help**
 * [When something goes wrong](troubleshooting.md): what each problem means, and how to fix it if retrying doesn't
