@@ -3319,7 +3319,7 @@ async fn one_at_a_time_never_overlaps_transfers() {
 async fn large_uploads_keep_to_their_own_limit() {
     let cloud = Fake::new();
     let mut s = Sync::new("large-uploads", cloud.clone());
-    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 2 });
+    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 2, hashes: 1 });
     let big = vec![7u8; oneup_graph::client::SIMPLE_UPLOAD_MAX + 1];
     for i in 0..6 {
         write(&s.p(&format!("big{i}.bin")), &big);
@@ -3327,6 +3327,51 @@ async fn large_uploads_keep_to_their_own_limit() {
     s.settle().await;
     assert_eq!(cloud.most_transfers(), 2);
     assert_eq!(cloud.tree().len(), 6);
+}
+
+/// Files here and in OneDrive under the same name and size are hashed to
+/// compare them (a first sync over a copy), several at once on blocking
+/// threads, never more than the limit: the same content is paired without
+/// a transfer, and different content of the same size keeps both.
+#[tokio::test]
+async fn everyday_same_files_on_both_sides_are_hashed_side_by_side_and_paired() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let cloud = Fake::new();
+    let dir = Tmp(std::env::temp_dir().join(format!("oneup-exec-hash-at-once-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    cloud.add("photos", None);
+    for i in 0..40 {
+        let same = format!("photo {i:03}");
+        cloud.add(&format!("photos/{i:03}.jpg"), Some(same.as_bytes()));
+        write(&dir.0.join(format!("photos/{i:03}.jpg")), same.as_bytes());
+    }
+    cloud.add("notes.txt", Some(b"cloud 1"));
+    write(&dir.0.join("notes.txt"), b"local 1");
+    let mut s = Sync::with_dir(dir, cloud.clone());
+    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 1, hashes: 3 });
+    // Each hash held a moment on its thread, as a disk would: how many are
+    // under way at once.
+    let (now, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (n, m) = (Arc::clone(&now), Arc::clone(&most));
+    s.exec.on_blocking(Some(Arc::new(move |op: &Op| {
+        if matches!(op, Op::Hash(_)) {
+            m.fetch_max(n.fetch_add(1, SeqCst) + 1, SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            n.fetch_sub(1, SeqCst);
+        }
+    })));
+    let r = s.round().await;
+    let hashed = r.done.iter().filter(|op| matches!(op, Op::Hash(_))).count();
+    assert_eq!(hashed, 41, "{r:?}");
+    assert_eq!(most.load(SeqCst), 3, "side by side, up to the limit");
+    s.exec.on_blocking(None);
+    s.settle().await;
+    assert_eq!(cloud.0.lock().unwrap().uploaded, 7, "only this PC's notes.txt, as a copy");
+    let t = local_tree(&s.dir.0);
+    assert_eq!(t.keys().filter(|p| p.starts_with("/photos/")).count(), 40);
+    assert_eq!(t.keys().filter(|p| p.starts_with("/notes")).count(), 2, "both kept: {:?}", names(&t));
+    assert_eq!(t, cloud.tree());
+    assert!(s.versions().is_empty());
 }
 
 /// A round takes in at most its budget of new folders' contents; the rest
@@ -3590,7 +3635,7 @@ async fn a_round_waits_for_a_busy_database_without_blocking_its_task() {
 async fn a_large_upload_whose_content_reached_onedrive_earlier_in_the_round_is_copied() {
     let cloud = Fake::new();
     let mut s = Sync::new("copy-large", cloud.clone());
-    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 1 });
+    s.exec.set_parallel(oneup_exec::Parallel { ops: 8, large_uploads: 1, hashes: 1 });
     let big = vec![9u8; (64 << 20) + 1];
     write(&s.p("a.bin"), &big);
     write(&s.p("b.bin"), &big);
