@@ -425,7 +425,9 @@ enum Cmd {
     #[command(subcommand)]
     Cloud(CloudCmd),
     /// Cryptomator vaults in a local folder (preview: for checking
-    /// compatibility; never changes or removes what exists)
+    /// compatibility; never changes or removes what exists), and encrypted
+    /// vaults synced with OneDrive. Experimental: the encryption hasn't had
+    /// an outside security review yet
     #[command(subcommand)]
     Vault(VaultCmd),
     /// More folder pairs under this sign-in: any OneDrive folder, a folder
@@ -832,8 +834,8 @@ enum VaultCmd {
     Mkdir { folder: PathBuf, path: String },
     /// Read and verify every file in the vault
     Check { folder: PathBuf },
-    /// Sync a vault in OneDrive with a folder on this PC, decrypted (test
-    /// accounts only, for now). Files are online-only and decrypted when
+    /// Sync a vault in OneDrive with a folder on this PC, decrypted
+    /// (experimental; test accounts only, for now). Files are online-only and decrypted when
     /// opened, unless --full-files
     Add {
         /// The vault's folder in OneDrive (the one with vault.cryptomator)
@@ -852,7 +854,7 @@ enum VaultCmd {
         no_start: bool,
     },
     /// Create a new vault in OneDrive and sync it with a new or empty folder
-    /// here (test accounts only, for now). Shows its recovery key
+    /// here (experimental; test accounts only, for now). Shows its recovery key
     New {
         /// A new or empty folder in OneDrive, e.g. /Private
         remote: String,

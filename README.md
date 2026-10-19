@@ -41,7 +41,7 @@ Same OneDrive cloud with a lighter, faster, and more careful engine that syncs w
 
 **Also included:**
 
-- 🔐 **Vaults.** Encrypted folders, decrypted on demand and unlocked with Windows Hello or password. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
+- 🔐 **Vaults** (experimental). Encrypted folders, decrypted on demand and unlocked with Windows Hello or password. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
 - 🕓 **Version history.** See what changed in any file, when, and which program changed it.
 
 ## ⚖️ How it compares
@@ -57,7 +57,7 @@ Same OneDrive cloud with a lighter, faster, and more careful engine that syncs w
 | **Control** | Pause | Pause (whole, per direction, per folder, timed), automatic pauses for games, battery saver and metered networks, quiet hours, bandwidth caps, sync order |
 | **Ransomware** | Detects afterwards and offers a restore (Microsoft 365 plans) | **Stops first.** Edited files that suddenly stop looking like what they are (a `.docx` that isn't a zip anymore) are held back and you're asked |
 | **Knowing what's going on** | A spinner | An activity log, `explain` for any file, and which programs change and open your files, with a chart |
-| **End-to-end encryption** | Personal Vault (encrypted with keys Microsoft manages) | [Cryptomator](https://cryptomator.org/)-compatible vaults, decrypted on demand, unlocked with Windows Hello if you like, with a recovery key. Only you hold the key |
+| **End-to-end encryption** | Personal Vault (encrypted with keys Microsoft manages) | [Cryptomator](https://cryptomator.org/)-compatible vaults, decrypted on demand, unlocked with Windows Hello if you like, with a recovery key. Only you hold the key. Experimental until an outside security review |
 | **Office AutoSave** | ✅ | ✅ **Open with AutoSave** from the right-click menu, or leave chosen folders to the OneDrive app; double-click integration is an experiment |
 | **Big uploads** | Fixed pieces | Piece size adapts to your connection (≈2× faster on our test line), and files OneDrive already has are copied server-side (300 MB in ~2 s) |
 
