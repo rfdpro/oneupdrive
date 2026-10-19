@@ -3,3 +3,4 @@
 .env
 # Never commit tokens or local spike output
 /spike-out
+AGENTS.md

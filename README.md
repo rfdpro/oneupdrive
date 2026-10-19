@@ -6,8 +6,8 @@
 
 ### One up your OneDrive.
 
-A OneDrive client for Windows, rebuilt from scratch in Rust.<br>
 Built for speed, privacy and control over your data.<br>
+A Windows OneDrive client rebuilt from scratch in Rust.<br>
 
 [![CI](https://github.com/rfdpro/oneupdrive/actions/workflows/ci.yml/badge.svg)](https://github.com/rfdpro/oneupdrive/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/rfdpro/oneupdrive?include_prereleases&label=release)](https://github.com/rfdpro/oneupdrive/releases/latest)
@@ -24,24 +24,24 @@ Built for speed, privacy and control over your data.<br>
 
 ---
 
-Same OneDrive account, same files, and onedrive.com and the phone apps keep working. Only the program on your PC changes: it's lighter, it's more careful with your data, and it syncs what *you* tell it to.
+Same OneDrive cloud with a lighter, faster, and more careful engine that syncs what *you* tell it to.
 
 > [!NOTE]
 > OneUpDrive is in **beta**. Expect rough edges, and please [report them as issues](https://github.com/rfdpro/oneupdrive/issues).
 
 ## ✨ Features
 
-- 🪶 **Lightweight.** Uses under 100 MB of RAM and 100 MB of disk, however many files you have.
+- 🪶 **Lightweight.** Uses under 100 MB of RAM while delivering maximum search and sync speeds.
 - 🔒 **Private.** No tracking, no telemetry, no data collection.
-- 🎯 **You decide what syncs.** Leave things out with familiar `.gitignore` syntax. No more `node_modules`, build caches or other junk filling your OneDrive.
-- ⚡ **Fast sync.** Follows the NTFS change journal, like [Everything](https://www.voidtools.com/), instead of rescanning your folders. When nothing changes, it does nothing.
-- ☁️ **Files On-Demand.** Files download only when you open them, and OneUpDrive can free up files you haven't used lately or when the disk is nearly full.
+- ⚡ **Fast sync.** Our own indexing follows the NTFS change journal, like [Everything](https://www.voidtools.com/), instead of rescanning your folders every minute. When nothing changes, nothing changes.
+- ☁️ **Files On-Demand.** Files available only when you need them. Free up files you haven't used lately or keep them on your computer ready for a flight.
 - 📝 **Office AutoSave.** Open Word, Excel and PowerPoint files with AutoSave, straight from the right-click menu.
-- 🚀 **Big uploads.** The piece size adapts to your connection speed.
+- 🎯 **You decide what syncs.** Leave things out with familiar `.gitignore` syntax. No more `node_modules`, build caches or other junk filling your OneDrive.
+- 🚀 **Big uploads.** Adaptive chunking scales by your connection speed.
 
 **Also included:**
 
-- 🔐 **Vaults.** Encrypted folders, decrypted on demand and unlocked with Windows Hello if you like, with a recovery key. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
+- 🔐 **Vaults.** Encrypted folders, decrypted on demand and unlocked with Windows Hello or password. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
 - 🕓 **Version history.** See what changed in any file, when, and which program changed it.
 
 ## ⚖️ How it compares
