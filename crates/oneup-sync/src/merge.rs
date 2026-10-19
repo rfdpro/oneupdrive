@@ -104,6 +104,25 @@ fn remote_within<T: Trees + ?Sized>(t: &T, dir: &RemoteId, item: &RemoteId) -> R
     Ok(false)
 }
 
+/// Whether Synced folder `dir` is `item` or below it in the Synced tree.
+/// Recording `item` in `dir` would make the Synced tree a loop, which no
+/// plan from the top reaches again. The two trees can put a folder inside
+/// one that is still below it in the Synced tree, when the other's own move
+/// isn't recorded yet (refused this round, or waiting); the move waits for
+/// it. A loop already there also answers yes.
+fn base_within<T: Trees + ?Sized>(t: &T, dir: Sid, item: Sid) -> Result<bool, T::Error> {
+    let mut cur = Some(dir);
+    // Deeper than any path OneDrive takes (400 characters).
+    for _ in 0..1024 {
+        let Some(sid) = cur else { return Ok(false) };
+        if sid == item {
+            return Ok(true);
+        }
+        cur = t.base(sid)?.and_then(|b| b.parent);
+    }
+    Ok(true)
+}
+
 /// Suffix of the temporary names given to moves whose destination is being
 /// vacated in the same round ([`crate::resolve`]).
 pub(crate) const STAGING: &str = ".oneup-staging-";
@@ -304,6 +323,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         // One-way: the cloud follows this PC's layout, whoever moved it.
         if lm && rm && lloc == rloc {
             let Some((parent, _)) = lloc else { return Ok(()) };
+            if b.kind == NodeKind::Folder && base_within(t, parent, b.sid)? {
+                return Ok(());
+            }
             cx.out.push(Op::Record(Base {
                 parent: Some(parent),
                 name: l.name.clone(),
@@ -328,6 +350,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         // Both moved to the same place. (Both "unknown" — moved into folders
         // not synced yet — is not the same place: wait for those folders.)
         let Some((parent, _)) = lloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, parent, b.sid)? {
+            return Ok(());
+        }
         cx.out.push(Op::Record(Base {
             parent: Some(parent),
             name: l.name.clone(),
@@ -340,6 +365,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         // The cloud moved it (and if both moved, the cloud's location wins:
         // that's a move, not a loss).
         let Some((psid, name)) = rloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
+            return Ok(());
+        }
         let Some(to) = cx.local_dir_for(psid)? else { return Ok(()) };
         if b.kind == NodeKind::Folder && local_within(t, to, l.id)? {
             // Moved into each other on the two sides: following the cloud
@@ -455,6 +483,9 @@ fn move_remote_to<T: Trees + ?Sized>(
     loc: Option<(Sid, String)>,
 ) -> Result<(), T::Error> {
     let Some((psid, name)) = loc else { return Ok(()) };
+    if b.kind == NodeKind::Folder && base_within(cx.t, psid, b.sid)? {
+        return Ok(());
+    }
     let Some(to) = cx.remote_dir_for(psid)? else { return Ok(()) };
     cx.out.push(Op::MoveRemote { sid: b.sid, remote: rpre(r), to, parent: psid, name });
     Ok(())
