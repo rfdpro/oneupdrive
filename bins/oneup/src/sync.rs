@@ -514,6 +514,9 @@ pub struct Engine {
     verified: std::sync::atomic::AtomicBool,
     /// Safety stops raised lately, and the lists the user approved.
     stops: std::sync::Mutex<Stops>,
+    /// Where what the rounds did goes as events (the agent's; none for
+    /// `oneup sync`).
+    events: std::sync::OnceLock<Arc<crate::events::Feed>>,
 }
 
 /// What stop `i` of `review` lists this round: exactly the operations its
@@ -768,6 +771,7 @@ impl Engine {
             full: std::sync::Mutex::new(None),
             verified: std::sync::atomic::AtomicBool::new(false),
             stops: std::sync::Mutex::default(),
+            events: std::sync::OnceLock::new(),
         }
     }
 
@@ -780,6 +784,12 @@ impl Engine {
     /// state), so they can't approve anything again.
     pub fn spent_answers(&self) -> Vec<u64> {
         std::mem::take(&mut self.stops_lock().to_drop)
+    }
+
+    /// What the rounds do goes to `feed` as events, as it goes to the
+    /// activity log.
+    pub fn publish_events(&self, feed: Arc<crate::events::Feed>) {
+        let _ = self.events.set(feed);
     }
 
     /// Holds the uploads of the files `busy` says keep changing.
@@ -1597,6 +1607,9 @@ impl Engine {
             }
             if let Some(why) = &report.halted {
                 log.push(notice(ActivityOutcome::Failed, "stopped", why.clone()));
+            }
+            if let Some(feed) = self.events.get() {
+                feed.push(crate::events::from_activity(&log));
             }
             // A database that fails can't take the log either; the halt
             // below still reports it.
@@ -2770,7 +2783,7 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
                 println!("  ok    {line}  ({COPIED})");
                 entry(line, ActivityOutcome::Done, Some(COPIED.into()));
             } else if let Some((_, copy)) = r.kept_theirs.iter().find(|(o, _)| o == op) {
-                let why = format!("it changed in OneDrive during the upload; that version is kept as {copy}");
+                let why = format!("{KEPT_THEIRS}; that version is kept as {copy}");
                 println!("  ok    {line}  ({why})");
                 entry(line, ActivityOutcome::Done, Some(why));
             } else if let Some((_, why)) = r.theirs_not_kept.iter().find(|(o, _)| o == op) {
@@ -2798,6 +2811,10 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
     }
     log
 }
+
+/// An upload went over an edit made in OneDrive meanwhile, which was kept
+/// next to it: a conflict (`crate::events`).
+pub const KEPT_THEIRS: &str = "it changed in OneDrive during the upload";
 
 const KEPT_INSTEAD: &str =
     "its old copy was kept in .oneup\\versions after all: it differed from the version OneDrive has";

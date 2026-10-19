@@ -479,6 +479,11 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     if let Some(e) = last.first() {
         println!("  last activity: {}", crate::activity::line(e, crate::activity::local_offset()));
     }
+    // The hooks a change to it starts (`oneup hooks`).
+    match oneup_app::hooks::explain(data_dir, rel) {
+        Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
+        Err(e) => println!("  hooks: {e:#}"),
+    }
     Ok(())
 }
 

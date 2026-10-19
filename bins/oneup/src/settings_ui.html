@@ -2183,6 +2183,13 @@
                 <div class="row">
                     <div class="label"><b>Timeout (seconds)</b><small>Ensure file is quiet before sending update</small></div><input type="number" min="1" data-agent="busy_quiet_s" aria-label="Timeout (seconds)"></div>
             </div>
+            <h3 id="hooks">Hooks</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Run hooks</b><small id="hk-state">Programs started on sync events, set in config.toml</small></div>
+                    <label class="toggle"><input type="checkbox" id="hk-run" aria-label="Run hooks"><span></span></label></div>
+                <div id="hk-list"></div>
+            </div>
             <h3 id="shortcuts">Shortcuts</h3>
             <div class="card">
                 <div class="row">
@@ -2696,6 +2703,7 @@
             if (page === "find") openFind();
             if (page === "accounts") loadAccounts();
             if (page === "general" && !scSearched) loadShortcuts();
+            if (page === "general") loadHooks();
             if (page === "lists") loadList(true);
             if (page === "lists") loadAttention();
         }
@@ -3040,6 +3048,44 @@
             loadShortcuts();
         }
         $("#sc-find").onclick = loadShortcuts;
+
+        // ---- hooks: config.toml's [[hook]] sections, each with its switch.
+        // A hook the agent refuses (its program is in a synced folder, say)
+        // shows why, and has no switch.
+        async function loadHooks() {
+            try {
+                const r = await call("hooks");
+                $("#hk-run").checked = !r.paused;
+                $("#hk-state").textContent = r.hooks.length ? plural(r.hooks.length, "hook") + " · output in " + r.log : "None set. Add a [[hook]] section to config.toml.";
+                $("#hk-list").replaceChildren(...r.hooks.map(h => {
+                    const detail = h.refused ? "Refused: " + h.refused : h.on.join(", ") + (h.paths.length ? " · " + h.paths.join(", ") : "") + " → " + h.program;
+                    const sw = h.refused ? null : el("label", {
+                        className: "toggle"
+                    }, el("input", {
+                        type: "checkbox",
+                        checked: h.enabled,
+                        "aria-label": h.name,
+                        onchange: e => run(call("hook_enable", {
+                            name: h.name,
+                            on: e.target.checked
+                        }), () => e.target.checked ? h.name + " on" : h.name + " off").catch(() => null).then(loadHooks)
+                    }), el("span"));
+                    return el("div", {
+                        className: "row"
+                    }, el("div", {
+                        className: "label"
+                    }, el("b", {}, h.name), el("small", {
+                        className: "path",
+                        title: detail
+                    }, detail)), sw);
+                }));
+            } catch (e) {
+                $("#hk-state").textContent = "Can't read the hooks: " + e.message;
+            }
+        }
+        $("#hk-run").onchange = e => run(call("hooks_pause", {
+            on: !e.target.checked
+        }), () => e.target.checked ? "Hooks on" : "Hooks paused").catch(() => null).then(loadHooks);
         $("#sc-fix").onclick = () => scChange("shortcuts_fix", {
             links: scFound.map(f => f.link)
         }, n => tr("Updated {n, plural, one {# shortcut} other {# shortcuts}}", {

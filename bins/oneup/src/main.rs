@@ -26,6 +26,7 @@ mod cloud_check;
 mod cloud_prune;
 mod dev_remote;
 mod find;
+mod hooks_cmd;
 mod migrate;
 mod pair;
 mod rules;
@@ -351,6 +352,19 @@ enum Cmd {
         cmd: Option<UnsyncedCmd>,
         #[command(flatten)]
         profile: ProfileArg,
+    },
+    /// Show what the background agent does as it happens: synced items,
+    /// conflicts, failures, safety stops, pauses and problems (Ctrl+C to stop)
+    Watch {
+        /// One JSON object per line, for scripts
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the hooks (programs the background agent starts on events, set
+    /// in config.toml), or pause, resume, turn one on or off
+    Hooks {
+        #[command(subcommand)]
+        cmd: Option<HooksCmd>,
     },
     /// Check the state database's internal consistency
     Verify(ProfileArg),
@@ -981,6 +995,21 @@ enum VaultCmd {
 }
 
 #[derive(Subcommand)]
+enum HooksCmd {
+    /// Start no hooks until `oneup hooks resume`
+    Pause,
+    Resume,
+    /// Turn a hook on, by name
+    On {
+        name: String,
+    },
+    /// Turn a hook off, by name
+    Off {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum UnsyncedCmd {
     /// Resolve items `oneup unsynced` lists; without a choice, shows each
     /// item's choices. OneUpDrive carries it out in its next round
@@ -1406,6 +1435,17 @@ async fn run() -> Result<()> {
                 println!("{what}: {why}");
             }
             Ok(())
+        }
+        Cmd::Watch { json } => hooks_cmd::watch(&data_dir(&cli)?, *json).await,
+        Cmd::Hooks { cmd } => {
+            let dir = data_dir(&cli)?;
+            match cmd {
+                None => hooks_cmd::list(&dir),
+                Some(HooksCmd::Pause) => hooks_cmd::pause(&dir, true).await,
+                Some(HooksCmd::Resume) => hooks_cmd::pause(&dir, false).await,
+                Some(HooksCmd::On { name }) => hooks_cmd::enable(&dir, name, true).await,
+                Some(HooksCmd::Off { name }) => hooks_cmd::enable(&dir, name, false).await,
+            }
         }
         Cmd::Stop => {
             let dir = data_dir(&cli)?;

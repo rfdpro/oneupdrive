@@ -21,8 +21,9 @@
 //!
 //! **Control** (`oneup_app::control`, over `oneup_ipc`'s pipe): `oneup
 //! status`, `pause`/`resume` (both directions or one, optionally timed; kept
-//! across restarts), `approve`/`keep`/`discard`, and `sync-now`, all while
-//! the agent keeps running. While both directions are paused, no rounds run
+//! across restarts), `approve`/`keep`/`discard`, `sync-now` and `watch`
+//! (its events), all while the agent keeps running. Event hooks
+//! (`oneup_app::hooks`) start the user's programs on those events. While both directions are paused, no rounds run
 //! at all; the journal is still read, so nothing is missed. A pause that
 //! comes during a round (the user's, or the agent's own on a metered
 //! connection and the like) stops that side's operations from the next one
@@ -261,7 +262,7 @@ async fn run(args: Args) -> Result<()> {
     if settings.compact_database {
         sync::compact(&mut setup::open_store(dir, cache_kib)?, dir);
     }
-    let control = {
+    let (control, synced_folder) = {
         let store = setup::open_store(dir, cache_kib)?;
         let pair = sync::pairing(&store)?;
         let local = pair.local.display().to_string();
@@ -273,8 +274,13 @@ async fn run(args: Args) -> Result<()> {
             discard: args.discard.clone(),
             ..Answers::default()
         };
-        Arc::new(Control::new(Some(dir), local, pair.remote, answers))
+        (Arc::new(Control::new(Some(dir), local, pair.remote, answers)), pair.local)
     };
+    // Event hooks (config.toml [[hook]]): programs started on the events of
+    // `control.events`. They mustn't inherit this process's output handle
+    // (its log): Windows hands a child every inheritable handle.
+    oneup_sys::inherit::keep_std_handles();
+    let mut hooks = oneup_app::hooks::AgentHooks::start(dir, &synced_folder, &control.events);
     let p = control.controls();
     if p.pause_local || p.pause_remote {
         println!("oneupd: {} (`oneup resume` to continue)", describe_pause(p.pause_local, p.pause_remote));
@@ -376,7 +382,7 @@ async fn run(args: Args) -> Result<()> {
     let mut window: Option<SafetyWindow> = None;
     loop {
         let started = Instant::now();
-        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window).await {
+        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window, &mut hooks).await {
             Ok(()) => {
                 println!("oneupd: stopped.");
                 end_flyout(dir, flyout);
@@ -502,6 +508,7 @@ async fn agent(
     memory: Memory,
     key: Option<&oneup_vault::key::Masterkey>,
     window: &mut Option<SafetyWindow>,
+    hooks: &mut oneup_app::hooks::AgentHooks,
 ) -> Result<()> {
     let mut store = setup::open_store(dir, memory.cache_kib)?;
     if memory.map_bytes > 0 {
@@ -546,6 +553,7 @@ async fn agent(
     let busy = Arc::new(Busy::new(oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?.busy));
     engine.hold_busy(Arc::clone(&busy));
     engine.back_off();
+    engine.publish_events(Arc::clone(&control.events));
     // The watcher's own connection, to tell synced items' delete records.
     let deletes = setup::open_store(dir, 1024)
         .inspect_err(|e| tracing::warn!(error = %e, "deletions during a journal loss will be held"))
@@ -594,6 +602,8 @@ async fn agent(
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "config.toml: keeping the previous settings"),
         }
         busy.set_settings(settings.busy);
+        // The hooks, if config.toml changed (`oneup hooks` nudges the agent).
+        hooks.refresh();
         let minute = autopause::local_minute_of_day();
         let auto = auto_pause(&settings, minute);
         if auto != auto_was {

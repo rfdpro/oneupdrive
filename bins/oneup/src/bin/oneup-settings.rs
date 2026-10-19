@@ -699,6 +699,23 @@ mod win {
                 })
                 .await?
             }
+            // Event hooks (config.toml [[hook]]): the list, each checked
+            // as the agent checks it, and turning them on and off.
+            "hooks" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || oneup_app::hooks::json(&d)).await?
+            }
+            "hook_enable" | "hooks_pause" => {
+                let on = args.get("on").and_then(Value::as_bool).context("on: expected true or false")?;
+                if op == "hook_enable" {
+                    oneup_app::config::set_hook_enabled(dir, &text(args, "name"), on)?;
+                } else {
+                    oneup_app::config::set_hooks_paused(dir, on)?;
+                }
+                // The agent reads config.toml again when nudged.
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
             "sync_first" => agent(dir, Call::SyncFirst { path: text(args, "rel") }).await,
             "sign_out" => {
                 // Syncing stops with it; files stay where they are.

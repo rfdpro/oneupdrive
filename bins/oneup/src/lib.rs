@@ -17,8 +17,11 @@ pub mod config;
 pub mod control;
 #[cfg(windows)]
 pub mod datafolders;
+pub mod events;
 pub mod filetree;
 pub mod flow;
+#[cfg(windows)]
+pub mod hooks;
 #[cfg(windows)]
 pub mod identity;
 #[cfg(windows)]
