@@ -31,8 +31,8 @@ use anyhow::{Context, Result, bail};
 use oneup_effects::LocalFs;
 use oneup_exec::{Cloud, Executor, GraphCloud, Report, Skip, link_roots};
 use oneup_gate::{
-    Approval, Approved, Breaker, BreakerKind, Choice, Context as GateContext, Decision, Fingerprint, OldCopy, Overflow,
-    OverflowOutcome, Recent, Side, Withheld, is_mass_sensitive, review_in, store_bytes,
+    Approval, Approved, Breaker, BreakerKind, Choice, Context as GateContext, Decision, Fingerprint, ItemKey, OldCopy,
+    Overflow, OverflowOutcome, Recent, Side, Withheld, is_mass_sensitive, review_in, store_bytes,
 };
 use oneup_graph::Graph;
 use oneup_ipc::Progress;
@@ -511,6 +511,64 @@ pub struct Engine {
     full: std::sync::Mutex<Option<Full>>,
     /// The store's invariants were checked once this run ([`Engine::remote`]).
     verified: std::sync::atomic::AtomicBool,
+    /// Safety stops raised lately, and the lists the user approved.
+    stops: std::sync::Mutex<Stops>,
+}
+
+/// Safety stops an engine raised, and what the user approved of them.
+///
+/// Approving a stop approves its list, item by item (`oneup_gate::ItemKey`):
+/// the rounds after the answer run whatever of it they plan, and the
+/// folders it lists to empty level by level. The list's folders were marked
+/// for planning when it was raised, so the round after the answer plans all
+/// of it, even for a stop a full pass raised.
+#[derive(Debug, Default)]
+struct Stops {
+    /// The stops raised lately, newest last (at most [`STOPS_KEPT`]): an
+    /// answer can come for one a later round already replaced.
+    raised: Vec<Breaker>,
+    /// Items on the lists approved, sorted, until a sequence of rounds
+    /// settles (everything on them done, or no longer planned).
+    approved: Vec<ItemKey>,
+}
+
+/// Stops remembered for an answer at most.
+const STOPS_KEPT: usize = 8;
+
+impl Stops {
+    /// Takes in the user's approvals (`codes`): the lists of stops raised
+    /// here become approved.
+    fn answer(&mut self, codes: &[u64]) {
+        let (taken, kept): (Vec<Breaker>, Vec<Breaker>) =
+            std::mem::take(&mut self.raised).into_iter().partition(|b| codes.contains(&b.fingerprint.0));
+        self.raised = kept;
+        for b in taken {
+            self.approve(&b);
+        }
+    }
+
+    /// A list over the limits approved (an answered code).
+    fn approve(&mut self, b: &Breaker) {
+        self.approved.extend(&b.items);
+        self.approved.sort_unstable();
+        self.approved.dedup();
+    }
+
+    /// Remembers stops a round raised. Returns the Synced items of those
+    /// not seen before, whose folders the caller marks for planning.
+    fn raise(&mut self, breakers: &[Breaker]) -> Vec<oneup_sync::Sid> {
+        let mut mark = Vec::new();
+        for b in breakers {
+            if self.raised.iter().any(|r| r.fingerprint == b.fingerprint) {
+                continue;
+            }
+            mark.extend(&b.sids);
+            self.raised.push(b.clone());
+        }
+        let over = self.raised.len().saturating_sub(STOPS_KEPT);
+        self.raised.drain(..over);
+        mark
+    }
 }
 
 /// OneDrive refused an upload for want of room: uploads wait until it has
@@ -619,7 +677,12 @@ impl Engine {
             backoff: std::sync::atomic::AtomicBool::new(false),
             full: std::sync::Mutex::new(None),
             verified: std::sync::atomic::AtomicBool::new(false),
+            stops: std::sync::Mutex::default(),
         }
+    }
+
+    fn stops_lock(&self) -> std::sync::MutexGuard<'_, Stops> {
+        self.stops.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Holds the uploads of the files `busy` says keep changing.
@@ -1096,14 +1159,17 @@ impl Engine {
             let lines = store.read(|o| {
                 Ok(held
                     .iter()
+                    .map(|op| describe(o, op))
+                    .chain(b.later.iter().map(|op| later_line(o, op)))
                     .take(crate::stoplist::MAX_LINES)
-                    .map(|op| describe(o, op).to_string())
+                    .map(|l| l.to_string())
                     .collect::<Vec<_>>())
             });
             let header = format!("OneUpDrive safety stop {code}: {}. Nothing has been changed yet.", breaker_what(b));
+            let total = held.len() + b.later.len();
             let saved = lines
                 .map_err(anyhow::Error::from)
-                .and_then(|l| Ok(crate::stoplist::write(&self.data_dir, code, &header, &l, held.len())?));
+                .and_then(|l| Ok(crate::stoplist::write(&self.data_dir, code, &header, &l, total)?));
             if let Err(e) = saved {
                 tracing::warn!(error = %e, "can't save the list of what a safety stop holds back");
             }
@@ -1221,9 +1287,20 @@ impl Engine {
             };
             extra.extend(chosen.ops.iter().map(|(op, _)| op.clone()));
             let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra };
+            // Stops approved since the last round: their lists are approved.
+            let listed = {
+                let mut stops = self.stops_lock();
+                stops.answer(&controls.answers.approve);
+                stops.approved.clone()
+            };
             let t = std::time::Instant::now();
             let Planned { review, problems, upto, suspicious, policy, synced, planning } =
-                plan_round(&store, Some(self.exec.local()), scope, controls, window, &user_rules, modes)?;
+                plan_round(&store, Some(self.exec.local()), scope, controls, window, &user_rules, modes, &listed)?;
+            // Approved by their codes (`oneup sync --approve`): their lists
+            // stay approved for the folders they empty in later rounds.
+            for b in &review.answered {
+                self.stops_lock().approve(b);
+            }
             // Said, so a slow start can be told from a slow round (one
             // can take minutes on a large folder).
             if scope == Scope::All || t.elapsed().as_secs() >= 10 {
@@ -1240,6 +1317,13 @@ impl Engine {
                     let detail = format!("{}; nothing was changed (code {:016x})", breaker_what(b), b.fingerprint.0);
                     let e = notice(ActivityOutcome::Waiting, "safety stop", detail);
                     self.log_once(&mut store, format!("stop {:x}", b.fingerprint.0), e)?;
+                }
+                // Every round while it stands, and the one after the answer,
+                // plans all of its list: a full pass's stop would otherwise
+                // shrink to what the marks cover (a new code, or none).
+                let mark = self.stops_lock().raise(&review.breakers);
+                if !mark.is_empty() {
+                    store.write(|o| o.dirty_mark_synced(&mark))?;
                 }
                 self.save_stop_lists(&store, &review, &suspicious);
                 out.breakers = review.breakers;
@@ -1371,6 +1455,8 @@ impl Engine {
                     synced_items: synced,
                     recent: window,
                     approvals: &approvals,
+                    approved: &listed,
+                    pending: &[],
                     decisions: &decisions,
                     room: None,
                     suspicious: &[],
@@ -1459,6 +1545,10 @@ impl Engine {
                 })?;
             }
             if let Some(end) = end {
+                if end == End::Settled {
+                    // Everything approved ran, or no longer applies.
+                    self.stops_lock().approved.clear();
+                }
                 out.end = end;
                 return Ok((store, out));
             }
@@ -1638,6 +1728,8 @@ impl Engine {
 /// different code). `fs`: the sync folder, to see how much room its version
 /// store has (only listed when the plan would add to it; without it, the
 /// store is taken to have no limit, which only a first dry run does).
+/// `approved`: items on lists the user approved (sorted).
+#[allow(clippy::too_many_arguments)]
 fn plan_round<'a>(
     store: &Store,
     fs: Option<&LocalFs>,
@@ -1646,6 +1738,7 @@ fn plan_round<'a>(
     recent: Recent,
     rules: &'a RuleSet,
     modes: Modes,
+    approved: &[ItemKey],
 ) -> Result<Planned<'a>> {
     let approvals = controls.answers.approvals();
     let decisions = controls.answers.decisions();
@@ -1656,19 +1749,21 @@ fn plan_round<'a>(
     };
     let synced = store.read(|o| o.synced_stats())?.items.max(0) as u64;
     let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?);
-    let (ops, problems, upto) = store.read(|o| {
+    let (ops, problems, upto, pending) = store.read(|o| {
         let dirty = o.dirty_scope()?;
         let folders = match scope {
             Scope::All => all_folders(&Parked::with_rules(o, &planning.hide))?,
             Scope::Dirty => dirty.folders,
         };
         let (mut ops, problems) = planning.plan(o, folders)?;
+        // The folders its deletions empty, for a stop to list with them.
+        let pending = oneup_sync::pending_deletes(&Parked::with_rules(o, &planning.hide), &ops, planning.flow)?;
         add_extra(&mut ops, modes.extra);
         let problems = problems
             .into_iter()
             .map(|(id, name, why)| Ok((o.local_path_of(id.0)?.unwrap_or(name), why)))
             .collect::<oneup_store::Result<Vec<_>>>()?;
-        Ok((ops, problems, dirty.upto))
+        Ok((ops, problems, dirty.upto, pending))
     })?;
     let room = match fs {
         Some(fs) if store_bytes(&policy, &ops) > 0 => fs.room(&crate::versions::trim_settings(store)?)?,
@@ -1682,6 +1777,8 @@ fn plan_round<'a>(
         synced_items: synced,
         recent,
         approvals: &approvals,
+        approved,
+        pending: &pending,
         decisions: &decisions,
         room,
         suspicious: &suspicious,
@@ -1899,7 +1996,7 @@ async fn dry_run(
     let pull = crate::config::load_rules(data_dir, &store)?.cloud != crate::config::CloudCopies::Keep;
     let modes = Modes { pull, extra: Vec::new() };
     let Planned { review, problems, .. } =
-        plan_round(&store, fs.as_ref(), Scope::All, &controls, Recent::default(), &user_rules, modes)?;
+        plan_round(&store, fs.as_ref(), Scope::All, &controls, Recent::default(), &user_rules, modes, &[])?;
     println!("Dry run: nothing is changed. The first round would do:");
     let limit = limit.unwrap_or(usize::MAX);
     let mut totals = std::collections::BTreeMap::<&str, u64>::new();
@@ -1920,9 +2017,19 @@ async fn dry_run(
                 shown += 1;
             }
         }
+        // A stop's folders to delete once emptied, in later rounds.
+        let needs = withheld_label(Withheld::Breaker(Side::Remote));
+        for op in review.breakers.iter().flat_map(|b| &b.later) {
+            *totals.entry(needs).or_default() += 1;
+            if shown < limit {
+                println!("  [{needs}] {}", later_line(o, op));
+                shown += 1;
+            }
+        }
         Ok(())
     })?;
-    let all = review.approved.len() + review.withheld.len();
+    let later: usize = review.breakers.iter().map(|b| b.later.len()).sum();
+    let all = review.approved.len() + review.withheld.len() + later;
     if all == 0 {
         println!("  nothing: both sides agree");
     } else {
@@ -2295,6 +2402,13 @@ fn transfer_bytes(o: &Ops<'_>, approved: &[Approved], on_demand: bool) -> oneup_
         total += u64::try_from(size).unwrap_or(0);
     }
     Ok(total)
+}
+
+/// A folder a stop lists to delete once the deletions on its list emptied
+/// it (`oneup_gate::Breaker::later`).
+fn later_line(o: &Ops<'_>, op: &Op) -> Line {
+    let l = describe(o, op);
+    Line { folder: true, note: format!("{}, once empty", l.note), ..l }
 }
 
 fn describe_approved(o: &Ops<'_>, a: &Approved) -> Line {
@@ -2911,6 +3025,35 @@ mod tests {
         );
         assert!(seen.is_empty(), "forgotten once the observer read past it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop's list folders are marked once while it stands; approving its
+    /// code approves its items, for the rounds until they settle.
+    #[test]
+    fn an_approved_stop_approves_its_list_and_its_folders_are_marked_once() {
+        let ops: Vec<Op> = (0..30u64)
+            .map(|i| Op::RecycleLocal {
+                sid: i,
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+            })
+            .collect();
+        let breakers = oneup_gate::review(&oneup_gate::Policy::default(), 100, &[], ops).breakers;
+        let code = breakers[0].fingerprint.0;
+        let mut s = Stops::default();
+        assert_eq!(s.raise(&breakers), (0..30).collect::<Vec<_>>());
+        assert!(s.raise(&breakers).is_empty(), "marked once while it stands");
+        s.answer(&[code ^ 1]);
+        assert!(s.approved.is_empty(), "another code approves nothing");
+        s.answer(&[code]);
+        assert_eq!(s.approved, breakers[0].items);
+        assert!(s.raised.is_empty());
+        // At most a few stops are remembered for an answer.
+        for i in 0..20u64 {
+            let mut b = breakers[0].clone();
+            b.fingerprint = oneup_gate::Fingerprint(i);
+            s.raise(&[b]);
+        }
+        assert_eq!(s.raised.len(), STOPS_KEPT);
     }
 
     #[test]

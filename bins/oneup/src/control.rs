@@ -689,6 +689,9 @@ mod tests {
             synced_items: 100,
             fingerprint: Fingerprint(0xab),
             kind: oneup_gate::BreakerKind::Mass,
+            items: Vec::new(),
+            later: Vec::new(),
+            sids: Vec::new(),
         };
         let overflow = Overflow {
             count: 2,
