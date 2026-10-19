@@ -34,6 +34,11 @@
 //!
 //! A failed check is [`Error::Changed`], which the executor treats as "skip;
 //! plan again from fresh state next round".
+//!
+//! Effects of more than one step (keeping an item in the version store,
+//! replacing a file by a download) have crash points between their steps
+//! under the test-only `crash-test` feature (`LocalFs::crash_after`), so
+//! the executor's crash tests also stop them half done.
 
 pub mod name;
 pub mod versions;
@@ -45,6 +50,8 @@ mod ondemand;
 #[cfg(windows)]
 pub mod release;
 
+#[cfg(all(windows, feature = "crash-test"))]
+pub use local::Crashed;
 #[cfg(windows)]
 pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource};
 #[cfg(windows)]

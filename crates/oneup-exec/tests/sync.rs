@@ -1872,6 +1872,71 @@ async fn a_crash_at_any_point_of_a_round_loses_nothing() {
     }
 }
 
+/// What a crash inside a replacing download left: whether the file was in
+/// its place, and with what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeftAt {
+    /// Nothing at the name: the old version kept, the new one not placed.
+    Free,
+    Placed(Vec<u8>),
+}
+
+/// A crash inside a download that replaces a file, at each of its steps:
+/// the old version moved into the version store, the new one renamed into
+/// place, the old copy discarded (when OneDrive's history has it). Between
+/// the two renames the name is free and the old version is only in the
+/// version store. After a restart the new version arrives, the old one is
+/// still in the version store or OneDrive's history, nothing is left in
+/// staging, and the store's invariants hold. With and without keeping
+/// replaced files.
+#[tokio::test]
+async fn a_crash_inside_a_replacing_download_loses_nothing() {
+    for keep in [false, true] {
+        let mut left = Vec::new();
+        for n in 0.. {
+            let cloud = Fake::new();
+            let mut s = Sync::on_disk(&format!("replace-crash-{keep}-{n}"), cloud.clone());
+            s.policy.keep_replaced = keep;
+            write(&s.p("a.txt"), b"v1");
+            s.settle().await;
+            cloud.edit("a.txt", b"v2");
+            s.exec.crash_after(Some(n));
+            let r = s.attempt().await;
+            if r.halted.as_deref() != Some(CRASHED) {
+                assert!(r.done.iter().any(|op| matches!(op, Op::Download { replace: Some(_), .. })), "{r:?}");
+                break;
+            }
+            let here = std::fs::read(s.p("a.txt")).ok();
+            left.push(here.clone().map_or(LeftAt::Free, LeftAt::Placed));
+            if here.is_none() {
+                assert!(s.versions().contains(&b"v1".to_vec()), "keep {keep}, crash point {n}: v1 isn't kept");
+            }
+
+            let mut s = s.restart();
+            let staging = std::fs::read_dir(s.p(".oneup/staging")).unwrap().count();
+            assert_eq!(staging, 0, "keep {keep}, crash point {n}: a partial download outlived the restart");
+            s.obs.catch_up().unwrap();
+            let store = s.obs.store_mut();
+            let r = s.exec.run(store, Vec::new()).await;
+            assert!(r.halted.is_none(), "keep {keep}, crash point {n}: {r:?}");
+            assert_eq!(store.read(|o| o.meta_under("exec.pending")).unwrap(), vec![]);
+            s.settle().await;
+            assert_eq!(std::fs::read(s.p("a.txt")).unwrap(), b"v2", "keep {keep}, crash point {n}");
+            assert!(s.versions().contains(&b"v1".to_vec()) || cloud.holds(b"v1"), "keep {keep}, crash point {n}");
+            if keep {
+                assert!(s.versions().contains(&b"v1".to_vec()), "keep {keep}, crash point {n}: v1 isn't kept");
+            }
+            let t = local_tree(&s.dir.0);
+            assert_eq!(names(&t), BTreeSet::from(["/a.txt"]), "keep {keep}, crash point {n}");
+        }
+        // The crashes did land inside the effect: between its renames, and
+        // after the new version was placed but before the old was dropped.
+        assert!(left.contains(&LeftAt::Free), "keep {keep}: {left:?}");
+        assert!(left.contains(&LeftAt::Placed(b"v2".to_vec())), "keep {keep}: {left:?}");
+        assert!(left.len() >= 5, "keep {keep}: only {} crash points", left.len());
+    }
+}
+
 fn user_rules(lines: &[&str]) -> RuleSet {
     RuleSet::new(&[] as &[&str], lines).unwrap()
 }

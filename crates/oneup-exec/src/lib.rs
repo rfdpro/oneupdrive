@@ -45,7 +45,8 @@
 //!   is settled right after the operation, before it releases its claims,
 //!   or at the start of the next run: if the folder shows the effect didn't
 //!   happen, the record is undone. `tests/sync.rs` crashes a round at every
-//!   such point (feature `crash-test`) and restarts it.
+//!   such point, and between the steps of effects that take several
+//!   (feature `crash-test`), and restarts it.
 //! * A failed precondition **skips** the operation; the next round re-plans
 //!   it from fresh state. A failed identity check of the sync folder, or a
 //!   database error, **halts** the round; operations still under way are

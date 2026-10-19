@@ -221,6 +221,21 @@ impl ChangedMeanwhile {
     }
 }
 
+/// Test-only (feature `crash-test`): what an effect stopped by an injected
+/// crash returns ([`LocalFs::crash_after`]). It travels as an I/O error, so
+/// `Error` is the same with the feature on or off.
+#[cfg(feature = "crash-test")]
+#[derive(Debug, thiserror::Error)]
+#[error("injected crash")]
+pub struct Crashed;
+
+#[cfg(feature = "crash-test")]
+impl Crashed {
+    pub fn is(e: &Error) -> bool {
+        matches!(e, Error::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<Self>()))
+    }
+}
+
 /// One sync folder, opened for changes after its identity check.
 #[derive(Debug)]
 pub struct LocalFs {
@@ -237,6 +252,9 @@ pub struct LocalFs {
     /// cloud content arrives as placeholders (`ondemand.rs`).
     on_demand: bool,
     locator: Locate,
+    /// Crash points left to pass before the injected crash; negative: off.
+    #[cfg(feature = "crash-test")]
+    crash: std::sync::atomic::AtomicI64,
 }
 
 /// Where the state database last saw a local item: its path relative to
@@ -300,6 +318,8 @@ impl LocalFs {
             seq: AtomicU64::new(0),
             on_demand,
             locator: Locate::default(),
+            #[cfg(feature = "crash-test")]
+            crash: std::sync::atomic::AtomicI64::new(-1),
         };
         match std::fs::read_to_string(fs.engine.join(MARKER)) {
             Ok(_) => {}
@@ -398,6 +418,38 @@ impl LocalFs {
     /// Whether the sync folder is in Files On-Demand mode (see `ondemand.rs`).
     pub fn on_demand(&self) -> bool {
         self.on_demand
+    }
+
+    /// Test-only: the crash point after `n` others have passed (here and
+    /// wherever the caller counts through [`LocalFs::crash_now`]) is where
+    /// the process dies. One inside an effect stops it there and returns
+    /// [`Crashed`]: nothing after it runs, no rollback included. `None`
+    /// turns it off.
+    #[cfg(feature = "crash-test")]
+    pub fn crash_after(&self, n: Option<u32>) {
+        self.crash.store(n.map_or(-1, i64::from), Relaxed);
+    }
+
+    /// Test-only: whether a crash is still to come ([`LocalFs::crash_after`]).
+    #[cfg(feature = "crash-test")]
+    pub fn crash_armed(&self) -> bool {
+        self.crash.load(Relaxed) >= 0
+    }
+
+    /// Test-only: counts a crash point; `true` if the process dies here.
+    #[cfg(feature = "crash-test")]
+    pub fn crash_now(&self) -> bool {
+        self.crash.fetch_sub(1, Relaxed) == 0
+    }
+
+    /// A place inside a multi-step effect where a killed process would
+    /// leave it half done. Without the `crash-test` feature, nothing.
+    fn crash_point(&self) -> Result<()> {
+        #[cfg(feature = "crash-test")]
+        if self.crash_now() {
+            return Err(Error::Io(std::io::Error::other(Crashed)));
+        }
+        Ok(())
     }
 
     pub(crate) fn volume(&self) -> &Volume {
@@ -555,6 +607,10 @@ impl LocalFs {
                 // so the content checked is the content dropped.
                 let drop_old = a.old_copy() == OldCopy::DropIfSynced && self.is_synced(&old, pre, synced)?;
                 let kept = self.keep(&old, &old_entry, &old_path)?;
+                // Killed here, the old version is in the version store and
+                // the new one in staging, which the next start clears: the
+                // name is free until the next round downloads it again.
+                self.crash_point()?;
                 if let Err(e) = win::rename_handle(&new, &old_path) {
                     return match win::rename_handle(&old, &old_path) {
                         Ok(()) => {
@@ -569,7 +625,9 @@ impl LocalFs {
                         }
                     };
                 }
-                if drop_old { self.discard_kept(old, &kept) } else { Some(kept) }
+                // Killed here, both versions are kept: the new one in place.
+                self.crash_point()?;
+                if drop_old { self.discard_kept(old, &kept)? } else { Some(kept) }
             }
         };
         // Placed: the staging path no longer holds anything of ours.
@@ -737,16 +795,19 @@ impl LocalFs {
 
     /// Deletes an old copy just moved into the version store, through the
     /// handle it was checked on, and removes its slot. If that fails, it
-    /// simply stays in the store (`Some`).
-    fn discard_kept(&self, h: Handle, kept: &Path) -> Option<PathBuf> {
+    /// simply stays in the store (`Some`). Errs only for an injected crash.
+    fn discard_kept(&self, h: Handle, kept: &Path) -> Result<Option<PathBuf>> {
         if let Err(e) = win::delete_handle(&h) {
             tracing::warn!(error = %e, "an old copy couldn't be removed; it stays in the version store");
-            return Some(kept.to_path_buf());
+            return Ok(Some(kept.to_path_buf()));
         }
         // The deletion completes when the handle closes.
         drop(h);
+        // Killed here, the slot holds only its origin, which the store's
+        // listing skips.
+        self.crash_point()?;
         self.drop_slot(kept);
-        None
+        Ok(None)
     }
 
     // ------------------------------------------------------- version store
@@ -1026,12 +1087,17 @@ impl LocalFs {
     /// and returns its new path.
     fn keep(&self, h: &Handle, entry: &DirEntry, from: &Path) -> Result<PathBuf> {
         let slot = self.new_slot()?;
+        // Killed here, an empty slot is left, which the store's listing
+        // skips; the item is where it was.
+        self.crash_point()?;
         let name = if entry.name_lossy || entry.name.is_empty() { "item" } else { entry.name.as_str() };
         let kept = slot.join(name);
         if let Err(e) = win::rename_handle(h, &kept) {
             let _ = std::fs::remove_dir(&slot);
             return Err(e.into());
         }
+        // Killed here, the item is kept without its origin.
+        self.crash_point()?;
         // Best effort: where it came from, for `oneup restore`. The item is
         // safe either way.
         if let Ok(rel) = from.strip_prefix(&self.root) {
