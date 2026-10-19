@@ -1280,6 +1280,42 @@ fn folders_moved_into_each_other_dont_loop() {
     assert_converged(&w, &BTreeSet::new());
 }
 
+/// Synced `C/A`. Here, A goes to the top and C into A; in the cloud, A goes
+/// into X. The round's move of A is refused (its preconditions failed, a
+/// name was in the way), and C's into A must not happen without it: the
+/// Synced tree would have C below A and A below C, a loop that no plan from
+/// the top reaches again (simulation seed 60953 of the journal-loss run).
+/// C waits a round instead.
+#[test]
+fn a_folder_never_moves_below_itself_in_the_synced_tree() {
+    let mut w = World::new();
+    let c = w.l_create(LOCAL_ROOT, "C", NodeKind::Folder, 0);
+    let a = w.l_create(c, "A", NodeKind::Folder, 0);
+    w.l_create(LOCAL_ROOT, "X", NodeKind::Folder, 0);
+    settle(&mut w, false);
+    let sid_a = w.bases.values().find(|b| b.name == "A").map(|b| b.sid);
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    edit(w.local.get_mut(&c), |it| it.parent = Some(a));
+    let (ra, rx) = (rid(&w, "A"), rid(&w, "X"));
+    let e = w.etag();
+    edit(w.remote.get_mut(&ra), |it| (it.parent, it.etag) = (Some(rx), e));
+
+    for op in plan_both(&w) {
+        if op.subjects().0 != sid_a {
+            w.apply(&op);
+        }
+    }
+    for b in w.bases.values() {
+        let mut cur = Some(b.sid);
+        for _ in 0..=w.bases.len() {
+            cur = cur.and_then(|s| w.bases.get(&s)).and_then(|b| b.parent);
+        }
+        assert_eq!(cur, None, "{b:?} doesn't reach the top of the Synced tree");
+    }
+    settle(&mut w, false);
+    assert_converged(&w, &BTreeSet::new());
+}
+
 /// How a scenario takes an item away from one side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gone {
