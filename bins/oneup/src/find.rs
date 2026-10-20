@@ -11,7 +11,20 @@ use oneup_app::t;
 /// Lists what's found: placement, then the path (a folder ends in `/`).
 fn print(found: &Found) {
     for i in &found.items {
-        println!("{:<13} {}", i.placement.name(), shown(i));
+        println!("{:<13} {}", place(i.placement), shown(i));
+    }
+}
+
+/// Where an item is, in the user's language (`--json` keeps the names).
+fn place(p: search::Placement) -> String {
+    use search::Placement as P;
+    match p {
+        P::Here => t!("here"),
+        P::OnlineOnly => t!("online-only"),
+        P::NotHereYet => t!("not here yet"),
+        P::Excluded => t!("excluded"),
+        P::NotSynced => t!("not synced"),
+        P::InOneDrive => t!("in OneDrive"),
     }
 }
 
@@ -60,7 +73,7 @@ pub async fn run(
         return Ok(());
     }
     if found.too_many {
-        println!("{}", search::TOO_MANY);
+        println!("{}", oneup_app::l10n::message(search::TOO_MANY, &[]));
     } else if found.items.is_empty() {
         println!("{}", t!("Nothing found."));
     }
@@ -75,7 +88,7 @@ pub async fn run(
         }
         print(f);
     }
-    println!("{}", search::LIMIT_NOTE);
+    println!("{}", oneup_app::l10n::message(search::LIMIT_NOTE, &[]));
     Ok(())
 }
 

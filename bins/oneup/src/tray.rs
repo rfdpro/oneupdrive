@@ -8,7 +8,8 @@ use std::collections::HashSet;
 use oneup_ipc::{Activity, Problem, Status};
 use oneup_sys::tray::{Glyph, Item, Kind};
 
-use crate::{t, t_key};
+use crate::l10n::{Locale, current};
+use crate::{t, t_in, t_key};
 
 /// What the tray knows of the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +77,7 @@ fn headline(v: &View, failures: bool) -> String {
     let s = match v {
         View::Connecting => return t!("Connecting…"),
         View::NotRunning => return t!("Not running"),
-        View::Stopped(p) => return t!("Stopped: {what}", what = &p.title),
+        View::Stopped(p) => return t!("Stopped: {what}", what = crate::problem::shown(p, current()).0),
         View::Unreachable(e) => return t!("Can't connect: {why}", why = e),
         View::Running(s) => s,
     };
@@ -85,18 +86,23 @@ fn headline(v: &View, failures: bool) -> String {
         return t!("{n, plural, one {Needs your review} other {# need your review}}", n = waiting);
     }
     if let Some(why) = &s.auto_pause {
-        return t!("Paused: {why}", why = why);
+        // The agent says why in English (`autopause`); shown in the reader's language.
+        return t!("Paused: {why}", why = crate::autopause::said(why, s.auto_pause_hours.as_deref(), current()));
     }
     if let Some(p) = working(s) {
-        let pass = if p.round > 1 { t!(" (pass {n})", n = p.round) } else { String::new() };
         let percent = p.items_done * 100 / p.items_total.max(1);
-        return t!(
-            "Syncing {done} of {total} items ({percent}%){pass}",
-            done = p.items_done,
-            total = p.items_total,
-            percent = percent,
-            pass = pass
-        );
+        let (done, total) = (p.items_done, p.items_total);
+        return if p.round > 1 {
+            t!(
+                "Syncing {done} of {total} items ({percent}%) (pass {pass})",
+                done = done,
+                total = total,
+                percent = percent,
+                pass = p.round
+            )
+        } else {
+            t!("Syncing {done} of {total} items ({percent}%)", done = done, total = total, percent = percent)
+        };
     }
     match s.activity {
         Activity::Starting => t!("Checking all folders…"),
@@ -105,18 +111,21 @@ fn headline(v: &View, failures: bool) -> String {
         Activity::Stopping => t!("Stopping…"),
         Activity::WaitingForYou => t!("Needs your review"),
         Activity::Retrying => match &s.problem {
-            Some(p) => t!("Problem: {what}", what = &p.title),
+            Some(p) => t!("Problem: {what}", what = crate::problem::shown(p, current()).0),
             None => t!("Retrying soon"),
         },
         // OneDrive full: up to date otherwise, but uploads wait.
         Activity::Idle if s.problem.is_some() => {
-            t!("Problem: {what}", what = s.problem.as_ref().map_or("", |p| p.title.as_str()))
+            t!(
+                "Problem: {what}",
+                what = s.problem.as_ref().map(|p| crate::problem::shown(p, current()).0).unwrap_or_default()
+            )
         }
         Activity::Idle => match (s.paused.local, s.paused.remote) {
             (true, false) => t!("Paused: changes to this PC"),
             (false, true) => t!("Paused: changes to OneDrive"),
             _ => match &s.unsynced {
-                Some(u) if failures => t!("Up to date · {items} failed", items = unsynced_count(u)),
+                Some(u) if failures => t!("Up to date · {items} failed", items = unsynced_count(u, current())),
                 _ => t!("Up to date"),
             },
         },
@@ -129,17 +138,23 @@ fn headline(v: &View, failures: bool) -> String {
 const PATIENT_ATTEMPTS: u32 = 4;
 
 /// The notification for a problem: what it is and what to do.
-fn problem_notice(title: &str, p: &Problem) -> Notice {
-    Notice { title: title.into(), text: format!("{} {}", p.title, p.action), kind: Kind::Error }
+/// `stopped`: the agent ended with it (else it's being retried).
+fn problem_notice(stopped: bool, p: &Problem, loc: &Locale) -> Notice {
+    let (what, _, action) = crate::problem::shown(p, loc);
+    Notice {
+        title: if stopped { t_in!(loc, "OneUpDrive stopped") } else { t_in!(loc, "Sync problem") },
+        text: t_in!(loc, "{problem} {action}", problem = what, action = action),
+        kind: Kind::Error,
+    }
 }
 
-/// `12 items`, `1,000 items or more`.
-pub(crate) fn unsynced_count(u: &oneup_ipc::Unsynced) -> String {
+/// `12 items`, `1,000 items or more`, in `loc`'s language.
+pub(crate) fn unsynced_count(u: &oneup_ipc::Unsynced, loc: &Locale) -> String {
     let n = u.count as u64;
     if u.more {
-        t!("{n, plural, one {# item} other {# items}} or more", n = n)
+        t_in!(loc, "{n, plural, one {# item} other {# items}} or more", n = n)
     } else {
-        t!("{n, plural, one {# item} other {# items}}", n = n)
+        t_in!(loc, "{n, plural, one {# item} other {# items}}", n = n)
     }
 }
 
@@ -152,12 +167,17 @@ fn working(s: &Status) -> Option<&oneup_ipc::Progress> {
 
 /// A time left, roughly: "about 25 min", "about 2 h 10 min".
 pub(crate) fn time_left(ms: u64) -> String {
+    time_left_in(ms, current())
+}
+
+/// [`time_left`] in `loc`'s language.
+pub(crate) fn time_left_in(ms: u64, loc: &Locale) -> String {
     let min = ms.div_ceil(60_000);
     match min {
-        0 | 1 => t!("less than a minute"),
-        m if m < 60 => t!("about {m} min", m = m),
-        m if m % 60 == 0 || m >= 600 => t!("about {h} h", h = (m + 30) / 60),
-        m => t!("about {h} h {m} min", h = m / 60, m = m % 60),
+        0 | 1 => t_in!(loc, "less than a minute"),
+        m if m < 60 => t_in!(loc, "about {m} min", m = m),
+        m if m % 60 == 0 || m >= 600 => t_in!(loc, "about {h} h", h = (m + 30) / 60),
+        m => t_in!(loc, "about {h} h {m} min", h = m / 60, m = m % 60),
     }
 }
 
@@ -281,12 +301,13 @@ fn note(label: impl Into<String>) -> Item {
     Item::Action { id: id::NOTE, label: label.into(), enabled: false, glyph: None }
 }
 
-/// The notification for a new safety stop.
-pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop) -> Notice {
+/// The notification for a new safety stop, in `loc`'s language.
+pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop, loc: &Locale) -> Notice {
     if st.kind == "content" {
         return Notice {
-            title: t!("Files may be encrypted"),
-            text: t!(
+            title: t_in!(loc, "Files may be encrypted"),
+            text: t_in!(
+                loc,
                 "{n} changed files look encrypted, possibly by ransomware. They weren't uploaded. Check them before continuing.",
                 n = st.count
             ),
@@ -295,11 +316,19 @@ pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop) -> Notice {
     }
     let n = st.items();
     Notice {
-        title: t!("Review needed"),
+        title: t_in!(loc, "Review needed"),
         text: if st.side == "local" {
-            t!("{n} items on this PC would be deleted, overwritten or moved. Nothing changes until you review.", n = n)
+            t_in!(
+                loc,
+                "{n} items on this PC would be deleted, overwritten or moved. Nothing changes until you review.",
+                n = n
+            )
         } else {
-            t!("{n} items in OneDrive would be deleted, overwritten or moved. Nothing changes until you review.", n = n)
+            t_in!(
+                loc,
+                "{n} items in OneDrive would be deleted, overwritten or moved. Nothing changes until you review.",
+                n = n
+            )
         },
         kind: Kind::Warning,
     }
@@ -351,7 +380,7 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
                 items.push(action(id::PROBLEM, t!("Error details…"), glyph::ERROR));
             }
             if let Some(u) = &s.unsynced {
-                let label = t!("Sync failure: {items}", items = unsynced_count(u));
+                let label = t!("Sync failure: {items}", items = unsynced_count(u, current()));
                 items.push(action(id::LIST_UNSYNCED, label, glyph::INFO));
             }
             if items.len() > waiting {
@@ -433,17 +462,17 @@ impl Notices {
                 self.stop_expected |= s.activity == Activity::Stopping;
                 for st in &s.safety_stops {
                     if self.shown.insert(st.code.clone()) {
-                        out.push(stop_notice(st));
+                        out.push(stop_notice(st, current()));
                     }
                 }
                 if let Some(o) = &s.prune_offer
                     && self.shown.insert(o.code.clone())
                 {
                     out.push(Notice {
-                        title: "Excluded items in OneDrive".into(),
-                        text: format!(
-                            "{} excluded items are still in OneDrive. Click to remove or keep them.",
-                            o.items
+                        title: t!("Excluded items in OneDrive"),
+                        text: t!(
+                            "{n} excluded items are still in OneDrive. Click to remove or keep them.",
+                            n = o.items
                         ),
                         kind: Kind::Info,
                     });
@@ -453,10 +482,10 @@ impl Notices {
                     && self.shown.insert(o.code.clone())
                 {
                     out.push(Notice {
-                        title: "Review needed".into(),
-                        text: format!(
-                            "{} files deleted in OneDrive don't fit in the version store. They stay here until you decide.",
-                            o.count
+                        title: t!("Review needed"),
+                        text: t!(
+                            "{n} files deleted in OneDrive don't fit in the version store. They stay here until you decide.",
+                            n = o.count
                         ),
                         kind: Kind::Warning,
                     });
@@ -466,17 +495,17 @@ impl Notices {
                     if (!patient || p.attempts >= PATIENT_ATTEMPTS)
                         && self.shown.insert(format!("problem:{}:{}", p.kind, p.since_ms))
                     {
-                        out.push(problem_notice("Sync problem", p));
+                        out.push(problem_notice(false, p, current()));
                     }
                 }
             }
             View::NotRunning | View::Stopped(_) => {
                 if self.was_running && !self.stop_expected {
                     out.push(match v {
-                        View::Stopped(p) => problem_notice("OneUpDrive stopped", p),
+                        View::Stopped(p) => problem_notice(true, p, current()),
                         _ => Notice {
-                            title: "OneUpDrive stopped".into(),
-                            text: "Files aren't syncing. Start it from this icon's menu.".into(),
+                            title: t!("OneUpDrive stopped"),
+                            text: t!("Files aren't syncing. Start it from this icon's menu."),
                             kind: Kind::Error,
                         },
                     });
@@ -728,6 +757,7 @@ mod tests {
             overflow: None,
             problem: None,
             auto_pause: None,
+            auto_pause_hours: None,
             prune_offer: None,
             progress: None,
             unsynced: None,
@@ -909,6 +939,32 @@ mod tests {
 
     /// Problems that need the user are notified at once, once a spell;
     /// those that usually clear by themselves only once they've lasted.
+    #[test]
+    fn a_problem_notice_is_one_message_in_the_readers_language() {
+        let de = r#"{
+            "Sync problem": "Synchronisierungsproblem",
+            "OneUpDrive stopped": "OneUpDrive angehalten",
+            "{problem} {action}": "{problem} Bitte: {action}",
+            "This PC's disk is full": "Der Datenträger ist voll",
+            "Free up space on the disk, or turn on Files On-Demand (Settings > Files) so files download only when opened.": "Schaffen Sie Platz."
+        }"#;
+        let de =
+            Locale::with_catalogue("de", de, "de-DE", crate::l10n::Numbers::new(",", ".", "3;0")).expect("catalogue");
+        let e = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let p = crate::problem::describe(&e, None, 0, Some(1));
+        assert_eq!(p.kind, "disk-full");
+        let n = problem_notice(false, &p, &de);
+        assert_eq!(n.title, "Synchronisierungsproblem");
+        assert_eq!(n.text, "Der Datenträger ist voll Bitte: Schaffen Sie Platz.");
+        assert_eq!(problem_notice(true, &p, &de).title, "OneUpDrive angehalten");
+        let en = problem_notice(true, &p, &Locale::english());
+        assert_eq!(en.title, "OneUpDrive stopped");
+        assert_eq!(
+            en.text,
+            "This PC's disk is full Free up space on the disk, or turn on Files On-Demand (Settings > Files) so files download only when opened."
+        );
+    }
+
     #[test]
     fn problems_are_notified_when_worth_it() {
         let mut n = Notices::default();

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use oneup_ipc::{Call, ClientError, Status, Unsynced};
 use serde_json::{Value, json};
 
+use crate::l10n::Locale;
+use crate::t_in;
 use crate::tray::View;
 
 /// How far back conflict copies are listed.
@@ -130,51 +132,67 @@ impl Item {
     }
 }
 
-/// The list for one data folder, most pressing first: what stops all
-/// syncing, then what waits for an answer, then the rest.
+/// The list for one data folder, most pressing first, in English (as
+/// `--json` gives it): [`collect_in`].
 pub fn collect(f: &Facts, now_ms: i64) -> Vec<Item> {
+    collect_in(f, now_ms, &Locale::english())
+}
+
+/// The list for one data folder, most pressing first: what stops all
+/// syncing, then what waits for an answer, then the rest. Said in `loc`'s
+/// language; the kinds and codes are the same in every language.
+pub fn collect_in(f: &Facts, now_ms: i64, loc: &Locale) -> Vec<Item> {
     let mut out = Vec::new();
     // Nothing else applies before the main folder syncs anything. An extra
     // pair or vault without its records still has an agent that should run,
     // or that stopped saying why.
     if !f.set_up && f.pair.is_none() {
         let (title, detail, action) = crate::problem::Kind::Setup.words();
-        out.push(Item::new("setup", title, detail, action));
+        out.push(Item::new("setup", loc.message(title, &[]), loc.message(detail, &[]), loc.message(action, &[])));
         return tagged(out, f);
     }
     if let Some(e) = &f.children_unreadable {
         out.push(Item::new(
             "records",
-            "Other folders not checked",
-            "OneUpDrive couldn't read which other folder pairs and vaults it has, so they aren't listed here.",
-            format!("Check that the pairs and vaults folders in {} can be opened. Details: {e}", f.dir.display()),
+            t_in!(loc, "Other folders not checked"),
+            t_in!(
+                loc,
+                "OneUpDrive couldn't read which other folder pairs and vaults it has, so they aren't listed here."
+            ),
+            t_in!(
+                loc,
+                "Check that the pairs and vaults folders in {folder} can be opened. Details: {why}",
+                folder = f.dir.display().to_string(),
+                why = e
+            ),
         ));
     }
     if f.pair.is_none() && !f.signed_in {
         out.push(Item::new(
             "signed_out",
-            "Not signed in",
-            "Nothing syncs until you sign in.",
-            "Open Settings > Accounts and select Sign in, or run `oneup login`.",
+            t_in!(loc, "Not signed in"),
+            t_in!(loc, "Nothing syncs until you sign in."),
+            t_in!(loc, "Open Settings > Accounts and select Sign in, or run `oneup login`."),
         ));
     }
     let running = match &f.view {
         View::Running(s) => Some(s.as_ref()),
         View::Stopped(p) => {
+            let (title, detail, action) = crate::problem::shown(p, loc);
             out.push(Item::new(
                 "stopped",
-                format!("Stopped: {}", p.title),
-                p.detail.clone(),
-                format!("{} `oneup start` starts it again.", p.action),
+                t_in!(loc, "Stopped: {what}", what = title),
+                detail,
+                t_in!(loc, "{action} `oneup start` starts it again.", action = action),
             ));
             None
         }
         View::NotRunning if f.pair.is_none() => {
             out.push(Item::new(
                 "not_running",
-                "Not running",
-                "Nothing syncs in the background.",
-                "Start OneUpDrive from its icon, or run `oneup start`.",
+                t_in!(loc, "Not running"),
+                t_in!(loc, "Nothing syncs in the background."),
+                t_in!(loc, "Start OneUpDrive from its icon, or run `oneup start`."),
             ));
             None
         }
@@ -184,12 +202,13 @@ pub fn collect(f: &Facts, now_ms: i64) -> Vec<Item> {
         View::NotRunning if f.expected => {
             out.push(Item::new(
                 "not_running",
-                "Not running",
-                "It starts with the main folder, but isn't running: this folder doesn't sync.",
-                format!(
-                    "Start it on the Files page, or run `oneup --data-dir \"{}\" start`. If it stops again, \
+                t_in!(loc, "Not running"),
+                t_in!(loc, "It starts with the main folder, but isn't running: this folder doesn't sync."),
+                t_in!(
+                    loc,
+                    "Start it on the Files page, or run `oneup --data-dir \"{folder}\" start`. If it stops again, \
                      `oneupd.log` in that folder says why.",
-                    f.dir.display()
+                    folder = f.dir.display().to_string()
                 ),
             ));
             None
@@ -197,56 +216,64 @@ pub fn collect(f: &Facts, now_ms: i64) -> Vec<Item> {
         View::Unreachable(e) => {
             out.push(Item::new(
                 "unreachable",
-                "Can't connect to OneUpDrive",
-                format!("It runs, but doesn't answer: {e}."),
-                "Restart it: `oneup stop`, then `oneup start`.",
+                t_in!(loc, "Can't connect to OneUpDrive"),
+                t_in!(loc, "It runs, but doesn't answer: {why}.", why = e),
+                t_in!(loc, "Restart it: `oneup stop`, then `oneup start`."),
             ));
             None
         }
         View::NotRunning | View::Connecting => None,
     };
     if let Some(s) = running {
-        from_status(s, now_ms, &mut out);
+        from_status(s, now_ms, loc, &mut out);
     } else if let Some(u) = &f.unsynced {
-        out.push(unsynced(u));
+        out.push(unsynced(u, loc));
     }
     for folder in &f.paused_folders {
         let shown = folder.trim_matches('/');
         out.push(Item::new(
             "paused_folder",
-            "Paused folder",
-            format!("/{shown}: changes there wait."),
-            format!("Resume it on the Files page, or run `oneup resume --folder \"{shown}\"`."),
+            t_in!(loc, "Paused folder"),
+            t_in!(loc, "/{folder}: changes there wait.", folder = shown),
+            t_in!(loc, "Resume it on the Files page, or run `oneup resume --folder \"{folder}\"`.", folder = shown),
         ));
     }
     for c in &f.conflicts {
         out.push(Item::new(
             "conflict",
-            "Changed on both sides",
-            format!("{}: both versions kept. This PC's is now {}.", c.path, c.copy),
-            "Compare the two and delete the one you don't need.",
+            t_in!(loc, "Changed on both sides"),
+            t_in!(loc, "{path}: both versions kept. This PC's is now {copy}.", path = &c.path, copy = &c.copy),
+            t_in!(loc, "Compare the two and delete the one you don't need."),
         ));
     }
     if f.stale_note {
         out.push(Item::new(
             "stop_note",
-            "Old stop note not deleted",
-            "OneUpDrive couldn't delete its note that this agent was stopped on purpose. It's ignored.",
-            format!("Delete {} when you can.", f.dir.join(crate::problem::ASKED_FILE).display()),
+            t_in!(loc, "Old stop note not deleted"),
+            t_in!(loc, "OneUpDrive couldn't delete its note that this agent was stopped on purpose. It's ignored."),
+            t_in!(
+                loc,
+                "Delete {file} when you can.",
+                file = f.dir.join(crate::problem::ASKED_FILE).display().to_string()
+            ),
         ));
     }
     match f.conflicts_more {
         More::Yes => out.push(Item::new(
             "more_conflicts",
-            "More files changed on both sides",
-            format!("Only the newest {CONFLICTS_MAX} are listed."),
-            "`oneup activity` lists them all (as \"keep both\").",
+            t_in!(loc, "More files changed on both sides"),
+            t_in!(loc, "Only the newest {n} are listed.", n = CONFLICTS_MAX),
+            t_in!(loc, "`oneup activity` lists them all (as \"keep both\")."),
         )),
         More::NotChecked => out.push(Item::new(
             "conflicts_not_checked",
-            "Older conflicts not checked",
-            format!("Only the newest {} conflict entries of the log were checked.", CONFLICT_PAGE * CONFLICT_PAGES),
-            "`oneup activity` lists them all (as \"keep both\").",
+            t_in!(loc, "Older conflicts not checked"),
+            t_in!(
+                loc,
+                "Only the newest {n} conflict entries of the log were checked.",
+                n = CONFLICT_PAGE * CONFLICT_PAGES
+            ),
+            t_in!(loc, "`oneup activity` lists them all (as \"keep both\")."),
         )),
         More::No => {}
     }
@@ -262,21 +289,23 @@ fn tagged(mut out: Vec<Item>, f: &Facts) -> Vec<Item> {
 }
 
 /// What a running agent's status says needs the user (what the tray shows).
-fn from_status(s: &Status, now_ms: i64, out: &mut Vec<Item>) {
+fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
     if let Some(p) = &s.problem {
-        out.push(Item::new(&p.kind, p.title.clone(), p.detail.clone(), p.action.clone()));
+        let (title, detail, action) = crate::problem::shown(p, loc);
+        out.push(Item::new(&p.kind, title, detail, action));
     }
     for st in &s.safety_stops {
-        let notice = crate::tray::stop_notice(st);
+        let notice = crate::tray::stop_notice(st, loc);
         out.push(Item {
             code: Some(st.code.clone()),
             ..Item::new(
                 "safety_stop",
                 notice.title,
                 notice.text,
-                format!(
-                    "See the items on the Activity page (Safety stops). If that's what you meant, run `oneup approve {}`.",
-                    st.code
+                t_in!(
+                    loc,
+                    "See the items on the Activity page (Safety stops). If that's what you meant, run `oneup approve {code}`.",
+                    code = &st.code
                 ),
             )
         });
@@ -289,57 +318,60 @@ fn from_status(s: &Status, now_ms: i64, out: &mut Vec<Item>) {
             code: Some(o.code.clone()),
             ..Item::new(
                 "version_store",
-                "Version store full",
-                format!(
-                    "{} removed files ({}) don't fit (room for {}). They're untouched on this PC.",
-                    o.count,
-                    size(o.bytes),
-                    size(o.room)
+                t_in!(loc, "Version store full"),
+                t_in!(
+                    loc,
+                    "{n} removed files ({size}) don't fit (room for {room}). They're untouched on this PC.",
+                    n = o.count,
+                    size = size(o.bytes),
+                    room = size(o.room)
                 ),
-                format!(
-                    "`oneup keep {0}` keeps them anyway; `oneup discard {0}` removes them without a local copy.",
-                    o.code
+                t_in!(
+                    loc,
+                    "`oneup keep {code}` keeps them anyway; `oneup discard {code}` removes them without a local copy.",
+                    code = &o.code
                 ),
             )
         });
     }
     if s.paused.local || s.paused.remote {
         let what = match (s.paused.local, s.paused.remote) {
-            (true, false) => "Changes to this PC wait; OneDrive still gets yours.",
-            (false, true) => "Changes to OneDrive wait; this PC still gets OneDrive's.",
-            _ => "Nothing syncs.",
+            (true, false) => t_in!(loc, "Changes to this PC wait; OneDrive still gets yours."),
+            (false, true) => t_in!(loc, "Changes to OneDrive wait; this PC still gets OneDrive's."),
+            _ => t_in!(loc, "Nothing syncs."),
         };
-        let until = s
-            .paused
-            .until_ms
-            .map(|u| {
-                format!(" Resumes by itself in {}.", crate::tray::time_left(u64::try_from(u - now_ms).unwrap_or(0)))
-            })
-            .unwrap_or_default();
+        let detail = match s.paused.until_ms {
+            Some(u) => {
+                let left = crate::tray::time_left_in(u64::try_from(u - now_ms).unwrap_or(0), loc);
+                t_in!(loc, "{text} Resumes by itself in {time}.", text = what, time = left)
+            }
+            None => what,
+        };
         out.push(Item::new(
             "paused",
-            "Paused",
-            format!("{what}{until}"),
-            "Resume from the icon, or run `oneup resume`.",
+            t_in!(loc, "Paused"),
+            detail,
+            t_in!(loc, "Resume from the icon, or run `oneup resume`."),
         ));
     }
     if let Some(why) = &s.auto_pause {
         out.push(Item::new(
             "auto_paused",
-            "Paused by itself",
-            format!("{why}."),
-            "Resumes when that ends. `oneup settings` changes when it pauses.",
+            t_in!(loc, "Paused by itself"),
+            format!("{}.", crate::autopause::said(why, s.auto_pause_hours.as_deref(), loc)),
+            t_in!(loc, "Resumes when that ends. `oneup settings` changes when it pauses."),
         ));
     }
     if let Some(u) = &s.unsynced {
-        out.push(unsynced(u));
+        out.push(unsynced(u, loc));
     }
     if let Some(r) = &s.retrying {
+        let left = crate::tray::time_left_in(u64::try_from(r.next_ms - now_ms).unwrap_or(0), loc);
         out.push(Item::new(
             "retrying",
-            format!("Failed: {} items", r.count),
-            format!("Tried again in {}.", crate::tray::time_left(u64::try_from(r.next_ms - now_ms).unwrap_or(0))),
-            "`oneup activity` says why.",
+            t_in!(loc, "Failed: {n, plural, one {# item} other {# items}}", n = r.count),
+            t_in!(loc, "Tried again in {time}.", time = left),
+            t_in!(loc, "`oneup activity` says why."),
         ));
     }
     if let Some(o) = &s.prune_offer {
@@ -347,20 +379,23 @@ fn from_status(s: &Status, now_ms: i64, out: &mut Vec<Item>) {
             code: Some(o.code.clone()),
             ..Item::new(
                 "excluded_in_onedrive",
-                "Excluded items in OneDrive",
-                format!("{} items excluded by your rules are still in OneDrive.", o.items),
-                "`oneup cloud prune` lists them; `--yes` removes them from OneDrive, `--keep` keeps them there.",
+                t_in!(loc, "Excluded items in OneDrive"),
+                t_in!(loc, "{n} items excluded by your rules are still in OneDrive.", n = o.items),
+                t_in!(
+                    loc,
+                    "`oneup cloud prune` lists them; `--yes` removes them from OneDrive, `--keep` keeps them there."
+                ),
             )
         });
     }
 }
 
-fn unsynced(u: &Unsynced) -> Item {
+fn unsynced(u: &Unsynced, loc: &Locale) -> Item {
     Item::new(
         "unsynced",
-        format!("Sync failure: {}", crate::tray::unsynced_count(u)),
-        "These can't sync until you change them.",
-        "See them on the Activity page (Sync failures), or run `oneup unsynced`.",
+        t_in!(loc, "Sync failure: {items}", items = crate::tray::unsynced_count(u, loc)),
+        t_in!(loc, "These can't sync until you change them."),
+        t_in!(loc, "See them on the Activity page (Sync failures), or run `oneup unsynced`."),
     )
 }
 
@@ -413,10 +448,10 @@ fn should_run(main_runs: bool, starts_with_main: bool, dir: &Path) -> bool {
     main_runs && starts_with_main && !crate::problem::asked_to_stop(dir)
 }
 
-/// Every item of every data folder of `main`.
-pub async fn list(main: &Path) -> Vec<Item> {
+/// Every item of every data folder of `main`, in `loc`'s language.
+pub async fn list(main: &Path, loc: &Locale) -> Vec<Item> {
     let now = crate::control::now_ms();
-    gather(main).await.iter().flat_map(|f| collect(f, now)).collect()
+    gather(main).await.iter().flat_map(|f| collect_in(f, now, loc)).collect()
 }
 
 async fn facts(dir: &Path, pair: Option<String>) -> Facts {
@@ -510,7 +545,9 @@ fn copy_exists(root: &Path, c: &Conflict) -> bool {
 
 /// `oneup problems`: the list, as text or JSON.
 pub async fn show(main: &Path, as_json: bool) -> anyhow::Result<()> {
-    let items = list(main).await;
+    // Text in the user's language; JSON the same everywhere, for scripts.
+    let loc = if as_json { Locale::english() } else { crate::l10n::current().clone() };
+    let items = list(main, &loc).await;
     if as_json {
         let all: Vec<Value> = items.iter().map(Item::to_json).collect();
         // Also items of their own; here for scripts that only look for these.
@@ -524,7 +561,7 @@ pub async fn show(main: &Path, as_json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if items.is_empty() {
-        println!("{}", crate::t!("Nothing needs your attention."));
+        println!("{}", t_in!(loc, "Nothing needs your attention."));
         return Ok(());
     }
     // Headings only when extra pairs or vaults have something too.
@@ -536,13 +573,14 @@ pub async fn show(main: &Path, as_json: bool) -> anyhow::Result<()> {
             match &i.pair {
                 Some(name) => println!(
                     "{}",
-                    crate::t!(
+                    t_in!(
+                        loc,
                         "{name} (commands take --data-dir \"{dir}\"):",
                         name = name,
                         dir = i.data_dir.display().to_string()
                     )
                 ),
-                None => println!("{}", crate::t!("Main folder:")),
+                None => println!("{}", t_in!(loc, "Main folder:")),
             }
         }
         println!("  {}", i.title);
@@ -572,6 +610,7 @@ mod tests {
             overflow: None,
             problem: None,
             auto_pause: None,
+            auto_pause_hours: None,
             prune_offer: None,
             progress: None,
             unsynced: None,
@@ -890,6 +929,40 @@ mod tests {
         f.set_up = true;
         f.signed_in = false;
         assert_eq!(kinds(&collect(&f, 0)), ["signed_out", "not_running", "paused_folder"]);
+    }
+
+    #[test]
+    fn the_list_is_said_in_the_readers_language_and_json_stays_english() {
+        let de = r#"{
+            "Not signed in": "Nicht angemeldet",
+            "Paused folder": "Pausierter Ordner",
+            "/{folder}: changes there wait.": "/{folder}: Änderungen dort warten.",
+            "Stopped: {what}": "Angehalten: {what}",
+            "OneDrive is full": "OneDrive ist voll",
+            "Uploads wait until there's room in OneDrive. Downloads go on.": "Uploads warten auf Platz."
+        }"#;
+        let loc =
+            Locale::with_catalogue("de", de, "de-DE", crate::l10n::Numbers::new(",", ".", "3;0")).expect("catalogue");
+        let mut f = facts(View::Stopped(Box::new(crate::problem::cloud_full(0, None, 0))));
+        f.signed_in = false;
+        f.paused_folders = vec!["Fotos".into()];
+        let shown = collect_in(&f, 0, &loc);
+        assert_eq!(kinds(&shown), ["signed_out", "stopped", "paused_folder"]);
+        assert_eq!(shown[0].title, "Nicht angemeldet");
+        // The agent's own words (kept in English) are said in German too.
+        assert_eq!(shown[1].title, "Angehalten: OneDrive ist voll");
+        assert_eq!(shown[1].detail, "Uploads warten auf Platz.");
+        assert_eq!(
+            (shown[2].title.as_str(), shown[2].detail.as_str()),
+            ("Pausierter Ordner", "/Fotos: Änderungen dort warten.")
+        );
+        // Untranslated text stays English rather than missing.
+        assert_eq!(shown[0].action, "Open Settings > Accounts and select Sign in, or run `oneup login`.");
+        // What `--json` gives: English, the same kinds.
+        let json = collect(&f, 0);
+        assert_eq!(kinds(&json), kinds(&shown));
+        assert_eq!(json[0].title, "Not signed in");
+        assert_eq!(json[1].title, "Stopped: OneDrive is full");
     }
 
     #[test]
