@@ -203,8 +203,11 @@ fn pin_item(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str, at_
             return Ok(Pinned::Failed);
         }
     };
-    // The intent, durably, before the pin.
-    store.write_durable(|o| o.pin_owned_add(id, created, at_seq))?;
+    // The intent, durably, before the pin. Not written (claimed by the
+    // user meanwhile, or gone from the tree): not the rule's to pin.
+    if !store.write_durable(|o| o.pin_owned_add(id, created, at_seq))? {
+        return Ok(Pinned::Other);
+    }
     match pinner.set(rel, (id, Some(created)), Change::Pin) {
         Ok(()) => {
             store.write(|o| o.pin_retry_remove(id))?;
@@ -1250,7 +1253,7 @@ fn reconcile(
             && let Ok((got, created)) = pinner.identify(rel, id)
             && got == id
         {
-            store.write(|o| o.pin_owned_add(id, created, seq))?;
+            store.write(|o| o.pin_owned_add(id, created, seq).map(|_| ()))?;
         }
         return Ok(());
     }
@@ -2547,6 +2550,48 @@ mod tests {
         assert_eq!(p.repinned, 1);
         assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
         assert!(s.read(|o| o.pin_changed_page(10)).unwrap().is_empty());
+    }
+
+    /// `oneup pin` (another process) claims the file while a pass is about
+    /// to pin it for a rule: no note is written, and the rule doesn't pin.
+    #[test]
+    fn a_claim_while_a_rule_pins_wins() {
+        struct Claims {
+            fake: Fake,
+            db: PathBuf,
+        }
+        impl Pinner for Claims {
+            fn identify(&mut self, rel: &str, expected: u128) -> std::io::Result<(u128, i64)> {
+                let mut other = Store::open(&self.db, 1024).unwrap();
+                other.write_durable(|o| o.pin_claim_for_user(expected)).unwrap();
+                self.fake.identify(rel, expected)
+            }
+            fn set(&mut self, rel: &str, expect: (u128, Option<i64>), change: Change) -> std::io::Result<()> {
+                self.fake.set(rel, expect, change)
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("oneup-pins-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.db");
+        {
+            let mut s = Store::open(&db, 1024).unwrap();
+            let mem = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
+            s.write(|o| {
+                o.local_begin(
+                    &mem.read(|m| m.local_root()).unwrap().unwrap(),
+                    &mem.read(|m| m.local_get(1)).unwrap().unwrap(),
+                )?;
+                o.local_put(&row(2, 1, "a.psd", LocalKind::File, RECALL))
+            })
+            .unwrap();
+            let mut p = Claims { fake: Fake::default(), db: db.clone() };
+            let pass = apply(&mut s, &mut p, &PinSet::new(&["*.psd"]), Duration::from_secs(60), 0).unwrap();
+            assert_eq!(pass.pinned, 0);
+            assert!(p.fake.set.is_empty(), "{:?}", p.fake.set);
+            assert!(!s.read(|o| o.pin_owned_has(2)).unwrap() && s.read(|o| o.pin_user_has(2)).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
