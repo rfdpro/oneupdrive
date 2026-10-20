@@ -743,7 +743,13 @@ mod win {
                     }
                 }
                 if op == "rewind_start" {
-                    a.push("--start".into());
+                    // Only the list the person saw: a changed one comes back
+                    // to be shown, and nothing starts.
+                    let code = text(args, "expect");
+                    if code.len() != 16 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
+                        bail!("not a code");
+                    }
+                    a.extend(["--start".into(), "--expect".into(), code.into()]);
                 }
                 a.push("--json".into());
                 let out = oneup(a).await?;
