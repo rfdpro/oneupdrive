@@ -147,6 +147,12 @@ function Wait-OneUpSync {
         if ($paused -and ($paused.local -or $paused.remote)) {
             throw 'Sync is paused (Resume-OneUp).'
         }
+        # The agent can pause itself (metered connection, battery saver,
+        # quiet hours): the activity still reads 'idle', so check for it.
+        $auto = Get-Field $s 'auto_pause'
+        if ($auto) {
+            throw "Sync is paused by itself: $auto."
+        }
         $checked = Get-Field $s 'checked_ms'
         $fresh = (-not $SyncNow) -or ($checked -and $checked -ge $since)
         if ($s.activity -eq 'idle' -and -not (Get-Field $s 'progress') -and $fresh) { return $s }
@@ -157,8 +163,11 @@ function Wait-OneUpSync {
         }
         $left = ($deadline - (Get-Date)).TotalSeconds
         if ($left -le 0) { throw "Not up to date after $TimeoutSeconds s (activity: $($s.activity))." }
-        # The agent answers a watch within 50 s even if nothing changed.
-        $s = Invoke-OneUpCall -Method watch -Params @{ since = $s.rev } -DataDir $DataDir -TimeoutSeconds 80
+        # Wait for the next status change, but never past the deadline: the
+        # agent answers a watch within 50 s even if nothing changed, and the
+        # reply itself may take a little longer.
+        $wait = [Math]::Min(80, [int][Math]::Ceiling($left) + 5)
+        $s = Invoke-OneUpCall -Method watch -Params @{ since = $s.rev } -DataDir $DataDir -TimeoutSeconds $wait
     }
 }
 
