@@ -96,7 +96,7 @@ pub trait Launch: Send + Sync {
 /// Starts programs contained (`oneup_sys::contained`): in a safe folder,
 /// without OneUpDrive's environment variables (`ONEUP_*`, which can hold a
 /// vault's recovery key), with synced folders off `PATH`, in a job so a
-/// hook can't reach the control pipe, output kept up to [`KEEP_OUTPUT`].
+/// hook can't reach the control pipe, output kept up to `KEEP_OUTPUT` (8 KiB).
 pub struct Contained {
     #[cfg(windows)]
     jobs: Option<Arc<oneup_sys::contained::HookJobs>>,

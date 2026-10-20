@@ -1,6 +1,6 @@
 //! Event hooks (`docs/architecture/hooks.md`): programs the user names in
 //! `config.toml`, started by the agent when sync events match (an event
-//! kind and, for items, a path rule), with the event as arguments.
+//! kind and, for items, a path rule), with the event as data.
 //!
 //! * [`HookSpec`]: one hook as configured, and the checks its shape must
 //!   pass ([`HookSpec::check`]).
@@ -14,9 +14,11 @@
 //!   without limit or slow sync down.
 //!
 //! What a hook gets: the event's kind, the item's path (full and relative),
-//! what was done and a short detail, as arguments only. Never file
-//! contents, tokens, approval codes or OneUpDrive's own environment
-//! variables.
+//! what was done and a short detail, through `ONEUPHOOK_*` environment
+//! variables and one JSON line on standard input ([`Fill::env`],
+//! [`Fill::json_line`]); a plain `.exe` that isn't an interpreter may also
+//! take them as template arguments ([`TEMPLATES`]). Never file contents,
+//! tokens, approval codes or OneUpDrive's own environment variables.
 
 use std::ffi::OsString;
 use std::path::Path;
