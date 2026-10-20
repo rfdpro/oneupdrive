@@ -2142,6 +2142,8 @@ impl Engine {
             }
 
             crate::conflicts::ran(&mut store, &conflicts, &report)?;
+            // However busy the folder, the history keeps to its limits.
+            crate::rewind::keep_history(&mut store, now_ms(), false)?;
             if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref()) {
                 let finished = store.write(|o| Ok(crate::rewind::ran(o, j, s, &report, now_ms())))??;
                 if finished {
@@ -2235,7 +2237,7 @@ impl Engine {
                     self.rewound.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     // A first sync has settled: from now on, the history of
                     // what's synced is kept, for rewinds, to its limits.
-                    crate::rewind::keep_history(&mut store, now_ms())?;
+                    crate::rewind::keep_history(&mut store, now_ms(), true)?;
                 }
                 out.end = end;
                 return Ok((store, out));

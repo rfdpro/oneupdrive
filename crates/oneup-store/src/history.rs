@@ -217,6 +217,20 @@ impl Ops<'_> {
     /// dropped. Returns how many went. Cheap when there's nothing to drop:
     /// two index probes.
     pub fn history_prune(&self, keep: Keep, now_ms: i64) -> Result<usize> {
+        self.history_prune_some(keep, now_ms, None, usize::MAX)
+    }
+
+    /// [`Ops::history_prune`], dropping at most `budget` rows (so each call
+    /// costs a bounded amount, whatever came before), and none written
+    /// after `needed_after`: a rewind under way to that moment reads the
+    /// first change after it of every item.
+    pub fn history_prune_some(
+        &self,
+        keep: Keep,
+        now_ms: i64,
+        needed_after: Option<i64>,
+        budget: usize,
+    ) -> Result<usize> {
         let mut upto: Option<i64> = None;
         if keep.days > 0 {
             let cutoff = now_ms.saturating_sub(i64::from(keep.days).saturating_mul(86_400_000));
@@ -236,7 +250,24 @@ impl Ops<'_> {
                 upto = Some(upto.unwrap_or(0).max(last - rows));
             }
         }
-        let Some(upto) = upto else { return Ok(0) };
+        let Some(mut upto) = upto else { return Ok(0) };
+        if let Some(t) = needed_after {
+            let before: Option<i64> = self
+                .c
+                .prepare_cached("SELECT min(seq) FROM synced_history WHERE at_ms > ?1")?
+                .query_row([t], |r| r.get(0))?;
+            if let Some(first_needed) = before {
+                upto = upto.min(first_needed - 1);
+            }
+        }
+        let first: Option<i64> =
+            self.c.prepare_cached("SELECT min(seq) FROM synced_history")?.query_row([], |r| r.get(0))?;
+        let Some(first) = first else { return Ok(0) };
+        let budget = i64::try_from(budget).unwrap_or(i64::MAX).max(1);
+        upto = upto.min(first.saturating_add(budget - 1));
+        if upto < first {
+            return Ok(0);
+        }
         let newest: Option<i64> = self
             .c
             .prepare_cached("SELECT max(at_ms) FROM synced_history WHERE seq <= ?1")?
@@ -419,5 +450,32 @@ mod tests {
         assert_eq!(gone, 2);
         assert_eq!(s.read(|o| o.history_since()).unwrap(), 8000);
         assert_eq!(s.write(|o| o.history_prune(Keep { days: 1, rows: 0 }, 0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn pruning_is_bounded_and_keeps_what_a_rewind_under_way_reads() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.history_start(0)?;
+            o.synced_put(&root())
+        })
+        .unwrap();
+        for i in 1..=20 {
+            s.write(|o| o.synced_put(&base(i, ROOT, "f", 1))).unwrap();
+            stamp(&mut s, i64::try_from(i).unwrap() * 1000);
+        }
+        let all = s.read(|o| o.history_rows()).unwrap();
+        // Over its limit of 2 rows: each call drops at most 5.
+        let keep = Keep { days: 0, rows: 2 };
+        assert_eq!(s.write(|o| o.history_prune_some(keep, 0, None, 5)).unwrap(), 5);
+        assert_eq!(s.read(|o| o.history_rows()).unwrap(), all - 5);
+        // A rewind to 9000 under way: the rows after it stay, whatever the limit.
+        while s.write(|o| o.history_prune_some(keep, 0, Some(9000), 5)).unwrap() > 0 {}
+        let left = s.read(|o| o.history_rows()).unwrap();
+        assert_eq!(left, 11, "rows after 9000 kept: 10..=20");
+        assert_eq!(s.read(|o| o.history_change_after(10, 9000)).unwrap(), Some(None), "still known as created then");
+        // Done with it: down to the limit.
+        while s.write(|o| o.history_prune_some(keep, 0, None, 5)).unwrap() > 0 {}
+        assert_eq!(s.read(|o| o.history_rows()).unwrap(), 2);
     }
 }
