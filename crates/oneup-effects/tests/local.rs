@@ -97,6 +97,26 @@ fn a_copy_set_aside_is_taken_only_from_where_it_was_shown() {
     assert!(!r.p("b.txt").exists(), "taken from where it is, as named");
 }
 
+/// A recycling that follows a rewind takes the copy only from where the
+/// approval saw it (the token's path), checked on the handle that moves it.
+#[test]
+fn a_rewinds_recycling_here_is_taken_only_from_where_it_was() {
+    let r = Root::new("follow-where");
+    let fs = r.fs();
+    std::fs::create_dir(r.p("docs")).unwrap();
+    std::fs::write(r.p("docs/n.txt"), b"new since").unwrap();
+    let op = Op::RecycleLocal { sid: 1, local: pre(&r.p("docs/n.txt")) };
+    let paths = vec!["/docs/n.txt".to_string()];
+    let f = oneup_gate::Follow::of_at(&op, &paths[0]).unwrap();
+    let rewound = [oneup_gate::follow_key(&f)];
+    let cx = Context { synced_items: 1_000_000, rewound: &rewound, paths: &paths, ..Context::default() };
+    let a = review_in(&Policy::default(), &cx, vec![op]).approved.into_iter().next().unwrap();
+    assert_eq!(a.at(), Some("/docs/n.txt"));
+    std::fs::rename(r.p("docs"), r.p("docs-keep")).unwrap();
+    assert!(matches!(fs.recycle(&a, None), Err(Error::Changed)));
+    assert!(r.p("docs-keep/n.txt").exists(), "left where it went");
+}
+
 /// Puts kept item `slot` back at `to` (or where it came from), as a
 /// restore asked for and approved: bound to the item and the folder as
 /// found now.

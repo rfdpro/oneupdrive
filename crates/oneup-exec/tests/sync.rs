@@ -6603,6 +6603,38 @@ async fn a_restore_into_a_name_taken_meanwhile_replaces_nothing() {
 }
 
 #[tokio::test]
+async fn a_rewinds_removal_followed_here_is_covered_only_where_it_was() {
+    // n1..n3 were made since the moment in docs/sub; the rewind removes
+    // them in OneDrive, and this PC is to follow. Before it does, docs is
+    // renamed here: the copies are no longer where the approval saw them,
+    // so recycling them isn't covered by it, and the circuit breakers judge
+    // it as any deletion (here: a stop).
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-follow-moved", cloud.clone());
+    write(&s.p("docs/sub/a.txt"), b"a");
+    write(&s.p("other.txt"), b"other");
+    s.settle().await;
+    let at = moment();
+    for i in 1..=3 {
+        write(&s.p(&format!("docs/sub/n{i}.txt")), b"new since");
+    }
+    s.settle().await;
+    s.start_rewind("/docs", at);
+    s.round().await;
+    s.stops.approve();
+    let r = s.attempt().await;
+    assert_eq!(r.done.iter().filter(|o| o.rewind_step().is_some()).count(), 3, "removed in OneDrive: {r:?}");
+    std::fs::rename(s.p("docs"), s.p("docs-keep")).unwrap();
+    s.policy = strict();
+    let r = s.attempt().await;
+    assert!(!r.done.iter().any(|o| matches!(o, Op::RecycleLocal { .. })), "not recycled: {r:?}");
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Mass), "a stop of its own: {:?}", s.stops.raised);
+    for i in 1..=3 {
+        assert!(s.p(&format!("docs-keep/sub/n{i}.txt")).exists());
+    }
+}
+
+#[tokio::test]
 async fn an_item_someone_else_restored_and_edited_isnt_put_back_over() {
     // a.txt was "first" then, "second" when it was deleted. The rewind
     // restores it and puts "first" back. After the approval, someone else

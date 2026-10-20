@@ -2540,7 +2540,8 @@ fn plan_round<'a>(
     // rewind's or an answered conflict's steps are always a list).
     let mut ops = ops;
     let steps_at = ops.len();
-    let listed_steps = rewind.is_some() || !answered.is_empty();
+    // A recycling that follows a rewind is covered only at its path.
+    let listed_steps = rewind.is_some() || !answered.is_empty() || !done_rewound.is_empty();
     if let Some(r) = &rewind {
         ops.extend(r.ops.iter().cloned());
     }
