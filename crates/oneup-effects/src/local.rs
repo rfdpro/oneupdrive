@@ -12,6 +12,7 @@ use oneup_ntfs::FileId;
 use oneup_ntfs::dirent::{DirEntry, FILE_ATTRIBUTE_REPARSE_POINT};
 use oneup_ntfs::win::{self, Handle, Volume, WatchedFile};
 use oneup_rules::ENGINE_DIR;
+use oneup_sync::rewind::Step;
 use oneup_sync::{Hash, LocalId, LocalPre, Op};
 
 use crate::name::is_valid_name;
@@ -834,10 +835,16 @@ impl LocalFs {
     /// deleted without a local copy (OneDrive's recycle bin has it);
     /// otherwise it goes into the version store.
     pub fn recycle(&self, a: &Approved, synced: Option<&Hash>) -> Result<Done> {
-        let Op::RecycleLocal { local, .. } = a.op() else {
-            return Err(Error::WrongOp);
-        };
-        self.recycle_item(local, a.old_copy(), synced)
+        match a.op() {
+            Op::RecycleLocal { local, .. } => self.recycle_item(local, a.old_copy(), synced),
+            // A rewind sets a copy changed here aside: it's never the synced
+            // version, so it's always kept.
+            Op::Rewind { step, .. } => match &**step {
+                Step::SetAside { local } | Step::Discard { local } => self.recycle_item(local, OldCopy::Keep, None),
+                _ => Err(Error::WrongOp),
+            },
+            _ => Err(Error::WrongOp),
+        }
     }
 
     /// A new, empty staging file for a download.

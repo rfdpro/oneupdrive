@@ -2007,6 +2007,7 @@ impl Engine {
                     decisions: &decisions,
                     room: None,
                     suspicious: &[],
+                    rewound: &[],
                 },
                 order: &order,
                 on_demand,
@@ -2391,6 +2392,7 @@ fn plan_round<'a>(
         decisions: &decisions,
         room,
         suspicious: &suspicious,
+        rewound: &[],
     };
     let review = review_in(&policy, &cx, ops);
     Ok(Planned { review, problems, upto, suspicious, policy, synced, planning })
@@ -3015,6 +3017,38 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
         Op::Pair { local, .. } => Line::new("in sync", lp(local.id.0), ""),
         Op::Hash(p) => Line::new("check", lp(p.id.0), "comparing contents"),
         Op::Record(_) | Op::Forget(_) => Line::new("bookkeeping", String::new(), ""),
+        Op::Rewind { sid, step } => {
+            use oneup_sync::rewind::Step;
+            let synced = || o.synced_get(*sid).ok().flatten().and_then(|b| b.remote).map(|r| rp(&r));
+            match &**step {
+                Step::Restore { to, name, .. } => {
+                    Line::new("restore", join(&rp(to), name), "rewind; from OneDrive's recycle bin")
+                }
+                Step::Reset { remote, place: Some((to, name)), content, .. } => moved(
+                    "move back",
+                    rp(&remote.id),
+                    join(&rp(to), name),
+                    if content.is_some() { "rewind; old version from OneDrive's history" } else { "rewind" },
+                ),
+                Step::Reset { remote, .. } => {
+                    Line::new("revert", rp(&remote.id), "rewind; old version from OneDrive's history")
+                }
+                Step::Remove { remote, .. } => Line::new("remove", rp(&remote.id), "rewind; to OneDrive's recycle bin"),
+                Step::SetAside { local } => {
+                    Line::new("set aside", lp(local.id.0), "rewind; to .oneup\\versions, OneDrive's copy comes back")
+                }
+                Step::Discard { local } => Line::new(
+                    "remove",
+                    lp(local.id.0),
+                    "the copy you didn't keep; to .oneup\\versions, OneDrive's copy to its recycle bin",
+                ),
+                Step::Forget => Line::new(
+                    "restore",
+                    synced().unwrap_or_else(|| "(item)".into()),
+                    "rewind; OneDrive's copy comes back",
+                ),
+            }
+        }
         Op::Hold { local, remote, reason, .. } => {
             // Held for being missing on one side: the side that still has
             // it names it (the local row is often the one gone).
@@ -3218,6 +3252,12 @@ impl Touched {
             Op::PruneRemote { remote: r, keep, .. } => {
                 remote.push(r.id.clone());
                 local.extend(keep.iter().map(|l| l.id));
+            }
+            Op::Rewind { sid, .. } => {
+                let (_, l, r) = op.subjects();
+                synced.push(*sid);
+                local.extend(l);
+                remote.extend(r);
             }
             Op::Hold { sid, local: l, remote: r, .. } => {
                 synced.extend(*sid);
@@ -3579,6 +3619,7 @@ pub fn breaker_what(b: &Breaker) -> String {
              (as when files are encrypted by ransomware)",
             b.count
         ),
+        BreakerKind::Rewind => format!("a rewind would make {} changes; it waits for your approval", b.count),
     }
 }
 

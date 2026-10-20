@@ -72,6 +72,7 @@ pub mod hydrate;
 mod moving;
 #[cfg(windows)]
 pub mod placement;
+pub mod recover;
 pub mod resolve;
 #[cfg(windows)]
 mod schedule;
@@ -81,7 +82,7 @@ pub use cloud::{Cloud, CloudError, Meta, MetaDone, Replaced, Source, VersionMark
 #[cfg(all(windows, feature = "crash-test"))]
 pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]
-pub use exec::{Executor, FOLLOW_MAX, FetchCheck, Follow, RESCUE_TRIES, Report, Skip, link_roots, rescues_given_up};
+pub use exec::{Executor, FOLLOW_MAX, FetchCheck, Follow, RESCUE_TRIES, Report, Skip, link_roots, rescues_given_up, rewind_mark};
 pub use graph::{GraphCloud, UploadMemory};
 pub use moving::Settled;
 #[cfg(windows)]

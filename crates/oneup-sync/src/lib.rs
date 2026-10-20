@@ -22,6 +22,7 @@ pub mod model;
 pub mod op;
 mod pending;
 mod resolve;
+pub mod rewind;
 
 pub use merge::{conflict_candidate, conflict_name};
 pub use model::{

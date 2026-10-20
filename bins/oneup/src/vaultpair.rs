@@ -480,6 +480,20 @@ impl Cloud for PairCloud {
         }
     }
 
+    async fn versions(&self, id: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.versions(id).await,
+            PairCloud::Vault(c) => c.versions(id).await,
+        }
+    }
+
+    async fn restore(&self, id: &RemoteId, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.restore(id, parent, name).await,
+            PairCloud::Vault(c) => c.restore(id, parent, name).await,
+        }
+    }
+
     fn upcoming(&self, downloads: &[RemotePre]) {
         match self {
             PairCloud::Plain(c) => c.upcoming(downloads),

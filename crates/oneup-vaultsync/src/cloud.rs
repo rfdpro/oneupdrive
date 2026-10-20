@@ -472,6 +472,17 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         Err(CloudError::Other("a vault folder can't be moved in parts".into()))
     }
 
+    /// Not offered: a rewind restores OneDrive's items, and a vault's are
+    /// its encrypted files, not the vault's items.
+    async fn versions(&self, _: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        Err(CloudError::Other("a vault can't be rewound".into()))
+    }
+
+    /// Not offered (see [`Self::versions`]).
+    async fn restore(&self, _: &RemoteId, _: &RemoteId, _: &str) -> Result<RemoteRow, CloudError> {
+        Err(CloudError::Other("a vault can't be rewound".into()))
+    }
+
     // OneDrive versions the encrypted contents; these address them.
 
     async fn version_mark(&self, pre: &RemotePre, size: i64) -> Result<Option<VersionMark>, CloudError> {

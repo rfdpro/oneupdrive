@@ -53,6 +53,7 @@ pub mod choose;
 pub mod pins;
 pub use choose::Totals;
 pub mod dupes;
+pub mod history;
 pub mod retry;
 mod rulefile;
 pub mod search;
@@ -117,7 +118,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -740,7 +741,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 22] = [
+    let steps: [(i64, String); 23] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -763,6 +764,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (20, dupes::MIGRATE_V20.into()),
         (21, shared::MIGRATE_V21.into()),
         (22, pins::migrate_v22()),
+        (23, history::migrate_v22()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
