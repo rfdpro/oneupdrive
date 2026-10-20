@@ -2,9 +2,13 @@
 //! (`docs/user-guide/slow-and-metered-networks.md` § Data budget).
 //!
 //! The agent counts what its Graph client sent and received
-//! ([`Meter`]: file contents as they go, and every response) and adds it
-//! to the profile in effect, kept in the store's `meta` table
-//! (`net.usage.<profile>`), so a restart doesn't forget it. A new month
+//! ([`Meter`]: every request body and every answer, as they go) and adds
+//! it to the profile in effect, kept in the `meta` table of the account's
+//! **main** data folder (`net.usage.<profile>`), so every agent of the
+//! account (its extra pairs and vaults too) shares one count and one
+//! budget, and a restart doesn't forget it. Agents take the budget in
+//! reservations ([`reserve`]), each in one transaction, so two agents
+//! can't both spend what's left. A new month
 //! starts from zero. When a budget is reached the agent pauses on that
 //! network and says so; the user can allow more for the rest of the month.
 
@@ -50,29 +54,51 @@ pub fn month_of(ms: i64) -> String {
     format!("{:04}-{:02}", t.year(), u8::from(t.month()))
 }
 
-/// Profile `profile`'s use in `month` (a new month starts from zero).
-pub fn load(store: &Store, profile: &str, month: &str) -> oneup_store::Result<Usage> {
-    let text = store.read(|o| o.meta_get(&format!("{KEY}{profile}")))?;
+/// A profile's record this month: what was used, and what each agent
+/// (by process) has reserved and not used yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Record {
+    usage: Usage,
+    reserved: std::collections::BTreeMap<String, u64>,
+}
+
+fn read_record(o: &oneup_store::Ops<'_>, profile: &str, month: &str) -> oneup_store::Result<Record> {
+    let text = o.meta_get(&format!("{KEY}{profile}"))?;
     let v: Option<serde_json::Value> = text.and_then(|t| serde_json::from_str(&t).ok());
-    let fresh = Usage { month: month.to_string(), ..Usage::default() };
+    let fresh = Record { usage: Usage { month: month.to_string(), ..Usage::default() }, ..Record::default() };
     Ok(match v {
-        Some(v) if v["month"].as_str() == Some(month) => Usage {
-            month: month.to_string(),
-            up: v["up"].as_u64().unwrap_or(0),
-            down: v["down"].as_u64().unwrap_or(0),
-            extra: v["extra"].as_u64().unwrap_or(0),
+        Some(v) if v["month"].as_str() == Some(month) => Record {
+            usage: Usage {
+                month: month.to_string(),
+                up: v["up"].as_u64().unwrap_or(0),
+                down: v["down"].as_u64().unwrap_or(0),
+                extra: v["extra"].as_u64().unwrap_or(0),
+            },
+            reserved: v["reserved"]
+                .as_object()
+                .map(|m| m.iter().filter_map(|(k, n)| Some((k.clone(), n.as_u64()?))).collect())
+                .unwrap_or_default(),
         },
         _ => fresh,
     })
 }
 
-pub fn save(store: &mut Store, profile: &str, u: &Usage) -> oneup_store::Result<()> {
-    let text = serde_json::json!({ "month": u.month, "up": u.up, "down": u.down, "extra": u.extra }).to_string();
-    store.write(|o| o.meta_set(&format!("{KEY}{profile}"), &text))
+fn write_record(o: &oneup_store::Ops<'_>, profile: &str, r: &Record) -> oneup_store::Result<()> {
+    let u = &r.usage;
+    let text = serde_json::json!({
+        "month": u.month, "up": u.up, "down": u.down, "extra": u.extra, "reserved": r.reserved,
+    })
+    .to_string();
+    o.meta_set(&format!("{KEY}{profile}"), &text)
+}
+
+/// Profile `profile`'s use in `month` (a new month starts from zero).
+pub fn load(store: &Store, profile: &str, month: &str) -> oneup_store::Result<Usage> {
+    store.read(|o| Ok(read_record(o, profile, month)?.usage))
 }
 
 /// Adds `up` and `down` bytes and `extra` allowed bytes to `profile`'s
-/// use this month; returns it.
+/// use this month, in one transaction; returns it.
 pub fn add(
     store: &mut Store,
     profile: &str,
@@ -81,15 +107,81 @@ pub fn add(
     down: u64,
     extra: u64,
 ) -> oneup_store::Result<Usage> {
-    let mut u = load(store, profile, month)?;
-    if up == 0 && down == 0 && extra == 0 {
-        return Ok(u);
-    }
-    u.up = u.up.saturating_add(up);
-    u.down = u.down.saturating_add(down);
-    u.extra = u.extra.saturating_add(extra);
-    save(store, profile, &u)?;
-    Ok(u)
+    charge_owned(store, profile, month, None, up, down, extra)
+}
+
+/// [`add`], the bytes taken from what `owner` had reserved.
+fn charge_owned(
+    store: &mut Store,
+    profile: &str,
+    month: &str,
+    owner: Option<&str>,
+    up: u64,
+    down: u64,
+    extra: u64,
+) -> oneup_store::Result<Usage> {
+    store.write(|o| {
+        let mut r = read_record(o, profile, month)?;
+        if up == 0 && down == 0 && extra == 0 {
+            return Ok(r.usage);
+        }
+        r.usage.up = r.usage.up.saturating_add(up);
+        r.usage.down = r.usage.down.saturating_add(down);
+        r.usage.extra = r.usage.extra.saturating_add(extra);
+        if let Some(own) = owner.and_then(|w| r.reserved.get_mut(w)) {
+            *own = own.saturating_sub(up.saturating_add(down));
+        }
+        write_record(o, profile, &r)?;
+        Ok(r.usage)
+    })
+}
+
+/// Reserves up to `want` bytes of `budget` (and what was allowed on top)
+/// for `owner` (an agent's process), in one transaction with every other
+/// agent's reservations: what's granted is what nobody else has used or
+/// reserved. Reservations of agents no longer running (`alive`) go.
+/// Returns what was granted.
+pub fn reserve(
+    store: &mut Store,
+    profile: &str,
+    month: &str,
+    owner: &str,
+    want: u64,
+    budget: u64,
+    alive: &dyn Fn(&str) -> bool,
+) -> oneup_store::Result<u64> {
+    store.write(|o| {
+        let mut r = read_record(o, profile, month)?;
+        r.reserved.retain(|k, n| *n > 0 && (k == owner || alive(k)));
+        let committed = r.usage.total().saturating_add(r.reserved.values().sum());
+        let grant = want.min(budget.saturating_add(r.usage.extra).saturating_sub(committed));
+        if grant > 0 {
+            *r.reserved.entry(owner.to_string()).or_default() += grant;
+        }
+        write_record(o, profile, &r)?;
+        Ok(grant)
+    })
+}
+
+/// What's left of `budget` for `owner`: not used, nor reserved by another
+/// agent.
+pub fn left_for(store: &Store, profile: &str, month: &str, owner: &str, budget: u64) -> oneup_store::Result<u64> {
+    store.read(|o| {
+        let r = read_record(o, profile, month)?;
+        let others: u64 = r.reserved.iter().filter(|(k, _)| k.as_str() != owner).map(|(_, n)| *n).sum();
+        Ok(budget.saturating_add(r.usage.extra).saturating_sub(r.usage.total().saturating_add(others)))
+    })
+}
+
+/// Gives back what `owner` reserved and didn't use.
+pub fn release(store: &mut Store, profile: &str, month: &str, owner: &str) -> oneup_store::Result<()> {
+    store.write(|o| {
+        let mut r = read_record(o, profile, month)?;
+        if r.reserved.remove(owner).is_some() {
+            write_record(o, profile, &r)?;
+        }
+        Ok(())
+    })
 }
 
 /// Counts what went over the network since it was last asked, from
@@ -168,29 +260,43 @@ impl Account {
 /// and once more when dropped, so what went just before a stop, an error
 /// or a restart is kept.
 pub struct Ledger {
+    /// The account's main data folder's store, shared by its agents.
     db: Store,
     account: Account,
     counters: Box<dyn Fn() -> (u64, u64) + Send>,
+    /// Who reserves (this agent's process ID).
+    owner: String,
 }
 
 impl Ledger {
-    pub fn new(db: Store, counters: Box<dyn Fn() -> (u64, u64) + Send>) -> Self {
+    pub fn new(db: Store, counters: Box<dyn Fn() -> (u64, u64) + Send>, owner: String) -> Self {
         let (up, down) = counters();
-        Self { db, account: Account::new(up, down), counters }
+        Self { db, account: Account::new(up, down), counters, owner }
     }
 
     /// Adds what went since the last charge to the profile in effect
-    /// meanwhile.
+    /// meanwhile, taken from what this agent reserved.
     pub fn charge(&mut self) -> oneup_store::Result<()> {
         let (up, down) = (self.counters)();
         let month = month_of(crate::control::now_ms());
-        let db = &mut self.db;
-        self.account.charge(up, down, |p, u, d| add(db, p, &month, u, d, 0).map(drop))
+        let (db, owner) = (&mut self.db, self.owner.as_str());
+        self.account.charge(up, down, |p, u, d| charge_owned(db, p, &month, Some(owner), u, d, 0).map(drop))
     }
 
-    /// Charge to `profile` from now on (charge first what went before).
+    /// Charge to `profile` from now on (charge first what went before);
+    /// what was reserved on the profile before goes back.
     pub fn switch(&mut self, profile: &str) {
+        if let Some(old) = self.account.profile().filter(|p| *p != profile).map(str::to_string) {
+            let month = month_of(crate::control::now_ms());
+            if let Err(e) = release(&mut self.db, &old, &month, &self.owner) {
+                tracing::debug!(error = %e, "a reservation of the data budget wasn't given back");
+            }
+        }
         self.account.switch(profile);
+    }
+
+    pub fn owner(&self) -> &str {
+        &self.owner
     }
 
     pub fn db(&mut self) -> &mut Store {
@@ -202,6 +308,9 @@ impl Drop for Ledger {
     fn drop(&mut self) {
         if let Err(e) = self.charge() {
             tracing::warn!(error = %e, "the data used last couldn't be recorded");
+        }
+        if let Some(p) = self.account.profile().map(str::to_string) {
+            let _ = release(&mut self.db, &p, &month_of(crate::control::now_ms()), &self.owner);
         }
     }
 }
@@ -289,8 +398,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let (sent, got) = (Arc::new(AtomicU64::new(10)), Arc::new(AtomicU64::new(10)));
         let (s, g) = (Arc::clone(&sent), Arc::clone(&got));
-        let mut l =
-            Ledger::new(Store::open(&path, 1024).unwrap(), Box::new(move || (s.load(Relaxed), g.load(Relaxed))));
+        let mut l = Ledger::new(
+            Store::open(&path, 1024).unwrap(),
+            Box::new(move || (s.load(Relaxed), g.load(Relaxed))),
+            "1".into(),
+        );
         l.switch("metered");
         sent.fetch_add(3 * MB, Relaxed);
         got.fetch_add(4 * MB, Relaxed);
@@ -298,6 +410,38 @@ mod tests {
         let month = month_of(crate::control::now_ms());
         let u = load(&Store::open(&path, 1024).unwrap(), "metered", &month).unwrap();
         assert_eq!((u.up, u.down), (3 * MB, 4 * MB));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two agents (an account's main folder and an extra pair) share one
+    /// budget: each takes it in reservations from the main data folder's
+    /// store, so together they never get more than it holds; what one
+    /// uses counts for both; a stopped agent's reservation goes back.
+    #[test]
+    fn agents_of_one_account_share_one_budget() {
+        let path = std::env::temp_dir().join(format!("oneup-shared-budget-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (mut a, mut b) = (Store::open(&path, 1024).unwrap(), Store::open(&path, 1024).unwrap());
+        let m = "2026-10";
+        let all = |_: &str| true;
+        let budget = 100 * MB;
+        assert_eq!(reserve(&mut a, "metered", m, "A", 40 * MB, budget, &all).unwrap(), 40 * MB);
+        assert_eq!(reserve(&mut b, "metered", m, "B", 40 * MB, budget, &all).unwrap(), 40 * MB);
+        assert_eq!(reserve(&mut a, "metered", m, "A", 40 * MB, budget, &all).unwrap(), 20 * MB, "only what's left");
+        assert_eq!(reserve(&mut b, "metered", m, "B", 1, budget, &all).unwrap(), 0);
+        // B used 30 of its 40: it counts for both, and B's reservation shrinks.
+        charge_owned(&mut b, "metered", m, Some("B"), 10 * MB, 20 * MB, 0).unwrap();
+        assert_eq!(load(&a, "metered", m).unwrap().total(), 30 * MB);
+        assert_eq!(left_for(&a, "metered", m, "A", budget).unwrap(), 100 * MB - 30 * MB - 10 * MB);
+        // B stops: what it didn't use goes back to A.
+        release(&mut b, "metered", m, "B").unwrap();
+        assert_eq!(reserve(&mut a, "metered", m, "A", 40 * MB, budget, &all).unwrap(), 10 * MB);
+        // A reservation of an agent that isn't running any more goes too.
+        let none = |w: &str| w == "A";
+        reserve(&mut b, "metered", m, "B", 5 * MB, budget, &all).unwrap();
+        assert_eq!(reserve(&mut a, "metered", m, "A", 40 * MB, budget, &none).unwrap(), 0, "A holds the rest");
+        assert_eq!(left_for(&a, "metered", m, "A", budget).unwrap(), 70 * MB, "B's 5 MB was dropped");
+        drop((a, b));
         let _ = std::fs::remove_file(&path);
     }
 

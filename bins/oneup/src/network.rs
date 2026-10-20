@@ -487,15 +487,15 @@ pub fn check(l: &Layer) -> Result<()> {
 
 /// What the agent does with the profile it just read (at a wake-up, on
 /// Windows' event, or when it counted the data used): hands the rounds its
-/// policy with what's left of the budget, and applies its caps and budget
-/// to the transport at once, so a round under way follows them from its
-/// next byte. `cap_hours` still decides whether the caps apply now.
+/// policy with what's left of the budget, and applies its caps to the
+/// transport at once, so a round under way follows them from its next
+/// byte. (The transport's budget is the agent's reservation of the shared
+/// one, `crate::netusage`.) `cap_hours` still decides whether the caps apply now.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_profile(
     control: &crate::control::Control,
     up: &oneup_graph::throttle::Throttle,
     down: &oneup_graph::throttle::Throttle,
-    budget: &oneup_graph::budget::Budget,
     agent: &Agent,
     p: &Profile,
     budget_left: Option<u64>,
@@ -505,7 +505,6 @@ pub fn apply_profile(
     let cap = |kib: u64| if capped { kib.saturating_mul(1024) } else { 0 };
     up.set(cap(p.upload_kib));
     down.set(cap(p.download_kib));
-    budget.set(budget_left);
     let mut policy = Policy::of(p);
     policy.budget_left = budget_left;
     control.set_policy(policy);
@@ -872,17 +871,16 @@ mod tests {
         // networks, and the default (paused there).
         let up = Arc::new(oneup_graph::throttle::Throttle::default());
         let down = Arc::new(oneup_graph::throttle::Throttle::default());
-        let budget = Arc::new(oneup_graph::budget::Budget::default());
         let react = |agent: Agent| {
             let (control, events, metered, nets) =
                 (Arc::clone(&control), Arc::clone(&events), Arc::clone(&metered), nets.clone());
-            let (up, down, budget) = (Arc::clone(&up), Arc::clone(&down), Arc::clone(&budget));
+            let (up, down) = (Arc::clone(&up), Arc::clone(&down));
             tokio::spawn(async move {
                 loop {
                     events.next().await;
                     let seen = Seen { id: Some(HOME.into()), name: "Phone".into(), metered: metered.load(Relaxed) };
                     let p = active(&agent, Interval::default(), &nets, &seen);
-                    apply_profile(&control, &up, &down, &budget, &agent, &p, None, 600);
+                    apply_profile(&control, &up, &down, &agent, &p, None, 600);
                     control.set_auto_pause(pause_reason(&p));
                 }
             })

@@ -1368,6 +1368,9 @@ struct NetUse {
     /// The network and profile last read: what the timed count between
     /// network changes goes by.
     last: Option<(oneup_sys::network::Network, oneup_app::network::Profile)>,
+    /// The profile whose budget the transport takes reservations of, and
+    /// that budget (`None`: no budget).
+    target: Arc<std::sync::Mutex<Option<(String, u64)>>>,
 }
 
 /// The network now, its profile, this month's use there, and why sync
@@ -1380,10 +1383,40 @@ struct Looked {
 }
 
 impl NetUse {
+    /// The count and the budget are the account's, shared by its agents
+    /// (its extra pairs and vaults): kept in its main data folder's store,
+    /// the budget taken a reservation at a time (`netusage::reserve`).
     fn new(dir: &Path, graph: &Arc<Graph>) -> Result<Self> {
         let g = Arc::clone(graph);
         let counters = Box::new(move || Self::counters(&g));
-        Ok(Self { ledger: oneup_app::netusage::Ledger::new(setup::open_store(dir, 1024)?, counters), last: None })
+        let main = oneup_app::vaultpair::main_dir(dir);
+        let owner = std::process::id().to_string();
+        let target: Arc<std::sync::Mutex<Option<(String, u64)>>> = Arc::default();
+        // More of the shared budget when the transport's runs low.
+        let reserve = {
+            let store = std::sync::Mutex::new(setup::open_store(&main, 1024)?);
+            let (target, owner) = (Arc::clone(&target), owner.clone());
+            Box::new(move |want: u64| -> u64 {
+                let Some((profile, budget)) = target.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+                    return 0;
+                };
+                let month = oneup_app::netusage::month_of(now_ms());
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                let alive = |w: &str| w.parse::<u32>().ok().and_then(oneup_sys::processes::image_of).is_some();
+                oneup_app::netusage::reserve(&mut s, &profile, &month, &owner, want, budget, &alive).unwrap_or_else(
+                    |e| {
+                        tracing::warn!(error = %e, "couldn't take more of the data budget");
+                        0
+                    },
+                )
+            }) as oneup_graph::budget::Refill
+        };
+        graph.budget.set_refill(Some(reserve));
+        Ok(Self {
+            ledger: oneup_app::netusage::Ledger::new(setup::open_store(&main, 1024)?, counters, owner),
+            last: None,
+            target,
+        })
     }
 
     /// Adds what went since the last charge to the profile in effect
@@ -1427,6 +1460,23 @@ impl NetUse {
         }
         let usage = netusage::load(self.ledger.db(), profile.key.id(), &month)?;
         let budget = profile.budget_bytes();
+        // The transport takes reservations of this profile's budget; a
+        // change of profile or budget starts it again from nothing held.
+        let want = budget.map(|b| (profile.key.id().to_string(), b));
+        let changed = {
+            let mut t = self.target.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = *t != want;
+            t.clone_from(&want);
+            changed
+        };
+        if changed {
+            graph.budget.set(want.as_ref().map(|_| 0));
+        }
+        let owner = self.ledger.owner().to_string();
+        let left = match budget {
+            Some(b) => Some(netusage::left_for(self.ledger.db(), profile.key.id(), &month, &owner, b)?),
+            None => None,
+        };
         control.set_budget_spot(profile.key.id(), &month, usage.reached(budget));
         let why = oneup_app::network::connection_reason(net.connectivity)
             .or_else(|| oneup_app::network::pause_reason(profile))
@@ -1435,10 +1485,9 @@ impl NetUse {
             control,
             &graph.upload,
             &graph.download,
-            &graph.budget,
             settings,
             profile,
-            usage.left(budget),
+            left,
             autopause::local_minute_of_day(),
         );
         Ok((usage, why))
