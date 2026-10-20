@@ -895,23 +895,70 @@ pub struct Fetch {
 /// the rules' own, opens to check), downloaded or passed over.
 pub const FETCH_READ_MAX: usize = 1024;
 
-/// Where the next download pass starts reading (`meta`, a file ID; none:
-/// from the first).
+/// Where the next download pass's scan starts reading (`meta`, a file ID;
+/// none: from the first). It only moves forward, wrapping at the end.
 pub const KEY_FETCH_AFTER: &str = "pins.fetch_after";
 
+/// The rules' file that waits for a go-ahead (`meta`, a file ID): the one
+/// the go-ahead is for, tried first by each pass until it's downloaded or
+/// no longer the rules' to fetch.
+pub const KEY_FETCH_WAITING: &str = "pins.fetch_waiting";
+
+/// What the remembered waiting file is this pass.
+enum Waiting {
+    /// None remembered, or forgotten now.
+    None,
+    /// Fits the budget now: fetched first.
+    Fetch(u128, u64),
+    /// Still past the budget, or unreadable now: remembered, its bytes
+    /// held from the rules' other files.
+    Held(u128, u64),
+}
+
+/// The remembered waiting file, checked: forgotten if it's gone, here
+/// already, no longer kept on this device, released or no longer the
+/// rules'.
+fn waiting_file(store: &mut Store, pinner: &mut dyn Pinner, budget: i64) -> Result<Waiting> {
+    let Some(id) = store.read(|o| o.meta_get(KEY_FETCH_WAITING))?.and_then(|v| v.parse::<u128>().ok()) else {
+        return Ok(Waiting::None);
+    };
+    let row = store.read(|o| o.local_get(id))?;
+    let to_fetch = row
+        .as_ref()
+        .is_some_and(|r| r.kind == LocalKind::File && r.attributes & PINNED != 0 && r.attributes & RECALL != 0);
+    let rel = store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p));
+    let owned = match (to_fetch, rel) {
+        (true, Some(rel)) if !store.read(|o| o.pin_released_has(id))? => owned_verified(store, pinner, id, &rel)?,
+        _ => Some(false),
+    };
+    let size = row.map_or(0, |r| u64::try_from(r.size).unwrap_or(0));
+    Ok(match owned {
+        Some(false) => {
+            store.write(|o| o.meta_delete(KEY_FETCH_WAITING))?;
+            Waiting::None
+        }
+        Some(true) if within_budget(budget, size) => Waiting::Fetch(id, size),
+        _ => Waiting::Held(id, size),
+    })
+}
+
 /// One pass of downloads of the files kept on this device whose content
-/// isn't here: up to a batch, read a page at a time by file ID from where
-/// the last pass stopped ([`KEY_FETCH_AFTER`], wrapping around at the
-/// end), at most [`FETCH_READ_MAX`] files. A file this pass won't download
-/// is passed over, not waited on: one of the rules' past the budget, or
-/// one whose identity can't be read now (neither charged nor fetched).
+/// isn't here. First the rules' file that waits for a go-ahead
+/// ([`KEY_FETCH_WAITING`]): downloaded once it fits the budget (that's the
+/// go-ahead), its bytes held from the rules' other files until then. Then
+/// a scan, up to a batch, read a page at a time by file ID from where the
+/// last scan stopped ([`KEY_FETCH_AFTER`], wrapping around at the end), at
+/// most [`FETCH_READ_MAX`] files. A file the scan won't download is passed
+/// over and the scan moves on: one of the rules' past the budget (the
+/// first is remembered as the waiting file, if none is), or one whose
+/// identity can't be read now (neither charged nor fetched).
 /// `may` says whether a file of a size may download now (a pause, the
-/// disk, the pass's share), and stops the pass if not; `fetch` downloads
-/// one (whether it's here now). Budget is reserved durably before any
-/// download and each of the rules' own is marked started before its own;
-/// the caller settles after. `more` only when this pass downloaded or
-/// tried something: a pass that only passed files over doesn't bring
-/// another soon.
+/// disk, the pass's share), and stops the pass if not; the next scan then
+/// starts at that file. `fetch` downloads one (whether it's here now).
+/// Budget is reserved durably before any download and each of the rules'
+/// own is marked started before its own; the caller settles after. `more`
+/// only when this pass downloaded or tried something: a pass that only
+/// passed files over doesn't bring another soon.
 pub fn fetch_pass(
     store: &mut Store,
     pinner: &mut dyn Pinner,
@@ -921,17 +968,33 @@ pub fn fetch_pass(
     let batch = oneup_exec::placement::BATCH;
     let mut budget = budget(store)?;
     let mut out = Fetch::default();
-    // Each candidate with the position before it, to resume at, and its
-    // place in this pass's reading order.
-    let mut candidates: Vec<(u128, u64, bool, Option<u128>, usize)> = Vec::with_capacity(batch);
-    // The first of the rules' files that waits for a go-ahead: the next
-    // pass starts at it (place in the reading order, position before it),
-    // so the go-ahead downloads the file it was given for.
-    let mut held: Option<(usize, Option<u128>)> = None;
+    // Each candidate with the scan position before it (none for the
+    // waiting file), to resume at if the pass stops there.
+    let mut candidates: Vec<(u128, u64, bool, Option<Option<u128>>)> = Vec::with_capacity(batch);
+    let waiting = waiting_file(store, pinner, budget)?;
+    let mut remembered = None;
+    match waiting {
+        Waiting::None => {}
+        Waiting::Fetch(id, size) => {
+            budget = budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
+            candidates.push((id, size, true, None));
+            remembered = Some(id);
+        }
+        Waiting::Held(id, size) => {
+            if !within_budget(budget, size) {
+                out.blocked = Some((id, size));
+            }
+            // The bytes approved for it are its own.
+            budget = budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
+            remembered = Some(id);
+        }
+    }
     let start: Option<u128> = store.read(|o| o.meta_get(KEY_FETCH_AFTER))?.and_then(|v| v.parse().ok());
     let (mut after, mut upto, mut wrapped) = (start, None, start.is_none());
     let mut read = 0;
-    // Where the next pass starts: after the last file read, or from the
+    // Past the budget this pass: the rest of the rules' files wait, unread.
+    let mut past = false;
+    // Where the next scan starts: after the last file read, or from the
     // first once every file was read.
     let mut resume = None;
     'pages: loop {
@@ -941,11 +1004,12 @@ pub fn fetch_pass(
             let before = after;
             after = Some(r.file_id);
             read += 1;
+            if Some(r.file_id) == remembered {
+                continue;
+            }
             let size = u64::try_from(r.size).unwrap_or(0);
             let owned = if store.read(|o| o.pin_owned_has(r.file_id))? {
-                // Past the budget: the rest of the rules' files wait for
-                // the go-ahead, unread.
-                if out.blocked.is_some() {
+                if past {
                     continue;
                 }
                 let Some(rel) = store.read(|o| o.local_path_of(r.file_id))? else { continue };
@@ -958,13 +1022,17 @@ pub fn fetch_pass(
             };
             if owned {
                 if !within_budget(budget, size) {
-                    out.blocked = Some((r.file_id, size));
-                    held = Some((read, before));
+                    past = true;
+                    if remembered.is_none() {
+                        store.write(|o| o.meta_set(KEY_FETCH_WAITING, &r.file_id.to_string()))?;
+                        remembered = Some(r.file_id);
+                        out.blocked = Some((r.file_id, size));
+                    }
                     continue;
                 }
                 budget = budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
             }
-            candidates.push((r.file_id, size, owned, before, read));
+            candidates.push((r.file_id, size, owned, Some(before)));
             if candidates.len() >= batch {
                 out.more = true;
                 resume = after;
@@ -976,7 +1044,7 @@ pub fn fetch_pass(
             break;
         }
         if page.len() < want {
-            // The end: once around from the first, up to where this pass
+            // The end: once around from the first, up to where this scan
             // began.
             if wrapped {
                 break;
@@ -986,15 +1054,8 @@ pub fn fetch_pass(
     }
     let list: Vec<(u128, u64, bool)> = candidates.iter().map(|c| (c.0, c.1, c.2)).collect();
     let (reserved, blocked) = reserve_budget(store, &list)?;
-    if out.blocked.is_none()
-        && let Some((id, _)) = blocked
-        && let Some(c) = candidates.iter().find(|c| c.0 == id)
-    {
-        held = Some((c.4, c.3));
-    }
     out.blocked = out.blocked.or(blocked);
-    let mut stop_at: Option<(usize, Option<u128>)> = None;
-    for &(id, size, owned, before, n) in &candidates {
+    for &(id, size, owned, before) in &candidates {
         // Not reserved after all (the budget changed meanwhile): it waits.
         if owned && !reserved.contains(&id) {
             continue;
@@ -1002,13 +1063,22 @@ pub fn fetch_pass(
         if let Err(why) = may(size) {
             out.stopped = Some(why);
             out.more = true;
-            // The next pass starts at this file.
-            stop_at = Some((n, before));
+            // The next scan starts at this file (the waiting file is
+            // tried first anyway).
+            if let Some(before) = before {
+                resume = before;
+            } else {
+                resume = start;
+            }
             break;
         }
         let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
         if owned {
             mark_started(store, id)?;
+            if before.is_none() {
+                // The go-ahead's file: tried, so no longer waiting.
+                store.write(|o| o.meta_delete(KEY_FETCH_WAITING))?;
+            }
         }
         if fetch(&rel) {
             out.done.push((rel, id, size));
@@ -1020,11 +1090,6 @@ pub fn fetch_pass(
         out.more = false;
     }
     out.read = read;
-    // Never past a file left for later: the earliest of them in this
-    // pass's order.
-    if let Some((_, before)) = [held, stop_at].into_iter().flatten().min_by_key(|h| h.0) {
-        resume = before;
-    }
     store.write(|o| match resume {
         Some(id) => o.meta_set(KEY_FETCH_AFTER, &id.to_string()),
         None => o.meta_delete(KEY_FETCH_AFTER),
@@ -2229,6 +2294,68 @@ mod tests {
         rescan(&mut s, &[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
         run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
         assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "the note survives the rescan");
+    }
+
+    /// More rule files past the budget than a pass reads, with a file the
+    /// user pinned after them and one sorting before them: the scan moves
+    /// on, so both download while the go-ahead is outstanding. The
+    /// go-ahead then downloads exactly the remembered file, even after a
+    /// pass where it couldn't be read (its bytes aren't spent on another).
+    #[test]
+    fn rule_files_waiting_for_a_go_ahead_dont_freeze_the_scan() {
+        let n = FETCH_READ_MAX as u128 + 76;
+        // In the index's order (file ID blobs, low byte first): first, and
+        // last.
+        let (early, late): (u128, u128) = (0x0001_0000, 0x00FF_FFFF);
+        let mut rows: Vec<LocalRow> = (10..10 + n)
+            .map(|i| LocalRow { size: 2 << 30, ..row(i, 1, &format!("a{i}.psd"), LocalKind::File, RECALL) })
+            .collect();
+        rows.push(row(early, 1, "early.txt", LocalKind::File, RECALL));
+        rows.push(row(late, 1, "late.txt", LocalKind::File, RECALL));
+        let mut s = store(&rows);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
+        let names: Vec<String> = (10..10 + n).map(|i| format!("a{i}.psd")).collect();
+        let ids: Vec<(u128, &str)> = (10..10 + n).zip(names.iter().map(String::as_str)).collect();
+        observe(&mut s, &fake, &ids);
+        journal(&mut s, &[(early, RECALL | PINNED), (late, RECALL | PINNED)]);
+        let pass = |s: &mut Store, fake: &mut Fake| {
+            let mut got = Vec::new();
+            let f = fetch_pass(s, fake, &mut |_| Ok(()), &mut |rel| {
+                got.push(rel.to_string());
+                true
+            })
+            .unwrap();
+            let done: Vec<u128> = f.done.iter().map(|d| d.1).collect();
+            settle(s, &done, &|_| false).unwrap();
+            // Downloaded: the observer sees them here.
+            let here: Vec<(u128, u32)> = done.iter().map(|id| (*id, PINNED)).collect();
+            journal(s, &here);
+            (f, got)
+        };
+        let mut got = Vec::new();
+        let mut asked = None;
+        for _ in 0..3 {
+            let (f, g) = pass(&mut s, &mut fake);
+            asked = asked.or(f.blocked);
+            got.extend(g);
+        }
+        got.sort_unstable();
+        assert_eq!(got, ["/early.txt", "/late.txt"], "the user's, none of the rules'");
+        let (waiting, size) = asked.unwrap();
+        assert_eq!(s.read(|o| o.meta_get(KEY_FETCH_WAITING)).unwrap(), Some(waiting.to_string()));
+        // The go-ahead; the waiting file can't be read on the next pass.
+        wait_for_go_ahead(&mut s, size).unwrap();
+        allow(&mut s, 0).unwrap();
+        let rel = s.read(|o| o.local_path_of(waiting)).unwrap().unwrap();
+        fake.failing = vec![crate::filetree::clean(&rel)];
+        let (_, g) = pass(&mut s, &mut fake);
+        assert!(g.is_empty(), "nothing else paid with its bytes: {g:?}");
+        assert_eq!(s.read(|o| o.meta_get(KEY_FETCH_WAITING)).unwrap(), Some(waiting.to_string()), "remembered");
+        fake.failing.clear();
+        let (_, g) = pass(&mut s, &mut fake);
+        assert_eq!(g, [rel], "exactly the remembered file");
+        assert!(s.read(|o| o.meta_get(KEY_FETCH_WAITING)).unwrap().is_none());
     }
 
     /// A rescan of the folder (the change journal lost) deletes every Local
