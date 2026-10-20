@@ -25,6 +25,7 @@ pub mod identity;
 pub mod install;
 #[cfg(windows)]
 pub mod item;
+pub mod l10n;
 pub mod launch;
 pub mod moveover;
 #[cfg(windows)]
