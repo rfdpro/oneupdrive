@@ -166,6 +166,9 @@ struct Req<'a> {
     /// The body is a file's contents: each attempt waits for the upload
     /// cap and must fit in the data budget right before it goes.
     content: bool,
+    /// Don't follow a redirect: a 3xx answer is the result (its
+    /// `Location` in the measure), for a caller that fetches it itself.
+    no_redirect: bool,
 }
 
 impl<'a> Req<'a> {
@@ -183,6 +186,7 @@ impl<'a> Req<'a> {
             private: false,
             retry: true,
             content: false,
+            no_redirect: false,
         }
     }
 
@@ -873,7 +877,8 @@ impl Graph {
             if attempt > MAX_ATTEMPTS || throttled > MAX_THROTTLES {
                 return Err(Error::Exhausted(attempt));
             }
-            let mut rb = self.http.request(req.method.clone(), url);
+            let http = if req.no_redirect { self.no_redirect_client()? } else { &self.http };
+            let mut rb = http.request(req.method.clone(), url);
             let mut token = None;
             if req.auth {
                 match self.auth.access_token().await {
@@ -978,7 +983,9 @@ impl Graph {
             }
             // Counted chunk by chunk as they arrive: a body cut off midway
             // used that traffic too.
-            let body = if (200..300).contains(&status) {
+            // A redirect asked not to be followed is an answer too.
+            let answered = (200..300).contains(&status) || (req.no_redirect && (300..400).contains(&status));
+            let body = if answered {
                 self.read_counted(resp).await
             } else {
                 crate::error_body_counted(resp, Some(&self.stats.bytes)).await
@@ -996,7 +1003,7 @@ impl Graph {
             };
             drop(permit);
             measure.location = location;
-            if !(200..300).contains(&status) {
+            if !answered {
                 let what = match req.label {
                     Some(l) => l.to_string(),
                     None => url.split('?').next().unwrap_or(url).to_string(),
@@ -1155,27 +1162,34 @@ impl Graph {
         let url = format!("{}/items/{}/versions/{}/content", self.drive_url(), encode_id(id), encode_id(version));
         // Only the redirect is read here; the content comes through
         // `download_to`, with its transfer timeout and stall detection.
-        let http = match self.no_redirect.get() {
-            Some(c) => c,
-            None => {
-                let c = http_builder().redirect(reqwest::redirect::Policy::none()).build()?;
-                self.no_redirect.get_or_init(|| c)
-            }
-        };
-        let _permit = self.limiter.acquire().await;
-        let resp = http.get(&url).bearer_auth(self.auth.access_token().await?).send().await?;
-        let status = resp.status().as_u16();
-        let to = match status {
-            301 | 302 | 303 | 307 | 308 => resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|l| l.to_str().ok())
-                .map(str::to_string)
-                .ok_or_else(|| Error::Status { status, what: "version download".into(), body: "no address".into() })?,
-            _ => return Err(Error::Status { status, what: "version download".into(), body: String::new() }),
-        };
-        drop(_permit);
+        let to = self.redirect_of(&url, true).await?;
         self.download_to(&to, out).await
+    }
+
+    /// Where `url` redirects to, asked without following it, through the
+    /// same throttling, retries and counting as every request (a 429 or
+    /// 503 pauses everyone for its `Retry-After`).
+    async fn redirect_of(&self, url: &str, auth: bool) -> Result<String> {
+        let req =
+            Req { auth, no_redirect: true, label: Some("version download"), ..Req::new(reqwest::Method::GET, url) };
+        let (status, _, m) = self.send_measured(&req).await?;
+        match status {
+            301 | 302 | 303 | 307 | 308 => m.location.ok_or_else(|| Error::Status {
+                status,
+                what: "version download".into(),
+                body: "no address".into(),
+            }),
+            _ => Err(Error::Status { status, what: "version download".into(), body: String::new() }),
+        }
+    }
+
+    /// The client that doesn't follow redirects.
+    fn no_redirect_client(&self) -> Result<&reqwest::Client> {
+        if let Some(c) = self.no_redirect.get() {
+            return Ok(c);
+        }
+        let c = http_builder().redirect(reqwest::redirect::Policy::none()).build()?;
+        Ok(self.no_redirect.get_or_init(|| c))
     }
 
     /// Graph's `restoreVersion`, with `If-Match: etag`. **OneDrive Personal
@@ -1594,6 +1608,24 @@ mod tests {
         g.budget.set(Some(100_000));
         let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
         assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+    }
+
+    /// The redirect to a version's content is asked through the shared
+    /// throttling: a 429 pauses everyone for its `Retry-After` and is asked
+    /// again, then the address comes back unfollowed.
+    #[tokio::test]
+    async fn a_versions_redirect_honours_the_services_pause() {
+        let throttled =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let moved = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, count) = serve_each(vec![throttled, moved]).await;
+        let g = graph();
+        let started = std::time::Instant::now();
+        let to = tokio::time::timeout(Duration::from_secs(10), g.redirect_of(&url, false)).await.unwrap().unwrap();
+        assert_eq!(to, "http://127.0.0.1:9/content");
+        assert_eq!(count.load(Relaxed), 2, "asked again after the pause");
+        assert_eq!(g.stats.throttled.load(Relaxed), 1, "the shared limiter paused");
+        assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
     }
 
     /// A file the user opens skips the limit on requests at once, but
