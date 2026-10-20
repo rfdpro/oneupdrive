@@ -59,6 +59,15 @@ impl Budget {
         }
     }
 
+    /// `n` bytes went out or came in that are never held (metadata: a
+    /// request's JSON, a listing's answer, the push channel): they use the
+    /// budget all the same.
+    pub fn spent(&self, n: u64) {
+        if let Some(left) = &mut *self.lock() {
+            *left = left.saturating_sub(n);
+        }
+    }
+
     /// `n` bytes arrived (they're used, whatever is left): whether they
     /// fit in what was left before them. A chunk that uses the budget up
     /// exactly still fits; only one past it doesn't.

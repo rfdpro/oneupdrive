@@ -77,11 +77,11 @@ pub(crate) async fn error_body(resp: reqwest::Response) -> reqwest::Result<Vec<u
     error_body_counted(resp, None).await
 }
 
-/// [`error_body`], counting each chunk in `counted` as it arrives (also of
-/// a read that fails later).
+/// [`error_body`], telling `counted` each chunk's size as it arrives (also
+/// of a read that fails later).
 pub(crate) async fn error_body_counted(
     mut resp: reqwest::Response,
-    counted: Option<&std::sync::atomic::AtomicU64>,
+    counted: Option<&(dyn Fn(u64) + Sync)>,
 ) -> reqwest::Result<Vec<u8>> {
     let limit = MAX_ERROR_BODY + 4;
     let mut body = Vec::new();
@@ -89,7 +89,7 @@ pub(crate) async fn error_body_counted(
         && let Some(chunk) = resp.chunk().await?
     {
         if let Some(c) = counted {
-            c.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            c(chunk.len() as u64);
         }
         body.extend_from_slice(&chunk);
     }
