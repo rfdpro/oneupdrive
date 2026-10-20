@@ -41,7 +41,9 @@
 //!   deletion evidence first, and a conflict copy detaches its Synced row
 //!   first. The same transaction saves which record is pending (in `meta`,
 //!   `exec.pending.<local file ID>`, one per item), and the final record
-//!   clears it. One left over (the operation failed, or the process died)
+//!   clears it. That transaction commits durably (`synchronous = FULL`,
+//!   where the rest commit at NORMAL): a power cut can roll back the
+//!   newest commits, and must not take a record whose effect is done. One left over (the operation failed, or the process died)
 //!   is settled right after the operation, before it releases its claims,
 //!   or at the start of the next run: if the folder shows the effect didn't
 //!   happen, the record is undone. `tests/sync.rs` crashes a round at every

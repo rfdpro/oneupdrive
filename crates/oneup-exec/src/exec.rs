@@ -53,11 +53,34 @@ impl<'a> Db<'a> {
     /// under way meanwhile. Gives up, as SQLite would, after
     /// [`oneup_store::BUSY_WAIT`].
     async fn write<T, E: From<oneup_store::Error>>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T, E>) -> Result<T, E> {
+        self.write_as(false, f).await
+    }
+
+    /// [`Db::write`] for a transaction that writes a record ahead of an
+    /// effect ([`PENDING`]): committed durably, so it's on disk before the
+    /// effect starts and outlives a power cut (`data-safety.md` invariant
+    /// 7). The record itself is written with `Ops::meta_set_ahead`, which
+    /// refuses anywhere else.
+    async fn write_ahead<T, E: From<oneup_store::Error>>(
+        &self,
+        f: impl FnOnce(&Ops<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.write_as(true, f).await
+    }
+
+    async fn write_as<T, E: From<oneup_store::Error>>(
+        &self,
+        durable: bool,
+        f: impl FnOnce(&Ops<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
         let started = Instant::now();
         let mut pause = Duration::from_millis(1);
         let mut f = f;
         loop {
-            let tried = self.lock().try_write_now(f);
+            let tried = {
+                let mut store = self.lock();
+                if durable { store.durably(|s| s.try_write_now(f)).map_err(E::from)? } else { store.try_write_now(f) }
+            };
             match tried {
                 Ok(done) => return done,
                 Err((_, busy)) if started.elapsed() >= oneup_store::BUSY_WAIT => return Err(busy.into()),
@@ -1578,9 +1601,9 @@ impl<C: Cloud> Executor<C> {
                 }
                 if let Some(old) = replace {
                     store
-                        .write(|o| {
+                        .write_ahead(|o| {
                             o.note_local_deleted(old.id.0)?;
-                            Ok::<_, Fail>(o.meta_set(&pending_of(old.id), &Pending::Evidence(old.id).encode())?)
+                            Ok::<_, Fail>(o.meta_set_ahead(&pending_of(old.id), &Pending::Evidence(old.id).encode())?)
                         })
                         .await?;
                     self.crash_point()?;
@@ -1682,12 +1705,12 @@ impl<C: Cloud> Executor<C> {
                 // Detach first (see the crate docs): the renamed copy must
                 // never be taken for a rename of the Synced item.
                 store
-                    .write(|o| {
+                    .write_ahead(|o| {
                         let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                         need(b.local == Some(local.id))?;
                         o.synced_put(&Base { local: None, ..b })?;
                         let p = Pending::Detached { sid: *sid, local: local.id, name: name.clone() };
-                        Ok(o.meta_set(&pending_of(local.id), &p.encode())?)
+                        Ok(o.meta_set_ahead(&pending_of(local.id), &p.encode())?)
                     })
                     .await?;
                 self.crash_point()?;
@@ -1704,10 +1727,10 @@ impl<C: Cloud> Executor<C> {
             // ------------------------------------------------ deletions
             Op::RecycleLocal { sid, local } => {
                 let synced = store
-                    .write(|o| {
+                    .write_ahead(|o| {
                         let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                         o.note_local_deleted(local.id.0)?;
-                        o.meta_set(&pending_of(local.id), &Pending::Evidence(local.id).encode())?;
+                        o.meta_set_ahead(&pending_of(local.id), &Pending::Evidence(local.id).encode())?;
                         Ok::<_, Fail>(b.hash)
                     })
                     .await?;
@@ -1846,7 +1869,8 @@ impl<C: Cloud> Executor<C> {
 /// Where write-ahead records are kept (see the crate docs): under
 /// `exec.pending.<local file ID>`, one per item, so operations under way
 /// at once each have their own. Set in the same transaction as the
-/// write-ahead, cleared in the same transaction as the final record.
+/// write-ahead, committed durably ([`Db::write_ahead`]), cleared in the
+/// same transaction as the final record.
 const PENDING: &str = "exec.pending";
 
 /// The key of item `id`'s write-ahead record.
