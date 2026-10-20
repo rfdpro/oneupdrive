@@ -170,7 +170,7 @@ impl Job {
             json!({
                 "approved": marks_json(&a.approved),
                 "left": marks_json(&a.left),
-                "rewound": a.rewound.iter().collect::<Vec<_>>(),
+                "follows": a.follows.iter().map(|k| format!("{k:032x}")).collect::<Vec<_>>(),
             })
         });
         json!({
@@ -190,7 +190,12 @@ impl Job {
             Some(a) => Some(Approval {
                 approved: marks_of(a.get("approved"))?,
                 left: marks_of(a.get("left"))?,
-                rewound: a.get("rewound")?.as_array()?.iter().map(Value::as_u64).collect::<Option<_>>()?,
+                follows: a
+                    .get("follows")?
+                    .as_array()?
+                    .iter()
+                    .map(|k| u128::from_str_radix(k.as_str()?, 16).ok())
+                    .collect::<Option<_>>()?,
             }),
         };
         Some(Job {
@@ -441,8 +446,9 @@ pub struct Steps {
     pub later: Shown,
     /// Approved: the keys the gate takes them by.
     pub keys: Vec<oneup_gate::ItemKey>,
-    /// Items it changed, whose follow-ups here the breakers don't count.
-    pub rewound: Vec<Sid>,
+    /// What this PC is to do to follow what it changed, which the breakers
+    /// don't count (`oneup_gate::Follow`).
+    pub rewound: Vec<oneup_gate::ItemKey>,
     /// Not approved yet: every step and folder of its list, which an
     /// approval of `code` approves.
     pub preview: Option<(u64, Vec<Op>)>,
@@ -474,7 +480,7 @@ pub fn steps(o: &Ops<'_>, rules: &RuleSet, job: &Job) -> Result<Steps> {
         paths,
         later,
         keys,
-        rewound: approval.rewound.iter().copied().collect(),
+        rewound: approval.follows.iter().map(|k| oneup_gate::ItemKey(*k)).collect(),
         preview: None,
         left_alone: leave.len(),
     })
@@ -498,6 +504,12 @@ pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Repor
     let done: Vec<&Op> = report.done.iter().filter(mine).collect();
     for op in &done {
         approval.ran(op, oneup_exec::rewind_mark(o, op)?);
+        let follows = oneup_exec::rewind_follows(o, op)?;
+        approval.follows.extend(follows.iter().map(|f| oneup_gate::follow_key(f).0));
+    }
+    // Each follow-up is approved once: gone when it ran.
+    for f in report.done.iter().filter_map(oneup_gate::Follow::of) {
+        approval.follows.remove(&oneup_gate::follow_key(&f).0);
     }
     job.ran += done.len() as u64;
     job.left_alone = job.left_alone.max(steps.left_alone as u64);
@@ -790,7 +802,7 @@ mod tests {
         approval.approved.insert(Key::Record(7), Mark::Record);
         let spot = Spot { parent: RemoteId("A!2".into()), name: "a b.txt".into(), size: 5, hash: Some([9; 20]) };
         approval.left.insert(Key::Cloud(RemoteId("A!3".into())), Mark::Cloud(spot));
-        approval.rewound.insert(7);
+        approval.follows.insert(7);
         let job = Job {
             folder: "/docs".into(),
             sid: 3,

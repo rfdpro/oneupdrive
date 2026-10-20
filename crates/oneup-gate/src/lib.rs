@@ -556,25 +556,60 @@ pub struct Context<'a> {
     /// type ([`content::looks_wrong`]), **sorted**. Uploads of these count
     /// for the content guard.
     pub suspicious: &'a [LocalId],
-    /// Synced items an approved rewind changed in OneDrive, **sorted**: this
-    /// PC following those changes ([`follows_rewind`]) isn't counted by the
-    /// circuit breakers.
-    pub rewound: &'a [Sid],
+    /// What this PC is to do to follow the changes an approved rewind made
+    /// in OneDrive ([`Follow`], by [`follow_key`]), **sorted**: exactly those
+    /// operations aren't counted by the circuit breakers.
+    pub rewound: &'a [ItemKey],
 }
 
-/// Whether `op` brings this PC along with a change a rewind made in
-/// OneDrive to an item in `rewound` (sorted): a reverted file downloaded
-/// over the copy here, a file or folder moved back, one removed recycled.
-/// Each still runs under its own preconditions and keeps what it replaces
+/// What this PC does to follow one change an approved rewind made in
+/// OneDrive, bound to the state the rewind left the item in: anything else
+/// for the item (a collaborator's edit, move or deletion before this PC
+/// caught up) is another operation, counted as ever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Follow {
+    /// Download over this PC's copy of `sid` exactly the version the rewind
+    /// left (its ID and eTag).
+    Download { sid: Sid, remote: oneup_sync::RemotePre },
+    /// Move this PC's copy of `sid` where the rewind put it (its Synced
+    /// folder and name).
+    Move { sid: Sid, parent: Sid, name: String },
+    /// Recycle this PC's copy of `sid`, as it was (ID and stamp) when the
+    /// rewind removed it in OneDrive.
+    Recycle { sid: Sid, local: oneup_sync::LocalPre },
+}
+
+impl Follow {
+    /// The follow-up `op` is, if it's one of the three kinds.
+    pub fn of(op: &Op) -> Option<Follow> {
+        Some(match op {
+            Op::Download { remote, replace: Some(_), link: Link::Existing(sid), .. } => {
+                Follow::Download { sid: *sid, remote: remote.clone() }
+            }
+            Op::MoveLocal { sid, parent, name, .. } => Follow::Move { sid: *sid, parent: *parent, name: name.clone() },
+            Op::RecycleLocal { sid, local } => Follow::Recycle { sid: *sid, local: local.clone() },
+            _ => return None,
+        })
+    }
+}
+
+/// A [`Follow`]'s key, for [`Context::rewound`].
+pub fn follow_key(f: &Follow) -> ItemKey {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    h.update(b"follow\0");
+    h.update(format!("{f:?}").as_bytes());
+    let d = h.finalize();
+    let mut first = [0u8; 16];
+    first.copy_from_slice(&d[..16]);
+    ItemKey(u128::from_le_bytes(first))
+}
+
+/// Whether `op` is exactly one of the follow-ups in `rewound` (sorted).
+/// It still runs under its own preconditions and keeps what it replaces
 /// as any download or recycling does.
-pub fn follows_rewind(op: &Op, rewound: &[Sid]) -> bool {
-    let sid = match op {
-        Op::Download { replace: Some(_), link: Link::Existing(sid), .. }
-        | Op::MoveLocal { sid, .. }
-        | Op::RecycleLocal { sid, .. } => *sid,
-        _ => return false,
-    };
-    rewound.binary_search(&sid).is_ok()
+pub fn follows_rewind(op: &Op, rewound: &[ItemKey]) -> bool {
+    !rewound.is_empty() && Follow::of(op).is_some_and(|f| rewound.binary_search(&follow_key(&f)).is_ok())
 }
 
 /// Whether `op` removes a duplicate copy the user chose to remove: an
@@ -1192,27 +1227,67 @@ mod tests {
         assert_eq!(review_in(&lax, &Context { paths: &elsewhere, ..cx }, vec![revert(1, "e1", 1)]).breakers.len(), 1);
     }
 
-    #[test]
-    fn following_an_approved_rewind_isnt_counted_by_the_breakers() {
-        let follow = |i: u128| Op::Download {
-            remote: rpre(i),
+    fn download(i: u128, etag: &str) -> Op {
+        Op::Download {
+            remote: RemotePre { id: RemoteId(format!("r{i}")), etag: etag.into() },
             to: LocalId(1),
             parent: 0,
             name: format!("f{i}"),
             replace: Some(lpre(i)),
             link: Link::Existing(i as Sid),
-        };
-        let ops: Vec<Op> = (1..=30).map(follow).collect();
+        }
+    }
+
+    fn move_local(i: u128, name: &str) -> Op {
+        Op::MoveLocal { sid: i as Sid, local: lpre(i), to: LocalId(1), parent: 0, name: name.into() }
+    }
+
+    fn keys(ops: &[Op]) -> Vec<ItemKey> {
+        let mut k: Vec<ItemKey> = ops.iter().filter_map(Follow::of).map(|f| follow_key(&f)).collect();
+        k.sort_unstable();
+        k
+    }
+
+    #[test]
+    fn following_an_approved_rewind_isnt_counted_by_the_breakers() {
+        let ops: Vec<Op> = (1..=30).map(|i| download(i, "after")).collect();
         let cx = Context { synced_items: 100, ..Context::default() };
         assert_eq!(review_in(&Policy::default(), &cx, ops.clone()).breakers.len(), 1);
-        let rewound: Vec<Sid> = (1..=30).collect();
+        let rewound = keys(&ops);
         let r = review_in(&Policy::default(), &Context { rewound: &rewound, ..cx }, ops.clone());
         assert!(r.breakers.is_empty() && r.approved.len() == 30);
-        // Only those items, and only what follows a change made in OneDrive.
-        let some: Vec<Sid> = (1..=5).collect();
+        // Only those items.
+        let some = keys(&ops[..5]);
         assert_eq!(review_in(&Policy::default(), &Context { rewound: &some, ..cx }, ops).breakers.len(), 1);
-        let deletes: Vec<Op> = (1..=30).map(delete_remote).collect();
-        assert_eq!(review_in(&Policy::default(), &Context { rewound: &rewound, ..cx }, deletes).breakers.len(), 1);
+    }
+
+    /// What a collaborator does to a rewound item before this PC catches up
+    /// isn't what the rewind's approval covers.
+    #[test]
+    fn a_change_made_after_the_rewind_isnt_covered_by_it() {
+        let cx = Context { synced_items: 100, ..Context::default() };
+        let p = Policy::default();
+        // Edited again in OneDrive: another eTag.
+        let rewound = keys(&(1..=30).map(|i| download(i, "after")).collect::<Vec<_>>());
+        let edited: Vec<Op> = (1..=30).map(|i| download(i, "edited again")).collect();
+        assert_eq!(review_in(&p, &Context { rewound: &rewound, ..cx }, edited).breakers.len(), 1);
+        // Moved again: another name.
+        let rewound = keys(&(1..=30).map(|i| move_local(i, "back")).collect::<Vec<_>>());
+        let moved: Vec<Op> = (1..=30).map(|i| move_local(i, "elsewhere")).collect();
+        assert_eq!(review_in(&p, &Context { rewound: &rewound, ..cx }, moved).breakers.len(), 1);
+        // Deleted: a recycling the rewind never asked for.
+        let rewound = keys(&(1..=30).map(|i| download(i, "after")).collect::<Vec<_>>());
+        let deleted: Vec<Op> = (1..=30).map(recycle).collect();
+        assert_eq!(review_in(&p, &Context { rewound: &rewound, ..cx }, deleted).breakers.len(), 1);
+        // A removal is followed only for the copy as it was then.
+        let rewound = keys(&(1..=30).map(recycle).collect::<Vec<_>>());
+        let changed: Vec<Op> = (1..=30)
+            .map(|i| Op::RecycleLocal { sid: i as Sid, local: LocalPre { id: LocalId(i), stamp: Some((1, 2)) } })
+            .collect();
+        assert_eq!(review_in(&p, &Context { rewound: &rewound, ..cx }, changed).breakers.len(), 1);
+        assert!(
+            review_in(&p, &Context { rewound: &rewound, ..cx }, (1..=30).map(recycle).collect()).breakers.is_empty()
+        );
     }
 
     #[test]

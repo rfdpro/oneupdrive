@@ -27,7 +27,7 @@ use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
 mod rewind;
-pub use rewind::rewind_mark;
+pub use rewind::{rewind_follows, rewind_mark};
 
 /// The store, shared by the operations under way. Each use locks it for
 /// one synchronous read or transaction, never across an `.await`.

@@ -979,9 +979,10 @@ pub fn mark_of(op: &Op) -> Option<(Key, Mark)> {
 pub struct Job {
     pub approved: BTreeMap<Key, Mark>,
     pub left: BTreeMap<Key, Mark>,
-    /// The Synced items its steps changed: this PC following those changes
-    /// was approved with the rewind (`oneup_gate::Context::rewound`).
-    pub rewound: BTreeSet<Sid>,
+    /// What this PC is to do to follow the changes its steps made, by key
+    /// (`oneup_gate::follow_key`; the caller adds them as steps run and
+    /// drops each once done): approved with the rewind.
+    pub follows: BTreeSet<u128>,
 }
 
 impl Job {
@@ -1012,9 +1013,6 @@ impl Job {
     pub fn ran(&mut self, op: &Op, now: Mark) {
         if let Some((key, _)) = mark_of(op) {
             self.left.insert(key, now);
-        }
-        if let Op::Rewind { sid, .. } = op {
-            self.rewound.insert(*sid);
         }
     }
 }

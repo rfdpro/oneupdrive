@@ -82,7 +82,10 @@ pub use cloud::{Cloud, CloudError, Meta, MetaDone, Replaced, Source, VersionMark
 #[cfg(all(windows, feature = "crash-test"))]
 pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]
-pub use exec::{Executor, FOLLOW_MAX, FetchCheck, Follow, RESCUE_TRIES, Report, Skip, link_roots, rescues_given_up, rewind_mark};
+pub use exec::{
+    Executor, FOLLOW_MAX, FetchCheck, Follow, RESCUE_TRIES, Report, Skip, link_roots, rescues_given_up, rewind_follows,
+    rewind_mark,
+};
 pub use graph::{GraphCloud, UploadMemory};
 pub use moving::Settled;
 #[cfg(windows)]
