@@ -50,6 +50,7 @@ cargo run -p oneup -- login --test-account --data-dir "$env:LOCALAPPDATA\OneUpDr
 ## What we look for in a PR
 * **Tests.** Behaviour changes come with tests. Changes to anything that can delete, overwrite, move or dehydrate data need tests that show the safety rules still hold, including failure and crash cases.
 * **Docs.** User-visible changes update `docs/user-guide/` in plain language. Design changes update `docs/architecture/`.
+* **Text people read** goes through the string catalogue: `t!("…")` in Rust, `tr("…")` in the settings page, with the English as the key. Translations: [Localisation § Adding a language](docs/architecture/localisation.md#adding-a-language).
 * **Small, focused changes** with a clear description of *why*.
 * **Never use real user data in tests.** Use temp directories and dedicated test accounts only.
 * Changes to the safety gate or the destructive-effects layer (`crates/oneup-gate`, `crates/oneup-effects`) need **two reviews**. With one maintainer, that means the maintainer's review plus an **independent model review**: an AI model session that didn't write the change reviews the diff against [Data safety](docs/architecture/data-safety.md), and the PR records the reviewer (model and version), its findings and how each was resolved. The [PR template](.github/pull_request_template.md) has a section for it.

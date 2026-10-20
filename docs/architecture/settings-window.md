@@ -52,6 +52,9 @@ First run walks through signing in (hidden sign-in that continues by itself, wit
 ## Parity with the command line
 Every window action has a CLI equivalent (ticking and unticking = `oneup rules --include-path/--exclude-path`, Suggestions = `oneup rules --suggest`, Recent activity = `oneup activity`, Kept on this PC = `oneup versions`/`restore`, Sync this first = `oneup sync-now PATH`, Sign out/Sign in = `oneup logout`/`login`, shared folders = `oneup login --shared-folders`, updates = `oneup updates`, accounts = `oneup accounts`, Shortcuts = `oneup shortcuts`, Sync failures = `oneup unsynced resolve`, Search = `oneup find`, its settings = `oneup search`). CLI-only by design: safety-stop answers (`oneup approve`; the tray's dialogs in the GUI), `verify`, `diagnose`, `plan`, `observe` and the developer commands.
 
+## Language
+The page's text is looked up in the user's language's catalogue (`tr()`, and its own markup when it loads), and its numbers and dates use the regional format the program passes in: [localisation.md](localisation.md).
+
 ## Accessibility
 Target: WCAG 2.2 AA, by keyboard and with a screen reader (Narrator, NVDA), in light, dark and Windows' contrast themes. `bins/oneup/tests/settings_a11y.rs` checks the page headless, as text, in `cargo test`: every control in the markup and every one the script makes (`el("input", …)` and the like) has a name, dialogs are named by their headings, icons are hidden from screen readers or described, ids are unique and the ids ARIA attributes name exist, the tab lists, tree and live regions have their roles, the details panel isn't a live region, and the palette's pairs meet 4.5:1 (text) and 3:1 (field borders, focus ring, status dots) in light and dark; the CSS must answer `prefers-color-scheme`, `forced-colors` and `prefers-reduced-motion`, and no focus style may drop the outline. axe-core (MPL-2.0) isn't on the licence list, hence a check of our own.
 

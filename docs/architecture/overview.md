@@ -56,5 +56,8 @@ Every name in OneDrive is already in the Remote tree, so search needs no network
 ## Knowing how files are used
 The agent counts which programs open online-only files (Windows names them in each download request) and which write files (asked of Windows' Restart Manager as the change journal reports each write), per hour, on the PC only. The same records drive the automatic space policies, which make long-unused files online-only, and the content guard reads the start of each edited file before upload to catch files that suddenly look encrypted ([usage.md](usage.md)).
 
+## Languages and accessibility
+What the window, the tray and the command line say is looked up by its English text in a catalogue for the user's display language, with English wherever a translation is missing; numbers and dates follow the regional format ([localisation.md](localisation.md)). The settings window works from the keyboard and with a screen reader, and follows Windows' contrast themes ([settings-window.md § Accessibility](settings-window.md#accessibility)).
+
 ## Data safety
 No deletion without explicit evidence, every change checked against the latest state right before it happens, every transfer verified by hash, circuit breakers on mass changes and on edited files that look encrypted, and both copies kept on conflict. The full list of invariants: [data-safety.md](data-safety.md).

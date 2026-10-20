@@ -68,6 +68,9 @@ The Microsoft accounts on this PC, each with its own settings window (**Open set
 ## About
 The version, and the data folder (database, settings, logs) with a shortcut to the log.
 
+## Language and formats
+OneUpDrive is in English for now. When a translation for your Windows display language is added, the window, the icon's menu and the command line use it, and English wherever a translation is missing. Numbers, sizes and dates follow your regional format (Settings > Time & language > Region), like 1.830 or 1 830 instead of 1,830.
+
 ## Keyboard, screen readers and contrast themes
 Everything in the window works from the keyboard. Tab moves between controls; the focused one has an outline.
 
