@@ -335,7 +335,10 @@ fn preview_in(o: &Ops<'_>, rules: &RuleSet, folder: &str, at_ms: i64, now_ms: i6
 /// Starts rewinding `folder` to `at_ms`: saved for the agent's next round,
 /// where it waits for the user's approval as a safety stop. Refused while
 /// another rewind is under way, in a backup pair (it never changes this
-/// PC), and when there's nothing to change.
+/// PC), and when there's nothing to change. With `expect` (the code of the
+/// preview the user saw), it starts only if the list is still that one;
+/// otherwise nothing starts and the new list comes back to be shown
+/// (`started` false). Returns the list and whether it started.
 pub fn start(
     store: &mut Store,
     data_dir: &std::path::Path,
@@ -343,7 +346,8 @@ pub fn start(
     folder: &str,
     at_ms: i64,
     now_ms: i64,
-) -> Result<Preview> {
+    expect: Option<u64>,
+) -> Result<(Preview, bool)> {
     if crate::flow::get(store)? == crate::flow::Flow::Backup {
         bail!("this folder is a backup: OneUpDrive never changes this PC there, so it can't rewind it");
     }
@@ -361,6 +365,9 @@ pub fn start(
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
+        if expect.is_some_and(|c| c != p.code) {
+            return Ok(Ok((p, false)));
+        }
         if p.changes.is_empty() {
             return Ok(Err(anyhow::anyhow!("nothing to rewind: {} is as it was then", shown_folder(folder))));
         }
@@ -386,7 +393,7 @@ pub fn start(
             folder,
             format!("to {}; waiting for your approval (code {:016x})", when(at_ms), p.code),
         )])?;
-        Ok(Ok(p))
+        Ok(Ok((p, true)))
     })?
 }
 
@@ -717,16 +724,24 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         let at = now();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let e = start(&mut store, &dir, &rules, "/", at, now()).unwrap_err();
+        let e = start(&mut store, &dir, &rules, "/", at, now(), None).unwrap_err();
         assert!(e.to_string().contains("nothing to rewind"), "{e}");
         assert!(preview(&store, &rules, "/", 0, now()).is_err(), "before the history began");
 
-        // Edited since, and synced.
+        // Edited since, and synced; previewed.
         synced(&mut store, 2, "e2");
-        let p = start(&mut store, &dir, &rules, "/", at, now()).unwrap();
+        let seen = preview(&store, &rules, "/", at, now()).unwrap();
+        // Edited again before the person starts it: the list they saw isn't
+        // the one there is now, so nothing starts and the new one comes back.
+        synced(&mut store, 4, "e4");
+        let (again, started) = start(&mut store, &dir, &rules, "/", at, now(), Some(seen.code)).unwrap();
+        assert!(!started && again.code != seen.code, "only what was seen starts");
+        assert!(store.read(load).unwrap().is_none(), "nothing started");
+        let (p, started) = start(&mut store, &dir, &rules, "/", at, now(), Some(again.code)).unwrap();
+        assert!(started);
         assert_eq!(p.changes.len(), 1);
         assert_eq!((p.changes[0].kind, p.changes[0].source), (Kind::Revert, Source::Versions));
-        assert!(start(&mut store, &dir, &rules, "/", at, now()).is_err(), "one at a time");
+        assert!(start(&mut store, &dir, &rules, "/", at, now(), None).is_err(), "one at a time");
 
         // The round shows the same list, with the code the preview gave.
         let job = store.read(load).unwrap().unwrap();
@@ -795,7 +810,7 @@ mod tests {
             synced(&mut store, i + 1, &format!("e{i}"));
         }
         let rules = RuleSet::default();
-        start(&mut store, &dir, &rules, "/", at, now()).unwrap();
+        start(&mut store, &dir, &rules, "/", at, now(), None).unwrap();
         keep_history(&mut store, now(), false).unwrap();
         assert_eq!(store.read(|o| o.history_rows()).unwrap(), 5, "the five changes after the moment stay");
         assert!(cancel(&mut store, now()).unwrap());

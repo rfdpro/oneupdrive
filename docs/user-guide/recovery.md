@@ -18,12 +18,15 @@ What it leaves alone:
 * **What OneUpDrive never saw.** The rewind works from OneUpDrive's own history of what it synced. That history starts when a folder's first sync finishes and keeps 30 days (at most a million changes), so you can't rewind further back than that. Files that were never synced aren't touched.
 * **What OneDrive no longer has.** OneDrive keeps deleted items in its recycle bin for a limited time (30 days for personal accounts, less if the bin is full) and a limited number of versions. What's gone from there can't come back; the rest of the rewind still runs, and the activity log says what couldn't be done.
 
+If the list changed between the preview and **Rewind** (something synced meanwhile), nothing starts: the new list is shown to look at again.
+
 A folder that's a [backup](folders.md) or an [encrypted vault](vaults.md) can't be rewound.
 
 From a terminal:
 ```powershell
 oneup rewind /Documents --to "2026-10-19 14:05"            # what would change; nothing changes
-oneup rewind /Documents --to "2026-10-19 14:05" --start    # ask the agent to do it
+oneup rewind /Documents --to "2026-10-19 14:05" --start --expect 3f2a9c4d5e6f7081
+                                                           # ask the agent to do the list with that code
 oneup approve 3f2a9c4d5e6f7081                             # the code it showed
 oneup rewind --cancel                                      # stop a rewind under way; what it did stays done
 oneup rewind --set-history-days 60                         # keep more history (0 turns rewinding off)

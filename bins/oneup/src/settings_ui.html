@@ -3983,14 +3983,27 @@
         }
 
         async function rewindPreview(args) {
-            const p = await run(call("rewind_preview", args));
+            rewindShown(args, await run(call("rewind_preview", args)));
+        }
+
+        // Starts only the list shown (its code); a list that changed
+        // meanwhile comes back and is shown instead, to be looked at again.
+        function rewindShown(args, p) {
             RW.preview = {
                 args,
                 p
             };
             const go = smallBtn("Rewind", async() => {
                 if (!confirm(`Rewind ${p.folder === "/" ? "everything" : p.folder} to ${when(p.at_ms)}? It waits for your approval next, and nothing changes until then.`)) return;
-                const s = await run(call("rewind_start", args));
+                const s = await run(call("rewind_start", {
+                    ...args,
+                    expect: p.code
+                }));
+                if (!s.started) {
+                    toast("The list changed. Here it is again.");
+                    rewindShown(args, s);
+                    return;
+                }
                 RW.preview.p = s;
                 rewindWaiting(s.code);
             }, "primary");
