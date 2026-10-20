@@ -73,16 +73,16 @@ OneUpDrive reads the hooks again when `config.toml` changes. To run a PowerShell
 ### What hooks can't do
 A change in OneDrive must never become a program running on your PC. So OneUpDrive refuses a hook, and says why, when:
 
-* its program is in a folder OneUpDrive syncs (any account's, any pair's or vault's), in a folder another sync app manages (the OneDrive app, Dropbox, …), or reached through a link into one;
-* an argument names a file in such a folder (a script for `powershell.exe`, say);
+* its program, or a script it runs, is in a folder OneUpDrive syncs (any account's, any pair's or vault's), in a folder another sync app manages (the OneDrive app, Dropbox, …), or reached through a link into one;
 * its program is given as a relative path (`tools\x.exe`): give the full path;
-* it would hand a file's name to `cmd.exe`, a batch file, or PowerShell without `-File`. These read their arguments as commands, and a file someone shared with you could be named to run one.
+* it runs an interpreter (`cmd.exe`, PowerShell, `python`, `node`, `wscript`, …) in a way that could let a value from the cloud run as a command: a template where the interpreter expects code (`powershell -Command {path}`, `cmd /c {path}`, `python -c`), or a template standing in for the script file itself (`powershell -File {path}`). Point the interpreter at a fixed script file and pass `{path}` after it;
+* OneUpDrive can't list all the folders it syncs just then (it waits and tries again rather than risk missing one).
 
-It checks when the hooks load and again right before each start. Move the program to a folder that isn't synced, like `C:\Tools`.
+It checks when the hooks load and again right before each start, against the folders read fresh then. Move the program to a folder that isn't synced, like `C:\Tools`. OneUpDrive also starts a hook with synced folders removed from its `PATH` and in a safe working folder, so it can't pick up a cloud-controlled helper by accident.
 
 Hooks get the event's words and paths as arguments, nothing else: never a file's contents, your sign-in, a safety stop's approval code, or OneUpDrive's own settings in the environment.
 
-**Hooks run as you.** Anything you can do, a hook's program can do too: open your files, run `oneup approve`, change your settings. OneUpDrive gives it no more than that, and no way to answer a safety stop that any other program you run doesn't have. Only add programs you trust, as you would for anything that starts by itself.
+**Hooks run as you.** A hook's program can do anything you can: open your files, read what only you can read. What it *can't* do is use OneUpDrive's own controls: the channel that `oneup approve`, pause and status use refuses hook programs (and anything they start), so a hook can't approve a safety stop or read one's code. That aside, OneUpDrive gives a hook nothing a program you double-click doesn't already have — including that files only you can read (Windows protects them per user, not per program) stay readable. Only add programs you trust, as you would for anything that starts by itself.
 
 ## PowerShell
 The module in `packaging\powershell` has `Get-OneUpStatus`, `Suspend-OneUp`, `Resume-OneUp` and `Wait-OneUpSync`:
