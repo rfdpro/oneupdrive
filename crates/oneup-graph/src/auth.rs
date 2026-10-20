@@ -217,6 +217,14 @@ impl Auth {
         Ok(token)
     }
 
+    /// Uses `token` as the access token for the next hour, without signing
+    /// in (tests against a loopback server).
+    #[doc(hidden)]
+    pub async fn set_access_for_tests(&self, token: &str) {
+        *self.access.lock().await =
+            Some(Access { token: token.to_string(), refresh_at: Instant::now() + Duration::from_secs(3600) });
+    }
+
     /// Forces the next request to refresh, after `stale` got a 401. Only
     /// if it's still the cached token: when a burst of requests all get a
     /// 401, the first one's refresh mustn't be thrown away by the rest.
