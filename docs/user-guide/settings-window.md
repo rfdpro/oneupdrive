@@ -5,7 +5,7 @@ Open it from the OneUpDrive icon's menu: **Settings**, or from OneUpDrive in the
 ## Set up
 Shown only until a folder is set up: sign in, choose the folders, what to exclude and Files On-Demand, look at the preview, **Start syncing**. See [Getting started](getting-started.md#setting-up). On a PC with the OneDrive app, it first offers **Move over from the OneDrive app** (see the [glossary](glossary.md) for unfamiliar words): your OneDrive folder stays where it is, after a check and unlinking the app. See [Moving over from the OneDrive app](migrating-from-onedrive.md#in-the-settings-window).
 
-At the top of every page, a light and a word say whether OneUpDrive is running and what it's doing. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While there's a problem, a red card above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Search**, **Apps**, **Activity** and **Shared**, then the settings: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**. On the Files page, the magnifier at the right of **All files**, **Exclude** and **Duplicates** opens a search box when you point at it or Tab to it.
+At the top of every page, a light and a word say whether OneUpDrive is running and what it's doing. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While there's a problem, a red card above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Search**, **Apps**, **Activity**, **Shared** and **Recovery**, then the settings: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**. On the Files page, the magnifier at the right of **All files**, **Exclude** and **Duplicates** opens a search box when you point at it or Tab to it.
 
 ## Files
 Everything about what syncs, in one place.
@@ -46,7 +46,7 @@ Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the
 * **Recent**: what OneUpDrive did lately, newest first, with whether it went through (*Done*, *Skipped*, *Failed*, *Waiting*). **Problems only** hides the rest; **Show older** goes further back.
 * **Sync failures**: items that won't sync until you do something about them, grouped by why, with a button for each way to resolve one (see [Syncing in depth](syncing.md#resolving-what-cant-sync)): **Delete in OneDrive** or **Restore** for items gone from this PC, **Delete here** or **Upload** for items gone from OneDrive, **Rename** for a name OneDrive doesn't allow, **Exclude** for a file over 250 GB or a hard link, **Contents** for a folder that can't be deleted because it isn't empty. The heading of a group says why once and resolves all its items at once. Items inside a listed folder are shown under it: the folder's buttons cover them. You're asked before anything is deleted. **Show** opens an item in File Explorer. A choice shows as *Queued* until OneUpDrive carries it out, then the item leaves the list. Excluded items aren't listed.
 * **Excluded in OneDrive**: excluded items that OneDrive still has, their size and whether they're on this PC yet. Looking changes nothing; the OneUpDrive icon asks what to do with them.
-* **Safety stops**: every change a waiting safety stop holds back. Decide from the OneUpDrive icon's menu.
+* **Safety stops**: every change a waiting safety stop holds back. Decide from the OneUpDrive icon's menu. For a ransomware stop, **Rewind** previews putting the folder back to just before it (see [Getting things back](recovery.md#after-a-ransomware-stop)).
 
 The numbers on the tabs count sync failures and waiting safety stops.
 
@@ -55,6 +55,14 @@ What you share in OneDrive, and who can open it. **Refresh** asks OneDrive again
 
 * **Shared by you**: each shared file or folder, with one line per link or person: **Who** (*Anyone with the link*, or *Specific people* and their names), **Access** (*Can view* or *Can edit*, and whether the link has a password), **Expires** and when it was **Shared**. The line above the list counts the links anyone can open that never expire. **Show more** reads further. **Stop sharing** removes that link (it stops working) or that access. With experimental options on, **Set expiry** sets the last day it works. See [Earlier versions and sharing](versions-and-sharing.md#what-you-share).
 * **Shared with you**: what other people share with your account, and who shared it.
+
+## Recovery
+Every way to get something back, explained in [Getting things back](recovery.md):
+* **Rewind a folder**: pick a folder and a moment, **Preview** what would change, **Rewind**, then **Approve** (it waits for that, as a safety stop).
+* **Conflicts**: files changed on both sides, kept as two copies, side by side with which is newer: **Keep original**, **Keep copy** or **Keep both**.
+* **Kept on this PC**: the version store, with **Restore**.
+* **OneDrive versions**: a file's versions in OneDrive, with **Open** and **Restore**.
+* **Deleted from OneDrive**: items OneUpDrive saw deleted from OneDrive, with **Restore** from its recycle bin.
 
 ## Safety
 * **Stop and ask when**: how many deletions, replacements or moves at once make OneUpDrive stop and ask you first (default: more than 200, or more than 10% of everything synced; never for 20 items or fewer); and the **ransomware guard**: stop when edited files suddenly no longer look like what they are (default: more than 20). See [Syncing in depth](syncing.md#safety-stop).

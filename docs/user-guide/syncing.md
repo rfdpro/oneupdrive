@@ -169,7 +169,7 @@ Ransomware encrypts your files where they are, keeping their names, so a sync ap
 Safety stop: 25 files would replace their OneDrive copy with content that doesn't look like their type (as when files are encrypted by ransomware)
 ```
 
-If you didn't expect this, don't approve. Disconnect the PC from the network and get help: OneDrive still has the good versions. File types it can't judge (anything unusual) are never flagged, so it doesn't get in the way of ordinary work.
+If you didn't expect this, don't approve. Disconnect the PC from the network and get help: OneDrive still has the good versions. To put them back, [rewind the folder to just before the stop](recovery.md#after-a-ransomware-stop): the scrambled files are set aside in kept copies and OneDrive's good copies come back. File types it can't judge (anything unusual) are never flagged, so it doesn't get in the way of ordinary work.
 
 ### Changing the limits
 ```powershell
@@ -251,7 +251,7 @@ oneup --data-dir … restore 1791337982375-3 --to "docs\old notes.txt"
 
 Restoring never replaces anything. If the name is taken, you get `name (restored 1).ext` beside it. The next `oneup sync` sends the restored file to OneDrive too.
 
-Files deleted from OneDrive are in OneDrive's own recycle bin (on the website). Older versions of a file are in its version history there.
+Files deleted from OneDrive are in OneDrive's own recycle bin (on the website); those OneUpDrive saw deleted can be brought back from the settings window or `oneup recycle-bin`. Older versions of a file are in its version history there. To put a whole folder back the way it was at some moment, [rewind it](recovery.md#rewind-a-folder).
 
 ## Making room
 The version store is trimmed automatically at the end of each `oneup sync`, and by `oneupd` whenever it has caught up (not while changes to this PC are paused). It is careful:

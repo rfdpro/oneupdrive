@@ -19,6 +19,7 @@ Welcome! This guide is for everyone, not just developers.
 * [Databases](databases.md): password vaults, mail folders and other databases, sent only when whole and replaced only while closed
 * [Finding files](search.md): search all of OneDrive by name, online-only files too, from the window, a hotkey or `oneup find`
 * [More folders, backups, shared folders and accounts](folders.md): any folder with any OneDrive folder, one-way backups, your Desktop and Documents, folders others shared, several accounts
+* [Getting things back](recovery.md): rewinding a folder to an earlier moment, conflicts, kept copies, OneDrive versions and deleted files
 * [Earlier versions and sharing](versions-and-sharing.md): getting an older version back, sharing links
 * [Office](office.md): AutoSave and editing together in Word, Excel and PowerPoint
 * [Encrypted vaults](vaults.md): folders only you can read, compatible with Cryptomator (experimental)
