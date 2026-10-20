@@ -388,10 +388,26 @@ mod win {
                 Ok(Value::from(tokio::task::spawn_blocking(move || oneup_app::filetree::rule_files(&d)).await??))
             }
             "tree_sync" => {
-                let msg =
-                    oneup_app::filetree::set_sync(dir, &text(args, "rel"), flag(args, "folder"), flag(args, "on"))?;
+                let msg = settingsapi::tree_sync(dir, args)?;
                 let _ = agent(dir, Call::SyncNow).await;
                 Ok(Value::from(msg))
+            }
+            "tree_preview" => {
+                // What unticking an item would take out of sync, before it's done.
+                let (d, rel, folder) = (dir.to_path_buf(), text(args, "rel"), flag(args, "folder"));
+                let local = args.get("local_id").and_then(Value::as_str).map(str::parse::<u128>).transpose()?;
+                let remote = args.get("remote_id").and_then(Value::as_str).map(str::to_string);
+                tokio::task::spawn_blocking(move || oneup_app::filetree::preview(&d, &rel, folder, local, remote))
+                    .await?
+            }
+            "rule_suggestions" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let store = oneup_app::setup::open_store(&d, 4 * 1024)?;
+                    let now = oneup_app::control::now_ms();
+                    Ok(oneup_app::suggest::to_json(&oneup_app::suggest::suggest(&d, &store, 5, now)?))
+                })
+                .await?
             }
             "tree_pause" => {
                 let msg = oneup_app::filetree::set_paused(dir, &text(args, "rel"), flag(args, "on"))?;

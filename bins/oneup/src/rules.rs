@@ -116,6 +116,100 @@ fn show(rules: &Rules) -> Result<()> {
     Ok(())
 }
 
+/// `oneup rules --suggest`: folders worth excluding, the largest and the
+/// busiest lately (`oneup_app::suggest`). Suggestions only.
+pub fn suggest(data_dir: &Path, store: &Store) -> Result<()> {
+    let s = oneup_app::suggest::suggest(data_dir, store, 5, oneup_app::control::now_ms())?;
+    println!("Largest folders in OneDrive:");
+    if s.largest.is_empty() {
+        println!("  none found");
+    }
+    for x in &s.largest {
+        println!("  {:>10}  /{}", oneup_app::versions::size(x.weight), x.rel);
+    }
+    println!("Busiest folders (changes synced in the last {} days):", oneup_app::suggest::DAYS);
+    if s.busiest.is_empty() {
+        println!("  none found");
+    }
+    for x in &s.busiest {
+        println!("  {:>10}  /{}", x.weight, x.rel);
+    }
+    if !s.largest.is_empty() || !s.busiest.is_empty() {
+        println!("To exclude one: oneup rules --exclude-path PATH (shows what stops syncing first)");
+    }
+    Ok(())
+}
+
+/// `rel` from a path the user typed (full, or inside the synced folder).
+fn rel_of(store: &Store, path: &str) -> Result<String> {
+    let pair = oneup_app::sync::pairing(store)?;
+    let rel = crate::activity::normalize(&crate::activity::within(&pair.local, path)?);
+    Ok(oneup_app::filetree::clean(&rel))
+}
+
+/// Whether the item at `rel` is a folder, on this PC or in OneDrive.
+fn is_folder(store: &Store, rel: &str) -> Result<bool> {
+    let pair = oneup_app::sync::pairing(store)?;
+    let full = rel.split('/').fold(pair.local.clone(), |p, x| p.join(x));
+    Ok(full.is_dir()
+        || oneup_app::sync::find_remote(store, &format!("{}/{rel}", pair.remote.trim_end_matches('/')))?.is_some())
+}
+
+/// `oneup rules --exclude-path PATH [--yes]`: what unticking the item in
+/// the settings window does, with the same preview first.
+pub async fn exclude_path(data_dir: &Path, store: &Store, path: &str, yes: bool) -> Result<()> {
+    let rel = rel_of(store, path)?;
+    let folder = is_folder(store, &rel)?;
+    let p = oneup_app::filetree::preview(data_dir, &rel, folder, None, None)?;
+    let size = |v: &serde_json::Value| oneup_app::versions::size(v["bytes"].as_u64().unwrap_or(0));
+    let count = |v: &serde_json::Value| {
+        let n = v["files"].as_u64().unwrap_or(0);
+        if v["skipped"].as_u64().unwrap_or(0) > 0 { format!("at least {n}") } else { n.to_string() }
+    };
+    println!("/{rel}");
+    if p["here"].is_object() {
+        println!("  on this PC: {} file(s), {}", count(&p["here"]), size(&p["here"]));
+    }
+    if p["cloud"].is_object() {
+        println!("  in OneDrive: {} file(s), {}", count(&p["cloud"]), size(&p["cloud"]));
+    }
+    let then = match p["mode"].as_str().unwrap_or_default() {
+        "keep" => "stops syncing; both copies stay as they are",
+        "prune" => {
+            "stops uploading; OneDrive's copies go to its recycle bin once they're here (safety stops apply); \
+             copies here stay"
+        }
+        _ => "stops uploading; OneDrive's copies and their changes still come here; copies here stay",
+    };
+    println!("  then: {then}");
+    let online = p["here"]["online_files"].as_u64().unwrap_or(0);
+    if online > 0 && p["mode"] == "prune" {
+        println!("  {online} online-only file(s) download first");
+    }
+    println!("  Nothing is deleted from this PC. Change what happens in OneDrive: oneup rules --cloud");
+    if !yes {
+        println!("To exclude it: add --yes");
+        return Ok(());
+    }
+    // Only what was just shown, even if the folder moved meanwhile.
+    println!("{}", oneup_app::filetree::exclude_checked(data_dir, &p["token"])?);
+    if crate::agent::nudge(data_dir).await {
+        println!("The background agent applies it now.");
+    }
+    Ok(())
+}
+
+/// `oneup rules --include-path PATH`: what ticking it again does.
+pub async fn include_path(data_dir: &Path, store: &Store, path: &str) -> Result<()> {
+    let rel = rel_of(store, path)?;
+    let folder = is_folder(store, &rel)?;
+    println!("{}", oneup_app::filetree::set_sync(data_dir, &rel, folder, true)?);
+    if crate::agent::nudge(data_dir).await {
+        println!("The background agent applies it now.");
+    }
+    Ok(())
+}
+
 /// `oneup priority [--first RULE] [--last RULE] [--remove RULE]`.
 pub async fn priority(data_dir: &Path, first: &[String], last: &[String], remove: &[String]) -> Result<()> {
     let (mut f, mut l) = config::load_priority(data_dir)?;
