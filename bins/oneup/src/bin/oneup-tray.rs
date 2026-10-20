@@ -201,7 +201,10 @@ mod win {
         };
         let mut asked = wait(Duration::from_secs(150));
         loop {
-            let auto = oneup_app::config::load_updates(dir).is_ok_and(|u| u.auto);
+            // By itself only where background transfers may go (not on a
+            // metered network, with a data budget, or offline); asked, always.
+            let auto = oneup_app::config::load_updates(dir).is_ok_and(|u| u.auto)
+                && oneup_app::updates::may_download_by_itself_now(dir);
             let found = match oneup_app::updates::manager(dir) {
                 Ok(Some(um)) if auto || asked => oneup_app::updates::check(um),
                 _ => Ok(None),

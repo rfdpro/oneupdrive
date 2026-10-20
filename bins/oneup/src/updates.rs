@@ -65,6 +65,25 @@ fn url_parts(repo: &str) -> Option<(&str, &str)> {
     (!owner.is_empty() && !name.is_empty() && !name.contains('/')).then_some((owner, name))
 }
 
+/// Whether the tray may look for and download an update by itself (the
+/// daily check): not on a metered network, a network with a data budget,
+/// or while working offline, as for any background transfer. A check the
+/// user asks for always goes.
+pub fn may_download_by_itself(metered: bool, budgeted: bool, offline: bool) -> bool {
+    !metered && !budgeted && !offline
+}
+
+/// [`may_download_by_itself`] for data folder `data_dir` now: the network
+/// Windows says this PC is on, its profile's budget, and the agent's
+/// offline mode.
+#[cfg(windows)]
+pub fn may_download_by_itself_now(data_dir: &Path) -> bool {
+    let agent = crate::config::load_agent(data_dir).unwrap_or_default();
+    let (net, profile) = crate::network::situation(data_dir, &agent);
+    let offline = data_dir.join(crate::control::OFFLINE_FILE).exists();
+    may_download_by_itself(net.metered, profile.budget_bytes().is_some(), offline)
+}
+
 /// Looks for a newer release; downloads and checks it if there is one.
 /// Blocking (network): run it off the UI thread.
 pub fn check(um: UpdateManager) -> Result<Option<Ready>> {
@@ -126,6 +145,14 @@ pub fn apply(ready: Ready, args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The daily check holds back like background work: not on a metered
+    /// network, with a data budget, or offline.
+    #[test]
+    fn updates_download_by_themselves_only_where_background_work_may() {
+        use super::may_download_by_itself as may;
+        assert!(may(false, false, false));
+        assert!(!may(true, false, false) && !may(false, true, false) && !may(false, false, true));
+    }
     #[test]
     fn only_github_repository_urls_are_used() {
         assert_eq!(super::url_parts("https://github.com/someone/oneupdrive"), Some(("someone", "oneupdrive")));
