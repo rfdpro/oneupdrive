@@ -28,6 +28,12 @@ What waits is kept in `meta` (`net.waiting`, the 500 largest, with the count and
 
 **Mid-round:** `control::LivePause` also holds the policy. `round_check` compares it with the policy the round was planned under; once it differs, a content transfer it doesn't allow stops that side for the rest of the round, as a pause does (downloads, whose size isn't known there, stop under a size limit too). The next round plans what waits under the new policy.
 
+## Data budget
+
+`oneup_app::netusage` keeps each profile's use this month in `meta` (`net.usage.<profile>`: month, bytes up and down, bytes allowed on top), so a restart keeps it and a new month starts at zero. The agent counts with `netusage::Meter` over the Graph client's counters (`Throttle::moved` for content sent, `NetStats::bytes` for every response, file contents included) at every wake-up and every 30 s while rounds run, through its own database connection, and adds the difference to the profile in effect then.
+
+What's left goes to the rounds as `Policy::budget_left`: `hold_for_network` lets transfers through in the round's order while they fit and holds the rest, as for the profile's choice, so background transfers stay within the budget (metadata requests and hydration are counted but never held). When nothing is left the agent pauses itself with that reason; the tray notifies once per month and budget, and offers `allow_data`, which `Control` hands to the agent's next look.
+
 ## Sync interval (`oneup_app::pace`)
 
 The `Pacer` is pure: the agent tells it what ended its wait (`Woke`) and when a pass began. With an interval, a journal change no longer ends the wait (the observer still reads the journal, so marks and the Local tree stay current), a push notification ends it only with `keep_push`, and the push channel is closed otherwise. The user's calls and a pass that hit `MAX_ROUNDS` run at once; retries and held uploads wait for the next pass. A simulated hour of steady edits at 15 minutes runs 4 passes (`pace::tests`).

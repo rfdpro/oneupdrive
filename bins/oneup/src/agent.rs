@@ -72,6 +72,18 @@ pub async fn answer(data_dir: &Path, code: u64, answer: Answer) -> Result<()> {
     }
 }
 
+/// `oneup network allow-more`: `mb` more this month on the data budget.
+pub async fn allow_data(data_dir: &Path, mb: u64) -> Result<()> {
+    match call(data_dir, Call::AllowData { mb }).await {
+        Ok(_) => {
+            println!("Allowed {mb} MB more this month on this network.");
+            Ok(())
+        }
+        Err(ClientError::NotRunning) => Err(not_running("there is no budget in use to add to")),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn sync_now(data_dir: &Path, first: Option<String>) -> Result<()> {
     let c = match &first {
         Some(path) => Call::SyncFirst { path: path.clone() },
@@ -286,6 +298,16 @@ fn print_status(s: &Status) {
             _ => "the default profile",
         };
         println!("  network           {name}{metered}: {} ({profile}; `oneup network`)", n.transfer);
+    }
+    if let Some(d) = s.network.as_ref().and_then(|n| n.data.as_ref()) {
+        let budget = if d.budget > 0 { format!(" of {}", size(d.budget)) } else { String::new() };
+        let reached = if d.reached { "; used up (`oneup network allow-more`)" } else { "" };
+        println!(
+            "  data this month   {}{budget}: {} up, {} down{reached}",
+            size(d.up + d.down),
+            size(d.up),
+            size(d.down)
+        );
     }
     if let Some(w) = s.network.as_ref().and_then(|n| n.waiting.as_ref()) {
         println!(

@@ -495,6 +495,9 @@ pub struct Policy {
     pub small_bytes: u64,
     /// The name of the network, for saying why something waits.
     pub network: String,
+    /// Bytes left of this month's data budget (`crate::netusage`); `None`:
+    /// no budget.
+    pub budget_left: Option<u64>,
 }
 
 impl Policy {
@@ -504,6 +507,7 @@ impl Policy {
             transfer: p.transfer,
             small_bytes: p.small_bytes(),
             network: p.network.clone(),
+            budget_left: None,
         }
     }
 
@@ -517,6 +521,12 @@ impl Policy {
             Transfer::Small => bytes.is_some_and(|b| b < self.small_bytes),
             Transfer::Opened => way == Way::Up,
         }
+    }
+
+    /// Why what the budget holds waits.
+    pub fn why_budget(&self) -> String {
+        let here = if self.network.is_empty() { "this network" } else { self.network.as_str() };
+        format!("over this month's data budget on {here}; waits for another network or more allowed")
     }
 
     /// Why what it holds waits, for `oneup status` and `oneup explain`.

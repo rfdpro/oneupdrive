@@ -1259,6 +1259,12 @@ enum NetworkCmd {
         #[command(flatten)]
         target: NetworkTarget,
     },
+    /// Allow more data this month on the network's budget (sync goes on if it paused for it)
+    AllowMore {
+        /// How many megabytes
+        #[arg(long, default_value_t = oneup_app::netusage::ALLOW_MB)]
+        mb: u64,
+    },
     /// List what waits for a network that lets it through, the largest first
     Waiting {
         /// How many to list at most
@@ -2434,6 +2440,7 @@ async fn run() -> Result<()> {
             };
             netcmd::set(&data_dir(&cli)?, &target.target(), &changes).await
         }
+        Cmd::Network { cmd: Some(NetworkCmd::AllowMore { mb }) } => agent::allow_data(&data_dir(&cli)?, *mb).await,
         Cmd::Network { cmd: Some(NetworkCmd::Waiting { limit }) } => {
             netcmd::waiting(&open_store(&cli, MemoryProfile::Balanced)?, *limit)
         }

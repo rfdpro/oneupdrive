@@ -373,6 +373,7 @@ mod win {
                     }
                 }
                 id::SYNC_NOW => self.send(Do::Call(Call::SyncNow)),
+                id::ALLOW_DATA => self.send(Do::Call(Call::AllowData { mb: oneup_app::netusage::ALLOW_MB })),
                 id::RESUME => self.send(Do::Call(Call::Resume { direction: Direction::Both })),
                 c if (id::PAUSE..id::PAUSE + tray::PAUSES.len() as u32).contains(&c) => {
                     let minutes = tray::PAUSES[(c - id::PAUSE) as usize].1;

@@ -34,6 +34,7 @@ pub mod item;
 pub mod l10n;
 pub mod launch;
 pub mod moveover;
+pub mod netusage;
 pub mod network;
 #[cfg(windows)]
 pub mod officeint;

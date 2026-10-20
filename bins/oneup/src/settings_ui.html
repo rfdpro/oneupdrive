@@ -2224,6 +2224,10 @@
             <div class="card">
                 <div class="row">
                     <div class="label"><b id="net-name"></b><small id="net-detail"></small></div><button class="btn" id="net-forget" hidden>Forget</button></div>
+                <div class="row" id="net-data-row" hidden>
+                    <div class="label"><b>Data this month</b><small id="net-data"></small></div><button class="btn" id="net-allow" hidden>Allow 500 MB more</button></div>
+                <div class="row" id="net-waiting-row" hidden>
+                    <div class="label"><b>Waiting</b><small id="net-waiting"></small></div></div>
                 <div class="row">
                     <div class="label"><b>What syncs</b></div><select data-net-this="transfer"><option value="">As other networks</option><option value="everything">Everything</option><option value="metadata">Names and folders only</option><option value="small">Files under the size limit</option><option value="opened">Only files I open or change</option><option value="paused">Nothing (paused)</option></select></div>
                 <div class="row">
@@ -3027,7 +3031,26 @@
             $("#net-forget").hidden = !n.own;
             $$("[data-net-this]").forEach(e => e.value = (n.own && n.own[e.dataset.netThis]) ?? "");
             $$("[data-net-metered]").forEach(e => e.value = n.metered[e.dataset.netMetered] ?? "");
+            call("status").then(fillNetworkUse, () => fillNetworkUse(null));
         }
+
+        // What the running agent says of this network: data used, what waits.
+        function fillNetworkUse(st) {
+            const n = st && st.network;
+            const d = n && n.data;
+            $("#net-data-row").hidden = !d;
+            if (d) {
+                const of = d.budget ? " of " + size(d.budget) : "";
+                $("#net-data").textContent = size(d.up + d.down) + of + " · " + size(d.up) + " up, " + size(d.down) + " down" + (d.reached ? " · Used up" : "");
+                $("#net-allow").hidden = !d.reached;
+            }
+            const w = n && n.waiting;
+            $("#net-waiting-row").hidden = !w;
+            if (w) $("#net-waiting").textContent = w.count + " files (" + size(w.bytes) + "): " + w.why;
+        }
+        $("#net-allow").onclick = () => run(call("control", {
+            call: "allow_data"
+        }), "Allowed 500 MB more").then(load, load);
 
         function saveNet(e, target, key) {
             const v = e.value.trim();

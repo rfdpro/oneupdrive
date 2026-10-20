@@ -883,6 +883,8 @@ mod win {
                     Some("pause") => Call::Pause { direction: Direction::Both, minutes: None },
                     Some("resume") => Call::Resume { direction: Direction::Both },
                     Some("stop") => Call::Stop,
+                    // More on the network's used-up data budget.
+                    Some("allow_data") => Call::AllowData { mb: oneup_app::netusage::ALLOW_MB },
                     // Accepts the agent's offer to bring excluded items here
                     // and remove them from OneDrive (by its code).
                     Some("prune") => Call::Answer { code: text(args, "code"), answer: Answer::Prune },

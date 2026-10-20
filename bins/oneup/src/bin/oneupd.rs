@@ -605,6 +605,7 @@ async fn agent(
     let mut woke = Woke::Start;
     // What the last pass held for another network (`oneup_app::network`).
     let mut waiting = oneup_app::network::load_waiting(&store)?;
+    let mut net_use = NetUse::new(dir, graph)?;
     control.set_on_demand(engine.local().on_demand());
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
@@ -615,9 +616,8 @@ async fn agent(
         }
         // The network and its profile (`oneup_app::network`): caps, the
         // interval, what transfers.
-        let (net, profile) = oneup_app::network::situation(dir, &settings);
+        let Looked { net, profile, usage, why: net_why } = net_use.look(dir, &settings, graph, control)?;
         pacer.set(profile.interval);
-        control.set_policy(oneup_app::network::Policy::of(&profile));
         // A folder in someone else's drive has no push channel for us: the
         // timer covers it.
         let want_push = !args.no_push && !graph.is_other_drive() && pacer.wants_push();
@@ -633,7 +633,7 @@ async fn agent(
         // The hooks, if config.toml changed (`oneup hooks` nudges the agent).
         hooks.refresh();
         let minute = autopause::local_minute_of_day();
-        let auto = auto_pause(&settings, minute, &profile);
+        let auto = auto_pause(&settings, minute, net_why);
         if auto != auto_was {
             match &auto {
                 Some(why) => println!("oneupd: pausing by itself: {}", why.english()),
@@ -695,6 +695,8 @@ async fn agent(
                 dir,
                 &settings,
                 control,
+                graph,
+                &mut net_use,
             )
             .await;
             // Before the error, if any: the retry must still count them.
@@ -815,7 +817,7 @@ async fn agent(
             }
             _ => next,
         };
-        control.set_network(net_status(&pacer, &net, &profile, waiting.as_ref()));
+        control.set_network(net_status(&pacer, &net, &profile, waiting.as_ref(), &usage));
 
         // ---- wait for something to do
         let (s, w) = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer).await?;
@@ -833,7 +835,16 @@ fn net_status(
     net: &oneup_sys::network::Network,
     profile: &oneup_app::network::Profile,
     waiting: Option<&oneup_app::network::Waiting>,
+    usage: &oneup_app::netusage::Usage,
 ) -> oneup_ipc::NetStatus {
+    let budget = profile.budget_bytes();
+    let data = (budget.is_some() || profile.key != oneup_app::network::Key::Default).then(|| oneup_ipc::DataUse {
+        month: usage.month.clone(),
+        up: usage.up,
+        down: usage.down,
+        budget: budget.map_or(0, |b| b.saturating_add(usage.extra)),
+        reached: usage.reached(budget),
+    });
     let next_ms = pacer.due().map(|d| {
         let left = d.saturating_duration_since(Instant::now());
         now_ms() + i64::try_from(left.as_millis()).unwrap_or(i64::MAX / 2)
@@ -852,6 +863,7 @@ fn net_status(
         interval_min: pacer.interval().minutes,
         next_ms,
         waiting: waiting.map(|w| oneup_ipc::NetWaiting { count: w.count, bytes: w.bytes, why: w.why.clone() }),
+        data,
     }
 }
 
@@ -859,10 +871,10 @@ fn net_status(
 fn auto_pause(
     settings: &oneup_app::config::Agent,
     minute: u32,
-    profile: &oneup_app::network::Profile,
+    network: Option<autopause::Reason>,
 ) -> Option<autopause::Reason> {
     let conditions = autopause::Conditions {
-        network: oneup_app::network::pause_reason(profile),
+        network,
         battery_saver: oneup_sys::conditions::battery_saver(),
         full_screen: oneup_sys::conditions::full_screen(),
         minute_of_day: minute,
@@ -878,6 +890,8 @@ async fn watching_auto_pause<T>(
     dir: &Path,
     settings: &oneup_app::config::Agent,
     control: &Control,
+    graph: &Graph,
+    net_use: &mut NetUse,
 ) -> T {
     tokio::pin!(rounds);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + AUTO_PAUSE_CHECK, AUTO_PAUSE_CHECK);
@@ -886,8 +900,16 @@ async fn watching_auto_pause<T>(
         tokio::select! {
             r = &mut rounds => return r,
             _ = tick.tick() => {
-                let (_, profile) = oneup_app::network::situation(dir, settings);
-                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day(), &profile) {
+                // Also counts the data used so far, so a budget reached
+                // mid-round pauses it.
+                let why = match tokio::task::block_in_place(|| net_use.look(dir, settings, graph, control)) {
+                    Ok(l) => l.why,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't count the data used");
+                        None
+                    }
+                };
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day(), why) {
                     control.set_auto_pause(Some(why));
                 }
             }
@@ -1239,6 +1261,63 @@ fn end_flyout(dir: &Path, task: Option<tokio::task::JoinHandle<()>>) {
     }
     if let Ok(Some(token)) = setup::open_store(dir, 1024).and_then(|s| Ok(s.read(|o| o.meta_get("sync.token"))?)) {
         oneup_app::shellstatus::clear(&token);
+    }
+}
+
+/// Counts the data the agent uses on each network profile
+/// (`oneup_app::netusage`), with its own database connection: it's asked
+/// while rounds hold the agent's.
+struct NetUse {
+    db: Store,
+    meter: oneup_app::netusage::Meter,
+}
+
+/// The network now, its profile, this month's use there, and why sync
+/// pauses on it (its profile, or a reached budget), if it does.
+struct Looked {
+    net: oneup_sys::network::Network,
+    profile: oneup_app::network::Profile,
+    usage: oneup_app::netusage::Usage,
+    why: Option<autopause::Reason>,
+}
+
+impl NetUse {
+    fn new(dir: &Path, graph: &Graph) -> Result<Self> {
+        let (up, down) = Self::counters(graph);
+        Ok(Self { db: setup::open_store(dir, 1024)?, meter: oneup_app::netusage::Meter::new(up, down) })
+    }
+
+    /// Bytes sent (file contents) and received (every response) so far.
+    fn counters(graph: &Graph) -> (u64, u64) {
+        (graph.upload.moved(), graph.stats.bytes.load(Relaxed))
+    }
+
+    /// Reads the network and its profile, adds what was used since the last
+    /// look (and what the user allowed meanwhile) to that profile, and
+    /// hands the rounds the policy with what's left of the budget.
+    fn look(
+        &mut self,
+        dir: &Path,
+        settings: &oneup_app::config::Agent,
+        graph: &Graph,
+        control: &Control,
+    ) -> Result<Looked> {
+        use oneup_app::netusage;
+        let (net, profile) = oneup_app::network::situation(dir, settings);
+        let (cu, cd) = Self::counters(graph);
+        let (up, down) = self.meter.take(cu, cd);
+        let extra = control.take_allowed_mb().saturating_mul(1_000_000);
+        let month = netusage::month_of(now_ms());
+        let usage = netusage::add(&mut self.db, profile.key.id(), &month, up, down, extra)?;
+        if extra > 0 {
+            println!("oneupd: {} more allowed this month on this network", oneup_app::versions::size(extra));
+        }
+        let budget = profile.budget_bytes();
+        let why = oneup_app::network::pause_reason(&profile).or_else(|| netusage::pause_reason(&usage, budget));
+        let mut policy = oneup_app::network::Policy::of(&profile);
+        policy.budget_left = usage.left(budget);
+        control.set_policy(policy);
+        Ok(Looked { net, profile, usage, why })
     }
 }
 

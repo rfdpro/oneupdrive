@@ -1853,7 +1853,13 @@ impl Engine {
             later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
             later.extend(for_network.iter().map(|(a, _, _)| a.op().clone()));
             let held_here = (!for_network.is_empty()).then(|| {
-                let mut w = crate::network::Waiting { why: controls.net.why(), ..Default::default() };
+                // The profile's choice, or else the budget, held them.
+                let why = if for_network.iter().any(|(_, _, (way, b))| !controls.net.allows(*way, Some(*b))) {
+                    controls.net.why()
+                } else {
+                    controls.net.why_budget()
+                };
+                let mut w = crate::network::Waiting { why, ..Default::default() };
                 for (_, l, (way, bytes)) in &for_network {
                     w.add(l.path.clone(), *bytes, *way);
                 }
@@ -3279,9 +3285,11 @@ fn hold_for_network(
     planned: Vec<(Approved, Line)>,
     on_demand: bool,
 ) -> oneup_store::Result<(Vec<(Approved, Line)>, Vec<(Approved, Line, (crate::network::Way, u64))>)> {
-    if net.transfer == crate::network::Transfer::Everything {
+    if net.transfer == crate::network::Transfer::Everything && net.budget_left.is_none() {
         return Ok((planned, Vec::new()));
     }
+    // What the round may still transfer of the month's data budget.
+    let mut left = net.budget_left;
     let (mut go, mut held) = (Vec::new(), Vec::new());
     for (a, l) in planned {
         let mut size = None;
@@ -3292,7 +3300,18 @@ fn hold_for_network(
         }
         match crate::network::content(a.op(), on_demand, |_| size) {
             Some((way, bytes)) if !net.allows(way, bytes) => held.push((a, l, (way, bytes.unwrap_or(0)))),
-            _ => go.push((a, l)),
+            Some((way, bytes)) => {
+                let bytes = bytes.unwrap_or(0);
+                match &mut left {
+                    Some(n) if *n < bytes => held.push((a, l, (way, bytes))),
+                    Some(n) => {
+                        *n -= bytes;
+                        go.push((a, l));
+                    }
+                    None => go.push((a, l)),
+                }
+            }
+            None => go.push((a, l)),
         }
     }
     Ok((go, held))
@@ -4397,11 +4416,11 @@ mod tests {
             link: Link::New,
         };
         let ops = vec![up(1, 5_000_000), up(2, 50_000_000), down, mkdir];
-        let run = |transfer, on_demand| {
+        let run_within = |transfer, on_demand, budget_left| {
             let review = review_in(&oneup_gate::Policy::default(), &GateContext::default(), ops.clone());
             let planned: Vec<(Approved, Line)> =
                 review.approved.into_iter().map(|a| (a, Line::new("x", "/p".into(), ""))).collect();
-            let net = Policy { transfer, small_bytes: 10_000_000, ..Policy::default() };
+            let net = Policy { transfer, small_bytes: 10_000_000, budget_left, ..Policy::default() };
             let (go, held) = s.read(|o| hold_for_network(o, &net, planned, on_demand)).unwrap();
             let names = |v: Vec<Op>| -> Vec<String> {
                 v.iter()
@@ -4420,8 +4439,15 @@ mod tests {
                 sizes,
             )
         };
+        let run = |transfer, on_demand| run_within(transfer, on_demand, None);
         let (go, held, _) = run(Transfer::Everything, false);
         assert_eq!((go.len(), held.len()), (4, 0));
+        // A data budget: the round's transfers stay within what's left,
+        // in order; what doesn't fit waits, and the rest still goes.
+        let (go, held, _) = run_within(Transfer::Everything, false, Some(30_000_000));
+        assert_eq!((go, held), (vec!["f1".to_string(), "film.mp4".into(), "d".into()], vec!["f2".to_string()]));
+        let (go, held, _) = run_within(Transfer::Everything, false, Some(0));
+        assert_eq!((go, held.len()), (vec!["d".to_string()], 3), "used up: no contents at all");
         let (go, held, sizes) = run(Transfer::Small, false);
         assert_eq!((go, held), (vec!["f1".to_string(), "d".into()], vec!["f2".to_string(), "film.mp4".into()]));
         assert_eq!(sizes, [(Way::Up, 50_000_000), (Way::Down, 20_000_000)]);

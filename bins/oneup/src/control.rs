@@ -159,6 +159,9 @@ struct Shared {
     net: oneup_ipc::NetStatus,
     /// What the network's profile lets rounds do.
     policy: crate::network::Policy,
+    /// Megabytes the user allowed on top of the data budget, for the agent
+    /// to add (`crate::netusage`).
+    allowed_mb: u64,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
     /// The sides paused when that was last told as an event, and why.
@@ -236,6 +239,7 @@ impl Control {
                 cloud_full: None,
                 net: oneup_ipc::NetStatus::default(),
                 policy: crate::network::Policy::default(),
+                allowed_mb: 0,
                 shown: None,
                 paused_told: (pause.local, pause.remote, None),
             }),
@@ -420,6 +424,11 @@ impl Control {
         self.lock().policy = p;
     }
 
+    /// The megabytes allowed on top of the data budget since last asked.
+    pub fn take_allowed_mb(&self) -> u64 {
+        std::mem::take(&mut self.lock().allowed_mb)
+    }
+
     /// The folder uses Files On-Demand (cloud files arrive as placeholders,
     /// which move no contents).
     pub fn set_on_demand(&self, on: bool) {
@@ -598,6 +607,12 @@ impl Control {
             // `serve` answers a watch itself; here it is a status.
             Call::Status | Call::Watch { .. } | Call::Events { .. } => wake = false,
             Call::SyncNow => {}
+            Call::AllowData { mb } => {
+                if !(1..=1_000_000).contains(&mb) {
+                    return Err(RpcError::new(INVALID_PARAMS, "allow from 1 MB to 1,000,000 MB"));
+                }
+                s.allowed_mb = s.allowed_mb.saturating_add(mb);
+            }
             Call::SyncFirst { path } => {
                 // Bounded: a client can't grow the agent's memory.
                 if !s.first.contains(&path) && s.first.len() < 32 {
@@ -896,6 +911,16 @@ mod tests {
         let check = live.round_check();
         c.set_policy(Policy::default());
         assert!(check(&upload));
+    }
+
+    #[test]
+    fn more_data_allowed_is_handed_to_the_agent_once() {
+        let c = control(None);
+        assert!(c.call(Call::AllowData { mb: 0 }, 0).is_err());
+        c.call(Call::AllowData { mb: 500 }, 0).unwrap();
+        c.call(Call::AllowData { mb: 200 }, 0).unwrap();
+        assert_eq!(c.take_allowed_mb(), 700);
+        assert_eq!(c.take_allowed_mb(), 0);
     }
 
     #[test]

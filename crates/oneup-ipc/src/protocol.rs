@@ -63,6 +63,11 @@ pub enum Call {
     },
     /// Stop the agent after the current round.
     Stop,
+    /// Allow `mb` more megabytes this month on the network's data budget
+    /// (`NetStatus::data`); the agent goes on if it had paused for it.
+    AllowData {
+        mb: u64,
+    },
     /// Wait until the status differs from revision `since` (or up to
     /// [`crate::WATCH_MAX`]), then return it: lets a client follow the
     /// agent without polling.
@@ -87,6 +92,11 @@ struct WatchParams {
 struct EventsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     since: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AllowParams {
+    mb: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,6 +134,7 @@ impl Call {
             Call::Stop => "stop",
             Call::Watch { .. } => "watch",
             Call::Events { .. } => "events",
+            Call::AllowData { .. } => "allow_data",
         }
     }
 
@@ -138,6 +149,7 @@ impl Call {
             Call::SyncFirst { path } => serde_json::to_value(PathParams { path: path.clone() }),
             Call::Watch { since } => serde_json::to_value(WatchParams { since: *since }),
             Call::Events { since } => serde_json::to_value(EventsParams { since: *since }),
+            Call::AllowData { mb } => serde_json::to_value(AllowParams { mb: *mb }),
         };
         v.unwrap_or(Value::Null)
     }
@@ -162,6 +174,10 @@ impl Call {
                 // No params at all reads as "from now".
                 let EventsParams { since } = if params.is_null() { EventsParams { since: None } } else { p(params)? };
                 Call::Events { since }
+            }
+            "allow_data" => {
+                let AllowParams { mb } = p(params)?;
+                Call::AllowData { mb }
             }
             "pause" => {
                 let PauseParams { direction, minutes } = p(params)?;
@@ -462,6 +478,23 @@ pub struct NetStatus {
     /// File contents waiting for a network that lets them through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<NetWaiting>,
+    /// Data used this month on this network's profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataUse>,
+}
+
+/// Data used this month on the profile in effect, by direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataUse {
+    /// `YYYY-MM`.
+    pub month: String,
+    pub up: u64,
+    pub down: u64,
+    /// The monthly budget with what the user allowed on top, in bytes; 0:
+    /// none.
+    pub budget: u64,
+    /// The budget is used up: sync pauses on this network.
+    pub reached: bool,
 }
 
 /// What waits for another network (`oneup network waiting` lists it, the
