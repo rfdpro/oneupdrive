@@ -553,6 +553,10 @@ impl Cloud for Fake {
         true
     }
 
+    fn moves_keep_ids(&self) -> bool {
+        true
+    }
+
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
         let _t = self.transfer().await;
         let stalled = {

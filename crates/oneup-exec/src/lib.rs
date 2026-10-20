@@ -45,7 +45,10 @@
 //!   `exec.pending.<local file ID>`, one per item), and the final record
 //!   clears it. That transaction commits durably (`synchronous = FULL`,
 //!   where the rest commit at NORMAL): a power cut can roll back the
-//!   newest commits, and must not take a record whose effect is done. One left over (the operation failed, or the process died)
+//!   newest commits, and must not take a record whose effect is done. (A
+//!   vault move that may give the item a new ID is written ahead too, and
+//!   settled before the next plan: `moving`.) One left over (the operation
+//!   failed, or the process died)
 //!   is settled right after the operation, before it releases its claims,
 //!   or at the start of the next run: if the folder shows the effect didn't
 //!   happen, the record is undone. `tests/sync.rs` crashes a round at every
@@ -66,6 +69,7 @@ mod exec;
 pub mod graph;
 #[cfg(windows)]
 pub mod hydrate;
+mod moving;
 #[cfg(windows)]
 pub mod placement;
 pub mod resolve;
@@ -79,6 +83,7 @@ pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]
 pub use exec::{Executor, FOLLOW_MAX, Follow, Report, Skip, link_roots};
 pub use graph::{GraphCloud, UploadMemory};
+pub use moving::{Settled, settle_moves};
 #[cfg(windows)]
 pub use schedule::Parallel;
 pub use timing::Timings;
