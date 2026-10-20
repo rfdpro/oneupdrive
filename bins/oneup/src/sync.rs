@@ -527,6 +527,9 @@ pub struct Engine {
     /// started, until excluded or kept syncing (at most
     /// [`crate::databases::MAX_LIVE`]).
     db_live: std::sync::Mutex<Vec<oneup_ipc::DatabaseNote>>,
+    /// Whether applying pin rules or downloading what they keep has work
+    /// left ([`Engine::pins_pending`]; the walk's own state is in the store).
+    pin_more: std::sync::atomic::AtomicBool,
 }
 
 /// What stop `i` of `review` lists this round: exactly the operations its
@@ -719,6 +722,39 @@ pub struct CloudFull {
     pub remaining: Option<i64>,
 }
 
+/// At most this long applying pin rules after a settled round; the rest
+/// waits for the next one ([`Engine::pins_pending`]).
+const PIN_SLICE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Drops from `ops` (freeing operations) the files a pin rule keeps, and
+/// sets their pin back. Returns how many.
+fn keep_pinned(
+    store: &mut Store,
+    pinner: &mut dyn crate::pinrules::Pinner,
+    pins: &oneup_rules::PinSet,
+    ops: &mut Vec<Op>,
+) -> Result<usize> {
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in std::mem::take(ops) {
+        let path = match &op {
+            Op::Dehydrate { local, .. } => store.read(|o| o.local_path_of(local.id.0))?.map(|p| (local.id.0, p)),
+            _ => None,
+        };
+        match path {
+            Some((id, p)) if pins.pins(&p, false) => {
+                kept += 1;
+                if !crate::pinrules::pin_back(store, pinner, id, &crate::filetree::clean(&p))? {
+                    tracing::debug!("a file a pin rule keeps couldn't be pinned again now");
+                }
+            }
+            _ => out.push(op),
+        }
+    }
+    *ops = out;
+    Ok(kept)
+}
+
 /// Excluded folders looked at per pass ([`Engine::clear_excluded_marks`]);
 /// more wait for the next settled round.
 const MARK_LIMIT: usize = 5_000;
@@ -784,6 +820,7 @@ impl Engine {
             events: std::sync::OnceLock::new(),
             db_waits: std::sync::Mutex::default(),
             db_live: std::sync::Mutex::default(),
+            pin_more: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1077,8 +1114,8 @@ impl Engine {
     /// Files On-Demand placement after a round (`oneup_exec::placement`):
     /// pinned files are downloaded, files set to free up space are freed
     /// through the gate. Nothing while changes to this PC are paused.
-    pub async fn placement(&self, mut store: Store, controls: &Controls) -> Result<Store> {
-        if !self.exec.local().on_demand() || controls.pause_local {
+    pub async fn placement(&self, mut store: Store, controls: &(dyn Fn() -> Controls + Send + Sync)) -> Result<Store> {
+        if !self.exec.local().on_demand() || controls().pause_local {
             return Ok(store);
         }
         let root = store.read(|o| o.local_root())?.context("no local scan")?;
@@ -1094,7 +1131,49 @@ impl Engine {
                 )],
             )?;
         }
-        let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path)).await?;
+        // Pin rules ([rules] pin): set on what they match, before anything
+        // is fetched or freed, so this pass already downloads them.
+        let pins = crate::config::load_rules(&self.data_dir, &store)?.pin_set();
+        let mut pinner = crate::pinrules::FsPinner(PathBuf::from(&root.path));
+        let pass = tokio::task::block_in_place(|| {
+            crate::pinrules::apply(&mut store, &mut pinner, &pins, PIN_SLICE, now_ms())
+        })?;
+        let mut notes = Vec::new();
+        if pass.pinned > 0 {
+            notes.push(notice(
+                ActivityOutcome::Note,
+                "keep",
+                format!("{} item(s) kept on this PC by pin rules", pass.pinned),
+            ));
+        }
+        if pass.unpinned > 0 {
+            let detail = format!("{} item(s) no longer kept on this PC: their pin rule was removed", pass.unpinned);
+            notes.push(notice(ActivityOutcome::Note, "keep", detail));
+        }
+        log_activity(&mut store, notes)?;
+        // Downloads keep to a pause that comes meanwhile, leave free space
+        // alone, and take a share per pass; the rest follows soon after.
+        let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
+        let total = oneup_sys::disk::total_bytes(Path::new(&root.path)).ok();
+        let reserve = crate::pinrules::reserve(total, space.low_disk_percent);
+        let limit = std::sync::Mutex::new(crate::pinrules::FetchLimit::new(reserve, std::time::Instant::now()));
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let root_path = PathBuf::from(&root.path);
+        let may = |size: u64| {
+            let paused = controls().pause_local;
+            let free = crate::pinrules::free_space(&root_path);
+            let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
+            let ok = l.may(size, paused, free, std::time::Instant::now());
+            if !ok {
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            ok
+        };
+        let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path), &may).await?;
+        // More to download (stopped by its share, not by a pause or space,
+        // which a later wake-up finds anyway).
+        let more_fetch = stopped.load(std::sync::atomic::Ordering::Relaxed) && !controls().pause_local;
+        self.pin_more.store(pass.more || more_fetch, std::sync::atomic::Ordering::Relaxed);
         if !fetched.is_empty() {
             let at_ms = now_ms();
             let log: Vec<ActivityEntry> = fetched
@@ -1112,7 +1191,16 @@ impl Engine {
             log_activity(&mut store, log)?;
         }
         let mut ops = oneup_exec::placement::free_ops(&store)?;
-        let note = self.space_policy(&mut store, Path::new(&root.path), &mut ops)?;
+        // A pin rule wins over "Free up space" chosen in File Explorer: the
+        // file isn't freed and gets its pin back.
+        if !pins.is_empty() {
+            let kept = keep_pinned(&mut store, &mut pinner, &pins, &mut ops)?;
+            if kept > 0 {
+                let detail = format!("{kept} item(s) kept on this PC by pin rules, though set to free up space");
+                log_activity(&mut store, vec![notice(ActivityOutcome::Note, "keep", detail)])?;
+            }
+        }
+        let note = self.space_policy(&mut store, Path::new(&root.path), &pins, &mut ops)?;
         if ops.is_empty() {
             return Ok(store);
         }
@@ -1131,6 +1219,12 @@ impl Engine {
             return Err(Halted(why).into());
         }
         Ok(store)
+    }
+
+    /// Whether applying pin rules has work left for another pass soon (a
+    /// walk after the rules changed, or many changes).
+    pub fn pins_pending(&self) -> bool {
+        self.pin_more.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Files On-Demand: turns synced files and folders that are already
@@ -1217,7 +1311,13 @@ impl Engine {
     /// The automatic space policies (`crate::space`): adds what they free
     /// now to `ops`, and says why. Files not used for a while are looked
     /// for at most hourly; a low disk, at every pass.
-    fn space_policy(&self, store: &mut Store, root: &Path, ops: &mut Vec<Op>) -> Result<Option<String>> {
+    fn space_policy(
+        &self,
+        store: &mut Store,
+        root: &Path,
+        pins: &oneup_rules::PinSet,
+        ops: &mut Vec<Op>,
+    ) -> Result<Option<String>> {
         const KEY_LAST: &str = "space.last_ms";
         let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
         if space.free_unused_days == 0 && !space.free_when_low {
@@ -1234,7 +1334,8 @@ impl Engine {
         if !low && now - last < 3_600_000 {
             return Ok(None);
         }
-        let sel = crate::space::select(store, &space, disk, now, &|rel| crate::space::last_access(root, rel))?;
+        let kept = |rel: &str| pins.pins(rel, false);
+        let sel = crate::space::select(store, &space, disk, now, &|rel| crate::space::last_access(root, rel), &kept)?;
         store.write(|o| o.meta_set(KEY_LAST, &now.to_string()))?;
         if sel.ops.is_empty() {
             return Ok(None);

@@ -44,7 +44,7 @@ use oneup_app::{setup, sync, test_account, versions};
 /// `oneup rules` options that change the rules: each of --exclude-path,
 /// --include-path and --suggest does one thing, so combining them with
 /// these is refused rather than one of them silently ignored.
-const RULE_CHANGES: [&str; 5] = ["cloud", "on", "off", "add", "remove"];
+const RULE_CHANGES: [&str; 7] = ["cloud", "on", "off", "add", "remove", "pin", "unpin"];
 
 #[derive(Parser)]
 #[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (beta)")]
@@ -148,6 +148,7 @@ enum Cmd {
         state: Option<Toggle>,
     },
     /// Show or change what syncs: presets, your own rules (config.toml)
+    #[command(group(clap::ArgGroup::new("yes_for").multiple(true).args(["exclude_path", "pin", "unpin"])))]
     Rules {
         /// What happens to OneDrive's copies of excluded items (excluding
         /// always stops uploads): pull (the default: bring them and their
@@ -167,18 +168,26 @@ enum Cmd {
         /// Remove one of your rules
         #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
         remove: Vec<String>,
+        /// Add a pin rule: with Files On-Demand, matching files and folders
+        /// are always kept on this PC (e.g. "*.psd", "/Work/")
+        #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
+        pin: Vec<String>,
+        /// Remove a pin rule
+        #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
+        unpin: Vec<String>,
         /// Exclude this file or folder (a full path, or one inside the synced
         /// folder): shows what stops syncing; --yes to do it
         #[arg(long, value_name = "PATH", conflicts_with_all = RULE_CHANGES)]
         exclude_path: Option<String>,
         /// Sync this excluded file or folder again
-        #[arg(long, value_name = "PATH", conflicts_with_all = ["cloud", "on", "off", "add", "remove", "exclude_path", "yes"])]
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "exclude_path", "yes"])]
         include_path: Option<String>,
-        /// With --exclude-path: exclude it
-        #[arg(long, requires = "exclude_path")]
+        /// With --exclude-path: exclude it. With --pin/--unpin: save pin rules
+        /// that download files (shown first)
+        #[arg(long, requires = "yes_for")]
         yes: bool,
         /// Suggest folders to exclude: the largest, and the busiest lately
-        #[arg(long, conflicts_with_all = ["cloud", "on", "off", "add", "remove", "exclude_path", "include_path", "yes"])]
+        #[arg(long, conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "exclude_path", "include_path", "yes"])]
         suggest: bool,
         #[command(flatten)]
         profile: ProfileArg,
@@ -1676,7 +1685,7 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Autostart { state } => agent::autostart(&data_dir(&cli)?, state.map(Toggle::on)),
-        Cmd::Rules { cloud, on, off, add, remove, exclude_path, include_path, yes, suggest, profile } => {
+        Cmd::Rules { cloud, on, off, add, remove, pin, unpin, exclude_path, include_path, yes, suggest, profile } => {
             let dir = data_dir(&cli)?;
             if *suggest {
                 return rules::suggest(&dir, &open_store(&cli, profile.memory_profile)?);
@@ -1693,6 +1702,9 @@ async fn run() -> Result<()> {
                 off: off.clone(),
                 add: add.clone(),
                 remove: remove.clone(),
+                pin: pin.clone(),
+                unpin: unpin.clone(),
+                yes: *yes,
             };
             rules::run(&dir, &open_store(&cli, profile.memory_profile)?, &changes).await
         }

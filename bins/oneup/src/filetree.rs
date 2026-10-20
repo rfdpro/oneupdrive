@@ -292,6 +292,7 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
     let store = crate::setup::open_store(data_dir, 4 * 1024)?;
     let (local_root, _, on_demand) = pair_info(&store)?;
     let (set, row) = rules_at(data_dir, &store, &parts, steps)?;
+    let pins = config::load_rules(data_dir, &store)?.pin_set();
     // The folder itself: left out (or inside a left-out one) means its
     // contents aren't tracked.
     if !parts.is_empty() {
@@ -362,9 +363,12 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
         // own mark, not a partly ticked box.
         let partial = folder && !verdict.is_excluded() && set.has_rules_inside(&child);
         let rule_file_below = folder && l.as_ref().is_some_and(|l| ruled.contains(&l.file_id));
+        // The pin rule keeping it on this PC.
+        let pinned_by = if on_demand { pins.pinned_by(&child, folder) } else { None };
         items.push(json!({
             "partial": partial,
             "rule_file_below": rule_file_below,
+            "pinned_by": pinned_by,
             "name": name,
             "folder": folder,
             "size": size,
@@ -1120,6 +1124,29 @@ mod tests {
         assert_eq!(rules().exclude, ["*.iso", "/Docs/"]);
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert!(text.contains("# kept by hand") && text.contains("# cap"), "{text}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Pin rules round-trip through `config.toml` like the others, and a
+    /// file without any keeps no `pin` key.
+    #[test]
+    fn pin_rules_round_trip_with_comments() {
+        let d = data_dir("pins");
+        let cfg = crate::config::path(&d);
+        std::fs::write(&cfg, "[rules]\n# mine\nexclude = []\n").unwrap();
+        let store = crate::setup::open_store(&d, 1024).unwrap();
+        let r = crate::config::load_rules(&d, &store).unwrap();
+        crate::config::save_rules(&d, &r).unwrap();
+        assert!(!std::fs::read_to_string(&cfg).unwrap().contains("pin"), "no pin key until there are pin rules");
+        let v = serde_json::json!({ "pin": ["*.psd", " /Work/ ", ""] });
+        let r = crate::settingsapi::rules_with(r, &v).unwrap();
+        crate::config::save_rules(&d, &r).unwrap();
+        let back = crate::config::load_rules(&d, &store).unwrap();
+        assert_eq!(back.pin, ["*.psd", "/Work/"]);
+        assert!(back.pin_set().pins("Work/a.txt", false) && back.pin_set().pins("x/y.PSD", false));
+        assert!(std::fs::read_to_string(&cfg).unwrap().contains("# mine"));
+        assert!(crate::settingsapi::rules_with(back, &serde_json::json!({ "pin": ["# not a rule"] })).is_err());
         drop(store);
         let _ = std::fs::remove_dir_all(&d);
     }

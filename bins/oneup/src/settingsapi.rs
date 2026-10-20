@@ -113,6 +113,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "exclude": r.exclude,
             "paused": r.paused,
             "cloud": r.cloud.name(),
+            "pin": r.pin,
         },
         "versions": {
             "keep_replaced": policy.keep_replaced,
@@ -436,6 +437,13 @@ pub fn rules_with(mut r: Rules, v: &Value) -> Result<Rules> {
             config::check_rule(l)?;
         }
         r.exclude = lines;
+    }
+    if let Some(lines) = list("pin")? {
+        let lines: Vec<String> = lines.into_iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        for l in &lines {
+            config::check_rule(l)?;
+        }
+        r.pin = lines;
     }
     if let Some(c) = get(v, "cloud") {
         r.cloud = CloudCopies::from_name(c.as_str().unwrap_or_default()).context("cloud: keep, prune or pull")?;

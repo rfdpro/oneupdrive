@@ -40,6 +40,7 @@ pub mod officeopen;
 pub mod ondemand;
 pub mod ownfile;
 pub mod pairs;
+pub mod pinrules;
 pub mod priority;
 pub mod problem;
 #[cfg(windows)]

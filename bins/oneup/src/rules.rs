@@ -20,6 +20,10 @@ pub struct Changes {
     pub off: Vec<String>,
     pub add: Vec<String>,
     pub remove: Vec<String>,
+    pub pin: Vec<String>,
+    pub unpin: Vec<String>,
+    /// Go ahead with pin rules that download a lot.
+    pub yes: bool,
 }
 
 impl Changes {
@@ -29,6 +33,8 @@ impl Changes {
             && self.off.is_empty()
             && self.add.is_empty()
             && self.remove.is_empty()
+            && self.pin.is_empty()
+            && self.unpin.is_empty()
     }
 }
 
@@ -38,6 +44,9 @@ pub async fn run(data_dir: &Path, store: &Store, changes: &Changes) -> Result<()
     if !changes.is_empty() {
         let before = rules.clone();
         apply(&mut rules, changes)?;
+        if !changes.pin.is_empty() && !pin_go_ahead(store, &rules.pin, changes.yes)? {
+            return Ok(());
+        }
         if rules == before {
             println!("Nothing to change.");
         } else {
@@ -79,6 +88,19 @@ fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
             bail!("`{r}` isn't one of your rules (`oneup rules` lists them)");
         }
     }
+    for r in &c.pin {
+        config::check_rule(r)?;
+        if !rules.pin.contains(r) {
+            rules.pin.push(r.clone());
+        }
+    }
+    for r in &c.unpin {
+        let n = rules.pin.len();
+        rules.pin.retain(|x| x != r);
+        if rules.pin.len() == n {
+            bail!("`{r}` isn't one of your pin rules (`oneup rules` lists them)");
+        }
+    }
     Ok(())
 }
 
@@ -97,6 +119,13 @@ fn show(rules: &Rules) -> Result<()> {
         println!("  {r}");
     }
     println!("Rule files: a .oneupignore in any synced folder adds rules for that folder and below.");
+    println!("Always kept on this PC with Files On-Demand (oneup rules --pin RULE / --unpin RULE):");
+    if rules.pin.is_empty() {
+        println!("  none");
+    }
+    for r in &rules.pin {
+        println!("  {r}");
+    }
     println!(
         "OneDrive's copies of excluded items: {} (oneup rules --cloud keep|prune|pull)",
         match rules.cloud {
@@ -138,6 +167,29 @@ pub fn suggest(data_dir: &Path, store: &Store) -> Result<()> {
         println!("To exclude one: oneup rules --exclude-path PATH (shows what stops syncing first)");
     }
     Ok(())
+}
+
+/// Whether pin rules `lines` may be saved: what they'd download is shown,
+/// and more than `pinrules::ASK_BYTES` (or more than the disk has free)
+/// needs `--yes`.
+fn pin_go_ahead(store: &Store, lines: &[String], yes: bool) -> Result<bool> {
+    let (files, bytes, all) = oneup_app::pinrules::preview(store, lines, std::time::Duration::from_secs(10))?;
+    if files == 0 {
+        return Ok(true);
+    }
+    let pair = oneup_app::sync::pairing(store)?;
+    let free = oneup_app::pinrules::free_space(&pair.local);
+    println!(
+        "Kept on this PC from now on: {}{files} online-only file(s), {}, to download{}.",
+        if all { "" } else { "at least " },
+        oneup_app::versions::size(bytes),
+        free.map(|f| format!(" ({} free)", oneup_app::versions::size(f))).unwrap_or_default()
+    );
+    if oneup_app::pinrules::must_ask(bytes, free) && !yes {
+        println!("Nothing saved. To keep them on this PC: add --yes");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// `rel` from a path the user typed (full, or inside the synced folder).
@@ -274,6 +326,13 @@ pub async fn pin(data_dir: &Path, store: &Store, path: &str, keep: bool) -> Resu
     let rel = crate::activity::normalize(&crate::activity::within(&pair.local, path)?);
     let full =
         rel.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).fold(pair.local.clone(), |p, x| p.join(x));
+    if !keep {
+        // A pin rule wins: the agent would pin it again.
+        let pins = config::load_rules(data_dir, store)?.pin_set();
+        if let Some(rule) = pins.pinned_by(&rel, full.is_dir()) {
+            bail!("{rel} is kept on this PC by the pin rule `{rule}`; remove that rule first (oneup rules --unpin)");
+        }
+    }
     let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
     let pin = if keep { provider::Pin::Pinned } else { provider::Pin::Unpinned };
     if full.is_dir() { provider::set_pin_tree(&f, pin) } else { provider::set_pin(&f, pin) }
@@ -420,6 +479,9 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     if engine {
         return Ok(());
     }
+    if let Some(rule) = config::load_rules(data_dir, store)?.pin_set().pinned_by(rel, is_dir) {
+        println!("  always kept on this PC: pin rule {rule} (with Files On-Demand)");
+    }
     let listed = skipped_at.is_none();
     if let Some(at) = skipped_at {
         let at = if at.is_empty() { "the synced folder".into() } else { format!("/{at}") };
@@ -538,6 +600,11 @@ mod tests {
     fn changes_turn_presets_on_and_off_and_edit_rules() {
         let mut r = Rules::default();
         let c = Changes { on: vec!["DEV".into(), "temp".into()], add: vec!["*.iso".into()], ..Changes::default() };
+        apply(&mut r, &Changes { pin: vec!["*.psd".into(), "*.psd".into()], ..Changes::default() }).unwrap();
+        assert_eq!(r.pin, ["*.psd"]);
+        assert!(apply(&mut r, &Changes { unpin: vec!["*.png".into()], ..Changes::default() }).is_err());
+        apply(&mut r, &Changes { unpin: vec!["*.psd".into()], ..Changes::default() }).unwrap();
+        assert!(r.pin.is_empty());
         apply(&mut r, &c).unwrap();
         assert_eq!(r.presets, ["dev", "temp"]);
         assert_eq!(r.exclude, ["*.iso"]);

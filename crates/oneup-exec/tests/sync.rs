@@ -2960,7 +2960,10 @@ async fn on_demand_pinned_files_download_and_freed_files_free_up() {
 
     provider::set_pin(&provider::open(&pk).unwrap(), provider::Pin::Pinned).unwrap();
     s.quiesce().await;
-    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0).await.unwrap();
+    // Asked before each file: a "no" (a pause, say) stops the pass there.
+    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_| false).await.unwrap();
+    assert!(fetched.is_empty() && placeholder(&pk).on_disk == 0, "nothing downloaded");
+    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|size| size == 11).await.unwrap();
     assert_eq!(fetched, ["/keep.txt"]);
     assert_eq!(placeholder(&pk).on_disk, 11, "downloaded");
 
@@ -2979,6 +2982,42 @@ async fn on_demand_pinned_files_download_and_freed_files_free_up() {
     assert_eq!(placeholder(&pf).on_disk, 0, "freed");
     let back = app_read(&pf).unwrap();
     assert!(String::from_utf8_lossy(&back).contains("plus an edit"), "the edit comes back from OneDrive");
+    drop(s);
+    drop(od);
+}
+
+/// A pinned file ("Always keep on this device", by the user or a pin rule)
+/// is never freed: a freeing operation for it, as a space policy would plan
+/// it (stamp and hash right, approved by the gate), is refused by the
+/// effects layer on its share-none handle, and the content stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_pinned_file_is_never_freed() {
+    let cloud = Fake::new();
+    cloud.add("kept.psd", Some(b"layers"));
+    let (od, mut s) = on_demand_sync("ondemand-pinned-kept", &cloud);
+    s.quiesce().await;
+    let p = s.p("kept.psd");
+    assert_eq!(app_read(&p).as_deref(), Some(&b"layers"[..]), "downloaded when opened");
+    provider::set_pin(&provider::open(&p).unwrap(), provider::Pin::Pinned).unwrap();
+    s.obs.catch_up().unwrap();
+    let id = s.local_id("kept.psd");
+    let row = s.obs.store().read(|o| o.local_get(id.0)).unwrap().unwrap();
+    let op = Op::Dehydrate { local: LocalPre { id, stamp: Some((row.size, row.mtime)) }, hash: qxh(b"layers") };
+    let r = review_in(&Policy::default(), &Context::default(), vec![op]);
+    assert_eq!(r.approved.len(), 1, "the gate has no reason to stop it");
+    let report = s.exec.run(s.obs.store_mut(), r.approved).await;
+    assert!(report.done.is_empty(), "{report:?}");
+    let info = placeholder(&p);
+    assert_eq!((info.on_disk, info.pin), (6, provider::Pin::Pinned), "still here, still pinned");
+    // Unpinned, the same operation frees it: the refusal was the pin.
+    provider::set_pin(&provider::open(&p).unwrap(), provider::Pin::Unspecified).unwrap();
+    s.obs.catch_up().unwrap();
+    let row = s.obs.store().read(|o| o.local_get(id.0)).unwrap().unwrap();
+    let op = Op::Dehydrate { local: LocalPre { id, stamp: Some((row.size, row.mtime)) }, hash: qxh(b"layers") };
+    let r = review_in(&Policy::default(), &Context::default(), vec![op]);
+    let report = s.exec.run(s.obs.store_mut(), r.approved).await;
+    assert_eq!(report.done.len(), 1, "{report:?}");
+    assert_eq!(placeholder(&p).on_disk, 0);
     drop(s);
     drop(od);
 }

@@ -443,7 +443,11 @@ mod tests {
             })
             .unwrap();
             s.read(|o| {
-                let undo = format!("{} {UNDO_V20} PRAGMA user_version = 19;", crate::shared::UNDO_V21);
+                let undo = format!(
+                    "{} {} {UNDO_V20} PRAGMA user_version = 19;",
+                    crate::pins::UNDO_V22,
+                    crate::shared::UNDO_V21
+                );
                 Ok(o.c.execute_batch(&undo)?)
             })
             .unwrap();

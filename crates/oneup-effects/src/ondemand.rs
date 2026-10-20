@@ -446,6 +446,7 @@ impl LocalFs {
     /// invariant 11). Only if, read under a share-none handle, the content
     /// hashes to the op's hash, which the caller checked is the cloud's
     /// current version, and Windows still has it in sync (`VERIFY_IN_SYNC`).
+    /// Never a pinned placeholder.
     pub fn free_up(&self, a: &Approved) -> Result<Done> {
         let Op::Dehydrate { local, hash } = a.op() else { return Err(Error::WrongOp) };
         let Some((size, _)) = local.stamp else { return Err(Error::WrongOp) };
@@ -455,6 +456,12 @@ impl LocalFs {
             return Err(Error::Changed); // already free
         }
         if info.on_disk < size || !info.in_sync {
+            return Err(Error::Changed);
+        }
+        // "Always keep on this device" (by the user or a pin rule) wins over
+        // anything that would free it, whoever planned it and whenever the
+        // pin was set: read on this share-none handle, just before acting.
+        if info.pin == provider::Pin::Pinned {
             return Err(Error::Changed);
         }
         let mut buf = vec![0u8; 1 << 20];
