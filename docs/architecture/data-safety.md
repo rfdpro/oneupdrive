@@ -37,5 +37,6 @@ A bounded, configurable local version store (`oneup versions`, `oneup restore`),
 ## Code structure
 
 * Destructive filesystem and network calls live in **one** crate (`oneup-effects`), behind typed tokens that the safety gate (`oneup-gate`) issues. The planner can't call them, and nothing else can create the tokens.
+* Changing who can open an item (removing a sharing link or people's access, setting its expiry) never touches content but changes OneDrive for others, so it takes the same path: the gate's `sharing::PermissionChange` token, issued only for the permission exactly as the user saw it, and `oneup_effects::sharing`, which re-reads it and sends the request with `If-Match` (invariant 2). The change is recorded ahead and its outcome judged by reading OneDrive back, then, or on a later run (invariant 7). See [remote-mirror.md § Sharing](remote-mirror.md#sharing).
 * The planner and the safety gate are pure (no I/O), so they are deterministic and run under simulation ([sync-engine.md § Simulation](sync-engine.md#simulation-cratesoneup-synctestssimrs)).
 * Changes to the safety gate or the effects layer need two reviews: the maintainer's and, while there is one maintainer, an independent model review recorded in the PR ([CONTRIBUTING.md](../../CONTRIBUTING.md#what-we-look-for-in-a-pr)). No release ships with an open data-safety issue.
