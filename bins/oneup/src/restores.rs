@@ -196,7 +196,7 @@ pub fn deleted(store: &mut Store, seq: i64) -> Result<String> {
             return Ok(None);
         };
         let Some(folder) = d.folder.clone() else { return Ok(Some(Err(d))) };
-        let op = oneup_exec::recover::deleted_op(o, d.sid, &d.id, &folder, &d.name, d.kind)?;
+        let op = oneup_exec::recover::deleted_op(d.sid, &d.id, &folder, &d.name, d.kind);
         Ok(Some(Ok((d, op))))
     })?;
     let (d, op) = match found {

@@ -303,6 +303,19 @@ impl Ops<'_> {
             .execute([budget])?)
     }
 
+    /// The OneDrive ID Synced record `sid` last had, as the history recorded
+    /// it (its record may have gone): one probe of the index on `sid`.
+    pub fn history_remote_of(&self, sid: Sid) -> Result<Option<RemoteId>> {
+        let id: Option<String> = self
+            .c
+            .prepare_cached(
+                "SELECT remote_id FROM synced_history WHERE sid = ?1 AND remote_id IS NOT NULL ORDER BY seq DESC LIMIT 1",
+            )?
+            .query_row([sid_in(sid)], |r| r.get(0))
+            .optional()?;
+        Ok(id.map(RemoteId))
+    }
+
     /// See [`History::children_after`].
     pub fn history_children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>> {
         let mut st =
