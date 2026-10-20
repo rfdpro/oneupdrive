@@ -55,6 +55,7 @@ pub mod prune;
 #[cfg(windows)]
 pub mod recyclebin;
 pub mod resolve;
+pub mod restores;
 pub mod rewind;
 pub mod rulefiles;
 pub mod safetywindow;

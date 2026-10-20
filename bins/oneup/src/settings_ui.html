@@ -4129,7 +4129,7 @@
                         const at = await run(call("cloud_bin_restore", {
                             seq: x.seq
                         }));
-                        toast("Back in OneDrive as " + at);
+                        toast("Queued: " + at);
                         loadBin();
                     }) : el("small", {
                         className: "muted",
@@ -6952,7 +6952,7 @@
                             run(call("item_restore", {
                                 path: n.path,
                                 id: x.id
-                            }), tr("Restored")).then(() => versionsInto(b, n));
+                            }), tr("Queued")).then(() => versionsInto(b, n));
                         }
                     }));
                     body.append(el("tr", {}, el("td", {
@@ -7090,7 +7090,7 @@
                                 root: r.id,
                                 id: x.id
                             }));
-                            toast(tr("Restored to {path}", {
+                            toast(tr("Queued: {path}", {
                                 path: at.replace(/^\\\\\?\\/, "")
                             }));
                             keptInto(b, r);

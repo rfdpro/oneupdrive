@@ -48,7 +48,7 @@ Files sync removed from or replaced on your PC, kept in `.oneup\versions`. **Res
 Type the full path of a file in your synced folder, then **Show**: the versions OneDrive keeps. **Open** saves a copy of one outside your synced folder; **Restore** makes it the current one, and the one it replaces stays in the history. The same as [Version history](versions-and-sharing.md#version-history) on the Files page.
 
 ## Deleted from OneDrive
-Items deleted from OneDrive, newest first, with **Restore**: it brings the item back from OneDrive's recycle bin to the folder it was in (under ` (restored 1)` if the name is taken now), and your PC gets it with the next sync.
+Items deleted from OneDrive, newest first, with **Restore**: the next sync brings the item back from OneDrive's recycle bin to the folder it was in (under ` (restored 1)` if the name is taken now), and your PC gets it.
 
 Only items OneUpDrive saw deleted are listed: OneDrive doesn't let apps read its recycle bin for personal accounts, only bring back an item it knows. Everything else is in the recycle bin on OneDrive's website. An item whose folder was deleted too can be restored once its folder is back.
 

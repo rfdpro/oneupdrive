@@ -1192,6 +1192,18 @@ impl LocalFs {
         }
     }
 
+    /// Runs an approved [`Step::RestoreKept`]: [`LocalFs::restore`] of the
+    /// slot it names. Returns the path it was restored to.
+    pub fn restore_approved(&self, a: &Approved) -> Result<String> {
+        match a.op() {
+            Op::Rewind { step, .. } => match &**step {
+                Step::RestoreKept { slot, to } => self.restore(slot, to.as_deref()),
+                _ => Err(Error::WrongOp),
+            },
+            _ => Err(Error::WrongOp),
+        }
+    }
+
     /// Moves a kept item back into the sync folder: to `to` (a path relative
     /// to the sync folder, `\` or `/` separated) or else where it came from.
     /// Never replaces anything: if the name is taken, the item is restored

@@ -135,6 +135,15 @@ pub enum Step {
     /// Not part of a rewind: the copy a user answering a conflict doesn't
     /// keep (`oneup_exec::recover::conflict_ops`).
     Discard { local: LocalPre },
+    /// Not part of a rewind: put a copy kept in the version store (its slot)
+    /// back into the synced folder, at `to` (a path in it) or where it came
+    /// from; never over anything (a taken name gets ` (restored N)`). The
+    /// next round sends it to OneDrive like any new file.
+    RestoreKept { slot: String, to: Option<String> },
+    /// Not part of a rewind: make version `version` of cloud file `remote`
+    /// its current one, uploaded as a new version under `If-Match` (the
+    /// one it replaces stays in the history).
+    RevertTo { remote: RemotePre, version: String },
 }
 
 /// Where a cloud item is now and what it holds: part of a step's identity,
@@ -1032,6 +1041,7 @@ pub fn mark_of(op: &Op) -> Option<(Key, Mark)> {
         }
         Step::SetAside { local } | Step::Discard { local } => (Key::Local(local.id), Mark::Local(local.stamp)),
         Step::Forget => (Key::Record(*sid), Mark::Record),
+        Step::RestoreKept { .. } | Step::RevertTo { .. } => return None,
     })
 }
 

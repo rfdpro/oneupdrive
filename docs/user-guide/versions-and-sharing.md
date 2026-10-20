@@ -6,7 +6,7 @@ OneDrive keeps earlier versions of your files (the *version history*; not the sa
 The list shows each version OneDrive keeps: when it was saved, its size and who saved it, newest first.
 
 * **Open** saves a copy of that version outside your synced folder (in `%TEMP%\OneUpDrive versions`) and opens it. Your file doesn't change.
-* **Restore** makes that version the current one in OneDrive. The version it replaces stays in the history, so you can go back. This PC gets the restored version with the next sync, like any change from OneDrive. If the file changed in OneDrive meanwhile, nothing is restored and you're asked to look again.
+* **Restore** makes that version the current one in OneDrive, with OneUpDrive's next sync. The version it replaces stays in the history, so you can go back. This PC then gets it like any change from OneDrive. If the file changed in OneDrive meanwhile, nothing is restored, and **Recent activity** says so.
 
 From a terminal: `oneup history "C:\…\Report.docx"` lists the versions, `--open 3` opens a copy of the third, `--restore 3` restores it.
 

@@ -2141,7 +2141,7 @@ async fn run() -> Result<()> {
             .await
         }
         Cmd::RecycleBin { restore, json, profile } => {
-            recycle_bin(&data_dir(&cli)?, &open_store(&cli, profile.memory_profile)?, *restore, *json).await
+            recycle_bin(&data_dir(&cli)?, open_store(&cli, profile.memory_profile)?, *restore, *json).await
         }
         Cmd::OnedriveApp { add, remove, top_files } => {
             let dir = data_dir(&cli)?;
@@ -2629,8 +2629,15 @@ async fn run() -> Result<()> {
             versions::versions(&store, *older_than_days, *max_gib, *yes)
         }
         Cmd::Restore { id, to, profile } => {
-            let _lock = DirLock::acquire(&data_dir(&cli)?)?;
-            versions::restore(&open_store(&cli, profile.memory_profile)?, id, to.as_deref())
+            let dir = data_dir(&cli)?;
+            let mut store = open_store(&cli, profile.memory_profile)?;
+            let at = oneup_app::restores::kept(&mut store, id, to.as_deref())?;
+            if agent::nudge(&dir).await {
+                println!("Restoring {at}; `oneup activity` says when it's done.");
+            } else {
+                println!("The next sync restores {at}, then sends it to OneDrive.");
+            }
+            Ok(())
         }
         Cmd::CloudCheck | Cmd::DevRemote(_) | Cmd::UploadBench { .. } => {
             let dir = data_dir(&cli)?;
@@ -2791,15 +2798,22 @@ async fn conflicts(
 }
 
 /// `oneup recycle-bin [--restore N]`.
-async fn recycle_bin(dir: &std::path::Path, store: &Store, restore: Option<usize>, json: bool) -> Result<()> {
+async fn recycle_bin(dir: &std::path::Path, mut store: Store, restore: Option<usize>, json: bool) -> Result<()> {
     use oneup_app::cloudbin;
     let listed = store.read(|o| cloudbin::list(o, cloudbin::MAX))?;
     if let Some(n) = restore {
         let d =
             listed.get(n.wrapping_sub(1)).with_context(|| format!("there's no item {n} (1 to {})", listed.len()))?;
-        let to = cloudbin::restore(dir, d.seq).await?;
-        agent::nudge(dir).await;
-        println!("Back in OneDrive as {to}; this PC gets it with the next sync.");
+        oneup_app::setup::require_test_account(dir)?;
+        if oneup_app::vaultpair::is_vault_dir(dir) {
+            bail!("this is an encrypted vault: OneDrive only has its encrypted files");
+        }
+        let to = oneup_app::restores::deleted(&mut store, d.seq)?;
+        if agent::nudge(dir).await {
+            println!("Bringing it back as {to}; `oneup activity` says when it's done.");
+        } else {
+            println!("The next sync brings it back as {to}.");
+        }
         return Ok(());
     }
     if json {
@@ -2861,8 +2875,12 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
             bail!("version 1 is the current one already");
         }
         let x = pick(n)?;
-        oneup_app::item::restore_version(path, x["id"].as_str().unwrap_or_default()).await?;
-        println!("Version {n} ({}) is the current version again; this PC gets it with the next sync.", shown(x));
+        let dir = oneup_app::item::restore_version(path, x["id"].as_str().unwrap_or_default())?;
+        if agent::nudge(&dir).await {
+            println!("Version {n} ({}) is restoring; `oneup activity` says when it's done.", shown(x));
+        } else {
+            println!("Version {n} ({}) is restored by the next sync.", shown(x));
+        }
         return Ok(());
     }
     println!("{} in OneDrive:", v["path"].as_str().unwrap_or_default());

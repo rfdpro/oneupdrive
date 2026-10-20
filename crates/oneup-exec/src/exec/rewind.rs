@@ -155,6 +155,32 @@ impl<C: Cloud> Executor<C> {
                     })
                     .await
             }
+            Step::RestoreKept { .. } => {
+                // Never over anything; the next round sends it to OneDrive.
+                self.off_task(a, |fs, a| fs.restore_approved(a)).await??;
+                Ok(())
+            }
+            Step::RevertTo { remote, version } => {
+                let row = store.read(|o| o.get_item(&remote.id.0))?.ok_or(Fail::Skip(Skip::Changed))?;
+                need(row.etag.as_deref() == Some(remote.etag.as_str()))?;
+                let parent = RemoteId(row.parent_id.clone().ok_or(Fail::Skip(Skip::Changed))?);
+                let mut staged = self.fs.stage()?;
+                let Some(file) = staged.file() else { return Err(odd()) };
+                let mut hashing = Hashing::new(&mut *file);
+                let len = self.cloud.download_version(&remote.id, version, &mut hashing).await?;
+                let hash = hashing.hash.finalize();
+                let size = i64::try_from(len).map_err(|e| Fail::Failed(e.to_string()))?;
+                file.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
+                let mut reader = OffTask::new(file.try_clone().map_err(|e| Fail::Failed(e.to_string()))?, &self.jobs);
+                let (sent_row, sent) = self.cloud.upload(&parent, &row.name, Some(remote), size, &mut reader).await?;
+                let sent = sent.unwrap_or_else(|| reader.hash.finalize());
+                self.crash_point()?;
+                store.write(|o| Ok::<_, Fail>(o.upsert_item(&sent_row, false)?)).await?;
+                if sent_row.qxh != Some(hash) || sent != hash || sent_row.size != size {
+                    return Err(Fail::Skip(Skip::ContentMismatch));
+                }
+                Ok(())
+            }
             Step::Forget => {
                 store
                     .write(|o| {

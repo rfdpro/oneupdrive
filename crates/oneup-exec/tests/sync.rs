@@ -1028,6 +1028,9 @@ struct Sync {
     /// Added to the next round's plan, as the agent adds the renames the
     /// user chose (`oneup_exec::resolve`).
     extra: Vec<Op>,
+    /// The next round's `extra` wasn't answered by the user: its recovery
+    /// steps aren't approved.
+    unanswered: bool,
     /// Safety stops, as the agent handles them (`oneup_app::sync`).
     stops: Stops,
 }
@@ -1140,6 +1143,7 @@ impl Sync {
             follow: true,
             follow_max: oneup_exec::FOLLOW_MAX,
             extra: Vec::new(),
+            unanswered: false,
             stops: Stops::default(),
         }
     }
@@ -1177,6 +1181,7 @@ impl Sync {
             follow,
             follow_max,
             extra,
+            unanswered,
             stops,
         } = self;
         drop((obs, exec));
@@ -1198,6 +1203,7 @@ impl Sync {
             follow,
             follow_max,
             extra,
+            unanswered,
             stops,
         }
     }
@@ -1229,6 +1235,7 @@ impl Sync {
             follow,
             follow_max,
             extra,
+            unanswered,
             stops,
         } = self;
         let seen = SeenDeletes::new();
@@ -1267,6 +1274,7 @@ impl Sync {
             follow,
             follow_max,
             extra,
+            unanswered,
             stops,
         };
         (s, noted)
@@ -1373,14 +1381,15 @@ impl Sync {
                 pending_paths.push(p);
             }
         }
-        // A conflict answered: the answer approves its steps.
+        // A conflict answered or a restore asked for: the answer approves
+        // its steps.
         let answered: Vec<(Op, String)> = ops
             .iter()
             .zip(&paths)
             .filter(|(o, _)| o.rewind_step().is_some())
             .map(|(o, p)| (o.clone(), p.clone()))
             .collect();
-        if self.stops.rewind.as_ref().is_none_or(|r| r.done) {
+        if self.stops.rewind.as_ref().is_none_or(|r| r.done) && !std::mem::take(&mut self.unanswered) {
             let (o, p): (Vec<Op>, Vec<String>) = answered.into_iter().unzip();
             approved.extend(oneup_gate::rewind_keys(&o, &p));
         }
@@ -5962,9 +5971,18 @@ async fn everyday_restoring_a_kept_copy_brings_it_back_on_both_sides() {
     s.settle().await;
     assert!(!s.p("docs/a.txt").exists());
     let slot = s.exec.local().versions().unwrap().into_iter().find(|v| v.name == "a.txt").expect("kept");
-    let back = s.exec.local().restore(&slot.id, None).unwrap();
-    assert_eq!(back.replace('\\', "/"), "docs/a.txt");
+    // A planned step, approved by the user's answer: unanswered, it stops.
+    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, None)];
+    s.unanswered = true;
+    s.stops.allowed = true;
+    let r = s.attempt().await;
+    assert!(r.done.is_empty() && !s.p("docs/a.txt").exists(), "nothing ran");
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Rewind), "a stop asks");
+    s.stops.raised.clear();
+    s.stops.allowed = false;
+    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, None)];
     s.settle().await;
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"keep me");
     assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"keep me".to_vec()), "uploaded again");
     assert!(s.versions().is_empty());
 }
@@ -5983,11 +6001,17 @@ async fn everyday_restoring_a_onedrive_version_and_a_deleted_item() {
     let id = RemoteId(resolve(&cloud.0.lock().unwrap(), "docs/a.txt"));
     let versions = cloud.versions(&id).await.unwrap();
     let old = versions.iter().skip(1).find(|v| v.size == Some(11)).unwrap();
-    let staging = s.dir.0.with_extension("restore.tmp");
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&staging).unwrap();
-    oneup_exec::recover::restore_version(&cloud, &id, &old.id, &mut f).await.unwrap();
-    drop(f);
-    let _ = std::fs::remove_file(&staging);
+    let revert = s.obs.store().read(|o| oneup_exec::recover::version_op(o, &id, &old.id)).unwrap().unwrap();
+    // Unanswered, it stops, and OneDrive keeps what it has.
+    s.extra = vec![revert.clone()];
+    s.unanswered = true;
+    s.stops.allowed = true;
+    s.attempt().await;
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Rewind), "a stop asks");
+    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"version two".to_vec()));
+    s.stops.raised.clear();
+    s.stops.allowed = false;
+    s.extra = vec![revert];
     s.settle().await;
     assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"version one");
     assert!(cloud.holds(b"version two"), "the version it replaced stays in the history");
@@ -6002,14 +6026,53 @@ async fn everyday_restoring_a_onedrive_version_and_a_deleted_item() {
     let b = gone.iter().find(|r| r.was.name == "b.txt").expect("recorded");
     let parent = s.obs.store().read(|o| o.synced_get(b.was.parent.unwrap())).unwrap().unwrap().remote.unwrap();
     let id = b.was.remote.clone().unwrap();
-    let row =
-        oneup_exec::recover::restore_deleted(&cloud, &id, &parent, "b.txt", oneup_sync::NodeKind::File).await.unwrap();
-    assert_eq!(row.name, "b (restored 1).txt");
+    let op = s
+        .obs
+        .store()
+        .read(|o| oneup_exec::recover::deleted_op(o, b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File))
+        .unwrap();
+    assert!(
+        matches!(op.rewind_step(), Some(oneup_sync::rewind::Step::Restore { name, .. }) if name == "b (restored 1).txt")
+    );
+    s.extra = vec![op];
     s.settle().await;
     assert_eq!(std::fs::read(s.p("docs/b (restored 1).txt")).unwrap(), b"bee");
     assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"another bee");
     let listed = s.obs.store().read(|o| o.history_removed(10, None)).unwrap();
     assert!(listed.iter().all(|r| r.was.remote.as_ref() != Some(&id)), "back in OneDrive: not listed as deleted");
+}
+
+#[tokio::test]
+async fn everyday_a_restore_asked_for_leaves_a_file_changed_since_alone() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-restore-changed", cloud.clone());
+    write(&s.p("docs/a.txt"), b"version one");
+    s.settle().await;
+    write(&s.p("docs/a.txt"), b"version two");
+    s.settle().await;
+    let id = RemoteId(resolve(&cloud.0.lock().unwrap(), "docs/a.txt"));
+    let old = cloud.versions(&id).await.unwrap().into_iter().skip(1).find(|v| v.size == Some(11)).unwrap();
+    // Asked for, then the file changes in OneDrive before the agent gets to it.
+    let revert = s.obs.store().read(|o| oneup_exec::recover::version_op(o, &id, &old.id)).unwrap().unwrap();
+    cloud.edit("docs/a.txt", b"version three");
+    s.extra = vec![revert.clone()];
+    let r = s.attempt().await;
+    assert!(!r.done.contains(&revert), "not run over a newer version");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"version three".to_vec()));
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"version three");
+    // A kept copy whose name was taken meanwhile comes back beside it.
+    write(&s.p("docs/k.txt"), b"kept");
+    s.settle().await;
+    cloud.delete("docs/k.txt");
+    s.settle().await;
+    let slot = s.exec.local().versions().unwrap().into_iter().find(|v| v.name == "k.txt").expect("kept");
+    write(&s.p("docs/k.txt"), b"a new k");
+    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, None)];
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("docs/k.txt")).unwrap(), b"a new k");
+    assert_eq!(std::fs::read(s.p("docs/k (restored 1).txt")).unwrap(), b"kept");
+    assert_eq!(s.synced_part(local_tree(&s.dir.0)), s.synced_part(cloud.tree()));
 }
 
 #[tokio::test]
