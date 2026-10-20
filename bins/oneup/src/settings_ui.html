@@ -2401,6 +2401,172 @@
             s.append(u);
             return s;
         };
+        // ---- localisation (`oneup_app::l10n`, which has the same formatter
+        // in Rust). The English text is the key: `tr("Nothing found.")`,
+        // `tr("{n, plural, one {# file} other {# files}}", { n })`. A string
+        // without a translation shows in English. The host puts in the
+        // language, its translations and the regional format (`locale`),
+        // which numbers and dates follow.
+        const L10N = "{{L10N}}";
+        const CAT = typeof L10N === "object" ? L10N : {
+            lang: "en",
+            locale: undefined,
+            strings: {}
+        };
+        const FMT = CAT.locale;
+        const num = n => Number(n).toLocaleString(FMT);
+        const MSGS = new Map();
+
+        // A message (ICU MessageFormat's simple and plural arguments) as
+        // parts: strings, [name], ["#"] and [name, {case: parts}].
+        function parseMsg(s) {
+            let i = 0;
+            const parts = inPlural => {
+                const out = [];
+                let text = "";
+                const flush = () => {
+                    if (text) out.push(text);
+                    text = "";
+                };
+                while (i < s.length) {
+                    const c = s[i];
+                    if (c === "'") {
+                        const next = s[i + 1];
+                        if (next === "'") {
+                            text += "'";
+                            i += 2;
+                        } else if (next === "{" || next === "}" || (inPlural && next === "#")) {
+                            i++;
+                            while (i < s.length) {
+                                if (s[i] === "'" && s[i + 1] === "'") {
+                                    text += "'";
+                                    i += 2;
+                                } else if (s[i] === "'") {
+                                    i++;
+                                    break;
+                                } else text += s[i++];
+                            }
+                        } else {
+                            text += c;
+                            i++;
+                        }
+                    } else if (c === "#" && inPlural) {
+                        flush();
+                        out.push(["#"]);
+                        i++;
+                    } else if (c === "{") {
+                        flush();
+                        i++;
+                        out.push(arg());
+                    } else if (c === "}") {
+                        if (!inPlural) throw new Error("unmatched }");
+                        break;
+                    } else {
+                        text += c;
+                        i++;
+                    }
+                }
+                flush();
+                return out;
+            };
+            const word = () => {
+                const m = /^\s*([\w=-]+)\s*/u.exec(s.slice(i));
+                if (!m) throw new Error("name expected at " + i);
+                i += m[0].length;
+                return m[1];
+            };
+            const expect = c => {
+                while (/\s/.test(s[i])) i++;
+                if (s[i++] !== c) throw new Error(c + " expected at " + (i - 1));
+            };
+            const arg = () => {
+                const name = word();
+                if (s[i] === "}") {
+                    i++;
+                    return [name];
+                }
+                expect(",");
+                const kind = word();
+                if (kind === "number") {
+                    expect("}");
+                    return [name];
+                }
+                if (kind !== "plural") throw new Error("number or plural expected");
+                expect(",");
+                const cases = {};
+                for (;;) {
+                    while (/\s/.test(s[i])) i++;
+                    if (s[i] === "}") {
+                        i++;
+                        break;
+                    }
+                    const key = word();
+                    expect("{");
+                    cases[key] = parts(true);
+                    expect("}");
+                }
+                if (!cases.other) throw new Error("plural without other");
+                return [name, cases];
+            };
+            const out = parts(false);
+            if (i < s.length) throw new Error("unmatched }");
+            return out;
+        }
+
+        function renderMsg(parts, args, lang, hash) {
+            const show = v => typeof v === "number" ? num(v) : String(v);
+            let out = "";
+            for (const p of parts) {
+                if (typeof p === "string") out += p;
+                else if (p[0] === "#") out += hash === undefined ? "" : show(hash);
+                else if (!(p[0] in args)) out += "{" + p[0] + "}";
+                else if (p.length === 1) out += show(args[p[0]]);
+                else {
+                    const v = Number(args[p[0]]);
+                    const cases = p[1];
+                    const c = cases["=" + v] || cases[new Intl.PluralRules(lang).select(v)] || cases.other;
+                    out += renderMsg(c, args, lang, v);
+                }
+            }
+            return out;
+        }
+
+        function tr(english, args = {}) {
+            const use = (pattern, lang) => {
+                if (!MSGS.has(pattern)) MSGS.set(pattern, parseMsg(pattern));
+                return renderMsg(MSGS.get(pattern), args, lang);
+            };
+            const translated = CAT.strings[english];
+            try {
+                if (translated) return use(translated, CAT.lang);
+            } catch {}
+            try {
+                return use(english, "en");
+            } catch {
+                return english;
+            }
+        }
+
+        // The page's own text (headings, labels, buttons, placeholders),
+        // where a translation has it; one piece of text at a time.
+        function translatePage() {
+            if (!Object.keys(CAT.strings).length) return;
+            document.documentElement.lang = CAT.lang;
+            const swap = v => {
+                const [, lead, text, trail] = /^(\s*)([\s\S]*?)(\s*)$/.exec(v);
+                const key = text.replace(/\s+/g, " ");
+                return key && CAT.strings[key] ? lead + tr(key) + trail : v;
+            };
+            const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+                acceptNode: n => n.parentElement.closest("script, style") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+            });
+            for (let n = walk.nextNode(); n; n = walk.nextNode()) n.nodeValue = swap(n.nodeValue);
+            for (const e of document.querySelectorAll("[placeholder], [title], [aria-label]"))
+                for (const a of ["placeholder", "title", "aria-label"])
+                    if (e.hasAttribute(a)) e.setAttribute(a, swap(e.getAttribute(a)));
+            document.title = swap(document.title);
+        }
+        translatePage();
         let seq = 0;
         const waiting = new Map();
         let snap = null;
@@ -2485,9 +2651,15 @@
                 b /= 1024;
                 i++;
             }
-            return (i ? b.toFixed(b < 10 ? 1 : 0) : b) + " " + u[i];
+            // One decimal under 10 (4.2 GB), in the regional format.
+            const d = i && b < 10 ? 1 : 0;
+            return Number(b.toFixed(d)).toLocaleString(FMT, {
+                minimumFractionDigits: d,
+                maximumFractionDigits: d,
+                useGrouping: false
+            }) + " " + u[i];
         };
-        const when = ms => ms ? new Date(ms).toLocaleString([], {
+        const when = ms => ms ? new Date(ms).toLocaleString(FMT, {
             dateStyle: "medium",
             timeStyle: "short"
         }) : "–";
@@ -2526,13 +2698,13 @@
 
         // ---- status
         const WORDS = {
-            idle: "Up to date",
-            starting: "Starting",
-            syncing: "Syncing",
-            paused: "Paused",
-            waitingforyou: "Waiting for you",
-            retrying: "Retrying soon",
-            stopping: "Stopping"
+            idle: tr("Up to date"),
+            starting: tr("Starting"),
+            syncing: tr("Syncing"),
+            paused: tr("Paused"),
+            waitingforyou: tr("Waiting for you"),
+            retrying: tr("Retrying soon"),
+            stopping: tr("Stopping")
         };
 
         // Why the agent stopped, when an error stopped it (`agent-stopped.json`).
@@ -2557,36 +2729,41 @@
             }));
             if (!s) {
                 dot.className = stopped ? "dot bad" : "dot";
-                title.textContent = stopped ? "Stopped" : "Not running";
-                detail.textContent = stopped ? stopped.title + "." : "Nothing syncs until it starts.";
-                btn("Start", () => run(call("start"), "Starting…"), "btn primary small");
+                title.textContent = stopped ? tr("Stopped") : tr("Not running");
+                detail.textContent = stopped ? stopped.title + "." : tr("Nothing syncs until it starts.");
+                btn(tr("Start"), () => run(call("start"), tr("Starting…")), "btn primary small");
                 return;
             }
             const a = String(s.activity || "").toLowerCase().replace(/[^a-z]/g, "");
             const paused = s.paused && (s.paused.local || s.paused.remote);
             const stops = s.safety_stops || [];
             const attention = stops.length || (s.overflow && s.overflow.waiting);
-            title.textContent = attention ? "Waiting for you" : s.problem ? "Problem" : paused || s.auto_pause ? "Paused" : (WORDS[a] || "Running");
+            title.textContent = attention ? tr("Waiting for you") : s.problem ? tr("Problem") : paused || s.auto_pause ? tr("Paused") : (WORDS[a] || tr("Running"));
             dot.className = "dot " + (attention || s.problem ? "bad" : paused || s.auto_pause ? "wait" : a === "syncing" || a === "starting" ? "busy" : "ok");
             const bits = [];
-            if (s.auto_pause) bits.push("Paused: " + s.auto_pause + ".");
+            if (s.auto_pause) bits.push(tr("Paused: {why}.", {
+                why: s.auto_pause
+            }));
             if (s.problem) bits.push(s.problem.title + ".");
-            if (stops.some(x => x.kind === "content")) bits.push("Some edited files look encrypted. Review them from the icon's menu.");
-            else if (attention) bits.push("Review from the icon's menu.");
-            if (s.last && s.last.done) bits.push(`Last sync ${new Date(s.last.at_ms).toLocaleString()}: ${s.last.done} changes.`);
+            if (stops.some(x => x.kind === "content")) bits.push(tr("Some edited files look encrypted. Review them from the icon's menu."));
+            else if (attention) bits.push(tr("Review from the icon's menu."));
+            if (s.last && s.last.done) bits.push(tr("Last sync {when}: {n, plural, one {# change} other {# changes}}.", {
+                when: new Date(s.last.at_ms).toLocaleString(FMT),
+                n: s.last.done
+            }));
             detail.textContent = bits.join(" ");
-            btn("Sync now", () => run(call("control", {
+            btn(tr("Sync now"), () => run(call("control", {
                 call: "sync_now"
-            }), "Checking…"), "btn small");
-            paused ? btn("Resume", () => run(call("control", {
+            }), tr("Checking…")), "btn small");
+            paused ? btn(tr("Resume"), () => run(call("control", {
                     call: "resume"
-                }), "Resumed"), "btn primary small") :
-                btn("Pause", () => run(call("control", {
+                }), tr("Resumed")), "btn primary small") :
+                btn(tr("Pause"), () => run(call("control", {
                     call: "pause"
-                }), "Paused"), "btn small");
-            btn("Stop", () => run(call("control", {
+                }), tr("Paused")), "btn small");
+            btn(tr("Stop"), () => run(call("control", {
                 call: "stop"
-            }), "Stopping…"), "btn danger small");
+            }), tr("Stopping…")), "btn danger small");
         }
 
         // ---- a problem: what happened, what to do, when it's tried again
@@ -2602,31 +2779,40 @@
             // Nothing set up yet: the Set up page is the answer, not a card.
             card.hidden = !p || p.kind === "setup";
             if (card.hidden) return;
-            $("#pb-title").textContent = (stopped ? "Stopped: " : "") + p.title;
+            $("#pb-title").textContent = stopped ? tr("Stopped: {what}", {
+                what: p.title
+            }) : p.title;
             $("#pb-detail").textContent = p.detail;
             $("#pb-action").textContent = p.action;
-            const at = t => new Date(t).toLocaleTimeString([], {
+            const at = t => new Date(t).toLocaleTimeString(FMT, {
                 hour: "numeric",
                 minute: "2-digit"
             });
-            $("#pb-when").textContent = stopped ? "OneUpDrive stopped. Start it to try again." :
-                (p.retry_ms ? `Next try at ${at(p.retry_ms)}` : "Trying again soon") +
-                ` · since ${when(p.since_ms)}` + (p.attempts > 1 ? ` · ${p.attempts} tries` : "");
-            $("#pb-retry").textContent = stopped ? "Start" : "Retry now";
+            $("#pb-when").textContent = stopped ? tr("OneUpDrive stopped. Start it to try again.") :
+                (p.retry_ms ? tr("Next try at {time}", {
+                    time: at(p.retry_ms)
+                }) : tr("Trying again soon")) +
+                tr(" · since {when}", {
+                    when: when(p.since_ms)
+                }) + (p.attempts > 1 ? tr(" · {n} tries", {
+                    n: p.attempts
+                }) : "");
+            $("#pb-retry").textContent = stopped ? tr("Start") : tr("Retry now");
             $("#pb-tech").textContent = p.technical;
         }
         $("#pb-retry").onclick = () => PROBLEM && PROBLEM.stopped ?
-            run(call("start"), "Starting…") :
+            run(call("start"), tr("Starting…")) :
             run(call("control", {
                 call: "sync_now"
-            }), "Trying again…");
+            }), tr("Trying again…"));
         $("#pb-copy").onclick = () => {
             const p = PROBLEM;
             if (!p) return;
+            // In English: it's for a bug report.
             const text = [`OneUpDrive ${p.version}`, `Problem: ${p.title} (${p.kind})`, `Since: ${new Date(p.since_ms).toISOString()}`,
                 `Tries: ${p.attempts}`, p.stopped ? "The agent stopped." : "", "", p.technical
             ].filter((x, i) => x !== "" || i === 5).join("\n");
-            navigator.clipboard.writeText(text).then(() => toast("Details copied"));
+            navigator.clipboard.writeText(text).then(() => toast(tr("Details copied")));
         };
 
         function flashProblem() {
@@ -2663,13 +2849,15 @@
             $("#guard-row").hidden = !(s.safety.content_guard > 0);
             $("#upd-auto").checked = s.updates.auto;
             $("#upd-preview").checked = s.updates.channel === "preview";
-            $("#about-version").textContent = "OneUpDrive " + s.version + (s.test_account ? " (test account)" : "");
+            $("#about-version").textContent = (s.test_account ? tr("OneUpDrive {version} (test account)", {
+                version: s.version
+            }) : "OneUpDrive " + s.version);
             $("#about-data").textContent = s.data_dir;
         }
         $("#autostart").onchange = e => run(call("save", {
             section: "autostart",
             value: e.target.checked
-        }), e.target.checked ? "Starts with Windows" : "Won't start with Windows").catch(() => e.target.checked = !e.target.checked);
+        }), e.target.checked ? tr("Starts with Windows") : tr("Won't start with Windows")).catch(() => e.target.checked = !e.target.checked);
 
         // Needs attention: one row per item of `oneup problems`.
         async function loadAttention() {
@@ -2704,7 +2892,11 @@
                 const name = document.createElement("b");
                 name.textContent = t.label;
                 const range = document.createElement("small");
-                range.textContent = `${t.min} to ${t.max}, default ${t.default}`;
+                range.textContent = tr("{min} to {max}, default {default}", {
+                    min: t.min,
+                    max: t.max,
+                    default: t.default
+                });
                 label.append(name, range);
                 const input = document.createElement("input");
                 Object.assign(input, { type: "number", min: t.min, max: t.max, step: 1, placeholder: String(t.default) });
@@ -2717,7 +2909,7 @@
                         value: {
                             [t.key]: v === "" ? null : Number(v)
                         }
-                    }), "Saved").catch(() => load());
+                    }), tr("Saved")).catch(() => load());
                 };
                 row.append(label, input);
                 box.append(row);
@@ -2731,7 +2923,7 @@
                 value: {
                     [key]: v
                 }
-            }), "Saved").catch(() => load());
+            }), tr("Saved")).catch(() => load());
         }
         $$("[data-agent]").forEach(e => e.onchange = () => saveField(e, "agent", e.dataset.agent));
         $$("[data-ver]").forEach(e => e.onchange = () => saveField(e, "versions", e.dataset.ver));
@@ -2743,14 +2935,14 @@
                 value: {
                     content_guard: e.target.checked ? Number($("#guard-n").value) || 20 : 0
                 }
-            }), e.target.checked ? "Content guard on" : "Content guard off").catch(load);
+            }), e.target.checked ? tr("Content guard on") : tr("Content guard off")).catch(load);
         };
         $("#guard-n").onchange = e => run(call("save", {
             section: "safety",
             value: {
                 content_guard: Math.max(1, Number(e.target.value) || 20)
             }
-        }), "Saved").catch(load);
+        }), tr("Saved")).catch(load);
         $$("[data-open]").forEach(b => b.onclick = () => run(call("open", {
             what: b.dataset.open
         })));
@@ -2759,41 +2951,49 @@
             value: {
                 auto: e.target.checked
             }
-        }), "Saved").catch(load);
+        }), tr("Saved")).catch(load);
         $("#upd-preview").onchange = e => run(call("save", {
             section: "updates",
             value: {
                 channel: e.target.checked ? "preview" : "stable"
             }
-        }), "Saved").catch(load);
+        }), tr("Saved")).catch(load);
         $("#upd-check").onclick = async() => {
-            $("#upd-state").textContent = "Checking for updates…";
+            $("#upd-state").textContent = tr("Checking for updates…");
             $("#upd-detail").textContent = "";
             try {
                 const r = await call("update_check");
                 $("#upd-state").textContent = r.title;
                 $("#upd-detail").textContent = r.detail || "";
             } catch (e) {
-                $("#upd-state").textContent = "Couldn't check for updates";
+                $("#upd-state").textContent = tr("Couldn't check for updates");
                 $("#upd-detail").textContent = e.message;
             }
         };
 
         let scFound = [];
         let scSearched = false;
+        // English only: new text says `tr("{n, plural, one {# file} other {# files}}", { n })`.
         const plural = (n, one) => n + " " + one + (n === 1 ? "" : "s");
         async function loadShortcuts() {
             scSearched = true;
-            $("#sc-state").textContent = "Searching…";
+            $("#sc-state").textContent = tr("Searching…");
             try {
                 const r = await call("shortcuts");
                 scFound = r.found;
                 const n = r.found.length;
-                $("#sc-state").textContent = n ? plural(n, "shortcut") + " to update" : "Nothing found.";
+                $("#sc-state").textContent = n ? tr("{n, plural, one {# shortcut} other {# shortcuts}} to update", {
+                    n
+                }) : tr("Nothing found.");
                 $("#sc-fix").hidden = !n;
-                $("#sc-fix").textContent = "Update " + plural(n, "shortcut");
+                $("#sc-fix").textContent = tr("Update {n, plural, one {# shortcut} other {# shortcuts}}", {
+                    n
+                });
                 $("#sc-undo").hidden = !r.last_fix;
-                if (r.last_fix) $("#sc-undo").title = "Restore the " + plural(r.last_fix.count, "shortcut") + " updated " + when(r.last_fix.at_ms);
+                if (r.last_fix) $("#sc-undo").title = tr("Restore the {n, plural, one {# shortcut} other {# shortcuts}} updated {when}", {
+                    n: r.last_fix.count,
+                    when: when(r.last_fix.at_ms)
+                });
                 $("#sc-list").replaceChildren(...r.found.map(f => el("div", {
                     className: "row"
                 }, el("div", {
@@ -2801,22 +3001,30 @@
                 }, el("b", {}, f.name), el("small", {
                     className: "path",
                     title: f.target
-                }, f.place + (f.broken ? " · broken" : "") + " → " + f.new_target)))));
+                }, f.place + (f.broken ? tr(" · broken") : "") + " → " + f.new_target)))));
                 return n;
             } catch (e) {
-                $("#sc-state").textContent = "Search failed: " + e.message;
+                $("#sc-state").textContent = tr("Search failed: {why}", {
+                    why: e.message
+                });
                 return 0;
             }
         }
         async function scChange(op, args, done) {
-            await run(call(op, args), r => done + " " + plural(r.changed, "shortcut") + (r.skipped ? "; " + r.skipped + " skipped" : "")).catch(() => null);
+            await run(call(op, args), r => done(r.changed) + (r.skipped ? tr("; {n} skipped", {
+                n: r.skipped
+            }) : "")).catch(() => null);
             loadShortcuts();
         }
         $("#sc-find").onclick = loadShortcuts;
         $("#sc-fix").onclick = () => scChange("shortcuts_fix", {
             links: scFound.map(f => f.link)
-        }, "Updated");
-        $("#sc-undo").onclick = () => scChange("shortcuts_undo", {}, "Restored");
+        }, n => tr("Updated {n, plural, one {# shortcut} other {# shortcuts}}", {
+            n
+        }));
+        $("#sc-undo").onclick = () => scChange("shortcuts_undo", {}, n => tr("Restored {n, plural, one {# shortcut} other {# shortcuts}}", {
+            n
+        }));
 
         // ---- activity: what sync did, and the lists the icon's menu used
         // to show in a console or Notepad. It opens the window on one of
@@ -2837,21 +3045,21 @@
             seen: null
         };
         const OUTCOME = {
-            done: ["Done", "ok"],
-            skipped: ["Skipped", "wait"],
-            failed: ["Failed", "bad"],
-            waiting: ["Waiting", "wait"],
-            note: ["Note", ""]
+            done: [tr("Done"), "ok"],
+            skipped: [tr("Skipped"), "wait"],
+            failed: [tr("Failed"), "bad"],
+            waiting: [tr("Waiting"), "wait"],
+            note: [tr("Note"), ""]
         };
         const ACTION = {
-            delete: "Delete",
-            upload: "Upload",
-            download: "Download",
-            move: "Move",
-            rename: "Rename",
-            create: "Create",
-            update: "Update",
-            "online-only": "Online-only"
+            delete: tr("Delete"),
+            upload: tr("Upload"),
+            download: tr("Download"),
+            move: tr("Move"),
+            rename: tr("Rename"),
+            create: tr("Create"),
+            update: tr("Update"),
+            "online-only": tr("Online-only")
         };
         $$("#ls-tabs button").forEach(b => b.onclick = () => {
             L.tab = b.dataset.tab;
@@ -2882,7 +3090,7 @@
                 b.querySelector(".count")?.remove();
                 if (n) b.append(el("span", {
                     className: "count " + cls,
-                    textContent: n.toLocaleString()
+                    textContent: num(n)
                 }));
             }
             const key = s ? JSON.stringify([s.last && s.last.at_ms, unsynced, stops.map(x => x.code)]) : null;
@@ -2900,7 +3108,9 @@
             const pick = $("#ls-root");
             pick.replaceChildren(...L.roots.map(r => el("option", {
                 value: r.id,
-                textContent: r.kind === "main" ? "Main folder" : (r.kind === "vault" ? "Vault " : "") + (r.name || r.remote || r.id)
+                textContent: r.kind === "main" ? tr("Main folder") : r.kind === "vault" ? tr("Vault {name}", {
+                    name: r.name || r.remote || r.id
+                }) : (r.name || r.remote || r.id)
             })));
             pick.value = L.root;
             pick.hidden = L.roots.length < 2;
@@ -2917,7 +3127,7 @@
             $$("#ls-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tab === L.tab));
             $("#ls-outcome").hidden = L.tab !== "log";
             const my = ++L.seq;
-            if (!L.data) $("#ls-sum").textContent = L.tab === "excluded" ? "Asking OneDrive…" : "Loading…";
+            if (!L.data) $("#ls-sum").textContent = L.tab === "excluded" ? tr("Asking OneDrive…") : tr("Loading…");
             try {
                 await loadRoots();
                 const args = {
@@ -2987,11 +3197,11 @@
             const has = (...t) => !q || t.some(x => x && String(x).toLowerCase().includes(q));
             const sum = $("#ls-sum");
             $("#ls-more").replaceChildren();
-            const n = x => Number(x).toLocaleString();
+            const n = num;
             if (L.tab === "log") {
                 const problems = $("#ls-outcome").value === "problems";
                 const rows = r.filter(e => (!problems || ["failed", "skipped", "waiting"].includes(e.outcome)) && has(e.path, e.action, e.detail));
-                setTable(["When", "", "What", "Item"], rows.map(e => {
+                setTable([tr("When"), "", tr("What"), tr("Item")], rows.map(e => {
                     const [word, cls] = OUTCOME[e.outcome] || [e.outcome, ""];
                     return el("tr", {}, el("td", {
                         className: "when",
@@ -3003,12 +3213,18 @@
                         textContent: e.action
                     }), cell(e.path, e.detail, "wrap path"));
                 }));
-                sum.textContent = !r.length ? "Nothing yet." : rows.length === r.length ? "" : `${n(rows.length)} of ${n(r.length)} shown.`;
-                if (r.length >= L.limit) moreBtn("Show older");
+                sum.textContent = !r.length ? tr("Nothing yet.") : rows.length === r.length ? "" : tr("{shown} of {all} shown.", {
+                    shown: rows.length,
+                    all: r.length
+                });
+                if (r.length >= L.limit) moreBtn(tr("Show older"));
             } else if (L.tab === "unsynced") {
                 renderUnsynced(r, has);
-                sum.textContent = !r.items.length ? "No sync failures." :
-                    `${n(r.items.length)}${r.more ? "+" : ""} items. Each is retried when it changes.`;
+                sum.textContent = !r.items.length ? tr("No sync failures.") : r.more ? tr("{n}+ items. Each is retried when it changes.", {
+                    n: r.items.length
+                }) : tr("{n, plural, one {# item} other {# items}}. Each is retried when it changes.", {
+                    n: r.items.length
+                });
             } else if (L.tab === "excluded") {
                 const rows = r.items.filter(c => has(c.path));
                 let items = 0,
@@ -3017,21 +3233,31 @@
                     items += Math.max(c.items, 1);
                     bytes += c.bytes || 0;
                 }
-                setTable(["Item", "What", "Size ", "On this PC"], rows.map(c => el("tr", {},
+                setTable([tr("Item"), tr("What"), tr("Size") + " ", tr("On this PC")], rows.map(c => el("tr", {},
                     cell(c.path, null, "wrap path"),
                     el("td", {
-                        textContent: c.folder ? `Folder, ${c.exact === false ? "at least " : ""}${n(c.items)} items` : "File"
+                        textContent: !c.folder ? tr("File") : c.exact === false ? tr("Folder, at least {n, plural, one {# item} other {# items}}", {
+                            n: c.items
+                        }) : tr("Folder, {n, plural, one {# item} other {# items}}", {
+                            n: c.items
+                        })
                     }),
                     el("td", {
                         className: "num",
                         textContent: c.bytes == null ? "–" : size(c.bytes)
                     }),
                     el("td", {
-                        textContent: c.here ? "Yes" : c.missing ? `${n(c.missing)} not yet` : "Not yet"
+                        textContent: c.here ? tr("Yes") : c.missing ? tr("{n} not yet", {
+                            n: c.missing
+                        }) : tr("Not yet")
                     }))));
-                const kept = r.kept ? ` ${n(r.kept)} more kept in OneDrive by choice aren't listed.` : "";
-                sum.textContent = (!r.items.length ? "No excluded items in OneDrive." :
-                    `${n(items)}+ items, ${size(bytes)}.`) + kept;
+                const kept = r.kept ? tr(" {n} more kept in OneDrive by choice aren't listed.", {
+                    n: r.kept
+                }) : "";
+                sum.textContent = (!r.items.length ? tr("No excluded items in OneDrive.") : tr("{n}+ items, {size}.", {
+                    n: items,
+                    size: size(bytes)
+                })) + kept;
             } else {
                 const rows = [];
                 let shown = 0,
@@ -3055,13 +3281,22 @@
                     shown += st.rows.length;
                     matching += st.matching;
                 }
-                setTable(["Change", "Item", ""], rows);
+                setTable([tr("Change"), tr("Item"), ""], rows);
                 const unwritten = r.reduce((a, st) => a + st.unwritten, 0);
-                sum.textContent = !r.length ? "No safety stops." :
-                    (r.length === 1 ? r[0].header : `${r.length} safety stops. Nothing changed yet.`) +
-                    (q ? ` ${n(matching)} match.` : "") + " Decide from the icon's menu." +
-                    (unwritten ? ` ${n(unwritten)} more not listed (oneup sync --dry-run lists all).` : "");
-                if (matching > shown) moreBtn(`Show more (${n(shown)} of ${n(matching)})`);
+                sum.textContent = !r.length ? tr("No safety stops.") :
+                    (r.length === 1 ? r[0].header : tr("{n} safety stops. Nothing changed yet.", {
+                        n: r.length
+                    })) +
+                    (q ? tr(" {n} match.", {
+                        n: matching
+                    }) : "") + tr(" Decide from the icon's menu.") +
+                    (unwritten ? tr(" {n} more not listed (oneup sync --dry-run lists all).", {
+                        n: unwritten
+                    }) : "");
+                if (matching > shown) moreBtn(tr("Show more ({shown} of {all})", {
+                    shown,
+                    all: matching
+                }));
             }
         }
 
@@ -3070,15 +3305,18 @@
         const KINDS = ["gone_here", "gone_there", "not_empty", "name_clash", "invalid_name", "name_taken", "too_large", "special", "one_way"];
         // Where a deletion goes.
         const DELETED_TO = {
-            "delete-in-onedrive": "To OneDrive's recycle bin.",
-            "delete-here": "To kept copies on this PC (.oneup\\versions)."
+            "delete-in-onedrive": tr("To OneDrive's recycle bin."),
+            "delete-here": tr("To kept copies on this PC (.oneup\\versions).")
         };
 
         // "Delete in OneDrive" -> "Delete all 18 in OneDrive".
         function allLabel(label, n) {
             const i = label.indexOf(" ");
-            const all = "all " + n.toLocaleString();
-            return i < 0 ? `${label} ${all}` : `${label.slice(0, i)} ${all}${label.slice(i)}`;
+            return tr("{verb} all {n}{rest}", {
+                verb: i < 0 ? label : label.slice(0, i),
+                n,
+                rest: i < 0 ? "" : label.slice(i)
+            });
         }
 
         function smallBtn(text, onclick, cls = "") {
@@ -3123,7 +3361,7 @@
                     className: "ug-head"
                 }, el("div", {}, group[0].i.why, el("span", {
                     className: "count",
-                    textContent: group.length.toLocaleString()
+                    textContent: num(group.length)
                 }), el("small", {
                     textContent: why.charAt(0).toUpperCase() + why.slice(1)
                 })), act))));
@@ -3137,7 +3375,7 @@
                     above.push(g);
                 }
             }
-            setTable(["Item", ""], rows);
+            setTable([tr("Item"), ""], rows);
         }
 
         function unsyncedRow(i, under, depth) {
@@ -3146,18 +3384,20 @@
             });
             if (i.queued) act.append(el("span", {
                 className: "tag wait",
-                textContent: "Queued: " + i.queued
+                textContent: tr("Queued: {what}", {
+                    what: i.queued
+                })
             }));
             else if (!under) {
                 for (const c of i.choices) act.append(smallBtn(c.label, () => resolveAsk(c, [i], false), c.deletes ? "danger" : ""));
-                if (i.kind === "not_empty") act.append(smallBtn("Contents", e => toggleInside(e.target.closest("tr"), i)));
+                if (i.kind === "not_empty") act.append(smallBtn(tr("Contents"), e => toggleInside(e.target.closest("tr"), i)));
             }
             const p = i.here && listPath(i.path);
             if (p) {
-                const show = smallBtn("Show", () => run(call("reveal", {
+                const show = smallBtn(tr("Show"), () => run(call("reveal", {
                     path: p
                 })));
-                show.title = "Show it in File Explorer";
+                show.title = tr("Show it in File Explorer");
                 act.append(show);
             }
             const name = el("td", {
@@ -3192,17 +3432,19 @@
             });
             if (!r.items.length) list.append(el("div", {
                 className: "muted",
-                textContent: "Nothing listed."
+                textContent: tr("Nothing listed.")
             }));
             for (const k of r.items) list.append(el("div", {}, k.name + (k.folder ? "\\" : ""), k.excluded ? el("span", {
                 className: "tag",
-                textContent: "Excluded"
+                textContent: tr("Excluded")
             }) : null));
             if (r.total > r.items.length) list.append(el("div", {
                 className: "muted",
-                textContent: `and ${(r.total - r.items.length).toLocaleString()} more`
+                textContent: tr("and {n} more", {
+                    n: r.total - r.items.length
+                })
             }));
-            const cloud = r.side === "remote" ? smallBtn("Excluded in OneDrive", () => {
+            const cloud = r.side === "remote" ? smallBtn(tr("Excluded in OneDrive"), () => {
                 L.tab = "excluded";
                 $("#ls-filter").value = i.path;
                 loadList(true);
@@ -3212,7 +3454,7 @@
             }, el("td", {
                 colSpan: 2
             }, el("small", {
-                textContent: r.side === "remote" ? "In OneDrive" : "On this PC"
+                textContent: r.side === "remote" ? tr("In OneDrive") : tr("On this PC")
             }), list, cloud)));
         }
 
@@ -3230,7 +3472,7 @@
                 subject: bulk ? undefined : items[0].subject || undefined,
                 name: name === null ? undefined : name
             }).then(pv => {
-                if (!pv.tops.length) throw new Error(pv.refused.join(" ") || "Nothing to do.");
+                if (!pv.tops.length) throw new Error(pv.refused.join(" ") || tr("Nothing to do."));
                 return pv;
             });
         }
@@ -3261,19 +3503,28 @@
                 if (!pv) return;
                 expect = pv.code;
                 facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
-                if (pv.tops.length > 5) facts.push(li(`and ${(pv.tops.length - 5).toLocaleString()} more`));
-                if (pv.items > pv.tops.length) facts.push(li(`${plural(pv.items, "item")} in all`));
-                if (pv.refused.length) facts.push(li(`${pv.refused.length.toLocaleString()} skipped: ${pv.refused[0]}`));
+                if (pv.tops.length > 5) facts.push(li(tr("and {n} more", {
+                    n: pv.tops.length - 5
+                })));
+                if (pv.items > pv.tops.length) facts.push(li(tr("{n, plural, one {# item} other {# items}} in all", {
+                    n: pv.items
+                })));
+                if (pv.refused.length) facts.push(li(tr("{n} skipped: {why}", {
+                    n: pv.refused.length,
+                    why: pv.refused[0]
+                })));
             }
             if (DELETED_TO[c.code]) facts.push(li(DELETED_TO[c.code]));
-            $("#rs-title").textContent = bulk ? allLabel(c.label, items.length) + "?" : rename ? "Rename" : c.label + "?";
+            $("#rs-title").textContent = rename ? tr("Rename") : tr("{choice}?", {
+                choice: bulk ? allLabel(c.label, items.length) : c.label
+            });
             $("#rs-facts").replaceChildren(...facts);
             $("#rs-name-box").hidden = !rename;
             $("#rs-busy").textContent = "";
             const name = $("#rs-name");
             if (rename) name.value = one.path.split("/").pop();
             const go = $("#rs-go");
-            go.textContent = rename ? "Rename" : c.label.split(" ")[0];
+            go.textContent = rename ? tr("Rename") : c.label.split(" ")[0];
             go.disabled = false;
             go.onclick = async() => {
                 go.disabled = true;
@@ -3353,14 +3604,16 @@
             if (!s.apps.length) body.append(el("tr", {}, el("td", {
                 colSpan: 4,
                 className: "muted",
-                textContent: "No activity in this period."
+                textContent: tr("No activity in this period.")
             })));
             for (const a of s.apps) {
                 const sw = colorOf(a.name);
                 // Click a program for the files it used lately.
                 const row = el("tr", {
                     className: "clickable",
-                    title: "Files " + a.name + " used",
+                    title: tr("Files {program} used", {
+                        program: a.name
+                    }),
                     onclick: () => toggleAppFiles(row, a)
                 });
                 body.append(row);
@@ -3376,11 +3629,11 @@
                     })),
                     el("td", {
                         className: "num",
-                        textContent: a.changed.toLocaleString()
+                        textContent: num(a.changed)
                     }),
                     el("td", {
                         className: "num",
-                        textContent: a.opened.toLocaleString()
+                        textContent: num(a.opened)
                     }),
                     el("td", {
                         className: "num",
@@ -3426,14 +3679,14 @@
             });
             if (!files.length) list.append(el("div", {
                 className: "muted",
-                textContent: "No files recorded yet."
+                textContent: tr("No files recorded yet.")
             }));
             for (const f of files) list.append(el("div", {
                     className: "app-file"
                 },
                 el("span", {
                     className: "muted",
-                    textContent: new Date(f.at_ms).toLocaleString()
+                    textContent: new Date(f.at_ms).toLocaleString(FMT)
                 }),
                 el("span", {
                     textContent: f.kind === "opened" ? "opened" : "changed"
@@ -3491,17 +3744,17 @@
                     "text-anchor": "end",
                     class: "axis"
                 });
-                lab.textContent = Math.round(t).toLocaleString();
+                lab.textContent = Math.round(t).toLocaleString(FMT);
                 box.append(lab);
             }
             const slot = (W - left) / Math.max(1, n),
                 bw = Math.max(2, Math.min(28, slot * 0.7));
             const at = i => new Date(s.start_ms + (s.hourly ? i * 3600e3 : i * 86400e3));
             const ends = i => new Date(s.start_ms + (s.hourly ? i * 3600e3 : (i + 1) * 86400e3 - 1));
-            const label = i => s.hourly ? at(i).toLocaleTimeString([], {
+            const label = i => s.hourly ? at(i).toLocaleTimeString(FMT, {
                 hour: "2-digit",
                 minute: "2-digit"
-            }) : ends(i).toLocaleDateString([], {
+            }) : ends(i).toLocaleDateString(FMT, {
                 month: "short",
                 day: "numeric"
             });
@@ -3555,18 +3808,18 @@
                     "text-anchor": "middle",
                     class: "axis"
                 });
-                t.textContent = "No activity in this time";
+                t.textContent = tr("No activity in this time");
                 box.append(t);
             }
 
             function tip(ev, i) {
                 const t = $("#apps-tip");
                 t.replaceChildren(el("b", {
-                    textContent: s.hourly ? at(i).toLocaleString([], {
+                    textContent: s.hourly ? at(i).toLocaleString(FMT, {
                         weekday: "short",
                         hour: "2-digit",
                         minute: "2-digit"
-                    }) : ends(i).toLocaleDateString([], {
+                    }) : ends(i).toLocaleDateString(FMT, {
                         weekday: "short",
                         month: "short",
                         day: "numeric"
@@ -3577,11 +3830,11 @@
                         className: "swatch",
                         style: "background:" + colorOf(sr.name)
                     }), sr.name), el("span", {
-                        textContent: sr.counts[i].toLocaleString()
+                        textContent: sr.counts[i].toLocaleString(FMT)
                     })));
                 if (!totals[i]) t.append(el("div", {
                     className: "muted",
-                    textContent: "Nothing"
+                    textContent: tr("Nothing")
                 }));
                 const b = $("#apps-chart").getBoundingClientRect();
                 t.hidden = false;
@@ -3604,27 +3857,27 @@
                 });
                 if (!a.current) acts.append(el("button", {
                     className: "btn",
-                    textContent: "Open settings",
+                    textContent: tr("Open settings"),
                     onclick: () => run(call("account_open", {
                         dir: a.dir
                     }))
                 }));
                 else if (a.signed_in) acts.append(el("button", {
                     className: "btn",
-                    textContent: "Sign out…",
+                    textContent: tr("Sign out…"),
                     onclick: async() => {
-                        if (!confirm("Sign out? Syncing stops until you sign in again. Your files stay put.")) return;
-                        await run(call("sign_out"), "Signed out");
+                        if (!confirm(tr("Sign out? Syncing stops until you sign in again. Your files stay put."))) return;
+                        await run(call("sign_out"), tr("Signed out"));
                         await load();
                         loadAccounts();
                     }
                 }));
                 else acts.append(el("button", {
                     className: "btn primary",
-                    textContent: "Sign in…",
+                    textContent: tr("Sign in…"),
                     onclick: async() => {
-                        toast("Finish signing in in your browser");
-                        await run(call("sign_in"), "Signed in");
+                        toast(tr("Finish signing in in your browser"));
+                        await run(call("sign_in"), tr("Signed in"));
                         await load();
                         loadAccounts();
                     }
@@ -3635,18 +3888,20 @@
                     el("div", {
                             className: "label"
                         }, el("b", {
-                            textContent: a.name + (a.current ? " (this one)" : "")
+                            textContent: a.current ? tr("{name} (this one)", {
+                                name: a.name
+                            }) : a.name
                         }),
                         el("small", {
                             className: "path",
-                            textContent: (a.signed_in ? "Signed in" : "Not signed in") + (a.test_account ? ", test account" : "") + ". " + a.dir
+                            textContent: (a.signed_in ? tr("Signed in") : tr("Not signed in")) + (a.test_account ? tr(", test account") : "") + ". " + a.dir
                         })),
                     acts));
             }
         }
         $("#ac-add").onclick = () => run(call("account_add", {
             name: $("#ac-name").value
-        }), "Opening its settings…").then(() => {
+        }), tr("Opening its settings…")).then(() => {
             $("#ac-name").value = "";
             loadAccounts();
         });
@@ -3657,21 +3912,25 @@
             box.replaceChildren();
             if (!s.onedrive_app.folders.length) box.append(el("span", {
                 className: "muted",
-                textContent: "None"
+                textContent: tr("None")
             }));
             for (const f of s.onedrive_app.folders) {
                 box.append(el("span", {
                     className: "chip"
                 }, f, el("button", {
-                    textContent: "Remove",
-                    "aria-label": "Stop leaving " + f + " to the OneDrive app",
+                    textContent: tr("Remove"),
+                    "aria-label": tr("Stop leaving {folder} to the OneDrive app", {
+                        folder: f
+                    }),
                     onclick: () =>
                         run(call("save", {
                             section: "onedrive_app",
                             value: {
                                 folders: s.onedrive_app.folders.filter(x => x !== f)
                             }
-                        }), "OneUpDrive syncs " + f + " again").then(load)
+                        }), tr("OneUpDrive syncs {folder} again", {
+                            folder: f
+                        })).then(load)
                 })));
             }
             $("#of-top").checked = s.onedrive_app.top_files;
@@ -3681,17 +3940,19 @@
             $("#of-experimental").hidden = !s.experimental && !s.office_integration;
             $("#of-opener").checked = s.office_opener.registered;
             $("#of-choose").disabled = !s.office_opener.registered;
-            $("#of-defaults").textContent = !s.office_opener.registered ? "Turn on the option above first." :
-                s.office_opener.defaults.length ? "OneUpDrive opens: ." + s.office_opener.defaults.join(", .") :
-                "Not chosen yet: choose OneUpDrive in Default apps.";
+            $("#of-defaults").textContent = !s.office_opener.registered ? tr("Turn on the option above first.") :
+                s.office_opener.defaults.length ? tr("OneUpDrive opens: {types}", {
+                    types: "." + s.office_opener.defaults.join(", .")
+                }) :
+                tr("Not chosen yet: choose OneUpDrive in Default apps.");
         }
         $("#of-opener").onchange = e => run(call("office_opener", {
                 on: e.target.checked
-            }), e.target.checked ? "Now choose OneUpDrive in Default apps" : "Off")
+            }), e.target.checked ? tr("Now choose OneUpDrive in Default apps") : tr("Off"))
             .then(load).catch(() => {
                 e.target.checked = !e.target.checked;
             });
-        $("#of-choose").onclick = () => run(call("office_defaults"), "Opening Default apps…");
+        $("#of-choose").onclick = () => run(call("office_defaults"), tr("Opening Default apps…"));
         $("#of-add").onclick = () => {
             const p = $("#of-add-path").value.trim();
             if (!p) return;
@@ -3700,7 +3961,7 @@
                     value: {
                         folders: [...snap.onedrive_app.folders, p]
                     }
-                }), "Left to the OneDrive app")
+                }), tr("Left to the OneDrive app"))
                 .then(() => {
                     $("#of-add-path").value = "";
                     load();
@@ -3711,16 +3972,16 @@
             value: {
                 top_files: e.target.checked
             }
-        }), "Saved").then(load);
+        }), tr("Saved")).then(load);
         $("#of-open").onclick = async() => {
             const p = await run(call("pick_file"));
             if (p) run(call("office_open", {
                 path: p
-            }), "Opening in Office…");
+            }), tr("Opening in Office…"));
         };
         $("#of-int").onchange = e => run(call("office_integration", {
             on: e.target.checked
-        }), e.target.checked ? "Office integration on (experimental)" : "Office integration off").catch(() => {
+        }), e.target.checked ? tr("Office integration on (experimental)") : tr("Office integration off")).catch(() => {
             e.target.checked = !e.target.checked;
         });
 
@@ -3740,38 +4001,38 @@
             found: null
         };
         const PRESET_NAMES = {
-            dev: "Developer folders",
-            temp: "Temporary files",
-            "os-junk": "System clutter"
+            dev: tr("Developer folders"),
+            temp: tr("Temporary files"),
+            "os-junk": tr("System clutter")
         };
         const STATE = {
-            synced: ["ok", "Synced"],
-            to_upload: ["busy", "Uploading"],
-            to_download: ["busy", "Downloading"],
-            pending: ["busy", "Syncing"],
-            left_out: ["off", "Excluded"],
-            paused: ["wait", "Paused"],
-            separate: ["ok", "Synced separately"],
-            onedrive_app: ["off", "OneDrive app"],
-            never: ["off", "Never synced"],
-            link: ["off", "Link"],
+            synced: ["ok", tr("Synced")],
+            to_upload: ["busy", tr("Uploading")],
+            to_download: ["busy", tr("Downloading")],
+            pending: ["busy", tr("Syncing")],
+            left_out: ["off", tr("Excluded")],
+            paused: ["wait", tr("Paused")],
+            separate: ["ok", tr("Synced separately")],
+            onedrive_app: ["off", tr("OneDrive app")],
+            never: ["off", tr("Never synced")],
+            link: ["off", tr("Link")],
         };
         const PLACE = {
-            online: "Online-only",
-            always: "Always on this PC",
-            here: "On this PC"
+            online: tr("Online-only"),
+            always: tr("Always on this PC"),
+            here: tr("On this PC")
         };
 
         function stateOf(n) {
             const w = n.why || {};
             // Where an exclusion comes from, in the row itself.
             if (n.state === "left_out") {
-                if (w.inside) return ["off", "In excluded folder"];
-                if (w.kind === "preset") return ["off", "Excluded by preset"];
-                if (w.kind === "own") return ["off", "Excluded by rule"];
-                if (w.kind === "file") return ["off", "By .oneupignore"];
+                if (w.inside) return ["off", tr("In excluded folder")];
+                if (w.kind === "preset") return ["off", tr("Excluded by preset")];
+                if (w.kind === "own") return ["off", tr("Excluded by rule")];
+                if (w.kind === "file") return ["off", tr("By .oneupignore")];
             }
-            if (n.state === "synced" && n.partial) return ["ok", "Some excluded"];
+            if (n.state === "synced" && n.partial) return ["ok", tr("Some excluded")];
             // Folders: only a choice made for the whole folder is worth showing.
             if (n.state === "synced" && n.placement && (!n.folder || n.placement !== "here")) return ["ok", PLACE[n.placement]];
             return STATE[n.state] || ["off", n.state];
@@ -3782,8 +4043,12 @@
         }
 
         function rootLine(r) {
-            const dir = r.kind === "vault" ? "Encrypted vault" : r.backup ? "Backs up" : "Syncs";
-            return `${dir} with OneDrive ${r.remote}` + (r.on_demand ? ", Files On-Demand" : "") + (r.running === false ? ". Not running." : ".");
+            const remote = {
+                remote: r.remote
+            };
+            const line = r.kind === "vault" ? tr("Encrypted vault with OneDrive {remote}", remote) :
+                r.backup ? tr("Backs up with OneDrive {remote}", remote) : tr("Syncs with OneDrive {remote}", remote);
+            return line + (r.on_demand ? tr(", Files On-Demand") : "") + (r.running === false ? tr(". Not running.") : ".");
         }
 
         function relPath(rel) {
@@ -3804,11 +4069,11 @@
                 $("#tree").replaceChildren(el("div", {
                         className: "msg"
                     }, el("b", {
-                        textContent: "Nothing syncs yet"
+                        textContent: tr("Nothing syncs yet")
                     }),
-                    "Set up your main folder, or ", el("button", {
+                    tr("Set up your main folder, or "), el("button", {
                         className: "link",
-                        textContent: "add a folder",
+                        textContent: tr("add a folder"),
                         onclick: () => $("#add-menu").showPopover()
                     }), "."));
                 $("#details").replaceChildren();
@@ -3825,7 +4090,7 @@
                 if (hit) {
                     id = hit.id;
                     want.rel = want.path.slice(hit.local.replace(/[\\/]+$/, "").length + 1).replace(/\\/g, "/");
-                } else toast("That file isn't in a synced folder", true);
+                } else toast(tr("That file isn't in a synced folder"), true);
             }
             if (!id) id = F.root && F.roots.some(r => r.id === F.root.id) ? F.root.id : F.roots[0].id;
             await selectRoot(id, F.root && F.root.id === id && !want);
@@ -3843,7 +4108,7 @@
                         onclick: () => selectRoot(r.id)
                     },
                     svg(rootIcon(r)), el("span", {
-                        textContent: r.kind === "main" ? "Main folder" : r.name
+                        textContent: r.kind === "main" ? tr("Main folder") : r.name
                     }),
                     r.running === false ? el("small", {
                         textContent: r.kind === "vault" ? "locked" : "stopped"
@@ -4055,11 +4320,11 @@
         function renderCols() {
             const box = $("#cols");
             box.replaceChildren();
-            for (const [key, label, right] of[["name", "Name"], ["status", "Status"], ["size", "Size", true]]) {
+            for (const [key, label, sortBy, right] of[["name", tr("Name"), tr("Sort by name")], ["status", tr("Status"), tr("Sort by status")], ["size", tr("Size"), tr("Sort by size"), true]]) {
                 const on = F.sort.key === key;
                 const b = el("button", {
                     className: on ? "on" : "",
-                    title: "Sort by " + label.toLowerCase(),
+                    title: sortBy,
                     onclick: () => {
                         F.sort = {
                             key,
@@ -4073,7 +4338,11 @@
                     "aria-hidden": "true",
                     textContent: F.sort.dir > 0 ? "▲" : "▼"
                 }) : "");
-                b.setAttribute("aria-label", on ? `Sort by ${label.toLowerCase()}, ${F.sort.dir > 0 ? "ascending" : "descending"}` : "Sort by " + label.toLowerCase());
+                b.setAttribute("aria-label", !on ? sortBy : F.sort.dir > 0 ? tr("{sort}, ascending", {
+                    sort: sortBy
+                }) : tr("{sort}, descending", {
+                    sort: sortBy
+                }));
                 box.append(right ? el("span", {
                     className: "r"
                 }, b) : el("span", {}, b));
@@ -4126,16 +4395,26 @@
 
         function whyShort(n) {
             const w = n.why || {};
-            if (w.inside) return `Inside excluded ${w.inside}`;
-            if (w.kind === "preset") return `Excluded by the preset ${PRESET_NAMES[w.name] || w.name} (${w.rule})`;
-            if (w.kind === "own") return `Excluded by your rule ${w.rule}`;
-            if (w.kind === "file") return `Excluded by ${w.folder === "/" ? "" : w.folder}/.oneupignore (${w.rule})`;
-            if (w.kind === "pause") return "Paused";
-            if (w.kind === "separate") return "Synced separately";
-            if (w.kind === "onedrive_app") return "Synced by the OneDrive app";
-            if (n.state === "never") return "Never synced";
-            if (n.partial) return "A rule excludes items inside";
-            if (n.rule_file_below) return "Has a .oneupignore inside";
+            if (w.inside) return tr("Inside excluded {folder}", {
+                folder: w.inside
+            });
+            if (w.kind === "preset") return tr("Excluded by the preset {preset} ({rule})", {
+                preset: PRESET_NAMES[w.name] || w.name,
+                rule: w.rule
+            });
+            if (w.kind === "own") return tr("Excluded by your rule {rule}", {
+                rule: w.rule
+            });
+            if (w.kind === "file") return tr("Excluded by {file} ({rule})", {
+                file: (w.folder === "/" ? "" : w.folder) + "/.oneupignore",
+                rule: w.rule
+            });
+            if (w.kind === "pause") return tr("Paused");
+            if (w.kind === "separate") return tr("Synced separately");
+            if (w.kind === "onedrive_app") return tr("Synced by the OneDrive app");
+            if (n.state === "never") return tr("Never synced");
+            if (n.partial) return tr("A rule excludes items inside");
+            if (n.rule_file_below) return tr("Has a .oneupignore inside");
             return "";
         }
 
@@ -4153,8 +4432,8 @@
             });
             i.indeterminate = on && !!n.partial;
             const why = whyShort(n);
-            i.title = why || (on ? "Synced" : "Excluded");
-            i.setAttribute("aria-label", (on ? "Synced" : "Excluded") + (why ? ". " + why : ""));
+            i.title = why || (on ? tr("Synced") : tr("Excluded"));
+            i.setAttribute("aria-label", (on ? tr("Synced") : tr("Excluded")) + (why ? ". " + why : ""));
             i.onclick = e => {
                 e.stopPropagation();
                 e.preventDefault();
@@ -4169,24 +4448,39 @@
             return i;
         }
         const EX_HELP = {
-            pull: "Applies to every excluded item. Only uploads stop.",
-            keep: "Applies to every excluded item. Not synced either way.",
-            prune: "Applies to every excluded item. Safety stops apply."
+            pull: tr("Applies to every excluded item. Only uploads stop."),
+            keep: tr("Applies to every excluded item. Not synced either way."),
+            prune: tr("Applies to every excluded item. Safety stops apply.")
         };
 
         function excludeFacts(pv, mode) {
             // Folders stored as one row (left out by name) aren't counted inside: "at least".
-            const files = t => `${t.skipped ? "at least " : ""}${t.files.toLocaleString()} file${t.files === 1 ? "" : "s"} (${size(t.bytes)})`;
+            const files = t => (t.skipped ? tr("at least {n, plural, one {# file} other {# files}} ({size})", {
+                n: t.files,
+                size: size(t.bytes)
+            }) : tr("{n, plural, one {# file} other {# files}} ({size})", {
+                n: t.files,
+                size: size(t.bytes)
+            }));
             const out = [];
-            if (pv.here) out.push(`On this PC: ${files(pv.here)}.`);
-            if (pv.cloud) out.push(`In OneDrive: ${files(pv.cloud)}.`);
-            if (!pv.here && !pv.cloud) out.push("Not on this PC or in OneDrive yet.");
-            if (mode === "keep") out.push("Both copies stop syncing and stay as they are.");
+            if (pv.here) out.push(tr("On this PC: {files}.", {
+                files: files(pv.here)
+            }));
+            if (pv.cloud) out.push(tr("In OneDrive: {files}.", {
+                files: files(pv.cloud)
+            }));
+            if (!pv.here && !pv.cloud) out.push(tr("Not on this PC or in OneDrive yet."));
+            if (mode === "keep") out.push(tr("Both copies stop syncing and stay as they are."));
             else if (mode === "prune") {
-                if (pv.cloud && pv.cloud.files) out.push(`OneDrive's copies go to its recycle bin once they're on this PC.`);
-                if (pv.here && pv.here.online_files) out.push(`${files({ files: pv.here.online_files, bytes: pv.here.online_bytes })} online-only: downloaded first.`);
-            } else out.push("Changes here stop uploading. OneDrive's copies and changes still come here.");
-            out.push("Nothing is deleted from this PC.");
+                if (pv.cloud && pv.cloud.files) out.push(tr("OneDrive's copies go to its recycle bin once they're on this PC."));
+                if (pv.here && pv.here.online_files) out.push(tr("{files} online-only: downloaded first.", {
+                    files: files({
+                        files: pv.here.online_files,
+                        bytes: pv.here.online_bytes
+                    })
+                }));
+            } else out.push(tr("Changes here stop uploading. OneDrive's copies and changes still come here."));
+            out.push(tr("Nothing is deleted from this PC."));
             return out;
         }
         // Unticking: what stops syncing, before anything changes.
@@ -4196,9 +4490,11 @@
                 go = $("#ex-go"),
                 mode = $("#ex-mode");
             const name = n.name || n.rel.split("/").pop();
-            $("#ex-title").textContent = `Exclude ${name}?`;
+            $("#ex-title").textContent = tr("Exclude {name}?", {
+                name
+            });
             facts.replaceChildren(el("li", {
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }));
             $("#ex-busy").textContent = "";
             go.disabled = true;
@@ -4267,11 +4563,13 @@
                     out.push([cn, level]);
                     if (cn.folder && cn.expanded && cn.children) walk(c, level + 1);
                     if (cn.folder && cn.expanded && cn.loading && !cn.children) out.push([{
-                        msg: "Looking…"
+                        msg: tr("Looking…")
                     }, level + 1]);
                 }
                 if (n.more) out.push([{
-                    msg: `${n.more.toLocaleString()} more. Search to find one.`
+                    msg: tr("{n} more. Search to find one.", {
+                        n: n.more
+                    })
                 }, level]);
             };
             walk("", 1);
@@ -4288,14 +4586,14 @@
                 tree.replaceChildren(el("div", {
                     className: "msg"
                 }, el("b", {
-                    textContent: "Couldn't list this folder"
+                    textContent: tr("Couldn't list this folder")
                 }), top.error));
                 return;
             }
             if (!top.children) {
                 tree.replaceChildren(el("div", {
                     className: "msg",
-                    textContent: "Looking…"
+                    textContent: tr("Looking…")
                 }));
                 return;
             }
@@ -4303,7 +4601,7 @@
                 tree.replaceChildren(el("div", {
                     className: "msg"
                 }, el("b", {
-                    textContent: "This folder is empty"
+                    textContent: tr("This folder is empty")
                 })));
                 return;
             }
@@ -4328,7 +4626,7 @@
                 const tw = el("button", {
                     className: "tw" + (opens ? "" : " none"),
                     tabIndex: -1,
-                    "aria-label": n.expanded ? "Collapse" : "Expand"
+                    "aria-label": n.expanded ? tr("Collapse") : tr("Expand")
                 }, svg("i-chev"));
                 tw.onclick = e => {
                     e.stopPropagation();
@@ -4428,7 +4726,7 @@
             F.openSection = openSection || null;
             setView("all");
             if (F.nodes.has(rel)) select(rel);
-            else toast("Not listed: it may be in an excluded folder", true);
+            else toast(tr("Not listed: it may be in an excluded folder"), true);
             const r = $(`#tree [data-rel="${CSS.escape(rel)}"]`);
             if (r) r.scrollIntoView({
                 block: "center"
@@ -4509,10 +4807,10 @@
             };
             const w = n.why || {};
             if (n.path) {
-                item(n.folder ? "Open folder" : "Open", () => run(call("open_path", {
+                item(n.folder ? tr("Open folder") : tr("Open"), () => run(call("open_path", {
                     path: n.path
                 })));
-                item("Show in File Explorer", () => run(call("reveal", {
+                item(tr("Show in File Explorer"), () => run(call("reveal", {
                     path: n.path
                 })));
             }
@@ -4523,14 +4821,14 @@
                 folder: n.folder,
                 ...args
             }), r => r).then(() => afterChange(n.rel));
-            if (["synced", "to_upload", "to_download", "pending"].includes(n.state)) item("Exclude…", () => openExclude(n));
-            if (n.state === "left_out" && !w.inside && (w.kind === "own" || w.kind === "preset")) item("Sync again", () => change({
+            if (["synced", "to_upload", "to_download", "pending"].includes(n.state)) item(tr("Exclude…"), () => openExclude(n));
+            if (n.state === "left_out" && !w.inside && (w.kind === "own" || w.kind === "preset")) item(tr("Sync again"), () => change({
                 on: true
             }, "tree_sync"));
-            if (n.folder && n.state === "paused" && !w.inside) item("Resume syncing", () => change({
+            if (n.folder && n.state === "paused" && !w.inside) item(tr("Resume syncing"), () => change({
                 on: false
             }, "tree_pause"));
-            else if (n.folder && ["synced", "to_upload", "to_download", "pending"].includes(n.state)) item("Pause syncing", () => change({
+            else if (n.folder && ["synced", "to_upload", "to_download", "pending"].includes(n.state)) item(tr("Pause syncing"), () => change({
                 on: true
             }, "tree_pause"));
             if (F.root.on_demand && n.here && n.state === "synced") {
@@ -4538,25 +4836,25 @@
                     root: F.root.id,
                     path: n.path,
                     keep
-                }), keep ? "It downloads and stays on this PC" : "It becomes online-only shortly").then(() => afterChange(n.rel));
-                if (n.placement !== "always") item("Always keep on this PC", () => place(true));
-                if (n.placement !== "online") item("Make online-only", () => place(false));
+                }), keep ? tr("It downloads and stays on this PC") : tr("It becomes online-only shortly")).then(() => afterChange(n.rel));
+                if (n.placement !== "always") item(tr("Always keep on this PC"), () => place(true));
+                if (n.placement !== "online") item(tr("Make online-only"), () => place(false));
             }
-            if (["to_upload", "to_download", "pending"].includes(n.state)) item("Sync this first", () => run(call("sync_first", {
+            if (["to_upload", "to_download", "pending"].includes(n.state)) item(tr("Sync this first"), () => run(call("sync_first", {
                 root: F.root.id,
                 rel: n.rel
-            }), "It goes before anything else"));
+            }), tr("It goes before anything else")));
             sep();
             if (n.path && n.cloud && F.root.kind !== "vault") {
-                item("Get link for viewers", () => shareLink(n, false));
-                item("Get link for editors", () => shareLink(n, true));
-                if (!n.folder) item("Version history", () => {
+                item(tr("Get link for viewers"), () => shareLink(n, false));
+                item(tr("Get link for editors"), () => shareLink(n, true));
+                if (!n.folder) item(tr("Version history"), () => {
                     F.openSection = "Versions";
                     F.detailsFor = null;
                     renderDetails();
                 });
             }
-            item("Why it syncs (or not)", () => {
+            item(tr("Why it syncs (or not)"), () => {
                 F.openSection = "Why";
                 F.detailsFor = null;
                 renderDetails();
@@ -4644,7 +4942,7 @@
             }) : null), ...acts);
         }
 
-        function showBtn(rel, text = "Show") {
+        function showBtn(rel, text = tr("Show")) {
             return el("button", {
                 className: "btn small",
                 textContent: text,
@@ -4660,12 +4958,14 @@
             if (!list.length) box.append(el("div", {
                 className: "msg"
             }, el("b", {
-                textContent: `Nothing named like "${F.q}"`
+                textContent: tr("Nothing named like \"{text}\"", {
+                    text: F.q
+                })
             })));
             for (const f of list) box.append(flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel)));
             if (list.length >= 100) box.append(el("div", {
                 className: "msg",
-                textContent: "First matches only. Type more to narrow it down."
+                textContent: tr("First matches only. Type more to narrow it down.")
             }));
             $("#tree").replaceChildren(box);
         }
@@ -4677,7 +4977,7 @@
             if (!rs) {
                 $("#tree").replaceChildren(el("div", {
                     className: "msg",
-                    textContent: "Looking…"
+                    textContent: tr("Looking…")
                 }));
                 return;
             }
@@ -4688,7 +4988,7 @@
             }), ok).then(() => afterChange(""));
             box.append(el("div", {
                 className: "group",
-                textContent: "Excluded everywhere"
+                textContent: tr("Excluded everywhere")
             }));
             for (const p of rs.rules.presets) {
                 const i = el("input", {
@@ -4699,7 +4999,7 @@
                 });
                 i.onchange = () => save({
                     presets: rs.rules.presets.filter(x => x.name === p.name ? i.checked : x.on).map(x => x.name)
-                }, i.checked ? "Now excluded" : "Syncs again").catch(() => i.checked = !i.checked);
+                }, i.checked ? tr("Now excluded") : tr("Syncs again")).catch(() => i.checked = !i.checked);
                 box.append(el("div", {
                         className: "fl"
                     }, el("div", {
@@ -4717,34 +5017,34 @@
             const exc = rs.rules.exclude.filter(r => r.trim().startsWith("!"));
             box.append(el("div", {
                 className: "group",
-                textContent: "Excluded by you"
+                textContent: tr("Excluded by you")
             }));
-            if (!own.length) box.append(flatRow("Nothing yet", "Right-click an item in All files and choose Exclude."));
+            if (!own.length) box.append(flatRow(tr("Nothing yet"), tr("Right-click an item in All files and choose Exclude.")));
             for (const r of own) {
                 const exact = /^\/[^*?]*$/.test(r.trim()) && !r.includes("[");
                 const rel = r.trim().replace(/^\/|\/$/g, "");
-                box.append(flatRow(r.trim(), exact ? "This item" : "Pattern",
+                box.append(flatRow(r.trim(), exact ? tr("This item") : tr("Pattern"),
                     exact ? showBtn(rel) : null,
                     el("button", {
                         className: "btn small",
-                        textContent: "Sync again",
+                        textContent: tr("Sync again"),
                         onclick: () => save({
                             exclude: rs.rules.exclude.filter(x => x !== r)
-                        }, "Syncs again")
+                        }, tr("Syncs again"))
                     })));
             }
             if (exc.length) {
                 box.append(el("div", {
                     className: "group",
-                    textContent: "Exceptions"
+                    textContent: tr("Exceptions")
                 }));
-                for (const r of exc) box.append(flatRow(r.trim().slice(1), "Synced despite a broader rule",
+                for (const r of exc) box.append(flatRow(r.trim().slice(1), tr("Synced despite a broader rule"),
                     el("button", {
                         className: "btn small",
-                        textContent: "Remove exception",
+                        textContent: tr("Remove exception"),
                         onclick: () => save({
                             exclude: rs.rules.exclude.filter(x => x !== r)
-                        }, "Exception removed")
+                        }, tr("Exception removed"))
                     })));
             }
             // Excluded items still in OneDrive: the agent offers to bring
@@ -4756,23 +5056,28 @@
             if (offer) {
                 box.append(el("div", {
                     className: "group",
-                    textContent: "Still in OneDrive"
+                    textContent: tr("Still in OneDrive")
                 }));
-                box.append(flatRow(`${offer.items} excluded items${offer.bytes ? " (" + size(offer.bytes) + ")" : ""} are in OneDrive`,
-                    "Removing downloads them first, then moves them to OneDrive's recycle bin. The copies here stay.",
+                box.append(flatRow(offer.bytes ? tr("{n, plural, one {# excluded item} other {# excluded items}} ({size}) are in OneDrive", {
+                        n: offer.items,
+                        size: size(offer.bytes)
+                    }) : tr("{n, plural, one {# excluded item} other {# excluded items}} are in OneDrive", {
+                        n: offer.items
+                    }),
+                    tr("Removing downloads them first, then moves them to OneDrive's recycle bin. The copies here stay."),
                     el("button", {
                         className: "btn small",
-                        textContent: "Remove from OneDrive",
+                        textContent: tr("Remove from OneDrive"),
                         onclick: () => run(call("control", {
                             root: F.root.id,
                             call: "prune",
                             code: offer.code
-                        }), "Downloading, then removing from OneDrive").then(() => afterChange(""))
+                        }), tr("Downloading, then removing from OneDrive")).then(() => afterChange(""))
                     }),
                     el("button", {
                         className: "btn small",
-                        textContent: "Keep in OneDrive",
-                        title: "Changes in OneDrive still come here; nothing is uploaded.",
+                        textContent: tr("Keep in OneDrive"),
+                        title: tr("Changes in OneDrive still come here; nothing is uploaded."),
                         onclick: async() => {
                             // Keeping them means pull-only: changes in OneDrive
                             // still come here, nothing here is sent.
@@ -4787,7 +5092,7 @@
                                 root: F.root.id,
                                 call: "keep_in_cloud",
                                 code: offer.code
-                            }), "Kept in OneDrive").then(() => afterChange(""));
+                            }), tr("Kept in OneDrive")).then(() => afterChange(""));
                         }
                     })));
             }
@@ -4799,31 +5104,36 @@
             if (sug && (sug.largest.length || sug.busiest.length)) {
                 box.append(el("div", {
                     className: "group",
-                    textContent: "Suggestions"
+                    textContent: tr("Suggestions")
                 }));
                 const exBtn = s => el("button", {
                     className: "btn small",
-                    textContent: "Exclude",
+                    textContent: tr("Exclude"),
                     onclick: () => openExclude({
                         rel: s.rel,
                         folder: true
                     })
                 });
-                for (const s of sug.largest) box.append(flatRow("/" + s.rel, `Large: ${size(s.bytes)} in OneDrive`, showBtn(s.rel), exBtn(s)));
-                for (const s of sug.busiest) box.append(flatRow("/" + s.rel, `Busy: ${s.changes.toLocaleString()} changes in ${sug.days} days`, showBtn(s.rel), exBtn(s)));
+                for (const s of sug.largest) box.append(flatRow("/" + s.rel, tr("Large: {size} in OneDrive", {
+                    size: size(s.bytes)
+                }), showBtn(s.rel), exBtn(s)));
+                for (const s of sug.busiest) box.append(flatRow("/" + s.rel, tr("Busy: {n, plural, one {# change} other {# changes}} in {days} days", {
+                    n: s.changes,
+                    days: sug.days
+                }), showBtn(s.rel), exBtn(s)));
             }
             box.append(el("div", {
                 className: "group",
-                textContent: "Paused"
+                textContent: tr("Paused")
             }));
             const pauseBtn = el("button", {
                 className: "btn small",
-                textContent: "Pause a folder…",
+                textContent: tr("Pause a folder…"),
                 onclick: async() => {
                     const p = await run(call("pick_folder"));
                     if (!p) return;
                     const base = F.root.local.replace(/[\\/]+$/, "");
-                    if (!p.toLowerCase().startsWith(base.toLowerCase() + "\\")) return toast("Choose a folder inside " + base, true);
+                    if (!p.toLowerCase().startsWith(base.toLowerCase() + "\\")) return toast(tr("Choose a folder inside ") + base, true);
                     const rel = p.slice(base.length + 1).replace(/\\/g, "/");
                     run(call("tree_pause", {
                         root: F.root.id,
@@ -4832,14 +5142,14 @@
                     }), m => m).then(() => afterChange(rel));
                 }
             });
-            box.append(flatRow(rs.rules.paused.length ? "Pause another folder" : "Nothing paused", "Holds a folder's changes until you resume.", pauseBtn));
-            for (const p of rs.rules.paused) box.append(flatRow("/" + p, "Paused", showBtn(p),
+            box.append(flatRow(rs.rules.paused.length ? tr("Pause another folder") : tr("Nothing paused"), tr("Holds a folder's changes until you resume."), pauseBtn));
+            for (const p of rs.rules.paused) box.append(flatRow("/" + p, tr("Paused"), showBtn(p),
                 el("button", {
                     className: "btn small",
-                    textContent: "Resume",
+                    textContent: tr("Resume"),
                     onclick: () => save({
                         paused: rs.rules.paused.filter(x => x !== p)
-                    }, "Resumed")
+                    }, tr("Resumed"))
                 })));
             const files = await call("rule_files", {
                 root: F.root.id
@@ -4847,12 +5157,12 @@
             if (files.length) {
                 box.append(el("div", {
                     className: "group",
-                    textContent: "Rule files (.oneupignore)"
+                    textContent: tr("Rule files (.oneupignore)")
                 }));
-                for (const f of files) box.append(flatRow(relPath(f) + (f ? "/" : "") + ".oneupignore", "Applies to its folder and below",
+                for (const f of files) box.append(flatRow(relPath(f) + (f ? "/" : "") + ".oneupignore", tr("Applies to its folder and below"),
                     el("button", {
                         className: "btn small",
-                        textContent: "Open",
+                        textContent: tr("Open"),
                         onclick: () => run(call("open_path", {
                             path: fullPath(f ? f + "/.oneupignore" : ".oneupignore")
                         }))
@@ -4862,39 +5172,39 @@
             const ta = el("textarea", {
                 spellcheck: false,
                 value: rs.rules.exclude.join("\n"),
-                placeholder: "One rule per line, like .gitignore:\n*.iso\n/Downloads/\nbuild/",
-                "aria-label": "Your rules"
+                placeholder: tr("One rule per line, like .gitignore:\n*.iso\n/Downloads/\nbuild/"),
+                "aria-label": tr("Your rules")
             });
             const first = el("textarea", {
                 spellcheck: false,
                 value: rs.priority.first.join("\n"),
                 style: "min-height:60px",
-                "aria-label": "Sync these first"
+                "aria-label": tr("Sync these first")
             });
             const last = el("textarea", {
                 spellcheck: false,
                 value: rs.priority.last.join("\n"),
                 style: "min-height:60px",
-                "aria-label": "Sync these last"
+                "aria-label": tr("Sync these last")
             });
             const cloud = el("select", {
-                    "aria-label": "OneDrive's copies of excluded items"
+                    "aria-label": tr("OneDrive's copies of excluded items")
                 },
                 el("option", {
                     value: "pull",
-                    textContent: "Download, never upload"
+                    textContent: tr("Download, never upload")
                 }), el("option", {
                     value: "keep",
-                    textContent: "Leave both alone"
+                    textContent: tr("Leave both alone")
                 }), el("option", {
                     value: "prune",
-                    textContent: "Download, then remove from OneDrive"
+                    textContent: tr("Download, then remove from OneDrive")
                 }));
             cloud.value = rs.rules.cloud;
             const help = {
-                pull: "Only uploads stop. OneDrive's copies and changes still come here.",
-                keep: "Not synced either way. Nothing is removed.",
-                prune: "Each is downloaded, then moved to OneDrive's recycle bin. Safety stops apply."
+                pull: tr("Only uploads stop. OneDrive's copies and changes still come here."),
+                keep: tr("Not synced either way. Nothing is removed."),
+                prune: tr("Each is downloaded, then moved to OneDrive's recycle bin. Safety stops apply.")
             };
             const cloudHelp = el("small", {
                 textContent: help[cloud.value]
@@ -4903,41 +5213,41 @@
                 cloudHelp.textContent = help[cloud.value];
                 save({
                     cloud: cloud.value
-                }, "Saved");
+                }, tr("Saved"));
             };
             const adv = el("details", {
                     className: "acc",
                     style: "border-top:1px solid var(--line);margin-top:10px"
                 },
-                el("summary", {}, svg("i-chev"), "Rules as text"),
+                el("summary", {}, svg("i-chev"), tr("Rules as text")),
                 el("div", {
                         className: "acc-body"
                     },
                     el("p", {
                         className: "say",
-                        textContent: "Like .gitignore. Paths start at this folder. A .oneupignore file in any folder works too."
+                        textContent: tr("Like .gitignore. Paths start at this folder. A .oneupignore file in any folder works too.")
                     }),
                     ta, el("div", {
                         className: "actions",
                         style: "margin-top:8px"
                     }, el("button", {
                         className: "btn primary",
-                        textContent: "Save rules",
+                        textContent: tr("Save rules"),
                         onclick: () => save({
                             exclude: ta.value.split(/\r?\n/)
-                        }, "Rules saved")
+                        }, tr("Rules saved"))
                     })),
                     el("p", {
                         className: "say",
                         style: "margin-top:14px",
-                        textContent: "Sync first, then last:"
+                        textContent: tr("Sync first, then last:")
                     }), first, last,
                     el("div", {
                         className: "actions",
                         style: "margin-top:8px"
                     }, el("button", {
                         className: "btn",
-                        textContent: "Save order",
+                        textContent: tr("Save order"),
                         onclick: () => run(call("save", {
                             root: F.root.id,
                             section: "priority",
@@ -4945,7 +5255,7 @@
                                 first: first.value.split(/\r?\n/),
                                 last: last.value.split(/\r?\n/)
                             }
-                        }), "Order saved")
+                        }), tr("Order saved"))
                     })),
                     el("div", {
                         className: "opt",
@@ -4953,7 +5263,7 @@
                     }, el("div", {
                         className: "label"
                     }, el("b", {
-                        textContent: "OneDrive's copies of excluded items"
+                        textContent: tr("OneDrive's copies of excluded items")
                     }), cloudHelp), cloud)));
             box.append(adv);
             $("#tree").replaceChildren(box);
@@ -5036,32 +5346,48 @@
 
         function sentence(n) {
             const w = n.why || {};
-            const where = n.here && n.cloud ? "here and in OneDrive" : n.here ? "only on this PC" : "only in OneDrive";
-            const by = w.kind === "preset" ? `the ${PRESET_NAMES[w.name] || w.name} setting` : w.kind === "own" ? "your rule " + w.rule :
-                w.kind === "file" ? `the .oneupignore file in ${w.folder}` : "a rule";
-            const inside = w.inside ? ` Inside excluded ${w.inside}.` : "";
+            const where = n.here && n.cloud ? tr("here and in OneDrive") : n.here ? tr("only on this PC") : tr("only in OneDrive");
+            const by = w.kind === "preset" ? tr("the {preset} setting", {
+                    preset: PRESET_NAMES[w.name] || w.name
+                }) : w.kind === "own" ? tr("your rule {rule}", {
+                    rule: w.rule
+                }) :
+                w.kind === "file" ? tr("the .oneupignore file in {folder}", {
+                    folder: w.folder
+                }) : tr("a rule");
+            const inside = w.inside ? tr(" Inside excluded {folder}.", {
+                folder: w.inside
+            }) : "";
             switch (n.state) {
                 case "synced":
-                    return n.placement === "online" ? "Synced. Downloads when you open it." :
-                        n.placement === "always" ? "Synced, always on this PC." : "Synced.";
+                    return n.placement === "online" ? tr("Synced. Downloads when you open it.") :
+                        n.placement === "always" ? tr("Synced, always on this PC.") : tr("Synced.");
                 case "to_upload":
-                    return "Uploading to OneDrive.";
+                    return tr("Uploading to OneDrive.");
                 case "to_download":
-                    return "Downloading to this PC.";
+                    return tr("Downloading to this PC.");
                 case "pending":
-                    return "Syncing.";
+                    return tr("Syncing.");
                 case "left_out":
-                    return `Excluded by ${by}. Stays ${where}${F.rs && F.rs.rules.cloud === "keep" ? "" : "; never uploaded"}.${inside}`;
+                    return (F.rs && F.rs.rules.cloud === "keep" ? tr("Excluded by {by}. Stays {where}.", {
+                        by,
+                        where
+                    }) : tr("Excluded by {by}. Stays {where}; never uploaded.", {
+                        by,
+                        where
+                    })) + inside;
                 case "paused":
-                    return w.inside ? `In the paused folder ${w.inside}.` : "Paused.";
+                    return w.inside ? tr("In the paused folder {folder}.", {
+                        folder: w.inside
+                    }) : tr("Paused.");
                 case "separate":
-                    return "Synced separately. Manage it from its tab above.";
+                    return tr("Synced separately. Manage it from its tab above.");
                 case "onedrive_app":
-                    return "Synced by the OneDrive app (Office page).";
+                    return tr("Synced by the OneDrive app (Office page).");
                 case "never":
-                    return "Never synced (lock and temporary files).";
+                    return tr("Never synced (lock and temporary files).");
                 case "link":
-                    return "Links aren't synced.";
+                    return tr("Links aren't synced.");
             }
             return "";
         }
@@ -5082,14 +5408,14 @@
             });
             if (n.path && !n.folder) acts.append(el("button", {
                 className: "btn small",
-                textContent: "Open",
+                textContent: tr("Open"),
                 onclick: () => run(call("open_path", {
                     path: n.path
                 }))
             }));
             if (n.path) acts.append(el("button", {
                 className: "btn small",
-                textContent: "Show in File Explorer",
+                textContent: tr("Show in File Explorer"),
                 onclick: () => run(call("reveal", {
                     path: n.path
                 }))
@@ -5101,7 +5427,9 @@
                 const other = F.roots.find(r => r.id !== F.root.id && (r.local.toLowerCase() === here || String(r.remote).toLowerCase() === cloud));
                 if (other) acts.prepend(el("button", {
                     className: "btn small primary",
-                    textContent: "Go to " + (other.kind === "main" ? "Main folder" : other.name),
+                    textContent: tr("Go to {folder}", {
+                        folder: other.kind === "main" ? tr("Main folder") : other.name
+                    }),
                     onclick: () => selectRoot(other.id)
                 }));
             }
@@ -5118,7 +5446,9 @@
                         }),
                         el("div", {
                             className: "where",
-                            textContent: "In " + (F.root.kind === "main" ? "Main folder" : F.root.name) + (parentOf(n.rel) ? " / " + parentOf(n.rel).replace(/\//g, " / ") : "")
+                            textContent: tr("In {folder}", {
+                                folder: (F.root.kind === "main" ? tr("Main folder") : F.root.name) + (parentOf(n.rel) ? " / " + parentOf(n.rel).replace(/\//g, " / ") : "")
+                            })
                         })),
                     canShare ? shareButton(n) : null),
                 el("div", {
@@ -5126,7 +5456,9 @@
                     style: "margin-top:10px"
                 }, el("span", {
                     className: "dot " + cls
-                }), word + (n.size != null ? `, ${size(n.size)}` : "") + (n.modified_ms ? `, changed ${when(n.modified_ms)}` : "")),
+                }), word + (n.size != null ? ", " + size(n.size) : "") + (n.modified_ms ? tr(", changed {when}", {
+                    when: when(n.modified_ms)
+                }) : "")),
                 el("p", {
                     className: "say",
                     textContent: sentence(n)
@@ -5134,27 +5466,27 @@
             const parts = [head];
             parts.push(syncSection(n));
             if (F.root.on_demand && n.here && n.state === "synced") parts.push(placeSection(n));
-            if (!n.folder && n.path && n.cloud && F.root.kind !== "vault") parts.push(acc("Versions", el("div", {
+            if (!n.folder && n.path && n.cloud && F.root.kind !== "vault") parts.push(acc(tr("Versions"), el("div", {
                 className: "muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }), {
                 onopen: b => versionsInto(b, n)
             }));
-            parts.push(acc("Recent activity", el("div", {
+            parts.push(acc(tr("Recent activity"), el("div", {
                 className: "muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }), {
                 onopen: b => activityInto(b, n.rel)
             }));
-            parts.push(acc("Why", el("div", {
+            parts.push(acc(tr("Why"), el("div", {
                 className: "muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }), {
                 onopen: b => explainInto(b, n)
             }));
             box.replaceChildren(...parts);
             if (F.openSection) {
-                const s = $$("details.acc > summary", box).find(x => x.textContent.startsWith(F.openSection));
+                const s = $$("details.acc > summary", box).find(x => x.textContent.startsWith(tr(F.openSection)));
                 if (s) {
                     s.parentElement.open = true;
                     s.parentElement.dispatchEvent(new Event("toggle"));
@@ -5177,10 +5509,14 @@
             const body = [];
             const fixed = ["separate", "onedrive_app", "never", "link"].includes(n.state) || w.kind === "file" || (w.inside && n.state === "left_out") || (w.inside && n.state === "paused");
             const on = !["left_out", "never", "onedrive_app", "link"].includes(n.state);
-            let sub = on ? "" : "Excluded. Nothing is deleted.";
-            if (w.kind === "file") sub = `Set by .oneupignore in ${w.folder}.`;
-            if (w.inside && n.state === "left_out") sub = `${w.inside} is excluded.`;
-            body.push(opt("Sync this " + (n.folder ? "folder" : "file"), sub, toggleEl(on && n.state !== "paused" || n.state === "paused", "Sync this", (v, i) => {
+            let sub = on ? "" : tr("Excluded. Nothing is deleted.");
+            if (w.kind === "file") sub = tr("Set by .oneupignore in {folder}.", {
+                folder: w.folder
+            });
+            if (w.inside && n.state === "left_out") sub = tr("{folder} is excluded.", {
+                folder: w.inside
+            });
+            body.push(opt(n.folder ? tr("Sync this folder") : tr("Sync this file"), sub, toggleEl(on && n.state !== "paused" || n.state === "paused", tr("Sync this"), (v, i) => {
                 // Excluding shows what stops syncing first.
                 if (!v) {
                     i.checked = true;
@@ -5196,11 +5532,15 @@
             if (w.inside && n.state === "left_out") body.push(el("div", {
                 className: "actions",
                 style: "margin:2px 0 6px"
-            }, showBtn(w.inside.slice(1), "Show " + w.inside)));
+            }, showBtn(w.inside.slice(1), tr("Show {folder}", {
+                folder: w.inside
+            }))));
             if (n.folder && n.state !== "left_out" && n.state !== "separate" && n.state !== "onedrive_app") {
                 const paused = n.state === "paused";
-                body.push(opt("Pause this folder", w.inside && paused ? `In the paused folder ${w.inside}.` : "",
-                    toggleEl(paused, "Pause this folder", (v, i) => run(call("tree_pause", {
+                body.push(opt(tr("Pause this folder"), w.inside && paused ? tr("In the paused folder {folder}.", {
+                        folder: w.inside
+                    }) : "",
+                    toggleEl(paused, tr("Pause this folder"), (v, i) => run(call("tree_pause", {
                         root: F.root.id,
                         rel: n.rel,
                         on: v
@@ -5211,24 +5551,24 @@
                     className: "muted",
                     textContent: "…"
                 }));
-                body.push(opt("Sync order", "", holder));
+                body.push(opt(tr("Sync order"), "", holder));
                 call("tree_order", {
                     root: F.root.id,
                     rel: n.rel,
                     folder: n.folder
                 }).then(cur => holder.replaceChildren(seg([
-                        ["first", "First"],
-                        ["normal", "Normal"],
-                        ["last", "Last"]
+                        ["first", tr("First")],
+                        ["normal", tr("Normal")],
+                        ["last", tr("Last")]
                     ], cur,
                     v => run(call("tree_order", {
                         root: F.root.id,
                         rel: n.rel,
                         folder: n.folder,
                         which: v
-                    }), v === "normal" ? "Normal order" : `Syncs ${v}`)))).catch(() => holder.replaceChildren());
+                    }), v === "normal" ? tr("Normal order") : v === "first" ? tr("Syncs first") : tr("Syncs last"))))).catch(() => holder.replaceChildren());
             }
-            return acc("Sync", body, {
+            return acc(tr("Sync"), body, {
                 open: true
             });
         }
@@ -5236,17 +5576,17 @@
         function placeSection(n) {
             const cur = n.placement === "always" ? "keep" : n.placement === "online" ? "free" : "auto";
             const s = seg([
-                    ["keep", "Always keep"],
-                    ["free", "Online-only"]
+                    ["keep", tr("Always keep")],
+                    ["free", tr("Online-only")]
                 ], cur === "auto" ? null : cur, v =>
                 run(call("placement", {
                     root: F.root.id,
                     path: n.path,
                     keep: v === "keep"
-                }), v === "keep" ? "Downloading" : "Freeing up space").then(() => afterChange(n.rel)));
-            return acc("On this PC", [el("p", {
+                }), v === "keep" ? tr("Downloading") : tr("Freeing up space")).then(() => afterChange(n.rel)));
+            return acc(tr("On this PC"), [el("p", {
                 className: "say",
-                textContent: n.placement === "online" ? "Takes no space. Downloads when you open it." : n.placement === "always" ? "Never freed automatically." : "May be freed automatically when unused."
+                textContent: n.placement === "online" ? tr("Takes no space. Downloads when you open it.") : n.placement === "always" ? tr("Never freed automatically.") : tr("May be freed automatically when unused.")
             }), s], {
                 note: PLACE[n.placement] || ""
             });
@@ -5259,10 +5599,10 @@
                 const t = el("table", {
                     className: "list"
                 }, el("thead", {}, el("tr", {}, el("th", {
-                    textContent: "Saved"
+                    textContent: tr("Saved")
                 }), el("th", {
                     className: "num",
-                    textContent: "Size"
+                    textContent: tr("Size")
                 }), el("th", {}))));
                 const body = el("tbody");
                 for (const x of v.versions) {
@@ -5270,27 +5610,33 @@
                         className: "actions"
                     }, el("button", {
                         className: "btn small",
-                        textContent: "Open",
+                        textContent: tr("Open"),
                         onclick: () => run(call("item_open", {
                             path: n.path,
                             id: x.id,
                             label: when(x.modified_ms).replace(/[^0-9A-Za-z ]/g, "-")
-                        }), "Opening a copy…")
+                        }), tr("Opening a copy…"))
                     }));
                     if (!x.current) a.append(el("button", {
                         className: "btn small",
-                        textContent: "Restore",
+                        textContent: tr("Restore"),
                         onclick: () => {
-                            if (!confirm(`Restore the version from ${when(x.modified_ms)}? The current one stays in the history.`)) return;
+                            if (!confirm(tr("Restore the version from {when}? The current one stays in the history.", {
+                                    when: when(x.modified_ms)
+                                }))) return;
                             run(call("item_restore", {
                                 path: n.path,
                                 id: x.id
-                            }), "Restored").then(() => versionsInto(b, n));
+                            }), tr("Restored")).then(() => versionsInto(b, n));
                         }
                     }));
                     body.append(el("tr", {}, el("td", {
-                        textContent: when(x.modified_ms) + (x.current ? " (current)" : ""),
-                        title: x.by ? "By " + x.by : ""
+                        textContent: x.current ? tr("{when} (current)", {
+                            when: when(x.modified_ms)
+                        }) : when(x.modified_ms),
+                        title: x.by ? tr("By {name}", {
+                            name: x.by
+                        }) : ""
                     }), el("td", {
                         className: "num",
                         textContent: x.size == null ? "–" : size(x.size)
@@ -5299,7 +5645,7 @@
                 t.append(body);
                 b.replaceChildren(t, el("p", {
                     className: "note",
-                    textContent: "Open saves a copy outside your synced folder."
+                    textContent: tr("Open saves a copy outside your synced folder.")
                 }));
             } catch (e) {
                 b.replaceChildren(el("div", {
@@ -5310,11 +5656,11 @@
         }
 
         function shareLink(n, edit) {
-            if (edit && !confirm("Anyone who gets this link can change " + (n.folder ? "what's in this folder" : "the file") + ". Create it?")) return;
+            if (edit && !confirm(n.folder ? tr("Anyone who gets this link can change what's in this folder. Create it?") : tr("Anyone who gets this link can change the file. Create it?"))) return;
             run(call("item_share", {
                 path: n.path,
                 edit
-            }), edit ? "Link for editors copied" : "Link for viewers copied");
+            }), edit ? tr("Link for editors copied") : tr("Link for viewers copied"));
         }
 
         function shareButton(n) {
@@ -5325,30 +5671,30 @@
                 // goes to the first, Tab reaches both.
                 el("button", {
                     className: "btn small",
-                    title: "Share",
+                    title: tr("Share"),
                     onclick: e => e.currentTarget.parentElement.querySelector(".pop button").focus()
-                }, svg("i-share"), "Share"),
+                }, svg("i-share"), tr("Share")),
                 el("div", {
                     className: "pop"
                 }, el("div", {
                         role: "group",
-                        "aria-label": "Share"
+                        "aria-label": tr("Share")
                     },
                     el("button", {
-                        textContent: "Get link for viewers",
+                        textContent: tr("Get link for viewers"),
                         onclick: () => shareLink(n, false)
                     }),
                     el("button", {
-                        textContent: "Get link for editors",
+                        textContent: tr("Get link for editors"),
                         onclick: () => shareLink(n, true)
                     }))));
         }
         // What sync did with an item (or, for "", the whole folder), newest first.
         const DID = {
             done: "",
-            skipped: "Skipped: ",
-            failed: "Failed: ",
-            waiting: "Waiting: ",
+            skipped: tr("Skipped: "),
+            failed: tr("Failed: "),
+            waiting: tr("Waiting: "),
             note: ""
         };
         async function activityInto(b, rel) {
@@ -5359,7 +5705,7 @@
                 });
                 if (!list.length) return b.replaceChildren(el("p", {
                     className: "say",
-                    textContent: "Nothing recorded yet."
+                    textContent: tr("Nothing recorded yet.")
                 }));
                 const t = el("table", {
                     className: "list"
@@ -5374,7 +5720,7 @@
                     })))));
                 b.replaceChildren(t, el("p", {
                     className: "note",
-                    textContent: "Full log: Activity page."
+                    textContent: tr("Full log: Activity page.")
                 }));
             } catch (e) {
                 b.replaceChildren(el("div", {
@@ -5391,7 +5737,7 @@
                 });
                 if (!list.length) return b.replaceChildren(el("p", {
                     className: "say",
-                    textContent: "Nothing kept."
+                    textContent: tr("Nothing kept.")
                 }));
                 const body = el("tbody");
                 for (const x of list) body.append(el("tr", {},
@@ -5409,29 +5755,29 @@
                     }),
                     el("td", {}, el("button", {
                         className: "btn small",
-                        textContent: "Restore",
+                        textContent: tr("Restore"),
                         onclick: async() => {
                             const at = await run(call("kept_restore", {
                                 root: r.id,
                                 id: x.id
                             }));
-                            toast("Restored to " + at.replace(/^\\\\\?\\/, ""));
+                            toast(tr("Restored to ") + at.replace(/^\\\\\?\\/, ""));
                             keptInto(b, r);
                         }
                     }))));
                 b.replaceChildren(el("table", {
                         className: "list"
                     }, el("thead", {}, el("tr", {}, el("th", {
-                        textContent: "Item"
+                        textContent: tr("Item")
                     }), el("th", {
                         className: "num",
-                        textContent: "Size"
+                        textContent: tr("Size")
                     }), el("th", {
-                        textContent: "Kept"
+                        textContent: tr("Kept")
                     }), el("th", {}))), body),
                     el("p", {
                         className: "note",
-                        textContent: "Restore puts it back where it was. Copies older than 30 days may be removed when space is short."
+                        textContent: tr("Restore puts it back where it was. Copies older than 30 days may be removed when space is short.")
                     }));
             } catch (e) {
                 b.replaceChildren(el("div", {
@@ -5463,7 +5809,7 @@
                 el("div", {
                     className: "t"
                 }, svg(rootIcon(r)), el("div", {}, el("h4", {
-                    textContent: r.kind === "main" ? "Main folder" : r.name
+                    textContent: r.kind === "main" ? tr("Main folder") : r.name
                 }), el("div", {
                     className: "where",
                     textContent: r.local
@@ -5476,28 +5822,28 @@
                     className: "actions"
                 }, el("button", {
                     className: "btn small",
-                    textContent: "Open folder",
+                    textContent: tr("Open folder"),
                     onclick: () => run(call("open_path", {
                         path: r.local
                     }))
                 })),
                 el("p", {
                     className: "note",
-                    textContent: "Select an item to change how it syncs."
+                    textContent: tr("Select an item to change how it syncs.")
                 }));
             const parts = [head];
             if (r.kind === "vault") parts.push(vaultSection(r));
             else parts.push(pairSection(r));
             if (r.kind !== "vault" && rs) parts.push(spaceSection(r, rs));
-            parts.push(acc("Kept on this PC", el("div", {
+            parts.push(acc(tr("Kept on this PC"), el("div", {
                 className: "muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }), {
                 onopen: b => keptInto(b, r)
             }));
-            parts.push(acc("Recent activity", el("div", {
+            parts.push(acc(tr("Recent activity"), el("div", {
                 className: "muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }), {
                 onopen: b => activityInto(b, "")
             }));
@@ -5506,36 +5852,36 @@
 
         function pairSection(r) {
             const body = [];
-            body.push(opt("Folder on this PC", r.local, el("span")));
-            body.push(opt("Folder in OneDrive", r.remote, el("span")));
-            body.push(opt("Direction", r.backup ? "Uploads only. Deleting here never deletes in OneDrive." : "",
+            body.push(opt(tr("Folder on this PC"), r.local, el("span")));
+            body.push(opt(tr("Folder in OneDrive"), r.remote, el("span")));
+            body.push(opt(tr("Direction"), r.backup ? tr("Uploads only. Deleting here never deletes in OneDrive.") : "",
                 seg([
-                    ["both", "Both ways"],
-                    ["backup", "Backup"]
+                    ["both", tr("Both ways")],
+                    ["backup", tr("Backup")]
                 ], r.backup ? "backup" : "both", v => {
                     const backup = v === "backup";
-                    const what = backup ? "Make this a backup? Deleting here will no longer delete in OneDrive, and OneDrive won't change this PC." :
-                        "Sync both ways? Files you deleted here but the backup kept in OneDrive come back.";
+                    const what = backup ? tr("Make this a backup? Deleting here will no longer delete in OneDrive, and OneDrive won't change this PC.") :
+                        tr("Sync both ways? Files you deleted here but the backup kept in OneDrive come back.");
                     if (!confirm(what)) return renderRootDetails();
                     run(call("flow", {...(r.kind === "main" ? {} : {
                             name: r.name
                         }),
                         backup
-                    }), backup ? "Now a backup" : "Now syncing both ways").then(() => openFiles());
+                    }), backup ? tr("Now a backup") : tr("Now syncing both ways")).then(() => openFiles());
                 })));
-            if (!r.backup) body.push(opt("Files On-Demand", r.on_demand ? "Files download when you open them." : "Every file is on this PC.",
-                toggleEl(r.on_demand, "Files On-Demand", async(v, i) => {
-                    if (!v && !confirm("Turn off Files On-Demand? Every online-only file is downloaded to this PC first.")) {
+            if (!r.backup) body.push(opt(tr("Files On-Demand"), r.on_demand ? tr("Files download when you open them.") : tr("Every file is on this PC."),
+                toggleEl(r.on_demand, tr("Files On-Demand"), async(v, i) => {
+                    if (!v && !confirm(tr("Turn off Files On-Demand? Every online-only file is downloaded to this PC first."))) {
                         i.checked = true;
                         return;
                     }
-                    toast(v ? "Turning on…" : "Downloading online-only files. This can take a while…");
+                    toast(v ? tr("Turning on…") : tr("Downloading online-only files. This can take a while…"));
                     try {
                         await call("on_demand", {
                             root: r.id,
                             on: v
                         });
-                        toast(v ? "Files On-Demand is on" : "Files On-Demand is off");
+                        toast(v ? tr("Files On-Demand is on") : tr("Files On-Demand is off"));
                     } catch (e) {
                         toast(e.message, true);
                     }
@@ -5547,41 +5893,38 @@
             });
             if (r.kind !== "main") acts.append(el("button", {
                 className: "btn small",
-                textContent: r.running ? "Pause" : "Start",
+                textContent: r.running ? tr("Pause") : tr("Start"),
                 onclick: () =>
                     run(call(r.running ? "pair_stop" : "pair_start", {
                         name: r.name
-                    }), r.running ? "Stopping…" : "Starting…").then(() => setTimeout(openFiles, 1500))
+                    }), r.running ? tr("Stopping…") : tr("Starting…")).then(() => setTimeout(openFiles, 1500))
             }));
             acts.append(el("button", {
                 className: "btn small danger",
-                textContent: "Stop syncing…",
+                textContent: tr("Stop syncing…"),
                 onclick: () => openRemove(r)
             }));
             body.push(acts);
-            return acc("This folder", body, {
+            return acc(tr("This folder"), body, {
                 open: true
             });
         }
 
         function spaceSection(r, rs) {
             const days = el("select", {
-                "aria-label": "Make files online-only when unused for"
+                "aria-label": tr("Make files online-only when unused for")
             }, ...[
-                [0, "Never"],
-                [7, "7 days"],
-                [14, "14 days"],
-                [30, "30 days"],
-                [60, "60 days"],
-                [90, "90 days"],
-                [180, "180 days"],
-                [365, "1 year"]
+                [0, tr("Never")],
+                ...[7, 14, 30, 60, 90, 180].map(d => [d, tr("{n, plural, one {# day} other {# days}}", {
+                    n: d
+                })]),
+                [365, tr("1 year")]
             ].map(([v, t]) => el("option", {
                 value: v,
                 textContent: t
             })));
             const pct = el("select", {
-                "aria-label": "Nearly full means free space below"
+                "aria-label": tr("Nearly full means free space below")
             }, ...[5, 10, 15, 20, 25].map(v => el("option", {
                 value: v,
                 textContent: v + "%"
@@ -5592,7 +5935,7 @@
                 root: r.id,
                 section: "space",
                 value: v
-            }), "Saved");
+            }), tr("Saved"));
             days.onchange = () => saveSpace({
                 free_unused_days: Number(days.value)
             });
@@ -5601,50 +5944,56 @@
             });
             const off = !r.on_demand;
             [days, pct].forEach(x => x.disabled = off);
-            return acc("Free up space", [
+            return acc(tr("Free up space"), [
                 off ? el("p", {
                     className: "say",
-                    textContent: "Needs Files On-Demand."
+                    textContent: tr("Needs Files On-Demand.")
                 }) : null,
-                opt("Make files online-only when unused for", "", days),
-                opt("When the disk is nearly full", "Frees the least-used files first.", toggleEl(rs.space.free_when_low, "When the disk is nearly full", v => saveSpace({
+                opt(tr("Make files online-only when unused for"), "", days),
+                opt(tr("When the disk is nearly full"), tr("Frees the least-used files first."), toggleEl(rs.space.free_when_low, tr("When the disk is nearly full"), v => saveSpace({
                     free_when_low: v
                 }), off)),
-                opt("Nearly full means free space below", "", pct),
+                opt(tr("Nearly full means free space below"), "", pct),
                 el("p", {
                     className: "note",
-                    textContent: "Files set to Always keep are never freed."
+                    textContent: tr("Files set to Always keep are never freed.")
                 })
             ]);
         }
 
         function vaultSection(r) {
             const body = [];
-            const askPw = () => r.remembered ? "" : prompt(`Password of the vault "${r.name}"` + (r.hello ? " (leave empty to use Windows Hello)" : ""));
-            body.push(opt(r.running ? "Unlocked" : "Locked", r.running ? "" : "Unlock to see and sync its files.",
+            const askPw = () => r.remembered ? "" : prompt(r.hello ? tr("Password of the vault \"{name}\" (leave empty to use Windows Hello)", {
+                name: r.name
+            }) : tr("Password of the vault \"{name}\"", {
+                name: r.name
+            }));
+            body.push(opt(r.running ? tr("Unlocked") : tr("Locked"), r.running ? "" : tr("Unlock to see and sync its files."),
                 el("button", {
                     className: "btn small" + (r.running ? "" : " primary"),
-                    textContent: r.running ? "Lock" : "Unlock…",
+                    textContent: r.running ? tr("Lock") : tr("Unlock…"),
                     onclick: () => r.running ?
                         run(call("vault_lock", {
                             name: r.name
-                        }), "Locked").then(() => setTimeout(openFiles, 1500)) : unlockVault(r)
+                        }), tr("Locked")).then(() => setTimeout(openFiles, 1500)) : unlockVault(r)
                 })));
-            if (snap && (snap.hello_available || r.hello)) body.push(opt("Unlock with Windows Hello", "Face, fingerprint or PIN.", toggleEl(r.hello, "Unlock with Windows Hello", async(v, i) => {
+            if (snap && (snap.hello_available || r.hello)) body.push(opt(tr("Unlock with Windows Hello"), tr("Face, fingerprint or PIN."), toggleEl(r.hello, tr("Unlock with Windows Hello"), async(v, i) => {
                 let p = "";
                 if (v && !r.remembered) {
-                    p = prompt(`Password of the vault "${r.name}":`);
+                    p = prompt(tr("Password of the vault \"{name}\":", {
+                        name: r.name
+                    }));
                     if (p === null) {
                         i.checked = false;
                         return;
                     }
                 }
-                if (v) toast("Confirm with Windows Hello…");
+                if (v) toast(tr("Confirm with Windows Hello…"));
                 run(call("vault_hello", {
                     name: r.name,
                     on: v,
                     password: p
-                }), v ? "Windows Hello unlocks this vault" : "Windows Hello turned off").then(openFiles).catch(() => i.checked = !v);
+                }), v ? tr("Windows Hello unlocks this vault") : tr("Windows Hello turned off")).then(openFiles).catch(() => i.checked = !v);
             })));
             body.push(el("div", {
                     className: "actions",
@@ -5652,7 +6001,7 @@
                 },
                 el("button", {
                     className: "btn small",
-                    textContent: "Recovery key…",
+                    textContent: tr("Recovery key…"),
                     onclick: async() => {
                         const p = askPw();
                         if (p === null) return;
@@ -5664,29 +6013,29 @@
                 }),
                 el("button", {
                     className: "btn small",
-                    textContent: "Change password…",
+                    textContent: tr("Change password…"),
                     onclick: async() => {
-                        const how = prompt("Current password or recovery key (empty if remembered or using Windows Hello):");
+                        const how = prompt(tr("Current password or recovery key (empty if remembered or using Windows Hello):"));
                         if (how === null) return;
                         const isKey = /^\s*oud1/i.test(how);
-                        const n1 = prompt("New password (8+ characters):");
+                        const n1 = prompt(tr("New password (8+ characters):"));
                         if (!n1) return;
-                        const n2 = prompt("Confirm new password:");
-                        if (n1 !== n2) return toast("The passwords don't match", true);
+                        const n2 = prompt(tr("Confirm new password:"));
+                        if (n1 !== n2) return toast(tr("The passwords don't match"), true);
                         await run(call("vault_password", {
                             name: r.name,
                             password: isKey ? "" : how,
                             recovery: isKey ? how : "",
                             new: n1
-                        }), "Password changed");
+                        }), tr("Password changed"));
                     }
                 }),
                 el("button", {
                     className: "btn small danger",
-                    textContent: "Stop syncing…",
+                    textContent: tr("Stop syncing…"),
                     onclick: () => openRemove(r)
                 })));
-            return acc("Vault", body, {
+            return acc(tr("Vault"), body, {
                 open: true
             });
         }
@@ -5695,10 +6044,13 @@
         async function openRemove(r) {
             const d = $("#dlg-remove"),
                 facts = $("#rm-facts");
-            const name = r.kind === "main" ? "your main folder" : r.kind === "vault" ? `the vault "${r.name}"` : r.name;
-            $("#rm-title").textContent = "Stop syncing " + name + "?";
+            $("#rm-title").textContent = r.kind === "main" ? tr("Stop syncing your main folder?") : r.kind === "vault" ? tr("Stop syncing the vault \"{name}\"?", {
+                name: r.name
+            }) : tr("Stop syncing {name}?", {
+                name: r.name
+            });
             facts.replaceChildren(el("li", {
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }));
             $("#rm-full-box").hidden = true;
             $("#rm-full").checked = false;
@@ -5717,30 +6069,43 @@
                 textContent: t
             });
             facts.replaceChildren(
-                li(`Nothing is deleted from OneDrive (${r.remote}).`),
-                li(`Files on this PC stay in ${r.local}.`));
+                li(tr("Nothing is deleted from OneDrive ({folder}).", {
+                    folder: r.remote
+                })),
+                li(tr("Files on this PC stay in {folder}.", {
+                    folder: r.local
+                })));
             if (pv.on_demand && pv.online_files > 0) {
-                facts.append(li(`${pv.online_files.toLocaleString()} online-only files (${size(pv.online_bytes)}) leave this PC. They stay in OneDrive.`));
+                facts.append(li(tr("{n, plural, one {# online-only file} other {# online-only files}} ({size}) leave this PC. They stay in OneDrive.", {
+                    n: pv.online_files,
+                    size: size(pv.online_bytes)
+                })));
                 const fits = pv.free_bytes > pv.online_bytes;
                 $("#rm-full-box").hidden = false;
                 $("#rm-full").disabled = !fits;
-                $("#rm-full-text").replaceChildren("Download them first",
+                $("#rm-full-text").replaceChildren(tr("Download them first"),
                     el("small", {
-                        textContent: fits ? `Needs ${size(pv.online_bytes)}; ${size(pv.free_bytes)} free.` : `Needs ${size(pv.online_bytes)}; only ${size(pv.free_bytes)} free.`
+                        textContent: (fits ? tr("Needs {needed}; {free} free.", {
+                            needed: size(pv.online_bytes),
+                            free: size(pv.free_bytes)
+                        }) : tr("Needs {needed}; only {free} free.", {
+                            needed: size(pv.online_bytes),
+                            free: size(pv.free_bytes)
+                        }))
                     }));
             }
-            facts.append(li(r.kind === "main" ? "Your sign-in, settings, other folders and vaults stay." : "Other folders keep syncing."));
+            facts.append(li(r.kind === "main" ? tr("Your sign-in, settings, other folders and vaults stay.") : tr("Other folders keep syncing.")));
             $("#rm-go").onclick = async() => {
                 $("#rm-go").disabled = true;
                 try {
                     if ($("#rm-full").checked) {
-                        $("#rm-busy").textContent = "Downloading online-only files. This can take a while…";
+                        $("#rm-busy").textContent = tr("Downloading online-only files. This can take a while…");
                         await call("on_demand", {
                             root: r.id,
                             on: false
                         });
                     }
-                    $("#rm-busy").textContent = "Stopping…";
+                    $("#rm-busy").textContent = tr("Stopping…");
                     if (r.kind === "main") await call("main_unpair");
                     else if (r.kind === "vault") await call("vault_remove", {
                         name: r.name
@@ -5749,7 +6114,9 @@
                         name: r.name
                     });
                     d.close();
-                    toast(`Stopped syncing ${r.local}`);
+                    toast(tr("Stopped syncing {folder}", {
+                        folder: r.local
+                    }));
                     F.root = null;
                     await load();
                     r.kind === "main" ? show("setup") : openFiles();
@@ -5763,29 +6130,31 @@
         function unlockVault(r) {
             if (r.remembered) return run(call("vault_unlock", {
                 name: r.name
-            }), "Unlocking…").then(() => setTimeout(openFiles, 3000));
+            }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
             if (r.hello) {
-                toast("Confirm with Windows Hello…");
+                toast(tr("Confirm with Windows Hello…"));
                 return run(call("vault_unlock", {
                     name: r.name,
                     hello: true
-                }), "Unlocking…").then(() => setTimeout(openFiles, 3000));
+                }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
             }
-            const pw = prompt(`Password of the vault "${r.name}":`);
+            const pw = prompt(tr("Password of the vault \"{name}\":", {
+                name: r.name
+            }));
             if (!pw) return;
-            const remember = confirm("Remember the password on this PC?");
+            const remember = confirm(tr("Remember the password on this PC?"));
             run(call("vault_unlock", {
                 name: r.name,
                 password: pw,
                 remember
-            }), "Unlocking…").then(() => setTimeout(openFiles, 3000));
+            }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
         }
 
         function showRecovery(text) {
             $("#recovery-text").textContent = text;
             $("#dlg-recovery").showModal();
         }
-        $("#recovery-copy").onclick = () => navigator.clipboard.writeText($("#recovery-text").textContent).then(() => toast("Copied"));
+        $("#recovery-copy").onclick = () => navigator.clipboard.writeText($("#recovery-text").textContent).then(() => toast(tr("Copied")));
         $("#dlg-recovery").addEventListener("close", () => $("#recovery-text").textContent = "");
 
         // ---- Add menu and dialogs
@@ -5818,7 +6187,7 @@
             if (e.target.checked) $("#pa-od").checked = false;
         };
         $("#pa-add").onclick = async() => {
-            $("#pa-busy").textContent = "Looking at both folders…";
+            $("#pa-busy").textContent = tr("Looking at both folders…");
             $("#pa-add").disabled = true;
             try {
                 const r = await call("pair_add", {
@@ -5827,7 +6196,7 @@
                     backup: $("#pa-backup").checked,
                     on_demand: $("#pa-od").checked
                 });
-                toast("Folder added and syncing");
+                toast(tr("Folder added and syncing"));
                 $("#dlg-pair").close();
                 $("#pa-remote").value = "";
                 $("#pa-local").value = "";
@@ -5843,7 +6212,7 @@
             const box = $("#known-list");
             box.replaceChildren(el("div", {
                 className: "row muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             }));
             const list = await call("known").catch(e => {
                 toast(e.message, true);
@@ -5852,19 +6221,23 @@
             box.replaceChildren();
             for (const k of list) {
                 let state, action = null;
-                if (k.pair) state = "Backed up";
-                else if (k.in_main) state = "Already synced, inside your main folder";
-                else if (k.other) state = "Backed up by " + k.other;
+                if (k.pair) state = tr("Backed up");
+                else if (k.in_main) state = tr("Already synced, inside your main folder");
+                else if (k.other) state = tr("Backed up by {folder}", {
+                    folder: k.other
+                });
                 else {
-                    state = "Not backed up";
+                    state = tr("Not backed up");
                     action = el("button", {
                         className: "btn",
-                        textContent: "Back up",
+                        textContent: tr("Back up"),
                         onclick: () => {
                             action.disabled = true;
                             run(call("pair_add_known", {
                                 name: k.name
-                            }), k.name + " is being backed up").then(() => {
+                            }), tr("{folder} is being backed up", {
+                                folder: k.name
+                            })).then(() => {
                                 loadKnown();
                                 afterAdd("pair:" + k.name);
                             }).catch(() => action.disabled = false);
@@ -5888,16 +6261,16 @@
             body.replaceChildren(el("tr", {}, el("td", {
                 colSpan: 3,
                 className: "muted",
-                textContent: "Looking…"
+                textContent: tr("Looking…")
             })));
             const list = await call("shared_list").catch(e => {
                 // Missing permission: signing in again (in the browser) can grant it.
                 const again = /broader permission/.test(e.message) ? el("button", {
                     className: "btn small",
                     style: "margin-left:8px",
-                    textContent: "Sign in again and allow it…",
+                    textContent: tr("Sign in again and allow it…"),
                     onclick: async() => {
-                        toast("Finish signing in in your browser and allow shared files");
+                        toast(tr("Finish signing in in your browser and allow shared files"));
                         try {
                             await call("sign_in", {
                                 shared: true
@@ -5919,12 +6292,12 @@
             if (!list.length) body.append(el("tr", {}, el("td", {
                 colSpan: 3,
                 className: "muted",
-                textContent: "No shared folders."
+                textContent: tr("No shared folders.")
             })));
             for (const f of list) {
                 const go = el("button", {
                     className: "btn",
-                    textContent: "Sync…",
+                    textContent: tr("Sync…"),
                     onclick: async() => {
                         const local = await run(call("pick_folder"));
                         if (!local) return;
@@ -5933,7 +6306,9 @@
                             local,
                             backup: false,
                             on_demand: true
-                        }), `"${f.name}" is syncing`).then(() => {
+                        }), tr("\"{name}\" is syncing", {
+                            name: f.name
+                        })).then(() => {
                             $("#dlg-shared").close();
                             afterAdd(null);
                         }).catch(() => go.disabled = false);
@@ -5953,8 +6328,8 @@
             if (p) $("#vc-local").value = p;
         };
         $("#vc-add").onclick = async() => {
-            if ($("#vc-pw").value !== $("#vc-pw2").value) return toast("The passwords don't match", true);
-            $("#vc-busy").textContent = "Creating the vault…";
+            if ($("#vc-pw").value !== $("#vc-pw2").value) return toast(tr("The passwords don't match"), true);
+            $("#vc-busy").textContent = tr("Creating the vault…");
             $("#vc-add").disabled = true;
             try {
                 const r = await call("vault_create", {
@@ -5967,7 +6342,9 @@
                 $("#vc-pw").value = "";
                 $("#vc-pw2").value = "";
                 $("#dlg-vault-new").close();
-                toast(`Vault "${r.name}" created and syncing`);
+                toast(tr("Vault \"{name}\" created and syncing", {
+                    name: r.name
+                }));
                 await afterAdd("vault:" + r.name);
                 showRecovery(r.recovery);
             } catch (e) {
@@ -5982,7 +6359,7 @@
             if (p) $("#va-local").value = p;
         };
         $("#va-add").onclick = async() => {
-            $("#va-busy").textContent = "Opening the vault…";
+            $("#va-busy").textContent = tr("Opening the vault…");
             $("#va-add").disabled = true;
             try {
                 const r = await call("vault_add", {
@@ -5994,7 +6371,9 @@
                 });
                 $("#va-pw").value = "";
                 $("#dlg-vault-add").close();
-                toast(`Vault "${r.name}" added and syncing`);
+                toast(tr("Vault \"{name}\" added and syncing", {
+                    name: r.name
+                }));
                 afterAdd("vault:" + r.name);
             } catch (e) {
                 toast(e.message, true);
@@ -6022,14 +6401,18 @@
             $("#setup-why").textContent = s.setup.why || "";
             $("#setup-form").disabled = !s.setup.allowed;
             $("#step-account").classList.toggle("done", s.signed_in);
-            if (!signingIn) $("#account-state").textContent = !s.signed_in ? " Opens your browser. OneUpDrive never sees your password." :
-                s.signed_in_as ? ` Signed in as ${s.signed_in_as}.` : " Signed in.";
+            if (!signingIn) $("#account-state").textContent = " " + (!s.signed_in ? tr("Opens your browser. OneUpDrive never sees your password.") :
+                s.signed_in_as ? tr("Signed in as {name}.", {
+                    name: s.signed_in_as
+                }) : tr("Signed in."));
             $("#sign-in").hidden = s.signed_in;
             $("#sign-out").hidden = !s.signed_in;
             // Moving over needs the account the OneDrive app syncs.
             const other = need && s.app_folder && s.same_account_as_app === false;
             $("#account-warn").hidden = !other;
-            if (other) $("#account-warn").textContent = `The OneDrive app uses another account${s.app_folder.email ? " (" + s.app_folder.email + ")" : ""}. Sign in with it to move its folder over.`;
+            if (other) $("#account-warn").textContent = s.app_folder.email ? tr("The OneDrive app uses another account ({email}). Sign in with it to move its folder over.", {
+                email: s.app_folder.email
+            }) : tr("The OneDrive app uses another account. Sign in with it to move its folder over.");
             // The OneDrive app's folder: moving it over is the first offer.
             if (need && s.app_folder) {
                 if (!MV.app) MV.mode = "move";
@@ -6072,48 +6455,58 @@
             }
             $("#mv-folder").textContent = app.folder;
             const inside = app.windows_folders.filter(w => w.inside).map(w => w.name);
-            $("#mv-windows").textContent = inside.length ? `${list(inside)} ${inside.length > 1 ? "move" : "moves"} over with it.` : "";
+            $("#mv-windows").textContent = inside.length ? tr("{n, plural, one {{folders} moves} other {{folders} move}} over with it.", {
+                n: inside.length,
+                folders: list(inside)
+            }) : "";
             const linked = !!app.linked,
                 c = MV.check;
             const cloudOk = c && c.scanned && c.scanned.finished && (!c.cloud || c.cloud.all_in_cloud);
             // After unlinking, the check still finds what it left behind.
             $("#mv-check-btn").disabled = !snap || !snap.signed_in;
-            if (!snap || !snap.signed_in) $("#mv-busy").textContent = linked ? "Sign in first." : "";
+            if (!snap || !snap.signed_in) $("#mv-busy").textContent = linked ? tr("Sign in first.") : "";
             $("#step-check").classList.toggle("done", !!cloudOk);
             const leftBehind = !!(c && c.scanned && c.scanned.left_behind > 0);
             if (!linked && !c) {
                 $("#mv-result").replaceChildren(el("p", {
                     className: "note",
-                    textContent: "The OneDrive app no longer manages this folder: nothing to check. Its choices can't be read any more; set them again on the Files page if needed."
+                    textContent: tr("The OneDrive app no longer manages this folder: nothing to check. Its choices can't be read any more; set them again on the Files page if needed.")
                 }));
             }
             // Unlinking: only once the check found nothing that unlinking would lose.
             $("#step-unlink").classList.toggle("done", !linked);
             $("#mv-unlink-say").textContent = linked ?
-                " In the OneDrive app: Settings → Account → Unlink this PC (personal account). Your files stay in OneDrive. This page continues when it's done." :
+                " " + tr("In the OneDrive app: Settings → Account → Unlink this PC (personal account). Your files stay in OneDrive. This page continues when it's done.") :
                 "";
             const st = $("#mv-unlink-state");
             st.replaceChildren();
             if (!linked) {
                 st.append(el("span", {
-                    textContent: "Unlinked."
+                    textContent: tr("Unlinked.")
                 }));
                 const moved = MV.inside.filter(n => !inside.includes(n));
                 if (moved.length) st.append(el("p", {
                     className: "note",
                     style: "color:var(--wait)",
-                    textContent: `Windows moved ${list(moved)} out while unlinking. Its files are still in the OneDrive folder, under ${list(moved)}. Move them back, or set the location again in Properties → Location.`
+                    textContent: tr("Windows moved {folders} out while unlinking. Its files are still in the OneDrive folder, under {folders}. Move them back, or set the location again in Properties → Location.", {
+                        folders: list(moved)
+                    })
                 }));
             } else if (!cloudOk && !app.stalled) {
-                st.textContent = "Check the folder first.";
+                st.textContent = tr("Check the folder first.");
             }
             // The app removed its account but never let go of the folder.
             $("#mv-stuck").hidden = !((linked && app.stalled) || (!linked && leftBehind));
             if (!linked && leftBehind) {
-                $("#mv-stuck-say").textContent = `Unlinking left ${c.scanned.left_behind} placeholders in folders a program had open (File Explorer, a terminal…). Close those, then finish unlinking.`;
+                $("#mv-stuck-say").textContent = tr("Unlinking left {n, plural, one {# placeholder} other {# placeholders}} in folders a program had open (File Explorer, a terminal…). Close those, then finish unlinking.", {
+                    n: c.scanned.left_behind
+                });
             } else if (linked && app.stalled) {
-                const ago = app.unlinked_at_ms ? ` ${Math.max(1, Math.round((Date.now() - app.unlinked_at_ms) / 3600000))} hour(s) ago` : "";
-                $("#mv-stuck-say").textContent = `The OneDrive app started unlinking${ago} but is stuck` + (app.app_running ? " and still running" : "") + ". OneUpDrive can finish it.";
+                const hours = app.unlinked_at_ms ? Math.max(1, Math.round((Date.now() - app.unlinked_at_ms) / 3600000)) : 0;
+                const started = hours ? tr("The OneDrive app started unlinking {n, plural, one {# hour} other {# hours}} ago but is stuck", {
+                    n: hours
+                }) : tr("The OneDrive app started unlinking but is stuck");
+                $("#mv-stuck-say").textContent = started + (app.app_running ? tr(" and still running") : "") + tr(". OneUpDrive can finish it.");
             }
             // Watching for the unlink while it's the next step.
             if (linked && cloudOk && !MV.timer) MV.timer = setInterval(async() => {
@@ -6122,7 +6515,7 @@
                     clearInterval(MV.timer);
                     MV.timer = 0;
                     MV.app = a;
-                    toast("The OneDrive app is unlinked");
+                    toast(tr("The OneDrive app is unlinked"));
                     moveRender();
                 }
             }, 3000);
@@ -6131,18 +6524,18 @@
         }
         // Gentlest first: restart the app, its own reset, then OneUpDrive
         // finishing it (only if every online-only file is in OneDrive).
-        const RELEASE_SAYS = "Windows then removes online-only files from this PC; they stay in OneDrive and come back as OneUpDrive's. Files on this PC stay. On a big folder this takes many minutes.";
+        const RELEASE_SAYS = tr("Windows then removes online-only files from this PC; they stay in OneDrive and come back as OneUpDrive's. Files on this PC stay. On a big folder this takes many minutes.");
         $("#mv-fix-btn").onclick = () => finishUnlink(false);
         $("#mv-fix-now-btn").onclick = () => finishUnlink(true);
         // now: straight to OneUpDrive finishing it (step 3).
         async function finishUnlink(now) {
             const app = MV.app;
             const ask = now ?
-                "Finish unlinking now?\n\nOneUpDrive stops the OneDrive app and finishes unlinking, after checking again that every online-only file is in OneDrive.\n\n" + RELEASE_SAYS :
-                "Finish unlinking the OneDrive app?\n\n" +
-                "1. Restart the OneDrive app, which may finish by itself.\n" +
-                "2. If not, reset the app" + (app && app.other_accounts ? " (skipped: it also has a work or school account)" : "") + ".\n" +
-                "3. If still stuck, stop the app and finish unlinking, after checking again that every online-only file is in OneDrive.\n\n" + RELEASE_SAYS;
+                tr("Finish unlinking now?") + "\n\n" + tr("OneUpDrive stops the OneDrive app and finishes unlinking, after checking again that every online-only file is in OneDrive.") + "\n\n" + RELEASE_SAYS :
+                tr("Finish unlinking the OneDrive app?") + "\n\n" +
+                tr("1. Restart the OneDrive app, which may finish by itself.") + "\n" +
+                (app && app.other_accounts ? tr("2. If not, reset the app (skipped: it also has a work or school account).") : tr("2. If not, reset the app.")) + "\n" +
+                tr("3. If still stuck, stop the app and finish unlinking, after checking again that every online-only file is in OneDrive.") + "\n\n" + RELEASE_SAYS;
             if (!app || !confirm(ask)) return;
             const b = $("#mv-fix-btn"),
                 bNow = $("#mv-fix-now-btn"),
@@ -6152,10 +6545,10 @@
             out.textContent = "";
             out.style.color = "";
             try {
-                const release = ["release", (now ? "" : "3 of 3: ") + "checking OneDrive, then finishing. This can take many minutes; leave this open…"];
+                const release = ["release", now ? tr("checking OneDrive, then finishing. This can take many minutes; leave this open…") : tr("3 of 3: checking OneDrive, then finishing. This can take many minutes; leave this open…")];
                 const steps = now ? [release] : [
-                    ["restart", "1 of 3: restarting the OneDrive app (waits up to 3 minutes)…"],
-                    ["reset", "2 of 3: resetting the OneDrive app (waits up to 3 minutes)…"],
+                    ["restart", tr("1 of 3: restarting the OneDrive app (waits up to 3 minutes)…")],
+                    ["reset", tr("2 of 3: resetting the OneDrive app (waits up to 3 minutes)…")],
                     release
                 ];
                 for (const [step, text] of steps) {
@@ -6169,17 +6562,22 @@
                 }
             } catch (e) {
                 out.style.color = "var(--bad)";
-                out.textContent = "Not finished: " + e.message;
+                out.textContent = tr("Not finished: {why}", {
+                    why: e.message
+                });
             } finally {
                 say("");
                 b.disabled = bNow.disabled = false;
                 const a = await call("move_state").catch(() => null);
                 if (a) MV.app = a;
-                if (a && !a.linked) toast("The OneDrive app is unlinked");
+                if (a && !a.linked) toast(tr("The OneDrive app is unlinked"));
                 moveRender();
             }
         }
-        const list = a => a.length < 2 ? a.join("") : a.slice(0, -1).join(", ") + " and " + a[a.length - 1];
+        const list = a => a.length < 2 ? a.join("") : tr("{list} and {last}", {
+            list: a.slice(0, -1).join(", "),
+            last: a[a.length - 1]
+        });
         $("#mv-check-btn").onclick = async() => {
             const b = $("#mv-check-btn"),
                 say = t => $("#mv-busy").textContent = t,
@@ -6187,15 +6585,15 @@
             b.disabled = true;
             $("#mv-result").replaceChildren();
             try {
-                say("1 of 3: reading your OneDrive folder…");
+                say(tr("1 of 3: reading your OneDrive folder…"));
                 await call("move_scan", {
                     preset
                 });
-                say("2 of 3: listing OneDrive (may take a few minutes)…");
+                say(tr("2 of 3: listing OneDrive (may take a few minutes)…"));
                 await call("move_list", {
                     preset
                 });
-                say("3 of 3: checking…");
+                say(tr("3 of 3: checking…"));
                 MV.check = await call("move_check");
                 if (MV.check) {
                     MV.app = MV.check.app;
@@ -6206,7 +6604,9 @@
                 $("#mv-result").replaceChildren(el("p", {
                     className: "note",
                     style: "color:var(--bad)",
-                    textContent: "The check didn't finish: " + e.message
+                    textContent: tr("The check didn't finish: {why}", {
+                        why: e.message
+                    })
                 }));
             } finally {
                 say("");
@@ -6222,15 +6622,16 @@
                 box.append(el("p", {
                     className: "note",
                     style: "color:var(--wait)",
-                    textContent: "You're signed in with a different account than the OneDrive app" +
-                        (c.app.email ? " (" + c.app.email + ")" : "") + ". Sign in with that account, then check again."
+                    textContent: c.app.email ? tr("You're signed in with a different account than the OneDrive app ({email}). Sign in with that account, then check again.", {
+                        email: c.app.email
+                    }) : tr("You're signed in with a different account than the OneDrive app. Sign in with that account, then check again.")
                 }));
                 return;
             }
             if (!c || !c.scanned) {
                 box.append(el("p", {
                     className: "note",
-                    textContent: "Not scanned. Try again."
+                    textContent: tr("Not scanned. Try again.")
                 }));
                 return;
             }
@@ -6242,20 +6643,38 @@
                 textContent: t,
                 style: warn ? "color:var(--wait)" : ""
             }));
-            li(`${s.on_pc.toLocaleString()} files on this PC; ${s.online_only.toLocaleString()} online-only (${size(s.online_only_bytes)}).`);
-            if (c.cloud && c.cloud.not_ready) li("Not compared with OneDrive yet: " + c.cloud.not_ready + ". Check again.", true);
+            li(tr("{files, plural, one {# file} other {# files}} on this PC; {online} online-only ({size}).", {
+                files: s.on_pc,
+                online: s.online_only,
+                size: size(s.online_only_bytes)
+            }));
+            if (c.cloud && c.cloud.not_ready) li(tr("Not compared with OneDrive yet: {why}. Check again.", {
+                why: c.cloud.not_ready
+            }), true);
             else if (c.cloud && !c.cloud.all_in_cloud) {
-                li(`${c.cloud.missing_files} online-only files and ${c.cloud.missing_folders} folders aren't in OneDrive at the same place. Don't unlink yet: they would be lost.`, true);
+                li(tr("{files} online-only files and {folders} folders aren't in OneDrive at the same place. Don't unlink yet: they would be lost.", {
+                    files: c.cloud.missing_files,
+                    folders: c.cloud.missing_folders
+                }), true);
                 for (const p of c.cloud.examples || []) li("  " + p, true);
-                li("Usually OneDrive is just behind: check again. If they're still listed, find them in OneDrive online (or its recycle bin), or set them to Always keep on this device first.", true);
-            } else if (s.online_only > 0) li("Every online-only file is in OneDrive. Safe to unlink.");
+                li(tr("Usually OneDrive is just behind: check again. If they're still listed, find them in OneDrive online (or its recycle bin), or set them to Always keep on this device first."), true);
+            } else if (s.online_only > 0) li(tr("Every online-only file is in OneDrive. Safe to unlink."));
             if (c.carried) {
                 const k = c.carried,
                     bits = [];
-                if (k.pinned) bits.push(`${k.pinned.toLocaleString()} items kept on this device`);
-                if (k.file_kinds.length) bits.push(`excluded file types (${k.file_kinds.join(", ")})`);
-                if (k.not_on_pc) bits.push(`${k.not_on_pc} folders not on this PC, paused (like /${k.not_on_pc_examples[0]})`);
-                li(bits.length ? "Carried over: " + bits.join("; ") + "." : "Nothing to carry over.");
+                if (k.pinned) bits.push(tr("{n, plural, one {# item} other {# items}} kept on this device", {
+                    n: k.pinned
+                }));
+                if (k.file_kinds.length) bits.push(tr("excluded file types ({types})", {
+                    types: k.file_kinds.join(", ")
+                }));
+                if (k.not_on_pc) bits.push(tr("{n, plural, one {# folder} other {# folders}} not on this PC, paused (like {example})", {
+                    n: k.not_on_pc,
+                    example: "/" + k.not_on_pc_examples[0]
+                }));
+                li(bits.length ? tr("Carried over: {what}.", {
+                    what: bits.join("; ")
+                }) : tr("Nothing to carry over."));
             }
             box.append(ul);
         }
@@ -6295,12 +6714,14 @@
         $("#sign-in").onclick = async() => {
             signingIn = true;
             $("#sign-in").disabled = true;
-            $("#account-state").textContent = " Finish signing in in your browser" + (snap && snap.test_account ? " with the test account" : "") + ".";
+            $("#account-state").textContent = " " + (snap && snap.test_account ? tr("Finish signing in in your browser with the test account.") : tr("Finish signing in in your browser."));
             try {
                 await call("sign_in");
-                toast("Signed in");
+                toast(tr("Signed in"));
             } catch (e) {
-                $("#account-state").textContent = " That didn't finish: " + e.message;
+                $("#account-state").textContent = " " + tr("That didn't finish: {why}", {
+                    why: e.message
+                });
             } finally {
                 signingIn = false;
                 $("#sign-in").disabled = false;
@@ -6308,10 +6729,10 @@
             }
         };
         $("#sign-out").onclick = async() => {
-            if (!confirm("Sign out of this account?")) return;
+            if (!confirm(tr("Sign out of this account?"))) return;
             try {
                 await call("sign_out");
-                toast("Signed out");
+                toast(tr("Signed out"));
                 MV.check = null;
                 $("#mv-result").replaceChildren();
             } catch (e) {
@@ -6331,23 +6752,23 @@
             }
         }
         $("#preview-btn").onclick = async() => {
-            if (!snap.signed_in) return toast("Sign in first", true);
+            if (!snap.signed_in) return toast(tr("Sign in first"), true);
             $("#preview-card").hidden = false;
             $("#preview").textContent = "";
             try {
-                const out = await busy("Comparing both sides…", call("setup_preview", setupArgs()));
+                const out = await busy(tr("Comparing both sides…"), call("setup_preview", setupArgs()));
                 $("#preview").textContent = out;
                 $("#start-btn").disabled = false;
             } catch (e) {
                 $("#preview").textContent = e.message;
-                toast("The preview didn't finish", true);
+                toast(tr("The preview didn't finish"), true);
             }
         };
         $("#start-btn").onclick = async() => {
             try {
-                const out = await busy("Setting up…", call("setup_start", setupArgs()));
+                const out = await busy(tr("Setting up…"), call("setup_start", setupArgs()));
                 $("#preview").textContent = out;
-                toast("Syncing has started");
+                toast(tr("Syncing has started"));
                 await load();
                 show("files");
                 if (await loadShortcuts()) {
@@ -6356,7 +6777,7 @@
                 }
             } catch (e) {
                 $("#preview").textContent = e.message;
-                toast("Setting up didn't finish", true);
+                toast(tr("Setting up didn't finish"), true);
             }
         };
 
@@ -6385,12 +6806,12 @@
             timer: null
         };
         const PLACES = {
-            "here": "On this PC",
-            "online-only": "Online-only",
-            "not here yet": "Not on this PC yet",
-            "excluded": "Excluded",
-            "not synced": "Not synced",
-            "in OneDrive": "Stays in OneDrive"
+            "here": tr("On this PC"),
+            "online-only": tr("Online-only"),
+            "not here yet": tr("Not on this PC yet"),
+            "excluded": tr("Excluded"),
+            "not synced": tr("Not synced"),
+            "in OneDrive": tr("Stays in OneDrive")
         };
 
         function openFind() {
@@ -6404,7 +6825,9 @@
         }
 
         function findBuilding(n) {
-            $("#fd-sum").textContent = `Building the search index (first search only): ${n.toLocaleString()} items`;
+            $("#fd-sum").textContent = tr("Building the search index (first search only): {n, plural, one {# item} other {# items}}", {
+                n
+            });
         }
 
         function findRow(f) {
@@ -6418,17 +6841,17 @@
                 onclick: fn
             }));
             const local = f.local && ["here", "online-only"].includes(f.placement);
-            if (local) btn("Open", () => run(call("open_path", {
+            if (local) btn(tr("Open"), () => run(call("open_path", {
                 path: f.local
             })));
-            if (local) btn("Show", () => run(call("reveal", {
+            if (local) btn(tr("Show"), () => run(call("reveal", {
                 path: f.local
             })));
-            if (f.rel && f.placement === "not here yet") btn("Sync this first", () => run(call("sync_first", {
+            if (f.rel && f.placement === "not here yet") btn(tr("Sync this first"), () => run(call("sync_first", {
                 rel: f.rel
-            }), "It goes before anything else"));
+            }), tr("It goes before anything else")));
             // No copy on this PC to open: OneDrive's website has it.
-            if (!local && ["in OneDrive", "excluded", "not synced"].includes(f.placement)) btn("Open in OneDrive", () => run(call("open_in_onedrive", {
+            if (!local && ["in OneDrive", "excluded", "not synced"].includes(f.placement)) btn(tr("Open in OneDrive"), () => run(call("open_in_onedrive", {
                 id: f.id
             })));
             return flatRow(f.folder ? f.name + "/" : f.name, bits.join(" · "), ...acts);
@@ -6442,7 +6865,7 @@
             }));
             else if (r.more) box.append(el("div", {
                 className: "msg",
-                textContent: "More found. Add to the search to narrow it."
+                textContent: tr("More found. Add to the search to narrow it.")
             }));
         }
         async function runFind(inside) {
@@ -6450,7 +6873,7 @@
             const n = ++FD.seq;
             clearTimeout(FD.timer);
             if ([...q].length < 3) {
-                $("#fd-sum").textContent = q ? "Type at least 3 characters." : "";
+                $("#fd-sum").textContent = q ? tr("Type at least 3 characters.") : "";
                 $("#fd-card").hidden = $("#fd-note").hidden = true;
                 return;
             }
@@ -6471,7 +6894,7 @@
                 if (cloud) {
                     box.append(el("div", {
                         className: "group",
-                        textContent: "Inside files (OneDrive's search)"
+                        textContent: tr("Inside files (OneDrive's search)")
                     }));
                     if (cloud.error) box.append(el("div", {
                         className: "msg",
@@ -6479,12 +6902,12 @@
                     }));
                     else if (!cloud.items.length) box.append(el("div", {
                         className: "msg",
-                        textContent: "Nothing found."
+                        textContent: tr("Nothing found.")
                     }));
                     else findList(box, cloud);
                 }
                 const found = names.items.length + (cloud && cloud.items ? cloud.items.length : 0);
-                $("#fd-sum").textContent = found ? "" : names.too_many || "Nothing found.";
+                $("#fd-sum").textContent = found ? "" : names.too_many || tr("Nothing found.");
                 $("#fd-card").hidden = !found && !cloud;
                 $("#fd-note").textContent = names.note;
                 $("#fd-note").hidden = false;
@@ -6505,13 +6928,13 @@
             value: {
                 onedrive: e.target.checked
             }
-        }), e.target.checked ? "Search inside files: on" : "Search inside files: off").then(load).catch(() => e.target.checked = !e.target.checked);
+        }), e.target.checked ? tr("Search inside files: on") : tr("Search inside files: off")).then(load).catch(() => e.target.checked = !e.target.checked);
         $("#fd-hotkey").onchange = e => run(call("save", {
             section: "search",
             value: {
                 hotkey: e.target.value.trim()
             }
-        }), "Saved").then(load).then(openFind).catch(() => load().then(openFind));
+        }), tr("Saved")).then(load).then(openFind).catch(() => load().then(openFind));
 
         function startAt(start, item) {
             const page = OLD[start] || start || "files";
