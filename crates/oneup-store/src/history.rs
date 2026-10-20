@@ -40,8 +40,10 @@ const REMOVED: i64 = 2;
 /// v23: the history table, its indexes and its triggers, the index on
 /// Synced names and the item marks. It touches only `synced_item`,
 /// `local_item`, `remote_item` and `meta`, all there since v9, so it runs
-/// on v19 as on any version after it. A folder already synced is covered
-/// from now on; a new one from the end of its
+/// on v19 as on any version after it. It doesn't start the history: an
+/// upgrade can come in the middle of a first sync, whose records are of
+/// items that were there before it, not created then. Every folder's is
+/// started when a sequence of rounds next settles; a new one from the end of its
 /// first sync ([`Ops::history_start`]): the records a first sync makes
 /// are of items that were there before it, not created then, and a large
 /// folder's would fill the history at once.
@@ -85,8 +87,6 @@ BEGIN
     INSERT INTO synced_history(at_ms, sid, change, parent_sid, name, kind, size, qxh, remote_id)
     VALUES ({NOW_MS}, OLD.sid, {REMOVED}, OLD.parent_sid, OLD.name, OLD.kind, OLD.size, OLD.qxh, OLD.remote_id);
 END;
-INSERT OR REPLACE INTO meta(key, value) SELECT '{SINCE}', CAST({NOW_MS} AS TEXT) WHERE EXISTS (SELECT 1 FROM synced_item);
-INSERT OR REPLACE INTO meta(key, value) SELECT '{ON}', '1' WHERE EXISTS (SELECT 1 FROM synced_item);
 "
     )
 }
@@ -526,13 +526,22 @@ mod tests {
         }
     }
 
-    /// A store at v19 (the last version before this one's neighbours) with
-    /// a synced folder comes up to v23: the history is kept from then on,
-    /// a change is recorded, an item that changes is marked, and a child
-    /// is found by name through the new index.
+    /// A store at v19, or at v20 to v22 (the versions landing before this
+    /// one), with a synced folder whose first sync may not have finished,
+    /// comes up to v23 without starting the history: a record made by that
+    /// sync after the upgrade isn't taken as created since. Once a sequence
+    /// of rounds settles it starts, and from then on a change is recorded,
+    /// an item that changes is marked, and a child is found by name through
+    /// the new index.
     #[test]
-    fn a_store_at_v19_is_upgraded() {
-        let dir = std::env::temp_dir().join(format!("oneup-store-history-up-{}", std::process::id()));
+    fn a_store_from_before_is_upgraded_without_starting_the_history() {
+        for from in [19, 20, 21, 22] {
+            upgraded_from(from);
+        }
+    }
+
+    fn upgraded_from(from: i64) {
+        let dir = std::env::temp_dir().join(format!("oneup-store-history-up{from}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.db");
@@ -543,17 +552,20 @@ mod tests {
                 o.synced_put(&base(1, ROOT, "a.txt", 3))
             })
             .unwrap();
-            s.read(|o| Ok(o.c.execute_batch(&format!("{UNDO_V23} DELETE FROM meta; PRAGMA user_version = 19;"))?))
-                .unwrap();
-            let v: i64 = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
-            assert_eq!(v, 19);
+            let undo = format!("{UNDO_V23} DELETE FROM meta; PRAGMA user_version = {from};");
+            s.read(|o| Ok(o.c.execute_batch(&undo)?)).unwrap();
         }
         let mut s = Store::open(&path, 1024).unwrap();
         let v: i64 = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
-        assert_eq!(v, 23);
-        assert!(s.read(|o| o.history_since()).unwrap() < i64::MAX, "already synced: kept from the upgrade");
+        assert_eq!(v, 23, "from v{from}");
+        assert_eq!(s.read(|o| o.history_since()).unwrap(), i64::MAX, "from v{from}: not started by the upgrade");
+        // The first sync goes on: what it records isn't history.
+        s.write(|o| o.synced_put(&base(2, ROOT, "found later.txt", 1))).unwrap();
+        assert_eq!(s.read(|o| o.history_rows()).unwrap(), 0, "from v{from}");
+        // The rounds settle: kept from then on.
+        assert!(s.write(|o| o.history_start(100)).unwrap());
         s.write(|o| o.synced_put(&base(1, ROOT, "a.txt", 4))).unwrap();
-        assert_eq!(s.read(|o| o.history_rows()).unwrap(), 1, "a change is recorded");
+        assert_eq!(s.read(|o| o.history_rows()).unwrap(), 1, "from v{from}: a change is recorded");
         let named = s.read(|o| oneup_sync::Trees::base_named(o, ROOT, "A.TXT")).unwrap();
         assert_eq!(named.iter().map(|b| b.sid).collect::<Vec<_>>(), [1], "found by name");
         s.write(|o| {
