@@ -323,10 +323,30 @@ pub fn pause_reason(u: &Usage, budget: Option<u64>) -> Option<crate::autopause::
         .then(|| crate::autopause::Reason::fixed(crate::t_key!("this month's data budget on this network is used up")))
 }
 
+/// Whether the agent that took a reservation (`owner`, its process ID)
+/// still runs: a process with that ID runs `oneupd.exe`. Windows reuses
+/// process IDs, so the ID alone could keep a dead agent's share forever.
+pub fn agent_alive(owner: &str) -> bool {
+    owner.parse::<u32>().ok().and_then(oneup_sys::processes::image_of).is_some_and(|p| is_agent(&p))
+}
+
+fn is_agent(image: &std::path::Path) -> bool {
+    image.file_stem().is_some_and(|s| s.eq_ignore_ascii_case("oneupd"))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// A process that took over a stopped agent's ID isn't the agent.
+    #[test]
+    fn only_a_running_oneupd_holds_a_reservation() {
+        assert!(!agent_alive(&std::process::id().to_string()), "this test runs, but isn't oneupd");
+        assert!(!agent_alive("not a number"));
+        assert!(is_agent(std::path::Path::new(r"C:\Program Files\OneUpDrive\OneUpD.exe")));
+        assert!(!is_agent(std::path::Path::new(r"C:\Windows\System32\cmd.exe")));
+    }
 
     const MB: u64 = 1_000_000;
 
