@@ -524,7 +524,7 @@ pub async fn show(main: &Path, as_json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if items.is_empty() {
-        println!("Nothing needs your attention.");
+        println!("{}", crate::t!("Nothing needs your attention."));
         return Ok(());
     }
     // Headings only when extra pairs or vaults have something too.
@@ -534,8 +534,15 @@ pub async fn show(main: &Path, as_json: bool) -> anyhow::Result<()> {
         if headed && pair != Some(&i.pair) {
             pair = Some(&i.pair);
             match &i.pair {
-                Some(name) => println!("{name} (commands take --data-dir \"{}\"):", i.data_dir.display()),
-                None => println!("Main folder:"),
+                Some(name) => println!(
+                    "{}",
+                    crate::t!(
+                        "{name} (commands take --data-dir \"{dir}\"):",
+                        name = name,
+                        dir = i.data_dir.display().to_string()
+                    )
+                ),
+                None => println!("{}", crate::t!("Main folder:")),
             }
         }
         println!("  {}", i.title);
