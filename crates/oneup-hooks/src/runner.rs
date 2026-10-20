@@ -899,11 +899,12 @@ mod tests {
     /// `a&calc.exe&.txt` can't inject a command.
     #[test]
     fn a_bat_hook_gets_the_event_by_environment_not_on_the_command_line() {
-        let dir = std::env::temp_dir().join(format!("oneup-hooks-bat-{}", std::process::id()));
+        // A folder and name like "Program Files (x86)" and "a,b.bat": cmd /d /c call keeps them whole.
+        let dir = std::env::temp_dir().join(format!("oneup-hooks-bat-{}", std::process::id())).join("Hooks (x86)");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("out.txt");
-        let bat = dir.join("hook.bat");
+        let bat = dir.join("a,b hook.bat");
         // `set VAR` prints the value literally (no re-parsing); the command
         // line (%CMDCMDLINE%) holds no cloud value, so echoing it is safe.
         std::fs::write(
@@ -937,7 +938,7 @@ mod tests {
         // ...and the command line is only cmd /c <bat>, without the value.
         let cmdline = text.lines().find(|l| l.starts_with("cmdline=")).unwrap_or("");
         assert!(!cmdline.contains("calc.exe"), "the event value must not be on the command line: {cmdline}");
-        assert!(cmdline.to_lowercase().contains("hook.bat"), "{cmdline}");
+        assert!(cmdline.to_lowercase().contains("a,b hook.bat"), "{cmdline}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
