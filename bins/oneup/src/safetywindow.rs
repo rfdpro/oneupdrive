@@ -104,7 +104,9 @@ impl SafetyWindow {
         w.save(store)
     }
 
-    /// Saves the window to the store.
+    /// Saves the window to the store, durably: the agent saves it before a
+    /// round runs ([`SafetyWindow::save_with`]), and a power cut must not
+    /// take the count while the round's deletions stay done.
     pub fn save(&self, store: &mut Store) -> oneup_store::Result<()> {
         let text = self
             .done
@@ -112,7 +114,7 @@ impl SafetyWindow {
             .map(|(at, r)| format!("{at},{},{},{}", r.local, r.remote, r.suspicious))
             .collect::<Vec<_>>()
             .join(";");
-        store.write(|o| if text.is_empty() { o.meta_delete(KEY) } else { o.meta_set(KEY, &text) })
+        store.write_durable(|o| if text.is_empty() { o.meta_delete(KEY) } else { o.meta_set_ahead(KEY, &text) })
     }
 
     /// Minutes later than now's (the clock was set back) count as now's;
