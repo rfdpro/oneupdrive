@@ -955,6 +955,13 @@ async fn watching_auto_pause<T>(
     loop {
         tokio::select! {
             r = &mut rounds => return r,
+            // Working offline, asked during the round: no push channel from
+            // now on (rounds already hold OneDrive's side through the pause).
+            () = control.offline_changed.notified() => {
+                if control.offline() {
+                    push_channel.close();
+                }
+            }
             () = net_events.next() => {
                 // Another network, mid-round: its policy (and a pause, if
                 // it pauses) applies from the next operation on.
@@ -1617,6 +1624,41 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work offline, asked while a round runs (a long upload): the push
+    /// channel closes then, not when the round ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn working_offline_closes_the_push_channel_during_a_round() {
+        let dir = std::env::temp_dir().join(format!("oneupd-offline-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = oneup_graph::DpapiFileStore::new(dir.join("none.dpapi"));
+        let auth = Arc::new(oneup_graph::Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
+        let graph = Arc::new(Graph::new(reqwest::Client::new(), auth, oneup_graph::Aimd::new(8, 8)));
+        let control = Control::new(None, "L".into(), "/R".into(), Default::default());
+        let mut net_use = NetUse::new(&dir, &graph).unwrap();
+        let events = oneup_app::network::Events::default();
+        let up = Arc::new(AtomicBool::new(true));
+        let mut push = PushChannel { task: None, up: Arc::clone(&up) };
+        push.open(|| AbortOnDrop(tokio::spawn(std::future::pending())));
+        let settings = oneup_app::config::Agent::default();
+        let round = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Still in the round: the channel must already be closed.
+            !up.load(Relaxed)
+        };
+        let asked = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            oneup_ipc::Handler::handle(&control, oneup_ipc::Call::Offline { on: true }).unwrap();
+        };
+        let (closed_in_round, ()) = tokio::join!(
+            watching_auto_pause(round, &dir, &settings, &control, &graph, &mut net_use, &events, &mut push),
+            asked
+        );
+        assert!(closed_in_round && push.task.is_none());
+        drop(net_use);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The transport's caps for a poor link follow the link's state at the
     /// start of each attempt, so caps left from before an error are lifted
