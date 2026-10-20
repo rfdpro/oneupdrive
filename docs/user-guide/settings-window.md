@@ -64,7 +64,7 @@ What you share in OneDrive, and who can open it. **Refresh** asks OneDrive again
 **Open with AutoSave**, **Let OneUpDrive open Office files** (double-click with AutoSave once you pick OneUpDrive as the default program), folders left to the OneDrive app, and, only with experimental options turned on (`oneup settings --experimental on`, for developers), the experimental Office integration. See [Office](office.md).
 
 ## Network
-Upload and download limits (and the hours they apply), and pausing by itself: on metered connections, with battery saver on, during games and presentations, and in quiet hours.
+Upload and download limits (and the hours they apply), and pausing by itself: on metered connections, with battery saver on, during games and presentations, and in quiet hours. **Sync interval**: sync every so many minutes instead of within seconds. See [Slow and metered connections](slow-and-metered-networks.md).
 
 ## General
 Starting at sign-in, the taskbar icon, memory use and background priority, **Memory and hashing** (each number the memory profile sets, and how many files are hashed at once; empty is the default; see [Syncing in depth](syncing.md#how-it-uses-your-pc)) (these apply when OneUpDrive next starts), file changes (**Timeout highly active files**), **Hooks** (**Run hooks**, and a switch for each hook in `config.toml`, or why one doesn't run; see [Scripts and hooks](hooks.md)), **Update shortcuts to use OneUpDrive folder** (see [Shortcuts to your old OneDrive folder](getting-started.md#shortcuts-to-your-old-onedrive-folder)), and updates: install automatically, whether to get preview versions, and **Check now**.

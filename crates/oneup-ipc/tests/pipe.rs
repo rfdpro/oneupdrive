@@ -38,6 +38,7 @@ impl Handler for Agent {
             retrying: None,
             databases: Vec::new(),
             databases_more: 0,
+            network: None,
         })
     }
 
@@ -114,6 +115,7 @@ impl Handler for Picky {
             retrying: None,
             databases: Vec::new(),
             databases_more: 0,
+            network: None,
         })
     }
     fn permit(&self, pid: u32) -> bool {

@@ -407,7 +407,7 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
 }
 
-fn read_doc(data_dir: &Path) -> Result<Option<DocumentMut>> {
+pub(crate) fn read_doc(data_dir: &Path) -> Result<Option<DocumentMut>> {
     let p = path(data_dir);
     match std::fs::read_to_string(&p) {
         Ok(text) => Ok(Some(text.parse::<DocumentMut>().with_context(|| format!("reading {}", p.display()))?)),
@@ -416,7 +416,7 @@ fn read_doc(data_dir: &Path) -> Result<Option<DocumentMut>> {
     }
 }
 
-fn section<'d>(doc: &'d DocumentMut, name: &str) -> Result<Option<&'d Table>> {
+pub(crate) fn section<'d>(doc: &'d DocumentMut, name: &str) -> Result<Option<&'d Table>> {
     match doc.get(name) {
         Some(Item::Table(t)) => Ok(Some(t)),
         Some(_) => bail!("{FILE}: `{name}` must be a section ([{name}])"),
@@ -424,14 +424,14 @@ fn section<'d>(doc: &'d DocumentMut, name: &str) -> Result<Option<&'d Table>> {
     }
 }
 
-fn strings(t: &Table, key: &str) -> Result<Option<Vec<String>>> {
+pub(crate) fn strings(t: &Table, key: &str) -> Result<Option<Vec<String>>> {
     let Some(item) = t.get(key) else { return Ok(None) };
     let bad = || format!("{FILE}: {key} must be a list of strings");
     let Some(arr) = item.as_array() else { bail!(bad()) };
     arr.iter().map(|v| v.as_str().map(str::to_owned).with_context(bad)).collect::<Result<Vec<_>>>().map(Some)
 }
 
-fn number(t: &Table, key: &str) -> Result<Option<u64>> {
+pub(crate) fn number(t: &Table, key: &str) -> Result<Option<u64>> {
     let Some(item) = t.get(key) else { return Ok(None) };
     let n = item.as_integer().with_context(|| format!("{FILE}: {key} must be a whole number"))?;
     Ok(Some(u64::try_from(n).with_context(|| format!("{FILE}: {key} can't be negative"))?))
@@ -440,7 +440,7 @@ fn number(t: &Table, key: &str) -> Result<Option<u64>> {
 /// Sets `entries` in section `name` (created with comment `intro` if
 /// missing), in place where a key exists so the comments around it stay,
 /// and writes the file: whole, flushed, then renamed into place.
-fn save(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Item)>) -> Result<()> {
+pub(crate) fn save(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, Item)>) -> Result<()> {
     save_or_remove(data_dir, name, intro, entries.into_iter().map(|(k, v)| (k, Some(v))).collect())
 }
 

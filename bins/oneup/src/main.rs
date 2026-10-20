@@ -255,6 +255,12 @@ enum Cmd {
         experimental: Option<Toggle>,
         #[command(flatten)]
         tuning: settings::TuningArgs,
+        /// Sync every this many minutes; `off` (or 0): within seconds of a change
+        #[arg(long, value_name = "MINUTES|off", value_parser = parse_interval)]
+        sync_interval: Option<u32>,
+        /// With a sync interval, still sync OneDrive's changes at once (off by default)
+        #[arg(long, value_enum)]
+        keep_push: Option<Toggle>,
     },
     /// Show or change freeing up space by itself (with Files On-Demand)
     Space {
@@ -1428,6 +1434,16 @@ fn updates_cmd(dir: &Path, auto: Option<bool>, channel: Option<&str>, check: boo
     Ok(())
 }
 
+/// A sync interval in minutes, or `off`.
+fn parse_interval(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    let n: u64 = s.parse().map_err(|_| "expected a number of minutes, or off".to_string())?;
+    oneup_app::pace::check_minutes(n).map_err(|e| e.to_string())
+}
+
 fn parse_code(s: &str) -> Result<u64, String> {
     u64::from_str_radix(s.trim(), 16).map_err(|_| "expected the 16-character code the safety stop printed".into())
 }
@@ -1747,6 +1763,8 @@ async fn run() -> Result<()> {
             compact_database,
             experimental,
             tuning,
+            sync_interval,
+            keep_push,
         } => {
             let changes = settings::Changes {
                 upload_kib: *upload_kib,
@@ -1768,6 +1786,8 @@ async fn run() -> Result<()> {
                 compact_database: compact_database.map(Toggle::on),
                 experimental: experimental.map(Toggle::on),
                 tuning: tuning.clone(),
+                sync_interval: *sync_interval,
+                keep_push: keep_push.map(Toggle::on),
             };
             settings::run(&data_dir(&cli)?, &changes).await
         }

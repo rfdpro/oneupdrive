@@ -635,6 +635,7 @@ mod tests {
             retrying: None,
             databases: Vec::new(),
             databases_more: 0,
+            network: None,
         }
     }
 

@@ -33,6 +33,9 @@ pub struct Changes {
     /// `[dev] experimental` (`config::load_experimental`).
     pub experimental: Option<bool>,
     pub tuning: TuningArgs,
+    /// `[sync]` (`oneup_app::pace`): minutes, 0 = off.
+    pub sync_interval: Option<u32>,
+    pub keep_push: Option<bool>,
 }
 
 /// A number instead of the memory profile's, or `profile` for the
@@ -88,6 +91,20 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
     {
         config::save_experimental(data_dir, on)?;
         println!("Experimental options are {}.", if on { "shown" } else { "hidden" });
+    }
+    let mut interval = oneup_app::pace::load(data_dir)?;
+    let interval_before = interval;
+    if let Some(m) = c.sync_interval {
+        interval.minutes = m;
+    }
+    if let Some(b) = c.keep_push {
+        interval.keep_push = b;
+    }
+    if interval != interval_before {
+        oneup_app::pace::save(data_dir, &interval)?;
+        if crate::agent::nudge(data_dir).await {
+            println!("The background agent uses the new sync interval from its next pass.");
+        }
     }
     let mut a = config::load_agent(data_dir)?;
     let before = a.clone();
@@ -178,11 +195,11 @@ pub async fn run(data_dir: &Path, c: &Changes) -> Result<()> {
             }
         }
     }
-    show(&a);
+    show(&a, &interval);
     Ok(())
 }
 
-fn show(a: &Agent) {
+fn show(a: &Agent, interval: &oneup_app::pace::Interval) {
     let cap = |n: u64| if n == 0 { "no cap".to_string() } else { format!("{n} KiB/s") };
     println!("Background agent settings (oneup settings --help to change them):");
     println!("  upload          {}", cap(a.upload_kib));
@@ -212,6 +229,13 @@ fn show(a: &Agent) {
     println!("  pause during games, presentations  {}", yes(a.pause_on_full_screen));
     println!("  pause during full-screen video     {}", yes(a.pause_on_full_screen_video));
     println!("  quiet hours (no syncing)        {}", a.quiet_hours.as_deref().unwrap_or("none"));
+    match interval.minutes {
+        0 => println!("  sync interval                   off: within seconds of a change"),
+        m => println!(
+            "  sync interval                   every {m} min; OneDrive's changes {}",
+            if interval.keep_push { "at once" } else { "with each pass" }
+        ),
+    }
     println!("  icon in the notification area   {}", yes(a.tray_icon));
     let b = &a.busy;
     if b.on {

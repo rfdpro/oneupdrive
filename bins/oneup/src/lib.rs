@@ -39,6 +39,7 @@ pub mod officeint;
 pub mod officeopen;
 pub mod ondemand;
 pub mod ownfile;
+pub mod pace;
 pub mod pairs;
 pub mod pinrules;
 pub mod priority;

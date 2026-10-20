@@ -13,6 +13,7 @@ Welcome! This guide is for everyone, not just developers.
 
 **How it works**
 * [Syncing in depth](syncing.md): what happens to deleted and conflicting files, safety stops, the ransomware guard, getting files back
+* [Slow and metered connections](slow-and-metered-networks.md): syncing every few minutes, data plans, phone hotspots
 * [Choosing what syncs](excluding-files.md): leaving out `node_modules`, temp files, huge videos…
 * [Files On-Demand and freeing space](files-on-demand.md): online-only files, freeing space by itself, your largest files, duplicates
 * [Databases](databases.md): password vaults, mail folders and other databases, sent only when whole and replaced only while closed
