@@ -28,9 +28,10 @@ pub const BUCKET_MS: i64 = 60 * 1000;
 /// In `meta`: `minute_ms,local,remote,suspicious` per minute, `;` between.
 pub const KEY: &str = "safety.window";
 /// What each count of a window that can't be read is taken to be: more
-/// than any limit, so the stops trip on anything. Also the most a count
-/// is kept as; a saved count above it can't be ours, so it's unreadable.
-pub const UNREADABLE: usize = 1_000_000_000;
+/// than any limit ([`oneup_gate::FULL`], as for a removal of unknown size),
+/// so the stops trip on anything. Also the most a count is kept as; a saved
+/// count above it can't be ours, so it's unreadable.
+pub const UNREADABLE: usize = oneup_gate::FULL;
 
 /// Mass-sensitive operations carried out recently, by the minute they were
 /// carried out in (its start, Unix ms).
@@ -285,6 +286,42 @@ mod tests {
         w.add(r(3, 2, 1), 7);
         w.save(&mut store).unwrap();
         assert_eq!(SafetyWindow::load(&store, 8).unwrap(), (w, true));
+    }
+
+    /// A removal of unknown size counts as full for the window: raising the
+    /// limits meanwhile doesn't let the next deletion through until the
+    /// window has let it go.
+    #[test]
+    fn a_removal_of_unknown_size_fills_the_window_whatever_the_limits() {
+        let prune = Op::PruneRemote {
+            remote: oneup_sync::RemotePre { id: oneup_sync::RemoteId("nm".into()), etag: "e".into() },
+            forget: Vec::new(),
+            items: 10,
+            exact: false,
+            keep: Vec::new(),
+        };
+        let mut done = Recent::default();
+        done.add_op(&prune, &[]);
+        let mut store = Store::open_in_memory().unwrap();
+        let mut w = SafetyWindow::default();
+        w.add(done, 0);
+        w.save(&mut store).unwrap();
+        let (mut w, readable) = SafetyWindow::load(&store, 5 * MIN).unwrap();
+        assert!(readable);
+        // The user raises the limits right after.
+        let raised = oneup_gate::Policy { max_count: 1_000_000, max_percent: 100, ..oneup_gate::Policy::default() };
+        let deletion = || {
+            vec![Op::DeleteRemote {
+                sid: 1,
+                remote: oneup_sync::RemotePre { id: oneup_sync::RemoteId("r1".into()), etag: "e".into() },
+            }]
+        };
+        let stops = |w: &mut SafetyWindow, now| {
+            let cx = oneup_gate::Context { synced_items: 1_000, recent: w.recent(now), ..Default::default() };
+            oneup_gate::review_in(&raised, &cx, deletion()).breakers.len()
+        };
+        assert_eq!(stops(&mut w, 5 * MIN), 1, "one deletion within the window still stops");
+        assert_eq!(stops(&mut w, 16 * MIN), 0, "once the window let it go, it doesn't");
     }
 
     /// The agent records a round's count before the round runs: a crash

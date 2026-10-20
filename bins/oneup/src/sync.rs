@@ -533,10 +533,10 @@ pub type Keep = dyn Fn(&mut Store, Recent) -> Result<()> + Send + Sync;
 
 /// `executed` plus what `approved` may carry out that the safety window
 /// counts: recorded before a round runs.
-fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId], policy: &oneup_gate::Policy) -> Recent {
+fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId]) -> Recent {
     let mut r = executed;
     for op in approved.iter().map(Approved::op) {
-        r.add_op(op, suspicious, policy);
+        r.add_op(op, suspicious);
     }
     r
 }
@@ -1546,7 +1546,7 @@ impl Engine {
             if let Some(keep) = keep {
                 // Counted before anything runs: a crash mid-round must not
                 // forget what it may have done.
-                keep(&mut store, reserved(*executed, &approved, &suspicious, &policy))
+                keep(&mut store, reserved(*executed, &approved, &suspicious))
                     .context("can't record the safety window, so nothing was changed")?;
             }
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
@@ -1584,7 +1584,7 @@ impl Engine {
             // Counted before anything below can fail: what ran must reach
             // the caller's safety window even if this call ends in an error.
             for op in &report.done {
-                executed.add_op(op, &suspicious, &policy);
+                executed.add_op(op, &suspicious);
             }
             // Approved changes that ran are done with; those that wait stay.
             self.stops_lock().round_ended(listed_ops, &report.done);
@@ -3392,14 +3392,14 @@ mod tests {
         let cx = GateContext { approved: &b.items, ..cx };
         let r = review_in(&p, &cx, vec![prune.clone()]);
         assert!(r.breakers.is_empty(), "approved where it was shown");
-        let reserve = reserved(Recent::default(), &r.approved, &[], &p);
+        let reserve = reserved(Recent::default(), &r.approved, &[]);
         assert_eq!(reserve.remote, 1000);
         let mut store = Store::open_in_memory().unwrap();
         crate::safetywindow::SafetyWindow::default().save_with(&mut store, reserve, 0).unwrap();
         let (mut w, _) = crate::safetywindow::SafetyWindow::load(&store, 1).unwrap();
         assert_eq!(w.recent(1).remote, 1000);
         let mut done = Recent::default();
-        done.add_op(&prune, &[], &p);
+        done.add_op(&prune, &[]);
         assert_eq!(done.remote, 1000);
     }
 
@@ -3491,10 +3491,7 @@ mod tests {
             .collect();
         let approved = oneup_gate::review(&oneup_gate::Policy::default(), 1_000_000, &[], ops).approved;
         let before = Recent { local: 5, remote: 1, suspicious: 0 };
-        assert_eq!(
-            reserved(before, &approved, &[], &oneup_gate::Policy::default()),
-            Recent { local: 35, remote: 1, suspicious: 0 }
-        );
+        assert_eq!(reserved(before, &approved, &[]), Recent { local: 35, remote: 1, suspicious: 0 });
     }
 
     #[test]
