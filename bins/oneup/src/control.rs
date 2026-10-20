@@ -165,9 +165,13 @@ struct Shared {
     net: oneup_ipc::NetStatus,
     /// What the network's profile lets rounds do.
     policy: crate::network::Policy,
-    /// Megabytes the user allowed on top of the data budget, for the agent
-    /// to add (`crate::netusage`).
-    allowed_mb: u64,
+    /// More data the user allowed on a used-up budget, for the agent to
+    /// add: (profile, month, MB), each for the profile and month it was
+    /// asked for (`crate::netusage`).
+    allowed: Vec<(String, String, u64)>,
+    /// The profile in effect, the month, and whether its budget is used
+    /// up: what an "allow more" answers.
+    budget_spot: Option<(String, String, bool)>,
     /// The user chose to work offline (kept in [`OFFLINE_FILE`]).
     offline: bool,
     /// The status as watchers last saw it (its `rev` left at 0).
@@ -250,7 +254,8 @@ impl Control {
                 cloud_full: None,
                 net: oneup_ipc::NetStatus::default(),
                 policy: crate::network::Policy::default(),
-                allowed_mb: 0,
+                allowed: Vec::new(),
+                budget_spot: None,
                 offline,
                 shown: None,
                 paused_told: (pause.local, pause.remote, None),
@@ -458,16 +463,24 @@ impl Control {
         self.lock().offline
     }
 
-    /// The megabytes allowed on top of the data budget since last asked.
-    pub fn take_allowed_mb(&self) -> u64 {
-        std::mem::take(&mut self.lock().allowed_mb)
+    /// The profile in effect (`crate::network::Key::id`), the month, and
+    /// whether its budget is used up.
+    pub fn set_budget_spot(&self, profile: &str, month: &str, reached: bool) {
+        self.lock().budget_spot = Some((profile.to_string(), month.to_string(), reached));
     }
 
-    /// Megabytes taken but not recorded (the write failed): handed out
-    /// again at the next [`Control::take_allowed_mb`].
-    pub fn allow_mb_again(&self, mb: u64) {
+    /// More data allowed since last asked: (profile, month, MB), each to
+    /// be added to the profile and month it was asked for.
+    pub fn take_allowed(&self) -> Vec<(String, String, u64)> {
+        std::mem::take(&mut self.lock().allowed)
+    }
+
+    /// Allowances taken but not recorded (the write failed): handed out
+    /// again at the next [`Control::take_allowed`].
+    pub fn allow_again(&self, a: Vec<(String, String, u64)>) {
         let mut s = self.lock();
-        s.allowed_mb = s.allowed_mb.saturating_add(mb);
+        let later = std::mem::replace(&mut s.allowed, a);
+        s.allowed.extend(later);
     }
 
     /// The folder uses Files On-Demand (cloud files arrive as placeholders,
@@ -673,7 +686,11 @@ impl Control {
                 if !(1..=1_000_000).contains(&mb) {
                     return Err(RpcError::new(INVALID_PARAMS, "allow from 1 MB to 1,000,000 MB"));
                 }
-                s.allowed_mb = s.allowed_mb.saturating_add(mb);
+                // For the budget used up now, on this network, this month.
+                let Some((profile, month, true)) = s.budget_spot.clone() else {
+                    return Err(RpcError::new(INVALID_PARAMS, "this network's data budget isn't used up"));
+                };
+                s.allowed.push((profile, month, mb));
             }
             Call::SyncFirst { path } => {
                 // Bounded: a client can't grow the agent's memory.
@@ -1007,11 +1024,20 @@ mod tests {
     #[test]
     fn more_data_allowed_is_handed_to_the_agent_once() {
         let c = control(None);
+        c.set_budget_spot("metered", "2026-10", false);
+        assert!(c.call(Call::AllowData { mb: 500 }, 0).is_err(), "not used up: nothing to allow");
+        c.set_budget_spot("metered", "2026-10", true);
         assert!(c.call(Call::AllowData { mb: 0 }, 0).is_err());
         c.call(Call::AllowData { mb: 500 }, 0).unwrap();
+        // Another network before the agent takes it: still the metered
+        // profile's, for the month it was asked in.
+        c.set_budget_spot("{HOME}", "2026-10", true);
         c.call(Call::AllowData { mb: 200 }, 0).unwrap();
-        assert_eq!(c.take_allowed_mb(), 700);
-        assert_eq!(c.take_allowed_mb(), 0);
+        let got = c.take_allowed();
+        assert_eq!(got, [("metered".into(), "2026-10".into(), 500), ("{HOME}".into(), "2026-10".into(), 200)]);
+        assert!(c.take_allowed().is_empty());
+        c.allow_again(got.clone());
+        assert_eq!(c.take_allowed(), got, "a failed write hands them out again");
     }
 
     #[test]
