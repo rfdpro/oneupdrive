@@ -68,6 +68,6 @@ Nothing in it is worked out anew, and there's no call for it: the list must also
 * It survives Explorer restarting (`TaskbarCreated`) and closes cleanly on sign-out and on `WM_CLOSE` (`taskkill`, an installer).
 
 ## Limits
-* Per-folder pauses aren't calls: they're config changes (`oneup pause --folder`), which the agent reads each round. Neither are the memory profile, its overrides and the files hashed at once (`[agent]`, [rules.md § User controls](rules.md#user-controls)): the agent reads them when it starts. The activity log is read from the database (`oneup activity`, the settings window), not through the pipe.
+* Per-folder pauses aren't calls: they're config changes (`oneup pause --folder`), which the agent reads each round. Neither are the memory profile, its overrides and the files hashed at once (`[agent]`, [rules.md § User controls](rules.md#user-controls)): the agent reads them when it starts. The activity log is read from the database (`oneup activity`, the settings window), not through the pipe, and so is search (`oneup find`, the Search page; [search.md](search.md)); its **Sync this first** is the `sync_first` call.
 * `oneup sync` doesn't look at the agent's pause: it's an explicit one-off run, and it refuses to run while `oneupd` holds the data folder anyway.
 * The tray icon reflects the main pair only; extra pairs' state is on the settings window's Files page.

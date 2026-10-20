@@ -38,6 +38,7 @@ Below it, grouped:
 * **Excluded, in OneDrive: …** appears when excluded items still have copies in OneDrive: **Show list**, or **Remove or keep…** (below).
 * **Sync failure: … items** appears when some items can't sync until you change them: it opens the Activity page, which lists each one and why.
 * **Install update …** when an update is ready.
+* **Search**: find any file in your OneDrive by name, on the settings window's [Search page](search.md).
 * **Settings**: the [settings window](settings-window.md).
 * **Stop OneUpDrive**, or **Start OneUpDrive** when it isn't running.
 * **Hide icon**: syncing carries on. Starting OneUpDrive from the Start menu brings it back.
