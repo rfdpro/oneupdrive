@@ -565,6 +565,9 @@ pub struct Policy {
     /// Bytes left of this month's data budget (`crate::netusage`); `None`:
     /// no budget.
     pub budget_left: Option<u64>,
+    /// The user chose to work offline (`crate::control`): nothing goes
+    /// over the network but what they open.
+    pub offline: bool,
 }
 
 impl Policy {
@@ -575,6 +578,7 @@ impl Policy {
             small_bytes: p.small_bytes(),
             network: p.network.clone(),
             budget_left: None,
+            offline: false,
         }
     }
 
@@ -582,6 +586,9 @@ impl Policy {
     /// yet) go `way`. Only what moves file contents is ever held:
     /// names, folders, moves, deletions and online-only placeholders go.
     pub fn allows(&self, way: Way, bytes: Option<u64>) -> bool {
+        if self.offline {
+            return false;
+        }
         match self.transfer {
             Transfer::Everything => true,
             Transfer::Paused | Transfer::Metadata => false,
@@ -598,6 +605,9 @@ impl Policy {
 
     /// Why what it holds waits, for `oneup status` and `oneup explain`.
     pub fn why(&self) -> String {
+        if self.offline {
+            return OFFLINE_WHY.into();
+        }
         let here = if self.network.is_empty() { "this network".to_string() } else { self.network.clone() };
         match self.transfer {
             Transfer::Small => format!(
@@ -611,6 +621,9 @@ impl Policy {
         }
     }
 }
+
+/// Why everything waits while working offline.
+pub const OFFLINE_WHY: &str = "working offline; sent and fetched once you go back online";
 
 /// Which way a transfer goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

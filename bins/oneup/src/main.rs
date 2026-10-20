@@ -442,6 +442,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<HooksCmd>,
     },
+    /// Work offline (nothing goes over the network but files you open) or
+    /// go back online; without on/off, list what waits, the largest first
+    Offline {
+        #[arg(value_enum)]
+        state: Option<Toggle>,
+    },
     /// Show the network this PC is on and what syncs on it, or change that
     /// for metered networks, this network or the default
     Network {
@@ -2407,6 +2413,11 @@ async fn run() -> Result<()> {
                 yes: r.yes,
             };
             unsynced_cmd::resolve(&data_dir(&cli)?, open_store(&cli, r.profile.memory_profile)?, ask).await
+        }
+        Cmd::Offline { state: Some(t) } => agent::offline(&data_dir(&cli)?, t.on()).await,
+        Cmd::Offline { state: None } => {
+            agent::status(&data_dir(&cli)?).await?;
+            netcmd::waiting(&open_store(&cli, MemoryProfile::Balanced)?, 30)
         }
         Cmd::Network { cmd: None } => netcmd::show(&data_dir(&cli)?),
         Cmd::Network {

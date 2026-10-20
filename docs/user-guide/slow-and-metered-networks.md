@@ -85,3 +85,13 @@ A large file whose upload the connection cut off goes on from where it stopped, 
 Windows tells OneUpDrive when the network changes, so switching to a phone hotspot, back to your home Wi-Fi or getting the internet back takes effect within seconds, also in the middle of a sync.
 
 On a network that wants you to sign in first (a hotel's, a train's or an airport's Wi-Fi page), OneUpDrive waits instead of trying and failing: `oneup status` says **paused by itself: waiting for the internet: sign in to this network first**. Once you've signed in, it goes on by itself. With no network at all it waits the same way.
+
+## Work offline
+
+**Work offline** (the icon's menu, **Network → Work offline**, or `oneup offline on`) stops all syncing over the network, whatever network you're on: on a plane, on an expensive connection you only want for e-mail. Changes on this PC still collect, and OneUpDrive keeps the queue of what waits. Opening an online-only file still downloads it. It stays offline, also after a restart, until you go back online.
+
+```
+oneup offline on       # work offline
+oneup offline          # what waits, the largest first
+oneup offline off      # back online: what waited syncs now
+```

@@ -7,7 +7,7 @@ While OneUpDrive runs, its icon (a blue cloud lifted one step above its base) si
 |---|---|
 | Blue icon | Up to date |
 | Blue icon, dark blue badge with a ring | Syncing |
-| Grey icon, pause badge | Paused, by you or by itself (on a metered connection, with battery saver on, during a game or presentation, in quiet hours) |
+| Grey icon, pause badge | Paused, by you or by itself (on a metered connection, with battery saver on, during a game or presentation, in quiet hours, with a network's data budget used up, or waiting for the internet) |
 | Blue icon, yellow **!** | Needs your review: something waits for your decision |
 | Blue icon, red **!** | A problem: OneUpDrive retries by itself, or stopped (see [When something goes wrong](troubleshooting.md)) |
 | Faded grey icon | OneUpDrive isn't running |
@@ -34,6 +34,8 @@ Below it, grouped:
 * **Open folder**: your synced folder in File Explorer.
 * **Sync now**: check both sides for changes straight away.
 * **Pause** for 30 minutes, 2 hours, 8 hours or until you resume, and **Resume**.
+* **Work offline** and **Go back online**: see [Slow and metered connections](slow-and-metered-networks.md#work-offline).
+* **Allow 500 MB more**, when a network's monthly data budget is used up (a notification tells you when it is).
 * **Recent activity**: what OneUpDrive did lately, on the settings window's [Activity page](settings-window.md#activity).
 * **Error details…** appears with a problem ("Problem: …" or "Stopped: …" at the top): it opens the settings window's problem card, with what happened, what to do, **Retry now** and **Copy details**. See [When something goes wrong](troubleshooting.md).
 * **Review …** and **Possibly encrypted: … files** appear when something needs your review (below).
