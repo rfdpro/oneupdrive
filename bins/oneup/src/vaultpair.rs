@@ -538,12 +538,10 @@ impl Cloud for PairCloud {
         }
     }
 
-    /// A vault's items are encrypted entries whose names and folders in
-    /// OneDrive aren't the vault's: it can't tell.
     async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
         match self {
             PairCloud::Plain(c) => c.is_at(id, parent, name).await,
-            PairCloud::Vault(_) => Ok(None),
+            PairCloud::Vault(c) => c.is_at(id, parent, name).await,
         }
     }
 

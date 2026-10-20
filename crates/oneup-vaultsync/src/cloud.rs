@@ -420,6 +420,24 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         Err(CloudError::Other("rules don't remove items from a vault".into()))
     }
 
+    /// From the encrypted entry itself: it's in vault folder `parent` under
+    /// `name` if OneDrive has it in that folder's storage folder under the
+    /// name `name` encrypts to there (a `.c9s` name for a long one). A
+    /// folder's ID never changes, so neither do those; one read of the
+    /// entry, nothing decrypted. A folder this cloud doesn't know: can't tell.
+    async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
+        let Ok(p) = self.node(parent) else { return Ok(None) };
+        let Some(dir_id) = p.dir_id else { return Ok(None) };
+        // No storage folder yet: nothing is in that folder.
+        let Some(storage) = p.storage else { return Ok(Some(false)) };
+        let enc = names::encrypt_name(&self.vault.key, name, &dir_id).map_err(other)?;
+        let stored = Stored::of(enc, self.vault.threshold);
+        let now = self.inner.item(id).await?;
+        Ok(Some(
+            now.is_some_and(|r| r.parent_id.as_deref() == Some(storage.as_str()) && r.name == stored.stored_name()),
+        ))
+    }
+
     /// Not offered: an encrypted folder's entries aren't the vault's items,
     /// so a folder too large for OneDrive to move at once can't be moved in
     /// parts here (the move is reported as failed).

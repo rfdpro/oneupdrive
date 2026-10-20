@@ -293,3 +293,46 @@ async fn refused_entries_keep_their_rows_and_produce_no_deletions() {
     let after: Vec<RemoteRow> = s.pairs.read(|o| o.all_items()).unwrap().into_iter().map(|(r, _)| r).collect();
     assert_eq!(after, before);
 }
+
+/// Where a vault item is, read from its encrypted entry in OneDrive, not
+/// from the last projection: what lets a move here that follows one in the
+/// vault check OneDrive still has the item there (`Cloud::is_at`), so a
+/// projection behind OneDrive can't undo a rename made here since.
+#[tokio::test]
+async fn a_vault_item_is_where_its_encrypted_entry_is() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = format!("{}.txt", "a long name ".repeat(20));
+    let a = RemoteId(s.vc.mkdir(&root, "A").await.unwrap().id);
+    let b = RemoteId(s.vc.mkdir(&root, "B").await.unwrap().id);
+    s.vc.upload(&a, "x.txt", None, 1, &mut &b"x"[..]).await.unwrap();
+    s.vc.upload(&a, &long, None, 1, &mut &b"l"[..]).await.unwrap();
+    s.vc.upload(&b, "z.txt", None, 1, &mut &b"z"[..]).await.unwrap();
+    s.refresh().await;
+    let (x, l) = (s.id("/A/x.txt"), s.id(&format!("/A/{long}")));
+    let at = |id: &RemoteId, dir: &RemoteId, name: &str| {
+        let (id, dir, name) = (id.clone(), dir.0.clone(), name.to_string());
+        let vc = &s.vc;
+        async move { vc.is_at(&id, &dir, &name).await.unwrap() }
+    };
+    assert_eq!(at(&x, &a, "x.txt").await, Some(true));
+    assert_eq!(at(&l, &a, &long).await, Some(true), "a long name, by its .c9s entry");
+    assert_eq!(at(&x, &b, "x.txt").await, Some(false), "another folder");
+    assert_eq!(at(&x, &a, "y.txt").await, Some(false), "another name");
+    assert_eq!(at(&x, &RemoteId("unknown".into()), "x.txt").await, None, "a folder the vault doesn't know");
+
+    // Moved through the vault: where it went, not where it was.
+    let moved = s.vc.move_item(&s.pre("/A/x.txt"), &b, "y.txt").await.unwrap();
+    let x = RemoteId(moved.id);
+    assert_eq!(at(&x, &a, "x.txt").await, Some(false));
+    assert_eq!(at(&x, &b, "y.txt").await, Some(true));
+
+    // Moved in OneDrive behind the projection's back (another device):
+    // the entry says so before any projection does.
+    let elsewhere = s.cloud.0.lock().unwrap().items[&s.id("/B/z.txt").0].parent.clone();
+    let a_storage = s.cloud.0.lock().unwrap().items[&l.0].parent.clone();
+    assert_ne!(elsewhere, a_storage);
+    s.cloud.0.lock().unwrap().items.get_mut(&l.0).unwrap().parent = elsewhere;
+    assert_eq!(at(&l, &a, &long).await, Some(false));
+}
