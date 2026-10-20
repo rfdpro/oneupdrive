@@ -787,6 +787,45 @@ pub fn save_experimental(data_dir: &Path, on: bool) -> Result<()> {
     )
 }
 
+/// The `[search]` section (`crate::search`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Search {
+    /// Also ask OneDrive to search inside files (sends what's searched for
+    /// to Microsoft). Off unless turned on.
+    pub onedrive: bool,
+    /// The key combination that opens search from anywhere (`Ctrl+Alt+F`);
+    /// empty: none.
+    pub hotkey: String,
+}
+
+pub fn load_search(data_dir: &Path) -> Result<Search> {
+    let mut s = Search::default();
+    let Some(doc) = read_doc(data_dir)? else { return Ok(s) };
+    let Some(t) = section(&doc, "search")? else { return Ok(s) };
+    if let Some(b) = t.get("onedrive") {
+        s.onedrive = b.as_bool().with_context(|| format!("{FILE}: search.onedrive must be true or false"))?;
+    }
+    if let Some(h) = t.get("hotkey") {
+        let h = h.as_str().with_context(|| format!("{FILE}: search.hotkey must be a string"))?.trim();
+        if !h.is_empty() {
+            crate::search::Hotkey::parse(h).with_context(|| format!("{FILE}: search.hotkey"))?;
+        }
+        s.hotkey = h.to_string();
+    }
+    Ok(s)
+}
+
+pub fn save_search(data_dir: &Path, s: &Search) -> Result<()> {
+    save(
+        data_dir,
+        "search",
+        "# Search: onedrive = true also asks OneDrive to search inside files (sends the search text to Microsoft);
+         # hotkey = \"Ctrl+Alt+F\" opens search from anywhere (\"\" for none).
+",
+        vec![("onedrive", value(s.onedrive)), ("hotkey", value(s.hotkey.as_str()))],
+    )
+}
+
 /// Checks a rule the user typed: it must be one rule line.
 pub fn check_rule(line: &str) -> Result<()> {
     if line.contains(['\n', '\r']) {

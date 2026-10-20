@@ -38,8 +38,8 @@ mod win {
         /// The data folder whose settings to show
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Open on this page (files, apps, activity, unsynced, excluded,
-        /// stops, general, accounts, office, safety, network, about)
+        /// Open on this page (files, find, apps, activity, unsynced,
+        /// excluded, stops, general, accounts, office, safety, network, about)
         #[arg(long, default_value = "")]
         page: String,
         /// For the "item" page: the file or folder to show
@@ -324,6 +324,36 @@ mod win {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
                 let steps = oneup_app::filetree::steps_from(&args["steps"])?;
                 tokio::task::spawn_blocking(move || oneup_app::filetree::sizes(&d, &rel, &steps)).await?
+            }
+            // The Search page: names from the index (built first, once,
+            // with its progress told to the page), then, if asked,
+            // OneDrive's own search inside files.
+            "search" => {
+                let (d, q, p) = (dir.to_path_buf(), text(args, "q"), poster.clone());
+                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let store = oneup_app::search::open(&d, |n| {
+                        p.post(json!({ "event": "search_build", "items": n }).to_string());
+                    })?;
+                    Ok(oneup_app::search::to_json(&oneup_app::search::find(&d, &store, &q, limit)?))
+                })
+                .await?
+            }
+            "search_onedrive" => {
+                // Nothing goes to Microsoft unless the setting says so.
+                if !oneup_app::config::load_search(dir)?.onedrive {
+                    bail!("turn on Search inside files first");
+                }
+                let q = text(args, "q");
+                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                let g = oneup_app::search::graph(dir, None)?;
+                let found = oneup_app::search::find_in_onedrive(dir, &g, &q, limit).await?;
+                Ok(oneup_app::search::to_json(&found))
+            }
+            "open_in_onedrive" => {
+                let g = oneup_app::search::graph(dir, None)?;
+                oneup_app::search::open_in_onedrive(&g, &text(args, "id")).await?;
+                Ok(Value::Null)
             }
             "tree_find" => {
                 let (d, q) = (dir.to_path_buf(), text(args, "q"));

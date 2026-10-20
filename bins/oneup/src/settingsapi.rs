@@ -28,6 +28,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
     let space = config::load_space(dir)?;
     let updates = config::load_updates(dir)?;
     let (first, last) = config::load_priority(dir)?;
+    let search = config::load_search(dir)?;
     let vaults: Vec<Value> = crate::vaultpair::list(dir)
         .iter()
         .map(|e| {
@@ -142,6 +143,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "experimental": config::load_experimental(dir)?,
         "office_opener": { "registered": crate::officeopen::is_registered(), "defaults": crate::officeopen::defaults() },
         "priority": { "first": first, "last": last },
+        "search": { "onedrive": search.onedrive, "hotkey": search.hotkey },
         "kept_folder": local.as_deref().map(|l| shown(&Path::new(l).join(oneup_rules::ENGINE_DIR).join("versions").to_string_lossy())),
     }))
 }
@@ -499,6 +501,23 @@ pub fn updates_with(mut u: config::Updates, v: &Value) -> Result<config::Updates
     Ok(u)
 }
 
+/// The `[search]` changed by the fields present in `v` (a hotkey written
+/// as `Hotkey` writes it; empty or `off`: none).
+pub fn search_with(mut s: config::Search, v: &Value) -> Result<config::Search> {
+    if let Some(b) = get(v, "onedrive") {
+        s.onedrive = b.as_bool().context("onedrive: on or off")?;
+    }
+    if let Some(h) = get(v, "hotkey") {
+        let h = h.as_str().context("hotkey: keys like Ctrl+Alt+F")?.trim();
+        s.hotkey = if h.is_empty() || h.eq_ignore_ascii_case("off") {
+            String::new()
+        } else {
+            crate::search::Hotkey::parse(h)?.to_string()
+        };
+    }
+    Ok(s)
+}
+
 /// The version-store changes in `v`.
 pub fn versions_changes(v: &Value) -> Result<crate::versions::Changes> {
     let flag = |k: &str| get(v, k).map(|x| x.as_bool().with_context(|| format!("{k}: expected on or off"))).transpose();
@@ -801,6 +820,13 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
             let u = updates_with(config::load_updates(dir)?, v)?;
             config::save_updates(dir, &u)
         }
+        "search" => {
+            let s = search_with(config::load_search(dir)?, v)?;
+            config::save_search(dir, &s)?;
+            // The icon in the notification area holds the hotkey.
+            crate::tray::settings_changed(dir);
+            Ok(())
+        }
         "priority" => {
             let (mut first, mut last) = config::load_priority(dir)?;
             let lines = |k: &str| -> Result<Option<Vec<String>>> {
@@ -965,6 +991,16 @@ mod tests {
         assert!(updates_with(config::Updates::default(), &json!({ "channel": "nightly" })).is_err());
         let r = rules_with(Rules::default(), &json!({ "paused": ["\\Big\\Videos\\", "", "/Work/"] })).unwrap();
         assert_eq!(r.paused, vec!["Big/Videos".to_string(), "Work".into()]);
+    }
+
+    #[test]
+    fn search_changes_are_checked() {
+        let s = search_with(config::Search::default(), &json!({ "onedrive": true, "hotkey": "ctrl+alt+f" })).unwrap();
+        assert_eq!((s.onedrive, s.hotkey.as_str()), (true, "Ctrl+Alt+F"));
+        let s = search_with(s, &json!({ "hotkey": "off" })).unwrap();
+        assert_eq!((s.onedrive, s.hotkey.as_str()), (true, ""));
+        assert!(search_with(config::Search::default(), &json!({ "hotkey": "F" })).is_err());
+        assert!(search_with(config::Search::default(), &json!({ "onedrive": "yes" })).is_err());
     }
 
     #[test]
