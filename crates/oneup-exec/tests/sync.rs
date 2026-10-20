@@ -129,6 +129,9 @@ struct State {
     during_upload: Option<Box<dyn FnOnce() + Send>>,
     /// OneDrive's recycle bin, by ID: what `restore` brings back.
     bin: BTreeMap<String, Item>,
+    /// The next restore brings the item back under another name than
+    /// asked, or (`new_id`) as another item.
+    restore_odd: Option<(String, bool)>,
 }
 
 /// See [`State::on_remove`].
@@ -871,8 +874,15 @@ impl Cloud for Fake {
             it.parent = Some(parent.0.clone());
             it.name = name.into();
             it.etag = etag;
-            s.items.insert(id.0.clone(), it);
-            Ok(s.row(&id.0))
+            let mut at = id.0.clone();
+            if let Some((other, new_id)) = s.restore_odd.take() {
+                it.name = other;
+                if new_id {
+                    at = format!("r{}", s.bump());
+                }
+            }
+            s.items.insert(at.clone(), it);
+            Ok(s.row(&at))
         })
         .await
     }
@@ -5785,6 +5795,9 @@ impl Sync {
             .unwrap()
             .expect("the folder was there then");
         self.stops.allowed = true;
+        // An earlier rewind's approval is spent (the agent drops it once its
+        // changes ran).
+        self.stops.approved.clear();
         self.stops.rewind = Some(Rewinding { folder: sid, at, ..Rewinding::default() });
     }
 
@@ -6191,6 +6204,43 @@ async fn everyday_an_edit_after_a_rewind_ran_is_judged_on_its_own() {
     let r = s.round().await;
     assert!(r.done.is_empty(), "nothing runs: {r:?}");
     assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Mass), "a stop of its own");
+}
+
+
+#[tokio::test]
+async fn everyday_what_a_restore_brings_back_is_checked_not_assumed() {
+    // OneDrive brings a deleted file back under another name than asked:
+    // the rewind moves it to its name then, through the gate.
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-restore-odd", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a");
+    write(&s.p("docs/b.txt"), b"b");
+    s.settle().await;
+    let at = moment();
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    s.settle().await;
+    cloud.0.lock().unwrap().restore_odd = Some(("b 1.txt".into(), false));
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    let t = local_tree(&s.dir.0);
+    assert_eq!(t.get("/docs/b.txt"), Some(&Some(b"b".to_vec())), "{t:?}");
+    assert!(!t.contains_key("/docs/b 1.txt"));
+
+    // As another item: said at once, and it comes here as a new file.
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    s.settle().await;
+    cloud.0.lock().unwrap().restore_odd = Some(("b.txt".into(), true));
+    s.start_rewind("/docs", at);
+    assert!(s.round().await.done.is_empty());
+    s.stops.approve();
+    let r = s.attempt().await;
+    assert!(r.failed.iter().any(|(_, why)| why.contains("as another item")), "said at once: {r:?}");
+    for _ in 0..10 {
+        let r = s.attempt().await;
+        if r.is_idle() && r.skipped.is_empty() && s.stops.rewind.as_ref().is_some_and(|r| r.done) {
+            break;
+        }
+    }
+    assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"b", "nothing lost");
 }
 
 // ---------------------------------------------------------------- duplicates

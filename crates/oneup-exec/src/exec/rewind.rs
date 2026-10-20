@@ -49,7 +49,20 @@ impl<C: Cloud> Executor<C> {
                     Err(e) => return Err(e.into()),
                 };
                 self.crash_point()?;
+                // What came back is checked, not assumed: it's recorded as
+                // it is (this PC gets it, whatever happens next).
                 store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
+                if row.id != id.0 {
+                    return Err(Fail::Failed(
+                        "OneDrive brought it back as another item; it comes to this PC as a new one".into(),
+                    ));
+                }
+                if row.parent_id.as_deref() != Some(to.0.as_str()) || row.name != *name {
+                    // Back, but elsewhere (another folder or name): the
+                    // rewind's next round moves it, from where it is.
+                    tracing::warn!("OneDrive restored an item somewhere other than asked");
+                    return Ok(());
+                }
                 if let (NodeKind::File, Some((size, hash))) = (kind, content)
                     && row.qxh != Some(*hash)
                 {
