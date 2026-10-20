@@ -30,6 +30,12 @@ OneUpDrive writes down each step before doing it, so after a restart it finishes
 **Can it lose my files?**
 It's built so it can't without telling you first. It never treats a missing file as a deletion, keeps both copies when both sides changed, keeps a copy of anything it removes from your PC, and stops to ask before many deletions at once or when edited files suddenly look encrypted (as ransomware leaves them). Details: [Syncing in depth](syncing.md).
 
+**Why did OneUpDrive stop and ask me?**
+It makes a **safety stop** before many files are deleted, overwritten or moved at once, or when edited files suddenly look encrypted. Nothing changes until you answer: select the icon's **Review …**. See [Safety stop](syncing.md#safety-stop).
+
+**What do "online-only", "folder pair" and the other words mean?**
+See [Words used in this guide](glossary.md).
+
 **Is there encryption?**
 Yes: [encrypted vaults](vaults.md) (experimental), compatible with the Cryptomator apps, so you can open them on your phone too.
 
