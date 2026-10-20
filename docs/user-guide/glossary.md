@@ -30,6 +30,8 @@
 
 **Paused folder**: a folder whose changes wait until you resume it.
 
+**Pin rule**: a rule, written like an exclusion rule, for files and folders to always keep on this device (with Files On-Demand). See [Files On-Demand](files-on-demand.md#always-keeping-files-by-rule).
+
 **Ransomware guard**: a safety stop that triggers when many edited files suddenly stop looking like what they are. See [Syncing in depth](syncing.md#the-content-guard-ransomware).
 
 **Recovery key**: the line starting `OUD1-` that opens an [encrypted vault](vaults.md) if you forget its password.
