@@ -421,21 +421,41 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
     }
 
     /// From the encrypted entry itself: it's in vault folder `parent` under
-    /// `name` if OneDrive has it in that folder's storage folder under the
-    /// name `name` encrypts to there (a `.c9s` name for a long one). A
-    /// folder's ID never changes, so neither do those; one read of the
-    /// entry, nothing decrypted. A folder this cloud doesn't know: can't tell.
+    /// `name` if OneDrive has its entry in that folder's storage folder
+    /// under the name `name` encrypts to there, in the shape that name
+    /// takes, and still carrying the item. A short-name file's entry is its
+    /// own `.c9r` file (one read). A long-name file's is a `.c9s` folder
+    /// that must still hold its `contents.c9r`, and a folder's a `.c9r` or
+    /// `.c9s` folder that must still hold its `dir.c9r` (two reads: the
+    /// entry, then its contents): a move that changed the entry's shape
+    /// can leave the old entry behind holding only its name, which isn't
+    /// the item any more. A folder's ID never changes, so neither do these;
+    /// nothing is decrypted. An item or folder this cloud doesn't know:
+    /// can't tell.
     async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
-        let Ok(p) = self.node(parent) else { return Ok(None) };
+        let (Ok(n), Ok(p)) = (self.node(&id.0), self.node(parent)) else { return Ok(None) };
         let Some(dir_id) = p.dir_id else { return Ok(None) };
         // No storage folder yet: nothing is in that folder.
         let Some(storage) = p.storage else { return Ok(Some(false)) };
         let enc = names::encrypt_name(&self.vault.key, name, &dir_id).map_err(other)?;
         let stored = Stored::of(enc, self.vault.threshold);
-        let now = self.inner.item(id).await?;
-        Ok(Some(
-            now.is_some_and(|r| r.parent_id.as_deref() == Some(storage.as_str()) && r.name == stored.stored_name()),
-        ))
+        let payload = match (n.kind, &stored) {
+            (NodeKind::File, Stored::Full(_)) => None,
+            (NodeKind::File, Stored::Short { .. }) => Some(CONTENTS_FILE),
+            (NodeKind::Dir, _) => Some(DIR_FILE),
+            (NodeKind::Root, _) => return Ok(None),
+        };
+        let Some(entry) = self.inner.item(id).await? else { return Ok(Some(false)) };
+        let kind = if payload.is_some() { Kind::Folder } else { Kind::File };
+        if entry.kind != kind
+            || entry.parent_id.as_deref() != Some(storage.as_str())
+            || entry.name != stored.stored_name()
+        {
+            return Ok(Some(false));
+        }
+        let Some(file) = payload else { return Ok(Some(true)) };
+        let inside = self.inner.children(id).await?;
+        Ok(Some(inside.iter().any(|c| c.kind == Kind::File && c.name.eq_ignore_ascii_case(file))))
     }
 
     /// Not offered: an encrypted folder's entries aren't the vault's items,

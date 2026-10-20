@@ -333,6 +333,35 @@ async fn a_vault_item_is_where_its_encrypted_entry_is() {
     let elsewhere = s.cloud.0.lock().unwrap().items[&s.id("/B/z.txt").0].parent.clone();
     let a_storage = s.cloud.0.lock().unwrap().items[&l.0].parent.clone();
     assert_ne!(elsewhere, a_storage);
-    s.cloud.0.lock().unwrap().items.get_mut(&l.0).unwrap().parent = elsewhere;
+    s.cloud.0.lock().unwrap().items.get_mut(&l.0).unwrap().parent = elsewhere.clone();
     assert_eq!(at(&l, &a, &long).await, Some(false));
+}
+
+/// Every entry shape is where it is only while it still carries the item:
+/// an entry left behind by a move that changed its shape, holding only its
+/// name, isn't the item. A long-name file without its `contents.c9r`, a
+/// folder (short or long name) without its `dir.c9r`.
+#[tokio::test]
+async fn a_vault_entry_without_its_contents_is_not_the_item() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = |w: &str| format!("{w} long name ").repeat(20);
+    let a = RemoteId(s.vc.mkdir(&root, "A").await.unwrap().id);
+    s.vc.upload(&a, &long("file"), None, 1, &mut &b"l"[..]).await.unwrap();
+    s.vc.mkdir(&a, "Dir").await.unwrap();
+    s.vc.mkdir(&a, &long("dir")).await.unwrap();
+    s.refresh().await;
+    for (name, payload) in [(long("file"), "contents.c9r"), ("Dir".into(), "dir.c9r"), (long("dir"), "dir.c9r")] {
+        let id = s.id(&format!("/A/{name}"));
+        assert_eq!(s.vc.is_at(&id, &a.0, &name).await.unwrap(), Some(true), "{name}");
+        // What carries it moves out (a move that changed the entry's shape,
+        // whose old entry stayed).
+        {
+            let mut c = s.cloud.0.lock().unwrap();
+            let inside = c.child(&id.0, payload).unwrap_or_else(|| panic!("{name}: no {payload}"));
+            c.items.get_mut(&inside).unwrap().parent = Some(root.0.clone());
+        }
+        assert_eq!(s.vc.is_at(&id, &a.0, &name).await.unwrap(), Some(false), "{name}: only a shell is left");
+    }
 }
