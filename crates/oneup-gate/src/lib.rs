@@ -128,6 +128,39 @@ pub fn unknown_size(op: &Op) -> bool {
     matches!(op, Op::PruneRemote { exact: false, .. })
 }
 
+/// Whether `op` trips its side's breaker whatever the counts: one of
+/// [`unknown_size`]. The one rule both [`review_in`] and [`may_stop`] use,
+/// so any operation that must always be asked about is covered by both.
+pub fn always_stops(op: &Op) -> bool {
+    unknown_size(op)
+}
+
+/// Whether reviewing a round could raise a safety stop, or match an
+/// approved list: whether the caller must read the paths the stops' lists
+/// show ([`Context::paths`]) before reviewing. Never false where
+/// [`review_in`] could stop: an operation that [`always_stops`], counts
+/// over the smaller limit ([`weight`], with `pending` and the window), a
+/// file the content guard judged, or a list approved before.
+pub fn may_stop(
+    policy: &Policy,
+    ops: &[Op],
+    pending: &[Op],
+    recent: Recent,
+    any_approved: bool,
+    any_suspicious: bool,
+) -> bool {
+    let mass = ops.iter().chain(pending).filter(|o| is_mass_sensitive(o));
+    let (mut n, mut always) = (0usize, false);
+    for o in mass {
+        n = n.saturating_add(weight(o));
+        always |= always_stops(o);
+    }
+    any_approved
+        || any_suspicious
+        || always
+        || n.saturating_add(recent.local.max(recent.remote)) > policy.min_count.min(policy.max_count)
+}
+
 /// How many items `op` counts as for the circuit breakers: a pruned folder
 /// counts as everything in it (for one of [`unknown_size`], as many as
 /// are known).
@@ -528,7 +561,7 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         let weighed = weigh(&batch).saturating_add(later.len());
         let n = weighed.saturating_add(cx.recent.on(side));
         // A folder of unknown size may hold any number: always asked.
-        let too_many = batch.iter().any(|(_, o, _)| unknown_size(o))
+        let too_many = batch.iter().any(|(_, o, _)| always_stops(o))
             || n > policy.max_count
             || (n > policy.min_count
                 && (n as u128) * 100 > u128::from(policy.max_percent) * u128::from(cx.synced_items));

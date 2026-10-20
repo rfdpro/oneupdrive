@@ -541,27 +541,6 @@ fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId], pol
     r
 }
 
-/// Whether anything in a round could trip a stop (or a list is approved),
-/// so the gate needs the paths its lists show. Counted as the breakers
-/// count (`oneup_gate::weight`: a pruned folder is everything in it).
-fn may_trip(
-    policy: &oneup_gate::Policy,
-    ops: &[Op],
-    pending: &[Op],
-    recent: Recent,
-    approved: bool,
-    suspicious: bool,
-) -> bool {
-    let mass = ops
-        .iter()
-        .chain(pending)
-        .filter(|o| is_mass_sensitive(o))
-        .fold(0usize, |n, o| n.saturating_add(oneup_gate::weight(o)));
-    approved
-        || suspicious
-        || mass.saturating_add(recent.local.max(recent.remote)) > policy.min_count.min(policy.max_count)
-}
-
 /// Safety stops an engine raised, and what the user approved of them.
 ///
 /// Approving a stop approves its list, item by item (`oneup_gate::ItemKey`):
@@ -1905,7 +1884,7 @@ fn plan_round<'a>(
     // The paths a stop's list shows are part of what an approval covers.
     // Read only when something could trip or a list is approved.
     let (paths, pending_paths) =
-        if may_trip(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty()) {
+        if oneup_gate::may_stop(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty()) {
             store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
         } else {
             (Vec::new(), Vec::new())
@@ -3405,7 +3384,7 @@ mod tests {
             exact: true,
             keep: Vec::new(),
         };
-        assert!(may_trip(&p, std::slice::from_ref(&prune), &[], Recent::default(), false, false));
+        assert!(oneup_gate::may_stop(&p, std::slice::from_ref(&prune), &[], Recent::default(), false, false));
         let shown = vec!["/node_modules/".to_string()];
         let cx = GateContext { synced_items: 100_000, paths: &shown, ..GateContext::default() };
         let b = review_in(&p, &cx, vec![prune.clone()]).breakers.remove(0);
@@ -3422,6 +3401,82 @@ mod tests {
         let mut done = Recent::default();
         done.add_op(&prune, &[], &p);
         assert_eq!(done.remote, 1000);
+    }
+
+    /// A removal of unknown size (a folder never listed in full, of which
+    /// 10 items are known) goes through a round as the engine plans it:
+    /// it raises a stop whose list is keyed with the path it shows, so
+    /// approving it works the first time (from the agent's list, or by its
+    /// code as `oneup sync --approve` does), and a move of a folder above it
+    /// between `status` and `approve` makes it a stop of its own again.
+    #[test]
+    fn a_removal_of_unknown_size_is_approved_where_it_was_shown() {
+        use oneup_store::RemoteRow;
+        let row = |id: &str, parent: &str, name: &str, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                o.upsert_item(
+                    &RemoteRow { parent_id: None, kind: Kind::Root, ..row("root", "", "", Kind::Root) },
+                    false,
+                )?;
+                o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+                o.upsert_item(&row("other", "top", "Other", Kind::Folder), false)?;
+                o.upsert_item(&row("app", "top", "App", Kind::Folder), false)?;
+                // Skipped by name when listing: nothing inside was ever seen.
+                o.upsert_item(&row("nm", "app", "node_modules", Kind::Folder), true)?;
+                oneup_exec::link_roots(o, 1, "top").map(|_| ())
+            })
+            .unwrap();
+        // As found and counted: 10 direct children, all OneDrive tells.
+        let prune = Op::PruneRemote {
+            remote: oneup_sync::RemotePre { id: RemoteId("nm".into()), etag: "e".into() },
+            forget: Vec::new(),
+            items: 10,
+            exact: false,
+            keep: Vec::new(),
+        };
+        let rules = RuleSet::new(&["dev"], &[] as &[&str]).unwrap();
+        let round = |store: &Store, approved: &[ItemKey], codes: Vec<u64>| {
+            let controls =
+                Controls { answers: Answers { approve: codes, ..Answers::default() }, ..Controls::default() };
+            let modes = Modes { pull: true, extra: vec![prune.clone()] };
+            plan_round(store, None, Scope::All, &controls, Recent::default(), &rules, modes, approved).unwrap().review
+        };
+
+        let r = round(&store, &[], Vec::new());
+        assert_eq!(r.breakers.len(), 1, "10 known items, but it may hold any number");
+        let b = r.breakers[0].clone();
+        assert!(b.at_least);
+        let shown = store.read(|o| Ok(stop_ops(&r, 0).into_iter().map(|op| describe(o, op).path).collect::<Vec<_>>()));
+        assert_eq!(shown.unwrap(), ["/App/node_modules"]);
+        let at = |path: &str| oneup_gate::item_key(BreakerKind::Mass, &prune, path);
+        assert_eq!(b.items, [at("/App/node_modules")], "keyed with the path the list shows");
+
+        // Approved the first time, from the agent's list or by the code.
+        let r = round(&store, &b.items, Vec::new());
+        assert!(r.breakers.is_empty() && r.approved.len() == 1, "{:?}", r.breakers);
+        let r = round(&store, &[], vec![b.fingerprint.0]);
+        assert!(r.breakers.is_empty() && r.approved.len() == 1);
+        assert_eq!(r.answered.len(), 1);
+
+        // `App` moved into `Other` between `status` and `approve`.
+        store.write(|o| o.upsert_item(&row("app", "other", "App", Kind::Folder), false).map(|_| ())).unwrap();
+        let r = round(&store, &b.items, Vec::new());
+        assert_eq!(r.breakers.len(), 1, "the same folder elsewhere isn't what was approved");
+        assert!(r.approved.is_empty());
+        assert_eq!(r.breakers[0].items, [at("/Other/App/node_modules")]);
+        let r = round(&store, &[], vec![b.fingerprint.0]);
+        assert_eq!(r.breakers.len(), 1, "nor does the old code approve it");
     }
 
     /// What a round may carry out is counted for the safety window before
