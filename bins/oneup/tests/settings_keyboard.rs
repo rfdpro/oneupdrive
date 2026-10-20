@@ -30,7 +30,12 @@ const HOST_ANSWERS = {
     {pair: {local: "C:\\Sync"}, agent: {memory: "balanced"}, versions: {}, safety: {max_changes: 200, max_percent: 10, content_guard: 20},
       updates: {auto: true, channel: "stable"}, onedrive_app: {folders: [], top_files: false}, office_opener: {registered: false, defaults: []},
       search: {onedrive: false, hotkey: ""}, setup: {allowed: true}, tuning: [], version: "0.0.0", data_dir: "C:\\Data",
-      autostart: false, signed_in: true},
+      autostart: false, signed_in: true,
+      sync: {interval_minutes: 15, keep_push: false},
+      network: {this: {id: "{11111111-2222-3333-4444-555555555555}", name: "Home Wi-Fi", metered: false, connectivity: "internet"},
+        own: {transfer: "small", small_mb: 5, upload_kib: null, download_kib: null, interval_minutes: null, keep_push: "on", budget_mb: null},
+        metered: {transfer: "paused", small_mb: null, upload_kib: null, download_kib: null, interval_minutes: null, keep_push: null, budget_mb: 2000},
+        small_mb_default: 10}},
   roots: [{id: "main", kind: "main", local: "C:\\Sync", remote: "/", on_demand: true, running: true},
           {id: "pair:Photos", kind: "pair", name: "Photos", local: "D:\\Photos", remote: "/Photos", running: true}],
   tree: a => ({more: 0, items: a.rel === "" ? [
@@ -159,6 +164,24 @@ const DRIVER: &str = r##"<script>
     check("it opens its files", document.querySelector("#apps-table .cell-btn").getAttribute("aria-expanded") === "true", "");
     await loadApps(true); await sleep(100);
     check("a reload keeps focus on it", document.activeElement.classList.contains("cell-btn"), at());
+
+    // Network: the sync interval, this network's settings and the metered
+    // ones are filled in and reachable from the keyboard.
+    document.querySelector('nav [data-page="network"]').click(); await sleep(300);
+    check("the sync interval is shown", document.querySelector('[data-sync="interval_minutes"]').value === "15",
+      document.querySelector('[data-sync="interval_minutes"]').value);
+    check("this network is named", document.querySelector("#net-name").textContent === "Home Wi-Fi", document.querySelector("#net-name").textContent);
+    check("its own settings are shown", document.querySelector('[data-net-this="transfer"]').value === "small"
+      && document.querySelector('[data-net-this="keep_push"]').value === "on" && !document.querySelector("#net-forget").hidden,
+      document.querySelector('[data-net-this="transfer"]').value);
+    check("the metered ones too", document.querySelector('[data-net-metered="transfer"]').value === "paused"
+      && document.querySelector('[data-net-metered="budget_mb"]').value === "2000", document.querySelector('[data-net-metered="budget_mb"]').value);
+    for (const sel of ['[data-sync="interval_minutes"]', '[data-net-this="transfer"]', '[data-net-metered="upload_kib"]']) {
+      const e = document.querySelector(sel);
+      e.focus();
+      check(sel + " takes focus", document.activeElement === e, at());
+    }
+    check("Work offline waits for the agent to run", document.querySelector("#net-offline").disabled, "");
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }
