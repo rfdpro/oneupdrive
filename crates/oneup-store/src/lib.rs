@@ -18,9 +18,10 @@
 //! deletion evidence the reconciler relies on (see [`synced`]), and since v5
 //! the marks of folders that need planning again (see [`dirty`]), since
 //! v17 when failed operations are tried again (see [`retry`]), since v18
-//! an index of the Remote tree's names for search (see [`search`]), and
-//! since v19 the cloud folders by size, for rule suggestions (see
-//! [`choose`]).
+//! an index of the Remote tree's names for search (see [`search`]), since
+//! v19 the cloud folders by size, for rule suggestions (see [`choose`]),
+//! and since v20 the hashes of local-only files made for finding
+//! duplicates (see [`dupes`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -48,11 +49,13 @@ pub use dirty::DirtyScope;
 pub mod activity;
 pub mod choose;
 pub use choose::Totals;
+pub mod dupes;
 pub mod retry;
 mod rulefile;
 pub mod search;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
+pub use dupes::{DupCursor, DupGroup, DupSummary};
 pub use retry::{Item as RetryItem, Retry};
 pub use search::{Found, Hit, IndexState};
 pub use usage::{AppFile, AppUse, UseKind};
@@ -109,7 +112,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -694,6 +697,15 @@ impl Store {
         Ok(busy == 0)
     }
 
+    /// Reads in one transaction: everything `f` reads is the same snapshot
+    /// of the database, whatever other connections write meanwhile.
+    pub fn snapshot<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let out = f(&Ops { c: &tx })?;
+        tx.rollback()?;
+        Ok(out)
+    }
+
     /// Read-only access outside an explicit transaction.
     pub fn read<T>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
         f(&Ops { c: &self.conn })
@@ -722,7 +734,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 19] = [
+    let steps: [(i64, String); 20] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -742,6 +754,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (17, retry::MIGRATE_V17.into()),
         (18, search::MIGRATE_V18.into()),
         (19, choose::MIGRATE_V19.into()),
+        (20, dupes::MIGRATE_V20.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1701,6 +1714,31 @@ mod tests {
         assert!(scans("SELECT * FROM enum_unit WHERE state = ?1").is_empty(), "small table");
         assert!(s.tree_scans(&["SELECT * FROM no_such_table".to_string()]).is_err(), "not skipped");
         assert!(scans("-- TRIGGER t").is_empty());
+    }
+
+    /// A snapshot reads one state of the database: another connection's
+    /// write in between doesn't show in its later reads.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_snapshot_reads_one_state() {
+        let path = std::env::temp_dir().join(format!("oneup-store-snapshot-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut a = Store::open(&path, 1024).unwrap();
+        let mut b = Store::open(&path, 1024).unwrap();
+        a.write(|o| o.meta_set("k", "1")).unwrap();
+        let (first, second) = a
+            .snapshot(|o| {
+                let first = o.meta_get("k")?;
+                b.write(|o| o.meta_set("k", "2")).unwrap();
+                Ok((first, o.meta_get("k")?))
+            })
+            .unwrap();
+        assert_eq!((first.as_deref(), second.as_deref()), (Some("1"), Some("1")));
+        assert_eq!(a.read(|o| o.meta_get("k")).unwrap().as_deref(), Some("2"));
+        drop((a, b));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 
     /// Two connections that each read and then write, at the same time (the
