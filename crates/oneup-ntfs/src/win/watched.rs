@@ -829,18 +829,24 @@ pub(super) mod tests {
         assert!(moved.is_ok(), "{moved:?}");
 
         let mut f = d.watched(&vol, &vec![7u8; 64 << 20]);
+        // The save starts once a read is under way, not after a guessed
+        // delay: under load the reader may not have started by then.
+        let (reading, started) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
             let mut buf = vec![0u8; 4 << 20];
             let mut total = 0usize;
             loop {
                 match f.read(&mut buf) {
                     Ok(0) => f.rewind(),
-                    Ok(n) => total += n,
+                    Ok(n) => {
+                        total += n;
+                        let _ = reading.send(());
+                    }
                     Err(_) => return (total, f.broken()),
                 }
             }
         });
-        std::thread::sleep(Duration::from_millis(50));
+        started.recv_timeout(Duration::from_secs(30)).unwrap();
         std::fs::write(d.p("doc.tmp"), b"new").unwrap();
         let (moved, waited) = move_over("doc.tmp", "doc.txt");
         let (total, broken) = reader.join().unwrap();
