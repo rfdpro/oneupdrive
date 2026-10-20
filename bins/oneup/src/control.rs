@@ -85,11 +85,11 @@ pub struct Control {
     rev: tokio::sync::watch::Sender<u64>,
     /// What happened, for `oneup watch` and hooks (`Call::Events`).
     pub events: Arc<Feed>,
-    /// Whether a client's process may use the pipe: the agent sets this to
-    /// refuse its own hook processes (`crate::hooks`), so a hook can't
-    /// approve a safety stop or read the status. `None` (tests, `oneup
+    /// Whether a client's process may use the pipe: the agent sets this so
+    /// its own hook processes are turned away (`crate::hooks`), so a hook
+    /// can't approve a safety stop or read the status. `None` (tests, `oneup
     /// sync`): everyone may.
-    hook_guard: std::sync::OnceLock<Box<dyn Fn(u32) -> bool + Send + Sync>>,
+    may_serve: std::sync::OnceLock<Box<dyn Fn(u32) -> bool + Send + Sync>>,
 }
 
 struct Shared {
@@ -201,14 +201,14 @@ impl Control {
             stopping: AtomicBool::new(false),
             rev: tokio::sync::watch::Sender::new(0),
             events: Arc::new(Feed::new()),
-            hook_guard: std::sync::OnceLock::new(),
+            may_serve: std::sync::OnceLock::new(),
         }
     }
 
-    /// Refuse a client process for which `refuse` returns true (the agent's
-    /// hook processes). Set once, before the pipe serves.
-    pub fn refuse_clients(&self, refuse: Box<dyn Fn(u32) -> bool + Send + Sync>) {
-        let _ = self.hook_guard.set(refuse);
+    /// Serve a client process only when `may_serve` returns true (the agent
+    /// turns away its own hook processes). Set once, before the pipe serves.
+    pub fn gate_clients(&self, may_serve: Box<dyn Fn(u32) -> bool + Send + Sync>) {
+        let _ = self.may_serve.set(may_serve);
     }
 
     /// Moves the revision on if the status changed, and passes the pause
@@ -637,7 +637,7 @@ impl oneup_ipc::Handler for Control {
     }
 
     fn permit(&self, pid: u32) -> bool {
-        self.hook_guard.get().is_none_or(|refuse| !refuse(pid))
+        self.may_serve.get().is_none_or(|allow| allow(pid))
     }
 }
 

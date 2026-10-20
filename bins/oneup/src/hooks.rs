@@ -46,51 +46,94 @@ const FAILURE_EVERY: Duration = Duration::from_secs(60);
 /// is false and hooks are refused rather than risk missing a folder.
 pub fn places(dir: &Path) -> Places {
     let mut complete = true;
+    let mut out: Vec<(PathBuf, String)> = Vec::new();
+    // This account's pairs and vaults, then every other data folder's,
+    // strictly: any folder we can't read makes the set incomplete, and
+    // every hook is then refused.
     let main = crate::vaultpair::main_dir(dir);
-    let mut out: Vec<(PathBuf, String)> = match crate::pairs::local_folders(&main, None) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "hooks: can't list this account's synced folders");
-            complete = false;
-            Vec::new()
+    if let Err(e) = synced_folders(&main, &mut out) {
+        tracing::warn!(error = %format!("{e:#}"), "hooks: can't list this account's synced folders");
+        complete = false;
+    }
+    match crate::datafolders::all_strict() {
+        Ok(folders) => {
+            for d in folders {
+                if crate::test_account::same_dir(&d, &main) {
+                    continue;
+                }
+                match other_folder(&d) {
+                    Ok(Some(local)) => {
+                        if !out.iter().any(|(p, _)| {
+                            oneup_local::coexist::is_within(p, &local) && oneup_local::coexist::is_within(&local, p)
+                        }) {
+                            out.push((local, "a folder another OneUpDrive account syncs".into()));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => complete = false,
+                }
+            }
         }
-    };
-    for d in crate::datafolders::all() {
-        let store = match crate::setup::open_store(&d, 1024) {
-            Ok(s) => s,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
-        };
-        let local = match store.read(|o| o.meta_get(crate::sync::KEY_LOCAL)) {
-            Ok(l) => l,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
-        };
-        let Some(local) = local else { continue };
-        let local = PathBuf::from(local);
-        if !out
-            .iter()
-            .any(|(p, _)| oneup_local::coexist::is_within(p, &local) && oneup_local::coexist::is_within(&local, p))
-        {
-            out.push((local, "a folder another OneUpDrive account syncs".into()));
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "hooks: can't list the PC's data folders");
+            complete = false;
         }
     }
-    let synced: Vec<PathBuf> = out.iter().map(|(p, _)| p.clone()).collect();
-    Places::new(out, complete, dir.to_path_buf(), Some(safe_path(&synced)))
+    let safe = safe_path(&out);
+    Places::new(out, complete, dir.to_path_buf(), Some(safe))
 }
 
-/// `PATH` with every directory inside a synced folder removed, so a hook's
-/// program can't reach a cloud-controlled DLL or helper by a `PATH` lookup.
-fn safe_path(synced: &[PathBuf]) -> std::ffi::OsString {
+/// The folders `main`'s pairs and vaults sync, strictly (a store that won't
+/// open or read is an error, not a skip), appended to `out`.
+fn synced_folders(main: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
+    let mut add = |d: &Path, what: String| -> Result<()> {
+        if let Some(l) = crate::setup::open_store(d, 1024)?.read(|o| o.meta_get(crate::sync::KEY_LOCAL))? {
+            out.push((PathBuf::from(l), what));
+        }
+        Ok(())
+    };
+    add(main, "your main synced folder".into())?;
+    for v in crate::vaultpair::list_strict(main)? {
+        add(&v.dir, format!("the vault {}", v.name))?;
+    }
+    for p in crate::pairs::list_strict(main)? {
+        add(&p.dir, format!("the folder pair {}", p.name))?;
+    }
+    Ok(())
+}
+
+/// Another data folder's synced root (`None`: it syncs nothing yet).
+fn other_folder(d: &Path) -> Result<Option<PathBuf>> {
+    let store = crate::setup::open_store(d, 1024)?;
+    Ok(store.read(|o| o.meta_get(crate::sync::KEY_LOCAL))?.map(PathBuf::from))
+}
+
+/// `PATH` with every directory inside a synced folder, or any cloud sync
+/// root, removed (checked raw and canonicalized), and relative entries
+/// dropped, so a hook's program can't reach a cloud-controlled DLL or helper
+/// by a `PATH` lookup. On any failure, just `System32`.
+fn safe_path(synced: &[(PathBuf, String)]) -> std::ffi::OsString {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let kept: Vec<PathBuf> = std::env::split_paths(&path)
-        .filter(|dir| !synced.iter().any(|s| oneup_local::coexist::is_within(dir, s)))
-        .collect();
-    std::env::join_paths(kept).unwrap_or(path)
+    let kept = kept_path_entries(std::env::split_paths(&path), synced);
+    std::env::join_paths(kept).unwrap_or_else(|_| system32())
+}
+
+/// `System32`, the fallback `PATH` so a hook can still find basic tools.
+fn system32() -> std::ffi::OsString {
+    std::env::var_os("SystemRoot").map(|r| Path::new(&r).join("System32").into_os_string()).unwrap_or_default()
+}
+
+/// The `PATH` entries to keep: absolute ones (relative entries depend on a
+/// current folder and are dropped) that are outside every cloud folder, both
+/// as written and canonicalized.
+fn kept_path_entries(entries: impl Iterator<Item = PathBuf>, synced: &[(PathBuf, String)]) -> Vec<PathBuf> {
+    entries
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| {
+            oneup_hooks::program::cloud_place(dir, synced).is_none()
+                && std::fs::canonicalize(dir).map_or(true, |c| oneup_hooks::program::cloud_place(&c, synced).is_none())
+        })
+        .collect()
 }
 
 /// Reads the synced folders fresh for each launch, but only re-walks them
@@ -138,9 +181,10 @@ impl PlacesSource for PlaceCache {
     fn places(&self) -> Arc<Places> {
         let stamp = Self::stamp(&self.dir);
         let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Re-walk only when the stamp changed, and at most a few times a
-        // second, so a burst of launches is cheap.
-        if stamp != last.0 && last.2.elapsed() >= Duration::from_millis(300) {
+        // Re-walk when the stamp changed, or the last reading was incomplete
+        // (so a folder that couldn't be read is retried), but at most a few
+        // times a second, so a burst of launches stays cheap.
+        if (stamp != last.0 || !last.1.complete) && last.2.elapsed() >= Duration::from_millis(300) {
             *last = (stamp, Arc::new(places(&self.dir)), Instant::now());
         }
         Arc::clone(&last.1)
@@ -461,6 +505,42 @@ mod tests {
         assert!(entries[0].detail.contains("hook h on synced: exit 2") && entries[0].path == "/a.txt");
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A synced directory, and a cloud sync root, are dropped from `PATH`
+    /// (raw and canonicalized); a relative entry is dropped; the rest stay.
+    #[test]
+    fn safe_path_drops_synced_and_relative_entries() {
+        let dir = std::env::temp_dir().join(format!("oneup-hooks-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let synced = dir.join("Synced");
+        let tools = dir.join("Tools");
+        std::fs::create_dir_all(&synced).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let places = vec![(synced.clone(), "the main folder".into())];
+        let entries = vec![
+            tools.clone(),           // outside: kept
+            synced.clone(),          // inside a synced folder: dropped
+            synced.join("bin"),      // below a synced folder: dropped
+            PathBuf::from(r".\rel"), // relative: dropped
+            PathBuf::from("rel2"),   // relative: dropped
+        ];
+        let kept = kept_path_entries(entries.into_iter(), &places);
+        assert_eq!(kept, vec![tools.clone()], "{kept:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Discovery fails closed: a data folder whose main store can't be read
+    /// leaves the set incomplete, and `check` then refuses every hook.
+    #[test]
+    fn unreadable_discovery_is_incomplete() {
+        // A file where the data folder should be: its store can't be opened
+        // (it isn't a directory), so the main folder can't be read.
+        let bad = std::env::temp_dir().join(format!("oneup-hooks-none-{}.dat", std::process::id()));
+        std::fs::write(&bad, b"not a data folder").unwrap();
+        let pl = places(&bad);
+        assert!(!pl.complete, "an unreadable main folder makes the set incomplete");
+        let _ = std::fs::remove_file(&bad);
     }
 
     /// `oneup hooks` (via [`list`]) marks hooks beyond [`MAX_HOOKS`] refused,
