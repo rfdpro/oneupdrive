@@ -1126,6 +1126,8 @@ impl Engine {
     /// through the gate. Nothing while changes to this PC are paused.
     pub async fn placement(&self, mut store: Store, controls: &(dyn Fn() -> Controls + Send + Sync)) -> Result<Store> {
         if !self.exec.local().on_demand() || controls().pause_local {
+            // Nothing more soon: resuming wakes the agent anyway.
+            self.pin_more.store(false, std::sync::atomic::Ordering::Relaxed);
             return Ok(store);
         }
         let root = store.read(|o| o.local_root())?.context("no local scan")?;
@@ -1205,13 +1207,26 @@ impl Engine {
         // The rules' own among the files this pass may fetch get their
         // budget reserved before any download (the store can't be shared
         // with the download tasks, so this is decided up front).
-        let candidates: Vec<(u128, u64, bool)> = store.read(|o| {
+        // The rules' own only while their note still names the item (its
+        // identity read on a handle): a reused ID isn't charged to them.
+        let rows: Vec<(u128, u64, bool)> = store.read(|o| {
             let mut v = Vec::new();
             for r in o.local_to_fetch(oneup_exec::placement::BATCH)? {
                 v.push((r.file_id, u64::try_from(r.size).unwrap_or(0), o.pin_owned_has(r.file_id)?));
             }
             Ok(v)
         })?;
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (id, size, noted) in rows {
+            let owned = noted && {
+                let rel = store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p));
+                match rel {
+                    Some(rel) => crate::pinrules::owned_verified(&mut store, &mut pinner, id, &rel)?,
+                    None => false,
+                }
+            };
+            candidates.push((id, size, owned));
+        }
         let owned: std::collections::HashSet<u128> = candidates.iter().filter(|c| c.2).map(|c| c.0).collect();
         let (reserved, blocked) = crate::pinrules::reserve_budget(&mut store, &candidates)?;
         let may = |id: u128, size: u64| -> std::result::Result<(), oneup_exec::placement::Stop> {
@@ -1224,8 +1239,10 @@ impl Engine {
             l.may(size, paused, free, std::time::Instant::now())
         };
         let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path), &may).await?;
-        // What wasn't downloaded goes back to the budget.
-        let done: Vec<u128> = fetched.done.iter().map(|d| d.1).collect();
+        // What wasn't tried goes back to the budget; a download that was
+        // tried counts, finished or not (bytes may have come), so failures
+        // can't go past the approval again and again.
+        let done: Vec<u128> = fetched.done.iter().map(|d| d.1).chain(fetched.attempted.iter().copied()).collect();
         crate::pinrules::settle(&mut store, &done, &|_| false)?;
         let asked = blocked.map(|(_, size)| size);
         use oneup_exec::placement::Stop;

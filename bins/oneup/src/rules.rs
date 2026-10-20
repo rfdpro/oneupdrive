@@ -357,18 +357,21 @@ pub async fn pin(data_dir: &Path, store: &Store, path: &str, keep: bool) -> Resu
         rel.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).fold(pair.local.clone(), |p, x| p.join(x))
     };
     let full = at(&rel);
+    // What the person chose is recorded first, durably, then the pin is
+    // set: a crash or an agent pass in between can't undo it.
+    let mut w = oneup_app::setup::open_store(data_dir, 1024)?;
     if keep {
-        let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
-        if full.is_dir() {
-            provider::set_pin_tree(&f, provider::Pin::Pinned)
-        } else {
-            provider::set_pin(&f, provider::Pin::Pinned)
-        }
-        .with_context(|| format!("{rel} isn't an online-only-capable item"))?;
         // Kept by the person: theirs, the folder's contents too, so no rule
         // undoes it later (and a file freed by name is kept again).
-        let mut w = oneup_app::setup::open_store(data_dir, 1024)?;
-        oneup_app::pinrules::claim_for_user(&mut w, &rel)?;
+        oneup_app::pinrules::keep_by_hand(&mut w, &rel, &mut || {
+            let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
+            if full.is_dir() {
+                provider::set_pin_tree(&f, provider::Pin::Pinned)
+            } else {
+                provider::set_pin(&f, provider::Pin::Pinned)
+            }
+            .with_context(|| format!("{rel} isn't an online-only-capable item"))
+        })?;
         println!("{rel}: always kept on this device; the background agent downloads what isn't here yet.");
     } else {
         // A file named itself is freed even if kept on this device (a pin
@@ -380,9 +383,8 @@ pub async fn pin(data_dir: &Path, store: &Store, path: &str, keep: bool) -> Resu
             provider::set_pin(&f, provider::Pin::Unpinned)
                 .with_context(|| format!("{rel} isn't an online-only-capable item"))
         };
-        let plan = oneup_app::pinrules::free_plan(store, &pins, &rel, &mut set)?;
-        if let Some(id) = plan.released {
-            oneup_app::setup::open_store(data_dir, 1024)?.write(|o| o.pin_released_add(id))?;
+        let plan = oneup_app::pinrules::free_plan(&mut w, &pins, &rel, &mut set)?;
+        if plan.released.is_some() {
             println!("{rel}: no longer kept on this device; it stays online-only until you keep it again (oneup pin).");
         }
         println!("{rel}: online-only; the background agent frees the space (what's in OneDrive stays there).");
