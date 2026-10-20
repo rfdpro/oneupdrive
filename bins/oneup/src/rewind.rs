@@ -240,16 +240,23 @@ pub fn set_history(store: &mut Store, days: Option<u32>, changes: Option<u64>) -
     Ok(())
 }
 
-/// After a sequence of rounds settled: the history starts being kept once a
-/// first sync has finished, and keeps to its limits.
-pub fn keep_history(store: &mut Store, now_ms: i64) -> Result<()> {
+/// Rows of history dropped at most at the end of a round: pruning keeps up
+/// with what any round writes, at a bounded cost per round.
+const PRUNE_BUDGET: usize = 50_000;
+
+/// At the end of every round: the history keeps to its limits (a bounded
+/// amount of pruning, never what a rewind under way reads); with
+/// `settled`, a sequence of rounds settled, and once a first sync has, the
+/// history starts being kept.
+pub fn keep_history(store: &mut Store, now_ms: i64, settled: bool) -> Result<()> {
     store.write(|o| {
         match history_keep(o)? {
             Some(keep) => {
-                if o.history_start(now_ms)? {
+                if settled && o.history_start(now_ms)? {
                     tracing::info!("keeping the history of what's synced from now on, for rewinds");
                 }
-                o.history_prune(keep, now_ms)?;
+                let needed = load(o)?.map(|j| j.at_ms);
+                o.history_prune_some(keep, now_ms, needed, PRUNE_BUDGET)?;
             }
             None => o.history_stop()?,
         }
@@ -735,6 +742,35 @@ mod tests {
             assert_eq!(ended, round == STALLS, "round {round}");
         }
         assert_eq!(job.failed, u64::from(STALLS));
+    }
+
+    #[test]
+    fn every_round_keeps_the_history_to_its_limits_but_what_a_rewind_reads() {
+        let dir = std::env::temp_dir();
+        let mut store = Store::open_in_memory().unwrap();
+        synced(&mut store, 1, "e0");
+        store.write(|o| o.history_start(0)).unwrap();
+        set_history(&mut store, None, Some(3)).unwrap();
+        for i in 1..=10u8 {
+            synced(&mut store, i + 1, &format!("e{i}"));
+        }
+        assert_eq!(store.read(|o| o.history_rows()).unwrap(), 10);
+        // A round that didn't settle still prunes.
+        keep_history(&mut store, now(), false).unwrap();
+        assert_eq!(store.read(|o| o.history_rows()).unwrap(), 3);
+        // A rewind under way to a moment before every row: they all stay.
+        let at = now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 11..=15u8 {
+            synced(&mut store, i + 1, &format!("e{i}"));
+        }
+        let rules = RuleSet::default();
+        start(&mut store, &dir, &rules, "/", at, now()).unwrap();
+        keep_history(&mut store, now(), false).unwrap();
+        assert_eq!(store.read(|o| o.history_rows()).unwrap(), 5, "the five changes after the moment stay");
+        assert!(cancel(&mut store, now()).unwrap());
+        keep_history(&mut store, now(), false).unwrap();
+        assert_eq!(store.read(|o| o.history_rows()).unwrap(), 3);
     }
 
     #[test]
