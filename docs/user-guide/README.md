@@ -2,10 +2,11 @@
 
 Welcome! This guide is for everyone, not just developers.
 
-> **Where things stand:** this is OneUpDrive's first release. The pages below describe the app as it works today. It's young software, so if something looks wrong, see [When something goes wrong](troubleshooting.md) and report it.
+> **Where things stand:** OneUpDrive is in beta. The pages below describe the app as it works today. If something looks wrong, see [When something goes wrong](troubleshooting.md) and report it.
 
 **Start here**
 * [Getting started](getting-started.md): installing, setting up, what you'll need
+* [Words used in this guide](glossary.md): what "online-only", "safety stop" and "folder pair" mean
 * [The settings window](settings-window.md): every setting, page by page
 * [The OneUpDrive icon](tray-icon.md): status at a glance, pausing, and the questions OneUpDrive asks you
 * [File Explorer](explorer.md): the navigation-pane entry, status icons and the right-click menu
@@ -21,6 +22,7 @@ Welcome! This guide is for everyone, not just developers.
 * [Encrypted vaults](vaults.md): folders only you can read, compatible with Cryptomator (experimental)
 * [Moving over from the OneDrive app](migrating-from-onedrive.md): switching without re-downloading everything
 
+**When you need help**
 * [When something goes wrong](troubleshooting.md): what each problem means, and how to fix it if retrying doesn't
 * [FAQ](faq.md)
 
