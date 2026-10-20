@@ -1534,10 +1534,12 @@ async fn a_kept_edit_takes_the_first_conflict_name_not_taken() {
     assert_eq!(cloud.tree()["/notes (conflict 3).txt"].as_deref(), Some(&b"theirs"[..]));
 }
 
-/// An edit an upload went over that can't be kept as a new file (its
-/// version won't download): the upload is still done, counted as such and
-/// not as a failure, and the edit is reported as not kept. It stays in the
-/// file's version history.
+/// An edit an upload went over that can't be kept as a new file yet (its
+/// version won't download: the data budget used up, the network gone):
+/// the upload is still done, counted as such and not as a failure, and the
+/// edit is reported as not kept yet. It stays in the file's version
+/// history, and keeping it is never dropped: once the version downloads
+/// again, a later round keeps it as a new file.
 #[tokio::test]
 async fn an_upload_over_an_edit_that_cant_be_kept_is_still_done() {
     let cloud = Fake::new();
@@ -1567,12 +1569,22 @@ async fn an_upload_over_an_edit_that_cant_be_kept_is_still_done() {
         }
     }
     assert_eq!(not_kept.len(), 1);
+    assert!(not_kept[0].1.contains("tried again next round"), "{}", not_kept[0].1);
+    s.settle().await;
+    assert_eq!(cloud.tree().len(), 1, "not kept while its version won't download");
+    assert!(cloud.0.lock().unwrap().old.values().any(|v| v == b"theirs"), "in the version history");
+    // The version downloads again (more data allowed, the network back):
+    // the next round keeps it.
+    cloud.0.lock().unwrap().versions_fail = false;
+    let r = s.round().await;
+    assert_eq!(r.kept_later, ["notes (conflict 1).txt"]);
     s.settle().await;
     for t in [local_tree(&s.dir.0), cloud.tree()] {
         assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]));
-        assert_eq!(t.len(), 1, "{:?}", names(&t));
+        assert_eq!(t["/notes (conflict 1).txt"].as_deref(), Some(&b"theirs"[..]));
+        assert_eq!(t.len(), 2, "{:?}", names(&t));
     }
-    assert!(cloud.0.lock().unwrap().old.values().any(|v| v == b"theirs"), "in the version history");
+    assert!(s.round().await.kept_later.is_empty(), "kept once");
 }
 
 /// Server-side copy: a new local file whose content OneDrive
