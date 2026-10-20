@@ -43,6 +43,7 @@ pub mod recyclebin;
 pub mod resolve;
 pub mod rulefiles;
 pub mod safetywindow;
+pub mod search;
 pub mod settingsapi;
 pub mod setup;
 #[cfg(windows)]

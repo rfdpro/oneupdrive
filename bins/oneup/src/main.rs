@@ -25,6 +25,7 @@ mod agent;
 mod cloud_check;
 mod cloud_prune;
 mod dev_remote;
+mod find;
 mod migrate;
 mod pair;
 mod rules;
@@ -250,6 +251,34 @@ enum Cmd {
         /// How many
         #[arg(long, default_value_t = 10)]
         count: usize,
+    },
+    /// Find files and folders in your OneDrive by name, online-only ones
+    /// too, and show where each is
+    Find {
+        /// What the name contains, in any case (at least 3 characters)
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// How many to list at most
+        #[arg(long, default_value_t = oneup_app::search::DEFAULT_LIMIT)]
+        limit: usize,
+        /// Also search inside files with OneDrive's search (sends the search
+        /// text to Microsoft)
+        #[arg(long)]
+        onedrive: bool,
+        /// Print the results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or change search settings (config.toml [search]); to search,
+    /// use `oneup find`
+    Search {
+        /// Also search inside files with OneDrive in the settings window
+        /// (sends the search text to Microsoft; off by default)
+        #[arg(long, value_enum)]
+        onedrive: Option<Toggle>,
+        /// Keys that open search from anywhere (e.g. Ctrl+Alt+F), or `off`
+        #[arg(long, value_name = "KEYS|off")]
+        hotkey: Option<String>,
     },
     /// Show or change the safety stops: when sync stops and asks you first
     Safety {
@@ -1533,6 +1562,12 @@ async fn run() -> Result<()> {
                 println!("{:>10}  {:<13} {}", size(u64::try_from(l.size).unwrap_or(0)), l.state.name(), l.path);
             }
             Ok(())
+        }
+        Cmd::Find { text, limit, onedrive, json } => {
+            find::run(&data_dir(&cli)?, cli.client_id.as_deref(), &text.join(" "), *limit, *onedrive, *json).await
+        }
+        Cmd::Search { onedrive, hotkey } => {
+            find::settings(&data_dir(&cli)?, onedrive.map(Toggle::on), hotkey.as_deref())
         }
         Cmd::Safety { max_changes, max_percent, content_guard } => {
             let mut store = open_store(&cli, MemoryProfile::Balanced)?;
@@ -2827,6 +2862,17 @@ fn diagnose(cli: &Cli, top: usize, profile: MemoryProfile) -> Result<()> {
 
 fn verify(cli: &Cli, profile: MemoryProfile) -> Result<()> {
     let store = open_store(cli, profile)?;
+    // The search index on its own line: its problems never stop syncing.
+    match store.read(|o| o.search_state())? {
+        oneup_store::IndexState::Building => println!("Search index: being built (by the agent, or the first search)."),
+        oneup_store::IndexState::Broken => {
+            println!("Search index: to be built again (by the agent at its next start, or the first search).")
+        }
+        oneup_store::IndexState::Ready => match store.read(|o| o.search_problems())?.as_slice() {
+            [] => println!("Search index: complete."),
+            found => println!("Search index: {}.", found.join("; ")),
+        },
+    }
     let problems = store.read(|o| o.check_invariants())?;
     if problems.is_empty() {
         println!("Mirror and folder scan are consistent.");

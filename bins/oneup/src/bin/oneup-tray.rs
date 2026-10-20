@@ -42,6 +42,8 @@ mod win {
         failure: Option<String>,
         /// An update downloaded and checked, ready to install.
         update: Option<oneup_app::updates::Ready>,
+        /// `[search]` changed: take up its hotkey.
+        search_changed: bool,
     }
 
     enum Do {
@@ -90,12 +92,20 @@ mod win {
             }
         }
         let icon = Tray::new()?;
-        let shared = Arc::new(Mutex::new(Shared { view: View::Connecting, failure: None, update: None }));
+        let shared =
+            Arc::new(Mutex::new(Shared { view: View::Connecting, failure: None, update: None, search_changed: false }));
         {
             let (dir, shared, waker) = (dir.clone(), Arc::clone(&shared), icon.waker());
             std::thread::Builder::new()
                 .name("updates".into())
                 .spawn(move || look_for_updates(&dir, &shared, &waker))
+                .context("starting a thread")?;
+        }
+        {
+            let (dir, shared, waker) = (dir.clone(), Arc::clone(&shared), icon.waker());
+            std::thread::Builder::new()
+                .name("search settings".into())
+                .spawn(move || follow_search_settings(&dir, &shared, &waker))
                 .context("starting a thread")?;
         }
         let (tx, rx) = mpsc::unbounded_channel();
@@ -118,13 +128,16 @@ mod win {
             look: None,
             shared: Arc::clone(&shared),
             update: None,
+            hotkey: String::new(),
         };
+        ui.set_hotkey();
         ui.refresh(&shared);
         while let Some(e) = icon.next() {
             match e {
                 Event::Wake => ui.refresh(&shared),
                 Event::Select { x, y } | Event::Menu { x, y } => ui.menu(x, y),
                 Event::NotificationClicked => ui.review_first(),
+                Event::Hotkey => ui.show_list("find"),
                 Event::Exit => break,
             }
         }
@@ -141,6 +154,20 @@ mod win {
         shared: Arc<Mutex<Shared>>,
         /// The version of an update ready to install (announced once).
         update: Option<String>,
+        /// The search hotkey held now (`[search] hotkey`; empty: none).
+        hotkey: String,
+    }
+
+    /// Waits for `[search]` to change (`oneup_app::tray::settings_changed`)
+    /// and tells the icon's thread, which holds the hotkey.
+    fn follow_search_settings(dir: &Path, shared: &Mutex<Shared>, waker: &Waker) {
+        let Ok(signal) = oneup_sys::signal::Signal::new(&tray::settings_signal(dir)) else { return };
+        loop {
+            if signal.wait(Duration::from_secs(24 * 3600)) {
+                shared.lock().unwrap_or_else(|e| e.into_inner()).search_changed = true;
+                waker.wake();
+            }
+        }
     }
 
     /// Starts the agent and the remembered vaults that aren't running.
@@ -197,11 +224,36 @@ mod win {
             shared.lock().unwrap_or_else(|e| e.into_inner())
         }
 
+        /// Holds the search hotkey `[search]` names (none if it names none),
+        /// and says so once if another program holds it.
+        fn set_hotkey(&mut self) {
+            let wanted = oneup_app::config::load_search(&self.dir).map(|s| s.hotkey).unwrap_or_default();
+            if wanted == self.hotkey {
+                return;
+            }
+            let keys = oneup_app::search::Hotkey::parse(&wanted).ok().map(|h| (h.modifiers(), h.key));
+            match self.icon.set_hotkey(keys) {
+                Ok(()) => self.hotkey = wanted,
+                Err(_) => {
+                    self.hotkey.clear();
+                    let _ = self.icon.notify(
+                        "Search hotkey unavailable",
+                        &format!("Another program uses {wanted}. Choose other keys in Settings, Search."),
+                        Kind::Warning,
+                    );
+                }
+            }
+        }
+
         fn refresh(&mut self, shared: &Mutex<Shared>) {
-            let (view, failure, update) = {
+            let (view, failure, update, search_changed) = {
                 let mut s = Self::lock(shared);
-                (s.view.clone(), s.failure.take(), s.update.as_ref().map(|r| r.version.clone()))
+                let changed = std::mem::take(&mut s.search_changed);
+                (s.view.clone(), s.failure.take(), s.update.as_ref().map(|r| r.version.clone()), changed)
             };
+            if search_changed {
+                self.set_hotkey();
+            }
             let auto = oneup_app::config::load_updates(&self.dir).is_ok_and(|u| u.auto);
             if update.is_some() && self.update.is_none() {
                 self.update.clone_from(&update);
@@ -293,7 +345,7 @@ mod win {
         }
 
         /// Opens the settings window on one of the Activity page's lists
-        /// (`activity`, `unsynced`, `excluded` or `stops`).
+        /// (`activity`, `unsynced`, `excluded` or `stops`), or another page.
         fn show_list(&self, page: &str) {
             if let Err(e) = oneup_app::launch::start_settings_on(&self.dir, page) {
                 self.icon.ask("OneUpDrive", &format!("{e:#}"), Kind::Error, Buttons::Ok);
@@ -353,6 +405,7 @@ mod win {
                     self.send(Do::Call(Call::Stop));
                 }
                 id::UPDATE => self.install_update(),
+                id::SEARCH => self.show_list("find"),
                 id::SETTINGS | id::STATUS => {
                     if let Err(e) = oneup_app::launch::start_settings(&self.dir) {
                         self.icon.ask("OneUpDrive", &format!("{e:#}"), Kind::Error, Buttons::Ok);

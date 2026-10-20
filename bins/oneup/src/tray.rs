@@ -218,6 +218,7 @@ pub mod id {
     pub const STOP: u32 = 61;
     pub const CLOSE: u32 = 70;
     pub const SETTINGS: u32 = 80;
+    pub const SEARCH: u32 = 81;
     pub const UPDATE: u32 = 90;
     /// The status line: opens the settings window, where it's told at length.
     pub const STATUS: u32 = 1;
@@ -239,6 +240,7 @@ mod glyph {
     pub const PLAY: Glyph = Glyph::Symbol('\u{E768}');
     pub const HISTORY: Glyph = Glyph::Symbol('\u{E81C}');
     pub const SETTINGS: Glyph = Glyph::Symbol('\u{E713}');
+    pub const SEARCH: Glyph = Glyph::Symbol('\u{E721}');
     pub const POWER: Glyph = Glyph::Symbol('\u{E7E8}');
     pub const CLOSE: Glyph = Glyph::Symbol('\u{E711}');
     pub const WARNING: Glyph = Glyph::Symbol('\u{E7BA}');
@@ -376,6 +378,7 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
         items.push(Item::Separator);
     }
     items.push(action(id::ACTIVITY, "Recent activity", glyph::HISTORY));
+    items.push(action(id::SEARCH, "Search", glyph::SEARCH));
     items.push(action(id::SETTINGS, "Settings", glyph::SETTINGS));
     items.push(Item::Separator);
     if let Some(version) = update {
@@ -672,6 +675,17 @@ pub fn render(look: Look, size: u32) -> Vec<u8> {
 }
 
 /// A name for the single-instance lock of `data_dir`'s tray.
+/// The event raised when `[search]` changed (`oneup search`, the settings
+/// window), so the icon takes up a new hotkey (`oneup_sys::signal`).
+pub fn settings_signal(data_dir: &std::path::Path) -> String {
+    instance_name(data_dir).replace("-tray-", "-search-settings-")
+}
+
+/// Tells `data_dir`'s icon, if it's showing, that `[search]` changed.
+pub fn settings_changed(data_dir: &std::path::Path) {
+    let _ = oneup_sys::signal::raise(&settings_signal(data_dir));
+}
+
 pub fn instance_name(data_dir: &std::path::Path) -> String {
     // FNV-1a over the path folded as Windows compares names: the same
     // folder, however it's typed. (Only processes of one version need to

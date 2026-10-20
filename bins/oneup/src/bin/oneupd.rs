@@ -343,6 +343,25 @@ async fn run(args: Args) -> Result<()> {
         });
     }
 
+    // Once, after an upgrade: the search index for what the store held
+    // before it (seconds, up to a minute at 3M items, in short steps). Not
+    // while paused, and it stops with the agent; the next start or the
+    // first search carries on.
+    {
+        let (dir, stop, control) = (dir.clone(), Arc::clone(&stop), Arc::clone(&control));
+        let built = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut store = setup::open_store(&dir, cache_kib)?;
+            oneup_app::search::build_index(&mut store, || {
+                let p = control.controls();
+                !stop.requested() && !(p.pause_local && p.pause_remote)
+            })
+        })
+        .await?;
+        if let Err(e) = built {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't build the search index; the first search will");
+        }
+    }
+
     // Explorer's status flyout, for a folder registered with the shell.
     let flyout = {
         let token = setup::open_store(dir, 1024)?.read(|o| o.meta_get("sync.token"))?;

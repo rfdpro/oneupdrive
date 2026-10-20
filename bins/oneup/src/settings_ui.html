@@ -1726,6 +1726,7 @@
         <div class="brand"><svg role="img" aria-label="OneUpDrive"><use href="#mark"/></svg><span>OneUpDrive</span></div>
         <button data-page="setup" id="nav-setup" hidden>Set up</button>
         <button data-page="files" aria-current="page">Files</button>
+        <button data-page="find">Search</button>
         <button data-page="apps">Apps</button>
         <button data-page="lists">Activity</button>
         <hr>
@@ -1865,6 +1866,28 @@
                     <div class="tree" id="tree" role="tree" aria-label="Files"></div>
                 </div>
                 <aside class="details" id="details" aria-live="polite"></aside>
+            </div>
+        </section>
+
+        <!-- Search: every name in OneDrive, from the mirror (oneup_app::search) -->
+        <section class="page" id="find">
+            <h2>Search</h2>
+            <div class="ls-bar">
+                <input type="search" id="fd-q" placeholder="Name, or part of one" spellcheck="false" aria-label="Search OneDrive by name">
+                <button class="btn primary" id="fd-go">Search</button>
+            </div>
+            <p class="lead" id="fd-sum"></p>
+            <div class="card" id="fd-card" hidden>
+                <div class="flat" id="fd-list"></div>
+            </div>
+            <p class="muted" id="fd-note" hidden></p>
+            <h3>Settings</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
+                    <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Hotkey</b><small>Opens this page from any program. Like Ctrl+Alt+F</small></div><input type="text" id="fd-hotkey" placeholder="None" aria-label="Hotkey"></div>
             </div>
         </section>
 
@@ -2309,6 +2332,7 @@
             // Opened again (from the icon's menu, or Explorer's commands
             // for a file) while open: the page, or the file, asked for.
             if (m.event === "goto") return startAt(m.page, m.item);
+            if (m.event === "search_build") return findBuilding(m.items);
             const w = waiting.get(m.id);
             if (!w) return;
             waiting.delete(m.id);
@@ -2367,6 +2391,7 @@
                 appsTimer = setInterval(() => document.hidden || loadApps(true), 15000);
             }
             if (page === "files") openFiles();
+            if (page === "find") openFind();
             if (page === "accounts") loadAccounts();
             if (page === "general" && !scSearched) loadShortcuts();
             if (page === "lists") loadList(true);
@@ -5953,6 +5978,141 @@
         };
         const START = "{{START_PAGE}}",
             START_ITEM = "{{START_ITEM}}";
+        // ---- search: names from the index, as you type; OneDrive's search
+        // inside files only on Search (it sends the text to Microsoft).
+        const FD = {
+            seq: 0,
+            timer: null
+        };
+        const PLACES = {
+            "here": "On this PC",
+            "online-only": "Online-only",
+            "not here yet": "Not on this PC yet",
+            "excluded": "Excluded",
+            "not synced": "Not synced",
+            "in OneDrive": "Stays in OneDrive"
+        };
+
+        function openFind() {
+            const s = snap && snap.search;
+            if (s) {
+                $("#fd-onedrive").checked = s.onedrive;
+                $("#fd-hotkey").value = s.hotkey || "";
+            }
+            $("#fd-q").focus();
+            $("#fd-q").select();
+        }
+
+        function findBuilding(n) {
+            $("#fd-sum").textContent = `Building the search index (first search only): ${n.toLocaleString()} items`;
+        }
+
+        function findRow(f) {
+            const parent = f.path.slice(0, f.path.lastIndexOf("/")) || "/";
+            const bits = [PLACES[f.placement] || f.placement, parent];
+            if (f.size != null) bits.push(size(f.size));
+            const acts = [];
+            const btn = (label, fn) => acts.push(el("button", {
+                className: "btn small",
+                textContent: label,
+                onclick: fn
+            }));
+            const local = f.local && ["here", "online-only"].includes(f.placement);
+            if (local) btn("Open", () => run(call("open_path", {
+                path: f.local
+            })));
+            if (local) btn("Show", () => run(call("reveal", {
+                path: f.local
+            })));
+            if (f.rel && f.placement === "not here yet") btn("Sync this first", () => run(call("sync_first", {
+                rel: f.rel
+            }), "It goes before anything else"));
+            // No copy on this PC to open: OneDrive's website has it.
+            if (!local && ["in OneDrive", "excluded", "not synced"].includes(f.placement)) btn("Open in OneDrive", () => run(call("open_in_onedrive", {
+                id: f.id
+            })));
+            return flatRow(f.folder ? f.name + "/" : f.name, bits.join(" · "), ...acts);
+        }
+
+        function findList(box, r) {
+            for (const f of r.items) box.append(findRow(f));
+            if (r.too_many) box.append(el("div", {
+                className: "msg",
+                textContent: r.too_many
+            }));
+            else if (r.more) box.append(el("div", {
+                className: "msg",
+                textContent: "More found. Add to the search to narrow it."
+            }));
+        }
+        async function runFind(inside) {
+            const q = $("#fd-q").value.trim();
+            const n = ++FD.seq;
+            clearTimeout(FD.timer);
+            if ([...q].length < 3) {
+                $("#fd-sum").textContent = q ? "Type at least 3 characters." : "";
+                $("#fd-card").hidden = $("#fd-note").hidden = true;
+                return;
+            }
+            const withOneDrive = inside && $("#fd-onedrive").checked;
+            try {
+                const names = await call("search", {
+                    q
+                });
+                const cloud = withOneDrive ? await call("search_onedrive", {
+                    q
+                }).catch(e => ({
+                    error: e.message
+                })) : null;
+                if (n !== FD.seq) return;
+                const box = $("#fd-list");
+                box.replaceChildren();
+                findList(box, names);
+                if (cloud) {
+                    box.append(el("div", {
+                        className: "group",
+                        textContent: "Inside files (OneDrive's search)"
+                    }));
+                    if (cloud.error) box.append(el("div", {
+                        className: "msg",
+                        textContent: cloud.error
+                    }));
+                    else if (!cloud.items.length) box.append(el("div", {
+                        className: "msg",
+                        textContent: "Nothing found."
+                    }));
+                    else findList(box, cloud);
+                }
+                const found = names.items.length + (cloud && cloud.items ? cloud.items.length : 0);
+                $("#fd-sum").textContent = found ? "" : names.too_many || "Nothing found.";
+                $("#fd-card").hidden = !found && !cloud;
+                $("#fd-note").textContent = names.note;
+                $("#fd-note").hidden = false;
+            } catch (e) {
+                if (n === FD.seq) $("#fd-sum").textContent = e.message;
+            }
+        }
+        $("#fd-q").addEventListener("input", () => {
+            clearTimeout(FD.timer);
+            FD.timer = setTimeout(() => runFind(false), 150);
+        });
+        $("#fd-q").addEventListener("keydown", e => {
+            if (e.key === "Enter") runFind(true);
+        });
+        $("#fd-go").onclick = () => runFind(true);
+        $("#fd-onedrive").onchange = e => run(call("save", {
+            section: "search",
+            value: {
+                onedrive: e.target.checked
+            }
+        }), e.target.checked ? "Search inside files: on" : "Search inside files: off").then(load).catch(() => e.target.checked = !e.target.checked);
+        $("#fd-hotkey").onchange = e => run(call("save", {
+            section: "search",
+            value: {
+                hotkey: e.target.value.trim()
+            }
+        }), "Saved").then(load).then(openFind).catch(() => load().then(openFind));
+
         function startAt(start, item) {
             const page = OLD[start] || start || "files";
             // Explorer's commands for a file: the section they're about.
