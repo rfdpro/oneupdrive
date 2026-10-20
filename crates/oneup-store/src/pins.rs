@@ -21,6 +21,10 @@
 //!   the file itself) that a pin rule matches: the rule leaves them freed
 //!   until someone keeps them on this device again (a trigger drops the
 //!   row when the file is pinned again).
+//! * `pin_user` also holds the folders the user pinned (a trigger notes a
+//!   folder that gets the pin without a rule's note); one that loses its
+//!   pin is queued in `pin_changed`, so a "Free up space" on a folder above
+//!   doesn't undo it.
 //! * `pin_user`: items found pinned already in a folder a rule pinned,
 //!   when the rules first looked at them: the user's own, never taken as
 //!   having inherited the folder's pin.
@@ -111,6 +115,20 @@ pub(crate) fn migrate_v22() -> String {
              DELETE FROM pin_changed WHERE file_id = NEW.file_id;
              INSERT INTO pin_changed(file_id) VALUES (NEW.file_id);
          END;
+         CREATE TRIGGER pin_user_folder AFTER UPDATE OF attributes ON local_item
+             WHEN NEW.kind = 1 AND (OLD.attributes & {PINNED}) = 0 AND (NEW.attributes & {PINNED}) != 0
+              AND NOT EXISTS (SELECT 1 FROM pin_owned WHERE file_id = NEW.file_id)
+         BEGIN
+             DELETE FROM pin_user WHERE file_id = NEW.file_id;
+             INSERT INTO pin_user(file_id) VALUES (NEW.file_id);
+         END;
+         CREATE TRIGGER pin_user_folder_lost AFTER UPDATE OF attributes ON local_item
+             WHEN NEW.kind = 1 AND (OLD.attributes & {PINNED}) != 0 AND (NEW.attributes & {PINNED}) = 0
+              AND EXISTS (SELECT 1 FROM pin_user WHERE file_id = NEW.file_id)
+         BEGIN
+             DELETE FROM pin_changed WHERE file_id = NEW.file_id;
+             INSERT INTO pin_changed(file_id) VALUES (NEW.file_id);
+         END;
          CREATE TRIGGER pin_released_pinned AFTER UPDATE OF attributes ON local_item
              WHEN (OLD.attributes & {PINNED}) = 0 AND (NEW.attributes & {PINNED}) != 0
          BEGIN
@@ -122,7 +140,8 @@ pub(crate) fn migrate_v22() -> String {
 /// Takes [`migrate_v22`] back out, for tests that make an older database.
 #[cfg(test)]
 pub(crate) const UNDO_V22: &str = "DROP TRIGGER pin_item_gone; DROP TRIGGER pin_item_kind;
-    DROP TRIGGER pin_owned_lost; DROP TRIGGER pin_released_pinned; DROP TABLE pin_released; DROP TABLE pin_owned; DROP TABLE pin_retry; DROP TABLE pin_changed;
+    DROP TRIGGER pin_owned_lost; DROP TRIGGER pin_released_pinned; DROP TRIGGER pin_user_folder;
+    DROP TRIGGER pin_user_folder_lost; DROP TABLE pin_released; DROP TABLE pin_owned; DROP TABLE pin_retry; DROP TABLE pin_changed;
     DROP TABLE pin_subtree; DROP TABLE pin_user; DROP TABLE pin_owned_hold; DROP TABLE pin_retry_hold;
     DROP TABLE pin_released_hold;";
 
@@ -342,6 +361,11 @@ impl Ops<'_> {
                 "INSERT OR IGNORE INTO pin_user(file_id) SELECT file_id FROM local_item WHERE file_id = ?1",
             )?
             .execute([blob(id)])?;
+        Ok(())
+    }
+
+    pub fn pin_user_remove(&self, id: u128) -> Result<()> {
+        self.c.prepare_cached("DELETE FROM pin_user WHERE file_id = ?1")?.execute([blob(id)])?;
         Ok(())
     }
 

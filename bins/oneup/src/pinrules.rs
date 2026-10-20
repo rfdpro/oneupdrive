@@ -93,6 +93,8 @@ pub const KEY_APPROVE: &str = "pins.approve";
 pub const KEY_WAITING: &str = "pins.waiting";
 /// Budget reserved for the downloads under way: `id:size,…`.
 pub const KEY_RESERVED: &str = "pins.reserved";
+/// Of those, the downloads started: `id,…`.
+const KEY_STARTED: &str = "pins.started";
 /// Queued items whose pin was lost, looked at per pass.
 const CHANGED: usize = 256;
 /// Activity entries looked at per pass; more wait for the next one.
@@ -189,6 +191,10 @@ enum Pinned {
 /// download budget, unpinnable by them), then sets the pin through a handle
 /// on which the identity is checked again. A failure takes the note back.
 fn pin_item(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str, at_seq: i64) -> Result<Pinned> {
+    // The user's (claimed with `oneup pin`, or found pinned): never the rule's.
+    if store.read(|o| o.pin_user_has(id))? {
+        return Ok(Pinned::Other);
+    }
     let created = match pinner.identify(rel, id) {
         Ok((got, created)) if got == id => created,
         Ok(_) => return Ok(Pinned::Other),
@@ -197,7 +203,8 @@ fn pin_item(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str, at_
             return Ok(Pinned::Failed);
         }
     };
-    store.write(|o| o.pin_owned_add(id, created, at_seq))?;
+    // The intent, durably, before the pin.
+    store.write_durable(|o| o.pin_owned_add(id, created, at_seq))?;
     match pinner.set(rel, (id, Some(created)), Change::Pin) {
         Ok(()) => {
             store.write(|o| o.pin_retry_remove(id))?;
@@ -542,8 +549,9 @@ fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
         };
         let pinned = row.attributes & PINNED != 0;
         let released = !pinned && store.read(|o| o.pin_released_has(id))?;
-        let matches = !released && pins.pins(&rel, row.kind != LocalKind::File);
-        let owned = store.read(|o| o.pin_owned_has(id))?;
+        let users = store.read(|o| o.pin_user_has(id))?;
+        let matches = !released && !users && pins.pins(&rel, row.kind != LocalKind::File);
+        let owned = !users && store.read(|o| o.pin_owned_has(id))?;
         let change = match op {
             PinOp::Pin if matches && !pinned => Change::Pin,
             PinOp::Unpin if !matches && owned && pinned => Change::Unpin,
@@ -571,7 +579,12 @@ fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
                 Pinned::Failed => true,
             },
             Change::Unpin => {
-                let created = store.read(|o| o.pin_owned_created(id))?;
+                // Read again right before acting: the user may have claimed it.
+                let (users, created) = store.read(|o| Ok((o.pin_user_has(id)?, o.pin_owned_created(id)?)))?;
+                if users || created.is_none() {
+                    store.write(|o| o.pin_retry_remove(id))?;
+                    continue;
+                }
                 match pinner.set(&rel, (id, created), Change::Unpin) {
                     Ok(()) => {
                         store.write(|o| {
@@ -616,15 +629,31 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
             store.write(|o| o.pin_changed_done(id))?;
             continue;
         };
+        if row.attributes & PINNED != 0 {
+            store.write(|o| o.pin_changed_done(id))?;
+            continue;
+        }
+        // A folder the user pinned: a "Free up space" on a folder above
+        // doesn't undo it (it's pinned again); on the folder itself, it's
+        // the user's choice and the note goes.
+        if row.kind == LocalKind::Folder && store.read(|o| o.pin_user_has(id))? {
+            let parent_freed = match row.parent_id {
+                Some(p) => store.read(|o| o.local_get(p))?.is_some_and(|p| p.attributes & UNPINNED != 0),
+                None => false,
+            };
+            if parent_freed && pinner.set(&rel, (id, None), Change::Pin).is_ok() {
+                pass.repinned += 1;
+            } else if !parent_freed {
+                store.write(|o| o.pin_user_remove(id))?;
+            }
+            store.write(|o| o.pin_changed_done(id))?;
+            continue;
+        }
         if !pins.pins(&rel, row.kind != LocalKind::File) {
             store.write(|o| {
                 o.pin_owned_remove(id)?;
                 o.pin_changed_done(id)
             })?;
-            continue;
-        }
-        if row.attributes & PINNED != 0 {
-            store.write(|o| o.pin_changed_done(id))?;
             continue;
         }
         if freed_by_name(store, &row)? {
@@ -676,7 +705,8 @@ pub fn freed_by_name(store: &Store, row: &LocalRow) -> Result<bool> {
         Some(p) => store.read(|o| o.local_get(p))?,
         None => None,
     };
-    Ok(parent.is_none_or(|p| p.kind == LocalKind::Root || p.attributes & UNPINNED == 0))
+    // The synced folder too: freed itself, it was a folder-level request.
+    Ok(parent.is_none_or(|p| p.attributes & UNPINNED == 0))
 }
 
 /// Whether a pin rule keeps the file `id` at `rel`: the rules match it and
@@ -744,17 +774,50 @@ pub fn keep_by_hand(store: &mut Store, rel: &str, pin: &mut dyn FnMut() -> Resul
 /// A note that doesn't (a rescan put it back on an ID another file reuses)
 /// is dropped: the item is the user's. What counts against the rules'
 /// download budget asks this first.
-pub fn owned_verified(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str) -> Result<bool> {
-    let Some(created) = store.read(|o| o.pin_owned_created(id))? else { return Ok(false) };
+pub fn owned_verified(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str) -> Result<Option<bool>> {
+    let Some(created) = store.read(|o| o.pin_owned_created(id))? else { return Ok(Some(false)) };
     match pinner.identify(rel, id) {
-        Ok((got, c)) if got == id && c == created => Ok(true),
+        Ok((got, c)) if got == id && c == created => Ok(Some(true)),
         Ok(_) => {
             store.write(|o| o.pin_owned_remove(id))?;
-            Ok(false)
+            Ok(Some(false))
         }
-        // Can't be read now: counted as the rule's, the cautious side for a budget.
-        Err(_) => Ok(true),
+        // Can't be read now: unproven either way; the caller leaves it
+        // alone this pass (neither charged nor fetched).
+        Err(_) => Ok(None),
     }
+}
+
+/// Whether a folder above `row` keeps it on this device: one pinned, or
+/// one the user pinned (`pin_user`, kept even while a "Free up space" on a
+/// folder above has taken its attribute). A walk up the parents, for one
+/// candidate at a time.
+pub fn kept_by_folder_above(store: &Store, row: &LocalRow) -> Result<bool> {
+    let mut cur = row.parent_id;
+    for _ in 0..4096 {
+        let Some(p) = cur else { return Ok(false) };
+        let Some(parent) = store.read(|o| o.local_get(p))? else { return Ok(false) };
+        if parent.attributes & PINNED != 0 || store.read(|o| o.pin_user_has(p))? {
+            return Ok(true);
+        }
+        cur = parent.parent_id;
+    }
+    Ok(false)
+}
+
+/// Marks file `id` as started, durably, before its download: a reservation
+/// a crash leaves is never refunded for a started file (bytes may have
+/// come), so an approval can't be spent twice.
+pub fn mark_started(store: &mut Store, id: u128) -> Result<()> {
+    store.write_durable(|o| {
+        let mut list = o.meta_get(KEY_STARTED)?.unwrap_or_default();
+        if !list.is_empty() {
+            list.push(',');
+        }
+        list.push_str(&id.to_string());
+        o.meta_set(KEY_STARTED, &list)
+    })?;
+    Ok(())
 }
 
 /// What `oneup free PATH` did ([`free_plan`]).
@@ -925,7 +988,7 @@ pub fn within_budget(budget: i64, size: u64) -> bool {
 /// off the budget.
 pub fn reserve_budget(store: &mut Store, candidates: &[(u128, u64, bool)]) -> Result<Reserved> {
     store
-        .write(|o| {
+        .write_durable(|o| {
             let mut b: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
             let mut taken = Vec::new();
             let mut blocked = None;
@@ -960,17 +1023,25 @@ pub type Reserved = (std::collections::HashSet<u128>, Option<(u128, u64)>);
 /// reservation a crash left, before the next.
 pub fn settle(store: &mut Store, done: &[u128], hydrated: &dyn Fn(u128) -> bool) -> Result<()> {
     let Some(list) = store.read(|o| o.meta_get(KEY_RESERVED))? else { return Ok(()) };
+    // Started downloads are never refunded (bytes may have come).
+    let started: Vec<u128> = store
+        .read(|o| o.meta_get(KEY_STARTED))?
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|i| i.parse().ok())
+        .collect();
     let mut back: i64 = 0;
     for item in list.split(',').filter(|i| !i.is_empty()) {
         let Some((id, size)) = item.split_once(':') else { continue };
         let (Ok(id), Ok(size)) = (id.parse::<u128>(), size.parse::<i64>()) else { continue };
-        if !done.contains(&id) && !hydrated(id) {
+        if !done.contains(&id) && !started.contains(&id) && !hydrated(id) {
             back = back.saturating_add(size);
         }
     }
     store.write(|o| {
         let b: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
         o.meta_set(KEY_BUDGET, &b.saturating_add(back).to_string())?;
+        o.meta_delete(KEY_STARTED)?;
         o.meta_delete(KEY_RESERVED)
     })?;
     Ok(())
@@ -1036,6 +1107,11 @@ fn reconcile(
     }
     let id = row.file_id;
     let pinned = row.attributes & PINNED != 0;
+    // The user's (claimed with `oneup pin`, possibly not pinned on disk yet):
+    // no rule pins or unpins it.
+    if store.read(|o| o.pin_user_has(id))? {
+        return Ok(());
+    }
     // Freed by name: no rule keeps it until it's pinned again.
     let released = !pinned && store.read(|o| o.pin_released_has(id))?;
     if released || !pins.pins(rel, row.kind != LocalKind::File) {
@@ -1110,8 +1186,13 @@ fn unpin(
         return Ok(());
     }
     // Only the item the rule pinned: same file ID and creation time, read
-    // on the handle that unpins it. Anything else there is the user's.
-    let created = store.read(|o| o.pin_owned_created(id))?;
+    // on the handle that unpins it. Anything else there is the user's, and so
+    // is what the user claimed meanwhile (read again right before acting).
+    let (users, created) = store.read(|o| Ok((o.pin_user_has(id)?, o.pin_owned_created(id)?)))?;
+    if users || created.is_none() {
+        store.write(|o| o.pin_owned_remove(id))?;
+        return Ok(());
+    }
     match pinner.set(rel, (id, created), Change::Unpin) {
         Ok(()) => {
             store.write(|o| {
@@ -2061,9 +2142,13 @@ mod tests {
         let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
         let mut fake = Fake::default();
         run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
-        assert!(owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap());
+        assert_eq!(owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap(), Some(true));
+        // Unreadable now: unproven, left alone this pass.
+        fake.failing = vec!["a.psd".into()];
+        assert_eq!(owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap(), None);
+        fake.failing.clear();
         fake.others.insert("a.psd".into(), (2, 9));
-        assert!(!owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap());
+        assert_eq!(owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap(), Some(false));
         assert!(!s.read(|o| o.pin_owned_has(2)).unwrap());
     }
 
@@ -2078,6 +2163,96 @@ mod tests {
         // 1 was tried (and failed partway); 2 never started.
         settle(&mut s, &[1], &|_| false).unwrap();
         assert_eq!(budget(&s).unwrap(), 40);
+    }
+
+    /// `oneup pin` with the rule still there: claimed before the pin is set
+    /// on disk, the item isn't taken by the rule (no note, no retry), so
+    /// removing the rule later leaves the user's pin.
+    #[test]
+    fn a_claim_before_its_pin_is_never_taken_by_a_rule() {
+        let mut s = store(&[row(2, 1, "Work", LocalKind::Folder, 0x10), row(3, 2, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd", "/Work/"]);
+        claim_for_user(&mut s, "Work").unwrap();
+        // The agent passes with the rule there, before `oneup pin` sets the pin.
+        run(&mut s, &mut fake, &pins, 0);
+        assert!(fake.set.is_empty(), "{:?}", fake.set);
+        assert!(!s.read(|o| o.pin_owned_has(3)).unwrap() && s.read(|o| o.pin_retry_count()).unwrap() == 0);
+        // The pin is set (by hand); the rule goes: nothing undone.
+        s.write(|o| {
+            for id in [2, 3] {
+                let mut r = o.local_get(id)?.unwrap();
+                r.attributes |= PINNED;
+                o.local_update(&r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(fake.set.is_empty(), "{:?}", fake.set);
+    }
+
+    /// "Free up space" on the synced folder itself is a folder-level request:
+    /// the rule's files at the top stay pinned.
+    #[test]
+    fn freeing_the_synced_folder_leaves_the_rules_files_pinned() {
+        let mut s = store(&[row(3, 1, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(3, "a.psd")]);
+        explorer_free(&mut s, &[1, 3]);
+        fake.set.clear();
+        let p = run(&mut s, &mut fake, &pins, 0);
+        assert_eq!((p.released, p.repinned), (0, 1));
+    }
+
+    /// A started download is never refunded, whatever happened to it.
+    #[test]
+    fn a_started_download_is_never_refunded() {
+        let mut s = store(&[]);
+        approve(&mut s, &PinSet::new(&["*.psd"]).fingerprint(), 100).unwrap();
+        take_approval(&mut s, &PinSet::new(&["*.psd"]).fingerprint()).unwrap();
+        reserve_budget(&mut s, &[(1, 60, true), (2, 30, true)]).unwrap();
+        mark_started(&mut s, 1).unwrap();
+        // A crash; on the next start nothing says 1 is here.
+        settle(&mut s, &[], &|_| false).unwrap();
+        assert_eq!(budget(&s).unwrap(), 40, "1 stays charged, 2 comes back");
+    }
+
+    /// A folder the user pinned keeps what's in it from being freed, and a
+    /// "Free up space" on a folder above doesn't undo its pin; on the folder
+    /// itself, it does.
+    #[test]
+    fn a_folder_the_user_pinned_wins_over_a_folder_above() {
+        let mut s = store(&[
+            row(2, 1, "Docs", LocalKind::Folder, 0x10),
+            row(3, 2, "Kept", LocalKind::Folder, 0x10),
+            row(4, 3, "a.txt", LocalKind::File, 0),
+        ]);
+        // The user pins Kept in File Explorer (seen by the observer).
+        s.write(|o| o.local_update(&row(3, 2, "Kept", LocalKind::Folder, 0x10 | PINNED))).unwrap();
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "noted as the user's");
+        let a = s.read(|o| o.local_get(4)).unwrap().unwrap();
+        assert!(kept_by_folder_above(&s, &a).unwrap());
+        // "Free up space" on Docs: Explorer marks Docs, Kept and a.txt.
+        explorer_free(&mut s, &[2, 3, 4]);
+        let mut fake = Fake::default();
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.repinned, 1);
+        assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
+        assert!(kept_by_folder_above(&s, &a).unwrap(), "still kept: the user's folder");
+        // "Free up space" on Kept itself (Docs not marked): the user's choice.
+        s.write(|o| {
+            o.local_update(&row(2, 1, "Docs", LocalKind::Folder, 0x10))?;
+            o.local_update(&row(3, 2, "Kept", LocalKind::Folder, 0x10 | PINNED))?;
+            o.local_update(&row(3, 2, "Kept", LocalKind::Folder, 0x10 | UNPINNED))
+        })
+        .unwrap();
+        fake.set.clear();
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(fake.set.is_empty() && !s.read(|o| o.pin_user_has(3)).unwrap());
+        assert!(!kept_by_folder_above(&s, &a).unwrap());
     }
 
     #[test]

@@ -728,6 +728,31 @@ const PIN_SLICE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Drops from `ops` (freeing operations) the files a pin rule keeps, and
 /// sets their pin back. Returns how many.
+/// Drops from `ops` (freeing operations) the files a folder above keeps
+/// (`pinrules::kept_by_folder_above`), unless freed by name. Returns how
+/// many.
+fn keep_by_folder(store: &Store, ops: &mut Vec<Op>) -> Result<usize> {
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in std::mem::take(ops) {
+        let row = match &op {
+            Op::Dehydrate { local, .. } => store.read(|o| o.local_get(local.id.0))?,
+            _ => None,
+        };
+        match row {
+            Some(row)
+                if crate::pinrules::kept_by_folder_above(store, &row)?
+                    && !crate::pinrules::freed_by_name(store, &row)? =>
+            {
+                kept += 1;
+            }
+            _ => out.push(op),
+        }
+    }
+    *ops = out;
+    Ok(kept)
+}
+
 fn keep_pinned(
     store: &mut Store,
     pinner: &mut dyn crate::pinrules::Pinner,
@@ -1218,27 +1243,53 @@ impl Engine {
         })?;
         let mut candidates = Vec::with_capacity(rows.len());
         for (id, size, noted) in rows {
-            let owned = noted && {
+            let owned = if noted {
                 let rel = store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p));
                 match rel {
                     Some(rel) => crate::pinrules::owned_verified(&mut store, &mut pinner, id, &rel)?,
-                    None => false,
+                    None => Some(false),
                 }
+            } else {
+                Some(false)
             };
-            candidates.push((id, size, owned));
+            // Unproven this pass (its identity couldn't be read): neither
+            // charged nor fetched.
+            if let Some(owned) = owned {
+                candidates.push((id, size, owned));
+            }
         }
         let owned: std::collections::HashSet<u128> = candidates.iter().filter(|c| c.2).map(|c| c.0).collect();
         let (reserved, blocked) = crate::pinrules::reserve_budget(&mut store, &candidates)?;
-        let may = |id: u128, size: u64| -> std::result::Result<(), oneup_exec::placement::Stop> {
-            if owned.contains(&id) && !reserved.contains(&id) {
-                return Err(oneup_exec::placement::Stop::Approval);
-            }
-            let paused = controls().pause_local;
-            let free = crate::pinrules::free_space(&root_path);
-            let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
-            l.may(size, paused, free, std::time::Instant::now())
+        // One file at a time: each of the rules' own is marked started,
+        // durably, before its download, so a crash never refunds it.
+        let mut fetched = oneup_exec::placement::Fetched {
+            more: candidates.len() >= oneup_exec::placement::BATCH,
+            ..Default::default()
         };
-        let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path), &may).await?;
+        for &(id, size, _) in &candidates {
+            let stop = if owned.contains(&id) && !reserved.contains(&id) {
+                Err(oneup_exec::placement::Stop::Approval)
+            } else {
+                let paused = controls().pause_local;
+                let free = crate::pinrules::free_space(&root_path);
+                let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
+                l.may(size, paused, free, std::time::Instant::now())
+            };
+            if let Err(why) = stop {
+                fetched.stopped = Some(why);
+                fetched.more = true;
+                break;
+            }
+            let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
+            if owned.contains(&id) {
+                crate::pinrules::mark_started(&mut store, id)?;
+            }
+            if oneup_exec::placement::fetch_one(Path::new(&root.path), &rel).await {
+                fetched.done.push((rel, id, size));
+            } else {
+                fetched.attempted.push(id);
+            }
+        }
         // What wasn't tried goes back to the budget; a download that was
         // tried counts, finished or not (bytes may have come), so failures
         // can't go past the approval again and again.
@@ -1280,6 +1331,13 @@ impl Engine {
             log_activity(&mut store, log)?;
         }
         let mut ops = oneup_exec::placement::free_ops(&store)?;
+        // A folder above that keeps it (the user's pin) wins over "Free up
+        // space" chosen on a folder above; on the file itself, it's freed.
+        let kept = keep_by_folder(&store, &mut ops)?;
+        if kept > 0 {
+            let detail = format!("{kept} item(s) kept on this PC by a folder above, though set to free up space");
+            log_activity(&mut store, vec![notice(ActivityOutcome::Note, "keep", detail)])?;
+        }
         // A pin rule wins over "Free up space" chosen in File Explorer: the
         // file isn't freed and gets its pin back.
         if !pins.is_empty() {

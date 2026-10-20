@@ -72,6 +72,17 @@ pub struct Fetched {
 /// error stops the pass there (a pause that came meanwhile, too little or
 /// unknown free space, the pass's share used, a download that needs the
 /// person's go-ahead), and says why.
+/// Downloads one pinned file, `rel` relative to the synced folder (as
+/// [`fetch_pinned`] does each). Whether it's here now.
+pub async fn fetch_one(root: &Path, rel: &str) -> bool {
+    let path: PathBuf = rel.trim_start_matches('/').split('/').fold(root.to_path_buf(), |p, part| p.join(part));
+    tokio::task::spawn_blocking(move || -> bool {
+        oneup_cfapi::provider::open(&path).is_ok_and(|f| oneup_cfapi::provider::hydrate(&f).is_ok())
+    })
+    .await
+    .unwrap_or(false)
+}
+
 pub async fn fetch_pinned(
     store: &Store,
     root: &Path,
@@ -93,13 +104,7 @@ pub async fn fetch_pinned(
             out.more = true;
             break;
         }
-        let path: PathBuf = rel.trim_start_matches('/').split('/').fold(root.to_path_buf(), |p, part| p.join(part));
-        let ok = tokio::task::spawn_blocking(move || -> bool {
-            oneup_cfapi::provider::open(&path).is_ok_and(|f| oneup_cfapi::provider::hydrate(&f).is_ok())
-        })
-        .await
-        .unwrap_or(false);
-        if ok {
+        if fetch_one(root, &rel).await {
             out.done.push((rel, id, size));
         } else {
             out.attempted.push(id);
