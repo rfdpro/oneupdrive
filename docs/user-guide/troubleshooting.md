@@ -15,6 +15,8 @@ OneUpDrive tells you about a problem in plain words, says whether it deals with 
 * `oneup status` prints the same, with the technical text last.
 
 ### Everything that needs you
+(A **safety stop**, where OneUpDrive stops and asks before many deletions or changes, isn't a problem: answer it from the icon's **Review …**, see [When OneUpDrive waits for you](tray-icon.md#when-oneupdrive-waits-for-you) and [Safety stop](syncing.md#safety-stop).)
+
 `oneup problems` lists, in one place, everything waiting for you, for the main folder and every other folder pair and vault, most pressing first:
 
 * nothing set up yet, or not signed in;

@@ -1,6 +1,6 @@
 # Syncing in depth
 
-Day to day you won't need any of the commands on this page: the [settings window](settings-window.md) and the [icon's menu](tray-icon.md) do the same. This page explains what happens underneath, with the commands for scripts and for testing.
+Day to day you won't need any of the commands on this page: the [settings window](settings-window.md) and the [icon's menu](tray-icon.md) do the same. This page explains what happens underneath, with the commands for scripts and for testing. Unfamiliar words are in the [glossary](glossary.md).
 
 ## What it does
 `oneup sync` keeps one folder on your PC and one folder in your OneDrive the same, in both directions:
@@ -10,10 +10,10 @@ Day to day you won't need any of the commands on this page: the [settings window
 * deletions are repeated on the other side, but always recoverably (see below).
 
 ```powershell
-oneup --data-dir "$env:LOCALAPPDATA\OneUpDrive-test" sync C:\Path\To\Folder --remote /My-Test-Folder
+oneup sync C:\Path\To\Folder --remote /My-Folder
 ```
 
-The first run looks through the folder once, and creates the OneDrive folder if it's missing. Later runs only look at what changed since, so they're quick however big the folder is. A data folder (`--data-dir`) syncs one pair of folders. Use another data folder for another pair.
+The first run looks through the folder once, and creates the OneDrive folder if it's missing. Later runs only look at what changed since, so they're quick however big the folder is. A data folder (`--data-dir`, the [glossary](glossary.md) says what it holds) syncs your main folder pair. Extra folders have their own data folders, made by `oneup pair add` ([More folders](folders.md)).
 
 Add `--dry-run` to see what would happen without changing anything (`--limit 200` lists at most 200 changes; the totals always come last).
 
@@ -23,8 +23,8 @@ Add `--dry-run` to see what would happen without changing anything (`--limit 200
 `oneupd` is the background agent. Once `oneup sync` has paired the folders, it keeps them in sync for as long as it runs. Start it in the background, with no window:
 
 ```powershell
-oneup --data-dir "$env:LOCALAPPDATA\OneUpDrive-test" start
-oneup --data-dir "$env:LOCALAPPDATA\OneUpDrive-test" stop     # after its current step
+oneup start
+oneup stop     # after its current step
 ```
 
 `oneup start` returns as soon as the agent answers, and shows its status. The agent's messages go to `oneupd.log` in the data folder (the previous run's are kept in `oneupd.log.1`). If it can't start, for example because you aren't signed in, `oneup start` shows why. If it's already running, `oneup start` just shows its status.
@@ -37,12 +37,12 @@ oneup --data-dir … autostart off    # don't
 oneup --data-dir … autostart        # show which
 ```
 
-This is off until you turn it on. It's set for your Windows account only and needs no administrator rights: Windows runs `oneupd-start.exe`, a small launcher that shows no window, starts the agent and exits. You'll find it in Task Manager's **Startup apps** as "OneUpDrive agent (*data folder name*)", and you can turn it off there too. Each data folder has its own setting. If you move the OneUpDrive programs, run `autostart on` again.
+The setup page turns it on unless you untick **Start with Windows**; from the command line it is off until you turn it on. It's set for your Windows account only and needs no administrator rights: Windows runs `oneupd-start.exe`, a small launcher that shows no window, starts the agent and exits. You'll find it in Task Manager's **Startup apps** as "OneUpDrive agent (*data folder name*)", and you can turn it off there too. Each data folder has its own setting. If you move the OneUpDrive programs, run `autostart on` again.
 
 You can also run the agent in a terminal window, where it prints what it does:
 
 ```powershell
-oneupd --data-dir "$env:LOCALAPPDATA\OneUpDrive-test"
+oneupd
 ```
 
 * Changes on your PC are sent within a few seconds.
@@ -104,8 +104,8 @@ oneup --data-dir … settings --hash-files-at-once 4        # compare up to 4 fi
 * **Copies of files already in OneDrive aren't uploaded again.** If you copy a large file (1 MiB or more) that's already in your OneDrive, for example a video into a second folder, OneUpDrive checks that the contents are identical and asks OneDrive to make the copy itself. That takes a couple of seconds whatever the size. `oneup activity` shows it as copied in OneDrive.
 * **An item that fails waits before it's tried again:** a minute, then twice as long after each failure in a row, up to an hour. Other files keep syncing, and a change to the item (here or in OneDrive) ends the wait. See [When something goes wrong](troubleshooting.md#a-file-that-fails-again-and-again).
 * **While OneDrive is full, uploads and new folders wait.** Downloads go on, and what waited is sent once OneDrive has more room. The icon and `oneup status` say "OneDrive is full" meanwhile ([details](troubleshooting.md#cloud-full)).
-* **Saving a file never fails because OneUpDrive is sending it.** If you save while it's being sent, the send stops and the saved version goes instead.
-* **Files that keep changing wait until they're left alone.** A file saved twice within 5 seconds (a database, an app that saves its settings every few seconds) isn't sent after every save: OneUpDrive waits until it has gone 15 seconds without a change, then sends it once. A file that never stops changing is still sent at least every 10 minutes. `oneup activity` shows such a file as waiting. In the settings window: **General → File changes**; `--busy-changes`, `--busy-window-s` and `--busy-max-s` set how many changes in how many seconds make a file busy and the longest it waits. Downloads never wait.
+* **Saving never fails because OneUpDrive is sending the file.** If you save while it's being sent, the send stops and the saved version goes instead.
+* **Timeout highly active files.** A file saved twice within 5 seconds (a database, an app that saves its settings every few seconds) isn't sent after every save: OneUpDrive waits until it has gone 15 seconds without a change, then sends it once. A file that never stops changing is still sent at least every 10 minutes. `oneup activity` shows such a file as waiting. In the settings window: **General → File changes**; `--busy-changes`, `--busy-window-s` and `--busy-max-s` set how many changes in how many seconds make a file busy and the longest it waits. Downloads never wait.
 * **The database is compacted** when `oneupd` starts, if deleted entries left most of it empty (it can otherwise stay at its largest size). It takes a few seconds and shows in `oneup activity`. `oneup settings --compact-database off` turns it off.
 * Priority, the memory profile and its numbers, and files hashed at once apply the next time `oneupd` starts (`oneup stop`, then `oneup start`).
 
@@ -140,13 +140,13 @@ A **safety stop** (see below) doesn't end `oneupd`: it changes nothing and waits
 * **Edited on both sides?** You get both. Your PC's copy is renamed to `name (conflict 1).ext` and uploaded, and the OneDrive version keeps the original name.
   * If the OneDrive edit lands in the last moment of a large upload from your PC, your PC's version keeps the original name instead and the OneDrive version arrives as `name (conflict 1).ext`. The activity log says so.
 * **Deleted on your PC?** The OneDrive copy goes to OneDrive's recycle bin, where you can restore it from the website.
-* **Deleted in OneDrive?** Your PC's copy is moved into the hidden `.oneup\versions` folder inside your synced folder, with a note of where it came from. (If that would make the folder too big, you're asked first: see [When the version store is full](#when-the-version-store-is-full).)
+* **Deleted in OneDrive?** Your PC's copy is moved into the hidden `.oneup\versions` folder inside your synced folder (the **version store**, called **Kept copies** in the settings window), with a note of where it came from. (If that would make the folder too big, you're asked first: see [When the version store is full](#when-the-version-store-is-full).)
 * **Replaced by a newer version from OneDrive?** Your PC gets the new version. The old one isn't kept on your PC, because OneDrive keeps it in the file's **version history** (on the website: right-click the file, *Version history*). This only happens when you hadn't changed the file on your PC; if you had, you get both copies (see above). Before the old copy is removed, OneUpDrive reads it to make sure it really is the version OneDrive has. If it isn't, it's kept in `.oneup\versions` instead. To keep old versions on your PC as well, run `oneup versions --set-keep-replaced on`.
 * **A file that's open in another program** is left alone and tried again on the next run.
 * **A file that disappeared without a trace** (for example, a disk that wasn't connected) is never taken as a deletion. It's left alone in both places.
 
 ## Safety stop
-If a single run would delete, overwrite or move a lot of files at once (more than 200, or more than 20 that are also over 10% of everything synced), OneUpDrive changes **nothing** and stops:
+A safety stop is OneUpDrive stopping to ask. If a single run would delete, overwrite or move a lot of files at once (more than 200, or more than 20 that are also over 10% of everything synced), it changes **nothing** and waits. Easiest: select the icon's **Review …** (see [When OneUpDrive waits for you](tray-icon.md#when-oneupdrive-waits-for-you)), look at the list and choose **Go ahead** or **Not now**. The commands below do the same for scripts. On the command line it looks like this:
 
 ```
 Safety stop: this round would delete, overwrite or move 30 items in OneDrive (41 items are synced).

@@ -1,6 +1,6 @@
 # More folders, backups, shared folders and accounts
 
-Your main synced folder is just the start. OneUpDrive can keep **any number of folders** in sync, each with its own OneDrive folder, and each either **both ways** or as a **backup**. All of this is on the settings window's **Files** page: each folder has a tab, and **Add** adds one.
+Your main synced folder is just the start. OneUpDrive can keep **any number of folders** in sync, each with its own OneDrive folder (a **folder pair**, `pair` in the commands), and each either **both ways** or as a **backup**. All of this is on the settings window's **Files** page: each folder has a tab, and **Add** adds one.
 
 ## Another folder
 **Files → Add → Sync another folder**: a folder in OneDrive (made if it doesn't exist) and a folder on this PC. Both may already hold files: files that are the same are matched, not copied again, and if two files with the same name differ, both are kept (one gets "(conflict 1)" in its name).
@@ -13,7 +13,7 @@ oneup unpair --yes                          # the same for your main folder
 ```
 
 * A folder can't be inside another synced folder, here or in OneDrive. One exception: a OneDrive folder **inside your main OneDrive folder** is fine. Your main folder then leaves it alone, and `oneup explain` says why.
-* Each extra folder has its own background agent, safety stops, rules and activity log. `oneup start` and `oneup stop` start and stop them all together.
+* Each extra folder has its own syncing process (the [background agent](glossary.md)), safety stops, rules and activity log. `oneup start` and `oneup stop` start and stop them all together.
 * **Files On-Demand** can be on for each folder separately (not for backups).
 
 ## Stopping a folder's sync
