@@ -84,6 +84,59 @@ pub fn may_download_by_itself_now(data_dir: &Path) -> bool {
     may_download_by_itself(net.metered, profile.budget_bytes().is_some(), offline)
 }
 
+/// How a download that may be stopped ended ([`run_stoppable`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ran {
+    /// It ended by itself; whether it succeeded.
+    Finished(bool),
+    /// A change made `stop` say no: it was ended.
+    Stopped,
+}
+
+/// What [`run_stoppable`] hears: the child ended, or something changed
+/// (the network) that `stop` judges.
+#[derive(Debug)]
+pub enum Heard {
+    Ended(bool),
+    Changed,
+}
+
+/// Runs `cmd` (the automatic update download, in a process of its own)
+/// until it ends, or until a change sent on `events` makes `stop()` true:
+/// then it's ended at once. A partial download is left as velopack's
+/// `.partial` file, which its next download clears. Waits on the channel:
+/// nothing is polled.
+#[cfg(windows)]
+pub fn run_stoppable(
+    mut cmd: std::process::Command,
+    events: std::sync::mpsc::Sender<Heard>,
+    heard: std::sync::mpsc::Receiver<Heard>,
+    stop: impl Fn() -> bool,
+) -> std::io::Result<Ran> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let exe = oneup_sys::processes::image_of(pid);
+    std::thread::Builder::new().name("update-download".into()).spawn(move || {
+        let ok = child.wait().is_ok_and(|s| s.success());
+        let _ = events.send(Heard::Ended(ok));
+    })?;
+    let mut stopping = false;
+    loop {
+        match heard.recv() {
+            Ok(Heard::Ended(ok)) => return Ok(if stopping { Ran::Stopped } else { Ran::Finished(ok) }),
+            Ok(Heard::Changed) if !stopping && stop() => {
+                stopping = true;
+                if let Some(exe) = exe.clone() {
+                    let p = oneup_sys::processes::Process { pid, exe };
+                    oneup_sys::processes::terminate(&p, 10_000).map_err(std::io::Error::other)?;
+                }
+            }
+            Ok(Heard::Changed) => {}
+            Err(_) => return Ok(Ran::Stopped),
+        }
+    }
+}
+
 /// Looks for a newer release; downloads and checks it if there is one.
 /// Blocking (network): run it off the UI thread.
 pub fn check(um: UpdateManager) -> Result<Option<Ready>> {
@@ -147,6 +200,36 @@ pub fn apply(ready: Ready, args: Vec<String>) -> Result<()> {
 mod tests {
     /// The daily check holds back like background work: not on a metered
     /// network, with a data budget, or offline.
+    #[test]
+    fn a_change_that_says_stop_ends_the_download_at_once() {
+        use super::{Heard, Ran, run_stoppable};
+        let slow = || {
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null());
+            c
+        };
+        // A change that doesn't say stop leaves it; one that does ends it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let say = tx.clone();
+        let started = std::time::Instant::now();
+        let flips = std::sync::atomic::AtomicU32::new(0);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = say.send(Heard::Changed);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = say.send(Heard::Changed);
+        });
+        let ran =
+            run_stoppable(slow(), tx, rx, || flips.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1).unwrap();
+        assert_eq!(ran, Ran::Stopped);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        // Left alone, it finishes by itself.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut quick = std::process::Command::new("cmd");
+        quick.args(["/C", "exit 0"]);
+        assert_eq!(run_stoppable(quick, tx, rx, || true).unwrap(), Ran::Finished(true));
+    }
+
     #[test]
     fn updates_download_by_themselves_only_where_background_work_may() {
         use super::may_download_by_itself as may;
