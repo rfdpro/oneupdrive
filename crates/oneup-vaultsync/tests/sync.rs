@@ -39,6 +39,8 @@ struct Pair {
     exec: Executor<VaultCloud<Fake>>,
     s: Setup,
     conn: Option<provider::Connection>,
+    /// Moves cut short that rounds recorded where they went.
+    relinked: usize,
     _hydrator: Option<Arc<Hydrator<VaultCloud<Fake>>>>,
 }
 
@@ -92,7 +94,7 @@ impl Pair {
             (None, None)
         };
         let obs = Observer::open(store, Config::new(rules)).unwrap();
-        Self { dir, db, obs, exec, s, conn, _hydrator: hydrator }
+        Self { dir, db, obs, exec, s, conn, relinked: 0, _hydrator: hydrator }
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -117,7 +119,7 @@ impl Pair {
         *self.s.nodes.write().unwrap() = p.nodes.clone();
         let store = self.obs.store_mut();
         apply(store, &self.s.src, &p).unwrap();
-        store.write(oneup_exec::settle_moves).unwrap();
+        self.relinked += store.write(oneup_exec::settle_moves).unwrap().relinked;
         let ops = store
             .read(|o| {
                 let p = Parked::new(o);
@@ -436,6 +438,7 @@ async fn a_vault_move_cut_short_by_a_crash_is_recorded_where_it_went() {
         assert_eq!(p.local(), want, "case {i}: here");
         assert_eq!(p.vault(), want, "case {i}: in the vault");
         assert_eq!(p.versions(), 0, "case {i}: nothing recycled");
+        assert_eq!(p.relinked, 1, "case {i}: recorded where it went, not held");
         assert!(p.obs.store().read(|o| o.meta_under("exec.moving")).unwrap().is_empty(), "case {i}");
     }
 }

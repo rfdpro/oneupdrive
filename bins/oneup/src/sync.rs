@@ -2158,7 +2158,9 @@ async fn dry_run(
     data_dir: &Path,
     limit: Option<usize>,
 ) -> Result<()> {
-    let store = observe(store, rules).await?;
+    let mut store = observe(store, rules).await?;
+    // As a round does: a move a crash cut short, recorded where it went.
+    store.write(oneup_exec::settle_moves)?;
     let (user_rules, ignored) = crate::rulefiles::load(data_dir, &store, &mut crate::rulefiles::Cache::default())?;
     for (path, why) in ignored {
         println!("Rule file {path} ignored: {why}");
