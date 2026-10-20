@@ -6,7 +6,7 @@
 
 **Backup**: a folder that sends changes from this PC to OneDrive only. Deleting a file here never deletes it in OneDrive. See [Backups](folders.md#backups-one-way-from-this-pc-to-onedrive).
 
-**Conflict copy**: when a file changed on both sides, you get both. One keeps its name; the other becomes `name (conflict 1).ext`.
+**Conflict copy**: when a file changed on both sides, you get both. One keeps its name; the other becomes `name (conflict 1).ext`. The **Recovery** page lists them side by side to keep one or both. See [Getting things back](recovery.md#conflicts).
 
 **Data budget**: a monthly limit, in MB, on what OneUpDrive sends and receives on a network. When it's used up, syncing pauses there until you allow more or the month ends. See [Slow and metered connections](slow-and-metered-networks.md#data-budget).
 
@@ -42,7 +42,9 @@
 
 **Recovery key**: the line starting `OUD1-` that opens an [encrypted vault](vaults.md) if you forget its password.
 
-**Safety stop**: OneUpDrive stops and asks before it deletes, overwrites or moves many files at once. Nothing changes until you answer. See [Syncing in depth](syncing.md#safety-stop).
+**Rewind**: put a folder back the way it was at a moment you pick, in OneDrive and on this PC. It shows the list of changes first and waits for your approval; what it replaces or removes can be got back. See [Getting things back](recovery.md#rewind-a-folder).
+
+**Safety stop**: OneUpDrive stops and asks before it deletes, overwrites or moves many files at once. Nothing changes until you answer (a rewind waiting for its approval holds only itself). See [Syncing in depth](syncing.md#safety-stop).
 
 **Sharing link**: a link to a file or folder in OneDrive that opens it for whoever has it (*Anyone with the link*) or only for the people you chose (*Specific people*). What's inside a shared folder is shared with it. See [What you share](versions-and-sharing.md#what-you-share).
 
