@@ -287,6 +287,14 @@ fn print_status(s: &Status) {
         };
         println!("  network           {name}{metered}: {} ({profile}; `oneup network`)", n.transfer);
     }
+    if let Some(w) = s.network.as_ref().and_then(|n| n.waiting.as_ref()) {
+        println!(
+            "  waiting           {} files ({}): {}  (`oneup network waiting` lists them)",
+            w.count,
+            size(w.bytes),
+            w.why
+        );
+    }
     let interval = s.network.as_ref().map_or(0, |n| n.interval_min);
     println!(
         "  OneDrive changes  {}",

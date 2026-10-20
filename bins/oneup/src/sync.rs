@@ -483,6 +483,8 @@ pub struct Outcome {
     /// of a file that keeps changing ([`crate::busy`]), or one that failed
     /// ([`crate::backoff`]). The caller runs a round then.
     pub held_until: Option<std::time::Instant>,
+    /// File contents the network's profile holds back (`crate::network`).
+    pub waiting: Option<crate::network::Waiting>,
 }
 
 /// Everything a round needs besides the database: the executor (with the
@@ -1239,7 +1241,11 @@ impl Engine {
                 &mut store,
                 &mut pinner,
                 &mut |size| {
-                    let paused = controls().pause_local;
+                    // Kept files download only where the network lets every
+                    // file's contents through (`crate::network`), asked again
+                    // before each: a change of network applies from the next.
+                    let c = controls();
+                    let paused = c.pause_local || c.net.transfer != crate::network::Transfer::Everything;
                     let free = crate::pinrules::free_space(&root_path);
                     let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
                     l.may(size, paused, free, std::time::Instant::now())
@@ -1598,6 +1604,7 @@ impl Engine {
             overflow: None,
             breakers: Vec::new(),
             held_until: None,
+            waiting: None,
         };
         let mut scope = first;
         let mut changed_rounds = 0;
@@ -1838,8 +1845,30 @@ impl Engine {
             };
             let (planned, failing, retry_at) = store.read(|o| self.hold_failed(o, planned))?;
             out.held_until = earliest(until, retry_at);
+            // File contents the network's profile doesn't let through wait
+            // for another network (`crate::network`). Their folders stay
+            // marked too, so a round on such a network plans them again.
+            let (planned, for_network) = store.read(|o| hold_for_network(o, &controls.net, planned, on_demand))?;
             let mut later: Vec<Op> = waiting.iter().map(|(op, _)| op.clone()).collect();
             later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
+            later.extend(for_network.iter().map(|(a, _, _)| a.op().clone()));
+            let held_here = (!for_network.is_empty()).then(|| {
+                let mut w = crate::network::Waiting { why: controls.net.why(), ..Default::default() };
+                for (_, l, (way, bytes)) in &for_network {
+                    w.add(l.path.clone(), *bytes, *way);
+                }
+                w
+            });
+            if let Some(w) = &held_here {
+                let detail = format!("{} files ({}): {}", w.count, crate::versions::size(w.bytes), w.why);
+                self.log_once(
+                    &mut store,
+                    format!("net wait {}", w.why),
+                    notice(ActivityOutcome::Waiting, "network", detail),
+                )?;
+            }
+            out.waiting = held_here.clone();
+            crate::network::save_waiting(&mut store, held_here)?;
             let wait = waiting.iter().filter(|(op, _)| matches!(op, Op::Upload { .. })).map(|(_, l)| {
                 let detail = "changing often; sent once it's left alone for a moment".to_string();
                 ActivityEntry {
@@ -1886,6 +1915,7 @@ impl Engine {
                 },
                 order: &order,
                 on_demand,
+                net: &controls.net,
                 taken: std::sync::Mutex::default(),
                 items: std::sync::atomic::AtomicU64::new(0),
                 bytes: std::sync::atomic::AtomicU64::new(0),
@@ -2343,6 +2373,8 @@ struct Follower<'a> {
     cx: GateContext<'a>,
     order: &'a crate::priority::Priority,
     on_demand: bool,
+    /// What the network lets through (`crate::network`).
+    net: &'a crate::network::Policy,
     /// What it took in, described, in the order it was taken in.
     taken: std::sync::Mutex<Vec<(Op, Line)>>,
     /// How many operations, and the bytes their transfers add up to.
@@ -2386,6 +2418,9 @@ impl Follower<'_> {
             .into_iter()
             .filter(|(a, _)| !(full && matches!(a.op(), Op::Upload { .. } | Op::MkdirRemote { .. })));
         let (planned, _, _) = self.engine.hold_failed(o, planned.collect())?;
+        // What waits for another network stays in the new folders, whose
+        // marks bring it to the next round.
+        let (planned, _) = hold_for_network(o, self.net, planned, self.on_demand)?;
         let (approved, lines): (Vec<Approved>, Vec<(Op, Line)>) = planned
             .into_iter()
             .take(room)
@@ -3232,6 +3267,35 @@ const KEPT_INSTEAD: &str =
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// What the network's profile holds back (`crate::network::Policy`): the
+/// transfers of file contents it doesn't let through, with which way each
+/// goes and its size; everything else goes, in order.
+#[allow(clippy::type_complexity)]
+fn hold_for_network(
+    o: &Ops<'_>,
+    net: &crate::network::Policy,
+    planned: Vec<(Approved, Line)>,
+    on_demand: bool,
+) -> oneup_store::Result<(Vec<(Approved, Line)>, Vec<(Approved, Line, (crate::network::Way, u64))>)> {
+    if net.transfer == crate::network::Transfer::Everything {
+        return Ok((planned, Vec::new()));
+    }
+    let (mut go, mut held) = (Vec::new(), Vec::new());
+    for (a, l) in planned {
+        let mut size = None;
+        if let Op::Download { remote, .. } = a.op()
+            && !on_demand
+        {
+            size = o.get_item(&remote.id.0)?.and_then(|r| u64::try_from(r.size).ok());
+        }
+        match crate::network::content(a.op(), on_demand, |_| size) {
+            Some((way, bytes)) if !net.allows(way, bytes) => held.push((a, l, (way, bytes.unwrap_or(0)))),
+            _ => go.push((a, l)),
+        }
+    }
+    Ok((go, held))
 }
 
 /// Splits `items` into those that go now and those `until` holds back,
@@ -4287,6 +4351,87 @@ mod tests {
         assert!(round(&mut s, &[upload]).contains(&d), "the round plans d and holds the upload");
         assert!(round(&mut s, &[]).contains(&d), "so the next round plans d again, and sends it");
         assert!(!round(&mut s, &[]).contains(&d), "after which d is done");
+    }
+
+    /// On a network whose profile holds file contents back, only the
+    /// transfers it doesn't let through wait (with their sizes, for
+    /// `oneup status`); folders, moves and placeholders go, in order.
+    #[test]
+    fn the_network_holds_back_only_the_contents_it_doesnt_let_through() {
+        use crate::network::{Policy, Transfer, Way};
+        use oneup_store::{Kind, RemoteRow};
+        use oneup_sync::{Link, LocalPre, RemotePre};
+        let mut s = Store::open_in_memory().unwrap();
+        let big = RemoteRow {
+            id: "big".into(),
+            parent_id: None,
+            name: "film.mp4".into(),
+            kind: Kind::File,
+            size: 20_000_000,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| o.upsert_item(&big, false)).unwrap();
+        let up = |id: u128, size: i64| Op::Upload {
+            local: LocalPre { id: LocalId(id), stamp: Some((size, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: format!("f{id}"),
+            replace: None,
+            link: Link::New,
+        };
+        let down = Op::Download {
+            remote: RemotePre { id: RemoteId("big".into()), etag: "e".into() },
+            to: LocalId(1),
+            parent: 1,
+            name: "film.mp4".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let mkdir = Op::MkdirRemote {
+            local: LocalPre { id: LocalId(9), stamp: None },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "d".into(),
+            link: Link::New,
+        };
+        let ops = vec![up(1, 5_000_000), up(2, 50_000_000), down, mkdir];
+        let run = |transfer, on_demand| {
+            let review = review_in(&oneup_gate::Policy::default(), &GateContext::default(), ops.clone());
+            let planned: Vec<(Approved, Line)> =
+                review.approved.into_iter().map(|a| (a, Line::new("x", "/p".into(), ""))).collect();
+            let net = Policy { transfer, small_bytes: 10_000_000, ..Policy::default() };
+            let (go, held) = s.read(|o| hold_for_network(o, &net, planned, on_demand)).unwrap();
+            let names = |v: Vec<Op>| -> Vec<String> {
+                v.iter()
+                    .map(|op| match op {
+                        Op::Upload { name, .. } | Op::Download { name, .. } | Op::MkdirRemote { name, .. } => {
+                            name.clone()
+                        }
+                        _ => "?".into(),
+                    })
+                    .collect()
+            };
+            let sizes: Vec<(Way, u64)> = held.iter().map(|(_, _, w)| *w).collect();
+            (
+                names(go.into_iter().map(|(a, _)| a.op().clone()).collect()),
+                names(held.into_iter().map(|(a, _, _)| a.op().clone()).collect()),
+                sizes,
+            )
+        };
+        let (go, held, _) = run(Transfer::Everything, false);
+        assert_eq!((go.len(), held.len()), (4, 0));
+        let (go, held, sizes) = run(Transfer::Small, false);
+        assert_eq!((go, held), (vec!["f1".to_string(), "d".into()], vec!["f2".to_string(), "film.mp4".into()]));
+        assert_eq!(sizes, [(Way::Up, 50_000_000), (Way::Down, 20_000_000)]);
+        let (go, held, _) = run(Transfer::Metadata, false);
+        assert_eq!((go, held.len()), (vec!["d".to_string()], 3));
+        let (go, held, _) = run(Transfer::Opened, false);
+        assert_eq!((go, held), (vec!["f1".to_string(), "f2".into(), "d".into()], vec!["film.mp4".to_string()]));
+        // With Files On-Demand the download is a placeholder: it goes.
+        let (go, _, _) = run(Transfer::Metadata, true);
+        assert_eq!(go, ["film.mp4", "d"]);
     }
 
     #[test]

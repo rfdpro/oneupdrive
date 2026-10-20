@@ -37,3 +37,24 @@ oneup network set --this --sync-interval 30 --upload-kib 200
 oneup network set --metered --transfer metadata            # on metered networks, names and folders only
 oneup network forget --this                                # this network back to the default or metered settings
 ```
+
+## What syncs
+
+For metered networks and for each network of its own, choose what syncs there:
+
+| Choice | What happens |
+|---|---|
+| **Nothing (paused)** | Sync pauses until you're on another network. The default for metered networks. |
+| **Everything** | As on any other network. |
+| **Names and folders only** | New folders, renames, moves and deletions sync both ways, and with Files On-Demand new files in OneDrive appear here as online-only files. No file contents travel. |
+| **Files under the size limit** | Contents of files under the limit (10 MB unless you set another) travel both ways; larger ones wait. |
+| **Only files I open or change** | Files you change here upload; nothing downloads in the background. |
+
+Whatever you choose, **opening an online-only file always downloads it**: you asked for that file.
+
+What waits isn't lost or skipped: it syncs as soon as you're on a network that lets it through. `oneup status` says how much waits and why, `oneup network waiting` lists it (largest first), and `oneup explain` says it for one file. If you switch networks in the middle of a sync, OneUpDrive stops starting transfers the new network doesn't allow straight away; the rest waits for the next sync. Files set to **Always keep on this device** download only on a network that lets everything through.
+
+```
+oneup network set --metered --transfer small --small-mb 25
+oneup network waiting
+```

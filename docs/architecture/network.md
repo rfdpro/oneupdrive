@@ -18,6 +18,16 @@ Three layers, each setting only what it changes, resolved by the pure `network::
 
 A profile carries what transfers, the size limit for "small files", upload and download caps, the sync interval (and `keep_push`) and a monthly budget. The agent resolves it at every wake-up and hands rounds a `network::Policy` through `sync::Controls`; a profile whose transfer is `paused` becomes an automatic pause (`autopause::Conditions::network`). `cap_hours` still limits when caps apply.
 
+## What transfers
+
+`network::Policy` holds the profile's `Transfer` (`everything`, `metadata`, `small`, `opened`, `paused`) and size limit. Only operations that move file contents are ever held (`network::content`): an upload, and a download unless the folder uses Files On-Demand (then it's a placeholder). Names, folders, moves, deletions and placeholders always go; so does hydration, which is the user opening a file and not a sync operation. `opened` lets uploads through and holds background downloads.
+
+Holding is the same mechanism as for files that keep changing or OneDrive being full: after the gate has reviewed the round, `sync::hold_for_network` takes the held operations out of what runs, and their folders keep their dirty marks, so a round on a network that allows them plans them again. Nothing new reaches the gate or the effects layer, and an operation held now is planned from fresh state later; holding a download while the local file changes ends as an ordinary conflict. The follower (new folders' contents in the same round) holds the same way. Files pinned to stay on the device are hydrated only under `everything`.
+
+What waits is kept in `meta` (`net.waiting`, the 500 largest, with the count and bytes) for `oneup status`, `oneup explain` and `oneup network waiting`, and logged once per reason.
+
+**Mid-round:** `control::LivePause` also holds the policy. `round_check` compares it with the policy the round was planned under; once it differs, a content transfer it doesn't allow stops that side for the rest of the round, as a pause does (downloads, whose size isn't known there, stop under a size limit too). The next round plans what waits under the new policy.
+
 ## Sync interval (`oneup_app::pace`)
 
 The `Pacer` is pure: the agent tells it what ended its wait (`Woke`) and when a pass began. With an interval, a journal change no longer ends the wait (the observer still reads the journal, so marks and the Local tree stay current), a push notification ends it only with `keep_push`, and the push channel is closed otherwise. The user's calls and a pass that hit `MAX_ROUNDS` run at once; retries and held uploads wait for the next pass. A simulated hour of steady edits at 15 minutes runs 4 passes (`pace::tests`).
