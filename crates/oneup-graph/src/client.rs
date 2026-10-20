@@ -927,7 +927,11 @@ impl Graph {
             if req.content && !self.budget.send(body_len) {
                 return Err(Error::OverBudget);
             }
+            // File contents took theirs above; the rest uses the budget too.
             self.stats.sent.fetch_add(body_len, Relaxed);
+            if !req.content {
+                self.budget.spent(body_len);
+            }
             measure.attempts += 1;
             self.stats.requests.fetch_add(1, Relaxed);
             let asked = std::time::Instant::now();
@@ -988,7 +992,7 @@ impl Graph {
             let body = if answered {
                 self.read_counted(resp).await
             } else {
-                crate::error_body_counted(resp, Some(&self.stats.bytes)).await
+                crate::error_body_counted(resp, Some(&|n| self.received(n))).await
             };
             let body = match body.map_err(|e| req.plain(e)) {
                 Ok(b) => b,
@@ -1021,10 +1025,25 @@ impl Graph {
     async fn read_counted(&self, mut resp: reqwest::Response) -> reqwest::Result<Vec<u8>> {
         let mut body = Vec::new();
         while let Some(chunk) = resp.chunk().await? {
-            self.stats.bytes.fetch_add(chunk.len() as u64, Relaxed);
+            self.received(chunk.len() as u64);
             body.extend_from_slice(&chunk);
         }
         Ok(body)
+    }
+
+    /// `n` bytes of an answer arrived: counted, and taken from the data
+    /// budget (an answer is never held, but it uses the budget).
+    fn received(&self, n: u64) {
+        self.stats.bytes.fetch_add(n, Relaxed);
+        self.budget.spent(n);
+    }
+
+    /// Traffic outside requests (the push channel's messages): counted
+    /// and taken from the data budget.
+    pub fn count_other(&self, sent: u64, received: u64) {
+        self.stats.sent.fetch_add(sent, Relaxed);
+        self.received(received);
+        self.budget.spent(sent);
     }
 
     /// OneDrive sends `RateLimit-*` headers (best effort) once usage passes
@@ -1610,6 +1629,23 @@ mod tests {
         assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
     }
 
+    /// Every byte of an ordinary request takes from the live budget as it
+    /// goes: its JSON body and its answer, chunk by chunk (a large listing
+    /// can't run past it until the agent next counts).
+    #[tokio::test]
+    async fn answers_and_request_bodies_take_from_the_budget_as_they_go() {
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789012345678901234567890123456789";
+        let whole =
+            "HTTP/1.1 200 OK\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"nextExpectedRanges\":[\"5-\"]}";
+        let (url, _) = serve_each(vec![partial, whole]).await;
+        let g = graph();
+        g.budget.set(Some(1000));
+        tokio::time::timeout(Duration::from_secs(30), g.upload_status(&url)).await.unwrap().unwrap();
+        assert_eq!(g.budget.left(), Some(1000 - 40 - 29));
+        g.count_other(5, 7);
+        assert_eq!(g.budget.left(), Some(1000 - 40 - 29 - 12), "the push channel's too");
+    }
+
     /// The redirect to a version's content is asked through the shared
     /// throttling: a 429 pauses everyone for its `Retry-After` and is asked
     /// again, then the address comes back unfollowed.
@@ -1760,7 +1796,7 @@ mod tests {
         g.upload_fragment(&url, 0, 10, b"0123456789").await.unwrap();
         assert_eq!(count.load(Relaxed), 2);
         assert_eq!(g.stats.sent.load(Relaxed), 20, "both sends");
-        assert_eq!(g.budget.left(), Some(80));
+        assert_eq!(g.budget.left(), Some(80 - 2), "both sends, and the answer");
 
         // Waiting for a 1 KB/s cap; meanwhile another network, no cap, and
         // its budget used up.

@@ -153,16 +153,14 @@ fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> Error {
 /// `Ok` when the server closes the channel normally (the caller asks for a
 /// new endpoint and reconnects), `Err` on a failure, including a server
 /// that goes silent for longer than its own ping deadline. Every message
-/// each way counts in `traffic` (`sent`, `bytes`), as the data budget
-/// counts the client's requests.
+/// each way counts on `graph` (and its data budget), as its requests do.
 pub async fn listen(
     ep: &Endpoint,
-    traffic: &crate::NetStats,
+    graph: &crate::Graph,
     mut joined: impl FnMut(),
     mut changed: impl FnMut(),
 ) -> Result<()> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let sent = |n: usize| traffic.sent.fetch_add(n as u64, Relaxed);
+    let sent = |n: usize| graph.count_other(n as u64, 0);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
     let (mut ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ep.ws_url.as_str()))
         .await
@@ -176,7 +174,7 @@ pub async fn listen(
             Ok(None) => return Ok(()),
             Ok(Some(m)) => m.map_err(ws_error)?,
         };
-        traffic.bytes.fetch_add(msg.len() as u64, Relaxed);
+        graph.count_other(0, msg.len() as u64);
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => return Ok(()),

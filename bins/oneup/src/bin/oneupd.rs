@@ -1244,7 +1244,7 @@ async fn push(graph: Arc<Graph>, remote: Arc<Notify>, up: Arc<AtomicBool>) {
             Ok(ep) => {
                 oneup_graph::push::listen(
                     &ep,
-                    &graph.stats,
+                    &graph,
                     || {
                         up.store(true, Relaxed);
                         tracing::info!("push channel live");
