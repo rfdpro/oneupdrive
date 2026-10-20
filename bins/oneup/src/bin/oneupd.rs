@@ -57,6 +57,7 @@ use clap::Parser;
 use oneup_app::autopause;
 use oneup_app::busy::Busy;
 use oneup_app::control::{Control, now_ms};
+use oneup_app::pace::{Pacer, Woke};
 use oneup_app::problem;
 use oneup_app::safetywindow::SafetyWindow;
 use oneup_app::setup::{self, DirLock, KEY_PRESET};
@@ -589,11 +590,9 @@ async fn agent(
         None
     };
     let push_up = Arc::clone(&control.push_up);
-    // Aborted when this attempt ends, so a restart never runs two channels.
-    // A folder in someone else's drive has no push channel for us: the
-    // timer covers it.
-    let _push = (!args.no_push && !graph.is_other_drive())
-        .then(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
+    // Opened and closed as the sync interval wants it (`oneup_app::pace`);
+    // aborted when this attempt ends, so a restart never runs two channels.
+    let mut push_channel: Option<AbortOnDrop> = None;
 
     let poll = Duration::from_secs(args.poll_seconds.max(15));
     // Every folder only when the marks may not cover everything (see
@@ -602,12 +601,26 @@ async fn agent(
     let mut retry = RETRY_FIRST;
     let mut settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
     let mut auto_was: Option<autopause::Reason> = None;
+    let mut pacer = Pacer::default();
+    let mut woke = Woke::Start;
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
         // wake-up; a broken config.toml keeps the last good settings
         match oneup_app::config::load_agent(dir) {
             Ok(s) => settings = s,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "config.toml: keeping the previous settings"),
+        }
+        pacer.set(oneup_app::config::kept(dir, oneup_app::pace::load(dir)).unwrap_or_default());
+        // A folder in someone else's drive has no push channel for us: the
+        // timer covers it.
+        let want_push = !args.no_push && !graph.is_other_drive() && pacer.wants_push();
+        if want_push != push_channel.is_some() {
+            push_channel = want_push
+                .then(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
+            if !want_push {
+                push_up.store(false, Relaxed);
+                println!("oneupd: OneDrive's push channel closed; OneDrive is checked with each pass");
+            }
         }
         busy.set_settings(settings.busy);
         // The hooks, if config.toml changed (`oneup hooks` nudges the agent).
@@ -629,7 +642,14 @@ async fn agent(
         // ---- a timed pause may be over; a changed pause is saved
         let paused = control.settle_pause(now_ms());
         let mut held_until = None;
+        // With a sync interval, a pass waits for its turn unless the user
+        // asked (`oneup_app::pace`).
+        let hold = pacer.decide(woke, Instant::now());
+        let mut continuing = false;
+        // Whether the wait below is the interval's (a pass ran or waits).
+        let mut paced = true;
         let next = if auto.is_some() {
+            paced = false;
             control.set_activity(Activity::Paused);
             // Looked at again at the next wake-up or check, or when the
             // quiet hours end.
@@ -638,10 +658,15 @@ async fn agent(
                 .map_or(check, |m| check.min(Duration::from_secs(u64::from(m) * 60 + 5)))
         } else if paused.local && paused.remote {
             control.set_activity(Activity::Paused);
+            paced = false;
             PAUSED_WAIT
+        } else if let Some(wait) = hold {
+            // Not yet: changes collect meanwhile.
+            wait
         } else {
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
+            pacer.started(started);
             let mut executed = Recent::default();
             let recent = window.recent(now_ms());
             // Each round records the window, with what it may do, before it
@@ -755,7 +780,10 @@ async fn agent(
                     println!("oneupd: retrying the skipped items in {} s", wait.as_secs());
                     wait
                 }
-                End::Unsettled => Duration::from_secs(5),
+                End::Unsettled => {
+                    continuing = true;
+                    Duration::from_secs(5)
+                }
                 // Nothing ran. The next wake-up (a change, a check, or the
                 // user's answer) plans it again; the stop is shown once.
                 End::Stopped => {
@@ -765,8 +793,12 @@ async fn agent(
             }
         };
         // A held upload goes once its file has been left alone, a failed
-        // operation once its wait is over.
-        let next = held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now())));
+        // operation once its wait is over; with a sync interval, both wait
+        // for the next pass, which is when OneDrive is checked too.
+        let next = match pacer.due() {
+            Some(due) if paced && !continuing => due.saturating_duration_since(Instant::now()),
+            _ => held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now()))),
+        };
         // A timed pause ends the wait when it's over.
         let next = match paused.until_ms {
             Some(u) if paused.local || paused.remote => {
@@ -774,13 +806,25 @@ async fn agent(
             }
             _ => next,
         };
+        control.set_network(net_status(&pacer));
 
         // ---- wait for something to do
-        store = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next).await?;
+        let (s, w) = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer).await?;
+        store = s;
+        woke = if w == Woke::Timer && continuing { Woke::Continue } else { w };
         if stop.requested() {
             return Ok(());
         }
     }
+}
+
+/// What `oneup status` shows of the network and the sync interval.
+fn net_status(pacer: &Pacer) -> oneup_ipc::NetStatus {
+    let next_ms = pacer.due().map(|d| {
+        let left = d.saturating_duration_since(Instant::now());
+        now_ms() + i64::try_from(left.as_millis()).unwrap_or(i64::MAX / 2)
+    });
+    oneup_ipc::NetStatus { interval_min: pacer.interval().minutes, next_ms }
 }
 
 /// Why the agent pauses by itself now (config.toml [agent]), if it does.
@@ -824,6 +868,11 @@ async fn watching_auto_pause<T>(
 ///
 /// "New" because marks left by a round with skipped items stay until their
 /// retry (`timeout`); only marks made after the wait began cut it short.
+///
+/// With a sync interval (`pacer`), changes in the synced folder are still
+/// read from the journal as they come, but don't end the wait; nor do
+/// OneDrive's notifications, unless the push channel is kept for them.
+#[allow(clippy::too_many_arguments)]
 async fn wait(
     mut store: Store,
     rules: &oneup_rules::ExcludeSet,
@@ -832,38 +881,42 @@ async fn wait(
     stop: &Stop,
     control: &Notify,
     timeout: Duration,
-) -> Result<Store> {
+    pacer: &Pacer,
+) -> Result<(Store, Woke)> {
     let deadline = tokio::time::Instant::now() + timeout;
     let seen = store.read(|o| o.dirty_last())?;
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return Ok(store),
-            _ = stop.notify.notified() => return Ok(store),
+            _ = tokio::time::sleep_until(deadline) => return Ok((store, Woke::Timer)),
+            _ = stop.notify.notified() => return Ok((store, Woke::Stop)),
             _ = control.notified() => {
                 tracing::debug!("control call");
-                return Ok(store);
+                return Ok((store, Woke::User));
             }
             _ = remote.notified() => {
                 // Something changed in OneDrive (or the channel dropped). A
                 // change often comes as a few notifications in a row.
                 tracing::debug!("push notification");
-                stop.sleep(PUSH_SETTLE).await;
-                return Ok(store);
+                if pacer.wakes_on(Woke::Cloud) {
+                    stop.sleep(PUSH_SETTLE).await;
+                    return Ok((store, Woke::Cloud));
+                }
+                continue;
             }
             _ = journal.notified() => {}
         }
         // A control call doesn't wait for the burst to settle.
         tokio::select! {
             _ = stop.sleep(SETTLE) => {}
-            _ = control.notified() => return Ok(store),
+            _ = control.notified() => return Ok((store, Woke::User)),
         }
         if stop.requested() {
-            return Ok(store);
+            return Ok((store, Woke::Stop));
         }
         store = sync::observe(store, rules).await?;
-        if store.read(|o| o.dirty_last())? > seen {
+        if pacer.wakes_on(Woke::Local) && store.read(|o| o.dirty_last())? > seen {
             tracing::debug!("change in the synced folder");
-            return Ok(store);
+            return Ok((store, Woke::Local));
         }
     }
 }

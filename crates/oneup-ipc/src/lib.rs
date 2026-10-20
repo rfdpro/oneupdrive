@@ -27,8 +27,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWri
 
 pub use protocol::{
     Activity, Answer, Call, DatabaseNote, Direction, Event, EventKind, Events, INVALID_PARAMS, INVALID_REQUEST,
-    LastRun, METHOD_NOT_FOUND, NO_SUCH_BATCH, Overflow, PARSE_ERROR, PauseState, Problem, Progress, PruneOffer,
-    Retrying, RpcError, SafetyStop, Status, Unsynced,
+    LastRun, METHOD_NOT_FOUND, NO_SUCH_BATCH, NetStatus, Overflow, PARSE_ERROR, PauseState, Problem, Progress,
+    PruneOffer, Retrying, RpcError, SafetyStop, Status, Unsynced,
 };
 
 /// In the data folder: the name of the running agent's pipe.
@@ -380,6 +380,7 @@ mod tests {
             retrying: None,
             databases: Vec::new(),
             databases_more: 0,
+            network: None,
         }
     }
 

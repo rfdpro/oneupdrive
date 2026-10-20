@@ -2212,6 +2212,13 @@
                 <div class="row">
                     <div class="label"><b>Quiet hours</b><small>Like 22:00-07:00</small></div><input type="text" data-agent="quiet_hours" placeholder="None" aria-label="Quiet hours"></div>
             </div>
+            <h3>Sync interval</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Sync every (minutes)</b><small>0 to sync within seconds. Changes collect in between.</small></div><input type="number" min="0" max="1440" data-sync="interval_minutes"></div>
+                <div class="row">
+                    <div class="label"><b>Get OneDrive's changes at once</b><small>Keeps push notifications on</small></div><label class="toggle"><input type="checkbox" data-sync="keep_push" aria-label="Get OneDrive's changes at once"><span></span></label></div>
+            </div>
         </section>
 
         <!-- General -->
@@ -2969,7 +2976,17 @@
                 version: s.version
             }) : "OneUpDrive " + s.version);
             $("#about-data").textContent = s.data_dir;
+            fillNetwork(s);
         }
+
+        // ---- the network page's sync interval
+        function fillNetwork(s) {
+            $$("[data-sync]").forEach(e => {
+                const v = s.sync[e.dataset.sync];
+                e.type === "checkbox" ? e.checked = !!v : e.value = v ?? 0;
+            });
+        }
+        $$("[data-sync]").forEach(e => e.onchange = () => saveField(e, "sync", e.dataset.sync));
         $("#autostart").onchange = e => run(call("save", {
             section: "autostart",
             value: e.target.checked

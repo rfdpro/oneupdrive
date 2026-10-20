@@ -29,6 +29,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
     let updates = config::load_updates(dir)?;
     let (first, last) = config::load_priority(dir)?;
     let search = config::load_search(dir)?;
+    let interval = crate::pace::load(dir)?;
     let vaults: Vec<Value> = crate::vaultpair::list(dir)
         .iter()
         .map(|e| {
@@ -147,6 +148,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "priority": { "first": first, "last": last },
         "search": { "onedrive": search.onedrive, "hotkey": search.hotkey },
         "databases": databases_json(dir)?,
+        "sync": { "interval_minutes": interval.minutes, "keep_push": interval.keep_push },
         "kept_folder": local.as_deref().map(|l| shown(&Path::new(l).join(oneup_rules::ENGINE_DIR).join("versions").to_string_lossy())),
     }))
 }
@@ -409,6 +411,17 @@ pub fn agent_with(mut a: Agent, v: &Value) -> Result<Agent> {
         a.cap_hours = q;
     }
     Ok(a)
+}
+
+/// The sync interval (`[sync]`) changed by the fields present in `v`.
+pub fn sync_with(mut i: crate::pace::Interval, v: &Value) -> Result<crate::pace::Interval> {
+    if let Some(n) = get(v, "interval_minutes") {
+        i.minutes = crate::pace::check_minutes(n.as_u64().context("interval_minutes: expected a whole number")?)?;
+    }
+    if let Some(b) = get(v, "keep_push") {
+        i.keep_push = b.as_bool().context("keep_push: expected on or off")?;
+    }
+    Ok(i)
 }
 
 /// The `[rules]` changed by the fields present in `v` (each rule checked).
@@ -975,6 +988,10 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
             }
             Ok(())
         }
+        "sync" => {
+            let i = sync_with(crate::pace::load(dir)?, v)?;
+            crate::pace::save(dir, &i)
+        }
         "autostart" => {
             let on = v.as_bool().context("autostart: expected on or off")?;
             let launcher = if on { Some(crate::launch::sibling("oneupd-start.exe")?) } else { None };
@@ -1090,6 +1107,16 @@ mod tests {
         ] {
             assert!(agent_with(Agent::default(), &bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_sync_interval_is_checked() {
+        let i = sync_with(crate::pace::Interval::default(), &json!({ "interval_minutes": 15 })).unwrap();
+        assert_eq!((i.minutes, i.keep_push), (15, false));
+        let i = sync_with(i, &json!({ "keep_push": true })).unwrap();
+        assert_eq!((i.minutes, i.keep_push), (15, true));
+        assert!(sync_with(i, &json!({ "interval_minutes": 5000 })).is_err());
+        assert!(sync_with(i, &json!({ "interval_minutes": -1 })).is_err());
     }
 
     #[test]

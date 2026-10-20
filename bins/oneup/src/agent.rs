@@ -275,7 +275,22 @@ fn print_status(s: &Status) {
         let why = oneup_app::autopause::said(why, s.auto_pause_hours.as_deref(), oneup_app::l10n::current());
         println!("  paused by itself  {why}; resumes when that ends (`oneup settings` to change this)");
     }
-    println!("  OneDrive changes  {}", if s.push { "notified as they happen" } else { "checked on a timer" });
+    let interval = s.network.as_ref().map_or(0, |n| n.interval_min);
+    println!(
+        "  OneDrive changes  {}",
+        match (s.push, interval) {
+            (true, _) => "notified as they happen",
+            (false, 0) => "checked on a timer",
+            (false, _) => "checked with each pass",
+        }
+    );
+    if interval > 0 {
+        let next = s.network.as_ref().and_then(|n| n.next_ms).map(|t| format!("; next in {}", remaining(t)));
+        println!(
+            "  sync interval     every {interval} min{}  (`oneup settings --sync-interval`)",
+            next.unwrap_or_default()
+        );
+    }
     if let Some(c) = s.checked_ms {
         println!("  last check        {}", ago(c));
     }

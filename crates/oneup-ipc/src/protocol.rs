@@ -398,6 +398,9 @@ pub struct Status {
     /// How many more were held back than `databases` lists.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub databases_more: u64,
+    /// The network and what it lets sync do (`docs/user-guide/slow-and-metered-networks.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetStatus>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -430,6 +433,17 @@ pub struct DatabaseNote {
     /// All of it in a sentence, as the activity log says it.
     #[serde(default)]
     pub detail: String,
+}
+
+/// How the agent uses the network now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetStatus {
+    /// Sync every this many minutes; 0: within seconds of a change.
+    #[serde(default)]
+    pub interval_min: u32,
+    /// When the next pass runs (Unix ms), with an interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_ms: Option<i64>,
 }
 
 /// Items whose operations failed and wait before they're tried again (a

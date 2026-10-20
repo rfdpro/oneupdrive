@@ -130,6 +130,8 @@ struct Shared {
     /// OneDrive is full: uploads wait, everything else goes on. Shown as
     /// the problem while no other one is.
     cloud_full: Option<oneup_ipc::Problem>,
+    /// The network and what it lets sync do (`crate::network`).
+    net: oneup_ipc::NetStatus,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
     /// The sides paused when that was last told as an event, and why.
@@ -205,6 +207,7 @@ impl Control {
                 databases: Vec::new(),
                 databases_more: 0,
                 cloud_full: None,
+                net: oneup_ipc::NetStatus::default(),
                 shown: None,
                 paused_told: (pause.local, pause.remote, None),
             }),
@@ -374,6 +377,13 @@ impl Control {
         self.publish(&mut s);
     }
 
+    /// How the agent uses the network now (`crate::network`, `crate::pace`).
+    pub fn set_network(&self, n: oneup_ipc::NetStatus) {
+        let mut s = self.lock();
+        s.net = n;
+        self.publish(&mut s);
+    }
+
     /// Why the agent paused by itself, or `None` when it didn't.
     pub fn set_auto_pause(&self, why: Option<crate::autopause::Reason>) {
         let mut s = self.lock();
@@ -535,6 +545,7 @@ impl Control {
             retrying: s.retrying.clone(),
             databases: s.databases.clone(),
             databases_more: s.databases_more,
+            network: (s.net != oneup_ipc::NetStatus::default()).then(|| s.net.clone()),
         }
     }
 
