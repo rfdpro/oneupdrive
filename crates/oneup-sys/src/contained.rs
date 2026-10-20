@@ -7,7 +7,8 @@
 //! The process is created in the job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`), so
 //! nothing it starts can get out of the job first, and nothing can leave it
 //! later (breaking away isn't allowed). It inherits exactly two handles,
-//! its standard input (empty) and output (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`):
+//! its standard input (the event's JSON line, then end of input) and its
+//! output (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`):
 //! none of this process's, whatever else is inheritable.
 //!
 //! Right before the process starts, the program (and any script handed to
@@ -77,7 +78,7 @@ pub struct Spec<'a> {
     /// they have, are outside every synced folder.
     pub guard: &'a [PathBuf],
     /// Written to the program's standard input, then closed (the event as
-    /// one JSON line). The program's input is otherwise empty.
+    /// one JSON line); nothing else is written to it.
     pub stdin: &'a [u8],
     pub timeout: Duration,
     /// How much of its output (standard output and error together) to keep;
