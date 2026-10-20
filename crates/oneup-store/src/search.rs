@@ -776,7 +776,7 @@ mod tests {
             s.read(|o| {
                 let undo = format!(
                     "{} {} {} {} {} {UNDO_V18} PRAGMA user_version = 17;",
-                    crate::history::UNDO_V22,
+                    crate::history::UNDO_V23,
                     crate::pins::UNDO_V22,
                     crate::shared::UNDO_V21,
                     crate::dupes::UNDO_V20,

@@ -766,7 +766,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (20, dupes::MIGRATE_V20.into()),
         (21, shared::MIGRATE_V21.into()),
         (22, pins::migrate_v22()),
-        (23, history::migrate_v22()),
+        (23, history::migrate_v23()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
