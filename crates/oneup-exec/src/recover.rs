@@ -75,6 +75,33 @@ pub fn deleted_op(
     ))
 }
 
+/// After restore step `op` (a [`deleted_op`]) ran: if OneDrive brought the
+/// item back somewhere other than asked (another folder or name), the move
+/// that puts it where asked, bound to the item exactly as it came back
+/// (its eTag, place and content: [`Step::Reset`]), for the caller to queue
+/// as the restore's own follow-up. `None`: it's where asked, or gone.
+pub fn follow_up(o: &Ops<'_>, op: &Op) -> oneup_store::Result<Option<Op>> {
+    let Some(Step::Restore { id, to, name, .. }) = op.rewind_step() else { return Ok(None) };
+    let Some(row) = o.get_item(&id.0)? else { return Ok(None) };
+    let Some(parent) = row.parent_id.clone() else { return Ok(None) };
+    if parent == to.0 && row.name == *name {
+        return Ok(None);
+    }
+    let Some(etag) = row.etag.clone() else { return Ok(None) };
+    let from = oneup_sync::rewind::Spot { parent: RemoteId(parent), name: row.name, size: row.size, hash: row.qxh };
+    let sid = match op {
+        Op::Rewind { sid, .. } => *sid,
+        _ => 0,
+    };
+    let step = Step::Reset {
+        remote: RemotePre { id: id.clone(), etag },
+        from,
+        place: Some((to.clone(), name.clone())),
+        content: None,
+    };
+    Ok(Some(Op::rewind(sid, step)))
+}
+
 /// Two copies of a file that changed on both sides: the one under the
 /// file's name, and the copy kept under a conflict name beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
