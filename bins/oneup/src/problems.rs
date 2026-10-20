@@ -92,9 +92,9 @@ pub struct Item {
     /// What kind: `setup`, `signed_out`, `stopped`, `not_running`,
     /// `unreachable`, `safety_stop`, `version_store`, a problem's kind
     /// (`offline`, `signin`, `cloud-full`, `disk-full`, `folder`, `records`,
-    /// `onedrive`, `other`), `paused`, `auto_paused`, `unsynced`,
-    /// `retrying`, `live_database`, `excluded_in_onedrive`, `paused_folder`,
-    /// `conflict`.
+    /// `onedrive`, `other`), `paused`, `auto_paused`, `data_budget`,
+    /// `working_offline`, `waiting_network`, `unsynced`,
+    /// `retrying`, `live_database`, `excluded_in_onedrive`, `paused_folder`, `conflict`.
     pub kind: String,
     pub title: String,
     pub detail: String,
@@ -355,12 +355,38 @@ fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
             t_in!(loc, "Resume from the icon, or run `oneup resume`."),
         ));
     }
-    if let Some(why) = &s.auto_pause {
+    let net = s.network.as_ref();
+    let size = crate::versions::size;
+    let budget = net.and_then(|n| n.data.as_ref()).filter(|d| d.reached);
+    if let Some(d) = budget {
+        out.push(Item::new(
+            "data_budget",
+            "Data budget used up",
+            format!("{} of {} used this month on this network; sync is paused.", size(d.up + d.down), size(d.budget)),
+            format!("Allow {} MB more from the icon, or run `oneup network allow-more`.", crate::netusage::ALLOW_MB),
+        ));
+    } else if let Some(why) = &s.auto_pause {
         out.push(Item::new(
             "auto_paused",
             t_in!(loc, "Paused by itself"),
             format!("{}.", crate::autopause::said(why, s.auto_pause_hours.as_deref(), loc)),
             t_in!(loc, "Resumes when that ends. `oneup settings` changes when it pauses."),
+        ));
+    }
+    if net.is_some_and(|n| n.offline) {
+        out.push(Item::new(
+            "working_offline",
+            "Working offline",
+            "Nothing syncs over the network; changes wait.",
+            "Go back online from the icon, or run `oneup offline off`.",
+        ));
+    }
+    if let Some(w) = net.and_then(|n| n.waiting.as_ref()) {
+        out.push(Item::new(
+            "waiting_network",
+            format!("Waiting: {} files", w.count),
+            format!("{} in all: {}.", size(w.bytes), w.why),
+            "`oneup offline` or `oneup network waiting` lists them; `oneup network` changes what syncs here.",
         ));
     }
     if let Some(u) = &s.unsynced {
@@ -727,6 +753,23 @@ mod tests {
         assert!(items[8].action.contains("oneup resume --folder \"Videos\""));
         assert!(items[9].detail.contains("/docs/a.txt") && items[9].detail.contains("a (1).txt"));
         assert!(items.iter().all(|i| i.pair.is_none()));
+    }
+
+    /// The network's part: a used-up budget (instead of the pause it
+    /// makes), working offline, and what waits for another network.
+    #[test]
+    fn a_used_up_budget_working_offline_and_what_waits_are_listed() {
+        let mut s = status();
+        s.auto_pause = Some("data budget reached on Phone".into());
+        s.network = Some(oneup_ipc::NetStatus {
+            offline: true,
+            data: Some(oneup_ipc::DataUse { month: "2026-10".into(), up: 1, down: 2, budget: 3, reached: true }),
+            waiting: Some(oneup_ipc::NetWaiting { count: 2, bytes: 5 << 20, why: "working offline".into() }),
+            ..oneup_ipc::NetStatus::default()
+        });
+        let items = collect(&facts(View::Running(Box::new(s))), 0);
+        assert_eq!(kinds(&items), ["data_budget", "working_offline", "waiting_network"]);
+        assert!(items[0].action.contains("allow-more"));
     }
 
     /// Without a running agent: why it stopped, or that it isn't running,
