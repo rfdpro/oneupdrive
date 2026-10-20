@@ -316,14 +316,17 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
 
     /// Whether the Synced record `b` is hidden (see the module docs).
     fn base_hidden(&self, b: &Base) -> Result<bool, T::Error> {
-        if self.base_companion(b)? {
-            return Ok(true);
-        }
-        let Some(rules) = self.rules else { return Ok(false) };
-        if !self.base_path_excluded(rules, b)? {
+        let excluded = match self.rules {
+            Some(rules) => self.base_path_excluded(rules, b)?,
+            None => false,
+        };
+        if !excluded && !self.base_companion(b)? {
             return Ok(false);
         }
-        // Visible on a side (moved out of the excluded part): keep it.
+        // Visible on a side (moved out of the excluded part, or renamed
+        // away from a working file's name): keep it, or that side's item
+        // would look new beside its own hidden record. The planner then
+        // sees the move, or holds what's missing on the other side.
         if let Some(l) = b.local
             && matches!(self.local(l)?, Seen::Present(_))
         {

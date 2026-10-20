@@ -6337,6 +6337,47 @@ async fn a_synced_working_file_stays_put_when_its_namesake_appears_on_one_side()
     }
 }
 
+/// A synced working file renamed away from its working name on one side
+/// (either one), its namesake beside it, keeps its Synced record: the
+/// renamed copy isn't taken for a new file and sent or brought (which would
+/// collide with that record and halt every round), nothing is deleted, and
+/// both copies keep their bytes.
+#[tokio::test]
+async fn a_synced_working_file_renamed_on_one_side_isnt_taken_for_new() {
+    for there in [true, false] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(if there { "names-renamed-cloud" } else { "names-renamed-here" }, cloud.clone());
+        write(&s.p("travel-journal"), b"day one");
+        s.settle().await;
+        write(&s.p("travel"), b"plans");
+        s.settle().await;
+        let t = cloud.tree();
+        assert_eq!(t["/travel-journal"].as_deref(), Some(&b"day one"[..]), "synced while alone");
+        assert!(t.contains_key("/travel"));
+
+        if there {
+            cloud.rename("travel-journal", "notes.txt");
+        } else {
+            std::fs::rename(s.p("travel-journal"), s.p("notes.txt")).unwrap();
+        }
+        for _ in 0..3 {
+            let r = s.round().await;
+            let touched = r.done.iter().chain(r.skipped.iter().map(|(op, _)| op)).any(|op| match op {
+                Op::Upload { name, .. } | Op::Download { name, .. } => name == "travel-journal" || name == "notes.txt",
+                Op::DeleteRemote { .. } | Op::RecycleLocal { .. } | Op::ConflictCopy { .. } => true,
+                _ => false,
+            });
+            assert!(!touched, "{r:?}");
+        }
+        let t = cloud.tree();
+        let (here, cloud_name) =
+            if there { ("travel-journal", "/notes.txt") } else { ("notes.txt", "/travel-journal") };
+        assert_eq!(std::fs::read(s.p(here)).unwrap(), b"day one");
+        assert_eq!(t[cloud_name].as_deref(), Some(&b"day one"[..]), "{:?}", names(&t));
+        assert!(!t.keys().any(|k| k.contains("conflict")), "{:?}", names(&t));
+    }
+}
+
 /// A database's upload is cancelled before it commits when, while it's
 /// read, another program writes its `-journal` (which stays as it was in
 /// meaning: zeroed, no transaction): the joint watch, not a state check,
