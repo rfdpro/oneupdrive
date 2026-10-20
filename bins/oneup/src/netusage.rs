@@ -136,11 +136,51 @@ fn charge_owned(
     })
 }
 
+/// The reservations of agents no longer running (`alive`; never
+/// `owner`'s), counted as used and dropped: such an agent may have used
+/// all of it since it last charged (a hard kill loses what it counted
+/// meanwhile), so it's never given out again. Counted as received.
+/// Whether any was.
+fn reap(r: &mut Record, owner: &str, alive: &dyn Fn(&str) -> bool) -> bool {
+    let stopped: Vec<String> = r.reserved.keys().filter(|k| k.as_str() != owner && !alive(k)).cloned().collect();
+    for k in &stopped {
+        let n = r.reserved.remove(k).unwrap_or(0);
+        r.usage.down = r.usage.down.saturating_add(n);
+    }
+    !stopped.is_empty()
+}
+
+/// [`reap`] at a look at the budget, before what's left is worked out:
+/// read first, and written only if an agent stopped without giving its
+/// reservation back.
+pub fn reap_stopped(
+    store: &mut Store,
+    profile: &str,
+    month: &str,
+    owner: &str,
+    alive: &dyn Fn(&str) -> bool,
+) -> oneup_store::Result<()> {
+    let any = store.read(|o| {
+        let r = read_record(o, profile, month)?;
+        Ok(r.reserved.keys().any(|k| k.as_str() != owner && !alive(k)))
+    })?;
+    if any {
+        store.write(|o| {
+            let mut r = read_record(o, profile, month)?;
+            if reap(&mut r, owner, alive) {
+                write_record(o, profile, &r)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 /// Reserves up to `want` bytes of `budget` (and what was allowed on top)
 /// for `owner` (an agent's process), in one transaction with every other
 /// agent's reservations: what's granted is what nobody else has used or
-/// reserved. Reservations of agents no longer running (`alive`) go.
-/// Returns what was granted.
+/// reserved. Reservations of agents no longer running (`alive`) count as
+/// used ([`reap`]). Returns what was granted.
 pub fn reserve(
     store: &mut Store,
     profile: &str,
@@ -152,7 +192,8 @@ pub fn reserve(
 ) -> oneup_store::Result<u64> {
     store.write(|o| {
         let mut r = read_record(o, profile, month)?;
-        r.reserved.retain(|k, n| *n > 0 && (k == owner || alive(k)));
+        reap(&mut r, owner, alive);
+        r.reserved.retain(|_, n| *n > 0);
         let committed = r.usage.total().saturating_add(r.reserved.values().sum());
         let grant = want.min(budget.saturating_add(r.usage.extra).saturating_sub(committed));
         if grant > 0 {
@@ -456,11 +497,25 @@ mod tests {
         // B stops: what it didn't use goes back to A.
         release(&mut b, "metered", m, "B").unwrap();
         assert_eq!(reserve(&mut a, "metered", m, "A", 40 * MB, budget, &all).unwrap(), 10 * MB);
-        // A reservation of an agent that isn't running any more goes too.
+        // An agent that stopped without giving its reservation back (killed)
+        // may have used all of it: it counts as used, at the next look,
+        // and is never given out again.
         let none = |w: &str| w == "A";
-        reserve(&mut b, "metered", m, "B", 5 * MB, budget, &all).unwrap();
-        assert_eq!(reserve(&mut a, "metered", m, "A", 40 * MB, budget, &none).unwrap(), 0, "A holds the rest");
-        assert_eq!(left_for(&a, "metered", m, "A", budget).unwrap(), 70 * MB, "B's 5 MB was dropped");
+        release(&mut a, "metered", m, "A").unwrap();
+        assert_eq!(reserve(&mut b, "metered", m, "B", 5 * MB, budget, &all).unwrap(), 5 * MB);
+        reap_stopped(&mut a, "metered", m, "A", &none).unwrap();
+        assert_eq!(load(&a, "metered", m).unwrap().total(), 35 * MB, "counted as used at the next look");
+        assert_eq!(left_for(&a, "metered", m, "A", budget).unwrap(), 65 * MB);
+        assert_eq!(
+            reserve(&mut a, "metered", m, "A", 100 * MB, budget, &none).unwrap(),
+            65 * MB,
+            "not given out again"
+        );
+        // Killed, and found by a transfer's reservation: the same.
+        release(&mut a, "metered", m, "A").unwrap();
+        assert_eq!(reserve(&mut b, "metered", m, "B", MB, budget, &all).unwrap(), MB);
+        reserve(&mut a, "metered", m, "A", 1, budget, &none).unwrap();
+        assert_eq!(load(&a, "metered", m).unwrap().total(), 36 * MB);
         drop((a, b));
         let _ = std::fs::remove_file(&path);
     }

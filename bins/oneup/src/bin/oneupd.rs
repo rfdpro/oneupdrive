@@ -1458,6 +1458,10 @@ impl NetUse {
             allowed.remove(0);
             println!("oneupd: {} more allowed this month", oneup_app::versions::size(extra));
         }
+        let owner = self.ledger.owner().to_string();
+        // A stopped agent's reservation, counted as used before what's left
+        // is worked out (otherwise it stays held until a transfer reserves).
+        netusage::reap_stopped(self.ledger.db(), profile.key.id(), &month, &owner, &netusage::agent_alive)?;
         let usage = netusage::load(self.ledger.db(), profile.key.id(), &month)?;
         let budget = profile.budget_bytes();
         // The transport takes reservations of this profile's budget; a
@@ -1472,7 +1476,6 @@ impl NetUse {
         if changed {
             graph.budget.set(want.as_ref().map(|_| 0));
         }
-        let owner = self.ledger.owner().to_string();
         let left = match budget {
             Some(b) => Some(netusage::left_for(self.ledger.db(), profile.key.id(), &month, &owner, b)?),
             None => None,
