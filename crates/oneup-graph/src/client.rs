@@ -70,14 +70,6 @@ pub struct Graph {
     fragment_cap: std::sync::atomic::AtomicUsize,
 }
 
-/// The version ID a cTag stands for: OneDrive Personal's cTag
-/// (`"c:{GUID},3"`) counts content changes as its version history numbers
-/// them (`3.0`), while the eTag counts renames and moves too (measured).
-fn content_version(ctag: &str) -> Option<String> {
-    let n = ctag.trim_matches('"').rsplit_once(',')?.1;
-    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{n}.0"))
-}
-
 /// The settings every OneUpDrive HTTP client starts from: a bounded
 /// connect, a total timeout for metadata requests (transfers set their own)
 /// and TCP keepalive, so a connection that died without closing (sleep and
@@ -1227,7 +1219,7 @@ impl Graph {
         match self.get::<serde_json::Value>(&url).await {
             Ok(v) => {
                 let etag = v.get("eTag").and_then(serde_json::Value::as_str).map(str::to_string);
-                let version = v.get("cTag").and_then(serde_json::Value::as_str).and_then(content_version);
+                let version = v.get("cTag").and_then(serde_json::Value::as_str).and_then(crate::model::content_version);
                 Ok(crate::model::FileVersion::from_json(&v)
                     .map(|f| (etag, crate::model::FileVersion { id: version.unwrap_or_default(), ..f })))
             }
@@ -1502,16 +1494,6 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// As measured on OneDrive Personal: the cTag's count is the version
-    /// history's ID.
-    #[test]
-    fn a_ctag_gives_its_version_id() {
-        assert_eq!(content_version("\"c:{00000000-0000-0000-0000-000000000001},3\"").as_deref(), Some("3.0"));
-        assert_eq!(content_version("c:{X},12").as_deref(), Some("12.0"));
-        assert_eq!(content_version("c:{X}"), None);
-        assert_eq!(content_version("c:{X},a1"), None);
-    }
 
     /// What's logged, for a test to read back.
     #[derive(Clone, Default)]
@@ -1914,6 +1896,7 @@ mod tests {
             root: None,
             file_system_info: None,
             shared: None,
+            c_tag: None,
         };
         let r = g.rooted(item("ABC!7"));
         assert!(r.is_root() && r.parent_id().is_none(), "the scope's folder stands in for the root");

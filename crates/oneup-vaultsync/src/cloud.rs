@@ -27,7 +27,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError, Ours, Replaced, Source, VersionMark};
+use oneup_exec::{Cloud, CloudError, Replaced, Source, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::content::{Decryptor, Encryptor, encrypted_size};
@@ -480,7 +480,17 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         self.inner.version_mark(&RemotePre { id: RemoteId(content), etag: pre.etag.clone() }, enc).await
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark, ours: &mut Ours) -> Result<Replaced, CloudError> {
+    async fn uploaded_version(&self, id: &RemoteId, etag: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
+        let content = self.node(&id.0)?.content.ok_or(CloudError::Changed)?;
+        self.inner.uploaded_version(&RemoteId(content), etag).await
+    }
+
+    async fn replaced_other(
+        &self,
+        id: &RemoteId,
+        mark: &VersionMark,
+        ours: &VersionMark,
+    ) -> Result<Replaced, CloudError> {
         let content = self.node(&id.0)?.content.ok_or(CloudError::Changed)?;
         // Its size is the encrypted file's; decrypting checks the content.
         Ok(match self.inner.replaced_other(&RemoteId(content), mark, ours).await? {

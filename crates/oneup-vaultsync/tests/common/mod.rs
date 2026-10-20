@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError, Ours, Replaced, VersionMark};
+use oneup_exec::{Cloud, CloudError, Replaced, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::key::Masterkey;
@@ -128,7 +128,10 @@ impl Cloud for Fake {
     async fn version_mark(&self, _: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
         Ok(None)
     }
-    async fn replaced_other(&self, _: &RemoteId, _: &VersionMark, _: &mut Ours) -> Result<Replaced, CloudError> {
+    async fn uploaded_version(&self, _: &RemoteId, _: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
+        Ok(None)
+    }
+    async fn replaced_other(&self, _: &RemoteId, _: &VersionMark, _: &VersionMark) -> Result<Replaced, CloudError> {
         Ok(Replaced::Planned)
     }
     async fn download_version(&self, _: &RemoteId, _: &str, _: &mut (dyn Write + Send)) -> Result<u64, CloudError> {

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use oneup_effects::LocalFs;
 use oneup_exec::{
-    CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Ours, Replaced, Report, Source, VersionMark, link_roots,
+    CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Replaced, Report, Source, VersionMark, link_roots,
 };
 use oneup_gate::{
     Breaker, Choice, Context, Decision, ItemKey, Overflow, OverflowOutcome, Policy, Recent, Side, is_mass_sensitive,
@@ -71,9 +71,12 @@ struct State {
     replaced: BTreeMap<String, u64>,
     /// Versions in the history can't be downloaded (a service error).
     versions_fail: bool,
-    /// Each file's version history, newest first: its versions' times
-    /// (the eTag each content got) and sizes.
-    history: BTreeMap<String, Vec<(u64, i64)>>,
+    /// Each file's version history, newest first: its versions' IDs (the
+    /// eTag each content got), times and sizes. A rename moves the current
+    /// version's time, as Graph's does (measured).
+    history: BTreeMap<String, Vec<(u64, i64, i64)>>,
+    /// Each file's last replacing upload: the eTag it left, and its version.
+    last_upload: BTreeMap<String, (u64, u64)>,
     /// The history doesn't list the newest version for this many more
     /// looks (Graph's history can lag behind a commit).
     history_lag: u32,
@@ -197,7 +200,7 @@ impl State {
         let id = format!("r{}", self.bump());
         let etag = self.bump();
         if !folder {
-            self.history.entry(id.clone()).or_default().insert(0, (etag, content.len() as i64));
+            self.history.entry(id.clone()).or_default().insert(0, (etag, etag as i64, content.len() as i64));
         }
         self.items.insert(id.clone(), Item { parent: Some(parent.into()), name: name.into(), folder, content, etag });
         id
@@ -291,7 +294,7 @@ impl Fake {
         let old = std::mem::replace(&mut it.content, content.to_vec());
         it.etag = etag;
         s.kept.push(old);
-        s.history.entry(id.to_string()).or_default().insert(0, (etag, content.len() as i64));
+        s.history.entry(id.to_string()).or_default().insert(0, (etag, etag as i64, content.len() as i64));
     }
     fn rename(&self, path: &str, name: &str) {
         let mut s = self.0.lock().unwrap();
@@ -300,6 +303,9 @@ impl Fake {
         let it = s.items.get_mut(&id).unwrap();
         it.name = name.into();
         it.etag = etag;
+        if let Some(v) = s.history.get_mut(&id).and_then(|h| h.first_mut()) {
+            v.1 = etag as i64;
+        }
     }
     /// Moves `path` into folder `dir`.
     fn mv(&self, path: &str, dir: &str) {
@@ -558,7 +564,8 @@ impl Fake {
                 s.kept.push(old.clone());
                 s.old.insert(over, old);
                 s.replaced.insert(pre.id.0.clone(), over);
-                s.history.entry(pre.id.0.clone()).or_default().insert(0, (etag, len));
+                s.history.entry(pre.id.0.clone()).or_default().insert(0, (etag, etag as i64, len));
+                s.last_upload.insert(pre.id.0.clone(), (etag, etag));
                 pre.id.0.clone()
             }
             None => {
@@ -700,40 +707,50 @@ impl Cloud for Fake {
             let s = self.0.lock().unwrap();
             s.check(pre)?;
             let newest = s.history.get(&pre.id.0).and_then(|h| h.first()).copied();
-            Ok(newest.map(|(t, size)| VersionMark { id: t.to_string(), modified_ms: Some(t as i64), size: Some(size) }))
+            Ok(newest.map(|(t, at, size)| VersionMark { id: t.to_string(), modified_ms: Some(at), size: Some(size) }))
         })
         .await
     }
 
-    /// As Graph's: the file's current version read while it still holds
-    /// the replacement, then its history (without its newest entry while
-    /// the history lags).
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark, ours: &mut Ours) -> Result<Replaced, CloudError> {
+    /// As Graph's, from the commit's answer: only for the upload that left
+    /// `etag`.
+    async fn uploaded_version(&self, id: &RemoteId, etag: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
+        self.exchange(|| -> Result<Option<VersionMark>, CloudError> {
+            let s = self.0.lock().unwrap();
+            let Some(&(left, v)) = s.last_upload.get(&id.0) else { return Ok(None) };
+            if etag != Some(left.to_string().as_str()) {
+                return Ok(None);
+            }
+            let size = s.history.get(&id.0).and_then(|h| h.iter().find(|e| e.0 == v)).map(|e| e.2);
+            Ok(Some(VersionMark { id: v.to_string(), modified_ms: None, size }))
+        })
+        .await
+    }
+
+    /// As Graph's: the history, without its newest entry while it lags.
+    async fn replaced_other(
+        &self,
+        id: &RemoteId,
+        mark: &VersionMark,
+        ours: &VersionMark,
+    ) -> Result<Replaced, CloudError> {
         self.exchange(|| -> Result<Replaced, CloudError> {
             let mut s = self.0.lock().unwrap();
-            let Some(etag) = s.items.get(&id.0).map(|it| it.etag.to_string()) else { return Ok(Replaced::Unknown) };
             let history = s.history.get(&id.0).cloned().unwrap_or_default();
-            if ours.mark.is_none() {
-                if ours.etag.as_ref().is_some_and(|e| *e != etag) {
-                    return Ok(Replaced::Unknown);
-                }
-                let Some(&(t, size)) = history.first() else { return Ok(Replaced::Unknown) };
-                ours.mark = Some(VersionMark { id: t.to_string(), modified_ms: Some(t as i64), size: Some(size) });
-            }
             let mut listed: Vec<oneup_graph::FileVersion> = history
                 .iter()
-                .map(|&(t, size)| oneup_graph::FileVersion {
+                .map(|&(t, at, size)| oneup_graph::FileVersion {
                     id: t.to_string(),
-                    modified_ms: Some(t as i64),
+                    modified_ms: Some(at),
                     size: Some(size),
                     by: None,
                 })
                 .collect();
-            if s.history_lag > 0 {
+            if s.history_lag > 0 && !listed.is_empty() {
                 s.history_lag -= 1;
                 listed.remove(0);
             }
-            Ok(oneup_exec::graph::replaced_version(&listed, mark, ours.mark.as_ref().unwrap()))
+            Ok(oneup_exec::graph::replaced_version(&listed, mark, ours))
         })
         .await
     }
@@ -1632,13 +1649,21 @@ async fn an_upload_over_an_edit_that_cant_be_kept_is_still_done() {
 
 /// The process killed at any point of an upload that goes over an edit
 /// in OneDrive (between the record written ahead of it and the upload,
-/// between the upload and its records, between those and keeping the
-/// edit, or while keeping it): after a restart, the edit is kept as a new
-/// file all the same, once. The record is written durably before the
-/// upload (`meta_set_ahead` refuses otherwise), so a power cut doesn't
-/// roll it back either.
+/// between the upload's commit and the version it is being recorded,
+/// between that and its other records, between those and keeping the
+/// edit, or while keeping it), then the file saved again in OneDrive on
+/// top: after a restart, the edit is kept as a new file exactly once, never
+/// the upload itself in its place. The record and the upload's version are
+/// written durably (`meta_set_ahead` refuses otherwise), so a power cut
+/// doesn't roll them back either. Killed after the commit but before the
+/// upload's version is recorded, nothing tells the upload apart from the
+/// later save: nothing is kept, and the record stays (to be given up and
+/// listed).
 #[tokio::test]
 async fn a_crash_around_an_upload_over_an_edit_still_keeps_the_edit() {
+    let count = |t: &Tree, c: &[u8]| t.values().filter(|v| v.as_deref() == Some(c)).count();
+    // Both cases after the commit came up: its version recorded, and not.
+    let (mut recorded, mut unrecorded) = (false, false);
     for n in 0.. {
         let cloud = Fake::new();
         let mut s = Sync::on_disk(&format!("raced-crash{n}"), cloud.clone());
@@ -1661,24 +1686,67 @@ async fn a_crash_around_an_upload_over_an_edit_still_keeps_the_edit() {
             }
         }
         if !crashed {
-            assert!(n > 2, "only {n} crash points");
+            assert!(n > 3, "only {n} crash points");
+            assert!(recorded && unrecorded, "{recorded} {unrecorded}");
             return;
         }
-        let mut s = s.restart();
-        s.settle().await;
-        for t in [local_tree(&s.dir.0), cloud.tree()] {
-            assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]), "crash point {n}");
-            assert_eq!(
-                t["/notes (conflict 1).txt"].as_deref(),
-                Some(&b"theirs"[..]),
-                "crash point {n}: {:?}",
-                names(&t)
-            );
-            assert_eq!(t.len(), 2, "crash point {n}: {:?}", names(&t));
+        // Where it stopped: the upload committed or not, and its version
+        // recorded or not.
+        let committed = cloud.tree()["/notes.txt"].as_deref() == Some(&b"mine"[..]);
+        let records = s.obs.store().read(|o| o.meta_under("exec.rescue")).unwrap();
+        // (No record left: the edit was kept already.)
+        let known = records.is_empty() || records.iter().any(|(_, v)| v.contains("\"ours\":{"));
+        recorded |= committed && known && !records.is_empty();
+        unrecorded |= committed && !known;
+        if committed {
+            // Saved again in OneDrive, on top of the upload.
+            cloud.edit("notes.txt", b"later");
         }
+        let mut s = s.restart();
+        let kept = std::cell::RefCell::new(Vec::new());
+        s.settle_with(&|_, r| kept.borrow_mut().extend(r.kept_later.iter().cloned())).await;
+        let t = cloud.tree();
         let left = s.obs.store().read(|o| o.meta_under("exec.rescue")).unwrap();
-        assert!(left.is_empty(), "crash point {n}: {left:?}");
+        if !committed || known {
+            assert_eq!(count(&t, b"theirs"), 1, "crash point {n}: {:?}", names(&t));
+            assert!(left.is_empty(), "crash point {n}: {left:?}");
+        } else {
+            assert_eq!(count(&t, b"theirs"), 0, "crash point {n}: {:?}", names(&t));
+            assert!(kept.borrow().is_empty(), "crash point {n}: nothing kept from a guess: {:?}", kept.borrow());
+            assert_eq!(left.len(), 1, "crash point {n}: the record stays");
+        }
+        assert_eq!(local_tree(&s.dir.0), t, "crash point {n}");
     }
+}
+
+/// On a network that moves only the files the user opens, keeping the
+/// edit waits; a rename in OneDrive meanwhile (which changes the eTag and
+/// the current version's time) doesn't stop it: the upload's version was
+/// recorded when it committed. Once downloads are allowed, it's kept.
+#[tokio::test]
+async fn a_rename_while_keeping_an_edit_waits_doesnt_lose_it() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-renamed", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    s.exec.set_may_fetch(Some(Arc::new(|_| false)));
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    for _ in 0..3 {
+        s.round().await;
+    }
+    cloud.rename("notes.txt", "renamed.txt");
+    for _ in 0..3 {
+        assert!(s.round().await.kept_later.is_empty());
+    }
+    s.exec.set_may_fetch(None);
+    let r = s.round().await;
+    assert_eq!(r.kept_later.len(), 1, "{r:?}");
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(t["/renamed.txt"].as_deref(), Some(&b"mine"[..]));
+    assert_eq!(t.values().filter(|v| v.as_deref() == Some(&b"theirs"[..])).count(), 1, "{:?}", names(&t));
 }
 
 /// OneDrive's version history can lag behind a commit: while it doesn't

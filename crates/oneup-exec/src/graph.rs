@@ -17,7 +17,7 @@ use oneup_graph::{DriveItem, FileVersion, Graph};
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
 
-use crate::cloud::{Cloud, CloudError, Meta, MetaDone, Ours, Replaced, Source, VersionMark};
+use crate::cloud::{Cloud, CloudError, Meta, MetaDone, Replaced, Source, VersionMark};
 use crate::timing::Timings;
 
 /// The executor's view of a signed-in drive.
@@ -39,7 +39,14 @@ pub struct GraphCloud {
     /// Downloads count against the data budget, which stops them once used
     /// up (`oneup_graph::budget`). Off for files the user opens.
     budgeted: bool,
+    /// The latest replacing uploads' versions, from their commits' answers
+    /// (item, eTag left, version): [`Cloud::uploaded_version`] takes them.
+    uploaded: Arc<Mutex<VecDeque<(String, String, VersionMark)>>>,
 }
+
+/// How many replacing uploads' versions are kept for
+/// [`Cloud::uploaded_version`], which asks right after each.
+const UPLOADED_KEPT: usize = 64;
 
 /// How long a link read ahead is used: they're pre-authenticated and
 /// short-lived, and one used within a minute of reading it works.
@@ -248,6 +255,7 @@ impl GraphCloud {
             links_read: Arc::default(),
             kept: Arc::default(),
             budgeted: true,
+            uploaded: Arc::default(),
         }
     }
 
@@ -974,7 +982,36 @@ impl Cloud for GraphCloud {
             self.timings.record("upload: session", started);
             item
         };
+        if let (Some((id, _)), Some(etag)) = (replace, item.e_tag.clone()) {
+            let v = VersionMark { id: item.content_version().unwrap_or_default(), modified_ms: None, size: item.size };
+            let mut up = self.uploaded.lock().unwrap_or_else(|p| p.into_inner());
+            up.retain(|(i, _, _)| i != id);
+            if up.len() == UPLOADED_KEPT {
+                up.pop_front();
+            }
+            up.push_back((id.to_string(), etag, v));
+        }
         Ok((self.row_of(item).await?, None))
+    }
+
+    async fn uploaded_version(&self, id: &RemoteId, etag: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
+        let Some(etag) = etag else { return Ok(None) };
+        let known = {
+            let mut up = self.uploaded.lock().unwrap_or_else(|p| p.into_inner());
+            let at = up.iter().position(|(i, e, _)| *i == id.0 && e == etag);
+            at.and_then(|i| up.remove(i)).map(|(_, _, v)| v)
+        };
+        if let Some(v) = known.filter(|v| !v.id.is_empty()) {
+            return Ok(Some(v));
+        }
+        // The answer had no cTag: read the file once, and only if it still
+        // has the upload's eTag is what it holds the upload.
+        Ok(match self.graph.current_version(&id.0).await.map_err(map)? {
+            Some((now, v)) if now.as_deref() == Some(etag) => {
+                Some(VersionMark { id: v.id, modified_ms: v.modified_ms, size: v.size })
+            }
+            _ => None,
+        })
     }
 
     async fn version_mark(&self, pre: &RemotePre, size: i64) -> Result<Option<VersionMark>, CloudError> {
@@ -997,22 +1034,14 @@ impl Cloud for GraphCloud {
         }))
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark, ours: &mut Ours) -> Result<Replaced, CloudError> {
-        if ours.mark.is_none() {
-            // Read from the file while it still holds the replacement: its
-            // eTag is the upload's. Saved again since, ours can't be told
-            // from what's in the history.
-            let Some((etag, now)) = self.graph.current_version(&id.0).await.map_err(map)? else {
-                return Ok(Replaced::Unknown);
-            };
-            if ours.etag.is_some() && ours.etag != etag || now.id.is_empty() && now.modified_ms.is_none() {
-                return Ok(Replaced::Unknown);
-            }
-            ours.mark = Some(VersionMark { id: now.id, modified_ms: now.modified_ms, size: now.size });
-        }
-        let Some(o) = &ours.mark else { return Ok(Replaced::Unknown) };
+    async fn replaced_other(
+        &self,
+        id: &RemoteId,
+        mark: &VersionMark,
+        ours: &VersionMark,
+    ) -> Result<Replaced, CloudError> {
         let versions = self.graph.versions(&id.0).await.map_err(map)?;
-        Ok(replaced_version(&versions, mark, o))
+        Ok(replaced_version(&versions, mark, ours))
     }
 
     async fn download_version(
@@ -1304,6 +1333,7 @@ mod tests {
                 root: None,
                 file_system_info: None,
                 shared: None,
+                c_tag: None,
             });
             Ok(Fragment { item, paused: Duration::ZERO, capped: Duration::ZERO })
         }
@@ -1574,6 +1604,7 @@ mod tests {
                 root: None,
                 file_system_info: None,
                 shared: None,
+                c_tag: None,
             });
             Ok(Fragment { item, paused: Duration::ZERO, capped: Duration::ZERO })
         }

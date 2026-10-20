@@ -80,17 +80,6 @@ pub struct VersionMark {
     pub size: Option<i64>,
 }
 
-/// The replacement as the version history should list it
-/// ([`Cloud::replaced_other`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Ours {
-    /// The eTag the upload left (`None`: not recorded).
-    pub etag: Option<String>,
-    /// Its time and size, read from the file while it still held it (its
-    /// `id` isn't used).
-    pub mark: Option<VersionMark>,
-}
-
 /// What a replacement went over ([`Cloud::replaced_other`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Replaced {
@@ -145,16 +134,25 @@ pub trait Cloud: Send + Sync {
         size: i64,
     ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
 
-    /// After replacing file `id`, which held `mark`'s version, with `ours`:
-    /// what the replacement went over. The history may not list `ours`
-    /// yet: then it can't tell. `ours.mark` is filled in from the file
-    /// while it still holds the replacement; once it's moved on, unread,
-    /// the history can't tell either. Read-only.
+    /// Right after an upload replaced file `id`, leaving eTag `etag`: the
+    /// version its history lists the upload as, by its ID where it can
+    /// (from the commit's answer; or read from the file, only while it
+    /// still has `etag`). `None`: it can't be told. Read-only.
+    fn uploaded_version(
+        &self,
+        id: &RemoteId,
+        etag: Option<&str>,
+    ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
+
+    /// After replacing file `id`, which held `mark`'s version, with the
+    /// version `ours` ([`Cloud::uploaded_version`]): what the replacement
+    /// went over. The history may not list `ours` yet: then it can't tell.
+    /// Read-only.
     fn replaced_other(
         &self,
         id: &RemoteId,
         mark: &VersionMark,
-        ours: &mut Ours,
+        ours: &VersionMark,
     ) -> impl Future<Output = Result<Replaced, CloudError>> + Send;
 
     /// Streams the content of version `version` of file `id` into `out`;
