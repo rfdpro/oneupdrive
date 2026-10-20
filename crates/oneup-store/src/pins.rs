@@ -777,7 +777,8 @@ mod tests {
             let s = Store::open(&path, 1024).unwrap();
             s.read(|o| {
                 Ok(o.c.execute_batch(&format!(
-                    "{UNDO_V22} {} {} PRAGMA user_version = 19;",
+                    "{} {UNDO_V22} {} {} PRAGMA user_version = 19;",
+                    crate::history::UNDO_V23,
                     crate::shared::UNDO_V21,
                     crate::dupes::UNDO_V20
                 ))?)

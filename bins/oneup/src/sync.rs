@@ -1898,7 +1898,8 @@ impl Engine {
                     // steps (the gate withholds them): the rest syncs, and a
                     // change in the folder changes its list, so an approval
                     // given for the list before isn't taken (`crate::rewind`).
-                    let what = if b.kind == BreakerKind::Rewind { "the rest syncs meanwhile" } else { "nothing was changed" };
+                    let what =
+                        if b.kind == BreakerKind::Rewind { "the rest syncs meanwhile" } else { "nothing was changed" };
                     let detail = format!("{}; {what} (code {:016x})", breaker_what(b), b.fingerprint.0);
                     let e = notice(ActivityOutcome::Waiting, "safety stop", detail);
                     self.log_once(&mut store, format!("stop {:x}", b.fingerprint.0), e)?;
