@@ -201,8 +201,20 @@ pub mod pipe {
     use windows::Win32::Security::{
         GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
+    use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{HSTRING, PWSTR};
+
+    /// The process id at the other end of a connected named-pipe instance,
+    /// `raw` being its handle (`as_raw_handle`). Lets the agent tell which
+    /// program is calling (to refuse its own hook processes).
+    pub fn client_process_id(raw: isize) -> Option<u32> {
+        let mut pid = 0u32;
+        // SAFETY: `raw` is a connected pipe-server handle the caller owns
+        // for the call; `pid` is a valid out location.
+        unsafe { GetNamedPipeClientProcessId(HANDLE(raw as *mut c_void), &mut pid) }.ok()?;
+        (pid != 0).then_some(pid)
+    }
 
     fn io(op: &'static str, e: windows::core::Error) -> std::io::Error {
         std::io::Error::other(format!("{op}: {e}"))

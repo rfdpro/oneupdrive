@@ -9,21 +9,39 @@
 //! later (breaking away isn't allowed). It inherits exactly two handles,
 //! its standard input (empty) and output (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`):
 //! none of this process's, whatever else is inheritable.
+//!
+//! Right before the process starts, the program (and any script handed to
+//! an interpreter) is reopened denying other writers and deleters, and its
+//! final path and link count are checked, so nothing that passed the
+//! caller's where-is-it checks can be swapped or hard-linked into a synced
+//! folder between the check and the launch (the handles stay open until the
+//! process has ended).
+//!
+//! Each run's job is registered in a shared [`HookJobs`] while it runs, so
+//! the control pipe can refuse any client that is one of these processes or
+//! their descendants ([`HookJobs::contains`]): a hook can't reach the pipe
+//! calls (approving a safety stop, say) by any path another of the user's
+//! programs doesn't also have.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::io::Read;
-use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::io::FromRawHandle as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_TIMEOUT,
+    CloseHandle, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
+    GetFileInformationByHandle, GetFinalPathNameByHandleW, OPEN_EXISTING,
+};
 use windows::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PRIORITY_CLASS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -31,22 +49,33 @@ use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, SetProcessInformation, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_LIMITED_INFORMATION,
+    ProcessPowerThrottling, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, SetProcessInformation,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
 /// What to run.
 pub struct Spec<'a> {
-    /// A full path (no search: the caller has checked this file).
+    /// The program, by a full path the caller has resolved and checked.
     pub program: &'a Path,
     pub args: &'a [OsString],
+    /// The working folder: a safe one (OneUpDrive's data folder), never a
+    /// synced folder (a DLL search there would reach cloud content).
     pub cwd: &'a Path,
     /// Environment variables the program doesn't get (by name); it gets
     /// the rest of this process's.
     pub drop_env: &'a dyn Fn(&OsStr) -> bool,
+    /// Variables set after the rest (e.g. a `PATH` with synced folders
+    /// removed).
+    pub env_overrides: &'a [(OsString, OsString)],
+    /// Files, besides the program, to open denying other writers/deleters
+    /// and check (final path and a single hard link) before the launch: a
+    /// script handed to an interpreter. The caller has checked these are
+    /// outside every synced folder.
+    pub guard: &'a [PathBuf],
     pub timeout: Duration,
     /// How much of its output (standard output and error together) to keep;
     /// the rest is read and dropped.
@@ -89,9 +118,74 @@ fn io(op: &'static str, e: windows::core::Error) -> std::io::Error {
     std::io::Error::other(format!("{op}: {e}"))
 }
 
+/// The jobs of the hook runs under way, so the control pipe can tell its
+/// own hook processes (and their descendants) apart from the user's other
+/// programs ([`HookJobs::contains`]). A run registers its job while it runs
+/// and removes it before the job handle is closed.
+#[derive(Default)]
+pub struct HookJobs {
+    /// Raw job handles by a token; the handle stays open (its run's `Owned`)
+    /// while it's listed here.
+    jobs: Mutex<Vec<(u64, isize)>>,
+    next: AtomicU64,
+}
+
+impl HookJobs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(&self, job: HANDLE) -> u64 {
+        let token = self.next.fetch_add(1, Relaxed);
+        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((token, job.0 as isize));
+        token
+    }
+
+    fn unregister(&self, token: u64) {
+        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(t, _)| *t != token);
+    }
+
+    /// Whether process `pid` is one of the hooks' processes, or started by
+    /// one (a job holds a whole tree, and breaking away isn't allowed). A
+    /// process that can't be opened (gone, or not ours) is not a hook.
+    pub fn contains(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: opening a process by id for a query only; the handle is
+        // owned and closed by `Owned`.
+        let Ok(proc) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+            return false;
+        };
+        let proc = Owned(proc);
+        let jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        jobs.iter().any(|&(_, job)| {
+            let mut in_job = windows::core::BOOL(0);
+            // SAFETY: `proc` is a valid handle we hold; `job` is open while
+            // it's listed here (its run keeps it); `in_job` is a valid out.
+            unsafe { IsProcessInJob(proc.0, Some(HANDLE(job as *mut c_void)), &mut in_job).is_ok() && in_job.as_bool() }
+        })
+    }
+}
+
+/// Removes a run's job from the registry when the run ends.
+struct Registered<'a> {
+    jobs: Option<&'a HookJobs>,
+    token: u64,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        if let Some(j) = self.jobs {
+            j.unregister(self.token);
+        }
+    }
+}
+
 /// A job whose processes run below normal priority, can't show the crash
 /// dialog (which would wait for a click no one makes), and end when it's
-/// closed.
+/// closed. Breaking away isn't allowed (no breakaway limit flag), so a
+/// descendant can't escape the job.
 fn job() -> std::io::Result<Owned> {
     // SAFETY: no name and default security; the handle is owned below.
     let job = Owned(unsafe { CreateJobObjectW(None, None) }.map_err(|e| io("CreateJobObjectW", e))?);
@@ -131,6 +225,70 @@ fn pipe(child_reads: bool) -> std::io::Result<(Owned, Owned)> {
     unsafe { SetHandleInformation(ours.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }
         .map_err(|e| io("SetHandleInformation", e))?;
     Ok((child, ours))
+}
+
+/// Opens `path` denying other writers and deleters, and checks it is the
+/// one file the caller checked: a single hard link (so no second name in a
+/// synced folder points at the same bytes) and the expected final path (so
+/// it wasn't replaced since). The handle stays open (returned) until the
+/// process has run, so it can't be swapped meanwhile.
+fn guard_file(path: &Path, check_links: bool) -> std::io::Result<Owned> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; no security
+    // attributes, no template.
+    let h = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|e| std::io::Error::other(format!("open {}: {e}", path.display())))?;
+    let h = Owned(h);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `h` is valid; `info` is a valid, writable out structure.
+    unsafe { GetFileInformationByHandle(h.0, &mut info) }.map_err(|e| io("GetFileInformationByHandle", e))?;
+    // A script must be a single name: a second hard link, possibly in a
+    // synced folder, could point at the same bytes. System interpreters
+    // (cmd.exe, powershell.exe) ship with several links by servicing, so the
+    // program itself is only checked for being swapped, not for links.
+    if check_links && info.nNumberOfLinks != 1 {
+        return Err(std::io::Error::other(format!(
+            "{} has {} hard links; another name could point at the same bytes from a synced folder",
+            path.display(),
+            info.nNumberOfLinks
+        )));
+    }
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `h` is valid; `buf` is writable for its length.
+    let n = unsafe { GetFinalPathNameByHandleW(h.0, &mut buf, FILE_NAME_NORMALIZED) } as usize;
+    if n == 0 || n > buf.len() {
+        return Err(std::io::Error::other(format!("couldn't read the final path of {}", path.display())));
+    }
+    let final_path = PathBuf::from(OsString::from_wide(&buf[..n]));
+    // The caller's path is already the canonical (`\\?\`) form.
+    if !same_path(&final_path, path) {
+        return Err(std::io::Error::other(format!(
+            "{} now resolves to {}; it was moved or replaced",
+            path.display(),
+            final_path.display()
+        )));
+    }
+    Ok(h)
+}
+
+/// Whether two paths are the same, ignoring case (Windows paths) and a
+/// `\\?\` prefix on either.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let strip = |p: &Path| {
+        let s = p.to_string_lossy().to_lowercase();
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    };
+    strip(a) == strip(b)
 }
 
 /// Asks Windows to run the process power-efficiently (EcoQoS). Best effort.
@@ -194,10 +352,16 @@ fn command_line(program: &Path, args: &[OsString]) -> Vec<u16> {
     cmd
 }
 
-/// This process's environment without the variables `drop` names, as a
-/// block (sorted by name without case, as Windows keeps it).
-fn environment(drop: &dyn Fn(&OsStr) -> bool) -> Vec<u16> {
+/// This process's environment without the variables `drop` names, with
+/// `overrides` set on top, as a block (sorted by name without case, as
+/// Windows keeps it).
+fn environment(drop: &dyn Fn(&OsStr) -> bool, overrides: &[(OsString, OsString)]) -> Vec<u16> {
     let mut vars: Vec<(OsString, OsString)> = std::env::vars_os().filter(|(k, _)| !drop(k)).collect();
+    for (k, v) in overrides {
+        let fold = |s: &OsStr| s.to_string_lossy().to_uppercase();
+        vars.retain(|(ek, _)| fold(ek) != fold(k));
+        vars.push((k.clone(), v.clone()));
+    }
     vars.sort_by_key(|(k, _)| k.to_string_lossy().to_uppercase());
     let mut block = Vec::new();
     for (k, v) in vars {
@@ -310,7 +474,7 @@ fn create(spec: &Spec<'_>, job: &Owned, stdin: &Owned, stdout: &Owned) -> std::i
     si.lpAttributeList = attributes.list();
     let program = wide(spec.program.as_os_str());
     let mut cmd = command_line(spec.program, spec.args);
-    let env = environment(spec.drop_env);
+    let env = environment(spec.drop_env, spec.env_overrides);
     let cwd = wide(spec.cwd.as_os_str());
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: every pointer is valid, NUL-terminated where required, and
@@ -340,9 +504,18 @@ fn create(spec: &Spec<'_>, job: &Owned, stdin: &Owned, stdout: &Owned) -> std::i
 }
 
 /// Runs the program until it ends or its time is up, and returns how it
-/// ended. Everything it started ends with it.
-pub fn run(spec: &Spec<'_>) -> std::io::Result<Finished> {
+/// ended. Everything it started ends with it. `jobs`: the shared registry
+/// its job joins while it runs (`None` in tests that don't need it).
+pub fn run(spec: &Spec<'_>, jobs: Option<&HookJobs>) -> std::io::Result<Finished> {
     let job = job()?;
+    let _registered = Registered { jobs, token: jobs.map(|j| j.register(job.0)).unwrap_or(0) };
+    // Open and verify the program and any script, denying other writers and
+    // deleters, and keep the handles open until the run has ended.
+    let mut guards = Vec::with_capacity(1 + spec.guard.len());
+    guards.push(guard_file(spec.program, false)?);
+    for p in spec.guard {
+        guards.push(guard_file(p, true)?);
+    }
     let (child_in, ours_in) = pipe(true)?;
     // Its input is empty: our end closes now.
     drop(ours_in);
@@ -383,6 +556,8 @@ pub fn run(spec: &Spec<'_>) -> std::io::Result<Finished> {
     if let Ok(r) = reader {
         let _ = r.join();
     }
+    // The program has ended: the guard handles have done their job.
+    drop(guards);
     let k = std::mem::take(&mut *kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     Ok(Finished { exit_code: if timed_out { None } else { code }, timed_out, output: k.bytes, truncated: k.truncated })
 }
@@ -393,7 +568,8 @@ mod tests {
     use super::*;
 
     fn cmd() -> std::path::PathBuf {
-        std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe")
+        let p = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
+        std::fs::canonicalize(p).unwrap()
     }
 
     fn spec<'a>(
@@ -402,7 +578,16 @@ mod tests {
         timeout: Duration,
         drop_env: &'a dyn Fn(&OsStr) -> bool,
     ) -> Spec<'a> {
-        Spec { program, args, cwd: Path::new(r"C:\"), drop_env, timeout, keep_output: 64 }
+        Spec {
+            program,
+            args,
+            cwd: Path::new(r"C:\Windows"),
+            drop_env,
+            env_overrides: &[],
+            guard: &[],
+            timeout,
+            keep_output: 64,
+        }
     }
 
     fn args(a: &[&str]) -> Vec<OsString> {
@@ -412,17 +597,18 @@ mod tests {
     #[test]
     fn a_program_runs_and_its_exit_code_and_output_come_back() {
         let a = args(&["/c", "echo hello& exit 3"]);
-        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false)).unwrap();
+        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), None).unwrap();
         assert_eq!((f.exit_code, f.timed_out), (Some(3), false));
         assert_eq!(String::from_utf8_lossy(&f.output).trim(), "hello");
         // Only so much output is kept.
         let a = args(&["/c", "for /l %i in (1,1,50) do @echo 0123456789"]);
-        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false)).unwrap();
+        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), None).unwrap();
         assert!(f.truncated && f.output.len() == 64, "{f:?}");
         // A file that isn't a program.
         let not = std::env::temp_dir().join(format!("oneup-contained-{}.exe", std::process::id()));
         std::fs::write(&not, b"not a program").unwrap();
-        assert!(run(&spec(&not, &[], Duration::from_secs(5), &|_| false)).is_err());
+        let not = std::fs::canonicalize(&not).unwrap();
+        assert!(run(&spec(&not, &[], Duration::from_secs(5), &|_| false), None).is_err());
         let _ = std::fs::remove_file(&not);
     }
 
@@ -437,20 +623,25 @@ mod tests {
         assert_eq!(line, r#"plain "two words" "" "C:\a b\\" "say \"hi\"" back\\slash a&b|c"#);
         // As a program reads them back.
         let a = args(&["/c", "echo", "two words"]);
-        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false)).unwrap();
+        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), None).unwrap();
         assert_eq!(String::from_utf8_lossy(&f.output).trim(), "\"two words\"");
     }
 
     #[test]
-    fn variables_it_mustnt_see_are_left_out() {
+    fn variables_it_mustnt_see_are_left_out_and_overrides_win() {
         // SAFETY: a variable only this test reads, in this process.
         unsafe { std::env::set_var("ONEUP_TEST_SECRET_CONTAINED", "s3cret") };
-        let a = args(&["/c", "set ONEUP_TEST_SECRET_CONTAINED"]);
+        let a = args(&["/c", "set ONEUP_TEST_PATHISH& set ONEUP_TEST_SECRET_CONTAINED"]);
         let drop = |n: &OsStr| n.to_string_lossy().to_ascii_uppercase().starts_with("ONEUP_");
-        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &drop)).unwrap();
-        assert!(!String::from_utf8_lossy(&f.output).contains("s3cret"), "{f:?}");
-        let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false)).unwrap();
-        assert!(String::from_utf8_lossy(&f.output).contains("s3cret"), "{f:?}");
+        let overrides = [(OsString::from("ONEUP_TEST_PATHISH"), OsString::from("clean"))];
+        let exe = cmd();
+        let mut sp = spec(&exe, &a, Duration::from_secs(30), &drop);
+        sp.env_overrides = &overrides;
+        let f = run(&sp, None).unwrap();
+        let out = String::from_utf8_lossy(&f.output);
+        assert!(!out.contains("s3cret"), "{out}");
+        // An override is set even though the drop would have removed it.
+        assert!(out.contains("ONEUP_TEST_PATHISH=clean"), "{out}");
     }
 
     /// A program past its time ends, and so does what it started (here
@@ -460,13 +651,13 @@ mod tests {
     fn a_program_past_its_time_ends_with_everything_it_started() {
         let a = args(&["/c", "ping -n 30 127.0.0.1"]);
         let t = std::time::Instant::now();
-        let f = run(&spec(&cmd(), &a, Duration::from_millis(500), &|_| false)).unwrap();
+        let f = run(&spec(&cmd(), &a, Duration::from_millis(500), &|_| false), None).unwrap();
         assert!(f.timed_out && f.exit_code.is_none(), "{f:?}");
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
         // A program that ends by itself takes what it started along too.
         let a = args(&["/c", "start /b ping -n 30 127.0.0.1 & exit 0"]);
         let t = std::time::Instant::now();
-        let f = run(&spec(&cmd(), &a, Duration::from_secs(20), &|_| false)).unwrap();
+        let f = run(&spec(&cmd(), &a, Duration::from_secs(20), &|_| false), None).unwrap();
         assert_eq!(f.exit_code, Some(0));
         assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
     }
@@ -479,7 +670,8 @@ mod tests {
         // inherited it, reading the pipe would only end with the program.
         let (inheritable, ours) = pipe(false).unwrap();
         let a = args(&["/c", "ping -n 4 127.0.0.1 >nul"]);
-        let runner = std::thread::spawn(move || run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false)).unwrap());
+        let runner =
+            std::thread::spawn(move || run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), None).unwrap());
         std::thread::sleep(Duration::from_millis(500));
         let t = std::time::Instant::now();
         drop(inheritable);
@@ -488,5 +680,75 @@ mod tests {
         let _ = f.read_to_end(&mut Vec::new());
         assert!(t.elapsed() < Duration::from_millis(1000), "{:?}", t.elapsed());
         assert_eq!(runner.join().unwrap().exit_code, Some(0));
+    }
+
+    /// A guarded script with a second hard link is refused: a second name,
+    /// in a synced folder, could point at the same bytes. The program (a
+    /// system binary with several servicing links) is only checked for a
+    /// swap, never for links.
+    #[test]
+    fn a_hard_linked_script_is_refused() {
+        let dir = std::env::temp_dir().join(format!("oneup-contained-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("s.bat");
+        std::fs::write(&script, b"@exit /b 0").unwrap();
+        let link = dir.join("also.bat");
+        std::fs::hard_link(&script, &link).unwrap();
+        let script = std::fs::canonicalize(&script).unwrap();
+        let guard = [script.clone()];
+        let a = args(&["/c", "exit 0"]);
+        let exe = cmd();
+        let mut sp = spec(&exe, &a, Duration::from_secs(10), &|_| false);
+        sp.guard = &guard;
+        let e = run(&sp, None).unwrap_err();
+        assert!(e.to_string().contains("hard link"), "{e}");
+        std::fs::remove_file(&link).unwrap();
+        // One link again: it runs (cmd.exe itself has several links, and is
+        // not refused for that).
+        assert!(run(&sp, None).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hook process (and its children) are in the shared registry; this
+    /// test process, which isn't one, is not.
+    #[test]
+    fn hook_processes_and_their_children_are_in_the_registry() {
+        let jobs = Arc::new(HookJobs::new());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A hook that starts a child (ping) and waits: while it runs, both
+        // it and the child are in the job.
+        let j = Arc::clone(&jobs);
+        let d = Arc::clone(&done);
+        let child_pid = Arc::new(Mutex::new(0u32));
+        let cp = Arc::clone(&child_pid);
+        let run_thread = std::thread::spawn(move || {
+            let a = args(&["/c", "ping -n 20 127.0.0.1 >nul"]);
+            let _ = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), Some(&j));
+            d.store(true, Relaxed);
+            let _ = cp;
+        });
+        // Wait for a descendant that is in our job (other tests may run
+        // their own cmd children under the shared test-binary process, so a
+        // bare "any descendant" could be someone else's).
+        let mut hook_pid = 0u32;
+        for _ in 0..400 {
+            if done.load(Relaxed) {
+                break;
+            }
+            if let Some(pid) = crate::processes::any_descendant(std::process::id())
+                && jobs.contains(pid)
+            {
+                hook_pid = pid;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(hook_pid != 0, "a hook process (or its child) should be in the registry");
+        assert!(!jobs.contains(std::process::id()), "this process is not a hook");
+        // Once the run ends, its job leaves the registry.
+        run_thread.join().unwrap();
+        assert!(!jobs.contains(hook_pid));
+        let _ = child_pid;
     }
 }

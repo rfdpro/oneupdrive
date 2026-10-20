@@ -128,6 +128,44 @@ pub fn terminate(p: &Process, wait_ms: u32) -> Result<bool> {
     Ok(true)
 }
 
+/// Any descendant process of `parent` (the deepest found), by walking the
+/// parent links in a snapshot of the system's processes. For tests that
+/// start a child and want to prove it, and its children, are in a job.
+#[cfg(test)]
+pub fn any_descendant(parent: u32) -> Option<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot of all processes; the handle is owned below.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    let snap = Owned(snap);
+    let mut entry = PROCESSENTRY32 { dwSize: size_of::<PROCESSENTRY32>() as u32, ..Default::default() };
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    // SAFETY: `entry` is a valid, sized structure for each call.
+    let mut more = unsafe { Process32First(snap.0, &mut entry) }.is_ok();
+    while more {
+        parents.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: as above.
+        more = unsafe { Process32Next(snap.0, &mut entry) }.is_ok();
+    }
+    // The deepest descendant: walk down as far as the links go.
+    let mut frontier = vec![parent];
+    let mut deepest = None;
+    for _ in 0..64 {
+        let next: Vec<u32> = parents
+            .iter()
+            .filter(|(pid, ppid)| frontier.contains(ppid) && *pid != parent)
+            .map(|(pid, _)| *pid)
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        deepest = next.first().copied();
+        frontier = next;
+    }
+    deepest
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
