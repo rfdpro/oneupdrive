@@ -6,10 +6,14 @@
 //! * [`ExcludeSet`]: the part enumeration may apply by folder name alone
 //!   ([`RuleSet::pruning`]), so excluded folders are never listed.
 //!
+//! * [`database`]: which files are databases, and when a copy of one is
+//!   consistent.
+//!
 //! Pure: callers read the rule files.
 
 use std::collections::BTreeMap;
 
+pub mod database;
 mod glob;
 mod pattern;
 mod presets;
