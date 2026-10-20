@@ -100,6 +100,26 @@ impl Rule {
         }
     }
 
+    /// The folder (folded parts, relative to the rule's folder) holding
+    /// everything this rule can match: the literal parts before the first
+    /// wildcard, less the item's own name when every part is literal.
+    /// `None` for a name rule, which can match at any depth.
+    pub(crate) fn within(&self) -> Option<Vec<String>> {
+        let Shape::Anchored(segs) = &self.shape else { return None };
+        let mut out = Vec::new();
+        for s in segs {
+            match s {
+                Seg::Name(g) => match g.literal() {
+                    Some(name) => out.push(name),
+                    None => return Some(out),
+                },
+                Seg::Deep => return Some(out),
+            }
+        }
+        out.pop();
+        Some(out)
+    }
+
     /// Whether this rule could match an item called `name` somewhere, judged
     /// by its last part only. Used to keep a folder name out of pruning when
     /// a `!` rule might re-include such a folder.

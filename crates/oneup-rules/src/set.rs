@@ -403,6 +403,34 @@ impl RuleSet {
         out
     }
 
+    /// Whether a rule meant for somewhere inside the folder at `folder`
+    /// (relative to the synced folder) excludes something there: an
+    /// anchored rule of yours below it (`/Docs/drafts/` for `Docs`), a
+    /// `.oneupignore` in it or below, a paused folder or one synced on its
+    /// own below it. What the file tree shows as a partly ticked folder.
+    /// Rules that apply everywhere (presets, `*.iso`) don't count: they
+    /// would mark every folder. Pure; a pass over the rules, not the tree.
+    pub fn has_rules_inside(&self, folder: &str) -> bool {
+        let want: Vec<Vec<char>> = parts(folder).map(crate::glob::folded).collect();
+        let covers =
+            |at: &[String]| at.len() >= want.len() && want.iter().zip(at).all(|(w, a)| a.chars().eq(w.iter().copied()));
+        let everywhere = |l: &Layer| matches!(l.source, Source::Preset(_) | Source::Config);
+        self.layers().any(|l| {
+            l.rules.iter().any(|(_, r)| {
+                if r.negated {
+                    return false;
+                }
+                let inside = match r.within() {
+                    Some(within) => within,
+                    None if everywhere(l) => return false,
+                    None => Vec::new(),
+                };
+                let at: Vec<String> = l.base.iter().cloned().chain(inside).collect();
+                covers(&at)
+            })
+        })
+    }
+
     /// Changes whenever any rule changes, so stored decisions can be
     /// re-evaluated (the planning fingerprint of rules.md).
     pub fn fingerprint(&self) -> String {
@@ -636,6 +664,28 @@ mod tests {
         }
         assert!(pruning.excludes_folder("ΛΟΓΟΣ") && !pruning.excludes_folder("\u{212A}it"));
         assert!(!pruning.excludes_folder("İx") && !pruning.excludes_folder("STRASSE"));
+    }
+
+    #[test]
+    fn rules_meant_for_inside_a_folder_mark_it_and_its_parents() {
+        let mut s = set(&["dev"], &["*.iso", "/Docs/Drafts/", "/Media/*.mov", "!/Keep/x/"]);
+        s.add_ignore_file("Code/app", "build/");
+        s.set_paused(&["Photos/2019"]);
+        for (folder, inside) in [
+            ("", true),
+            ("docs", true),
+            ("Docs/Drafts", false),
+            ("Media", true),
+            ("Code", true),
+            ("Code/App", true),
+            ("Code/App/src", false),
+            ("Photos", true),
+            ("Keep", false),
+            ("Music", false),
+        ] {
+            assert_eq!(s.has_rules_inside(folder), inside, "{folder:?}");
+        }
+        assert!(!set(&["dev"], &["*.iso"]).has_rules_inside(""), "rules for everywhere don't count");
     }
 
     #[test]
