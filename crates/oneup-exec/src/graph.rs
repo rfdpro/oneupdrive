@@ -33,6 +33,12 @@ pub struct GraphCloud {
     /// batch of them was read.
     links: Arc<Mutex<Links>>,
     links_read: Arc<tokio::sync::Notify>,
+    /// Upload sessions cut short by the network, to go on with
+    /// ([`Resumer`]).
+    kept: Arc<Resumer>,
+    /// Downloads count against the data budget, which stops them once used
+    /// up (`oneup_graph::budget`). Off for files the user opens.
+    budgeted: bool,
 }
 
 /// How long a link read ahead is used: they're pre-authenticated and
@@ -240,7 +246,16 @@ impl GraphCloud {
             timings: Arc::default(),
             links: Arc::default(),
             links_read: Arc::default(),
+            kept: Arc::default(),
+            budgeted: true,
         }
+    }
+
+    /// For serving files the user opens: always fetched, the data budget
+    /// notwithstanding (their bytes still count toward it).
+    #[must_use]
+    pub fn unbudgeted(self) -> Self {
+        Self { budgeted: false, ..self }
     }
 
     /// Records how long its requests take in `t` (shared with the
@@ -404,6 +419,14 @@ trait Session: Sync {
     fn pause(&self, sends: u32) -> impl Future<Output = ()> + Send;
     /// Item `id`'s eTag now; `None`: it's gone.
     fn etag(&self, id: &str) -> impl Future<Output = oneup_graph::Result<Option<String>>> + Send;
+    /// The largest fragment to send now, if less than the sizer would
+    /// choose (a poor link: `Graph::set_fragment_cap`).
+    fn most(&self) -> Option<usize> {
+        None
+    }
+    /// A fragment is about to be sent again: a retry, for judging the link
+    /// (`NetStats::retries`; the client sends each fragment once itself).
+    fn resent(&self) {}
 }
 
 struct GraphSession<'a> {
@@ -427,6 +450,12 @@ impl Session for GraphSession<'_> {
     }
     async fn etag(&self, id: &str) -> oneup_graph::Result<Option<String>> {
         Ok(self.graph.item(id).await?.and_then(|it| it.e_tag))
+    }
+    fn most(&self) -> Option<usize> {
+        self.graph.fragment_cap()
+    }
+    fn resent(&self) {
+        self.graph.stats.retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -460,6 +489,7 @@ fn maybe_received(e: &oneup_graph::Error) -> bool {
 /// memory; anything else ends the upload (the source can't be read again).
 /// A session that is gone (expired, or completed by the lost answer) ends
 /// it too, and the next round plans again from what OneDrive then has.
+#[cfg(test)]
 async fn send_session<S: Session>(
     s: &S,
     sizer: &std::sync::Mutex<Sizer>,
@@ -467,12 +497,98 @@ async fn send_session<S: Session>(
     total: u64,
     src: &mut dyn Source,
 ) -> Result<DriveItem, CloudError> {
+    send_from(s, sizer, replace, total, src, None, false).await.map_err(|(e, _)| e)
+}
+
+/// Where an upload cut short ended: the bytes the session is known to
+/// have, with the QuickXorHash of those bytes as they were read then, and
+/// the same for the end of the fragment in flight, which it may have
+/// received with its answer lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reached {
+    next: u64,
+    prefix: [u8; 20],
+    then: Option<(u64, [u8; 20])>,
+}
+
+/// [`send_session`], going on from `from` (what the session already has,
+/// checked: the source's first `from.next` bytes must hash as they did
+/// when they were sent, or nothing more is sent). With `keep`, a session
+/// the network cut off is left open rather than cancelled, and the error
+/// says where it ended, so the next try goes on from there instead of
+/// sending the file again from its start.
+async fn send_from<S: Session>(
+    s: &S,
+    sizer: &std::sync::Mutex<Sizer>,
+    replace: Option<(&str, &str)>,
+    total: u64,
+    src: &mut dyn Source,
+    from: Option<(u64, [u8; 20])>,
+    keep: bool,
+) -> Result<DriveItem, (CloudError, Option<Reached>)> {
     let sizer = || sizer.lock().unwrap_or_else(|p| p.into_inner());
     let mut buf = Vec::new();
     let mut start = 0u64;
+    // The bytes the session has confirmed, hashed: what a later try checks.
+    let mut prefix = oneup_hash::QuickXorHash::new();
+    if let Some((next, want_hash)) = from {
+        // Read and hashed again (the executor hashes everything it reads),
+        // not sent.
+        while start < next {
+            let want = usize::try_from((next - start).min(16 * UNIT as u64)).unwrap_or(16 * UNIT);
+            if buf.len() < want {
+                buf.resize(want, 0);
+            }
+            let (filled, read) = src.fill(std::mem::take(&mut buf), want).await;
+            buf = filled;
+            match read {
+                Ok(n) if n == want => prefix.update(&buf[..n]),
+                Ok(_) => {
+                    s.cancel().await;
+                    return Err((short(), None));
+                }
+                Err(e) => {
+                    s.cancel().await;
+                    return Err((CloudError::Io(e), None));
+                }
+            }
+            start += want as u64;
+        }
+        if prefix.finalize() != want_hash {
+            s.cancel().await;
+            tracing::debug!("a file changed since its upload was cut short; it's sent again from its start");
+            return Err((CloudError::Other("the file changed since its upload began".into()), None));
+        }
+        tracing::debug!(from = next, "an upload cut short goes on from where it ended");
+    }
+    // Ends the upload after an error: a session the network cut off is
+    // kept (if asked) with where it ended; any other is cancelled.
+    // A used-up data budget keeps it too: once more is allowed (or another
+    // network), it goes on from there, never from the file's first byte.
+    let end = |e: &oneup_graph::Error, prefix: &oneup_hash::QuickXorHash, at: u64, have: &[u8], sent: &[u8]| {
+        let cut_off =
+            e.is_transient() || matches!(e, oneup_graph::Error::Exhausted(_) | oneup_graph::Error::OverBudget);
+        (keep && cut_off).then(|| {
+            let mut p = prefix.clone();
+            p.update(have);
+            let next = at + have.len() as u64;
+            let then = (sent.len() > have.len()).then(|| {
+                let mut q = prefix.clone();
+                q.update(sent);
+                (at + sent.len() as u64, q.finalize())
+            });
+            Reached { next, prefix: p.finalize(), then }
+        })
+    };
     loop {
         let left = total - start;
         let mut want = sizer().next(left);
+        if let Some(most) = s.most()
+            && want > most
+        {
+            // A poor link: smaller fragments, so a drop loses less.
+            want = most.max(UNIT) / UNIT * UNIT;
+        }
         if replace.is_some() && want as u64 == left && want > UNIT {
             // All but the last unit (fragments are whole units but the last).
             want = (want - 1) / UNIT * UNIT;
@@ -488,27 +604,30 @@ async fn send_session<S: Session>(
             Ok(n) if n == want => n,
             Ok(_) => {
                 s.cancel().await;
-                return Err(short());
+                return Err((short(), None));
             }
             Err(e) => {
                 s.cancel().await;
-                return Err(CloudError::Io(e));
+                return Err((CloudError::Io(e), None));
             }
         };
-        let end = start + n as u64;
-        let last = end == total;
+        let end_at = start + n as u64;
+        let last = end_at == total;
         if last && let Some((id, etag)) = replace {
             let now = match s.etag(id).await {
                 Ok(now) => now,
                 Err(e) => {
-                    s.cancel().await;
-                    return Err(map(e));
+                    let kept = end(&e, &prefix, start, &[], &[]);
+                    if kept.is_none() {
+                        s.cancel().await;
+                    }
+                    return Err((map(e), kept));
                 }
             };
             if now.as_deref() != Some(etag) {
                 tracing::debug!("the file changed in OneDrive during its upload; the upload is cancelled");
                 s.cancel().await;
-                return Err(CloudError::Changed);
+                return Err((CloudError::Changed, None));
             }
         }
         // How much of this fragment the session has, and how many times it
@@ -517,6 +636,9 @@ async fn send_session<S: Session>(
         let mut sends = 0;
         let item = loop {
             sends += 1;
+            if sends > 1 {
+                s.resent();
+            }
             let sent = std::time::Instant::now();
             let got = s.put(start + have as u64, total, &buf[have..n]).await;
             let took = sent.elapsed();
@@ -528,7 +650,7 @@ async fn send_session<S: Session>(
                     break f.item;
                 }
                 Err(e) if maybe_received(&e) && sends < SENDS => match s.status().await {
-                    Ok(Some(next)) if (start..=end).contains(&next) => {
+                    Ok(Some(next)) if (start..=end_at).contains(&next) => {
                         tracing::debug!(
                             sends,
                             "an upload fragment's answer was lost; going on from the session's state"
@@ -541,32 +663,162 @@ async fn send_session<S: Session>(
                     }
                     Ok(Some(_)) => {
                         s.cancel().await;
-                        return Err(CloudError::Other("the upload session expects bytes already sent".into()));
+                        return Err((CloudError::Other("the upload session expects bytes already sent".into()), None));
                     }
-                    Ok(None) if last => return Err(CloudError::Changed),
+                    Ok(None) if last => return Err((CloudError::Changed, None)),
                     Ok(None) => {
-                        return Err(CloudError::Other("the upload session ended before the upload finished".into()));
+                        return Err((
+                            CloudError::Other("the upload session ended before the upload finished".into()),
+                            None,
+                        ));
                     }
+                    // The network is down: asked again after a pause, from
+                    // what's known to be there.
+                    Err(e2) if e2.is_transient() => s.pause(sends).await,
                     Err(_) => {
                         sizer().failed();
-                        s.cancel().await;
-                        return Err(map(e));
+                        let kept = end(&e, &prefix, start, &buf[..have], &buf[..n]);
+                        if kept.is_none() {
+                            s.cancel().await;
+                        }
+                        return Err((map(e), kept));
                     }
                 },
                 Err(e) => {
-                    sizer().failed();
-                    s.cancel().await;
-                    return Err(map(e));
+                    // Not the line's fault: the fragment wasn't sent.
+                    if !matches!(e, oneup_graph::Error::OverBudget) {
+                        sizer().failed();
+                    }
+                    let kept = end(&e, &prefix, start, &buf[..have], &buf[..n]);
+                    if kept.is_none() {
+                        s.cancel().await;
+                    }
+                    return Err((map(e), kept));
                 }
             }
         };
+        prefix.update(&buf[..n]);
         match item {
             Some(item) => return Ok(item),
-            None if !last => start = end,
+            None if !last => start = end_at,
             None => {
                 s.cancel().await;
-                return Err(CloudError::Other("the upload session did not complete".into()));
+                return Err((CloudError::Other("the upload session did not complete".into()), None));
             }
+        }
+    }
+}
+
+/// Which upload a kept session is for: the same file name in the same
+/// folder, replacing the same version (or none), of the same size.
+#[derive(Clone, PartialEq, Eq)]
+struct KeptKey {
+    parent: String,
+    name: String,
+    replace: Option<(String, String)>,
+    total: u64,
+}
+
+/// An upload session the network cut off, with where it ended.
+struct Kept {
+    key: KeptKey,
+    /// Pre-authenticated: never logged (no `Debug` shows it).
+    url: String,
+    reached: Reached,
+}
+
+/// Upload sessions cut short, at most [`KEPT_MAX`], the oldest dropped
+/// (sessions expire on their own after a while). Only in memory: a session
+/// URL is a credential, and a restart starts such uploads again.
+#[derive(Default)]
+struct Resumer {
+    kept: Mutex<VecDeque<Kept>>,
+}
+
+const KEPT_MAX: usize = 16;
+
+impl std::fmt::Debug for Resumer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.kept.lock().map(|k| k.len()).unwrap_or(0);
+        f.debug_struct("Resumer").field("kept", &n).finish()
+    }
+}
+
+impl Resumer {
+    fn take(&self, key: &KeptKey) -> Option<Kept> {
+        let mut k = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+        let at = k.iter().position(|x| x.key == *key)?;
+        k.remove(at)
+    }
+
+    fn keep(&self, kept: Kept) {
+        let mut k = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+        k.retain(|x| x.key != kept.key);
+        if k.len() == KEPT_MAX {
+            k.pop_front();
+        }
+        k.push_back(kept);
+    }
+}
+
+/// One try at a large upload through sessions `open`/`reopen` make,
+/// going on with a kept session for the same upload if its state is
+/// exactly where it was left (and the source may be read again).
+async fn upload_resuming<S: Session, F, Fut>(
+    kept: &Resumer,
+    key: KeptKey,
+    sizer: &std::sync::Mutex<Sizer>,
+    src: &mut dyn Source,
+    open: F,
+    reopen: impl FnOnce(String) -> S,
+) -> Result<DriveItem, CloudError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(String, S), CloudError>>,
+{
+    let resumable = src.resumable();
+    let replace = key.replace.clone();
+    let replace = replace.as_ref().map(|(id, e)| (id.as_str(), e.as_str()));
+    let earlier = if resumable { kept.take(&key) } else { None };
+    let (url, session, from) = match earlier {
+        Some(k) => {
+            let s = reopen(k.url.clone());
+            let r = k.reached;
+            match s.status().await {
+                Ok(Some(next)) if next == r.next => (k.url, s, Some((r.next, r.prefix))),
+                // The fragment in flight arrived; its answer was lost.
+                Ok(Some(next)) if r.then.is_some_and(|(end, _)| end == next) => (k.url, s, r.then),
+                Ok(other) => {
+                    // Not exactly where it was left (a fragment's answer was
+                    // lost, or it's gone): those bytes can't be checked, so
+                    // a new session from the start.
+                    if other.is_some() {
+                        s.cancel().await;
+                    }
+                    let (url, s) = open().await?;
+                    (url, s, None)
+                }
+                Err(e) => {
+                    // Still unreachable: kept for the next try.
+                    let err = map(e);
+                    kept.keep(k);
+                    return Err(err);
+                }
+            }
+        }
+        None => {
+            let (url, s) = open().await?;
+            (url, s, None)
+        }
+    };
+    match send_from(&session, sizer, replace, key.total, src, from, resumable).await {
+        Ok(item) => Ok(item),
+        Err((e, reached)) => {
+            if let Some(reached) = reached {
+                tracing::debug!(at = reached.next, "an upload was cut short; the next try goes on from there");
+                kept.keep(Kept { key, url, reached });
+            }
+            Err(e)
         }
     }
 }
@@ -627,7 +879,7 @@ impl Cloud for GraphCloud {
         // waits a little (an unfinished batch is dropped, and read again).
         let fetched = {
             let refill = std::pin::pin!(self.refill());
-            let content = std::pin::pin!(self.graph.download_to(&url, &mut *out));
+            let content = std::pin::pin!(self.graph.download_within(&url, &mut *out, self.budgeted));
             match futures_util::future::select(content, refill).await {
                 futures_util::future::Either::Left((fetched, refill)) => {
                     if fetched.is_ok() {
@@ -648,7 +900,7 @@ impl Cloud for GraphCloud {
                     return Err(CloudError::Changed);
                 }
                 let url = info.download_url.ok_or_else(|| CloudError::Other("no download URL".into()))?;
-                self.graph.download_to(&url, out).await
+                self.graph.download_within(&url, out, self.budgeted).await
             }
             r => r,
         };
@@ -680,9 +932,19 @@ impl Cloud for GraphCloud {
             self.timings.record("upload: one request", started);
             item
         } else {
-            let url = self.graph.upload_session(&parent.0, name, replace).await.map_err(map)?;
-            let session = GraphSession { graph: &self.graph, url };
-            let item = send_session(&session, &self.sizer, replace, total, src).await?;
+            let key = KeptKey {
+                parent: parent.0.clone(),
+                name: name.to_string(),
+                replace: replace.map(|(id, e)| (id.to_string(), e.to_string())),
+                total,
+            };
+            let graph = &self.graph;
+            let open = || async move {
+                let url = graph.upload_session(&parent.0, name, replace).await.map_err(map)?;
+                Ok((url.clone(), GraphSession { graph, url }))
+            };
+            let item =
+                upload_resuming(&self.kept, key, &self.sizer, src, open, |url| GraphSession { graph, url }).await?;
             self.timings.record("upload: session", started);
             item
         };
@@ -949,6 +1211,8 @@ mod tests {
         /// Every send, received or not, and every pause before one.
         sends: Mutex<u32>,
         pauses: Mutex<Vec<u32>>,
+        /// Sends counted as retries.
+        resent: Mutex<u32>,
     }
 
     fn refused(status: u16) -> oneup_graph::Error {
@@ -1017,6 +1281,9 @@ mod tests {
         }
         async fn pause(&self, sends: u32) {
             self.pauses.lock().unwrap().push(sends);
+        }
+        fn resent(&self) {
+            *self.resent.lock().unwrap() += 1;
         }
         async fn etag(&self, _: &str) -> oneup_graph::Result<Option<String>> {
             Ok(Some(self.etag.lock().unwrap().clone()))
@@ -1118,6 +1385,7 @@ mod tests {
         assert!(matches!(r, Err(CloudError::Other(_))), "{r:?}");
         assert_eq!(*s.sends.lock().unwrap(), SENDS);
         assert_eq!(*s.pauses.lock().unwrap(), [1, 2, 3, 4]);
+        assert_eq!(*s.resent.lock().unwrap(), SENDS - 1, "each send again is a retry, for judging the link");
         assert!(*s.cancelled.lock().unwrap());
 
         let s = fake();
@@ -1134,6 +1402,317 @@ mod tests {
         assert_eq!(*s.got.lock().unwrap(), c);
         assert_eq!(*s.sends.lock().unwrap(), 3);
         assert!(s.pauses.lock().unwrap().is_empty(), "nothing was sent again");
+    }
+
+    /// A link as the roadmap's test harness describes it: 256 kbit/s, 600 ms
+    /// round trips, 1% of answers lost (the fragment arrived), and the
+    /// connection dropping for 20 s every 3 minutes, and gone for 4 minutes
+    /// every quarter of an hour. Simulated time. The
+    /// state is the service's and outlives each try's session.
+    #[derive(Default)]
+    struct LineState {
+        /// Each session's bytes, by URL; `None` once gone.
+        sessions: HashMap<String, Option<Vec<u8>>>,
+        created: u32,
+        rng: u64,
+        /// Bytes put on the wire (received or not), requests, failures,
+        /// and fragments sent from the file's first byte.
+        wire: u64,
+        requests: u32,
+        failed: u32,
+        from_zero: u32,
+        /// Lost answers at random (1%).
+        random_loss: bool,
+        /// The network is gone once this many fragments were sent.
+        down_after: Option<u32>,
+        /// This fragment (counted from 1) arrives, its answer is lost.
+        lose_put: Option<u32>,
+        puts: u32,
+        /// What the data budget lets through still (`None`: no budget): a
+        /// fragment that doesn't fit isn't sent, as the client does.
+        budget: Option<u64>,
+    }
+
+    struct Line {
+        state: Arc<Mutex<LineState>>,
+        url: String,
+        t0: tokio::time::Instant,
+    }
+
+    const RTT: Duration = Duration::from_millis(600);
+    const BYTES_PER_S: f64 = 256_000.0 / 8.0;
+
+    impl Line {
+        /// The connection is gone now.
+        fn down(&self) -> bool {
+            let st = self.state.lock().unwrap();
+            match st.down_after {
+                Some(n) => st.puts >= n,
+                None => st.random_loss && self.dropping(),
+            }
+        }
+
+        /// The harness's timed drops and outage.
+        fn dropping(&self) -> bool {
+            let s = self.t0.elapsed().as_secs();
+            s % 180 >= 160 || (300..540).contains(&(s % 900))
+        }
+
+        fn lost(&self) -> bool {
+            let mut st = self.state.lock().unwrap();
+            if st.lose_put == Some(st.puts) {
+                return true;
+            }
+            if !st.random_loss {
+                return false;
+            }
+            st.rng = st.rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st.rng >> 33).is_multiple_of(100)
+        }
+    }
+
+    fn dropped() -> oneup_graph::Error {
+        oneup_graph::Error::Stalled("upload", 30)
+    }
+
+    impl Session for Line {
+        async fn put(&self, start: u64, total: u64, bytes: &[u8]) -> oneup_graph::Result<Fragment> {
+            {
+                let mut st = self.state.lock().unwrap();
+                match &mut st.budget {
+                    Some(b) if *b < bytes.len() as u64 => return Err(oneup_graph::Error::OverBudget),
+                    Some(b) => *b -= bytes.len() as u64,
+                    None => {}
+                }
+            }
+            // No connection: it fails at once, nothing sent.
+            let down = self.down();
+            self.state.lock().unwrap().puts += 1;
+            if down {
+                tokio::time::sleep(RTT).await;
+                let mut st = self.state.lock().unwrap();
+                st.requests += 1;
+                st.failed += 1;
+                return Err(dropped());
+            }
+            tokio::time::sleep(RTT + Duration::from_secs_f64(bytes.len() as f64 / BYTES_PER_S)).await;
+            let lost = self.lost();
+            // Dropped while it was on its way (the timed drops only).
+            let cut = self.state.lock().unwrap().random_loss && self.dropping();
+            let mut st = self.state.lock().unwrap();
+            st.requests += 1;
+            st.wire += bytes.len() as u64;
+            if start == 0 {
+                st.from_zero += 1;
+            }
+            if cut {
+                st.failed += 1;
+                return Err(dropped());
+            }
+            let Some(Some(got)) = st.sessions.get_mut(&self.url) else {
+                st.failed += 1;
+                return Err(refused(404));
+            };
+            if start != got.len() as u64 {
+                st.failed += 1;
+                return Err(refused(416));
+            }
+            got.extend_from_slice(bytes);
+            let done = got.len() as u64 == total;
+            if done {
+                st.sessions.insert(self.url.clone(), None);
+            }
+            if lost {
+                st.failed += 1;
+                return Err(dropped());
+            }
+            let item = done.then(|| DriveItem {
+                id: "F".into(),
+                name: Some("f.bin".into()),
+                size: Some(total as i64),
+                e_tag: Some("after".into()),
+                parent_reference: None,
+                file: None,
+                folder: None,
+                package: None,
+                deleted: None,
+                root: None,
+                file_system_info: None,
+                shared: None,
+            });
+            Ok(Fragment { item, paused: Duration::ZERO, capped: Duration::ZERO })
+        }
+        async fn status(&self) -> oneup_graph::Result<Option<u64>> {
+            tokio::time::sleep(RTT).await;
+            let down = self.down();
+            let mut st = self.state.lock().unwrap();
+            st.requests += 1;
+            if down {
+                st.failed += 1;
+                return Err(dropped());
+            }
+            Ok(st.sessions.get(&self.url).cloned().flatten().map(|g| g.len() as u64))
+        }
+        async fn cancel(&self) {
+            if !self.down() {
+                self.state.lock().unwrap().sessions.insert(self.url.clone(), None);
+            }
+        }
+        async fn pause(&self, sends: u32) {
+            tokio::time::sleep(Duration::from_millis(500 << sends.min(6))).await;
+        }
+        async fn etag(&self, _: &str) -> oneup_graph::Result<Option<String>> {
+            Ok(Some("planned".into()))
+        }
+        fn most(&self) -> Option<usize> {
+            // The agent's cap on a poor link.
+            Some(4 * UNIT)
+        }
+    }
+
+    /// A local file's content as the executor reads it: may be read again.
+    struct File<'a>(&'a [u8]);
+
+    impl std::io::Read for File<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Source for File<'_> {
+        fn resumable(&self) -> bool {
+            true
+        }
+    }
+
+    /// The roadmap's exit test for slow links: a 12 MiB upload over the
+    /// harness's link, tried again a minute after each failure (the
+    /// agent's back-off for a failed operation). It arrives whole, one
+    /// session from start to end (never sent again from its first byte),
+    /// with few failed requests a minute and at most a quarter more data
+    /// on the wire than the file holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_dropping_link_finishes_an_upload_without_starting_it_again() {
+        let content: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let state = Arc::new(Mutex::new(LineState { rng: 7, random_loss: true, ..LineState::default() }));
+        let t0 = tokio::time::Instant::now();
+        let kept = Resumer::default();
+        let sizer = std::sync::Mutex::new(Sizer::new(8 * UNIT));
+        let key = KeptKey { parent: "P".into(), name: "f.bin".into(), replace: None, total: content.len() as u64 };
+        let mut tries = 0;
+        let item = loop {
+            tries += 1;
+            assert!(tries < 40, "gave up after {tries} tries");
+            let open = || async {
+                let mut st = state.lock().unwrap();
+                st.created += 1;
+                let url = format!("s{}", st.created);
+                st.sessions.insert(url.clone(), Some(Vec::new()));
+                Ok((url.clone(), Line { state: Arc::clone(&state), url, t0 }))
+            };
+            let reopen = |url| Line { state: Arc::clone(&state), url, t0 };
+            let mut src = File(&content);
+            match upload_resuming(&kept, key.clone(), &sizer, &mut src, open, reopen).await {
+                Ok(item) => break item,
+                Err(_) => tokio::time::sleep(Duration::from_secs(60)).await,
+            }
+        };
+        assert_eq!(item.size, Some(content.len() as i64));
+        let st = state.lock().unwrap();
+        let minutes = t0.elapsed().as_secs_f64() / 60.0;
+        assert_eq!((st.created, st.from_zero), (1, 1), "one session, sent from its start once ({tries} tries)");
+        assert!(st.wire <= content.len() as u64 * 5 / 4, "{} bytes on the wire for {}", st.wire, content.len());
+        assert!(f64::from(st.failed) / minutes <= 6.0, "{} failed requests in {minutes:.1} min", st.failed);
+        assert!(tries > 1, "the link went down during the upload at least once");
+    }
+
+    /// One try of an upload over the harness's link, as `GraphCloud`
+    /// makes it: a kept session goes on, or a new one starts.
+    async fn try_upload(
+        state: &Arc<Mutex<LineState>>,
+        kept: &Resumer,
+        sizer: &std::sync::Mutex<Sizer>,
+        content: &[u8],
+        t0: tokio::time::Instant,
+    ) -> Result<DriveItem, CloudError> {
+        let key = KeptKey { parent: "P".into(), name: "f.bin".into(), replace: None, total: content.len() as u64 };
+        let open = || async {
+            let mut st = state.lock().unwrap();
+            st.created += 1;
+            let url = format!("s{}", st.created);
+            st.sessions.insert(url.clone(), Some(Vec::new()));
+            Ok((url.clone(), Line { state: Arc::clone(state), url, t0 }))
+        };
+        let reopen = |url| Line { state: Arc::clone(state), url, t0 };
+        let mut src = File(content);
+        upload_resuming(kept, key, sizer, &mut src, open, reopen).await
+    }
+
+    /// The data budget used up halfway through a large upload keeps its
+    /// session: once more is allowed, the next try goes on in the same
+    /// session from where it stopped, never from the file's first byte.
+    #[tokio::test(start_paused = true)]
+    async fn an_upload_stopped_by_the_budget_goes_on_once_more_is_allowed() {
+        let c: Vec<u8> = (0..12 * UNIT).map(|i| (i % 251) as u8).collect();
+        let state = Arc::new(Mutex::new(LineState { budget: Some(6 * U), ..LineState::default() }));
+        let (t0, kept) = (tokio::time::Instant::now(), Resumer::default());
+        let sizer = std::sync::Mutex::new(Sizer::new(4 * UNIT));
+        let r = try_upload(&state, &kept, &sizer, &c, t0).await;
+        assert!(matches!(r, Err(CloudError::Other(_))), "{r:?}");
+        let had = state.lock().unwrap().sessions["s1"].as_ref().map(Vec::len);
+        assert_eq!(had, Some(4 * UNIT), "kept, with what it has");
+        // "Allow 500 MB more".
+        state.lock().unwrap().budget = None;
+        let item = try_upload(&state, &kept, &sizer, &c, t0).await.unwrap();
+        assert_eq!(item.size, Some(c.len() as i64));
+        let st = state.lock().unwrap();
+        assert_eq!((st.created, st.from_zero), (1, 1), "the same session, sent from its start once");
+        assert_eq!(st.wire, c.len() as u64, "nothing sent twice");
+    }
+
+    /// Two tries through a kept session, the file changed in between inside
+    /// what was sent already: the second try re-reads and hashes everything
+    /// sent so far, finds the change, sends nothing more and cancels the
+    /// session; unchanged, it goes on and sends only the rest. Both where
+    /// the session was known to be, and where the fragment in flight ended
+    /// (its answer lost).
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_upload_goes_on_only_if_everything_sent_is_still_the_file() {
+        let c: Vec<u8> = (0..12 * UNIT).map(|i| (i % 251) as u8).collect();
+        // (when the network goes, the put whose answer is lost, where the
+        // change is, where the second try begins)
+        for (down_after, lose_put, at, from) in [(1, None, 2 * UNIT, 4 * U), (2, Some(2), 6 * UNIT, 8 * U)] {
+            for changed in [true, false] {
+                let state =
+                    Arc::new(Mutex::new(LineState { down_after: Some(down_after), lose_put, ..LineState::default() }));
+                let (t0, kept) = (tokio::time::Instant::now(), Resumer::default());
+                let sizer = std::sync::Mutex::new(Sizer::new(4 * UNIT));
+                assert!(try_upload(&state, &kept, &sizer, &c, t0).await.is_err(), "the network went");
+                let (wire, had) = {
+                    let mut st = state.lock().unwrap();
+                    st.down_after = None;
+                    (st.wire, st.sessions["s1"].as_ref().unwrap().len() as u64)
+                };
+                assert_eq!(had, from, "what the session has");
+                let mut file = c.clone();
+                if changed {
+                    file[at] ^= 1;
+                }
+                let r = try_upload(&state, &kept, &sizer, &file, t0).await;
+                let st = state.lock().unwrap();
+                assert_eq!(st.created, 1, "no new session either way");
+                if changed {
+                    assert!(matches!(r, Err(CloudError::Other(_))), "{r:?}");
+                    assert_eq!(st.wire, wire, "nothing more sent");
+                    assert_eq!(st.sessions["s1"], None, "the session was cancelled");
+                    assert!(kept.kept.lock().unwrap().is_empty());
+                } else {
+                    assert_eq!(r.unwrap().size, Some(c.len() as i64));
+                    assert_eq!(st.wire - wire, c.len() as u64 - from, "only the rest was sent");
+                    assert_eq!(st.from_zero, 1);
+                }
+            }
+        }
     }
 
     fn version(id: &str, modified_ms: i64, size: i64) -> FileVersion {

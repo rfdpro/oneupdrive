@@ -481,6 +481,9 @@ pub struct NetStatus {
     /// Data used this month on this network's profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<DataUse>,
+    /// `poor` while the agent has adapted to a poor link; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
 }
 
 /// Data used this month on the profile in effect, by direction.

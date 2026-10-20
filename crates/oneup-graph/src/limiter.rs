@@ -34,6 +34,8 @@ struct State {
     last_decrease: Option<Instant>,
     throttles: u64,
     paused_total: Duration,
+    /// A cap the caller set (a poor link), below `max`.
+    cap: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,7 @@ impl Aimd {
                 last_decrease: None,
                 throttles: 0,
                 paused_total: Duration::ZERO,
+                cap: None,
             }),
             notify: Notify::new(),
             min: 1.0,
@@ -135,12 +138,30 @@ impl Aimd {
     }
 
     fn effective_ceiling(&self, s: &State, now: Instant) -> f64 {
+        let most = s.cap.unwrap_or(self.max).min(self.max);
         match s.ceiling {
-            None => self.max,
+            None => most,
             Some((c, since)) => {
                 let relaxed = now.saturating_duration_since(since).as_secs_f64() / self.ceiling_relax.as_secs_f64();
-                (c + relaxed.floor()).min(self.max)
+                (c + relaxed.floor()).min(most)
             }
+        }
+    }
+
+    /// The cap the caller set ([`Aimd::set_cap`]), if any.
+    pub fn cap(&self) -> Option<usize> {
+        self.lock().cap.map(|c| c as usize)
+    }
+
+    /// At most `n` requests at once from now on (a poor link: fewer
+    /// requests competing for it, each more likely to get through);
+    /// `None`: the limiter's own maximum again. Requests already under way
+    /// finish.
+    pub fn set_cap(&self, n: Option<usize>) {
+        let mut s = self.lock();
+        s.cap = n.map(|n| n.max(1) as f64);
+        if let Some(c) = s.cap {
+            s.limit = s.limit.min(c).max(self.min);
         }
     }
 
@@ -247,6 +268,22 @@ mod tests {
         drop(a);
         let _c = tokio::time::timeout(Duration::from_millis(500), l.acquire()).await.expect("released slot is reused");
         assert_eq!(l.in_flight(), 2);
+    }
+
+    #[test]
+    fn a_cap_bounds_the_limit_until_lifted() {
+        let l = Aimd::new(6, 16);
+        l.set_cap(Some(2));
+        assert_eq!(l.limit(), 2);
+        for _ in 0..100 {
+            l.on_success();
+        }
+        assert_eq!(l.limit(), 2, "it doesn't grow past the cap");
+        l.set_cap(None);
+        for _ in 0..100 {
+            l.on_success();
+        }
+        assert!(l.limit() > 2);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! asks to sync folders others shared, and `Files.Read` for read-only use.
 
 pub mod auth;
+pub mod budget;
 pub mod client;
 pub mod fragment;
 pub mod limiter;
@@ -51,6 +52,10 @@ pub enum Error {
     /// Writing downloaded content locally failed.
     #[error("writing the download: {0}")]
     Local(std::io::Error),
+    /// This month's data budget on the network is used up: the transfer
+    /// stopped, or wasn't started ([`budget`]).
+    #[error("this month's data budget on this network is used up")]
+    OverBudget,
     /// The push channel failed (never contains its URL, a credential).
     #[error("{0}")]
     Push(String),
@@ -68,12 +73,24 @@ pub const MAX_ERROR_BODY: usize = 2048;
 /// Reads the body of a refused response, but only as much of it as
 /// [`Error::refused`] keeps (plus a little, so it knows the body was cut):
 /// a huge page is never downloaded only to be thrown away.
-pub(crate) async fn error_body(mut resp: reqwest::Response) -> reqwest::Result<Vec<u8>> {
+pub(crate) async fn error_body(resp: reqwest::Response) -> reqwest::Result<Vec<u8>> {
+    error_body_counted(resp, None).await
+}
+
+/// [`error_body`], counting each chunk in `counted` as it arrives (also of
+/// a read that fails later).
+pub(crate) async fn error_body_counted(
+    mut resp: reqwest::Response,
+    counted: Option<&std::sync::atomic::AtomicU64>,
+) -> reqwest::Result<Vec<u8>> {
     let limit = MAX_ERROR_BODY + 4;
     let mut body = Vec::new();
     while body.len() < limit
         && let Some(chunk) = resp.chunk().await?
     {
+        if let Some(c) = counted {
+            c.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         body.extend_from_slice(&chunk);
     }
     body.truncate(limit);
@@ -140,6 +157,7 @@ impl Error {
             }
             Error::Http(_) | Error::Stalled(..) => "network error".into(),
             Error::Exhausted(n) => format!("gave up after {n} attempts"),
+            Error::OverBudget => "data budget used up".into(),
             Error::Auth(_) => "sign-in failed".into(),
             Error::NotSignedIn => "not signed in".into(),
             Error::Invalid(what) => (*what).into(),

@@ -33,6 +33,7 @@ pub mod install;
 pub mod item;
 pub mod l10n;
 pub mod launch;
+pub mod link;
 pub mod moveover;
 pub mod netusage;
 pub mod network;

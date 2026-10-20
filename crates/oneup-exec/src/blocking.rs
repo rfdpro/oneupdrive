@@ -166,6 +166,11 @@ impl<R: Read> Read for OffTask<R> {
 }
 
 impl<R: Read + Send + 'static> Source for OffTask<R> {
+    /// A local file read as it is.
+    fn resumable(&self) -> bool {
+        true
+    }
+
     fn fill(&mut self, mut buf: Vec<u8>, want: usize) -> BoxFuture<'_, (Vec<u8>, std::io::Result<usize>)> {
         Box::pin(async move {
             let mut hash = std::mem::take(&mut self.hash);

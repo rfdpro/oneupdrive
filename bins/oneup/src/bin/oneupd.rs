@@ -417,18 +417,21 @@ async fn run(args: Args) -> Result<()> {
                 tracing::error!("{e:#}");
                 let before = control.problem();
                 pause = error_pause(pause, before.is_none(), started.elapsed());
-                let retry_ms = now_ms() + i64::try_from(pause.as_millis()).unwrap_or(i64::MAX);
+                // Longer on a poor link (`oneup_app::link`).
+                let slower = if control.poor_link() { oneup_app::link::POOR_BACKOFF } else { 1 };
+                let wait = pause * slower;
+                let retry_ms = now_ms() + i64::try_from(wait.as_millis()).unwrap_or(i64::MAX);
                 let p = problem::describe(&e, before.as_ref(), now_ms(), Some(retry_ms));
                 // Once per spell, not at every retry.
                 if before.is_none_or(|b| b.kind != p.kind) {
                     note_problem(dir, &p, false);
                 }
-                println!("oneupd: {}: {e:#}\n        trying again in {} s", p.title, pause.as_secs());
+                println!("oneupd: {}: {e:#}\n        trying again in {} s", p.title, wait.as_secs());
                 control.set_problem(Some(p));
                 // Retry now (the settings window, `oneup sync-now`) cuts the
                 // pause short; the next one still grows.
                 tokio::select! {
-                    () = stop.sleep(pause) => {}
+                    () = stop.sleep(wait) => {}
                     () = control.wake.notified() => println!("oneupd: trying again now, as asked"),
                 }
                 if stop.requested() {
@@ -606,6 +609,8 @@ async fn agent(
     // What the last pass held for another network (`oneup_app::network`).
     let mut waiting = oneup_app::network::load_waiting(&store)?;
     let mut net_use = NetUse::new(dir, graph)?;
+    // How good the link is, judged after each pass (`oneup_app::link`).
+    let mut link = oneup_app::link::Link::default();
     control.set_on_demand(engine.local().on_demand());
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
@@ -674,6 +679,7 @@ async fn agent(
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
             pacer.started(started);
+            let counted = LinkCounters::of(graph);
             let mut executed = Recent::default();
             let recent = window.recent(now_ms());
             // Each round records the window, with what it may do, before it
@@ -706,6 +712,7 @@ async fn agent(
             let (s, out) = rounds?;
             store = s;
             waiting.clone_from(&out.waiting);
+            adapt(&mut store, graph, &mut link, &counted.since(graph, started.elapsed()), control);
             if executed != Recent::default() {
                 window.save(&mut store).context("can't record the safety window")?;
             }
@@ -785,7 +792,9 @@ async fn agent(
                     if more || engine.pins_pending() { CONVERT_GAP } else { check }
                 }
                 End::Retry => {
-                    let wait = retry.min(check);
+                    // Longer on a poor link.
+                    let slower = if link.is_poor() { oneup_app::link::POOR_BACKOFF } else { 1 };
+                    let wait = (retry * slower).min(check);
                     retry = (retry * 2).min(RETRY_MAX);
                     control.set_activity(Activity::Retrying);
                     println!("oneupd: retrying the skipped items in {} s", wait.as_secs());
@@ -864,6 +873,8 @@ fn net_status(
         next_ms,
         waiting: waiting.map(|w| oneup_ipc::NetWaiting { count: w.count, bytes: w.bytes, why: w.why.clone() }),
         data,
+        // Kept by `Control::set_network`, which `set_poor_link` sets.
+        link: String::new(),
     }
 }
 
@@ -1318,6 +1329,84 @@ impl NetUse {
         policy.budget_left = usage.left(budget);
         control.set_policy(policy);
         Ok(Looked { net, profile, usage, why })
+    }
+}
+
+/// The Graph client's counters a pass's link sample is the difference of.
+#[derive(Clone, Copy)]
+struct LinkCounters {
+    requests: u64,
+    retries: u64,
+    timed: u64,
+    timed_ms: u64,
+    bytes: u64,
+}
+
+impl LinkCounters {
+    fn of(graph: &Graph) -> Self {
+        let s = &graph.stats;
+        Self {
+            requests: s.requests.load(Relaxed),
+            retries: s.retries.load(Relaxed),
+            timed: s.timed.load(Relaxed),
+            timed_ms: s.timed_ms.load(Relaxed),
+            bytes: graph.upload.moved() + graph.download.moved(),
+        }
+    }
+
+    /// What the requests since saw, over `took`.
+    fn since(&self, graph: &Graph, took: Duration) -> oneup_app::link::Sample {
+        let now = Self::of(graph);
+        oneup_app::link::Sample {
+            requests: now.requests.saturating_sub(self.requests),
+            retries: now.retries.saturating_sub(self.retries),
+            timed: now.timed.saturating_sub(self.timed),
+            timed_ms: now.timed_ms.saturating_sub(self.timed_ms),
+            bytes: now.bytes.saturating_sub(self.bytes),
+            secs: took.as_secs_f64(),
+            capped: graph.upload.get() > 0 || graph.download.get() > 0,
+        }
+    }
+}
+
+/// Judges the link from the pass just run and, when it turns poor or good
+/// again, sets how many requests go at once and how large upload fragments
+/// are (requests and uploads under way finish as they are), saying so.
+fn adapt(
+    store: &mut Store,
+    graph: &Graph,
+    link: &mut oneup_app::link::Link,
+    s: &oneup_app::link::Sample,
+    control: &Control,
+) {
+    use oneup_app::link::{POOR_FRAGMENT, POOR_REQUESTS};
+    let was = link.is_poor();
+    let poor = link.observe(s);
+    control.set_poor_link(poor);
+    if poor == was {
+        return;
+    }
+    graph.limiter().set_cap(poor.then_some(POOR_REQUESTS));
+    graph.set_fragment_cap(poor.then_some(POOR_FRAGMENT));
+    let detail = if poor {
+        format!(
+            "the connection is poor ({} of {} requests retried); fewer requests at once, smaller upload pieces, longer waits",
+            s.retries, s.requests
+        )
+    } else {
+        "the connection is good again; transfers back to normal".to_string()
+    };
+    println!("oneupd: {detail}");
+    let e = oneup_store::ActivityEntry {
+        seq: 0,
+        at_ms: now_ms(),
+        outcome: oneup_store::ActivityOutcome::Note,
+        action: "network".into(),
+        path: String::new(),
+        detail,
+    };
+    if let Err(e) = store.write(|o| o.activity_add(&[e])) {
+        tracing::warn!(error = %e, "couldn't note the link in the activity log");
     }
 }
 

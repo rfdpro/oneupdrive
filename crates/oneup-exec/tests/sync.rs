@@ -2664,10 +2664,16 @@ struct OnDemand {
 
 impl OnDemand {
     fn new(path: &Path, db: &Path, cloud: &Fake) -> Self {
+        Self::with_ours(path, db, cloud, None)
+    }
+
+    /// Serving OneUpDrive's own requests (pinned files) through `ours`.
+    fn with_ours(path: &Path, db: &Path, cloud: &Fake, ours: Option<Fake>) -> Self {
         provider::register(path, b"test-token").unwrap();
         let staging = PathBuf::from(format!("{}.staging", path.display()));
-        let h = Hydrator::new(
+        let h = Hydrator::with_ours(
             cloud.clone(),
+            ours,
             Store::open(db, 1024).unwrap(),
             staging,
             path,
@@ -2692,13 +2698,17 @@ impl Drop for OnDemand {
 /// A sync folder in on-demand mode, with its database on disk (the
 /// hydration service reads it through its own connection).
 fn on_demand_sync(tag: &str, cloud: &Fake) -> (OnDemand, Sync) {
+    on_demand_sync_with(tag, cloud, None)
+}
+
+fn on_demand_sync_with(tag: &str, cloud: &Fake, ours: Option<Fake>) -> (OnDemand, Sync) {
     let dir = Tmp(std::env::temp_dir().join(format!("oneup-exec-{tag}-{}", std::process::id())));
     let _ = std::fs::remove_dir_all(&dir.0);
     std::fs::create_dir_all(&dir.0).unwrap();
     let db = PathBuf::from(format!("{}.db", dir.0.display()));
     drop(DbFile(db.clone()));
     drop(Store::open(&db, 1024).unwrap());
-    let od = OnDemand::new(&dir.0, &db, cloud);
+    let od = OnDemand::with_ours(&dir.0, &db, cloud, ours);
     let s = Sync::open(dir, Some(DbFile(db)), cloud.clone());
     (od, s)
 }
@@ -3048,6 +3058,33 @@ async fn on_demand_a_full_batch_of_pinned_files_says_more_may_wait() {
     s.quiesce().await;
     let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_, _| Ok(())).await.unwrap();
     assert_eq!((fetched.done.len(), fetched.stopped, fetched.more), (n, None, true));
+    drop(s);
+    drop(od);
+}
+
+/// Pinned files download through OneUpDrive's own cloud (the agent's is
+/// on the data budget), decided before downloading; a program opening a
+/// file goes through the other. Here OneUpDrive's own cloud has nothing,
+/// so the pinned download fails while opening still works. A network that
+/// says no before a pinned file leaves it for the next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_pins_download_on_the_budget_and_opening_files_does_not() {
+    let cloud = Fake::new();
+    cloud.add("keep.txt", Some(b"always kept"));
+    cloud.add("open.txt", Some(b"opened by a program"));
+    let budgeted = Fake::new();
+    let (od, mut s) = on_demand_sync_with("ondemand-budget", &cloud, Some(budgeted));
+    s.quiesce().await;
+    let pk = s.p("keep.txt");
+    provider::set_pin(&provider::open(&pk).unwrap(), provider::Pin::Pinned).unwrap();
+    s.quiesce().await;
+    use oneup_exec::placement::Stop;
+    let none = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_, _| Err(Stop::Paused)).await.unwrap();
+    assert!(none.done.is_empty() && none.attempted.is_empty(), "the network said no");
+    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_, _| Ok(())).await.unwrap();
+    assert!(fetched.done.is_empty(), "served by OneUpDrive's own (budgeted) cloud, which hasn't got it");
+    assert_eq!(placeholder(&pk).on_disk, 0);
+    assert_eq!(app_read(&s.p("open.txt")).as_deref(), Some(&b"opened by a program"[..]), "opening isn't");
     drop(s);
     drop(od);
 }

@@ -299,6 +299,9 @@ fn print_status(s: &Status) {
         };
         println!("  network           {name}{metered}: {} ({profile}; `oneup network`)", n.transfer);
     }
+    if s.network.as_ref().is_some_and(|n| n.link == "poor") {
+        println!("  connection        poor: fewer requests at once, smaller upload pieces, longer waits");
+    }
     if let Some(d) = s.network.as_ref().and_then(|n| n.data.as_ref()) {
         let budget = if d.budget > 0 { format!(" of {}", size(d.budget)) } else { String::new() };
         let reached = if d.reached { "; used up (`oneup network allow-more`)" } else { "" };

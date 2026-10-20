@@ -41,7 +41,11 @@ pub enum Refusal {
 }
 
 pub struct Hydrator<C> {
+    /// Serves programs opening a file: the user's own action.
     cloud: C,
+    /// Serves OneUpDrive's own requests (files set to always stay on this
+    /// device), on the data budget; `None`: as `cloud`.
+    ours: Option<C>,
     /// A connection of its own to the state database (the agent's is busy
     /// with rounds); read for the Remote tree, written for the activity log.
     store: Mutex<Store>,
@@ -69,6 +73,23 @@ impl<C: Cloud + 'static> Hydrator<C> {
         rt: tokio::runtime::Handle,
         on_stale: Box<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Arc<Self>> {
+        Self::with_ours(cloud, None, store, staging, sync_root, rt, on_stale)
+    }
+
+    /// [`Hydrator::new`], serving OneUpDrive's own requests through `ours`
+    /// (the agent's: on the data budget), and only programs opening files
+    /// through `cloud`. Which one is decided from who asked, before
+    /// anything is downloaded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_ours(
+        cloud: C,
+        ours: Option<C>,
+        store: Store,
+        staging: PathBuf,
+        sync_root: &std::path::Path,
+        rt: tokio::runtime::Handle,
+        on_stale: Box<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Arc<Self>> {
         std::fs::create_dir_all(&staging)?;
         // Leftovers of an interrupted run are ours (only our extension).
         for e in std::fs::read_dir(&staging)?.flatten() {
@@ -78,6 +99,7 @@ impl<C: Cloud + 'static> Hydrator<C> {
         }
         Ok(Arc::new(Self {
             cloud,
+            ours,
             store: Mutex::new(store),
             staging,
             root: volume_relative(sync_root),
@@ -151,9 +173,10 @@ impl<C: Cloud + 'static> Hydrator<C> {
             .open(path)
             .map_err(|_| Refusal::Download)?;
         let pre = RemotePre { id: RemoteId(id.item.clone()), etag: id.etag.clone() };
+        let cloud = self.cloud_for(asked_by_us(fetch.process.as_ref(), std::process::id()));
         let (len, hash) = {
             let mut w = Hashing::new(&mut file);
-            let received = self.cloud.download(&pre, &mut w).await.map_err(|_| Refusal::Download)?;
+            let received = cloud.download(&pre, &mut w).await.map_err(|_| Refusal::Download)?;
             // The identity's hash is the cloud's (see `cloud`).
             (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
         };
@@ -211,6 +234,24 @@ impl<C: Cloud + 'static> Hydrator<C> {
             tracing::debug!(error = %e, "a hydration wasn't logged");
         }
     }
+}
+
+impl<C> Hydrator<C> {
+    /// The cloud a request is served through: OneUpDrive's own (a file set
+    /// to always stay here) on the data budget, a program's opening not.
+    fn cloud_for(&self, ours: bool) -> &C {
+        match (&self.ours, ours) {
+            (Some(c), true) => c,
+            _ => &self.cloud,
+        }
+    }
+}
+
+/// Whether a request comes from this process (`me`): OneUpDrive itself
+/// downloading a file set to always stay on this device, not a program
+/// opening it. Unknown requesters count as programs.
+fn asked_by_us(process: Option<&provider::Process>, me: u32) -> bool {
+    process.is_some_and(|p| p.pid == me)
 }
 
 /// The wrapper Cloud Files calls (an `Arc` so tasks can keep it).
@@ -272,6 +313,33 @@ fn now_ms() -> i64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Who asked decides the cloud, before anything is downloaded: this
+    /// process (a file set to stay here) the budgeted one, a program
+    /// opening the file the other.
+    #[test]
+    fn our_own_requests_go_on_the_budget_and_programs_opening_files_dont() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let h = Hydrator {
+            cloud: "opened",
+            ours: Some("budgeted"),
+            store: Mutex::new(Store::open_in_memory().unwrap()),
+            staging: PathBuf::new(),
+            root: String::new(),
+            rt: rt.handle().clone(),
+            on_stale: Box::new(|| {}),
+            running: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(0),
+            refused: Mutex::new(Vec::new()),
+        };
+        let me = std::process::id();
+        let proc = |pid| provider::Process { pid, image: "x.exe".into() };
+        assert_eq!(*h.cloud_for(asked_by_us(Some(&proc(me)), me)), "budgeted");
+        assert_eq!(*h.cloud_for(asked_by_us(Some(&proc(me + 1)), me)), "opened");
+        assert_eq!(*h.cloud_for(asked_by_us(None, me)), "opened");
+        let one = Hydrator { ours: None, ..h };
+        assert_eq!(*one.cloud_for(true), "opened");
+    }
 
     /// A cancel aborts the hydration task mid-download: its staging file,
     /// still open and part-written, goes with it.

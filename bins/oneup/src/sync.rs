@@ -1037,7 +1037,9 @@ impl Engine {
     /// The cloud for serving Files On-Demand downloads: the same view of
     /// OneDrive as the executor's (decrypting, for a vault pair).
     pub fn hydration_cloud(&self) -> crate::vaultpair::PairCloud {
-        let plain = GraphCloud::new(Arc::clone(&self.graph));
+        // Opening a file is the user's own action: never stopped by the
+        // data budget.
+        let plain = GraphCloud::new(Arc::clone(&self.graph)).unbudgeted();
         match &self.vault {
             Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
             None => crate::vaultpair::PairCloud::Plain(plain),
