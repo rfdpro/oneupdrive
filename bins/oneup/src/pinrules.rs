@@ -820,6 +820,103 @@ pub fn mark_started(store: &mut Store, id: u128) -> Result<()> {
     Ok(())
 }
 
+/// What a pass of downloads ([`fetch_pass`]) did.
+#[derive(Debug, Default)]
+pub struct Fetch {
+    /// Downloaded: path, file ID, size.
+    pub done: Vec<(String, u128, u64)>,
+    /// Tried and failed (charged all the same).
+    pub attempted: Vec<u128>,
+    /// What stopped the pass before the end of its batch.
+    pub stopped: Option<Stop>,
+    /// More to fetch after this pass.
+    pub more: bool,
+    /// The first of the rules' files past the budget (ID, size): the
+    /// download that needs a go-ahead.
+    pub blocked: Option<(u128, u64)>,
+}
+
+/// One pass of downloads of the files kept on this device whose content
+/// isn't here: up to a batch, read a page at a time by file ID. A file
+/// this pass won't download is passed over, not waited on: one of the
+/// rules' past the budget, or one whose identity can't be read now
+/// (neither charged nor fetched). `may` says whether a file of a size may
+/// download now (a pause, the disk, the pass's share), and stops the pass
+/// if not; `fetch` downloads one (whether it's here now). Budget is
+/// reserved durably before any download and each of the rules' own is
+/// marked started before its own; the caller settles after.
+pub fn fetch_pass(
+    store: &mut Store,
+    pinner: &mut dyn Pinner,
+    may: &mut dyn FnMut(u64) -> Result<(), Stop>,
+    fetch: &mut dyn FnMut(&str) -> bool,
+) -> Result<Fetch> {
+    let batch = oneup_exec::placement::BATCH;
+    let mut budget = budget(store)?;
+    let mut out = Fetch::default();
+    let mut candidates: Vec<(u128, u64, bool)> = Vec::with_capacity(batch);
+    let mut after = None;
+    'pages: loop {
+        let page = store.read(|o| o.local_to_fetch_after(after, batch))?;
+        for r in &page {
+            after = Some(r.file_id);
+            let size = u64::try_from(r.size).unwrap_or(0);
+            let owned = if store.read(|o| o.pin_owned_has(r.file_id))? {
+                // Past the budget: the rest of the rules' files wait for
+                // the go-ahead, unread.
+                if out.blocked.is_some() {
+                    continue;
+                }
+                let Some(rel) = store.read(|o| o.local_path_of(r.file_id))? else { continue };
+                match owned_verified(store, pinner, r.file_id, &crate::filetree::clean(&rel))? {
+                    Some(o) => o,
+                    None => continue,
+                }
+            } else {
+                false
+            };
+            if owned {
+                if !within_budget(budget, size) {
+                    out.blocked = Some((r.file_id, size));
+                    continue;
+                }
+                budget = budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
+            }
+            candidates.push((r.file_id, size, owned));
+            if candidates.len() >= batch {
+                out.more = true;
+                break 'pages;
+            }
+        }
+        if page.len() < batch {
+            break;
+        }
+    }
+    let (reserved, blocked) = reserve_budget(store, &candidates)?;
+    out.blocked = out.blocked.or(blocked);
+    for &(id, size, owned) in &candidates {
+        // Not reserved after all (the budget changed meanwhile): it waits.
+        if owned && !reserved.contains(&id) {
+            continue;
+        }
+        if let Err(why) = may(size) {
+            out.stopped = Some(why);
+            out.more = true;
+            break;
+        }
+        let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
+        if owned {
+            mark_started(store, id)?;
+        }
+        if fetch(&rel) {
+            out.done.push((rel, id, size));
+        } else {
+            out.attempted.push(id);
+        }
+    }
+    Ok(out)
+}
+
 /// What `oneup free PATH` did ([`free_plan`]).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct FreePlan {
@@ -1812,6 +1909,71 @@ mod tests {
         // Past the budget by more than ASK_BYTES: the first that doesn't fit.
         let (got, blocked) = reserve_budget(&mut s, &[(4, ASK_BYTES, true), (5, 100, true)]).unwrap();
         assert_eq!((got.len(), blocked), (1, Some((5, 100))));
+    }
+
+    /// Rule files 10.., more than a batch, ahead (by file ID) of a file the
+    /// user pinned (ID 1000), all online-only, each `size`; the rules'
+    /// pinned through a pass and seen pinned by the observer.
+    fn many_kept(n: u128, size: i64) -> (Store, Fake, Vec<String>) {
+        let mut rows: Vec<LocalRow> = (10..10 + n)
+            .map(|i| LocalRow { size, ..row(i, 1, &format!("a{i}.psd"), LocalKind::File, RECALL) })
+            .collect();
+        rows.push(row(1000, 1, "u.txt", LocalKind::File, RECALL));
+        let mut s = store(&rows);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
+        let names: Vec<String> = (10..10 + n).map(|i| format!("a{i}.psd")).collect();
+        let ids: Vec<(u128, &str)> = (10..10 + n).zip(names.iter().map(String::as_str)).collect();
+        observe(&mut s, &fake, &ids);
+        journal(&mut s, &[(1000, RECALL | PINNED)]);
+        (s, fake, names)
+    }
+
+    /// Rule files whose identity can't be read now fill more than a
+    /// batch: they're passed over, and the user's file after them is
+    /// still downloaded.
+    #[test]
+    fn unreadable_rule_files_dont_hold_up_the_rest() {
+        let n = oneup_exec::placement::BATCH as u128 + 8;
+        let (mut s, mut fake, names) = many_kept(n, 10);
+        fake.failing = names;
+        let mut got = Vec::new();
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(got, ["/u.txt"]);
+        assert_eq!((f.stopped, f.more, f.blocked), (None, false, None));
+        assert!(s.read(|o| o.meta_get(KEY_STARTED)).unwrap().is_none(), "none of the rules' charged");
+    }
+
+    /// Rule files past the budget fill more than a batch: they wait for
+    /// the go-ahead, and the user's file after them is downloaded. A
+    /// pause still stops the pass.
+    #[test]
+    fn rule_files_past_the_budget_dont_hold_up_the_rest() {
+        let n = oneup_exec::placement::BATCH as u128 + 8;
+        let (mut s, mut fake, _) = many_kept(n, 2 << 30);
+        fake.seen.clear();
+        let mut got = Vec::new();
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(got, ["/u.txt"]);
+        assert_eq!(f.blocked, Some((10, 2 << 30)), "the first asks");
+        assert_eq!((f.stopped, f.more), (None, false));
+        assert_eq!(fake.seen.len(), 1, "the rest past the budget aren't read");
+        got.clear();
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Err(Stop::Paused), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        assert!(got.is_empty());
+        assert_eq!(f.stopped, Some(Stop::Paused));
     }
 
     /// A rescan of the folder (the change journal lost) deletes every Local
