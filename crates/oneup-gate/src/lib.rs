@@ -62,12 +62,15 @@
 //!
 //! One decision stands apart from the rounds: [`release::review_release`],
 //! for finishing another program's stalled unlinking (it releases a whole
-//! folder, not one item), with its own token.
+//! folder, not one item), with its own token. So does
+//! [`sharing::review_permission`], for removing a sharing link or setting
+//! its expiry (it changes who can open an item, never its content).
 
 use oneup_sync::{LocalId, Op, Sid};
 
 pub mod content;
 pub mod release;
+pub mod sharing;
 
 /// The side an operation changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

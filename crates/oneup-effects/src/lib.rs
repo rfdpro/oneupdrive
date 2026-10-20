@@ -28,9 +28,12 @@
 //!   to the last synced version, which OneDrive has. It is deleted through
 //!   that same handle. Anything else is kept (`data-safety.md` invariant 1).
 //!
-//! One effect isn't an operation of a round: [`release::release_root`]
+//! Two effects aren't operations of a round: [`release::release_root`]
 //! finishes another program's stalled unlinking, for the gate's
-//! [`oneup_gate::release::Release`] token.
+//! [`oneup_gate::release::Release`] token, and [`sharing::apply`] removes a
+//! sharing link or sets its expiry in OneDrive, for the gate's
+//! [`oneup_gate::sharing::PermissionChange`] token (who can open an item,
+//! never its content).
 //!
 //! A failed check is [`Error::Changed`], which the executor treats as "skip;
 //! plan again from fresh state next round".
@@ -41,6 +44,7 @@
 //! the executor's crash tests also stop them half done.
 
 pub mod name;
+pub mod sharing;
 pub mod versions;
 
 #[cfg(windows)]
