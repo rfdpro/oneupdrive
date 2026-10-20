@@ -196,15 +196,19 @@ impl Ops<'_> {
     /// Notes that a pin rule pins item `id`, created at `created` (read on
     /// the handle that pins it), when the activity log's last entry was
     /// `at_seq`; written before the pin is set. It must be in the Local tree
-    /// (the note goes with its row). An existing note is replaced.
-    pub fn pin_owned_add(&self, id: u128, created: i64, at_seq: i64) -> Result<()> {
-        self.c
+    /// (the note goes with its row). An existing note is replaced. Nothing
+    /// is written for an item the user claimed (`pin_user`): returns
+    /// whether the note was written.
+    pub fn pin_owned_add(&self, id: u128, created: i64, at_seq: i64) -> Result<bool> {
+        let n = self
+            .c
             .prepare_cached(
                 "INSERT OR REPLACE INTO pin_owned(file_id, created, at_seq)
-                 SELECT file_id, ?2, ?3 FROM local_item WHERE file_id = ?1",
+                 SELECT file_id, ?2, ?3 FROM local_item WHERE file_id = ?1
+                  AND NOT EXISTS (SELECT 1 FROM pin_user WHERE file_id = ?1)",
             )?
             .execute(rusqlite::params![blob(id), created, at_seq])?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// The creation time recorded when a rule pinned item `id`, if one did.
@@ -618,7 +622,7 @@ mod tests {
             assert!(o.pin_user_has(2)?, "pinned: the trigger notes it");
             // A "Free up space" above took 2's pin; not restored yet.
             o.local_update(&folder(2, 0x0010_0000))?;
-            o.pin_owned_add(3, 30, 1)
+            o.pin_owned_add(3, 30, 1).map(|_| ())
         })
         .unwrap();
         s.write(|o| {
@@ -677,6 +681,8 @@ mod tests {
             assert!(o.pin_retry_put(7, PinOp::Unpin, 1, 0)?);
             o.pin_claim_for_user(7)?;
             assert!(!o.pin_owned_has(7)? && o.pin_retry_count()? == 0 && o.pin_user_has(7)?);
+            assert!(!o.pin_owned_add(7, 70, 2)?, "the user's: no note");
+            assert!(!o.pin_owned_has(7)?);
             Ok(())
         })
         .unwrap();
