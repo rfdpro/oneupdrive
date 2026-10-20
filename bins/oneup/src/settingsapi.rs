@@ -421,6 +421,7 @@ fn layer_json(l: &crate::network::Layer) -> Value {
         "upload_kib": l.upload_kib,
         "download_kib": l.download_kib,
         "interval_minutes": l.interval_minutes,
+        "keep_push": l.keep_push.map(|b| if b { "on" } else { "off" }),
         "budget_mb": l.budget_mb,
     })
 }
@@ -478,6 +479,17 @@ pub fn layer_with(mut l: crate::network::Layer, v: &Value) -> Result<crate::netw
     if let Some(n) = num("budget_mb")? {
         l.budget_mb = n;
     }
+    // "on", "off", a boolean, or empty/null for the layer below.
+    if let Some(k) = v.get("keep_push") {
+        l.keep_push = match k {
+            Value::Null => None,
+            Value::Bool(b) => Some(*b),
+            Value::String(s) if s.is_empty() => None,
+            Value::String(s) if s == "on" => Some(true),
+            Value::String(s) if s == "off" => Some(false),
+            _ => bail!("keep_push: on, off or empty"),
+        };
+    }
     crate::network::check(&l)?;
     Ok(l)
 }
@@ -489,14 +501,15 @@ fn save_network(dir: &Path, v: &Value) -> Result<()> {
     match v.get("target").and_then(Value::as_str) {
         Some("metered") => {
             nets.metered = layer_with(nets.metered.clone(), v)?;
+            // With `pause_on_metered`, in one write (`network::save_with_agent`).
+            let mut a = config::load_agent(dir)?;
             if let Some(t) = v.get("transfer").and_then(Value::as_str) {
-                let mut a = config::load_agent(dir)?;
                 a.pause_on_metered = t == "paused";
-                config::save_agent(dir, &a)?;
                 if a.pause_on_metered {
                     nets.metered.transfer = None;
                 }
             }
+            return crate::network::save_with_agent(dir, &nets, &a);
         }
         Some("this") => {
             let (id, name) = crate::network::this_network()?;
@@ -1220,6 +1233,13 @@ mod tests {
         assert!(layer_with(Layer::default(), &json!({ "transfer": "most" })).is_err());
         assert!(layer_with(Layer::default(), &json!({ "small_mb": 0 })).is_err());
         assert!(layer_with(Layer::default(), &json!({ "interval_minutes": 99999 })).is_err());
+        // The window's metered caps and keep-push, as config and CLI have them.
+        let l =
+            layer_with(Layer::default(), &json!({ "upload_kib": 64, "download_kib": 128, "keep_push": "on" })).unwrap();
+        assert_eq!((l.upload_kib, l.download_kib, l.keep_push), (Some(64), Some(128), Some(true)));
+        assert_eq!(layer_json(&l)["keep_push"], "on");
+        assert_eq!(layer_with(l, &json!({ "keep_push": "" })).unwrap().keep_push, None);
+        assert!(layer_with(Layer::default(), &json!({ "keep_push": "maybe" })).is_err());
     }
 
     #[test]
