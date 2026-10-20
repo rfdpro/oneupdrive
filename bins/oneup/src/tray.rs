@@ -314,6 +314,13 @@ pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop, loc: &Locale) -> Notice {
             kind: Kind::Warning,
         };
     }
+    if st.kind == "removal" {
+        return Notice {
+            title: t_in!(loc, "Approve removing duplicates"),
+            text: t_in!(loc, "The duplicates you chose are removed once you approve."),
+            kind: Kind::Info,
+        };
+    }
     let n = st.items();
     Notice {
         title: t_in!(loc, "Review needed"),
@@ -352,6 +359,8 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
             for (i, st) in s.safety_stops.iter().enumerate() {
                 let label = if st.kind == "content" {
                     t!("Possibly encrypted: {n} files…", n = st.count)
+                } else if st.kind == "removal" {
+                    t!("Review removing duplicates…")
                 } else if st.side == "local" {
                     t!("Review {n} changes on this PC…", n = st.items())
                 } else {

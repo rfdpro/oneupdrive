@@ -439,7 +439,16 @@ mod win {
             let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
             let earlier =
                 if st.recent > 0 { format!(", on top of {} in the last 15 minutes", st.recent) } else { String::new() };
-            let text = if st.kind == "content" {
+            // A removal is approved only with its paths in view.
+            let removal = (st.kind == "removal").then(|| oneup_app::duplicates::approval_text(&self.dir, &st.code, 10));
+            if removal == Some(None) {
+                let why = "The list of what goes isn't ready yet. Try again in a moment.";
+                self.icon.ask("OneUpDrive", why, Kind::Info, Buttons::Ok);
+                return;
+            }
+            let text = if let Some(Some(text)) = removal {
+                text
+            } else if st.kind == "content" {
                 format!(
                     "{} changed files{earlier} look encrypted, possibly by ransomware.\n\n\
                      They weren't uploaded. Open a few. If they don't open, choose Not now, disconnect this PC \
@@ -457,8 +466,11 @@ mod win {
             const GO: i32 = 100;
             const SHOW: i32 = 101;
             const LATER: i32 = 102;
-            let go =
-                if st.kind == "content" { "Upload them\nThey open fine." } else { "Go ahead\nMake these changes now." };
+            let go = match st.kind.as_str() {
+                "content" => "Upload them\nThey open fine.",
+                "removal" => "Remove\nRemove the copies listed.",
+                _ => "Go ahead\nMake these changes now.",
+            };
             let choices = [
                 (GO, go),
                 (SHOW, "Show the files\nEach item and what would happen to it."),

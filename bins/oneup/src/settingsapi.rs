@@ -894,6 +894,63 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
     }
 }
 
+/// The Duplicates view (`crate::duplicates`): a page of groups after
+/// `after` (a cursor a page gave), the removal waiting for approval if
+/// any, and how many files only here are hashed.
+pub fn duplicates(dir: &Path, after: Option<&str>, limit: usize) -> Result<Value> {
+    let store = crate::setup::open_store(dir, 1024)?;
+    let after = after.filter(|a| !a.is_empty()).map(crate::duplicates::parse_cursor).transpose()?;
+    let page = crate::duplicates::list(dir, &store, after, limit)?;
+    let mut v = crate::duplicates::page_json(&page);
+    v["waiting"] = match store.read(crate::duplicates::queued)? {
+        Some(w) => json!({ "copies": w.copies.len(), "code": w.code }),
+        None => Value::Null,
+    };
+    v["hashed"] = Value::from(store.read(|o| o.local_only_hash_count())?);
+    Ok(v)
+}
+
+/// The copies the window chose: `[{path, key}]` as [`duplicates`] listed them.
+/// The paths the window sent only name a copy in a refusal: what's
+/// previewed and removed is worked out from the store.
+fn chosen_copies(copies: &[Value]) -> Result<Vec<oneup_exec::dupes::Chosen>> {
+    copies
+        .iter()
+        .map(|c| {
+            let path = c["path"].as_str().unwrap_or_default();
+            crate::duplicates::parse_key(&c["key"]).with_context(|| format!("{path}: not a listed copy"))
+        })
+        .collect()
+}
+
+fn prepared_json(p: &crate::duplicates::Prepared) -> Value {
+    let lines: Vec<Value> = p.lines.iter().map(|l| json!({ "path": l.path, "size": l.size, "to": l.to })).collect();
+    let left: Vec<Value> = p.left.iter().map(|(path, why)| json!({ "path": path, "why": why })).collect();
+    json!({ "lines": lines, "left": left, "bytes": p.bytes, "code": p.code })
+}
+
+/// What removing the chosen copies would do now, and its code.
+pub fn duplicates_preview(dir: &Path, copies: &[Value]) -> Result<Value> {
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    let chosen = chosen_copies(copies)?;
+    Ok(prepared_json(&crate::duplicates::prepare(dir, &mut store, &chosen)?))
+}
+
+/// Hands removing the chosen copies to the agent, if it still does exactly
+/// what the preview with code `expect` showed. The agent then asks for
+/// approval like any safety stop.
+pub fn duplicates_remove(dir: &Path, copies: &[Value], expect: &str) -> Result<Value> {
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    let chosen = chosen_copies(copies)?;
+    Ok(prepared_json(&crate::duplicates::ask(dir, &mut store, &chosen, expect)?))
+}
+
+/// Drops the removal waiting for approval.
+pub fn duplicates_cancel(dir: &Path) -> Result<Value> {
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    Ok(Value::from(crate::duplicates::cancel(&mut store)?))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

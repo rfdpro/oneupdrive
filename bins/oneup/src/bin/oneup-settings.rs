@@ -452,6 +452,35 @@ mod win {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::largest_json(&d, 10)).await?
             }
+            // The Duplicates view (`oneup_app::duplicates`).
+            "duplicates" => {
+                let (d, after, limit) = (dir.to_path_buf(), text(args, "after"), count(args, "limit", 30));
+                tokio::task::spawn_blocking(move || settingsapi::duplicates(&d, Some(&after), limit.min(200))).await?
+            }
+            "duplicates_preview" => {
+                let (d, copies) = (dir.to_path_buf(), args["copies"].as_array().cloned().unwrap_or_default());
+                tokio::task::spawn_blocking(move || settingsapi::duplicates_preview(&d, &copies)).await?
+            }
+            // Queued as previewed; the agent then stops for approval.
+            "duplicates_remove" => {
+                let (d, copies) = (dir.to_path_buf(), args["copies"].as_array().cloned().unwrap_or_default());
+                let expect = text(args, "expect");
+                let out =
+                    tokio::task::spawn_blocking(move || settingsapi::duplicates_remove(&d, &copies, &expect)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(out)
+            }
+            "duplicates_cancel" => {
+                let out = settingsapi::duplicates_cancel(dir)?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(out)
+            }
+            // At background priority, in its own process; bounded per run.
+            "duplicates_hash" => {
+                let a: Vec<std::ffi::OsString> =
+                    vec!["--data-dir".into(), dir.into(), "duplicates".into(), "--hash-local".into()];
+                Ok(Value::from(oneup(a).await?))
+            }
             "reveal" => {
                 let path = args.get("path").and_then(Value::as_str).context("no path")?;
                 std::process::Command::new("explorer.exe")
@@ -817,6 +846,20 @@ mod win {
                     Some("prune") => Call::Answer { code: text(args, "code"), answer: Answer::Prune },
                     // Settles the offer: the items stay in OneDrive.
                     Some("keep_in_cloud") => Call::Answer { code: text(args, "code"), answer: Answer::KeepInCloud },
+                    // Approves removing the duplicates the user chose, by its
+                    // stop's code: only such a stop (the others are
+                    // reviewed from the icon's menu, with their list).
+                    Some("approve_removal") => {
+                        let code = text(args, "code");
+                        let status = agent(dir, Call::Status).await?;
+                        let ours = status["safety_stops"]
+                            .as_array()
+                            .is_some_and(|v| v.iter().any(|s| s["kind"] == "removal" && s["code"] == code.as_str()));
+                        if !ours {
+                            bail!("that removal isn't waiting any more; look again");
+                        }
+                        Call::Answer { code, answer: Answer::Approve }
+                    }
                     _ => bail!("unknown control call"),
                 };
                 agent(dir, call).await
