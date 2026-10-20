@@ -4960,19 +4960,26 @@
             });
         }
         // Dialogs (Esc closes them) give focus back to where it was when
-        // they opened.
+        // they opened: at once when the script closes one, and on its
+        // `close` event when Esc or a form button does.
         {
-            const showModal = HTMLDialogElement.prototype.showModal;
-            HTMLDialogElement.prototype.showModal = function() {
-                this.back = document.activeElement;
-                showModal.call(this);
-            };
-            for (const d of $$("dialog")) d.addEventListener("close", () => {
+            const showModal = HTMLDialogElement.prototype.showModal,
+                close = HTMLDialogElement.prototype.close;
+            const giveBack = d => {
                 const back = d.back;
                 d.back = null;
                 if (!back || (document.activeElement !== document.body && !d.contains(document.activeElement))) return;
                 refocus(back);
-            });
+            };
+            HTMLDialogElement.prototype.showModal = function() {
+                this.back = document.activeElement;
+                showModal.call(this);
+            };
+            HTMLDialogElement.prototype.close = function(...args) {
+                close.apply(this, args);
+                giveBack(this);
+            };
+            for (const d of $$("dialog")) d.addEventListener("close", () => giveBack(d));
         }
 
         // ---- flat views: search results, left out, largest
