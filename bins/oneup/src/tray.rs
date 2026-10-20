@@ -414,7 +414,8 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
                 items.push(action(id::RESUME, t!("Resume"), glyph::PLAY));
             }
             let offline = s.network.as_ref().is_some_and(|n| n.offline);
-            items.push(action(id::OFFLINE, if offline { "Go back online" } else { "Work offline" }, glyph::CLOUD));
+            let label = if offline { t!("Go back online") } else { t!("Work offline") };
+            items.push(action(id::OFFLINE, label, glyph::CLOUD));
             if !(s.paused.local && s.paused.remote) {
                 let choices = PAUSES
                     .iter()
