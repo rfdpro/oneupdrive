@@ -279,7 +279,7 @@ pub enum Op {
         keep: Vec<LocalPre>,
     },
 
-    /// One step of rewinding a folder to an earlier moment (F2; never
+    /// One step of rewinding a folder to an earlier moment (never
     /// planned by the reconciler, see [`crate::rewind`]). It changes
     /// OneDrive (or sets this PC's copy aside) and leaves the Synced tree
     /// alone, so the next round brings this PC along. `sid`: the Synced

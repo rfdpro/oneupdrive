@@ -40,7 +40,7 @@
 //!   list, but never counted in, nor released by, a mass breaker's list, and
 //!   they don't hold the rest of the round back. What they remove here
 //!   always goes to the version store.
-//! * **Rewind** (F2): every step of rewinding a folder ([`Op::Rewind`]) is
+//! * **Rewind**: every step of rewinding a folder ([`Op::Rewind`]) is
 //!   on a stop of its own, whatever the limits, until the user approves its
 //!   list. Its follow-ups on this PC (a reverted file downloaded, a moved
 //!   one moved, a removed one recycled) aren't counted by the breakers
@@ -433,7 +433,7 @@ pub enum BreakerKind {
     /// Duplicate copies the user chose to remove (see the module docs):
     /// always a stop, whatever the limits.
     Removal,
-    /// A rewind (F2): always a stop, whatever its size.
+    /// A rewind: always a stop, whatever its size.
     Rewind,
 }
 
