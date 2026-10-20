@@ -22,10 +22,12 @@
             --accent-ink: #ffffff;
             --accent-soft: #e6ecff;
             --sel: #dfe7ff;
-            --ok: #1f8a4c;
+            --ok: #18753f;
             --busy: #2f86f6;
-            --wait: #a86a12;
-            --bad: #c93a3a;
+            --wait: #8a560b;
+            --bad: #b83232;
+            --bad-ink: #ffffff;
+            --field: #7d8699;
             --off: #8a93a6;
             --hover: rgba(20, 26, 46, .045);
             --radius: 8px;
@@ -56,6 +58,8 @@
                 --busy: #6aa8ff;
                 --wait: #f0b14a;
                 --bad: #ff8f8f;
+                --bad-ink: #1a1f2c;
+                --field: #6b7590;
                 --off: #7a849b;
                 --hover: rgba(232, 236, 246, .06);
                 --grid: #262c3b;
@@ -438,7 +442,7 @@
             font: inherit;
             color: var(--ink);
             background: var(--panel);
-            border: 1px solid var(--line-strong);
+            border: 1px solid var(--field);
             border-radius: 6px;
             padding: 5px 9px;
         }
@@ -792,7 +796,7 @@
 
         .seg .count.bad {
             background: var(--bad);
-            color: #fff;
+            color: var(--bad-ink);
         }
 
         #ls-more {
@@ -1144,7 +1148,7 @@
             color: var(--ink);
         }
         
-        .cols button[aria-sort] {
+        .cols button.on {
             color: var(--ink);
             font-weight: 600;
         }
@@ -1583,10 +1587,13 @@
             white-space: nowrap;
         }
         
-        .share .pop button:hover,
-        .share .pop button:focus-visible {
+        .share .pop button:hover {
             background: var(--hover);
-            outline: none;
+        }
+
+        .share .pop button:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
         }
         /* Menus and dialogs */
         
@@ -1623,10 +1630,13 @@
             font-size: 12px;
         }
         
-        .menu button:hover,
-        .menu button:focus-visible {
+        .menu button:hover {
             background: var(--hover);
-            outline: none;
+        }
+
+        .menu button:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: -2px;
         }
         
         .menu hr {
@@ -1709,6 +1719,81 @@
             color: var(--muted);
             font-size: 12px;
         }
+        /* Accessibility */
+
+        /* A program's name in the Apps table: a button, so the keyboard can open its files. */
+        button.cell-btn {
+            border: 0;
+            background: none;
+            color: inherit;
+            font: inherit;
+            padding: 0;
+            cursor: pointer;
+            text-align: left;
+        }
+
+        /* Narrow windows (or large zoom): the details go under the tree. */
+        @media (max-width: 860px) {
+            .pane {
+                grid-template-columns: 1fr;
+                grid-template-rows: minmax(220px, 1fr) minmax(220px, 1fr);
+            }
+        }
+
+        /* Windows' contrast themes: backgrounds and borders take the theme's
+           colours, so what only a colour showed (the selection, a pressed
+           button, a switch that's on) is drawn with the theme's own. */
+        @media (forced-colors: active) {
+            .ti[aria-selected="true"],
+            nav button[aria-current="page"],
+            .seg button[aria-pressed="true"],
+            .views button[aria-selected="true"],
+            .root-tab[aria-selected="true"] {
+                forced-color-adjust: none;
+                background: Highlight;
+                color: HighlightText;
+            }
+
+            .ti[aria-selected="true"] * {
+                color: HighlightText;
+            }
+
+            .toggle span {
+                forced-color-adjust: none;
+                border-color: CanvasText;
+                background: Canvas;
+            }
+
+            .toggle span::after {
+                background: CanvasText;
+            }
+
+            .toggle input:checked+span {
+                background: Highlight;
+                border-color: Highlight;
+            }
+
+            .toggle input:checked+span::after {
+                background: HighlightText;
+            }
+
+            .toggle input:disabled+span {
+                border-color: GrayText;
+            }
+
+            .toggle input:focus-visible+span {
+                outline-color: CanvasText;
+            }
+
+            .dot {
+                border: 1px solid CanvasText;
+            }
+
+            .chart,
+            .swatch {
+                forced-color-adjust: none;
+            }
+        }
     </style>
 </head>
 
@@ -1755,7 +1840,7 @@
     <main id="main">
         <!-- The background agent: what it's doing, and its controls -->
         <header id="agent"><button id="st-btn" popovertarget="st-menu" aria-haspopup="menu" title="OneUpDrive status">
-    <span class="dot" id="st-dot"></span><span id="st-title">Connecting…</span><svg><use href="#i-chev"/></svg></button></header>
+    <span class="dot" id="st-dot"></span><span id="st-title" aria-live="polite">Connecting…</span><svg aria-hidden="true"><use href="#i-chev"/></svg></button></header>
         <!-- A problem the agent ran into: on every page while it lasts -->
         <section class="card" id="problem" role="alert" hidden>
             <div class="p-head"><span class="dot bad"></span><b id="pb-title"></b></div>
@@ -1800,8 +1885,8 @@
                             </div>
                             <div id="mode-new">
                                 <span class="muted">A folder on this PC and the OneDrive folder it mirrors.</span>
-                                <div class="field"><input type="text" id="setup-local" placeholder="Folder on this PC" spellcheck="false"><button class="btn" id="browse">Browse…</button></div>
-                                <div class="field"><input type="text" id="setup-remote" placeholder="OneDrive folder, or / for all of it" spellcheck="false"></div>
+                                <div class="field"><input type="text" id="setup-local" placeholder="Folder on this PC" aria-label="Folder on this PC" spellcheck="false"><button class="btn" id="browse">Browse…</button></div>
+                                <div class="field"><input type="text" id="setup-remote" placeholder="OneDrive folder, or / for all of it" aria-label="OneDrive folder" spellcheck="false"></div>
                                 <p class="note">Tip: a new folder with <b>/</b> syncs all of OneDrive. Files already in both places are matched, not copied. Folders another app syncs can't be used.</p>
                             </div>
                         </div>
@@ -1810,7 +1895,7 @@
                         <div class="num">3</div>
                         <div class="body">
                             <b>Exclude</b>
-                            <div class="field"><select id="setup-preset">
+                            <div class="field"><select id="setup-preset" aria-label="Exclude">
           <option value="dev">Developer folders (node_modules, .venv, target, build caches…)</option>
           <option value="none">Nothing</option></select></div>
                             <p class="note">Change it later in Files &gt; Exclude.</p>
@@ -1834,7 +1919,7 @@
                         <div class="body">
                             <b>Check your OneDrive folder</b>
                             <span class="muted">Compares the folder with OneDrive and records the OneDrive app's choices so they carry over. Changes nothing.</span>
-                            <div class="field"><button class="btn" id="mv-check-btn">Check</button><span class="muted" id="mv-busy"></span></div>
+                            <div class="field"><button class="btn" id="mv-check-btn">Check</button><span class="muted" id="mv-busy" role="status"></span></div>
                             <div id="mv-result"></div>
                         </div>
                     </div>
@@ -1847,14 +1932,14 @@
                             <div id="mv-stuck" hidden>
                                 <p class="note" style="color:var(--wait)" id="mv-stuck-say"></p>
                                 <div class="field"><button class="btn" id="mv-fix-btn">Finish unlinking</button>
-                                    <button class="btn" id="mv-fix-now-btn" title="Skip restarting and resetting the OneDrive app">Finish it now</button><span class="muted" id="mv-fix-busy"></span></div>
-                                <p class="note" id="mv-fix-result"></p>
+                                    <button class="btn" id="mv-fix-now-btn" title="Skip restarting and resetting the OneDrive app">Finish it now</button><span class="muted" id="mv-fix-busy" role="status"></span></div>
+                                <p class="note" id="mv-fix-result" role="status"></p>
                             </div>
                         </div>
                     </div>
                 </div>
                 <div class="actions" style="margin:14px 0"><button class="btn" id="preview-btn">Preview</button>
-                    <button class="btn primary" id="start-btn" disabled>Start syncing</button><span class="muted" id="setup-busy"></span></div>
+                    <button class="btn primary" id="start-btn" disabled>Start syncing</button><span class="muted" id="setup-busy" role="status"></span></div>
                 <div class="card" id="preview-card" hidden>
                     <div class="row block"><pre class="out" id="preview" style="margin:0"></pre></div>
                 </div>
@@ -1866,21 +1951,21 @@
         <section class="page on" id="files">
             <div class="files-head">
                 <h2>Files</h2>
-                <button class="btn" id="add-btn" aria-haspopup="menu" popovertarget="add-menu"><svg width="12" height="12" style="vertical-align:-1px;margin-right:6px"><use href="#i-plus"/></svg>Add</button></div>
+                <button class="btn" id="add-btn" aria-haspopup="menu" popovertarget="add-menu"><svg width="12" height="12" style="vertical-align:-1px;margin-right:6px" aria-hidden="true"><use href="#i-plus"/></svg>Add</button></div>
             <div class="roots" id="roots" role="tablist" aria-label="Synced folders"></div>
             <div class="toolbar">
                 <div class="views" role="tablist" aria-label="View">
                     <button role="tab" data-view="all" aria-selected="true">All files</button>
                     <button role="tab" data-view="out">Exclude</button>
                 </div>
-                <div class="search" id="search"><svg><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
+                <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
             </div>
             <div class="pane">
                 <div class="browser">
                     <div class="cols" id="cols"></div>
                     <div class="tree" id="tree" role="tree" aria-label="Files"></div>
                 </div>
-                <aside class="details" id="details" aria-live="polite"></aside>
+                <aside class="details" id="details" aria-label="Details"></aside>
             </div>
         </section>
 
@@ -1891,7 +1976,7 @@
                 <input type="search" id="fd-q" placeholder="Name, or part of one" spellcheck="false" aria-label="Search OneDrive by name">
                 <button class="btn primary" id="fd-go">Search</button>
             </div>
-            <p class="lead" id="fd-sum"></p>
+            <p class="lead" id="fd-sum" role="status"></p>
             <div class="card" id="fd-card" hidden>
                 <div class="flat" id="fd-list"></div>
             </div>
@@ -1958,7 +2043,7 @@
                 <select id="ls-outcome" aria-label="Show"><option value="">Everything</option><option value="problems">Problems only</option></select>
                 <button class="btn" id="ls-refresh">Refresh</button>
             </div>
-            <p class="lead" id="ls-sum"></p>
+            <p class="lead" id="ls-sum" role="status"></p>
             <div class="card" id="ls-card" hidden>
                 <table class="list" id="ls-table">
                     <thead></thead>
@@ -1974,14 +2059,14 @@
             <h3>Stop and ask when</h3>
             <div class="card">
                 <div class="row">
-                    <div class="label"><b>Files deleted, replaced or moved exceed</b><small>On one side, within 15 minutes</small></div><input type="number" min="1" data-safety="max_changes"></div>
+                    <div class="label"><b>Files deleted, replaced or moved exceed</b><small>On one side, within 15 minutes</small></div><input type="number" min="1" data-safety="max_changes" aria-label="Files deleted, replaced or moved exceed"></div>
                 <div class="row">
-                    <div class="label"><b>…or this share of all synced files (%)</b><small>Batches of 20 or fewer never stop</small></div><input type="number" min="1" max="100" data-safety="max_percent"></div>
+                    <div class="label"><b>…or this share of all synced files (%)</b><small>Batches of 20 or fewer never stop</small></div><input type="number" min="1" max="100" data-safety="max_percent" aria-label="Share of all synced files (%)"></div>
                 <div class="row">
                     <div class="label"><b>Edited files look encrypted</b><small>A sign of ransomware</small></div>
                     <label class="toggle"><input type="checkbox" id="guard-on" aria-label="Edited files look encrypted"><span></span></label></div>
                 <div class="row" id="guard-row">
-                    <div class="label"><b>…more than this many</b></div><input type="number" min="1" id="guard-n"></div>
+                    <div class="label"><b>…more than this many</b></div><input type="number" min="1" id="guard-n" aria-label="Edited files that look encrypted"></div>
             </div>
             <h3>Kept copies</h3>
             <div class="card">
@@ -1991,14 +2076,14 @@
                     <div class="label"><b>Also keep files replaced from OneDrive</b><small>OneDrive's version history has them anyway</small></div><label class="toggle"><input type="checkbox" data-ver="keep_replaced" aria-label="Also keep replaced files"><span></span></label></div>
                 <div class="row">
                     <div class="label"><b>When removed files don't fit</b></div>
-                    <select data-ver="overflow"><option value="hold">Ask me</option><option value="keep">Keep them and tell me</option></select></div>
+                    <select data-ver="overflow" aria-label="When removed files don't fit"><option value="hold">Ask me</option><option value="keep">Keep them and tell me</option></select></div>
                 <div class="row">
                     <div class="label"><b>Delete the oldest copies to make room</b></div><label class="toggle"><input type="checkbox" data-ver="rotate" aria-label="Delete the oldest copies to make room"><span></span></label></div>
                 <div class="row">
-                    <div class="label"><b>Keep copies for at least</b><small>days</small></div><input type="number" min="0" data-ver="min_days"></div>
+                    <div class="label"><b>Keep copies for at least</b><small>days</small></div><input type="number" min="0" data-ver="min_days" aria-label="Keep copies for at least (days)"></div>
                 <div class="row">
                     <div class="label"><b>Space for kept copies</b><small>GiB, and at most this % of the disk</small></div>
-                    <div class="actions"><input type="number" min="0" step="0.5" data-ver="max_gib"><input type="number" min="0" max="100" step="0.5" data-ver="max_percent"></div>
+                    <div class="actions"><input type="number" min="0" step="0.5" data-ver="max_gib" aria-label="Space for kept copies (GiB)"><input type="number" min="0" max="100" step="0.5" data-ver="max_percent" aria-label="Space for kept copies (% of the disk)"></div>
                 </div>
             </div>
         </section>
@@ -2025,7 +2110,7 @@
                 <div class="row block">
                     <div class="label"><small>OneUpDrive skips these folders so the OneDrive app can sync them with AutoSave (in the OneDrive app: Settings &gt; Account &gt; Choose folders).</small></div>
                     <div class="chips" id="of-folders"></div>
-                    <div class="field"><input type="text" id="of-add-path" placeholder="OneDrive folder, like /Office" spellcheck="false"><button class="btn" id="of-add">Add</button></div>
+                    <div class="field"><input type="text" id="of-add-path" placeholder="OneDrive folder, like /Office" aria-label="OneDrive folder" spellcheck="false"><button class="btn" id="of-add">Add</button></div>
                     <div class="field"><label><input type="checkbox" id="of-top"> Also files at the top of OneDrive (the OneDrive app always syncs them)</label></div>
                 </div>
             </div>
@@ -2045,11 +2130,11 @@
             <h3>Speed limits</h3>
             <div class="card">
                 <div class="row">
-                    <div class="label"><b>Upload limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-agent="upload_kib"></div>
+                    <div class="label"><b>Upload limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-agent="upload_kib" aria-label="Upload limit (KB/s)"></div>
                 <div class="row">
-                    <div class="label"><b>Download limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-agent="download_kib"></div>
+                    <div class="label"><b>Download limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-agent="download_kib" aria-label="Download limit (KB/s)"></div>
                 <div class="row">
-                    <div class="label"><b>Only during these hours</b><small>Like 09:00-18:00</small></div><input type="text" data-agent="cap_hours" placeholder="Always"></div>
+                    <div class="label"><b>Only during these hours</b><small>Like 09:00-18:00</small></div><input type="text" data-agent="cap_hours" placeholder="Always" aria-label="Only during these hours"></div>
             </div>
             <h3>Pause automatically</h3>
             <div class="card">
@@ -2062,7 +2147,7 @@
                 <div class="row">
                     <div class="label"><b>During full-screen videos</b></div><label class="toggle"><input type="checkbox" data-agent="pause_on_full_screen_video" aria-label="Pause during full-screen videos"><span></span></label></div>
                 <div class="row">
-                    <div class="label"><b>Quiet hours</b><small>Like 22:00-07:00</small></div><input type="text" data-agent="quiet_hours" placeholder="None"></div>
+                    <div class="label"><b>Quiet hours</b><small>Like 22:00-07:00</small></div><input type="text" data-agent="quiet_hours" placeholder="None" aria-label="Quiet hours"></div>
             </div>
         </section>
 
@@ -2082,7 +2167,7 @@
             <div class="card">
                 <div class="row">
                     <div class="label"><b>Memory</b><small>More is faster with big files and folders</small></div>
-                    <select data-agent="memory"><option value="minimal">Low</option><option value="balanced">Balanced</option><option value="performance">High</option></select></div>
+                    <select data-agent="memory" aria-label="Memory"><option value="minimal">Low</option><option value="balanced">Balanced</option><option value="performance">High</option></select></div>
                 <div class="row">
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
@@ -2096,12 +2181,12 @@
                     <div class="label"><b>Timeout highly active files</b><small>Don't upload files with constant updates on every change, wait for quiet period.</small></div>
                     <label class="toggle"><input type="checkbox" data-agent="hold_busy_files" aria-label="Timeout highly active files"><span></span></label></div>
                 <div class="row">
-                    <div class="label"><b>Timeout (seconds)</b><small>Ensure file is quiet before sending update</small></div><input type="number" min="1" data-agent="busy_quiet_s"></div>
+                    <div class="label"><b>Timeout (seconds)</b><small>Ensure file is quiet before sending update</small></div><input type="number" min="1" data-agent="busy_quiet_s" aria-label="Timeout (seconds)"></div>
             </div>
             <h3 id="shortcuts">Shortcuts</h3>
             <div class="card">
                 <div class="row">
-                    <div class="label"><b>Update shortcuts to use OneUpDrive folder</b><small id="sc-state">Desktop, Start menu and taskbar</small></div>
+                    <div class="label"><b>Update shortcuts to use OneUpDrive folder</b><small id="sc-state" role="status">Desktop, Start menu and taskbar</small></div>
                     <div class="actions"><button class="btn" id="sc-undo" hidden>Undo</button><button class="btn" id="sc-find">Search</button><button class="btn primary" id="sc-fix" hidden>Update</button></div></div>
                 <div id="sc-list"></div>
             </div>
@@ -2112,7 +2197,7 @@
                 <div class="row">
                     <div class="label"><b>Get previews</b><small>New features sooner, more bugs</small></div><label class="toggle"><input type="checkbox" id="upd-preview" aria-label="Get preview versions"><span></span></label></div>
                 <div class="row">
-                    <div class="label"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
+                    <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
             </div>
         </section>
 
@@ -2124,7 +2209,7 @@
             <h3>Add an account</h3>
             <div class="card">
                 <div class="row block">
-                    <div class="field"><input type="text" id="ac-name" placeholder="Name, like Work or Family" spellcheck="false"><button class="btn primary" id="ac-add">Add account…</button></div>
+                    <div class="field"><input type="text" id="ac-name" placeholder="Name, like Work or Family" aria-label="Account name" spellcheck="false"><button class="btn primary" id="ac-add">Add account…</button></div>
                     <p class="note">Opens a window to sign in and choose what to sync.</p>
                 </div>
             </div>
@@ -2153,25 +2238,25 @@
         <button role="menuitem" data-dlg="dlg-vault-new">Create an encrypted vault<small>Encrypted before upload</small></button>
         <button role="menuitem" data-dlg="dlg-vault-add">Add an existing vault<small>A Cryptomator vault in OneDrive</small></button>
     </div>
-    <dialog id="dlg-pair">
+    <dialog id="dlg-pair" aria-labelledby="dlg-pair-t">
         <form method="dialog">
             <div class="dh">
-                <h3>Sync another folder</h3>
+                <h3 id="dlg-pair-t">Sync another folder</h3>
             </div>
             <div class="db">
-                <div class="field"><input type="text" id="pa-local" placeholder="Folder on this PC" spellcheck="false"><button class="btn" type="button" id="pa-browse">Browse…</button></div>
-                <div class="field"><input type="text" id="pa-remote" placeholder="OneDrive folder, like /Photos" spellcheck="false"></div>
+                <div class="field"><input type="text" id="pa-local" placeholder="Folder on this PC" aria-label="Folder on this PC" spellcheck="false"><button class="btn" type="button" id="pa-browse">Browse…</button></div>
+                <div class="field"><input type="text" id="pa-remote" placeholder="OneDrive folder, like /Photos" aria-label="OneDrive folder" spellcheck="false"></div>
                 <label class="ck"><input type="checkbox" id="pa-backup"><span>Backup only<small>Uploads only. Deleting here never deletes in OneDrive.</small></span></label>
                 <label class="ck"><input type="checkbox" id="pa-od"><span>Files On-Demand<small>Files download when you open them.</small></span></label>
                 <p class="note">Existing files are matched. If two differ, both are kept.</p>
             </div>
-            <div class="df"><span class="muted" id="pa-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="pa-add">Sync folder</button></div>
+            <div class="df"><span class="muted" id="pa-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="pa-add">Sync folder</button></div>
         </form>
     </dialog>
-    <dialog id="dlg-known">
+    <dialog id="dlg-known" aria-labelledby="dlg-known-t">
         <form method="dialog">
             <div class="dh">
-                <h3>Back up a PC folder</h3>
+                <h3 id="dlg-known-t">Back up a PC folder</h3>
             </div>
             <div class="db">
                 <p class="muted" style="margin:4px 0 8px">Folders stay where they are and back up to a OneDrive folder of the same name.</p>
@@ -2180,10 +2265,10 @@
             <div class="df"><button class="btn" value="cancel">Done</button></div>
         </form>
     </dialog>
-    <dialog id="dlg-shared">
+    <dialog id="dlg-shared" aria-labelledby="dlg-shared-t">
         <form method="dialog">
             <div class="dh">
-                <h3>Sync a folder shared with you</h3>
+                <h3 id="dlg-shared-t">Sync a folder shared with you</h3>
             </div>
             <div class="db">
                 <div class="card">
@@ -2202,46 +2287,46 @@
             <div class="df"><button class="btn" value="cancel">Done</button></div>
         </form>
     </dialog>
-    <dialog id="dlg-vault-new">
+    <dialog id="dlg-vault-new" aria-labelledby="dlg-vault-new-t">
         <form method="dialog">
             <div class="dh">
-                <h3>Create an encrypted vault</h3>
+                <h3 id="dlg-vault-new-t">Create an encrypted vault</h3>
             </div>
             <div class="db">
-                <div class="field"><input type="text" id="vc-remote" placeholder="New OneDrive folder, like /Private" spellcheck="false"></div>
-                <div class="field"><input type="text" id="vc-local" placeholder="Empty folder on this PC" spellcheck="false"><button class="btn" type="button" id="vc-browse">Browse…</button></div>
-                <div class="field"><input type="password" id="vc-pw" placeholder="Password (8+ characters)"></div>
-                <div class="field"><input type="password" id="vc-pw2" placeholder="Confirm password"></div>
+                <div class="field"><input type="text" id="vc-remote" placeholder="New OneDrive folder, like /Private" aria-label="New OneDrive folder" spellcheck="false"></div>
+                <div class="field"><input type="text" id="vc-local" placeholder="Empty folder on this PC" aria-label="Empty folder on this PC" spellcheck="false"><button class="btn" type="button" id="vc-browse">Browse…</button></div>
+                <div class="field"><input type="password" id="vc-pw" placeholder="Password (8+ characters)" aria-label="Password"></div>
+                <div class="field"><input type="password" id="vc-pw2" placeholder="Confirm password" aria-label="Confirm password"></div>
                 <label class="ck"><input type="checkbox" id="vc-full"><span>Keep all files on this PC<small>Otherwise they download when you open them.</small></span></label>
                 <label class="ck"><input type="checkbox" id="vc-remember"><span>Remember the password on this PC</span></label>
                 <p class="note">A standard Cryptomator vault: Cryptomator's apps open it too.</p>
                 <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
             </div>
-            <div class="df"><span class="muted" id="vc-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="vc-add">Create vault</button></div>
+            <div class="df"><span class="muted" id="vc-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="vc-add">Create vault</button></div>
         </form>
     </dialog>
-    <dialog id="dlg-vault-add">
+    <dialog id="dlg-vault-add" aria-labelledby="dlg-vault-add-t">
         <form method="dialog">
             <div class="dh">
-                <h3>Add an existing vault</h3>
+                <h3 id="dlg-vault-add-t">Add an existing vault</h3>
             </div>
             <div class="db">
-                <div class="field"><input type="text" id="va-remote" placeholder="Vault folder in OneDrive, like /Vault" spellcheck="false"></div>
-                <div class="field"><input type="text" id="va-local" placeholder="Empty folder on this PC" spellcheck="false"><button class="btn" type="button" id="va-browse">Browse…</button></div>
-                <div class="field"><input type="password" id="va-pw" placeholder="Vault password"></div>
+                <div class="field"><input type="text" id="va-remote" placeholder="Vault folder in OneDrive, like /Vault" aria-label="Vault folder in OneDrive" spellcheck="false"></div>
+                <div class="field"><input type="text" id="va-local" placeholder="Empty folder on this PC" aria-label="Empty folder on this PC" spellcheck="false"><button class="btn" type="button" id="va-browse">Browse…</button></div>
+                <div class="field"><input type="password" id="va-pw" placeholder="Vault password" aria-label="Vault password"></div>
                 <label class="ck"><input type="checkbox" id="va-full"><span>Keep all files on this PC</span></label>
                 <label class="ck"><input type="checkbox" id="va-remember"><span>Remember the password on this PC</span></label>
                 <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
             </div>
-            <div class="df"><span class="muted" id="va-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="va-add">Add vault</button></div>
+            <div class="df"><span class="muted" id="va-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="va-add">Add vault</button></div>
         </form>
     </dialog>
     <div class="menu ctx" id="ctx" role="menu" popover></div>
-    <div class="menu ctx" id="st-menu" role="menu" popover>
+    <div class="menu ctx" id="st-menu" role="menu" aria-describedby="st-detail" popover>
         <p class="st-detail" id="st-detail"></p>
         <div id="st-actions"></div>
     </div>
-    <dialog id="dlg-remove">
+    <dialog id="dlg-remove" aria-labelledby="rm-title">
         <form method="dialog">
             <div class="dh">
                 <h3 id="rm-title">Stop syncing</h3>
@@ -2249,10 +2334,10 @@
             <div class="db">
                 <ul class="facts" id="rm-facts"></ul>
                 <label class="ck" id="rm-full-box"><input type="checkbox" id="rm-full"><span id="rm-full-text"></span></label></div>
-            <div class="df"><span class="muted" id="rm-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rm-go">Stop syncing</button></div>
+            <div class="df"><span class="muted" id="rm-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rm-go">Stop syncing</button></div>
         </form>
     </dialog>
-    <dialog id="dlg-exclude">
+    <dialog id="dlg-exclude" aria-labelledby="ex-title">
         <form method="dialog">
             <div class="dh">
                 <h3 id="ex-title">Exclude</h3>
@@ -2268,10 +2353,10 @@
                     </select>
                 </div>
             </div>
-            <div class="df"><span class="muted" id="ex-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="ex-go">Exclude</button></div>
+            <div class="df"><span class="muted" id="ex-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="ex-go">Exclude</button></div>
         </form>
     </dialog>
-    <dialog id="dlg-resolve">
+    <dialog id="dlg-resolve" aria-labelledby="rs-title">
         <form method="dialog">
             <div class="dh">
                 <h3 id="rs-title"></h3>
@@ -2280,13 +2365,13 @@
                 <ul class="facts" id="rs-facts"></ul>
                 <div class="field" id="rs-name-box"><input type="text" id="rs-name" spellcheck="false" aria-label="New name"></div>
             </div>
-            <div class="df"><span class="muted" id="rs-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rs-go"></button></div>
+            <div class="df"><span class="muted" id="rs-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rs-go"></button></div>
         </form>
     </dialog>
-    <dialog id="dlg-recovery">
+    <dialog id="dlg-recovery" aria-labelledby="dlg-recovery-t">
         <form method="dialog">
             <div class="dh">
-                <h3>Recovery key</h3>
+                <h3 id="dlg-recovery-t">Recovery key</h3>
             </div>
             <div class="db">
                 <p class="muted" style="margin:4px 0 0">Keep it somewhere safe. It resets a forgotten password, and anyone who has it can read the vault. Cryptomator's apps don't use it.</p>
@@ -2308,6 +2393,8 @@
         };
         const svg = (id, cls = "") => {
             const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            // Icons sit beside words that say the same: screen readers skip them.
+            s.setAttribute("aria-hidden", "true");
             if (cls) s.setAttribute("class", cls);
             const u = document.createElementNS("http://www.w3.org/2000/svg", "use");
             u.setAttribute("href", "#" + id);
@@ -2554,6 +2641,8 @@
         }
 
         // ---- filling the settings pages
+        // The on/off switches are checkboxes underneath: screen readers say "on" and "off".
+        $$(".toggle input").forEach(i => i.setAttribute("role", "switch"));
         function fill(s) {
             snap = s;
             setupState(s);
@@ -3258,6 +3347,8 @@
             }), x.name));
             drawColumns(s, series, colorOf);
             const body = $("#apps-table tbody");
+            // Read again every 15 s: a program focused keeps the focus.
+            const focused = body.contains(document.activeElement) ? document.activeElement.closest("tr").dataset.exe : null;
             body.replaceChildren();
             if (!s.apps.length) body.append(el("tr", {}, el("td", {
                 colSpan: 4,
@@ -3273,11 +3364,16 @@
                     onclick: () => toggleAppFiles(row, a)
                 });
                 body.append(row);
+                // The name is a button, so the keyboard opens the list too (its click reaches the row).
                 row.append(
                     el("td", {}, el("span", {
                         className: "swatch",
                         style: "background:" + (sw || "transparent")
-                    }), a.name),
+                    }), el("button", {
+                        className: "cell-btn",
+                        textContent: a.name,
+                        "aria-expanded": String(lists.has(a.exe) && !!lists.get(a.exe))
+                    })),
                     el("td", {
                         className: "num",
                         textContent: a.changed.toLocaleString()
@@ -3292,6 +3388,8 @@
                     }));
                 const files = lists.get(a.exe);
                 if (files) row.after(appFilesRow(files));
+                row.dataset.exe = a.exe;
+                if (a.exe === focused) $(".cell-btn", row).focus();
             }
         }
 
@@ -3299,13 +3397,16 @@
         // close). At most the latest 5,000 in all.
         async function toggleAppFiles(row, a) {
             const open = row.nextElementSibling;
+            const btn = $(".cell-btn", row);
             if (open && open.classList.contains("app-files")) {
                 appsOpen.delete(a.exe);
+                btn.setAttribute("aria-expanded", "false");
                 return open.remove();
             }
             const files = await appFiles(a.exe);
             if (!files) return;
             appsOpen.add(a.exe);
+            btn.setAttribute("aria-expanded", "true");
             row.after(appFilesRow(files));
         }
 
@@ -3733,6 +3834,7 @@
 
         function renderRoots() {
             const box = $("#roots");
+            const had = box.contains(document.activeElement);
             box.replaceChildren();
             for (const r of F.roots) {
                 const b = el("button", {
@@ -3747,9 +3849,13 @@
                         textContent: r.kind === "vault" ? "locked" : "stopped"
                     }) : null);
                 b.setAttribute("aria-selected", String(!!F.root && F.root.id === r.id));
+                b.tabIndex = F.root && F.root.id === r.id ? 0 : -1;
                 b.title = r.local;
                 box.append(b);
             }
+            const chosen = $("[aria-selected=true]", box) || box.firstElementChild;
+            if (chosen) chosen.tabIndex = 0;
+            if (had && chosen) chosen.focus();
         }
         async function selectRoot(id, keep = false) {
             const r = F.roots.find(x => x.id === id);
@@ -3867,15 +3973,37 @@
 
         function setView(v, quiet = false) {
             F.view = v;
-            $$(".views button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.view === v && !F.q)));
+            $$(".views button").forEach(b => {
+                b.setAttribute("aria-selected", String(b.dataset.view === v && !F.q));
+                b.tabIndex = b.dataset.view === v ? 0 : -1;
+            });
             render(quiet);
         }
+        // Tabs, as Windows' own: Tab reaches the chosen one, the arrow keys
+        // (and Home, End) move between them and choose.
+        for (const list of $$("[role=tablist]")) list.addEventListener("keydown", e => {
+            const tabs = $$("[role=tab]", list),
+                i = tabs.indexOf(document.activeElement);
+            if (i < 0) return;
+            const j = {
+                ArrowRight: i + 1,
+                ArrowLeft: i - 1,
+                Home: 0,
+                End: tabs.length - 1
+            }[e.key];
+            if (j === undefined) return;
+            e.preventDefault();
+            const t = tabs[(j + tabs.length) % tabs.length];
+            t.focus();
+            t.click();
+        });
 
         function render() {
             const all = F.view === "all";
             $(".search").hidden = !all;
             $("#cols").hidden = !all || !!F.q;
             renderCols();
+            if (!all || F.q) $("#tree").setAttribute("role", "region");
             if (all && F.q) renderFound();
             else if (!all) renderOut();
             else renderTree();
@@ -3930,7 +4058,7 @@
             for (const [key, label, right] of[["name", "Name"], ["status", "Status"], ["size", "Size", true]]) {
                 const on = F.sort.key === key;
                 const b = el("button", {
-                    textContent: label + (on ? (F.sort.dir > 0 ? " ▲" : " ▼") : ""),
+                    className: on ? "on" : "",
                     title: "Sort by " + label.toLowerCase(),
                     onclick: () => {
                         F.sort = {
@@ -3940,7 +4068,12 @@
                         render();
                     }
                 });
-                if (on) b.setAttribute("aria-sort", F.sort.dir > 0 ? "ascending" : "descending");
+                // The arrow is a picture; the direction is said in words.
+                b.append(label, on ? el("span", {
+                    "aria-hidden": "true",
+                    textContent: F.sort.dir > 0 ? "▲" : "▼"
+                }) : "");
+                b.setAttribute("aria-label", on ? `Sort by ${label.toLowerCase()}, ${F.sort.dir > 0 ? "ascending" : "descending"}` : "Sort by " + label.toLowerCase());
                 box.append(right ? el("span", {
                     className: "r"
                 }, b) : el("span", {}, b));
@@ -4149,6 +4282,8 @@
             const tree = $("#tree");
             const top = F.nodes.get("");
             if (!top) return;
+            // A tree only while it lists items; a message or a list otherwise.
+            tree.setAttribute("role", "region");
             if (top.error) {
                 tree.replaceChildren(el("div", {
                     className: "msg"
@@ -4172,9 +4307,15 @@
                 })));
                 return;
             }
+            // Redrawing replaces the rows: the focused one gets focus back.
+            const focused = tree.contains(document.activeElement) ? document.activeElement.closest("[data-rel]") : null;
+            const had = focused ? focused.dataset.rel : null;
             const rows = visible().map(([n, level]) => {
                 if (n.msg) return el("div", {
                     className: "ti dim",
+                    role: "treeitem",
+                    "aria-disabled": "true",
+                    "aria-level": level,
                     style: `padding-left:${6 + level * 18}px`
                 }, el("div", {
                     className: "nm"
@@ -4217,7 +4358,9 @@
                         textContent: sizeOf(n) != null ? size(sizeOf(n)) : ""
                     }));
                 row.dataset.rel = n.rel;
-                row.setAttribute("aria-label", n.name);
+                // The name, then what the row's columns show; the box as the item's checked state.
+                row.setAttribute("aria-label", [n.name, word, sizeOf(n) != null ? size(sizeOf(n)) : ""].filter(Boolean).join(", "));
+                row.setAttribute("aria-checked", ck.indeterminate ? "mixed" : String(ck.checked));
                 // Selection follows focus, as in a single-select tree.
                 row.onfocus = () => {
                     if (F.sel !== n.rel) select(n.rel, false);
@@ -4237,7 +4380,15 @@
                 return row;
             });
             tree.replaceChildren(...rows);
-            if (!$("#tree [tabindex='0']") && rows[0] && rows[0].dataset) rows[0].tabIndex = 0;
+            tree.setAttribute("role", "tree");
+            const first = rows.find(r => r.dataset.rel != null);
+            if (!$("#tree [tabindex='0']") && first) first.tabIndex = 0;
+            if (had != null) {
+                const back = $(`#tree [data-rel="${CSS.escape(had)}"]`) || $("#tree [tabindex='0']");
+                if (back) back.focus({
+                    preventScroll: true
+                });
+            }
         }
         async function toggle(rel) {
             const n = F.nodes.get(rel);
@@ -4330,6 +4481,15 @@
                 e.preventDefault();
                 const b = cur.getBoundingClientRect();
                 openCtx(n, b.left + 40, b.bottom);
+            } else if (e.key.length === 1 && e.key !== " " && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                // Typing a letter goes to the next item whose name starts with it.
+                const k = e.key.toLocaleLowerCase();
+                const order = rows.slice(i + 1).concat(rows.slice(0, i + 1));
+                const hit = order.find(r => (F.nodes.get(r.dataset.rel) || {}).name?.toLocaleLowerCase().startsWith(k));
+                if (hit) {
+                    e.preventDefault();
+                    select(hit.dataset.rel);
+                }
             }
         });
         // The quick actions for an item, at the pointer.
@@ -4418,30 +4578,57 @@
             const first = $("button", m);
             if (first) first.focus();
         });
-        $("#st-menu").addEventListener("keydown", e => {
-            const items = $$("#st-menu button"),
-                i = items.indexOf(document.activeElement);
-            if (e.key === "ArrowDown") {
+        // Focus back on an element, or, if a tree row it was in was redrawn
+        // meanwhile, on that item's new row.
+        function refocus(back) {
+            if (back.isConnected) return back.focus();
+            const row = back.closest && back.closest("[data-rel]");
+            if (row) $(`#tree [data-rel="${CSS.escape(row.dataset.rel)}"]`)?.focus();
+        }
+        // Menus: the arrow keys, Home and End move between the items (Esc
+        // closes them). A menu opened without its button (the right-click
+        // menu) gives focus back to where it was when it closes.
+        for (const m of $$(".menu[popover]")) {
+            m.addEventListener("keydown", e => {
+                const items = $$("button", m).filter(b => !b.disabled),
+                    i = items.indexOf(document.activeElement);
+                const j = {
+                    ArrowDown: i + 1,
+                    ArrowUp: i - 1,
+                    Home: 0,
+                    End: items.length - 1
+                }[e.key];
+                if (j === undefined || !items.length) return;
                 e.preventDefault();
-                items[(i + 1) % items.length].focus();
-            }
-            if (e.key === "ArrowUp") {
-                e.preventDefault();
-                items[(i - 1 + items.length) % items.length].focus();
-            }
-        });
-        $("#ctx").addEventListener("keydown", e => {
-            const items = $$("#ctx button"),
-                i = items.indexOf(document.activeElement);
-            if (e.key === "ArrowDown") {
-                e.preventDefault();
-                items[(i + 1) % items.length].focus();
-            }
-            if (e.key === "ArrowUp") {
-                e.preventDefault();
-                items[(i - 1 + items.length) % items.length].focus();
-            }
-        });
+                items[(j + items.length) % items.length].focus();
+            });
+            m.addEventListener("beforetoggle", e => {
+                if (e.newState === "open") m.back = document.activeElement;
+            });
+            m.addEventListener("toggle", e => {
+                const back = m.back;
+                if (e.newState !== "closed" || !back) return;
+                m.back = null;
+                const gone = document.activeElement === document.body || m.contains(document.activeElement);
+                if (!gone) return;
+                refocus(back);
+            });
+        }
+        // Dialogs (Esc closes them) give focus back to where it was when
+        // they opened.
+        {
+            const showModal = HTMLDialogElement.prototype.showModal;
+            HTMLDialogElement.prototype.showModal = function() {
+                this.back = document.activeElement;
+                showModal.call(this);
+            };
+            for (const d of $$("dialog")) d.addEventListener("close", () => {
+                const back = d.back;
+                d.back = null;
+                if (!back || (document.activeElement !== document.body && !d.contains(document.activeElement))) return;
+                refocus(back);
+            });
+        }
 
         // ---- flat views: search results, left out, largest
         function flatRow(label, sub, ...acts) {
@@ -4506,6 +4693,7 @@
             for (const p of rs.rules.presets) {
                 const i = el("input", {
                     type: "checkbox",
+                    role: "switch",
                     checked: p.on,
                     "aria-label": PRESET_NAMES[p.name] || p.name
                 });
@@ -4814,6 +5002,7 @@
         function toggleEl(checked, label, onchange, disabled = false) {
             const i = el("input", {
                 type: "checkbox",
+                role: "switch",
                 checked,
                 disabled,
                 "aria-label": label
@@ -5132,23 +5321,24 @@
             return el("div", {
                     className: "share"
                 },
+                // The links show while Share is pointed at or focused; Enter
+                // goes to the first, Tab reaches both.
                 el("button", {
                     className: "btn small",
-                    "aria-haspopup": "true",
-                    title: "Share"
+                    title: "Share",
+                    onclick: e => e.currentTarget.parentElement.querySelector(".pop button").focus()
                 }, svg("i-share"), "Share"),
                 el("div", {
                     className: "pop"
                 }, el("div", {
-                        role: "menu"
+                        role: "group",
+                        "aria-label": "Share"
                     },
                     el("button", {
-                        role: "menuitem",
                         textContent: "Get link for viewers",
                         onclick: () => shareLink(n, false)
                     }),
                     el("button", {
-                        role: "menuitem",
                         textContent: "Get link for editors",
                         onclick: () => shareLink(n, true)
                     }))));
