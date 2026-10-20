@@ -29,7 +29,7 @@ impl<C: Cloud> Executor<C> {
     /// Runs one approved rewind step.
     pub(super) async fn rewind(&self, store: &Db<'_>, a: &Arc<Approved>, sid: Sid, step: &Step) -> Res {
         match step {
-            Step::Restore { id, to, name, kind, content, .. } => {
+            Step::Restore { id, to, name, kind, content, gone } => {
                 // Back already (a folder restored with its contents, or the
                 // user meanwhile): only if it's where it belongs.
                 let row = match self.cloud.item(id).await {
@@ -64,8 +64,12 @@ impl<C: Cloud> Executor<C> {
                     return Ok(());
                 }
                 if let (NodeKind::File, Some((size, hash))) = (kind, content)
-                    && row.qxh != Some(*hash)
+                    && !(row.qxh == Some(*hash) && row.size == *size)
                 {
+                    // Only over what the approval saw it come back as (what
+                    // went into the recycle bin): an item someone else
+                    // restored and changed is left as it is.
+                    need(gone.is_some_and(|(s, h)| row.qxh == Some(h) && row.size == s))?;
                     self.put_back(store, &row, *size, hash).await?;
                 }
                 Ok(())
@@ -86,13 +90,15 @@ impl<C: Cloud> Executor<C> {
                 }
                 Ok(())
             }
-            Step::Remove { remote, from: _ } => {
+            Step::Remove { remote, from } => {
                 let kind = store.read(|o| o.get_item(&remote.id.0))?.map(|r| r.kind);
                 let pre = if kind == Some(Kind::Folder) {
                     // Its eTag moved as the rewind emptied it: what counts is
-                    // that OneDrive has nothing in it now.
+                    // that OneDrive has nothing in it now, and that it's
+                    // where the approval saw it (moved since, it's left).
                     let now = self.cloud.item(&remote.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
                     need(now.kind == Kind::Folder)?;
+                    need(now.parent_id.as_deref() == Some(from.parent.0.as_str()) && now.name == from.name)?;
                     if !self.cloud.children(&remote.id).await?.is_empty() {
                         return Err(Fail::Skip(Skip::NotEmpty));
                     }

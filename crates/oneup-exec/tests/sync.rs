@@ -129,6 +129,9 @@ struct State {
     during_upload: Option<Box<dyn FnOnce() + Send>>,
     /// OneDrive's recycle bin, by ID: what `restore` brings back.
     bin: BTreeMap<String, Item>,
+    /// Runs when the item with this ID is next asked for (`Cloud::item`):
+    /// someone else acting on it between a round's plan and its step.
+    on_item: Option<(String, Meanwhile)>,
     /// The next restore brings the item back under another name than
     /// asked, or (`new_id`) as another item.
     restore_odd: Option<(String, bool)>,
@@ -136,6 +139,9 @@ struct State {
 
 /// See [`State::on_remove`].
 type OnRemove = Arc<dyn Fn(&str) + Send + std::marker::Sync>;
+
+/// Something done to the cloud by someone else, at a chosen moment.
+type Meanwhile = Box<dyn FnOnce(&mut State) + Send>;
 
 /// What one pull delivers: every live item (parents first), then the
 /// deletions since the pull before.
@@ -703,6 +709,13 @@ impl Cloud for Fake {
     }
 
     async fn item(&self, id: &RemoteId) -> Result<Option<RemoteRow>, CloudError> {
+        {
+            let mut s = self.0.lock().unwrap();
+            if s.on_item.as_ref().is_some_and(|(at, _)| *at == id.0) {
+                let (_, f) = s.on_item.take().unwrap();
+                f(&mut s);
+            }
+        }
         self.exchange(|| -> Result<Option<RemoteRow>, CloudError> {
             let s = self.0.lock().unwrap();
             Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
@@ -6347,6 +6360,72 @@ async fn everyday_what_a_restore_brings_back_is_checked_not_assumed() {
     assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"b", "nothing lost");
 }
 
+
+#[tokio::test]
+async fn a_folder_moved_after_the_rewind_was_approved_isnt_removed() {
+    // new/ was made since the moment; the rewind removes it. Someone moves
+    // it out of the folder after the approval, before the step runs: it's
+    // no longer what was approved, and stays where they put it.
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-folder-moved", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a");
+    s.settle().await;
+    let at = moment();
+    std::fs::create_dir_all(s.p("docs/new")).unwrap();
+    s.settle().await;
+    let id = resolve(&cloud.0.lock().unwrap(), "docs/new");
+    let mover = id.clone();
+    cloud.0.lock().unwrap().on_item = Some((
+        id,
+        Box::new(move |st: &mut State| {
+            let etag = st.bump();
+            let it = st.items.get_mut(&mover).unwrap();
+            it.parent = Some("root".into());
+            it.etag = etag;
+        }),
+    ));
+    s.rewind_to("/docs", at, |_| {}).await;
+    s.settle().await;
+    let t = cloud.tree();
+    assert!(t.contains_key("/new"), "moved, not removed: {t:?}");
+    assert!(cloud.0.lock().unwrap().on_item.is_none(), "the step looked at it");
+}
+
+#[tokio::test]
+async fn an_item_someone_else_restored_and_edited_isnt_put_back_over() {
+    // a.txt was "first" then, "second" when it was deleted. The rewind
+    // restores it and puts "first" back. After the approval, someone else
+    // restores it from the recycle bin and saves "theirs": the rewind
+    // leaves their version current.
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-restored-meanwhile", cloud.clone());
+    write(&s.p("docs/a.txt"), b"first");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/a.txt"), b"second");
+    s.settle().await;
+    let id = resolve(&cloud.0.lock().unwrap(), "docs/a.txt");
+    std::fs::remove_file(s.p("docs/a.txt")).unwrap();
+    s.settle().await;
+    let theirs = id.clone();
+    cloud.0.lock().unwrap().on_item = Some((
+        id,
+        Box::new(move |st: &mut State| {
+            let etag = st.bump();
+            let docs = resolve(st, "docs");
+            let mut it = st.bin.remove(&theirs).unwrap();
+            it.parent = Some(docs);
+            it.content = b"theirs".to_vec();
+            it.etag = etag;
+            st.items.insert(theirs, it);
+        }),
+    ));
+    s.rewind_to("/docs", at, |_| {}).await;
+    s.settle().await;
+    assert!(cloud.0.lock().unwrap().on_item.is_none(), "the step looked at it");
+    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"theirs".to_vec()), "their version stays current");
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"theirs");
+}
 
 #[tokio::test]
 async fn everyday_a_rewind_keeps_what_was_there_then_but_synced_only_since() {
