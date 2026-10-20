@@ -297,6 +297,9 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
     let mut pass = Pass::default();
     let fp = pins.fingerprint();
     take_approval(store, &fp)?;
+    // After a rescan, first: what it set aside is the rules' and the
+    // user's again, and a user's folder waiting for its pin is queued.
+    store.write(|o| o.pins_rebind())?;
     retry(store, pinner, pins, now_ms, &mut pass)?;
     repin(store, pinner, pins, now_ms, &mut pass)?;
 
@@ -315,7 +318,7 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
     if applied.as_deref() != Some(fp.as_str()) {
         let walk = store.read(|o| o.meta_get(KEY_WALK))?.and_then(|t| Walk::from_json(&t));
         // No rules, and none of theirs to undo: nothing to walk for.
-        if pins.is_empty() && walk.is_none() && store.write(|o| o.pins_rebind())? == 0 && no_owned(store)? {
+        if pins.is_empty() && walk.is_none() && no_owned(store)? {
             store.write(|o| {
                 o.meta_set(KEY_APPLIED, &fp)?;
                 o.meta_set(KEY_SEQ, &last.to_string())
@@ -334,10 +337,8 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
                     owned: Some(None),
                     stack: vec![Frame { id: r.root_file_id, rel: String::new(), after: None }],
                 };
-                // Under way, saved: the reasons to walk again are settled,
-                // and what a rescan set aside is the rules' again.
+                // Under way, saved: the reasons to walk again are settled.
                 store.write(|o| {
-                    o.pins_rebind()?;
                     o.meta_set(KEY_WALK, &w.to_json())?;
                     o.meta_delete(KEY_REWALK)?;
                     o.meta_delete(KEY_APPLIED)?;
@@ -641,12 +642,18 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
                 Some(p) => store.read(|o| o.local_get(p))?.is_some_and(|p| p.attributes & UNPINNED != 0),
                 None => false,
             };
-            if parent_freed && pinner.set(&rel, (id, None), Change::Pin).is_ok() {
+            if !parent_freed {
+                store.write(|o| {
+                    o.pin_user_remove(id)?;
+                    o.pin_changed_done(id)
+                })?;
+            } else if pinner.set(&rel, (id, None), Change::Pin).is_ok() {
+                store.write(|o| o.pin_changed_done(id))?;
                 pass.repinned += 1;
-            } else if !parent_freed {
-                store.write(|o| o.pin_user_remove(id))?;
+            } else {
+                // Not now (in use, say): it stays queued for the next pass.
+                pass.waiting += 1;
             }
-            store.write(|o| o.pin_changed_done(id))?;
             continue;
         }
         if !pins.pins(&rel, row.kind != LocalKind::File) {
@@ -2469,6 +2476,77 @@ mod tests {
         run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
         assert!(fake.set.is_empty() && !s.read(|o| o.pin_user_has(3)).unwrap());
         assert!(!kept_by_folder_above(&s, &a).unwrap());
+    }
+
+    /// A rescan of the same folder: every Local row again, as `rows`.
+    fn rescan(s: &mut Store, rows: &[LocalRow]) {
+        s.write(|o| {
+            let root = o.local_get(1)?.unwrap();
+            let info = o.local_root()?.unwrap();
+            o.local_begin(&info, &root)?;
+            for r in rows {
+                o.local_put(r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A folder pinned when the folder was scanned is the user's: a "Free
+    /// up space" on the folder above doesn't undo it.
+    #[test]
+    fn a_folder_found_pinned_by_the_scan_is_the_users() {
+        let mut s =
+            store(&[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10 | PINNED)]);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "noted as the user's");
+        explorer_free(&mut s, &[2, 3]);
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.repinned, 1);
+        assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
+    }
+
+    /// A user's folder whose pin a "Free up space" above took, not restored
+    /// yet when the folder is scanned again, is still the user's and gets
+    /// its pin back.
+    #[test]
+    fn a_rescan_keeps_a_users_folder_waiting_to_be_restored() {
+        let mut s = store(&[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
+        journal(&mut s, &[(3, 0x10 | PINNED)]);
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap());
+        explorer_free(&mut s, &[2, 3]);
+        rescan(
+            &mut s,
+            &[
+                row(2, 1, "Docs", LocalKind::Folder, 0x10 | UNPINNED),
+                row(3, 2, "Kept", LocalKind::Folder, 0x10 | UNPINNED),
+            ],
+        );
+        let mut fake = Fake::default();
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.repinned, 1);
+        assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "still the user's");
+    }
+
+    /// A user's folder whose pin can't be restored now stays queued and
+    /// gets it on a later pass.
+    #[test]
+    fn a_users_folder_that_cant_be_pinned_now_stays_queued() {
+        let mut s = store(&[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
+        journal(&mut s, &[(3, 0x10 | PINNED)]);
+        explorer_free(&mut s, &[2, 3]);
+        let mut fake = Fake { failing: vec!["Docs/Kept".into()], ..Fake::default() };
+        let p = apply(&mut s, &mut fake, &PinSet::new::<&str>(&[]), Duration::from_secs(60), 0).unwrap();
+        assert_eq!((p.repinned, p.waiting), (0, 1));
+        assert_eq!(s.read(|o| o.pin_changed_page(10)).unwrap(), [3], "still queued");
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap());
+        fake.failing.clear();
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.repinned, 1);
+        assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
+        assert!(s.read(|o| o.pin_changed_page(10)).unwrap().is_empty());
     }
 
     #[test]

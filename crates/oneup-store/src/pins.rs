@@ -22,7 +22,8 @@
 //!   until someone keeps them on this device again (a trigger drops the
 //!   row when the file is pinned again).
 //! * `pin_user` also holds the folders the user pinned (a trigger notes a
-//!   folder that gets the pin without a rule's note); one that loses its
+//!   folder that gets the pin without a rule's note, and the first pass
+//!   after a scan notes the folders it found pinned); one that loses its
 //!   pin is queued in `pin_changed`, so a "Free up space" on a folder above
 //!   doesn't undo it.
 //! * `pin_user`: items found pinned already in a folder a rule pinned,
@@ -37,7 +38,7 @@
 //! **A rescan keeps them.** A new scan of the same folder (after the change
 //! journal was lost, say) deletes every Local row, which takes these rows
 //! along; `local_begin` first sets the rules' own pins, retries and
-//! releases aside ([`Ops::pins_hold_for_rescan`]) and forgets that the
+//! releases and the user's items aside ([`Ops::pins_hold_for_rescan`]) and forgets that the
 //! rules were applied, so the agent walks again and puts back those whose
 //! IDs the new scan found ([`Ops::pins_rebind`]). An ID alone proves
 //! nothing (it can be reused): an ownership put back is used only through
@@ -57,6 +58,10 @@ const PINNED: i64 = 0x0008_0000;
 /// The meta key `oneup_app::pinrules` stores the applied rules under; a
 /// rescan forgets it so they are applied again.
 pub const KEY_APPLIED: &str = "pins.applied";
+
+/// Set by a rescan until [`Ops::pins_rebind`] has run: what it set aside
+/// is put back, and the folders it found pinned are noted, once.
+const KEY_REBIND: &str = "pins.rebind";
 
 /// What a retry is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +110,7 @@ pub(crate) fn migrate_v22() -> String {
          CREATE TABLE pin_owned_hold (file_id BLOB PRIMARY KEY, created INTEGER NOT NULL, at_seq INTEGER NOT NULL) WITHOUT ROWID;
          CREATE TABLE pin_released_hold (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_retry_hold (file_id BLOB PRIMARY KEY, op INTEGER NOT NULL) WITHOUT ROWID;
+         CREATE TABLE pin_user_hold (file_id BLOB PRIMARY KEY, waiting INTEGER NOT NULL) WITHOUT ROWID;
          CREATE TRIGGER pin_item_gone AFTER DELETE ON local_item BEGIN {gone} END;
          CREATE TRIGGER pin_item_kind AFTER UPDATE OF kind ON local_item WHEN OLD.kind != NEW.kind
          BEGIN {gone} END;
@@ -143,7 +149,7 @@ pub(crate) const UNDO_V22: &str = "DROP TRIGGER pin_item_gone; DROP TRIGGER pin_
     DROP TRIGGER pin_owned_lost; DROP TRIGGER pin_released_pinned; DROP TRIGGER pin_user_folder;
     DROP TRIGGER pin_user_folder_lost; DROP TABLE pin_released; DROP TABLE pin_owned; DROP TABLE pin_retry; DROP TABLE pin_changed;
     DROP TABLE pin_subtree; DROP TABLE pin_user; DROP TABLE pin_owned_hold; DROP TABLE pin_retry_hold;
-    DROP TABLE pin_released_hold;";
+    DROP TABLE pin_released_hold; DROP TABLE pin_user_hold;";
 
 /// At most this many items wait for a pin to be retried.
 pub const PIN_RETRY_MAX: usize = 10_000;
@@ -387,19 +393,31 @@ impl Ops<'_> {
             self.c.execute_batch(
                 "INSERT OR IGNORE INTO pin_owned_hold(file_id, created, at_seq) SELECT file_id, created, at_seq FROM pin_owned;
                  INSERT OR IGNORE INTO pin_retry_hold(file_id, op) SELECT file_id, op FROM pin_retry;
-                 INSERT OR IGNORE INTO pin_released_hold(file_id) SELECT file_id FROM pin_released;",
+                 INSERT OR IGNORE INTO pin_released_hold(file_id) SELECT file_id FROM pin_released;
+                 INSERT OR IGNORE INTO pin_user_hold(file_id, waiting)
+                     SELECT u.file_id, EXISTS (SELECT 1 FROM pin_changed c WHERE c.file_id = u.file_id) FROM pin_user u;",
             )?;
         } else {
             self.c.execute_batch(
-                "DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;",
+                "DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;
+                 DELETE FROM pin_user_hold;",
             )?;
         }
+        self.meta_set(KEY_REBIND, "1")?;
         self.meta_delete(KEY_APPLIED)
     }
 
     /// Puts back what [`Ops::pins_hold_for_rescan`] set aside, for the items
-    /// the new scan found; drops the rest. Returns how many were put back.
+    /// the new scan found; drops the rest. Returns how many of the rules'
+    /// own were put back. Then notes the folders the scan found pinned that
+    /// aren't the rules' as the user's (the scan inserts rows, which no
+    /// trigger watches), and queues again a user's folder that was waiting
+    /// for its pin to be restored. Once per rescan (one pass over
+    /// the folders), nothing otherwise.
     pub fn pins_rebind(&self) -> Result<usize> {
+        if self.meta_get(KEY_REBIND)?.is_none() {
+            return Ok(0);
+        }
         let n = self.c.execute(
             "INSERT OR IGNORE INTO pin_owned(file_id, created, at_seq)
              SELECT h.file_id, h.created, h.at_seq FROM pin_owned_hold h JOIN local_item l ON l.file_id = h.file_id",
@@ -415,8 +433,19 @@ impl Ops<'_> {
              SELECT h.file_id, h.op, 1, 0 FROM pin_retry_hold h JOIN local_item l ON l.file_id = h.file_id",
             [],
         )?;
-        self.c
-            .execute_batch("DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;")?;
+        self.c.execute_batch(&format!(
+            "INSERT OR IGNORE INTO pin_user(file_id)
+                 SELECT h.file_id FROM pin_user_hold h JOIN local_item l ON l.file_id = h.file_id;
+             INSERT OR IGNORE INTO pin_user(file_id)
+                 SELECT l.file_id FROM local_item l WHERE l.kind = 1 AND (l.attributes & {PINNED}) != 0
+                  AND NOT EXISTS (SELECT 1 FROM pin_owned o WHERE o.file_id = l.file_id);
+             INSERT OR IGNORE INTO pin_changed(file_id)
+                 SELECT h.file_id FROM pin_user_hold h JOIN local_item l ON l.file_id = h.file_id
+                 WHERE h.waiting != 0 AND l.kind = 1 AND (l.attributes & {PINNED}) = 0;
+             DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;
+             DELETE FROM pin_user_hold;"
+        ))?;
+        self.meta_delete(KEY_REBIND)?;
         Ok(n)
     }
 }
@@ -569,6 +598,54 @@ mod tests {
             assert_eq!(o.pin_retry_due(0, 10)?, [(8, PinOp::Unpin, 1)]);
             assert!(o.pin_released_has(8)?, "a file freed by name stays released");
             assert_eq!(o.pins_rebind()?, 0, "set aside once");
+            assert!(o.meta_get(KEY_REBIND)?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A rescan keeps the user's items, notes the folders it finds pinned
+    /// (not the rules') as the user's, and queues a user's folder whose pin
+    /// was taken, to be restored.
+    #[test]
+    fn a_rescan_keeps_and_notes_the_users_folders() {
+        let mut s = store();
+        let folder = |id, attributes| row(id, 1, LocalKind::Folder, 0x10 | attributes);
+        s.write(|o| {
+            o.local_put(&folder(2, 0))?;
+            o.local_put(&folder(3, PINNED as u32))?;
+            o.local_update(&folder(2, PINNED as u32))?;
+            assert!(o.pin_user_has(2)?, "pinned: the trigger notes it");
+            // A "Free up space" above took 2's pin; not restored yet.
+            o.local_update(&folder(2, 0x0010_0000))?;
+            o.pin_owned_add(3, 30, 1)
+        })
+        .unwrap();
+        s.write(|o| {
+            let root = LocalRow { parent_id: None, ..row(1, 0, LocalKind::Root, 0x10) };
+            let info = LocalRoot {
+                path: r"C:\Sync".into(),
+                volume_serial: 1,
+                root_file_id: 1,
+                rules: String::new(),
+                journal: None,
+                started_at_ms: 0,
+                finished_at_ms: None,
+                sync_root_provider: None,
+            };
+            o.local_begin(&info, &root)?;
+            o.local_put(&folder(2, 0x0010_0000))?;
+            o.local_put(&folder(3, PINNED as u32))?;
+            o.local_put(&folder(4, PINNED as u32))?;
+            assert!(!o.pin_user_has(4)?, "an insert notes nothing");
+            o.pins_rebind()?;
+            assert!(o.pin_user_has(2)?, "held across the rescan");
+            assert!(o.pin_user_has(4)?, "found pinned: the user's");
+            assert!(!o.pin_user_has(3)?, "the rules'");
+            assert_eq!(o.pin_changed_page(10)?, [2], "to be restored");
+            o.pin_user_remove(4)?;
+            o.pins_rebind()?;
+            assert!(!o.pin_user_has(4)?, "once per rescan");
             Ok(())
         })
         .unwrap();
