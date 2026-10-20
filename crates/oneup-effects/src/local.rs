@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oneup_gate::{Approved, OldCopy};
 use oneup_ntfs::FileId;
 use oneup_ntfs::dirent::{DirEntry, FILE_ATTRIBUTE_REPARSE_POINT};
-use oneup_ntfs::win::{self, Handle, Volume, WriteWatch};
+use oneup_ntfs::win::{self, Handle, Volume, WatchedFile};
 use oneup_rules::ENGINE_DIR;
 use oneup_sync::{Hash, LocalId, LocalPre, Op};
 
@@ -160,53 +160,52 @@ impl Drop for Staged {
 }
 
 /// A local file opened for an upload, at the checked stamp. Other programs
-/// may keep using it, writing included: a save must never fail because
-/// the file is being uploaded. Instead, every read through this fails with
-/// [`ChangedMeanwhile`] once anyone has written the file since it was
-/// opened, so a copy mixing two versions never completes an upload.
+/// may keep using it, writing, replacing and deleting it included: a save
+/// must never fail because the file is being uploaded. Instead, every read
+/// through this fails with [`ChangedMeanwhile`] once anyone has written
+/// the file since it was opened, or needed it closed (`win::WatchedFile`),
+/// so a copy mixing two versions never completes an upload.
 #[derive(Debug)]
 pub struct UploadSource {
-    file: File,
-    watch: WriteWatch,
+    file: WatchedFile,
     pub size: i64,
     pub mtime: i64,
 }
 
 impl UploadSource {
-    /// Whether nobody has written the file since it was opened: what was
-    /// read so far is the checked version.
+    /// Whether nobody has written the file (or needed it closed) since it
+    /// was opened: what was read so far is the checked version.
     pub fn unchanged(&self) -> bool {
-        !self.watch.broken()
+        !self.file.broken()
     }
 
     pub fn rewind(&mut self) -> std::io::Result<()> {
-        use std::io::Seek as _;
-        self.file.rewind()
+        self.file.rewind();
+        Ok(())
     }
 }
 
 impl std::io::Read for UploadSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.file.read(buf)?;
+        let read = self.file.read(buf);
         if !self.unchanged() {
             return Err(std::io::Error::other(ChangedMeanwhile));
         }
-        Ok(n)
+        read
     }
 }
 
-/// A planned file opened for reading at its checked stamp, watched for
-/// writes from the open on.
+/// A planned file opened for reading at its checked stamp, watched from
+/// the open on.
 struct OpenedToRead {
-    handle: Handle,
-    watch: WriteWatch,
+    file: WatchedFile,
     size: i64,
     mtime: i64,
 }
 
 impl OpenedToRead {
     fn into_source(self) -> UploadSource {
-        UploadSource { file: self.handle.into_file(), watch: self.watch, size: self.size, mtime: self.mtime }
+        UploadSource { file: self.file, size: self.size, mtime: self.mtime }
     }
 }
 
@@ -646,7 +645,7 @@ impl LocalFs {
         let opened = self.open_for_read(local)?;
         // Reading a placeholder whose content isn't all here would ask the
         // cloud (ourselves) for it.
-        if self.on_demand && !self.fully_on_disk(&opened.handle, opened.size) {
+        if self.on_demand && !self.on_disk(&opened) {
             return Err(Error::NotOrdinary);
         }
         Ok(opened.into_source())
@@ -659,7 +658,7 @@ impl LocalFs {
     pub fn sample(&self, pre: &LocalPre, max: usize) -> Option<Vec<u8>> {
         use std::io::Read;
         let opened = self.open_for_read(pre).ok()?;
-        if self.on_demand && !self.fully_on_disk(&opened.handle, opened.size) {
+        if self.on_demand && !self.on_disk(&opened) {
             return None;
         }
         let mut head = Vec::with_capacity(max);
@@ -679,14 +678,13 @@ impl LocalFs {
         }
         let opened = self.open_for_read(pre)?;
         let (size, mtime) = (opened.size, opened.mtime);
-        let handle = &opened.handle;
         if self.on_demand {
             // A placeholder whose identity vouches for its content is never
             // read (a dehydrated one would be downloaded from ourselves).
-            if let Some(hash) = self.identity_hash(handle, size) {
+            if let Some(hash) = opened.file.with_handle(|h| self.identity_hash(h, size)).flatten() {
                 return Ok(Done::Hashed { hash, size, mtime });
             }
-            if !self.fully_on_disk(handle, size) {
+            if !self.on_disk(&opened) {
                 return Err(Error::NotOrdinary);
             }
         }
@@ -1027,6 +1025,12 @@ impl LocalFs {
         Ok((h, entry, path))
     }
 
+    /// Whether all of an opened file's content is on disk
+    /// ([`LocalFs::fully_on_disk`]), asked through its own handle.
+    fn on_disk(&self, opened: &OpenedToRead) -> bool {
+        opened.file.with_handle(|h| self.fully_on_disk(h, opened.size)).unwrap_or(false)
+    }
+
     fn open_for_read(&self, pre: &LocalPre) -> Result<OpenedToRead> {
         let Some(stamp) = pre.stamp else {
             return Err(Error::WrongOp);
@@ -1036,13 +1040,13 @@ impl LocalFs {
             // Opening it with data access would download it from ourselves.
             return Err(Error::NotOrdinary);
         }
-        let (h, watch, path) = self.volume.open_watched(id, self.hint(id).as_deref())?;
-        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        let (file, path) = self.volume.open_watched(id, self.hint(id).as_deref())?;
+        let entry = file.with_handle(|h| win::stat_handle(h, id)).ok_or(Error::Changed)??.ok_or(Error::Changed)?;
         check_placeholder(&entry, Some(stamp), self.on_demand)?;
         if !self.is_inside(&path) {
             return Err(Error::Outside);
         }
-        Ok(OpenedToRead { handle: h, watch, size: stamp.0, mtime: stamp.1 })
+        Ok(OpenedToRead { file, size: stamp.0, mtime: stamp.1 })
     }
 
     /// Opens destination folder `id`, pinned in place for as long as the

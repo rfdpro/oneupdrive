@@ -408,13 +408,14 @@ fn temp_folders_are_not_another_engines() {
 /// recorded, and changes nothing by reading.
 #[test]
 fn verify_hashes_only_unchanged_ordinary_files() {
-    use oneup_local::verify::{Checked, Verifier};
+    use oneup_local::verify::{Checked, Small, Verifier};
     let t = Tmp::new("verify");
     let big: Vec<u8> = (0..3_000_000u32).map(|i| (i.wrapping_mul(7) >> 3) as u8).collect();
     t.file("same.txt", b"hello world");
     t.file("big.bin", &big);
     let edited = t.file("edited.txt", b"before");
     let gone = t.file("gone.txt", b"bye");
+    let offline = t.file("offline.txt", b"was ordinary");
     let target = t.dir("target");
     assert!(junction(&t.path.join("link"), &target));
 
@@ -430,6 +431,11 @@ fn verify_hashes_only_unchanged_ordinary_files() {
     f.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000)).unwrap();
     drop(f);
     std::fs::remove_file(&gone).unwrap();
+    // Became a placeholder-like file since the scan (marked offline, as an
+    // archiver does; same size and time): refused on the open handle,
+    // before any byte is read.
+    let st = std::process::Command::new("attrib").arg("+O").arg(&offline).status().unwrap();
+    assert!(st.success());
     let before = snapshot(&t.path);
 
     let qxh = |d: &[u8]| {
@@ -443,12 +449,13 @@ fn verify_hashes_only_unchanged_ordinary_files() {
     assert_eq!(v.hash(&rows["edited.txt"]), Checked::Changed);
     assert_eq!(v.hash(&rows["gone.txt"]), Checked::Changed);
     assert_eq!(v.hash(&rows["link"]), Checked::NotOrdinary);
+    assert_eq!(v.hash(&rows["offline.txt"]), Checked::NotOrdinary);
+    assert_eq!(v.read_small(&rows["offline.txt"], 64), Small::Checked(Checked::NotOrdinary));
     assert_eq!(v.opened_by_id(), 1, "found by path, in their folders; only the deleted one looked up by ID");
     // A placeholder as the scan recorded it is refused without being opened.
     let placeholder = oneup_store::LocalRow { reparse_tag: 0x9000_101A, ..rows["same.txt"].clone() };
     assert_eq!(v.hash(&placeholder), Checked::NotOrdinary);
     // Rule files are read with the same guards, and bounded.
-    use oneup_local::verify::Small;
     assert_eq!(v.read_small(&rows["same.txt"], 64), Small::Read(b"hello world".to_vec()));
     assert_eq!(v.read_small(&rows["same.txt"], 5), Small::TooLarge);
     assert_eq!(v.read_small(&rows["edited.txt"], 64), Small::Checked(Checked::Changed));
