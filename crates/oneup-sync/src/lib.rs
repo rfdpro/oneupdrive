@@ -28,7 +28,7 @@ pub use model::{
     Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold, fold_char, same_name,
     strip_folded_prefix,
 };
-pub use op::{Dir, HoldReason, Link, LocalPre, Op, RemotePre, Vacates};
+pub use op::{Dir, HoldReason, Keep, Link, LocalPre, Op, RemotePre, Up, Vacates};
 pub use pending::pending_deletes;
 
 /// Plans one round over the given Synced folders (each folder's *children*

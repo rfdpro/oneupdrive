@@ -2509,6 +2509,10 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
             Line::new("remove", lp(local.id.0), "no copy kept, as you chose; in OneDrive's recycle bin")
         }
         Op::RecycleLocal { local, .. } => Line::new("recycle", lp(local.id.0), "to .oneup\\versions"),
+        Op::RemoveCopy { remote: Some(r), .. } => Line::new("remove", rp(&r.id), "duplicate, as you chose"),
+        Op::RemoveCopy { local, .. } => {
+            Line::new("remove", local.as_ref().map_or_else(String::new, |l| lp(l.id.0)), "duplicate, as you chose")
+        }
         Op::Pair { local, .. } => Line::new("in sync", lp(local.id.0), ""),
         Op::Hash(p) => Line::new("check", lp(p.id.0), "comparing contents"),
         Op::Record(_) | Op::Forget(_) => Line::new("bookkeeping", String::new(), ""),
@@ -2619,6 +2623,11 @@ impl Touched {
             }
             Op::Forget(sid) => synced.push(*sid),
             Op::Hash(l) | Op::Dehydrate { local: l, .. } => local.push(l.id),
+            Op::RemoveCopy { sid, local: l, remote: r, .. } => {
+                synced.extend(*sid);
+                local.extend(l.as_ref().map(|l| l.id));
+                remote.extend(r.as_ref().map(|r| r.id.clone()));
+            }
             Op::Upload { local: l, to, parent, replace, .. } => {
                 local.push(l.id);
                 remote.push(to.clone());
@@ -2957,6 +2966,7 @@ pub fn breaker_what(b: &Breaker) -> String {
             if b.at_least { "at least " } else { "" },
             b.count
         ),
+        BreakerKind::Removal => format!("removing the duplicates you chose: {} changes", b.count),
         BreakerKind::Suspicious => format!(
             "{} files would replace their OneDrive copy with content that doesn't look like their type \
              (as when files are encrypted by ransomware)",

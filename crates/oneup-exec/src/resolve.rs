@@ -97,7 +97,7 @@ enum What {
     /// `folder` again, where it reads as new.
     Forget { sid: Sid, folder: Sid },
     /// Run this in the next round.
-    Rename(Op),
+    Rename(Box<Op>),
 }
 
 /// Fingerprints the records a change concerns.
@@ -155,7 +155,7 @@ impl Change {
                 o.synced_remove(sid)?;
                 o.dirty_mark_synced(&[folder])?;
             }
-            What::Rename(op) => return Ok(Some(op)),
+            What::Rename(op) => return Ok(Some(*op)),
         }
         Ok(None)
     }
@@ -348,7 +348,7 @@ pub fn rename(o: &Ops<'_>, id: LocalId, name: &str) -> Result<Change> {
     }
     print.0.update(name.as_bytes());
     let op = Op::RenameLocal { local: LocalPre { id, stamp }, dir: LocalId(parent), name: name.to_string() };
-    Ok(print.done(What::Rename(op), 1))
+    Ok(print.done(What::Rename(Box::new(op)), 1))
 }
 
 /// `b` is gone from this PC and still in OneDrive (what the planner holds

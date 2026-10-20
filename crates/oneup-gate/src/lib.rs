@@ -32,6 +32,14 @@
 //!   isn't text, as when ransomware encrypts files where they are) than the
 //!   policy allows, those uploads are withheld until the user approves that
 //!   batch, like a circuit breaker. Counted with the recent window too.
+//! * **Removal** of duplicate copies the user chose (`oneup_exec::dupes`):
+//!   the operations that remove them (every [`Op::RemoveCopy`]) are always
+//!   a stop's list of their own
+//!   ([`BreakerKind::Removal`]), whatever the limits: one copy is as much a
+//!   stop as a thousand. They're keyed and approved item by item like any
+//!   list, but never counted in, nor released by, a mass breaker's list, and
+//!   they don't hold the rest of the round back. What they remove here
+//!   always goes to the version store.
 //! * **Malformed** operations, as a defence in depth: a file operation
 //!   without a size/time stamp could not be re-checked, so it never runs.
 //! * The planner's own **holds** pass through, so they can be reported.
@@ -81,7 +89,11 @@ impl Side {
             | Op::RenameLocal { .. }
             | Op::ConflictCopy { .. }
             | Op::RecycleLocal { .. }
+            | Op::RemoveCopy { remote: None, .. }
             | Op::Dehydrate { .. } => Some(Side::Local),
+            // A synced copy goes from both sides: OneDrive's first
+            // ([`changes`] says this PC too).
+            Op::RemoveCopy { remote: Some(_), .. } => Some(Side::Remote),
             Op::Upload { .. }
             | Op::MkdirRemote { .. }
             | Op::MoveRemote { .. }
@@ -92,6 +104,12 @@ impl Side {
     }
 }
 
+/// Whether `op` changes `side`: the side [`Side::changed_by`] names, and
+/// this PC too for a duplicate removed from both sides.
+pub fn changes(op: &Op, side: Side) -> bool {
+    Side::changed_by(op) == Some(side) || (side == Side::Local && matches!(op, Op::RemoveCopy { local: Some(_), .. }))
+}
+
 /// Operations that remove, replace or relocate existing synced content:
 /// what the circuit breakers count. Renames that only clear a name
 /// (`RenameLocal`, `RenameRemote`) or keep both copies (`ConflictCopy`)
@@ -100,6 +118,7 @@ pub fn is_mass_sensitive(op: &Op) -> bool {
     matches!(
         op,
         Op::RecycleLocal { .. }
+            | Op::RemoveCopy { .. }
             | Op::DeleteRemote { .. }
             | Op::PruneRemote { .. }
             | Op::Download { replace: Some(_), .. }
@@ -134,11 +153,14 @@ pub fn unknown_size(op: &Op) -> bool {
 /// through). The window counts a record it can't read as this too.
 pub const FULL: usize = 1_000_000_000;
 
-/// Whether `op` trips its side's breaker whatever the counts: one of
-/// [`unknown_size`]. The one rule both [`review_in`] and [`may_stop`] use,
-/// so any operation that must always be asked about is covered by both.
+/// Whether `op` is asked about whatever the counts: one of
+/// [`unknown_size`] (it trips its side's breaker), or the removal of a
+/// duplicate the user chose ([`is_removal`]: always a list of its own). The
+/// one rule both [`review_in`] and [`may_stop`] use, so any operation that
+/// must always be asked about is covered by both, and its list's keys
+/// always hold the paths the list shows.
 pub fn always_stops(op: &Op) -> bool {
-    unknown_size(op)
+    unknown_size(op) || is_removal(op)
 }
 
 /// Whether reviewing a round could raise a safety stop, or match an
@@ -369,10 +391,12 @@ impl Recent {
     pub fn add_op(&mut self, op: &Op, suspicious: &[LocalId]) {
         if is_mass_sensitive(op) {
             let n = if unknown_size(op) { weight(op).max(FULL) } else { weight(op) };
-            match Side::changed_by(op) {
-                Some(Side::Local) => self.local = self.local.saturating_add(n),
-                Some(Side::Remote) => self.remote = self.remote.saturating_add(n),
-                None => {}
+            // A duplicate removed from both sides counts on each.
+            if changes(op, Side::Local) {
+                self.local = self.local.saturating_add(n);
+            }
+            if changes(op, Side::Remote) {
+                self.remote = self.remote.saturating_add(n);
             }
         }
         if is_suspicious(op, suspicious) {
@@ -390,6 +414,9 @@ pub enum BreakerKind {
     /// Too many files whose new content doesn't look like their type
     /// (the content guard).
     Suspicious,
+    /// Duplicate copies the user chose to remove (see the module docs):
+    /// always a stop, whatever the limits.
+    Removal,
 }
 
 /// A tripped circuit breaker, for the user to review.
@@ -513,6 +540,22 @@ pub struct Context<'a> {
     pub suspicious: &'a [LocalId],
 }
 
+/// Whether `op` removes a duplicate copy the user chose to remove: an
+/// [`Op::RemoveCopy`], only ever made for that.
+pub fn is_removal(op: &Op) -> bool {
+    matches!(op, Op::RemoveCopy { .. })
+}
+
+/// The code of a removal list made of `items` (each operation with the path
+/// its list shows), as its stop shows it: a preview gives the same code for
+/// the same operations at the same paths.
+pub fn removal_fingerprint(items: &[(&Op, &str)]) -> Fingerprint {
+    let mut keys: Vec<ItemKey> = items.iter().map(|(o, p)| item_key(BreakerKind::Removal, o, p)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    fingerprint(b"removal", &keys)
+}
+
 /// Whether `op` sends a file the caller judged suspicious.
 pub fn is_suspicious(op: &Op, suspicious: &[LocalId]) -> bool {
     matches!(op, Op::Upload { local, .. } if suspicious.binary_search(&local.id).is_ok())
@@ -545,11 +588,13 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         .map(|(i, o)| (i, o, cx.pending_paths.get(i).map_or("", String::as_str)))
         .collect();
     let listed = |kind, (_, op, path): Item<'_>| is_listed(kind, op, path, cx.approved);
+    let removal = is_removal;
     for (i, op, p) in items.iter().copied() {
-        for kind in [BreakerKind::Mass, BreakerKind::Suspicious] {
+        for kind in [BreakerKind::Mass, BreakerKind::Suspicious, BreakerKind::Removal] {
             let relevant = match kind {
-                BreakerKind::Mass => is_mass_sensitive(op),
+                BreakerKind::Mass => is_mass_sensitive(op) && !removal(op),
                 BreakerKind::Suspicious => is_suspicious(op, cx.suspicious),
+                BreakerKind::Removal => removal(op),
             };
             if relevant && let Some(k) = listed_key(kind, op, p, cx.approved) {
                 on_lists[i].push(k);
@@ -557,7 +602,9 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         }
     }
     for side in [Side::Local, Side::Remote] {
-        let on_side = |(_, o, _): &Item<'_>| Side::changed_by(o) == Some(side) && is_mass_sensitive(o);
+        // A removal the user chose has a list of its own: a mass list's
+        // approval never covers it.
+        let on_side = |(_, o, _): &Item<'_>| Side::changed_by(o) == Some(side) && is_mass_sensitive(o) && !removal(o);
         let batch: Vec<Item<'_>> = items.iter().copied().filter(on_side).collect();
         if batch.is_empty() {
             continue;
@@ -614,6 +661,27 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
             }
         }
     }
+    // Removing chosen duplicates: always a list of its own, whatever the
+    // limits, until approved item by item like any other. One list for both
+    // sides, shown on OneDrive's if it removes anything there.
+    let batch: Vec<Item<'_>> = items.iter().copied().filter(|(_, o, _)| removal(o)).collect();
+    let (on_list, rest): (Vec<Item<'_>>, Vec<Item<'_>>) =
+        batch.into_iter().partition(|i| listed(BreakerKind::Removal, *i));
+    if !rest.is_empty() {
+        let remote = rest.iter().any(|(_, o, _)| Side::changed_by(o) == Some(Side::Remote));
+        let side = if remote { Side::Remote } else { Side::Local };
+        let b = breaker(BreakerKind::Removal, side, cx, &rest, Vec::new(), weigh(&on_list));
+        if cx.approvals.contains(&Approval { side, fingerprint: b.fingerprint }) {
+            for (i, o, p) in &rest {
+                on_lists[*i].push(item_key(BreakerKind::Removal, o, p));
+            }
+            out.answered.push(b);
+        } else {
+            lists.push(rest.iter().map(|(i, _, _)| *i).collect());
+            breakers.push(b);
+        }
+    }
+
     // Which operations each tripped list holds: they're all withheld (a
     // tripped list's operations never run), placed below.
     let mut in_list: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
@@ -626,12 +694,17 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     drop(items);
 
     // The overflow batch, only when local changes can run at all this round
-    // (otherwise there is nothing to decide yet).
-    let local_blocked = policy.panic || policy.pause_local || breakers.iter().any(|b| b.side == Side::Local);
+    // (otherwise there is nothing to decide yet). A removal waiting for its
+    // approval holds nothing else back.
+    let local_blocked = policy.panic
+        || policy.pause_local
+        || breakers.iter().any(|b| b.side == Side::Local && b.kind != BreakerKind::Removal);
     let mut held_overflow = false;
     let mut discard = false;
     if !local_blocked && let Some(room) = cx.room {
-        let batch: Vec<&Op> = ops.iter().filter(|o| store_size(policy, o).is_some()).collect();
+        // What a removal takes from this PC is kept whatever the room: the
+        // user approved exactly that.
+        let batch: Vec<&Op> = ops.iter().filter(|o| store_size(policy, o).is_some() && !removal(o)).collect();
         let bytes: u64 = batch.iter().filter_map(|o| store_size(policy, o)).sum();
         if bytes > room {
             let fingerprint = overflow_fingerprint(&batch);
@@ -650,16 +723,17 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     for (i, (op, keys)) in ops.into_iter().zip(on_lists).enumerate() {
         let side = Side::changed_by(&op);
         let lists_of = std::mem::take(&mut in_list[i]);
-        let in_batch = store_size(policy, &op).is_some();
+        let chosen = removal(&op);
+        let in_batch = store_size(policy, &op).is_some() && !chosen;
         let why = if matches!(op, Op::Hold { .. }) {
             Some(Withheld::Held)
         } else if malformed(&op) {
             Some(Withheld::Malformed)
         } else if side.is_some() && policy.panic {
             Some(Withheld::Panic)
-        } else if side == Some(Side::Local) && policy.pause_local {
+        } else if changes(&op, Side::Local) && policy.pause_local {
             Some(Withheld::Paused(Side::Local))
-        } else if side == Some(Side::Remote) && policy.pause_remote {
+        } else if changes(&op, Side::Remote) && policy.pause_remote {
             Some(Withheld::Paused(Side::Remote))
         } else if let Some(&l) = lists_of.first() {
             Some(Withheld::Breaker(breakers[l].side))
@@ -680,6 +754,7 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
             }
             None => {
                 let old = match &op {
+                    _ if chosen => OldCopy::Keep,
                     Op::Download { replace: Some(_), .. } if !policy.keep_replaced => OldCopy::DropIfSynced,
                     _ if discard && in_batch => OldCopy::DropIfSynced,
                     _ => OldCopy::Keep,
@@ -702,7 +777,9 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
 /// are only recycled once empty, so they take no room and aren't counted.
 pub fn store_size(policy: &Policy, op: &Op) -> Option<u64> {
     match op {
-        Op::RecycleLocal { local, .. } => local.stamp.map(|(size, _)| size.max(0) as u64),
+        Op::RecycleLocal { local, .. } | Op::RemoveCopy { local: Some(local), .. } => {
+            local.stamp.map(|(size, _)| size.max(0) as u64)
+        }
         Op::Download { replace: Some(local), .. } if policy.keep_replaced => {
             local.stamp.map(|(size, _)| size.max(0) as u64)
         }
@@ -724,7 +801,9 @@ pub fn store_bytes(policy: &Policy, ops: &[Op]) -> u64 {
 fn malformed(op: &Op) -> bool {
     match op {
         // Content goes from or to a file: the stamp is required.
-        Op::Upload { local, .. } | Op::Hash(local) => local.stamp.is_none(),
+        Op::Upload { local, .. } | Op::Hash(local) | Op::RemoveCopy { local: Some(local), .. } => local.stamp.is_none(),
+        // Nothing to remove.
+        Op::RemoveCopy { local: None, remote: None, .. } => true,
         Op::Download { replace: Some(local), .. } => local.stamp.is_none(),
         // Folders are created or empty when they move; anything goes.
         _ => false,
@@ -764,6 +843,7 @@ fn breaker(
     let tag: &[u8] = match kind {
         BreakerKind::Mass => b"breaker",
         BreakerKind::Suspicious => b"suspicious",
+        BreakerKind::Removal => b"removal",
     };
     Breaker {
         kind,
@@ -772,6 +852,8 @@ fn breaker(
         recent: match kind {
             BreakerKind::Mass => cx.recent.on(side),
             BreakerKind::Suspicious => cx.recent.suspicious,
+            // No limit to have used up: only what approved lists ran.
+            BreakerKind::Removal => 0,
         }
         .saturating_add(approved),
         synced_items: cx.synced_items,
@@ -857,6 +939,7 @@ fn key_of(kind: BreakerKind, op: &Op, path: &str) -> ItemKey {
     let tag: &[u8] = match kind {
         BreakerKind::Mass => b"mass",
         BreakerKind::Suspicious => b"suspicious",
+        BreakerKind::Removal => b"removal",
     };
     let mut h = sha2::Sha256::new();
     h.update(tag);
@@ -1462,6 +1545,153 @@ mod tests {
         let r = review(&p, 100, &[Approval { side: Side::Local, fingerprint: b.fingerprint }], ops);
         assert_eq!(r.listed.len(), 30);
         assert!(review(&p, 100, &[], vec![recycle(1)]).listed.is_empty(), "nothing approved, nothing listed");
+    }
+
+    fn prune(i: u128) -> Op {
+        Op::PruneRemote { remote: rpre(i), forget: Vec::new(), items: 1, exact: true, keep: Vec::new() }
+    }
+
+    fn keep() -> oneup_sync::Keep {
+        oneup_sync::Keep::Remote(rpre(99))
+    }
+
+    /// A duplicate only on this PC, chosen for removal.
+    fn remove_local(i: u128, size: i64) -> Op {
+        Op::RemoveCopy {
+            sid: None,
+            remote: None,
+            local: Some(LocalPre { id: LocalId(i), stamp: Some((size, 1)) }),
+            remote_dir: None,
+            remote_up: Default::default(),
+            local_dir: None,
+            local_up: Default::default(),
+            name: format!("f{i}"),
+            hash: [1; 20],
+            keep: keep(),
+        }
+    }
+
+    /// A duplicate in OneDrive only.
+    fn remove_cloud(i: u128) -> Op {
+        Op::RemoveCopy {
+            sid: None,
+            remote: Some(rpre(i)),
+            local: None,
+            remote_dir: None,
+            remote_up: Default::default(),
+            local_dir: None,
+            local_up: Default::default(),
+            name: format!("f{i}"),
+            hash: [1; 20],
+            keep: keep(),
+        }
+    }
+
+    /// A synced duplicate: both sides.
+    fn remove_synced(i: u128, size: i64) -> Op {
+        Op::RemoveCopy {
+            sid: Some(i as Sid),
+            remote: Some(rpre(i)),
+            local: Some(LocalPre { id: LocalId(i), stamp: Some((size, 1)) }),
+            remote_dir: None,
+            remote_up: Default::default(),
+            local_dir: None,
+            local_up: Default::default(),
+            name: format!("f{i}"),
+            hash: [1; 20],
+            keep: keep(),
+        }
+    }
+
+    /// Removing duplicates the user chose always stops for their approval,
+    /// even one copy, far under every limit; only those operations wait.
+    /// The list's code is the preview's for the same operations at the
+    /// same paths; approved, its items run (kept here) and count in the
+    /// window by weight; anything more is a list of its own.
+    #[test]
+    fn a_chosen_removal_is_always_a_stop_of_its_own() {
+        let p = Policy::default();
+        let ops = vec![remove_cloud(1), remove_synced(2, 1), upload_new(3), delete_remote(4), remove_local(5, 70)];
+        let paths: Vec<String> = ["/a.jpg", "/b.jpg", "", "/d.txt", "/e.jpg"].map(String::from).to_vec();
+        let cx = Context { synced_items: 1_000_000, paths: &paths, ..Context::default() };
+        let r = review_in(&p, &cx, ops.clone());
+        assert_eq!(r.breakers.len(), 1);
+        let b = r.breakers[0].clone();
+        assert_eq!((b.kind, b.side, b.count, b.items.len()), (BreakerKind::Removal, Side::Remote, 3, 3));
+        let held: Vec<&Op> = r.withheld.iter().map(|(o, _)| o).collect();
+        assert_eq!(held, [&ops[0], &ops[1], &ops[4]]);
+        assert_eq!(r.lists, [vec![0, 1, 2]], "its list is exactly what it holds");
+        assert_eq!(r.approved.len(), 2, "the rest of the round goes on");
+        let shown = [(&ops[0], "/a.jpg"), (&ops[1], "/b.jpg"), (&ops[4], "/e.jpg")];
+        assert_eq!(removal_fingerprint(&shown), b.fingerprint, "the preview's code");
+        assert_ne!(removal_fingerprint(&shown[..2]), b.fingerprint);
+
+        // Nothing else is a removal, however many: a prune and a recycle
+        // are ordinary.
+        assert!(!is_removal(&prune(1)) && !is_removal(&recycle(2)));
+
+        // Approved item by item: it runs, what goes here is kept and isn't
+        // part of an overflow batch, and it's reported as listed.
+        let approved = b.items.clone();
+        let cx2 = Context { approved: &approved, room: Some(0), ..cx };
+        let r = review_in(&p, &cx2, ops.clone());
+        assert!(r.breakers.is_empty() && r.withheld.is_empty() && r.overflow.is_none());
+        assert!(r.approved.iter().all(|a| a.old_copy() == OldCopy::Keep));
+        assert_eq!(r.store_bytes, 1 + 70);
+        assert_eq!(r.listed.len(), 3);
+        let mut w = Recent::default();
+        for a in &r.approved {
+            w.add_op(a.op(), &[]);
+        }
+        assert_eq!((w.local, w.remote), (2, 3), "counted in the window by weight, a synced copy on both sides");
+        // One more copy is a list of its own.
+        let mut more = ops.clone();
+        more.push(remove_local(6, 1));
+        let r = review_in(&p, &cx2, more);
+        assert_eq!((r.breakers.len(), r.breakers[0].count, r.breakers[0].recent), (1, 1, 3));
+        // Approved by its code: answered, and its items reported for keeping.
+        let ok = [Approval { side: Side::Remote, fingerprint: b.fingerprint }];
+        let r = review_in(&p, &Context { approvals: &ok, ..cx }, ops.clone());
+        assert!(r.breakers.is_empty());
+        assert_eq!((r.answered.len(), r.listed.len()), (1, 3));
+        // Paused: withheld as such, whatever was approved; a synced copy
+        // waits while either side is paused.
+        let paused = Policy { pause_local: true, ..Policy::default() };
+        let r = review_in(&paused, &cx2, ops.clone());
+        assert!(r.withheld.contains(&(ops[1].clone(), Withheld::Paused(Side::Local))));
+        assert!(r.approved.iter().any(|a| a.op() == &ops[0]), "only in OneDrive: goes on");
+    }
+
+    /// A round holding only a removal of chosen duplicates, far below every
+    /// limit, still reads the paths its stop's list shows: they're part of
+    /// its keys, so the list is keyed as it's shown.
+    #[test]
+    fn a_removal_always_has_its_paths_read() {
+        let p = Policy::default();
+        let ops = vec![remove_local(1, 1)];
+        assert!(always_stops(&ops[0]));
+        assert!(may_stop(&p, &ops, &[], Recent::default(), false, false));
+        assert!(!may_stop(&p, &[recycle(1)], &[], Recent::default(), false, false), "an ordinary one doesn't");
+    }
+
+    /// A removal's operations are never counted in, nor released by, a mass
+    /// breaker's list: many chosen removals trip only their own stop, and a
+    /// mass list's approval doesn't run them.
+    #[test]
+    fn chosen_removals_are_never_on_a_mass_list() {
+        let ops: Vec<Op> = (0..300).map(|i| remove_local(i, 1)).collect();
+        let r = review(&Policy::default(), 100, &[], ops.clone());
+        assert_eq!(r.breakers.iter().map(|b| b.kind).collect::<Vec<_>>(), [BreakerKind::Removal]);
+        // Keys of the same operations on a mass list don't approve them.
+        let mass: Vec<ItemKey> = {
+            let mut v: Vec<ItemKey> = ops.iter().map(|o| item_key(BreakerKind::Mass, o, "")).collect();
+            v.sort_unstable();
+            v
+        };
+        let r =
+            review_in(&Policy::default(), &Context { synced_items: 100, approved: &mass, ..Context::default() }, ops);
+        assert_eq!(r.breakers.len(), 1);
+        assert!(r.approved.is_empty());
     }
 
     fn folder_delete(i: u128, etag: &str) -> Op {

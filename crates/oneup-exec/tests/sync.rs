@@ -92,6 +92,11 @@ struct State {
     beaten: Option<String>,
     /// The next folder made with this name fails (a service error).
     mkdir_fails: Option<String>,
+    /// Removals of excluded items and duplicates fail (a service error).
+    prune_fails: bool,
+    /// The next removal first moves this item into that folder: a user on
+    /// the web, between the removal's last check and its request.
+    prune_moves: Option<(String, String)>,
     /// The listing lags behind the cloud (delta lag, [`Fake::lag`]): each
     /// pull delivers what the pull before would have, so it can be older
     /// than what our own requests just got back.
@@ -716,6 +721,16 @@ impl Cloud for Fake {
     async fn prune(&self, pre: &RemotePre) -> Result<(), CloudError> {
         self.exchange(|| -> Result<(), CloudError> {
             let mut s = self.0.lock().unwrap();
+            if s.prune_fails {
+                return Err(CloudError::Other("the service refused".into()));
+            }
+            if let Some((path, into)) = s.prune_moves.take() {
+                let (id, to) = (resolve(&s, &path), resolve(&s, &into));
+                let etag = s.bump();
+                let it = s.items.get_mut(&id).unwrap();
+                it.parent = Some(to);
+                it.etag = etag;
+            }
             s.check(pre)?;
             if let Some(f) = &s.on_remove {
                 f(&pre.id.0);
@@ -1132,7 +1147,13 @@ impl Sync {
                 // What a folder holds, unfiltered, as `oneup_app::sync` reads it.
                 let pending =
                     oneup_sync::pending_deletes(&Parked::with_rules(o, rules), o, &ops, oneup_sync::Flow::TwoWay)?;
-                ops.extend(extra);
+                // A removal of chosen duplicates waits for a round whose
+                // plan doesn't touch what it removes or keeps, as in the agent.
+                let (removal, other): (Vec<Op>, Vec<Op>) = extra.into_iter().partition(oneup_gate::is_removal);
+                ops.extend(other);
+                if !oneup_exec::dupes::touched(&ops, &removal) {
+                    ops.extend(removal);
+                }
                 let (paths, pending_paths) = (shown_paths(o, &ops)?, shown_paths(o, &pending)?);
                 Ok((scope, ops, pending, paths, pending_paths))
             })
@@ -1148,8 +1169,11 @@ impl Sync {
             ..Context::default()
         };
         let r = review_in(&self.policy, &cx, ops);
-        assert!(self.stops.allowed || r.breakers.is_empty(), "{:?}", r.breakers);
-        if !r.breakers.is_empty() {
+        // Removing chosen duplicates waits for its own approval and holds
+        // nothing else back, as in the agent.
+        let blocking = r.breakers.iter().any(|b| b.kind != oneup_gate::BreakerKind::Removal);
+        assert!(self.stops.allowed || !blocking, "{:?}", r.breakers);
+        if blocking {
             // Nothing runs; the marks stay, and the list's folders are
             // marked so every round plans all of it.
             let sids: Vec<oneup_sync::Sid> = r.breakers.iter().flat_map(|b| b.sids.clone()).collect();
@@ -1157,7 +1181,7 @@ impl Sync {
             self.stops.raised = r.breakers;
             return Report::default();
         }
-        self.stops.raised.clear();
+        self.stops.raised.clone_from(&r.breakers);
         self.overflow = r.overflow.clone();
         let awaiting = r.overflow.as_ref().is_some_and(|o| o.outcome == OverflowOutcome::Held);
         let planned = r.approved.len();
@@ -3426,7 +3450,12 @@ fn shown_paths(o: &oneup_store::Ops<'_>, ops: &[Op]) -> oneup_store::Result<Vec<
         .map(|op| {
             Ok(match op {
                 Op::DeleteRemote { remote, .. } => o.path_of(&remote.id.0)?.unwrap_or_default(),
-                Op::RecycleLocal { local, .. } => o.local_path_of(local.id.0)?.unwrap_or_default(),
+                Op::RecycleLocal { local, .. } | Op::RemoveCopy { remote: None, local: Some(local), .. } => {
+                    o.local_path_of(local.id.0)?.unwrap_or_default()
+                }
+                // As `oneup_app::sync` shows a duplicate's removal: by its
+                // OneDrive path when it has one.
+                Op::RemoveCopy { remote: Some(remote), .. } => o.path_of(&remote.id.0)?.unwrap_or_default(),
                 _ => String::new(),
             })
         })
@@ -5095,4 +5124,703 @@ async fn bench_hooks_under_a_10000_file_burst() {
     let slower = b.as_secs_f64() / a.as_secs_f64() - 1.0;
     eprintln!("median sync: without {:.2} s, with {:.2} s: {:+.1}%", a.as_secs_f64(), b.as_secs_f64(), slower * 100.0);
     assert!(slower <= 0.05, "hooks slowed sync by {:.1}%", slower * 100.0);
+}
+
+// ---------------------------------------------------------------- duplicates
+// Copies the user chose to remove (`oneup_exec::dupes`): the gate holds them
+// until the user approves exactly that batch, whatever the circuit breakers'
+// limits, and they run as ordinary operations: OneDrive's copies into its
+// recycle bin, the copies here into the version store.
+
+use oneup_exec::dupes::{Chosen, CopyId, Kept, Plan};
+
+/// Content large enough for the cloud files by size index (1 MiB or more).
+fn big(fill: u8) -> Vec<u8> {
+    let mut v = vec![fill; (1 << 20) + 7];
+    v[0] = b'#';
+    v
+}
+
+impl Sync {
+    /// The copies of `content`, as the Duplicates view lists them: its path
+    /// (in OneDrive, or here for a file only here) and how it's chosen.
+    fn copies_of(&self, content: &[u8]) -> Vec<(String, Chosen)> {
+        let (size, hash) = (content.len() as i64, qxh(content));
+        self.obs
+            .store()
+            .read(|o| {
+                let mut v = Vec::new();
+                for r in o.dup_cloud_copies(size, &hash, 100)? {
+                    let path = o.path_of(&r.id)?.unwrap();
+                    let copy = CopyId::Cloud { id: RemoteId(r.id), etag: r.etag.unwrap() };
+                    v.push((path, Chosen { copy, size, hash }));
+                }
+                for l in o.dup_local_copies(size, &hash, 100)? {
+                    let path = o.local_path_of(l.file_id)?.unwrap();
+                    let copy = CopyId::Local { id: LocalId(l.file_id), size: l.size, mtime: l.mtime };
+                    v.push((path, Chosen { copy, size, hash }));
+                }
+                Ok(v)
+            })
+            .unwrap()
+    }
+
+    /// The copies of `content` at `paths`.
+    fn chosen(&self, content: &[u8], paths: &[&str]) -> Vec<Chosen> {
+        let all = self.copies_of(content);
+        paths
+            .iter()
+            .map(|p| all.iter().find(|(q, _)| q == p).unwrap_or_else(|| panic!("no copy {p}")).1.clone())
+            .collect()
+    }
+
+    /// What the agent adds to its next round for a choice still waiting:
+    /// worked out again from the store as it is now.
+    fn remove_copies(&mut self, chosen: &[Chosen]) -> Plan {
+        let p = self.obs.store().read(|o| oneup_exec::dupes::plan(o, chosen, &[])).unwrap();
+        self.extra = p.ops.clone();
+        p
+    }
+
+    /// The code the preview shows for `p`, its paths as the stop's list
+    /// shows them.
+    fn preview_code(&self, p: &Plan) -> String {
+        p.code(&self.obs.store().read(|o| shown_paths(o, &p.ops)).unwrap())
+    }
+
+    /// The user approves the stop the last round showed.
+    fn approve_stop(&mut self) {
+        assert!(!self.stops.raised.is_empty(), "a stop to approve");
+        self.stops.approve();
+    }
+
+    /// What OneDrive's recycle bin and version history hold of `content`.
+    fn recycled(cloud: &Fake, content: &[u8]) -> usize {
+        cloud.0.lock().unwrap().kept.iter().filter(|k| k.as_slice() == content).count()
+    }
+}
+
+/// Duplicates the user chose go only once the safety stop for exactly them
+/// is approved, even a few, far below the circuit breakers' limits. Then
+/// OneDrive's copies go to its recycle bin and the copies here, synced or
+/// only here, to the version store; the copy left stays on both sides, and
+/// being the last, it can't be chosen.
+#[tokio::test]
+async fn everyday_duplicates_chosen_for_removal_go_recoverably_once_approved() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-remove", cloud.clone());
+    let photo = big(b'p');
+    for p in ["photos/a.jpg", "backup/a.jpg", "old/a copy.jpg", "_vti_a.jpg"] {
+        write(&s.p(p), &photo);
+    }
+    write(&s.p("notes.txt"), b"notes");
+    s.settle().await;
+    assert!(!cloud.tree().contains_key("/_vti_a.jpg"), "a name OneDrive refuses: only here");
+    // Hashed on request (`oneup duplicates --hash-local`).
+    let id = s.local_id("_vti_a.jpg");
+    s.obs
+        .store_mut()
+        .write(|o| {
+            let row = o.local_get(id.0)?.unwrap();
+            o.local_only_hash_put(id.0, row.size, row.mtime, &qxh(&photo)).map(|_| ())
+        })
+        .unwrap();
+    assert_eq!(s.copies_of(&photo).len(), 4);
+
+    let chosen = s.chosen(&photo, &["/backup/a.jpg", "/old/a copy.jpg", "/_vti_a.jpg"]);
+    let plan = s.remove_copies(&chosen);
+    assert_eq!((plan.ops.len(), plan.kept.len()), (3, 0), "one removal per copy, a synced one from both sides");
+    s.round().await;
+    assert_eq!(s.stops.raised.len(), 1, "a stop of its own, below every limit");
+    assert_eq!(
+        format!("{:016x}", s.stops.raised[0].fingerprint.0),
+        s.preview_code(&plan),
+        "the code the preview showed"
+    );
+    for p in ["backup/a.jpg", "old/a copy.jpg", "_vti_a.jpg"] {
+        assert!(s.p(p).exists(), "{p}: not removed without approval");
+    }
+    assert!(cloud.tree().contains_key("/backup/a.jpg"));
+
+    s.approve_stop();
+    s.remove_copies(&chosen);
+    let r = s.round().await;
+    assert!(s.stops.raised.is_empty());
+    assert_eq!(r.done.len(), 3, "{r:?}");
+    s.settle().await;
+    for p in ["backup/a.jpg", "old/a copy.jpg", "_vti_a.jpg"] {
+        assert!(!s.p(p).exists(), "{p}");
+    }
+    let t = cloud.tree();
+    assert!(!t.contains_key("/backup/a.jpg") && !t.contains_key("/old/a copy.jpg"));
+    assert_eq!(t["/photos/a.jpg"].as_deref(), Some(photo.as_slice()));
+    assert_eq!(std::fs::read(s.p("photos/a.jpg")).unwrap(), photo);
+    assert_eq!(s.versions().iter().filter(|v| **v == photo).count(), 3, "each copy here, in the version store");
+    assert_eq!(Sync::recycled(&cloud, &photo), 2, "each copy in OneDrive, in its recycle bin");
+
+    let left = s.copies_of(&photo);
+    assert_eq!(left.len(), 1);
+    let p = s.remove_copies(&[left[0].1.clone()]);
+    assert!(p.ops.is_empty());
+    assert_eq!(p.kept, [(0, Kept::LastCopy)]);
+}
+
+/// A copy that changed after the preview isn't removed: worked out again
+/// for the round, it's left out (and the stop's code changes); changed
+/// after the round planned it, the executor's preconditions skip what it
+/// touches. The edit survives on both sides either way.
+#[tokio::test]
+async fn a_duplicate_changed_after_the_preview_is_skipped_and_its_edit_survives() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-changed", cloud.clone());
+    let data = big(b'd');
+    for p in ["a/x.bin", "b/x.bin", "c/x.bin"] {
+        write(&s.p(p), &data);
+    }
+    s.settle().await;
+
+    // Edited here after it was shown: once that's seen, it's left out.
+    let chosen = s.chosen(&data, &["/b/x.bin", "/c/x.bin"]);
+    let shown = s.remove_copies(&chosen);
+    s.round().await;
+    let edited_here = big(b'h');
+    write(&s.p("b/x.bin"), &edited_here);
+    s.extra.clear();
+    s.round().await;
+    let now = s.remove_copies(&chosen);
+    assert_eq!(now.kept.len(), 1, "{now:?}");
+    assert!(matches!(now.kept[0], (0, Kept::NotInSync | Kept::Changed)), "{now:?}");
+    assert_ne!(s.preview_code(&now), s.preview_code(&shown));
+
+    // Edited in OneDrive after the removal was worked out: the round that
+    // brings the edit here runs none of the removal; worked out again, the
+    // copy has changed.
+    s.round().await;
+    s.approve_stop();
+    let edited_there = big(b't');
+    cloud.edit("c/x.bin", &edited_there);
+    s.remove_copies(&chosen);
+    let r = s.round().await;
+    let ran = r.done.iter().chain(r.skipped.iter().map(|(o, _)| o)).any(oneup_gate::is_removal);
+    assert!(!ran, "put off while the round changes the copy: {r:?}");
+    let again = s.remove_copies(&chosen);
+    assert!(again.kept.iter().any(|(i, k)| *i == 1 && *k == Kept::Changed), "{again:?}");
+    s.extra.clear();
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("b/x.bin")).unwrap(), edited_here);
+    assert_eq!(cloud.tree()["/b/x.bin"].as_deref(), Some(edited_here.as_slice()));
+    assert_eq!(std::fs::read(s.p("c/x.bin")).unwrap(), edited_there);
+    assert_eq!(cloud.tree()["/c/x.bin"].as_deref(), Some(edited_there.as_slice()));
+    assert_eq!(std::fs::read(s.p("a/x.bin")).unwrap(), data, "never chosen");
+    // The version it replaced: in OneDrive's version history, or the
+    // version store if the copy here went first.
+    assert!(Sync::recycled(&cloud, &data) > 0 || s.versions().contains(&data));
+}
+
+/// A crash at any point of an approved removal loses nothing: after a
+/// restart, sync converges, the copy kept is on both sides, and every copy
+/// that went is in the version store or OneDrive's recycle bin.
+#[tokio::test]
+async fn a_crash_while_removing_duplicates_loses_nothing() {
+    for n in 0.. {
+        let cloud = Fake::new();
+        let mut s = Sync::on_disk(&format!("dupes-crash{n}"), cloud.clone());
+        let photo = big(b'c');
+        for p in ["keep/a.jpg", "dup/a.jpg", "_vti_a.jpg"] {
+            write(&s.p(p), &photo);
+        }
+        s.settle().await;
+        let id = s.local_id("_vti_a.jpg");
+        s.obs
+            .store_mut()
+            .write(|o| {
+                let row = o.local_get(id.0)?.unwrap();
+                o.local_only_hash_put(id.0, row.size, row.mtime, &qxh(&photo)).map(|_| ())
+            })
+            .unwrap();
+        let chosen = s.chosen(&photo, &["/dup/a.jpg", "/_vti_a.jpg"]);
+        s.remove_copies(&chosen);
+        s.round().await;
+        s.approve_stop();
+        s.remove_copies(&chosen);
+        s.exec.crash_after(Some(n));
+        let r = s.attempt().await;
+        if r.halted.as_deref() != Some(CRASHED) {
+            assert!(n >= 3, "only {n} crash points");
+            return;
+        }
+        let mut s = s.restart();
+        s.extra.clear();
+        s.settle().await;
+        assert_eq!(std::fs::read(s.p("keep/a.jpg")).unwrap(), photo, "crash point {n}");
+        assert_eq!(cloud.tree()["/keep/a.jpg"].as_deref(), Some(photo.as_slice()), "crash point {n}");
+        let here = local_tree(&s.dir.0).values().filter(|c| c.as_deref() == Some(photo.as_slice())).count();
+        let kept = s.versions().iter().filter(|v| **v == photo).count();
+        assert!(here + kept >= 3, "crash point {n}: a copy on this PC was lost ({here} here, {kept} kept)");
+        let there = cloud.tree().values().filter(|c| c.as_deref() == Some(photo.as_slice())).count();
+        assert!(there + Sync::recycled(&cloud, &photo) >= 2, "crash point {n}: a copy in OneDrive was lost");
+    }
+}
+
+/// The store's durable commits, and the record written ahead, as a second
+/// connection sees them while OneDrive's copy goes.
+type DurableAndRecord = (u64, Option<String>);
+
+/// A synced copy's removal writes its record ahead durably before
+/// OneDrive's copy goes: a power cut then can't lose it, so the copy here
+/// is never left to an ordinary deletion.
+#[tokio::test]
+async fn a_removal_is_recorded_durably_before_onedrives_copy_goes() {
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("dupes-durable", cloud.clone());
+    let data = big(b'd');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    s.extra.clear();
+    let id = resolve(&cloud.0.lock().unwrap(), "/dup/x.bin");
+    let key = format!("exec.pending.{:x}", s.local_id("dup/x.bin").0);
+    let before = s.obs.store().read(|o| o.durable_commits()).unwrap();
+    let db = s.db.as_ref().expect("a database on disk").0.clone();
+    let seen: Arc<Mutex<Option<DurableAndRecord>>> = Arc::default();
+    let out = seen.clone();
+    s.cloud.0.lock().unwrap().on_remove = Some(Arc::new(move |removed: &str| {
+        if removed == id {
+            let store = Store::open(&db, 1024).unwrap();
+            *out.lock().unwrap() = Some(store.read(|o| Ok((o.durable_commits()?, o.meta_get(&key)?))).unwrap());
+        }
+    }));
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.done.iter().any(oneup_gate::is_removal), "{r:?}");
+    let (durable, record) = seen.lock().unwrap().clone().expect("OneDrive's copy went");
+    assert!(record.as_deref().is_some_and(|r| r.starts_with("removing ")), "{record:?}");
+    assert_eq!(durable, before + 1, "in a durable commit");
+}
+
+impl Sync {
+    /// Runs `ops` now, as the agent would once their stop is approved, but
+    /// without reading either side first: what changes between a round's
+    /// plan and its run.
+    async fn run_approved_now(&mut self, ops: Vec<Op>) -> Report {
+        let first = review_in(&Policy::default(), &Context::default(), ops.clone());
+        let approvals: Vec<oneup_gate::Approval> =
+            first.breakers.iter().map(|b| oneup_gate::Approval { side: b.side, fingerprint: b.fingerprint }).collect();
+        let r = review_in(&Policy::default(), &Context { approvals: &approvals, ..Context::default() }, ops);
+        assert!(r.breakers.is_empty(), "{:?}", r.breakers);
+        self.exec.run(self.obs.store_mut(), r.approved).await
+    }
+}
+
+/// The copy that stays is re-read just before a removal runs: changed in
+/// OneDrive meanwhile (another content), the removal is skipped and the
+/// chosen copy stays on both sides.
+#[tokio::test]
+async fn a_removal_whose_survivor_changed_just_before_is_skipped() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-witness", cloud.clone());
+    let data = big(b'w');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    assert_eq!(plan.ops.len(), 1);
+    s.extra.clear();
+    // The copy that stays is edited in OneDrive; nothing has read it yet.
+    cloud.edit("keep/x.bin", &big(b'e'));
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, k)| oneup_gate::is_removal(op) && *k == oneup_exec::Skip::Changed), "{r:?}");
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data);
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+/// A round whose own plan deletes the copy that stays runs none of the
+/// removal: deleted here meanwhile, the survivor goes to OneDrive's recycle
+/// bin as any deletion, and the chosen copy, the last one now, stays.
+#[tokio::test]
+async fn a_removal_waits_while_the_round_deletes_its_survivor() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-survivor-race", cloud.clone());
+    let data = big(b's');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let chosen = s.chosen(&data, &["/dup/x.bin"]);
+    s.remove_copies(&chosen);
+    s.round().await;
+    s.approve_stop();
+    std::fs::remove_file(s.p("keep/x.bin")).unwrap();
+    wait_for_journal(&mut s, 1);
+    s.remove_copies(&chosen);
+    let r = s.round().await;
+    let ran = r.done.iter().chain(r.skipped.iter().map(|(o, _)| o)).any(oneup_gate::is_removal);
+    assert!(!ran, "put off: the round deletes the copy that stays: {r:?}");
+    assert!(r.done.iter().any(|op| matches!(op, Op::DeleteRemote { .. })), "{r:?}");
+    let left = s.remove_copies(&chosen);
+    assert_eq!(left.kept, [(0, Kept::LastCopy)]);
+    s.extra.clear();
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data);
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+/// A synced copy renamed here after it was chosen isn't removed: just
+/// before acting, its name isn't the synced one; once the rename is seen,
+/// the whole choice waits until it has synced. The rename then syncs.
+#[tokio::test]
+async fn a_chosen_copy_renamed_meanwhile_is_left_alone() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-renamed", cloud.clone());
+    let data = big(b'r');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let chosen = s.chosen(&data, &["/dup/x.bin"]);
+    let plan = s.remove_copies(&chosen);
+    s.extra.clear();
+    std::fs::rename(s.p("dup/x.bin"), s.p("dup/renamed.bin")).unwrap();
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, _)| oneup_gate::is_removal(op)), "{r:?}");
+    assert!(s.p("dup/renamed.bin").exists() && cloud.tree().contains_key("/dup/x.bin"));
+    wait_for_journal(&mut s, 1);
+    let now = s.remove_copies(&chosen);
+    assert!(now.wait && now.ops.is_empty(), "{now:?}");
+    s.extra.clear();
+    s.settle().await;
+    assert_eq!(cloud.tree()["/dup/renamed.bin"].as_deref(), Some(data.as_slice()));
+    assert_eq!(std::fs::read(s.p("dup/renamed.bin")).unwrap(), data);
+}
+
+/// The copy here is checked against the chosen content, not only its size
+/// and time: rewritten with the same size and its time put back, it isn't
+/// removed, and neither is OneDrive's copy.
+#[tokio::test]
+async fn a_copy_rewritten_with_its_old_stamp_is_not_removed() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-same-stamp", cloud.clone());
+    let data = big(b'm');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    s.extra.clear();
+    let path = s.p("dup/x.bin");
+    let was = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let other = big(b'o');
+    assert_eq!(other.len(), data.len());
+    std::fs::write(&path, &other).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(was).unwrap();
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, k)| oneup_gate::is_removal(op) && *k == oneup_exec::Skip::Changed), "{r:?}");
+    assert_eq!(std::fs::read(&path).unwrap(), other, "left alone");
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()), "OneDrive's copy too");
+}
+
+/// A synced copy moved here to another folder under the same name after it
+/// was chosen isn't removed: just before acting, it isn't where it was
+/// shown (its folder, by the handle's final path), and neither copy goes.
+#[tokio::test]
+async fn a_chosen_copy_moved_meanwhile_under_its_name_is_left_alone() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-moved", cloud.clone());
+    let data = big(b'v');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    write(&s.p("important/other.txt"), b"other");
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    s.extra.clear();
+    std::fs::rename(s.p("dup/x.bin"), s.p("important/x.bin")).unwrap();
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, _)| oneup_gate::is_removal(op)), "{r:?}");
+    assert_eq!(std::fs::read(s.p("important/x.bin")).unwrap(), data);
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()), "nor OneDrive's");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/important/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+/// A chosen copy whose folder above its own moved after it was shown isn't
+/// removed: it's no longer at the full path the approval named (here, by
+/// the handle's final path), though its own folder and name are the same.
+#[tokio::test]
+async fn a_chosen_copy_whose_folder_above_moved_here_is_left_alone() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-above-here", cloud.clone());
+    let data = big(b'u');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("a/dup/x.bin"), &data);
+    write(&s.p("important/other.txt"), b"other");
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/a/dup/x.bin"]));
+    s.extra.clear();
+    std::fs::rename(s.p("a"), s.p("important/a")).unwrap();
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, _)| oneup_gate::is_removal(op)), "{r:?}");
+    assert_eq!(std::fs::read(s.p("important/a/dup/x.bin")).unwrap(), data);
+    assert_eq!(cloud.tree()["/a/dup/x.bin"].as_deref(), Some(data.as_slice()), "nor OneDrive's");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/important/a/dup/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+/// The same in OneDrive: a folder above the chosen copy moved there after
+/// it was shown, so neither copy goes.
+#[tokio::test]
+async fn a_chosen_copy_whose_folder_above_moved_in_onedrive_is_left_alone() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-above-cloud", cloud.clone());
+    let data = big(b't');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("a/dup/x.bin"), &data);
+    write(&s.p("important/other.txt"), b"other");
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/a/dup/x.bin"]));
+    s.extra.clear();
+    cloud.mv("/a", "/important");
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, _)| oneup_gate::is_removal(op)), "{r:?}");
+    assert_eq!(cloud.tree()["/important/a/dup/x.bin"].as_deref(), Some(data.as_slice()));
+    assert_eq!(std::fs::read(s.p("a/dup/x.bin")).unwrap(), data, "nor the copy here");
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("important/a/dup/x.bin")).unwrap(), data);
+}
+
+/// While the copy here is open to be removed, its place checked, no folder
+/// above it can be moved or renamed by another program: the path checked is
+/// the one it leaves from. Tried in that moment (`cmd /c move` and `ren`),
+/// both are refused, and the copy goes from the path shown.
+#[tokio::test]
+async fn a_folder_above_a_copy_being_removed_cant_move() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-above-held", cloud.clone());
+    let data = big(b'm');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("a/dup/x.bin"), &data);
+    write(&s.p("important/other.txt"), b"other");
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/a/dup/x.bin"]));
+    s.extra.clear();
+    let tried = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (t, a, dup, to) = (tried.clone(), s.p("a"), s.p("a/dup"), s.p("important"));
+    s.exec.local().on_removing(Some(Arc::new(move |_: &Path| {
+        let cmd = |line: String| std::process::Command::new("cmd").raw_arg(line).status().unwrap().success();
+        let moved = cmd(format!("/C move \"{}\" \"{}\" >nul 2>nul", a.display(), to.display()));
+        let renamed = cmd(format!("/C ren \"{}\" dup2 >nul 2>nul", dup.display()));
+        t.lock().unwrap().extend([moved, renamed]);
+    })));
+    let r = s.run_approved_now(plan.ops).await;
+    s.exec.local().on_removing(None);
+    assert_eq!(*tried.lock().unwrap(), [false, false], "neither folder could move");
+    assert!(r.done.iter().any(oneup_gate::is_removal), "{r:?}");
+    assert!(!s.p("a/dup/x.bin").exists());
+    assert!(s.versions().contains(&data), "kept from the path shown");
+    assert_eq!(std::fs::read(s.p("keep/x.bin")).unwrap(), data);
+    // The same move, once nothing holds the copy open, goes through.
+    let line = format!("/C move \"{}\" \"{}\" >nul 2>nul", s.p("a").display(), s.p("important").display());
+    assert!(std::process::Command::new("cmd").raw_arg(line).status().unwrap().success());
+    assert!(s.p("important/a/dup").is_dir());
+}
+
+/// A folder above OneDrive's copy, moved there by someone else between the
+/// removal's last check of it and its request (Graph can't make the two
+/// one step), is harmless: the item removed is exactly the one approved (by
+/// ID and eTag: a folder moving doesn't change what's in it), it goes to
+/// OneDrive's recycle bin, the copy that stays stands, and the moved folder
+/// and everything else in it are untouched.
+#[tokio::test]
+async fn a_folder_above_moved_in_onedrive_during_the_removal_is_harmless() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-above-race", cloud.clone());
+    let data = big(b'r');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("a/dup/x.bin"), &data);
+    write(&s.p("a/dup/other.txt"), b"other");
+    write(&s.p("important/note.txt"), b"note");
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/a/dup/x.bin"]));
+    s.extra.clear();
+    let id = resolve(&cloud.0.lock().unwrap(), "/a/dup/x.bin");
+    cloud.0.lock().unwrap().prune_moves = Some(("/a".into(), "/important".into()));
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.done.iter().any(oneup_gate::is_removal), "{r:?}");
+    assert!(!cloud.0.lock().unwrap().items.contains_key(&id), "the item approved went");
+    assert_eq!(Sync::recycled(&cloud, &data), 1, "to OneDrive's recycle bin");
+    let t = cloud.tree();
+    assert_eq!(t["/important/a/dup/other.txt"].as_deref(), Some(&b"other"[..]));
+    assert_eq!(t["/keep/x.bin"].as_deref(), Some(data.as_slice()));
+    assert!(s.versions().contains(&data), "the copy here, from the path shown");
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("important/a/dup/other.txt")).unwrap(), b"other");
+    assert!(!s.p("important/a/dup/x.bin").exists());
+    assert_eq!(std::fs::read(s.p("keep/x.bin")).unwrap(), data);
+}
+
+/// OneDrive refusing a removal leaves both copies as they were: nothing
+/// here goes first, so no ordinary deletion is left to carry the removal
+/// out later, without its stop or its survivor. Even once the copy that
+/// stayed is deleted, the chosen copy stays on both sides.
+#[tokio::test]
+async fn a_refused_removal_never_finishes_without_its_survivor() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-refused", cloud.clone());
+    let data = big(b'f');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    s.extra.clear();
+    cloud.0.lock().unwrap().prune_fails = true;
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(!r.done.iter().any(oneup_gate::is_removal), "{r:?}");
+    cloud.0.lock().unwrap().prune_fails = false;
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data, "nothing here went first");
+    std::fs::remove_file(s.p("keep/x.bin")).unwrap();
+    s.settle().await;
+    assert!(!cloud.tree().contains_key("/keep/x.bin"), "the survivor's deletion is the user's own");
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()), "the chosen copy stays");
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data);
+}
+
+/// A copy that stays here is read and hashed just before the removal, not
+/// trusted by its size and time: rewritten with the same size and its time
+/// put back, it no longer counts, and the chosen copy isn't removed.
+#[tokio::test]
+async fn a_removal_whose_survivor_here_was_rewritten_with_its_old_stamp_is_skipped() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-survivor-stamp", cloud.clone());
+    let data = big(b'q');
+    write(&s.p("dup/x.bin"), &data);
+    write(&s.p("_vti_x.bin"), &data);
+    s.settle().await;
+    let id = s.local_id("_vti_x.bin");
+    s.obs
+        .store_mut()
+        .write(|o| {
+            let row = o.local_get(id.0)?.unwrap();
+            o.local_only_hash_put(id.0, row.size, row.mtime, &qxh(&data)).map(|_| ())
+        })
+        .unwrap();
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    assert!(matches!(&plan.ops[0], Op::RemoveCopy { keep: oneup_sync::Keep::Local(_), .. }), "{plan:?}");
+    s.extra.clear();
+    let path = s.p("_vti_x.bin");
+    let was = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, big(b'z')).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(was).unwrap();
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.skipped.iter().any(|(op, k)| oneup_gate::is_removal(op) && *k == oneup_exec::Skip::Changed), "{r:?}");
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data);
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+/// OneDrive's copy went, and then the copy here changed before it could go
+/// too (rewritten under its old stamp): the removal isn't finished by an
+/// ordinary deletion later. The copy here keeps its new content and is
+/// uploaded again, and the copy that stays is untouched.
+#[tokio::test]
+async fn a_removal_whose_copy_here_changes_after_onedrives_went_is_undone() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-undone", cloud.clone());
+    let data = big(b'u');
+    write(&s.p("keep/x.bin"), &data);
+    write(&s.p("dup/x.bin"), &data);
+    s.settle().await;
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    s.extra.clear();
+    // The second job of the removal is the copy here going (the first read
+    // it): just before, it's rewritten with the same size and time.
+    let path = s.p("dup/x.bin");
+    let rewritten = big(b'n');
+    let (calls, p, new) = (Arc::new(AtomicUsize::new(0)), path.clone(), rewritten.clone());
+    s.exec.on_blocking(Some(Arc::new(move |op: &Op| {
+        if oneup_gate::is_removal(op) && calls.fetch_add(1, SeqCst) == 1 {
+            let was = std::fs::metadata(&p).unwrap().modified().unwrap();
+            std::fs::write(&p, &new).unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(was).unwrap();
+        }
+    })));
+    let r = s.run_approved_now(plan.ops).await;
+    s.exec.on_blocking(None);
+    assert!(r.skipped.iter().any(|(op, _)| oneup_gate::is_removal(op)), "{r:?}");
+    assert!(!cloud.tree().contains_key("/dup/x.bin"), "OneDrive's went first");
+    s.settle().await;
+    assert_eq!(std::fs::read(&path).unwrap(), rewritten, "kept here");
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(rewritten.as_slice()), "and sent again");
+    assert_eq!(cloud.tree()["/keep/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+/// The copy that stays here is saved in the moment between the executor's
+/// last look at it and the copy here going (OneDrive's already went): the
+/// effect checks its watch once the copy has left its place, puts it back,
+/// so the chosen copy stays, is uploaded again, and both contents survive.
+#[tokio::test]
+async fn a_survivor_saved_just_before_the_copy_here_goes_keeps_the_copy() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let cloud = Fake::new();
+    let mut s = Sync::new("dupes-survivor-gap", cloud.clone());
+    let data = big(b'g');
+    write(&s.p("dup/x.bin"), &data);
+    write(&s.p("_vti_x.bin"), &data);
+    s.settle().await;
+    let id = s.local_id("_vti_x.bin");
+    s.obs
+        .store_mut()
+        .write(|o| {
+            let row = o.local_get(id.0)?.unwrap();
+            o.local_only_hash_put(id.0, row.size, row.mtime, &qxh(&data)).map(|_| ())
+        })
+        .unwrap();
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    assert!(matches!(&plan.ops[0], Op::RemoveCopy { keep: oneup_sync::Keep::Local(_), .. }), "{plan:?}");
+    s.extra.clear();
+    // The removal's jobs: the survivor read, the copy here read, then the
+    // copy here going. Just before that last one, the survivor is saved.
+    let survivor = s.p("_vti_x.bin");
+    let saved = big(b'h');
+    let (calls, p, new) = (Arc::new(AtomicUsize::new(0)), survivor.clone(), saved.clone());
+    s.exec.on_blocking(Some(Arc::new(move |op: &Op| {
+        if oneup_gate::is_removal(op) && calls.fetch_add(1, SeqCst) == 2 {
+            std::fs::write(&p, &new).unwrap();
+        }
+    })));
+    let r = s.run_approved_now(plan.ops).await;
+    s.exec.on_blocking(None);
+    assert!(r.skipped.iter().any(|(op, _)| oneup_gate::is_removal(op)), "{r:?}");
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data, "the chosen copy stays here");
+    assert_eq!(std::fs::read_dir(s.p(".oneup/versions")).unwrap().count(), 0, "back out of the version store");
+    assert_eq!(std::fs::read(&survivor).unwrap(), saved);
+    s.settle().await;
+    assert_eq!(cloud.tree()["/dup/x.bin"].as_deref(), Some(data.as_slice()), "and is sent again");
+    assert_eq!(std::fs::read(s.p("dup/x.bin")).unwrap(), data);
+}
+
+/// Files On-Demand: a chosen duplicate that's a dehydrated placeholder goes
+/// without being downloaded. OneDrive's copy goes to its recycle bin; the
+/// placeholder leaves its place through the version store, like any copy,
+/// and is deleted there (it had no content here); the copy that stays is
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_dehydrated_duplicate_goes_without_downloading() {
+    let cloud = Fake::new();
+    let data = big(b'o');
+    cloud.add("keep", None);
+    cloud.add("keep/x.bin", Some(&data));
+    cloud.add("dup", None);
+    cloud.add("dup/x.bin", Some(&data));
+    let (_od, mut s) = on_demand_sync("dupes-od", &cloud);
+    s.quiesce().await;
+    let (dup, keep) = (s.p("dup").join("x.bin"), s.p("keep").join("x.bin"));
+    assert_eq!(placeholder(&dup).on_disk, 0);
+    let plan = s.remove_copies(&s.chosen(&data, &["/dup/x.bin"]));
+    s.extra.clear();
+    let r = s.run_approved_now(plan.ops).await;
+    assert!(r.done.iter().any(oneup_gate::is_removal), "{r:?}");
+    assert!(!dup.exists());
+    assert!(!cloud.tree().contains_key("/dup/x.bin"));
+    assert_eq!(Sync::recycled(&cloud, &data), 1, "in OneDrive's recycle bin");
+    let slots = std::fs::read_dir(s.p(".oneup/versions")).unwrap().count();
+    assert_eq!(slots, 0, "nothing of it kept here");
+    assert_eq!(placeholder(&keep).on_disk, 0, "nothing downloaded");
+    assert_eq!(cloud.tree()["/keep/x.bin"].as_deref(), Some(data.as_slice()));
 }
