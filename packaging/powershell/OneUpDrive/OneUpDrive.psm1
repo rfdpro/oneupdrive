@@ -141,6 +141,12 @@ function Wait-OneUpSync {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $s = if ($SyncNow) { Invoke-OneUpCall -Method sync_now -DataDir $DataDir } else { Get-OneUpStatus -DataDir $DataDir }
     while ($true) {
+        # A one-direction pause still reads activity 'idle', so check the
+        # pause flags too: "up to date" must mean nothing is held back.
+        $paused = Get-Field $s 'paused'
+        if ($paused -and ($paused.local -or $paused.remote)) {
+            throw 'Sync is paused (Resume-OneUp).'
+        }
         $checked = Get-Field $s 'checked_ms'
         $fresh = (-not $SyncNow) -or ($checked -and $checked -ge $since)
         if ($s.activity -eq 'idle' -and -not (Get-Field $s 'progress') -and $fresh) { return $s }

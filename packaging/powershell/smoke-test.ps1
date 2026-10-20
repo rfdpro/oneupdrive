@@ -101,6 +101,17 @@ try {
     $threw = $false
     try { Wait-OneUpSync -TimeoutSeconds 5 -DataDir $dir | Out-Null } catch { $threw = $_.Exception.Message -like '*paused*' }
     Check 'Wait-OneUpSync says when sync is paused' $threw
+    [void](Resume-OneUp -DataDir $dir)
+
+    # A one-direction pause leaves activity 'idle', but Wait-OneUpSync must
+    # still report it (nothing on that side can finish).
+    foreach ($dir2 in 'Local', 'Remote') {
+        [void](Suspend-OneUp -Direction $dir2 -DataDir $dir)
+        $threw = $false
+        try { Wait-OneUpSync -TimeoutSeconds 5 -DataDir $dir | Out-Null } catch { $threw = $_.Exception.Message -like '*paused*' }
+        Check "Wait-OneUpSync reports a $dir2-only pause" $threw
+        [void](Resume-OneUp -DataDir $dir)
+    }
 
     $none = Join-Path ([IO.Path]::GetTempPath()) ("oneup-ps-none-" + [Guid]::NewGuid().ToString('N'))
     $threw = $false
