@@ -23,9 +23,12 @@
 //!   row when the file is pinned again).
 //! * `pin_user` also holds the folders the user pinned (a trigger notes a
 //!   folder that gets the pin without a rule's note, and the first pass
-//!   after a scan notes the folders it found pinned); one that loses its
-//!   pin is queued in `pin_changed`, so a "Free up space" on a folder above
-//!   doesn't undo it.
+//!   after a scan notes the folders it found pinned), with the creation
+//!   time read on a handle while it's pinned (queued in `pin_changed` to
+//!   read it); one that loses its pin is queued in `pin_changed`, so a
+//!   "Free up space" on a folder above doesn't undo it. Its pin is put back
+//!   only on the item with that creation time: after a rescan, an ID
+//!   another folder reuses isn't pinned.
 //! * `pin_user`: items found pinned already in a folder a rule pinned,
 //!   when the rules first looked at them: the user's own, never taken as
 //!   having inherited the folder's pin.
@@ -103,14 +106,14 @@ pub(crate) fn migrate_v22() -> String {
              next_ms INTEGER NOT NULL
          ) WITHOUT ROWID;
          CREATE INDEX pin_retry_next ON pin_retry(next_ms);
-         CREATE TABLE pin_changed (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
+         CREATE TABLE pin_changed (file_id BLOB PRIMARY KEY, seen INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
          CREATE TABLE pin_subtree (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
-         CREATE TABLE pin_user (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
+         CREATE TABLE pin_user (file_id BLOB PRIMARY KEY, created INTEGER) WITHOUT ROWID;
          CREATE TABLE pin_released (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_owned_hold (file_id BLOB PRIMARY KEY, created INTEGER NOT NULL, at_seq INTEGER NOT NULL) WITHOUT ROWID;
          CREATE TABLE pin_released_hold (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_retry_hold (file_id BLOB PRIMARY KEY, op INTEGER NOT NULL) WITHOUT ROWID;
-         CREATE TABLE pin_user_hold (file_id BLOB PRIMARY KEY, waiting INTEGER NOT NULL) WITHOUT ROWID;
+         CREATE TABLE pin_user_hold (file_id BLOB PRIMARY KEY, waiting INTEGER NOT NULL, created INTEGER) WITHOUT ROWID;
          CREATE TRIGGER pin_item_gone AFTER DELETE ON local_item BEGIN {gone} END;
          CREATE TRIGGER pin_item_kind AFTER UPDATE OF kind ON local_item WHEN OLD.kind != NEW.kind
          BEGIN {gone} END;
@@ -127,6 +130,8 @@ pub(crate) fn migrate_v22() -> String {
          BEGIN
              DELETE FROM pin_user WHERE file_id = NEW.file_id;
              INSERT INTO pin_user(file_id) VALUES (NEW.file_id);
+             DELETE FROM pin_changed WHERE file_id = NEW.file_id;
+             INSERT INTO pin_changed(file_id) VALUES (NEW.file_id);
          END;
          CREATE TRIGGER pin_user_folder_lost AFTER UPDATE OF attributes ON local_item
              WHEN NEW.kind = 1 AND (OLD.attributes & {PINNED}) != 0 AND (NEW.attributes & {PINNED}) = 0
@@ -314,6 +319,18 @@ impl Ops<'_> {
 
     /// Item `id` was pinned again, or handed to `pin_retry`, or needs
     /// nothing: off the queue.
+    /// Whether queued item `id` was looked at once already and left
+    /// queued ([`Ops::pin_changed_seen_mark`]).
+    pub fn pin_changed_seen(&self, id: u128) -> Result<bool> {
+        Ok(self.c.prepare_cached("SELECT 1 FROM pin_changed WHERE file_id = ?1 AND seen != 0")?.exists([blob(id)])?)
+    }
+
+    /// Queued item `id` was looked at and left queued for a later pass.
+    pub fn pin_changed_seen_mark(&self, id: u128) -> Result<()> {
+        self.c.prepare_cached("UPDATE pin_changed SET seen = 1 WHERE file_id = ?1")?.execute([blob(id)])?;
+        Ok(())
+    }
+
     pub fn pin_changed_done(&self, id: u128) -> Result<()> {
         self.c.prepare_cached("DELETE FROM pin_changed WHERE file_id = ?1")?.execute([blob(id)])?;
         Ok(())
@@ -379,6 +396,26 @@ impl Ops<'_> {
         Ok(())
     }
 
+    /// The creation time of the user's item `id`, read on a handle while
+    /// it was pinned, if one was.
+    pub fn pin_user_created(&self, id: u128) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension as _;
+        Ok(self
+            .c
+            .prepare_cached("SELECT created FROM pin_user WHERE file_id = ?1")?
+            .query_row([blob(id)], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten())
+    }
+
+    /// Records the creation time of the user's item `id`.
+    pub fn pin_user_set_created(&self, id: u128, created: i64) -> Result<()> {
+        self.c
+            .prepare_cached("UPDATE pin_user SET created = ?2 WHERE file_id = ?1")?
+            .execute(rusqlite::params![blob(id), created])?;
+        Ok(())
+    }
+
     pub fn pin_user_has(&self, id: u128) -> Result<bool> {
         Ok(self.c.prepare_cached("SELECT 1 FROM pin_user WHERE file_id = ?1")?.exists([blob(id)])?)
     }
@@ -398,8 +435,9 @@ impl Ops<'_> {
                 "INSERT OR IGNORE INTO pin_owned_hold(file_id, created, at_seq) SELECT file_id, created, at_seq FROM pin_owned;
                  INSERT OR IGNORE INTO pin_retry_hold(file_id, op) SELECT file_id, op FROM pin_retry;
                  INSERT OR IGNORE INTO pin_released_hold(file_id) SELECT file_id FROM pin_released;
-                 INSERT OR IGNORE INTO pin_user_hold(file_id, waiting)
-                     SELECT u.file_id, EXISTS (SELECT 1 FROM pin_changed c WHERE c.file_id = u.file_id) FROM pin_user u;",
+                 INSERT OR IGNORE INTO pin_user_hold(file_id, waiting, created)
+                     SELECT u.file_id, EXISTS (SELECT 1 FROM pin_changed c WHERE c.file_id = u.file_id), u.created
+                     FROM pin_user u;",
             )?;
         } else {
             self.c.execute_batch(
@@ -438,14 +476,18 @@ impl Ops<'_> {
             [],
         )?;
         self.c.execute_batch(&format!(
-            "INSERT OR IGNORE INTO pin_user(file_id)
-                 SELECT h.file_id FROM pin_user_hold h JOIN local_item l ON l.file_id = h.file_id;
+            "INSERT OR IGNORE INTO pin_user(file_id, created)
+                 SELECT h.file_id, h.created FROM pin_user_hold h JOIN local_item l ON l.file_id = h.file_id
+                 WHERE h.created IS NOT NULL;
              INSERT OR IGNORE INTO pin_user(file_id)
                  SELECT l.file_id FROM local_item l WHERE l.kind = 1 AND (l.attributes & {PINNED}) != 0
                   AND NOT EXISTS (SELECT 1 FROM pin_owned o WHERE o.file_id = l.file_id);
              INSERT OR IGNORE INTO pin_changed(file_id)
                  SELECT h.file_id FROM pin_user_hold h JOIN local_item l ON l.file_id = h.file_id
-                 WHERE h.waiting != 0 AND l.kind = 1 AND (l.attributes & {PINNED}) = 0;
+                 WHERE h.waiting != 0 AND h.created IS NOT NULL AND l.kind = 1 AND (l.attributes & {PINNED}) = 0;
+             INSERT OR IGNORE INTO pin_changed(file_id)
+                 SELECT u.file_id FROM pin_user u JOIN local_item l ON l.file_id = u.file_id
+                 WHERE u.created IS NULL AND l.kind = 1 AND (l.attributes & {PINNED}) != 0;
              DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;
              DELETE FROM pin_user_hold;"
         ))?;
@@ -620,8 +662,15 @@ mod tests {
             o.local_put(&folder(3, PINNED as u32))?;
             o.local_update(&folder(2, PINNED as u32))?;
             assert!(o.pin_user_has(2)?, "pinned: the trigger notes it");
-            // A "Free up space" above took 2's pin; not restored yet.
+            assert_eq!(o.pin_changed_page(10)?, [2], "queued for its creation time");
+            o.pin_user_set_created(2, 20)?;
+            o.pin_changed_done(2)?;
+            // 5 too, its creation time never read.
+            o.local_put(&folder(5, 0))?;
+            o.local_update(&folder(5, PINNED as u32))?;
+            // A "Free up space" above took their pins; not restored yet.
             o.local_update(&folder(2, 0x0010_0000))?;
+            o.local_update(&folder(5, 0x0010_0000))?;
             o.pin_owned_add(3, 30, 1).map(|_| ())
         })
         .unwrap();
@@ -641,12 +690,17 @@ mod tests {
             o.local_put(&folder(2, 0x0010_0000))?;
             o.local_put(&folder(3, PINNED as u32))?;
             o.local_put(&folder(4, PINNED as u32))?;
+            o.local_put(&folder(5, 0x0010_0000))?;
             assert!(!o.pin_user_has(4)?, "an insert notes nothing");
             o.pins_rebind()?;
             assert!(o.pin_user_has(2)?, "held across the rescan");
+            assert_eq!(o.pin_user_created(2)?, Some(20));
+            assert!(!o.pin_user_has(5)?, "unproven: its ID may be another folder's");
             assert!(o.pin_user_has(4)?, "found pinned: the user's");
             assert!(!o.pin_user_has(3)?, "the rules'");
-            assert_eq!(o.pin_changed_page(10)?, [2], "to be restored");
+            let mut queued = o.pin_changed_page(10)?;
+            queued.sort_unstable();
+            assert_eq!(queued, [2, 4], "to be restored; to read its creation time");
             o.pin_user_remove(4)?;
             o.pins_rebind()?;
             assert!(!o.pin_user_has(4)?, "once per rescan");

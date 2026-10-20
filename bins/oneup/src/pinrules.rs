@@ -634,28 +634,53 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
             continue;
         };
         if row.attributes & PINNED != 0 {
+            // A folder the user pinned: its creation time, read on a
+            // handle, so its pin is only ever put back on this folder.
+            if row.kind == LocalKind::Folder
+                && store.read(|o| Ok(o.pin_user_has(id)? && o.pin_user_created(id)?.is_none()))?
+                && let Ok((got, created)) = pinner.identify(&rel, id)
+                && got == id
+            {
+                store.write(|o| o.pin_user_set_created(id, created))?;
+            }
             store.write(|o| o.pin_changed_done(id))?;
             continue;
         }
         // A folder the user pinned: a "Free up space" on a folder above
         // doesn't undo it (it's pinned again); on the folder itself, it's
-        // the user's choice and the note goes.
+        // the user's choice and the note goes (one pass later).
         if row.kind == LocalKind::Folder && store.read(|o| o.pin_user_has(id))? {
-            let parent_freed = match row.parent_id {
-                Some(p) => store.read(|o| o.local_get(p))?.is_some_and(|p| p.attributes & UNPINNED != 0),
-                None => false,
-            };
-            if !parent_freed {
-                store.write(|o| {
-                    o.pin_user_remove(id)?;
-                    o.pin_changed_done(id)
-                })?;
-            } else if pinner.set(&rel, (id, None), Change::Pin).is_ok() {
-                store.write(|o| o.pin_changed_done(id))?;
-                pass.repinned += 1;
-            } else {
+            if !kept_through_folder_above(store, &row)? {
+                // The folder above may be marked by a record this pass
+                // hasn't seen yet: one more pass before it's the user's
+                // choice on the folder itself.
+                if store.read(|o| o.pin_changed_seen(id))? {
+                    store.write(|o| {
+                        o.pin_user_remove(id)?;
+                        o.pin_changed_done(id)
+                    })?;
+                } else {
+                    store.write(|o| o.pin_changed_seen_mark(id))?;
+                }
+                continue;
+            }
+            // Only on the folder the user pinned: its creation time on the
+            // handle, once read. (A note put back by a rescan always has
+            // one; until it's read, the row itself, kept since, is proof.)
+            let created = store.read(|o| o.pin_user_created(id))?;
+            match pinner.set(&rel, (id, created), Change::Pin) {
+                Ok(()) => {
+                    store.write(|o| o.pin_changed_done(id))?;
+                    pass.repinned += 1;
+                }
+                Err(e) if is_other_item(&e) => {
+                    store.write(|o| {
+                        o.pin_user_remove(id)?;
+                        o.pin_changed_done(id)
+                    })?;
+                }
                 // Not now (in use, say): it stays queued for the next pass.
-                pass.waiting += 1;
+                Err(_) => pass.waiting += 1,
             }
             continue;
         }
@@ -699,6 +724,21 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
         }
     }
     Ok(())
+}
+
+/// Whether a folder above `row` is set to "free up space" (File Explorer
+/// marks every folder down to the one chosen): a walk up the parents.
+fn kept_through_folder_above(store: &Store, row: &LocalRow) -> Result<bool> {
+    let mut cur = row.parent_id;
+    for _ in 0..4096 {
+        let Some(p) = cur else { return Ok(false) };
+        let Some(parent) = store.read(|o| o.local_get(p))? else { return Ok(false) };
+        if parent.attributes & UNPINNED != 0 {
+            return Ok(true);
+        }
+        cur = parent.parent_id;
+    }
+    Ok(false)
 }
 
 /// Whether `row`, set to "free up space" and not pinned, was freed by name
@@ -2604,6 +2644,9 @@ mod tests {
         })
         .unwrap();
         fake.set.clear();
+        // Left queued once (Docs's record may come later), then dropped.
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "one more pass");
         run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
         assert!(fake.set.is_empty() && !s.read(|o| o.pin_user_has(3)).unwrap());
         assert!(!kept_by_folder_above(&s, &a).unwrap());
@@ -2643,22 +2686,61 @@ mod tests {
     /// its pin back.
     #[test]
     fn a_rescan_keeps_a_users_folder_waiting_to_be_restored() {
+        for reused in [false, true] {
+            let mut s =
+                store(&[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
+            journal(&mut s, &[(3, 0x10 | PINNED)]);
+            assert!(s.read(|o| o.pin_user_has(3)).unwrap());
+            // A pass reads its creation time on a handle.
+            let mut fake = Fake::default();
+            run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+            assert_eq!(s.read(|o| o.pin_user_created(3)).unwrap(), Some(0));
+            explorer_free(&mut s, &[2, 3]);
+            rescan(
+                &mut s,
+                &[
+                    row(2, 1, "Docs", LocalKind::Folder, 0x10 | UNPINNED),
+                    row(3, 2, "Kept", LocalKind::Folder, 0x10 | UNPINNED),
+                ],
+            );
+            if reused {
+                // Another folder took the ID meanwhile: not the user's pin.
+                fake.others.insert("Docs/Kept".into(), (3, 99));
+            }
+            let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+            if reused {
+                assert_eq!(p.repinned, 0);
+                assert!(fake.set.is_empty(), "{:?}", fake.set);
+                assert!(!s.read(|o| o.pin_user_has(3)).unwrap());
+            } else {
+                assert_eq!(p.repinned, 1);
+                assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
+                assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "still the user's");
+            }
+        }
+    }
+
+    /// "Free up space" on a folder above whose own record comes in a later
+    /// batch than the user's folder's: the folder stays queued and is
+    /// pinned again once the folder above is seen marked.
+    #[test]
+    fn a_users_folder_waits_for_the_folder_above_to_be_seen() {
         let mut s = store(&[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
         journal(&mut s, &[(3, 0x10 | PINNED)]);
-        assert!(s.read(|o| o.pin_user_has(3)).unwrap());
-        explorer_free(&mut s, &[2, 3]);
-        rescan(
-            &mut s,
-            &[
-                row(2, 1, "Docs", LocalKind::Folder, 0x10 | UNPINNED),
-                row(3, 2, "Kept", LocalKind::Folder, 0x10 | UNPINNED),
-            ],
-        );
         let mut fake = Fake::default();
-        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        // Only Kept's record in this batch.
+        journal(&mut s, &[(3, 0x10 | UNPINNED)]);
+        let p = apply(&mut s, &mut fake, &PinSet::new::<&str>(&[]), Duration::from_secs(60), 0).unwrap();
+        assert_eq!(p.repinned, 0);
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "not dropped yet");
+        assert_eq!(s.read(|o| o.pin_changed_page(10)).unwrap(), [3]);
+        // Docs's record, in the next batch.
+        journal(&mut s, &[(2, 0x10 | UNPINNED)]);
+        let p = apply(&mut s, &mut fake, &PinSet::new::<&str>(&[]), Duration::from_secs(60), 0).unwrap();
         assert_eq!(p.repinned, 1);
         assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
-        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "still the user's");
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap());
     }
 
     /// A user's folder whose pin can't be restored now stays queued and
