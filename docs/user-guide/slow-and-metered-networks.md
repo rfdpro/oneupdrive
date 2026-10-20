@@ -61,7 +61,7 @@ oneup network waiting
 
 ## Data budget
 
-A network's settings (or the metered ones) can have a **monthly data budget** in MB. OneUpDrive counts what it sends and receives on that network, by direction, and shows it in `oneup status` and on the **Network** page (**This network → Data this month**). The count starts again on the first of each month.
+A network's settings (or the metered ones) can have a **monthly data budget** in MB. OneUpDrive counts what it sends and receives on that network, by direction, and shows it in `oneup status` and on the **Network** page (**This network → Data this month**). The count starts again on the first of each month. Your extra folder pairs and vaults share the budget with your main folder: three folders on a 1,000 MB budget use 1,000 MB between them.
 
 * A sync only starts transfers that fit in what's left; the rest waits.
 * When the budget is used up, OneUpDrive pauses on that network and tells you (a notification from the OneUpDrive icon). **Allow 500 MB more** (in the icon's menu, on the Network page, or `oneup network allow-more`) adds to this month's budget and syncing goes on.
