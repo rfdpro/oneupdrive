@@ -2,7 +2,36 @@
 
 Some files don't belong in the cloud: downloaded dependencies, build output, temporary files. Syncing them wastes your computer's resources. On one developer's PC, **9 out of 10** files the OneDrive app was tracking were exactly this kind of junk.
 
-In the settings window, all of this is on the **Files** page: right-click an item and choose **Exclude** (or **Sync again**), or see everything excluded under **Exclude**. Excluding something **never deletes it**, from your PC or from OneDrive. It stops it being **uploaded**: what's already in OneDrive still shows up here (online-only, with Files On-Demand) and opens as usual (see [What happens to OneDrive's copies](#what-happens-to-onedrives-copies)). Rule changes take effect at once, with no rescan: a running background agent applies them as soon as `oneup rules` saves them, or as soon as you save a `.oneupignore` file.
+In the settings window, all of this is on the **Files** page: untick an item's box in the tree (or right-click it and choose **Exclude…**), tick it to sync it again, or see everything excluded under **Exclude**. Excluding something **never deletes it**, from your PC or from OneDrive. It stops it being **uploaded**: what's already in OneDrive still shows up here (online-only, with Files On-Demand) and opens as usual (see [What happens to OneDrive's copies](#what-happens-to-onedrives-copies)). Rule changes take effect at once, with no rescan: a running background agent applies them as soon as `oneup rules` saves them, or as soon as you save a `.oneupignore` file.
+
+## Ticking and unticking in the file tree
+Each file and folder on the **Files** page has a box:
+
+* **Ticked**: it syncs.
+* **Unticked**: it's excluded. The status beside it says why: *Excluded by preset*, *Excluded by rule* (one of yours), *By .oneupignore*, or *In excluded folder*. Point at the box for the exact rule.
+* **Partly ticked** (a dash): the folder syncs, but one of your rules excludes something inside it (*Some excluded*). Rules that apply everywhere, such as `*.iso` or a preset, don't mark every folder. A folder with a `.oneupignore` file somewhere inside says so when you point at its box ("Has a .oneupignore inside").
+* **Greyed out**: the window can't change it here. A paused folder is resumed from its details; a folder inside an excluded one comes back by ticking that folder; a `.oneupignore` rule is changed in that file.
+
+**Unticking** shows first what stops syncing: how many files and how much is inside it on this PC (and how many of those are online-only) and in OneDrive ("at least" when it holds folders OneUpDrive doesn't look inside), and what then happens to OneDrive's copies (the setting below, which you can change in the same dialog; it applies to every excluded item). **Exclude** writes a rule naming exactly that item, like `/Projects/old/`, into `config.toml`. Nothing is deleted from your PC.
+
+**Ticking** an item a preset or one of your broader rules excludes adds an exception (`!/Projects/old/`); ticking one you unticked removes its rule.
+
+From the command line:
+
+```powershell
+oneup --data-dir … rules --exclude-path "Projects\old"         # what would stop syncing (changes nothing)
+oneup --data-dir … rules --exclude-path "Projects\old" --yes   # exclude it (refused if it moved or was replaced meanwhile)
+oneup --data-dir … rules --include-path "Projects\old"         # sync it again
+```
+
+## Suggestions
+**Exclude** lists a few folders worth a look: the **largest** in OneDrive, and the **busiest**, those whose files changed most often in the last 7 days. A folder that's nearly all one folder inside it suggests the one inside. They're only suggestions: nothing is excluded unless you choose **Exclude**, which shows the same summary as unticking. Folders already excluded aren't suggested.
+
+```powershell
+oneup --data-dir … rules --suggest
+```
+
+The largest come from the sizes OneDrive reports for its folders, so a folder only on this PC isn't among them until it's uploaded.
 
 ## Presets
 Ready-made rule sets. None is on unless you turn it on, because what's junk to one person is work to another.
