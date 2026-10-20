@@ -475,8 +475,8 @@ mod tests {
         let r = oneup_gate::review_in(&p, &cx, vec![c.op()]);
         assert_eq!(r.approved.len(), 1, "approved, it goes");
         let mut window = oneup_gate::Recent::default();
-        window.add_op(r.approved[0].op(), &[], &p);
-        assert!(window.remote > p.max_count, "counted as over the limit, not as 10");
+        window.add_op(r.approved[0].op(), &[]);
+        assert_eq!(window.remote, oneup_gate::FULL, "counted as full, not as 10");
     }
 
     /// Items the user chose to keep in OneDrive aren't offered again, also

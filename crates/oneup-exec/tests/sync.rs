@@ -1035,7 +1035,7 @@ impl Sync {
         let report = self.exec.run_following(store, r.approved, &count, may_run, &follow, self.follow_max).await;
         if let Some(w) = &mut self.stops.window {
             for op in &report.done {
-                w.add_op(op, &[], &self.policy);
+                w.add_op(op, &[]);
             }
         }
         let followed = followed.into_inner().unwrap();

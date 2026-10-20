@@ -128,6 +128,12 @@ pub fn unknown_size(op: &Op) -> bool {
     matches!(op, Op::PruneRemote { exact: false, .. })
 }
 
+/// A count more than any limit: what the safety window records for a
+/// removal of unknown size ([`unknown_size`]), whatever the limits are
+/// then or later (raising them meanwhile doesn't let the next deletions
+/// through). The window counts a record it can't read as this too.
+pub const FULL: usize = 1_000_000_000;
+
 /// Whether `op` trips its side's breaker whatever the counts: one of
 /// [`unknown_size`]. The one rule both [`review_in`] and [`may_stop`] use,
 /// so any operation that must always be asked about is covered by both.
@@ -357,10 +363,10 @@ impl Recent {
     /// changes if it's mass-sensitive, and one suspicious upload if it's in
     /// `suspicious`. Every count the safety window keeps goes through this,
     /// so a pruned folder counts as everything in it, and one of unknown
-    /// size ([`unknown_size`]) as over `policy`'s limit by itself.
-    pub fn add_op(&mut self, op: &Op, suspicious: &[LocalId], policy: &Policy) {
+    /// size ([`unknown_size`]) as [`FULL`].
+    pub fn add_op(&mut self, op: &Op, suspicious: &[LocalId]) {
         if is_mass_sensitive(op) {
-            let n = if unknown_size(op) { weight(op).max(policy.max_count.saturating_add(1)) } else { weight(op) };
+            let n = if unknown_size(op) { weight(op).max(FULL) } else { weight(op) };
             match Side::changed_by(op) {
                 Some(Side::Local) => self.local = self.local.saturating_add(n),
                 Some(Side::Remote) => self.remote = self.remote.saturating_add(n),
@@ -1375,12 +1381,12 @@ mod tests {
         let r = review_in(&p, &cx, vec![huge.clone(), delete_remote(1)]);
         assert_eq!(r.breakers[0].count, usize::MAX);
         let mut done = Recent::default();
-        done.add_op(&huge, &[], &p);
-        done.add_op(&huge, &[], &p);
+        done.add_op(&huge, &[]);
+        done.add_op(&huge, &[]);
         assert_eq!(done.remote, usize::MAX);
         let mut few = Recent::default();
         let prune = |items, exact| Op::PruneRemote { remote: rpre(9), forget: vec![9], items, exact, keep: Vec::new() };
-        few.add_op(&prune(1000, true), &[], &p);
+        few.add_op(&prune(1000, true), &[]);
         assert_eq!(few, Recent { remote: 1000, ..Recent::default() }, "a pruned folder counts as all it holds");
     }
 
@@ -1400,8 +1406,8 @@ mod tests {
         let cx = Context { synced_items: 10_000_000, approved: &b.items, ..Context::default() };
         assert!(review_in(&p, &cx, vec![some.clone()]).breakers.is_empty());
         let mut done = Recent::default();
-        done.add_op(&some, &[], &p);
-        assert_eq!(done.remote, p.max_count + 1);
+        done.add_op(&some, &[]);
+        assert_eq!(done.remote, FULL);
         let r = review_in(
             &p,
             &Context { synced_items: 10_000_000, recent: done, ..Context::default() },
