@@ -29,7 +29,7 @@ impl<C: Cloud> Executor<C> {
     /// Runs one approved rewind step.
     pub(super) async fn rewind(&self, store: &Db<'_>, a: &Arc<Approved>, sid: Sid, step: &Step) -> Res {
         match step {
-            Step::Restore { id, to, name, kind, content } => {
+            Step::Restore { id, to, name, kind, content, .. } => {
                 // Back already (a folder restored with its contents, or the
                 // user meanwhile): only if it's where it belongs.
                 let row = match self.cloud.item(id).await {

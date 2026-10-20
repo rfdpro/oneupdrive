@@ -61,6 +61,7 @@ CREATE TABLE synced_history (
 CREATE INDEX synced_history_sid ON synced_history(sid, seq);
 CREATE INDEX synced_history_parent ON synced_history(parent_sid, at_ms) WHERE parent_sid IS NOT NULL;
 CREATE INDEX synced_history_at ON synced_history(at_ms);
+CREATE INDEX synced_history_remote ON synced_history(remote_id) WHERE remote_id IS NOT NULL;
 CREATE TRIGGER synced_history_ins AFTER INSERT ON synced_item WHEN {on}
 BEGIN
     INSERT INTO synced_history(at_ms, sid, change) VALUES ({NOW_MS}, NEW.sid, {CREATED});
@@ -348,6 +349,19 @@ impl History for Ops<'_> {
 
     fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>> {
         self.history_children_after(parent, at)
+    }
+
+    fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>> {
+        let row = self
+            .c
+            .prepare_cached(
+                "SELECT change, parent_sid, name, kind, size, qxh, remote_id FROM synced_history
+                 WHERE remote_id = ?1 ORDER BY seq DESC LIMIT 1",
+            )?
+            .query_row([id.0.as_str()], |r| was_of(r, 0))
+            .optional()?
+            .flatten();
+        row.map(to_was).transpose()
     }
 }
 

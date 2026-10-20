@@ -169,6 +169,7 @@ impl Job {
         let approval = self.approval.as_ref().map(|a| {
             json!({
                 "approved": marks_json(&a.approved),
+                "between": marks_json(&a.between),
                 "left": marks_json(&a.left),
                 "follows": a.follows.iter().map(|k| format!("{k:032x}")).collect::<Vec<_>>(),
             })
@@ -189,6 +190,7 @@ impl Job {
             None | Some(Value::Null) => None,
             Some(a) => Some(Approval {
                 approved: marks_of(a.get("approved"))?,
+                between: marks_of(a.get("between"))?,
                 left: marks_of(a.get("left"))?,
                 follows: a
                     .get("follows")?
@@ -454,6 +456,9 @@ pub struct Steps {
     pub preview: Option<(u64, Vec<Op>)>,
     /// Steps planned that its approval doesn't cover.
     pub left_alone: usize,
+    /// Items skipped only until the next rounds sync what changed (often
+    /// the rewind's own steps): it doesn't end meanwhile.
+    pub waiting: usize,
 }
 
 /// The steps a round adds for rewind `job`, planned from the store now.
@@ -471,6 +476,7 @@ pub fn steps(o: &Ops<'_>, rules: &RuleSet, job: &Job) -> Result<Steps> {
             ..Steps::default()
         });
     };
+    let waiting = r.skipped.iter().filter(|(_, _, why)| why.passes()).count();
     let (take, leave) = approval.take(r.ops, r.paths);
     let later: Shown = r.later.into_iter().filter(|(op, _)| approval.accepts(op)).collect();
     let (ops, paths): (Vec<Op>, Vec<String>) = take.into_iter().unzip();
@@ -483,6 +489,7 @@ pub fn steps(o: &Ops<'_>, rules: &RuleSet, job: &Job) -> Result<Steps> {
         rewound: approval.follows.iter().map(|k| oneup_gate::ItemKey(*k)).collect(),
         preview: None,
         left_alone: leave.len(),
+        waiting,
     })
 }
 
@@ -516,7 +523,12 @@ pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Repor
     job.failed += report.failed.iter().filter(|(op, _)| matches!(op, Op::Rewind { .. })).count() as u64;
     let tried = !steps.ops.is_empty();
     job.stalls = if tried && done.is_empty() { job.stalls + 1 } else { 0 };
-    let finished = (!tried && steps.later.is_empty()) || job.stalls >= STALLS;
+    // Waiting for this PC to catch up with its own steps (or a change
+    // there) isn't the end, but counts towards a stall.
+    if !tried && steps.waiting > 0 {
+        job.stalls += 1;
+    }
+    let finished = (!tried && steps.later.is_empty() && steps.waiting == 0) || job.stalls >= STALLS;
     if !finished {
         save(o, job)?;
         return Ok(false);
@@ -801,7 +813,8 @@ mod tests {
         approval.approved.insert(Key::Local(LocalId(0xabc)), Mark::Local(Some((3, 4))));
         approval.approved.insert(Key::Record(7), Mark::Record);
         let spot = Spot { parent: RemoteId("A!2".into()), name: "a b.txt".into(), size: 5, hash: Some([9; 20]) };
-        approval.left.insert(Key::Cloud(RemoteId("A!3".into())), Mark::Cloud(spot));
+        approval.left.insert(Key::Cloud(RemoteId("A!3".into())), Mark::Cloud(spot.clone()));
+        approval.between.insert(Key::Cloud(RemoteId("A!4".into())), Mark::Cloud(spot));
         approval.follows.insert(7);
         let job = Job {
             folder: "/docs".into(),

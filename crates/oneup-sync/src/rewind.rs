@@ -84,6 +84,11 @@ pub trait History {
     /// with the folder's children now, every item that may have been in it
     /// at `at`.
     fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>, Self::Error>;
+
+    /// What a record linked to OneDrive item `id` last agreed on before it
+    /// went (or was linked to another item): the item as it went into
+    /// OneDrive's recycle bin.
+    fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, Self::Error>;
 }
 
 /// One step of a rewind, for [`Op::Rewind`].
@@ -92,8 +97,17 @@ pub enum Step {
     /// Bring back deleted item `id` from OneDrive's recycle bin, into cloud
     /// folder `to` as `name`. A file whose content then was `content`
     /// (size, hash) is put back to it from its version history if it was
-    /// edited before it was deleted.
-    Restore { id: RemoteId, to: RemoteId, name: String, kind: NodeKind, content: Option<(i64, Hash)> },
+    /// edited before it was deleted; `gone`: its content when it went, what
+    /// the recycle bin gives back (a restore cut short between the two
+    /// goes on from there).
+    Restore {
+        id: RemoteId,
+        to: RemoteId,
+        name: String,
+        kind: NodeKind,
+        content: Option<(i64, Hash)>,
+        gone: Option<(i64, Hash)>,
+    },
     /// Put cloud item `remote`, which is `from` now, back into folder and
     /// name `place`, and (files) back to content `content` from its version
     /// history. The version it replaces stays in that history.
@@ -199,6 +213,14 @@ pub enum Skip {
     NotSyncedYet,
     /// Its content then wasn't recorded (no hash), so it can't be checked.
     UnknownContent,
+}
+
+impl Skip {
+    /// Whether it lasts only until the next rounds sync what changed (often
+    /// the rewind's own steps): a rewind waits for it rather than end.
+    pub fn passes(self) -> bool {
+        matches!(self, Skip::ChangedInCloud | Skip::NotSyncedYet)
+    }
 }
 
 /// A rewind's plan: the operations, in the order they must run, the path
@@ -441,10 +463,10 @@ where
         match (target, current) {
             (None, None) => {}
             (None, Some((base, path))) => b.created(t, sid, base, path)?,
-            (Some(then_item), None) => b.deleted(t, sid, then_item, &dest)?,
+            (Some(then_item), None) => b.deleted(t, h, sid, then_item, &dest)?,
             (Some(then_item), Some((base, path))) if split.contains(&sid) => {
                 b.created(t, sid, base, path)?;
-                b.deleted(t, sid, then_item, &dest)?;
+                b.deleted(t, h, sid, then_item, &dest)?;
             }
             (Some(then_item), Some((base, path))) => b.kept(t, sid, then_item, base, path, &dest)?,
         }
@@ -552,9 +574,10 @@ impl Builder {
     }
 
     /// Deleted since (or replaced by another item): back from the recycle bin.
-    fn deleted<T: Trees + ?Sized>(
+    fn deleted<T: Trees + ?Sized, H: History<Error = T::Error> + ?Sized>(
         &mut self,
         t: &T,
+        h: &H,
         sid: Sid,
         (w, path, depth): &Then,
         dest: &dyn Fn(Sid) -> Result<Option<RemoteId>, T::Error>,
@@ -576,8 +599,9 @@ impl Builder {
             (NodeKind::File, Some(hash)) => Some((w.size, hash)),
             _ => None,
         };
+        let gone = h.last_seen(&id)?.and_then(|g| g.hash.map(|hash| (g.size, hash)));
         self.change(sid, Kind::Restore, w.kind, Some(path), None, w.size);
-        let step = Step::Restore { id, to, name: w.name.clone(), kind: w.kind, content };
+        let step = Step::Restore { id, to, name: w.name.clone(), kind: w.kind, content, gone };
         self.restores.push((*depth, Op::rewind(sid, step), path.clone()));
         Ok(())
     }
@@ -971,13 +995,34 @@ pub fn mark_of(op: &Op) -> Option<(Key, Mark)> {
     })
 }
 
+/// The state a step leaves its item in between its two parts, if it has
+/// two: a restore that also puts back content (restored as it went), a
+/// reset that also moves (content first, then the move). A step cut short
+/// there (the process killed, a refusal) goes on from it in a later round.
+pub fn midway(op: &Op) -> Option<(Key, Mark)> {
+    let Op::Rewind { step, .. } = op else { return None };
+    match &**step {
+        Step::Restore { id, to, name, content: Some(c), gone: Some(g), .. } if c != g => Some((
+            Key::Cloud(id.clone()),
+            Mark::Cloud(Spot { parent: to.clone(), name: name.clone(), size: g.0, hash: Some(g.1) }),
+        )),
+        Step::Reset { remote, from, place: Some(_), content: Some((size, hash)) } => Some((
+            Key::Cloud(remote.id.clone()),
+            Mark::Cloud(Spot { parent: from.parent.clone(), name: from.name.clone(), size: *size, hash: Some(*hash) }),
+        )),
+        _ => None,
+    }
+}
+
 /// A rewind the user approved, item by item: the state each item was in
-/// when the preview listed it, and the state the rewind's own last step on
-/// it left it in. A later round's step runs only from one of those (see
-/// the module docs).
+/// when the preview listed it, the state between a two-part step's parts
+/// ([`midway`]), and the state the rewind's own last step on it left it
+/// in. A later round's step runs only from one of those (see the module
+/// docs).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Job {
     pub approved: BTreeMap<Key, Mark>,
+    pub between: BTreeMap<Key, Mark>,
     pub left: BTreeMap<Key, Mark>,
     /// What this PC is to do to follow the changes its steps made, by key
     /// (`oneup_gate::follow_key`; the caller adds them as steps run and
@@ -988,13 +1033,19 @@ pub struct Job {
 impl Job {
     /// The approval of exactly the steps `ops` (a stop's list).
     pub fn approve(ops: &[Op]) -> Job {
-        Job { approved: ops.iter().filter_map(mark_of).collect(), ..Job::default() }
+        Job {
+            approved: ops.iter().filter_map(mark_of).collect(),
+            between: ops.iter().filter_map(midway).collect(),
+            ..Job::default()
+        }
     }
 
     /// Whether `op` is a step of this rewind from a state it may run from.
     pub fn accepts(&self, op: &Op) -> bool {
         let Some((key, mark)) = mark_of(op) else { return false };
-        self.approved.get(&key) == Some(&mark) || self.left.get(&key) == Some(&mark)
+        self.approved.get(&key) == Some(&mark)
+            || self.between.get(&key) == Some(&mark)
+            || self.left.get(&key) == Some(&mark)
     }
 
     /// Of a round's steps `ops` (each shown at the path of the same place
