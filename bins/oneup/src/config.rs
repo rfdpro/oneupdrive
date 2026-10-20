@@ -449,6 +449,24 @@ fn save_or_remove(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, 
     let existing = read_doc(data_dir)?;
     let fresh = existing.is_none();
     let mut doc = existing.unwrap_or_default();
+    put_section(&mut doc, fresh, name, intro, entries)?;
+    write_doc(data_dir, &doc)
+}
+
+/// Writes the whole file at once: flushed, then renamed into place.
+fn write_doc(data_dir: &Path, doc: &DocumentMut) -> Result<()> {
+    let p = path(data_dir);
+    crate::ownfile::write(&p, doc.to_string().as_bytes()).with_context(|| format!("writing {}", p.display()))
+}
+
+/// [`save_or_remove`]'s change, in a document being edited.
+fn put_section(
+    doc: &mut DocumentMut,
+    fresh: bool,
+    name: &str,
+    intro: &str,
+    entries: Vec<(&str, Option<Item>)>,
+) -> Result<()> {
     if !doc.contains_table(name) {
         let mut t = Table::new();
         t.decor_mut().set_prefix(if fresh { format!("{HEADER}\n{intro}") } else { format!("\n{intro}") });
@@ -463,8 +481,6 @@ fn save_or_remove(data_dir: &Path, name: &str, intro: &str, entries: Vec<(&str, 
             (None, None) => {}
         }
     }
-    let p = path(data_dir);
-    crate::ownfile::write(&p, doc.to_string().as_bytes()).with_context(|| format!("writing {}", p.display()))?;
     Ok(())
 }
 
@@ -661,7 +677,29 @@ pub fn check_busy(b: &crate::busy::Settings) -> Result<()> {
     Ok(())
 }
 
+const AGENT_INTRO: &str = "# How the background agent uses this PC. Caps in KiB/s, 0 = none.\n";
+
 pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
+    save_or_remove(data_dir, "agent", AGENT_INTRO, agent_entries(a))
+}
+
+/// `[agent]` and whatever `more` changes, written in one go: settings that
+/// must change together (`crate::network`'s metered choice and
+/// `pause_on_metered`) never end up half saved.
+pub(crate) fn save_agent_with(
+    data_dir: &Path,
+    a: &Agent,
+    more: impl FnOnce(&mut DocumentMut) -> Result<()>,
+) -> Result<()> {
+    let existing = read_doc(data_dir)?;
+    let fresh = existing.is_none();
+    let mut doc = existing.unwrap_or_default();
+    put_section(&mut doc, fresh, "agent", AGENT_INTRO, agent_entries(a))?;
+    more(&mut doc)?;
+    write_doc(data_dir, &doc)
+}
+
+fn agent_entries(a: &Agent) -> Vec<(&'static str, Option<Item>)> {
     let n = |v: u64| value(i64::try_from(v).unwrap_or(i64::MAX));
     let mut entries: Vec<(&str, Option<Item>)> = vec![
         ("upload_kib_per_s", n(a.upload_kib)),
@@ -697,7 +735,7 @@ pub fn save_agent(data_dir: &Path, a: &Agent) -> Result<()> {
     ]) {
         entries.push((key, v.map(|v| value(i64::from(v)))));
     }
-    save_or_remove(data_dir, "agent", "# How the background agent uses this PC. Caps in KiB/s, 0 = none.\n", entries)
+    entries
 }
 
 /// The `[space]` section: freeing up space by itself, with Files

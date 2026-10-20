@@ -309,6 +309,19 @@ fn write_layer(t: &mut Table, l: &Layer) {
 /// file (and the comments around these keys) as it was.
 pub fn save(data_dir: &Path, nets: &Networks) -> Result<()> {
     let mut doc = config::read_doc(data_dir)?.unwrap_or_else(DocumentMut::new);
+    write_networks(&mut doc, nets)?;
+    let p = config::path(data_dir);
+    crate::ownfile::write(&p, doc.to_string().as_bytes()).with_context(|| format!("writing {}", p.display()))
+}
+
+/// `[metered]` and `[networks]` with `[agent]` (its `pause_on_metered`
+/// goes with the metered choice), in one write.
+pub fn save_with_agent(data_dir: &Path, nets: &Networks, agent: &Agent) -> Result<()> {
+    config::save_agent_with(data_dir, agent, |doc| write_networks(doc, nets))
+}
+
+/// [`save`]'s change, in a document being edited.
+fn write_networks(doc: &mut DocumentMut, nets: &Networks) -> Result<()> {
     if !doc.contains_table("metered") {
         let mut t = Table::new();
         t.decor_mut().set_prefix(
@@ -341,8 +354,7 @@ pub fn save(data_dir: &Path, nets: &Networks) -> Result<()> {
             write_layer(t, l);
         }
     }
-    let p = config::path(data_dir);
-    crate::ownfile::write(&p, doc.to_string().as_bytes()).with_context(|| format!("writing {}", p.display()))
+    Ok(())
 }
 
 /// Which profile `oneup network set` and the settings window change.
@@ -437,17 +449,16 @@ pub fn apply(dir: &Path, target: &Target, c: &Changes) -> Result<()> {
             let mut nets = load(dir)?;
             c.onto(&mut nets.metered);
             // "Paused" is the long-standing [agent] switch; [metered]
-            // transfer says what moves when it's off.
+            // transfer says what moves when it's off. Both in one write.
+            let mut a = config::load_agent(dir)?;
             if let Some(t) = c.transfer {
-                let mut a = config::load_agent(dir)?;
                 a.pause_on_metered = t == Transfer::Paused;
-                config::save_agent(dir, &a)?;
                 if t == Transfer::Paused {
                     nets.metered.transfer = None;
                 }
             }
             check(&nets.metered)?;
-            save(dir, &nets)
+            save_with_agent(dir, &nets, &a)
         }
         Target::This | Target::Id(_) => {
             let (id, name) = match target {
@@ -916,6 +927,30 @@ mod tests {
         }
         assert!(!live.round_check()(&upload));
         task.abort();
+    }
+
+    /// Opting metered networks into a choice turns `pause_on_metered` off
+    /// and sets `[metered] transfer` in one write: if it fails, neither
+    /// changed (metered networks stay paused, never "everything").
+    #[test]
+    fn the_metered_choice_and_its_switch_are_written_together() {
+        let d = std::env::temp_dir().join(format!("oneup-network-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut nets = Networks::default();
+        nets.metered.transfer = Some(Transfer::Metadata);
+        let a = Agent { pause_on_metered: false, ..Agent::default() };
+        let failed = config::save_agent_with(&d, &a, |doc| {
+            write_networks(doc, &nets)?;
+            anyhow::bail!("the disk is full")
+        });
+        assert!(failed.is_err());
+        assert!(config::load_agent(&d).unwrap().pause_on_metered, "still paused");
+        assert_eq!(load(&d).unwrap(), Networks::default());
+        save_with_agent(&d, &nets, &a).unwrap();
+        assert!(!config::load_agent(&d).unwrap().pause_on_metered);
+        assert_eq!(load(&d).unwrap().metered.transfer, Some(Transfer::Metadata));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

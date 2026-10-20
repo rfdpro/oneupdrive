@@ -2240,6 +2240,8 @@
                     <div class="label"><b>Download limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-net-this="download_kib" placeholder="As other networks"></div>
                 <div class="row">
                     <div class="label"><b>Monthly data budget</b><small>MB, 0 for none</small></div><input type="number" min="0" data-net-this="budget_mb" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Get OneDrive's changes at once</b><small>With a sync interval</small></div><select data-net-this="keep_push"><option value="">As other networks</option><option value="on">On</option><option value="off">Off</option></select></div>
             </div>
             </div>
             <h3>Work offline</h3>
@@ -2256,7 +2258,13 @@
                 <div class="row">
                     <div class="label"><b>Sync every (minutes)</b></div><input type="number" min="0" max="1440" data-net-metered="interval_minutes" placeholder="As other networks"></div>
                 <div class="row">
+                    <div class="label"><b>Upload limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-net-metered="upload_kib" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Download limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-net-metered="download_kib" placeholder="As other networks"></div>
+                <div class="row">
                     <div class="label"><b>Monthly data budget</b><small>MB, 0 for none</small></div><input type="number" min="0" data-net-metered="budget_mb" placeholder="None"></div>
+                <div class="row">
+                    <div class="label"><b>Get OneDrive's changes at once</b><small>With a sync interval</small></div><select data-net-metered="keep_push"><option value="">As other networks</option><option value="on">On</option><option value="off">Off</option></select></div>
             </div>
         </section>
 
