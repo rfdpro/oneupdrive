@@ -155,6 +155,26 @@ impl Auth {
         }
     }
 
+    /// Test support: signed in with access token `token` for an hour.
+    #[cfg(test)]
+    pub(crate) fn with_token(token: &str) -> Self {
+        struct Nothing;
+        impl TokenStore for Nothing {
+            fn load(&self) -> Result<Option<String>> {
+                Ok(Some("rt".into()))
+            }
+            fn save(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn clear(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let a = Self::new(reqwest::Client::new(), "x".into(), "s", Box::new(Nothing));
+        let refresh_at = Instant::now() + std::time::Duration::from_secs(3600);
+        Self { access: Mutex::new(Some(Access { token: token.into(), refresh_at })), ..a }
+    }
+
     pub fn is_signed_in(&self) -> Result<bool> {
         Ok(self.store.load()?.is_some())
     }

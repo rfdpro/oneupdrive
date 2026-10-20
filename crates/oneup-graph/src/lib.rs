@@ -23,7 +23,7 @@ pub mod throttle;
 pub use auth::{Auth, DpapiFileStore, TokenStore};
 pub use client::{Graph, NetStats};
 pub use limiter::Aimd;
-pub use model::{Drive, DriveItem, FileVersion, Page, SharedFolder};
+pub use model::{Drive, DriveItem, FileVersion, ItemSharing, Page, Permission, SharedFolder, SharedItem};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -54,6 +54,9 @@ pub enum Error {
     /// The push channel failed (never contains its URL, a credential).
     #[error("{0}")]
     Push(String),
+    /// A request the caller asked for can't be made (nothing was sent).
+    #[error("{0}")]
+    Invalid(&'static str),
 }
 
 /// The most of a refused request's body an [`Error::Status`] keeps. The
@@ -119,6 +122,32 @@ impl Error {
         }
     }
 
+    /// What went wrong, without anything from a response body or a URL:
+    /// for records that outlive the moment (the activity log). A refused
+    /// request's body can hold names, e-mail addresses or sharing links.
+    pub fn summary(&self) -> String {
+        match self {
+            Error::Status { status, .. } => {
+                // OneDrive's codes are identifiers (`accessDenied`); anything
+                // else in that place isn't kept.
+                let code = self.code().filter(|c| {
+                    !c.is_empty() && c.len() <= 64 && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                });
+                match code {
+                    Some(c) => format!("OneDrive refused it ({status}, {c})"),
+                    None => format!("OneDrive refused it ({status})"),
+                }
+            }
+            Error::Http(_) | Error::Stalled(..) => "network error".into(),
+            Error::Exhausted(n) => format!("gave up after {n} attempts"),
+            Error::Auth(_) => "sign-in failed".into(),
+            Error::NotSignedIn => "not signed in".into(),
+            Error::Invalid(what) => (*what).into(),
+            Error::Json(_) => "unexpected answer from OneDrive".into(),
+            Error::Sys(_) | Error::Io(_) | Error::Local(_) | Error::Push(_) => "error on this PC".into(),
+        }
+    }
+
     /// Whether OneDrive refused the request because it would touch too
     /// many items at once (see [`too_many_items`]).
     pub fn is_too_many_items(&self) -> bool {
@@ -155,6 +184,16 @@ mod tests {
             super::Error::Status { status: 422, what: "x".into(), body: r#"{"error":{"code":"notSupported"}}"#.into() };
         assert!(!other.is_too_many_items());
         assert!(!super::Error::Exhausted(8).is_too_many_items());
+    }
+
+    #[test]
+    fn a_summary_keeps_nothing_from_the_body() {
+        let body = r#"{"error":{"code":"accessDenied","message":"sam@example.com can't use https://1drv.ms/x?authkey=!SECRET"}}"#;
+        let e = super::Error::refused(403, "https://graph.microsoft.com/v1.0/me/drive/items/A!1", body.into());
+        assert_eq!(e.summary(), "OneDrive refused it (403, accessDenied)");
+        let odd = super::Error::refused(400, "x", r#"{"error":{"code":"see https://1drv.ms/y"}}"#.into());
+        assert_eq!(odd.summary(), "OneDrive refused it (400)", "a code that isn't an identifier isn't kept");
+        assert_eq!(super::Error::Exhausted(8).summary(), "gave up after 8 attempts");
     }
 
     #[test]

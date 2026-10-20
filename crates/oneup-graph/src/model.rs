@@ -4,8 +4,13 @@ use base64::Engine as _;
 use serde::Deserialize;
 
 /// Properties requested for every item. Keeping this minimal measurably
-/// speeds up enumeration (measured: ~22% lower page latency).
-pub const ITEM_SELECT: &str = "id,name,size,eTag,parentReference,file,folder,package,deleted,root,fileSystemInfo";
+/// speeds up enumeration (measured: ~22% lower page latency). `shared` is
+/// there for the sharing audit: only shared items carry the facet, so it
+/// adds bytes to their entries alone. Microsoft's delta documentation lists
+/// no property that OneDrive (consumer) leaves out of created or modified
+/// items ("Remarks", `driveItem: delta`), so the facet arrives with delta.
+pub const ITEM_SELECT: &str =
+    "id,name,size,eTag,parentReference,file,folder,package,deleted,root,fileSystemInfo,shared";
 
 /// The account's drive (`GET /me/drive`), only what identifies it.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -143,6 +148,29 @@ pub struct DriveItem {
     pub root: Option<Facet>,
     #[serde(default)]
     pub file_system_info: Option<FileSystemInfo>,
+    #[serde(default)]
+    pub shared: Option<SharedFacet>,
+}
+
+/// An item's `shared` facet: Graph's sign that it was shared with others.
+/// Who can open it and how is in its permissions
+/// ([`crate::Graph::sharing`]); the facet's `scope` is deprecated.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedFacet {
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub shared_date_time: Option<String>,
+    #[serde(default)]
+    pub shared_by: Option<Owner>,
+}
+
+impl SharedFacet {
+    /// When it was shared (Unix milliseconds).
+    pub fn shared_ms(&self) -> Option<i64> {
+        parse_time_ms(self.shared_date_time.as_deref()?)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -219,6 +247,139 @@ impl DriveItem {
     pub fn modified_ms(&self) -> Option<i64> {
         parse_time_ms(self.file_system_info.as_ref()?.last_modified_date_time.as_ref()?)
     }
+
+    /// `Some(when)` if the item carries a `shared` facet, with when it was
+    /// shared if Graph said. Any facet counts, even one that is empty or
+    /// names only the owner: Graph says a non-null facet means shared, and
+    /// what the facet holds varies (it's empty for "unique permissions,
+    /// not shared" only with `Prefer: hierarchicalsharing`, which isn't
+    /// sent). The audit's permissions read drops the false ones.
+    pub fn sharing(&self) -> Option<Option<i64>> {
+        self.shared.as_ref().map(SharedFacet::shared_ms)
+    }
+}
+
+/// One way an item is shared: a sharing link, or access granted to people
+/// (`permission` resource). Only what the sharing audit shows and checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Permission {
+    pub id: String,
+    /// `read`, `write`, `owner`.
+    pub roles: Vec<String>,
+    /// For a sharing link: `view`, `edit` or `embed`.
+    pub link_type: Option<String>,
+    /// For a sharing link: `anonymous` (anyone with it), `users` (people
+    /// chosen), `organization`, `existingAccess`.
+    pub link_scope: Option<String>,
+    /// The link itself. Anyone with it can open the item: never log it.
+    pub link_url: Option<String>,
+    /// Whom it grants access to: names, or e-mail addresses for invitations
+    /// not yet accepted. Personal: never log them.
+    pub granted_to: Vec<String>,
+    /// When it stops working (Unix milliseconds); `None` if never (Graph
+    /// says so with the earliest possible date).
+    pub expires_ms: Option<i64>,
+    /// The folder it comes from, if it's inherited from one.
+    pub inherited_from: Option<String>,
+    pub has_password: bool,
+}
+
+impl Permission {
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let s = |p: &str| v.pointer(p).and_then(|x| x.as_str()).map(str::to_string);
+        let roles = v
+            .get("roles")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let who = |i: &serde_json::Value| {
+            ["/user/displayName", "/user/email", "/siteUser/displayName", "/group/displayName"]
+                .iter()
+                .find_map(|p| i.pointer(p).and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(str::to_string))
+        };
+        let mut names: Vec<String> = ["grantedToV2", "grantedTo"].iter().filter_map(|k| who(v.get(*k)?)).collect();
+        for key in ["grantedToIdentitiesV2", "grantedToIdentities"] {
+            names.extend(v.get(key).and_then(|a| a.as_array()).into_iter().flatten().filter_map(who));
+        }
+        if names.is_empty() {
+            names.extend(s("/invitation/email"));
+        }
+        let mut granted_to: Vec<String> = Vec::new();
+        for n in names {
+            if !granted_to.contains(&n) {
+                granted_to.push(n);
+            }
+        }
+        Some(Self {
+            id: s("/id")?,
+            roles,
+            link_type: s("/link/type"),
+            link_scope: s("/link/scope"),
+            link_url: s("/link/webUrl"),
+            granted_to,
+            expires_ms: s("/expirationDateTime").as_deref().and_then(parse_time_ms).filter(|&ms| ms > 0),
+            inherited_from: s("/inheritedFrom/id"),
+            has_password: v.get("hasPassword").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        })
+    }
+
+    /// The owner's own access, which can't be taken away.
+    pub fn is_owner(&self) -> bool {
+        self.roles.iter().any(|r| r == "owner")
+    }
+
+    /// Whether it lets people change the item.
+    pub fn can_edit(&self) -> bool {
+        self.link_type.as_deref() == Some("edit") || self.roles.iter().any(|r| r == "write")
+    }
+
+    /// Whether anyone who has it can open the item, without signing in.
+    pub fn is_anyone(&self) -> bool {
+        self.link_scope.as_deref() == Some("anonymous")
+    }
+}
+
+/// An item's sharing as OneDrive has it now ([`crate::Graph::sharing`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemSharing {
+    /// Its eTag when read.
+    pub etag: String,
+    /// The drive's root, whose permissions OneDrive Personal won't change.
+    pub root: bool,
+    pub permissions: Vec<Permission>,
+}
+
+/// An item someone shared with the signed-in account (`sharedWithMe`):
+/// where it really is (another person's drive) and who shared it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedItem {
+    pub name: String,
+    pub drive_id: String,
+    pub id: String,
+    pub folder: bool,
+    pub size: Option<i64>,
+    pub owner: Option<String>,
+    /// When it was shared (Unix milliseconds), if Graph said.
+    pub shared_ms: Option<i64>,
+}
+
+impl SharedItem {
+    /// From one `sharedWithMe` entry; `None` if incomplete.
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let r = v.get("remoteItem")?;
+        let s = |p: &str| r.pointer(p).and_then(|x| x.as_str()).map(str::to_string);
+        Some(Self {
+            name: s("/name").or_else(|| v.get("name").and_then(|n| n.as_str()).map(str::to_string))?,
+            drive_id: s("/parentReference/driveId")?,
+            id: s("/id")?,
+            folder: r.get("folder").is_some(),
+            size: r.get("size").and_then(serde_json::Value::as_i64),
+            owner: s("/shared/owner/user/displayName")
+                .or_else(|| s("/shared/sharedBy/user/displayName"))
+                .or_else(|| s("/createdBy/user/displayName")),
+            shared_ms: s("/shared/sharedDateTime").as_deref().and_then(parse_time_ms),
+        })
+    }
 }
 
 /// One page of a collection response (children or delta).
@@ -278,6 +439,57 @@ mod tests {
         assert_eq!(f.modified_ms(), Some(1_791_315_649_000));
         assert!(p.value[2].is_deleted());
         assert!(p.value[3].is_package());
+    }
+
+    #[test]
+    fn every_shared_facet_marks_a_candidate() {
+        let item = |json: &str| serde_json::from_str::<DriveItem>(json).unwrap();
+        let shared = item(
+            r#"{"id":"a","shared":{"owner":{"user":{"displayName":"Me"}},"scope":"users",
+                "sharedDateTime":"2026-10-06T19:40:49Z"}}"#,
+        );
+        assert_eq!(shared.sharing(), Some(Some(1_791_315_649_000)));
+        assert_eq!(item(r#"{"id":"b","shared":{"scope":"anonymous"}}"#).sharing(), Some(None));
+        assert_eq!(item(r#"{"id":"c"}"#).sharing(), None);
+        // Any facet is a candidate, even an empty one or one naming only
+        // the owner: the permissions read tells.
+        assert_eq!(item(r#"{"id":"d","shared":{}}"#).sharing(), Some(None));
+        assert_eq!(item(r#"{"id":"e","shared":{"owner":{"user":{"displayName":"Me"}}}}"#).sharing(), Some(None));
+    }
+
+    #[test]
+    fn permissions_are_read_as_links_and_people() {
+        let p = |json: &str| Permission::from_json(&serde_json::from_str(json).unwrap()).unwrap();
+        let link = p(r#"{"id":"1","roles":["write"],"link":{"type":"edit","scope":"anonymous",
+            "webUrl":"https://1drv.ms/x"},"expirationDateTime":"0001-01-01T00:00:00Z","hasPassword":true}"#);
+        assert!(link.can_edit() && link.is_anyone() && link.has_password && !link.is_owner());
+        assert_eq!((link.expires_ms, link.inherited_from.as_deref()), (None, None), "the earliest date is never");
+        let people = p(r#"{"id":"2","roles":["read"],"link":{"type":"view","scope":"users"},
+            "grantedToIdentitiesV2":[{"user":{"displayName":"Sam"}},{"user":{"displayName":"Ana"}}],
+            "grantedToIdentities":[{"user":{"displayName":"Sam"}}],
+            "expirationDateTime":"2026-11-01T00:00:00Z","inheritedFrom":{"id":"F!1"}}"#);
+        assert_eq!(people.granted_to, ["Sam", "Ana"]);
+        assert!(!people.can_edit() && !people.is_anyone());
+        assert_eq!(people.expires_ms, Some(1_793_491_200_000));
+        assert_eq!(people.inherited_from.as_deref(), Some("F!1"));
+        let invited = p(r#"{"id":"3","roles":["write"],"invitation":{"email":"x@example.com"}}"#);
+        assert_eq!(invited.granted_to, ["x@example.com"]);
+        assert!(p(r#"{"id":"4","roles":["owner"]}"#).is_owner());
+        assert!(Permission::from_json(&serde_json::json!({"roles":["read"]})).is_none(), "no id");
+    }
+
+    #[test]
+    fn items_shared_with_me_are_files_and_folders() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"id":"L!1","remoteItem":{"id":"B!8","name":"a.txt","file":{},"size":5,
+                "parentReference":{"driveId":"b0"},
+                "shared":{"owner":{"user":{"displayName":"Sam"}},"sharedDateTime":"2026-10-06T19:40:49Z"}}}"#,
+        )
+        .unwrap();
+        let it = SharedItem::from_json(&v).unwrap();
+        assert_eq!((it.name.as_str(), it.folder, it.owner.as_deref()), ("a.txt", false, Some("Sam")));
+        assert_eq!((it.size, it.shared_ms), (Some(5), Some(1_791_315_649_000)));
+        assert!(SharedItem::from_json(&serde_json::json!({"remoteItem":{"id":"x"}})).is_none());
     }
 
     #[test]
