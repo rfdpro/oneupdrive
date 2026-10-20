@@ -397,7 +397,8 @@ mod win {
                 format!(
                     "{} of {} synced items {side} would be deleted, overwritten or moved{earlier}.\n\n\
                      Nothing changes until you decide. If you didn't expect this, check the files first.",
-                    st.count, st.synced_items
+                    st.items(),
+                    st.synced_items
                 )
             };
             const GO: i32 = 100;

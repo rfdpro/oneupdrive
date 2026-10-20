@@ -2872,7 +2872,7 @@
                 setTable(["Item", "What", "Size ", "On this PC"], rows.map(c => el("tr", {},
                     cell(c.path, null, "wrap path"),
                     el("td", {
-                        textContent: c.folder ? `Folder, ${c.unlisted ? "at least " : ""}${n(c.items)} items` : "File"
+                        textContent: c.folder ? `Folder, ${c.exact === false ? "at least " : ""}${n(c.items)} items` : "File"
                     }),
                     el("td", {
                         className: "num",

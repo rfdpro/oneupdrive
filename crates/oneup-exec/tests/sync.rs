@@ -1035,7 +1035,7 @@ impl Sync {
         let report = self.exec.run_following(store, r.approved, &count, may_run, &follow, self.follow_max).await;
         if let Some(w) = &mut self.stops.window {
             for op in &report.done {
-                w.add_op(op, &[]);
+                w.add_op(op, &[], &self.policy);
             }
         }
         let followed = followed.into_inner().unwrap();
@@ -1982,7 +1982,7 @@ impl Sync {
                 Ok(v)
             })
             .unwrap();
-        let op = Op::PruneRemote { remote: RemotePre { id: RemoteId(id), etag }, forget, items: 2, keep };
+        let op = Op::PruneRemote { remote: RemotePre { id: RemoteId(id), etag }, forget, items: 2, exact: true, keep };
         let r = review_in(&Policy::default(), &Context::default(), vec![op]);
         assert!(r.breakers.is_empty(), "{:?}", r.breakers);
         self.exec.run(store, r.approved).await

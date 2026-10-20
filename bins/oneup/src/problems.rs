@@ -608,6 +608,7 @@ mod tests {
             kind: "mass".into(),
             side: "local".into(),
             count: 12,
+            at_least: false,
             recent: 0,
             synced_items: 100,
             code: "00000000000000ab".into(),

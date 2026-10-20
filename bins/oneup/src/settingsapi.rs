@@ -742,7 +742,7 @@ pub async fn cloud_copies(dir: &Path, graph: &oneup_graph::Graph) -> Result<Valu
     let items: Vec<Value> = found
         .iter()
         .map(|c| {
-            json!({ "path": c.path, "folder": c.folder, "items": c.items, "unlisted": c.unlisted,
+            json!({ "path": c.path, "folder": c.folder, "items": c.items, "unlisted": c.unlisted, "exact": c.exact,
                 // A folder OneDrive hasn't sized yet reports 0: unknown.
                 "bytes": (!c.folder || c.size > 0).then_some(c.size.max(0)),
                 "missing": c.fetch.len() as u64 + c.waiting, "here": c.ready() })

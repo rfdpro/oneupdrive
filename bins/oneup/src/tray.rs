@@ -286,7 +286,7 @@ pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop) -> Notice {
         title: "Review needed".into(),
         text: format!(
             "{} items {side} would be deleted, overwritten or moved. Nothing changes until you review.",
-            st.count
+            st.items()
         ),
         kind: Kind::Warning,
     }
@@ -312,7 +312,7 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
                     format!("Possibly encrypted: {} files…", st.count)
                 } else {
                     let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
-                    format!("Review {} changes {side}…", st.count)
+                    format!("Review {} changes {side}…", st.items())
                 };
                 items.push(action(id::REVIEW_STOP + i as u32, label, glyph::WARNING));
             }
@@ -772,6 +772,7 @@ mod tests {
             kind: "mass".into(),
             side: "local".into(),
             count: 40,
+            at_least: false,
             recent: 0,
             synced_items: 100,
             code: code.into(),
