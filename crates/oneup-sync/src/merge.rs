@@ -505,6 +505,9 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
         // Changed or moved in the cloud since: that change wins over the
         // deletion. Re-create it here at the cloud's location.
         let Some((psid, name)) = rloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
+            return Ok(());
+        }
         let Some(to) = cx.local_dir_for(psid)? else { return Ok(()) };
         let link = Link::Existing(b.sid);
         cx.out.push(match b.kind {
@@ -535,6 +538,9 @@ fn remote_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode) -
     // One-way: what this PC has, the cloud gets back.
     if lc || lloc != here || cx.backup {
         let Some((psid, name)) = lloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
+            return Ok(());
+        }
         let Some(to) = cx.remote_dir_for(psid)? else { return Ok(()) };
         let link = Link::Existing(b.sid);
         cx.out.push(match b.kind {
@@ -702,6 +708,9 @@ fn pair_new<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, l: LocalNode, r: RemoteNode)
 /// depth is bounded by the tree's.
 fn resurrect_local<T: Trees + ?Sized>(t: &T, sid: Sid, r: &RemoteNode) -> Result<Option<Op>, T::Error> {
     let Some((psid, name)) = remote_loc(t, r)? else { return Ok(None) };
+    if base_within(t, psid, sid)? {
+        return Ok(None);
+    }
     if let Some(to) = local_dir(t, psid)? {
         return Ok(Some(Op::MkdirLocal { remote: rpre(r), to, parent: psid, name, link: Link::Existing(sid) }));
     }
@@ -718,6 +727,9 @@ fn resurrect_local<T: Trees + ?Sized>(t: &T, sid: Sid, r: &RemoteNode) -> Result
 /// Mirror image of [`resurrect_local`].
 fn resurrect_remote<T: Trees + ?Sized>(t: &T, sid: Sid, l: &LocalNode) -> Result<Option<Op>, T::Error> {
     let Some((psid, name)) = local_loc(t, l)? else { return Ok(None) };
+    if base_within(t, psid, sid)? {
+        return Ok(None);
+    }
     if let Some(to) = remote_dir(t, psid)? {
         return Ok(Some(Op::MkdirRemote { local: lpre(l), to, parent: psid, name, link: Link::Existing(sid) }));
     }

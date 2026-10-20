@@ -1097,6 +1097,7 @@ fn round_flow(w: &mut World, rng: Option<&mut Rng>, debug: bool, flow: Flow) -> 
         }
         w.run(op, &snap);
     }
+    assert_no_loop(w);
     let actions = ops.iter().filter(|o| o.is_action()).count();
     (actions, ops.len() - actions)
 }
@@ -1588,31 +1589,9 @@ fn a_lagging_listing_never_undoes_a_rename_here() {
     assert_eq!(w.local[&id].name, "b3");
 }
 
-/// Synced `C/A`. Here, A goes to the top and C into A; in the cloud, A goes
-/// into X. The round's move of A is refused (its preconditions failed, a
-/// name was in the way), and C's into A must not happen without it: the
-/// Synced tree would have C below A and A below C, a loop that no plan from
-/// the top reaches again (simulation seed 60953 of the journal-loss run).
-/// C waits a round instead.
-#[test]
-fn a_folder_never_moves_below_itself_in_the_synced_tree() {
-    let mut w = World::new();
-    let c = w.l_create(LOCAL_ROOT, "C", NodeKind::Folder, 0);
-    let a = w.l_create(c, "A", NodeKind::Folder, 0);
-    w.l_create(LOCAL_ROOT, "X", NodeKind::Folder, 0);
-    settle(&mut w, false);
-    let sid_a = w.bases.values().find(|b| b.name == "A").map(|b| b.sid);
-    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
-    edit(w.local.get_mut(&c), |it| it.parent = Some(a));
-    let (ra, rx) = (rid(&w, "A"), rid(&w, "X"));
-    let e = w.etag();
-    edit(w.remote.get_mut(&ra), |it| (it.parent, it.etag) = (Some(rx), e));
-
-    for op in plan_both(&w) {
-        if op.subjects().0 != sid_a {
-            w.apply(&op);
-        }
-    }
+/// Every Synced row reaches the top of the Synced tree: a loop is never
+/// planned again (full passes walk the tree from its root).
+fn assert_no_loop(w: &World) {
     for b in w.bases.values() {
         let mut cur = Some(b.sid);
         for _ in 0..=w.bases.len() {
@@ -1620,8 +1599,110 @@ fn a_folder_never_moves_below_itself_in_the_synced_tree() {
         }
         assert_eq!(cur, None, "{b:?} doesn't reach the top of the Synced tree");
     }
+}
+
+/// Synced `C/A` and `X`, with their local IDs `(c, a)`.
+fn c_holding_a() -> (World, u128, u128) {
+    let mut w = World::new();
+    let c = w.l_create(LOCAL_ROOT, "C", NodeKind::Folder, 0);
+    let a = w.l_create(c, "A", NodeKind::Folder, 0);
+    w.l_create(LOCAL_ROOT, "X", NodeKind::Folder, 0);
     settle(&mut w, false);
-    assert_converged(&w, &BTreeSet::new());
+    (w, c, a)
+}
+
+/// Moves cloud item `name` into cloud folder `into`, as a user on the web.
+fn move_in_cloud(w: &mut World, name: &str, into: &str) {
+    let (id, to) = (rid(w, name), rid(w, into));
+    let e = w.etag();
+    edit(w.remote.get_mut(&id), |it| (it.parent, it.etag) = (Some(to), e));
+}
+
+/// A round in which A's own operation is refused (its preconditions
+/// failed, a name was in the way): what puts C inside A must wait for it,
+/// or the Synced tree would have C below A while A is still below C. Then
+/// the rounds settle without losing `must`.
+fn refuse_a_once_then_settle(mut w: World, must: &BTreeSet<Content>) {
+    let sid_a = w.bases.values().find(|b| b.name == "A").map(|b| b.sid);
+    for op in plan_both(&w) {
+        if op.subjects().0 != sid_a {
+            w.apply(&op);
+        }
+    }
+    assert_no_loop(&w);
+    settle(&mut w, false);
+    assert_converged(&w, must);
+}
+
+/// Here, A goes to the top and C into A; in the cloud, A goes into X. C's
+/// move into A waits for A's (simulation seed 60953 of the journal-loss
+/// run).
+#[test]
+fn a_folder_never_moves_below_itself_in_the_synced_tree() {
+    let (mut w, c, a) = c_holding_a();
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    edit(w.local.get_mut(&c), |it| it.parent = Some(a));
+    move_in_cloud(&mut w, "A", "X");
+    refuse_a_once_then_settle(w, &BTreeSet::new());
+}
+
+/// Here, A goes to the top and C is deleted; in the cloud, A goes into X
+/// and C into A. The cloud's move beats the deletion, so C is made here
+/// again inside A (`local_gone`), once A's move is recorded. With
+/// `new_file`, a new cloud file in C needs C here too (`resurrect_local`).
+fn deleted_here_moved_there(new_file: bool) {
+    let (mut w, _, a) = c_holding_a();
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    take_local(&mut w, "C", Gone::Deleted);
+    move_in_cloud(&mut w, "A", "X");
+    move_in_cloud(&mut w, "C", "A");
+    let mut must = BTreeSet::new();
+    if new_file {
+        let c = w.content();
+        let rc = rid(&w, "C");
+        w.r_create(&rc, "new.txt", NodeKind::File, c);
+        must.insert(c);
+    }
+    refuse_a_once_then_settle(w, &must);
+}
+
+#[test]
+fn a_folder_made_here_again_never_lands_below_itself() {
+    deleted_here_moved_there(false);
+}
+
+#[test]
+fn a_folder_made_here_again_for_new_contents_never_lands_below_itself() {
+    deleted_here_moved_there(true);
+}
+
+/// The mirror image: in the cloud, A goes into X and C is deleted; here,
+/// A goes to the top and C into A. C is made in the cloud again inside A
+/// (`remote_gone`), once A's move is recorded. With `new_file`, a new file
+/// here in C needs C in the cloud too (`resurrect_remote`).
+fn deleted_there_moved_here(new_file: bool) {
+    let (mut w, c, a) = c_holding_a();
+    move_in_cloud(&mut w, "A", "X");
+    take_remote(&mut w, "C", Gone::Deleted);
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    edit(w.local.get_mut(&c), |it| it.parent = Some(a));
+    let mut must = BTreeSet::new();
+    if new_file {
+        let n = w.content();
+        w.l_create(c, "new.txt", NodeKind::File, n);
+        must.insert(n);
+    }
+    refuse_a_once_then_settle(w, &must);
+}
+
+#[test]
+fn a_folder_made_in_the_cloud_again_never_lands_below_itself() {
+    deleted_there_moved_here(false);
+}
+
+#[test]
+fn a_folder_made_in_the_cloud_again_for_new_contents_never_lands_below_itself() {
+    deleted_there_moved_here(true);
 }
 
 /// How a scenario takes an item away from one side.
