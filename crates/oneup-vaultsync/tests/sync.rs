@@ -310,3 +310,79 @@ async fn a_vault_pair_on_demand_decrypts_only_what_is_opened() {
     assert_eq!(app_read(&long).unwrap(), b"unopened", "and opens with its content");
     drop(p);
 }
+
+/// Another client moves a long-named file into another folder by moving
+/// its `.c9s` folder whole (renamed, with its `name.c9s` rewritten), and
+/// the next round plans to follow it here. Before that move runs, the
+/// entry's contents move out (a later move of that client that changed
+/// the entry's shape, whose old entry stayed behind with only its name),
+/// so the listing shows a shell where the file went. The executor asks
+/// OneDrive (`Cloud::is_at`), finds the entry without its contents, and
+/// doesn't follow it: the file stays where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vault_move_to_an_entry_left_without_its_contents_is_not_followed() {
+    use oneup_store::Kind;
+    use oneup_sync::Op;
+    use oneup_vault::names::{self, Stored};
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = format!("{}.txt", "a long name ".repeat(20));
+    let a = RemoteId(s.vc.mkdir(&root, "A").await.unwrap().id);
+    let b = RemoteId(s.vc.mkdir(&root, "B").await.unwrap().id);
+    s.vc.upload(&a, &long, None, 4, &mut &b"long"[..]).await.unwrap();
+    s.vc.upload(&b, "b.txt", None, 1, &mut &b"b"[..]).await.unwrap();
+    let mut p = Pair::new("shell-move", s, false);
+    p.quiesce().await;
+    assert!(p.p(&format!("A/{long}")).exists());
+
+    // The other client's move of the whole `.c9s` folder into B.
+    p.s.refresh().await;
+    let holder = p.s.id(&format!("/A/{long}"));
+    let to = p.s.nodes.read().unwrap()[&b.0].clone();
+    let (b_dir, b_storage) = (to.dir_id.unwrap(), to.storage.unwrap());
+    let enc = names::encrypt_name(&p.s.vault.key, &long, &b_dir).unwrap();
+    let Stored::Short { dir, name } = Stored::of(enc, p.s.vault.threshold) else { panic!("a long name") };
+    let (rows, contents) = {
+        let mut c = p.s.cloud.0.lock().unwrap();
+        let (e1, e2) = (c.bump(), c.bump());
+        let h = c.items.get_mut(&holder.0).unwrap();
+        (h.parent, h.name, h.etag) = (Some(b_storage), dir, e1);
+        let name_file = c.child(&holder.0, names::NAME_FILE).unwrap();
+        let n = c.items.get_mut(&name_file).unwrap();
+        (n.content, n.etag) = (name.into_bytes(), e2);
+        let contents = c.child(&holder.0, names::CONTENTS_FILE).unwrap();
+        (vec![c.row(&holder.0), c.row(&name_file)], contents)
+    };
+    p.s.listing.lock().unwrap().write(|o| rows.iter().try_for_each(|r| o.upsert_item(r, false))).unwrap();
+
+    // The round's plan follows it here.
+    p.obs.catch_up().unwrap();
+    let mut cache = oneup_vaultsync::project::Cache::default();
+    let projected = project(&p.s.src, &p.s.vault, &mut cache).await.unwrap();
+    assert!(projected.problems.is_empty(), "{:?}", projected.problems);
+    *p.s.nodes.write().unwrap() = projected.nodes.clone();
+    let store = p.obs.store_mut();
+    apply(store, &p.s.src, &projected).unwrap();
+    let ops = store.read(|o| plan(&Parked::new(o), all_folders(&Parked::new(o))?)).unwrap();
+    assert!(ops.iter().any(|op| matches!(op, Op::MoveLocal { .. })), "{ops:?}");
+    let r = review_in(&Policy::default(), &Context::default(), ops);
+
+    // Meanwhile its contents leave the moved entry, which the listing
+    // doesn't show yet.
+    {
+        let mut c = p.s.cloud.0.lock().unwrap();
+        let aside = c.create(&root.0, "aside", true, vec![]).unwrap();
+        assert!(!c.items[&contents].folder);
+        c.items.get_mut(&contents).unwrap().parent = Some(aside);
+        assert!(c.row(&holder.0).kind == Kind::Folder);
+    }
+    let report = p.exec.run(store, r.approved).await;
+    assert!(report.halted.is_none() && report.failed.is_empty(), "{report:?}");
+    assert!(
+        report.skipped.iter().any(|(op, k)| matches!(op, Op::MoveLocal { .. }) && *k == oneup_exec::Skip::Changed),
+        "{report:?}"
+    );
+    assert!(p.p(&format!("A/{long}")).exists(), "the file stays where it is");
+    assert!(!p.p(&format!("B/{long}")).exists());
+}
