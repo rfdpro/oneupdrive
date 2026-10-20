@@ -4,7 +4,7 @@ With Files On-Demand, files in your synced folder can be **online-only**: you se
 
 Turn it on or off in the settings window, on the **Files** page in the folder's own settings (shown when nothing in the list is selected), or when setting up. From the command line, with the background agent stopped: `oneup on-demand on` / `off`; `oneup on-demand` shows which.
 
-Turning it on makes every synced file already on your PC a Files On-Demand file that keeps its content. On a big folder that takes a while; if it's interrupted (say, by an update), the background agent finishes the rest by itself when it has nothing else to do, a little at a time, and notes it in **Recent activity**. Until then, those files show as **Sync pending** in File Explorer.
+Turning it on makes every synced file already on your PC a Files On-Demand file that keeps its content. On a big folder that takes a while; if it's interrupted (say, by an update), the background agent finishes the rest by itself when it has nothing else to do, a little at a time, and notes it in **Recent activity**. Until then, those files show as **Sync pending** in File Explorer (see [Sync pending](excluding-files.md#sync-pending-in-explorer)).
 
 ## What turning it on does
 * Nothing is removed from your PC. Files you already have stay downloaded.
@@ -23,7 +23,7 @@ Right-click in File Explorer: **Always keep on this device**, or **Free up space
 From the command line: `oneup pin "Photos\2024"` (always keep) and `oneup free "Videos"` (free up space).
 
 ## Freeing space by itself
-Under **Storage → Free up space automatically**:
+On the **Files** page, in the folder's settings (nothing selected), under **Free up space**:
 * **Make files online-only when unused for** 7 days … 1 year (never, unless you choose).
 * **When the disk is nearly full** (less than 10% free, or the share you choose), the files unused longest are made online-only until there's room again (5 points more free). Anything used in the last day is left alone.
 
@@ -32,7 +32,7 @@ Under **Storage → Free up space automatically**:
 From the command line: `oneup space --free-unused-days 30`, `oneup space --free-when-low on --low-disk-percent 10`, `oneup space` to show.
 
 ## Your largest files
-**Storage → Largest files in your OneDrive** lists the ten biggest files in your OneDrive, whether each is on this PC, online-only or outside your synced folder, with **Show**, **Free up space** and **Keep on this PC**. `oneup largest --count 20` does the same in a terminal.
+On the **Files** page, select **Size** above the list to sort by it: a folder's size is everything inside it, so the biggest are at the top. **Exclude → Suggestions** lists the largest folders in your OneDrive. In a terminal, `oneup largest --count 20` lists the biggest files and whether each is on this PC. To make one online-only, right-click it and choose **Free up space**.
 
 ## Good to know
 * A file is only ever filled with the exact version it stands for. If it changed in OneDrive and the change hasn't arrived yet, opening it fails once instead of showing the wrong content; OneUpDrive then catches up, usually within seconds.

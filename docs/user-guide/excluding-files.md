@@ -1,6 +1,6 @@
 # Choosing what syncs
 
-Some files don't belong in the cloud: downloaded dependencies, build output, temporary files. Syncing them wastes your computer's resources. On one developer's PC, **9 out of 10** files the OneDrive app was tracking were exactly this kind of junk.
+Some files don't belong in the cloud: downloaded dependencies, build output, temporary files. Syncing them wastes your computer's resources.
 
 In the settings window, all of this is on the **Files** page: untick an item's box in the tree (or right-click it and choose **Exclude…**), tick it to sync it again, or see everything excluded under **Exclude**. Excluding something **never deletes it**, from your PC or from OneDrive. It stops it being **uploaded**: what's already in OneDrive still shows up here (online-only, with Files On-Demand) and opens as usual (see [What happens to OneDrive's copies](#what-happens-to-onedrives-copies)). Rule changes take effect at once, with no rescan: a running background agent applies them as soon as `oneup rules` saves them, or as soon as you save a `.oneupignore` file.
 
@@ -92,7 +92,7 @@ Remove the rule and syncing picks up where it left off: an edit you made meanwhi
 If you move a synced file *into* an excluded folder, OneUpDrive doesn't treat that as a deletion: the OneDrive copy stays, and the file is listed as held.
 
 ## What happens to OneDrive's copies
-Excluding always stops uploads. What comes the other way is your choice (**Files**, **Exclude**, **Advanced**, or `oneup rules --cloud`):
+Excluding always stops uploads. What comes the other way is your choice (**Files**, **Exclude**, **Rules as text**, or `oneup rules --cloud`):
 
 ```powershell
 oneup --data-dir … rules --cloud pull    # bring them and their changes here, never upload (the default)
@@ -128,8 +128,6 @@ Folders that a preset or one of your `config.toml` rules skips by name alone (su
 
 ## "Sync pending" in Explorer
 With Files On-Demand, File Explorer shows a blue two-arrow **Sync pending** icon on anything in your OneDrive folder that isn't a OneDrive file, which includes everything you excluded (they stay on your PC on purpose), and on the folders above it. It can also show it on folders that hold nothing unsynced at all. This is Windows' own display, not something OneUpDrive is still working on: `oneup status` says whether OneUpDrive is up to date, and `oneup unsynced` lists anything that really can't sync. `oneup explain PATH` tells you which rule excludes an item.
-
-Ways to make Explorer show these as fine were tried and set aside.
 
 ## "Why is this file (not) syncing?"
 ```

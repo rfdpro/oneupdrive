@@ -48,8 +48,8 @@ Below it, grouped:
 ## When OneUpDrive waits for you
 It shows a notification once when it needs a decision. Click the notification, or the matching menu entry:
 * **Files may be encrypted** (the ransomware guard): edited files look encrypted, the way ransomware leaves them. They were **not** uploaded. Open a few: if they don't open, choose **Not now**, disconnect the PC from the network and get help; OneDrive still has the good versions. If they open fine (you really did convert them), **Upload them**.
-* **A safety stop:** many files would be deleted, overwritten or moved at once. Nothing changes until you answer. **Show the files** shows every item and what would happen to it on the Activity page (pressing Enter does this too), then asks again. **Go ahead** carries them out, and the icon stops saying it's waiting at once, even if a large batch takes a while. **Not now** leaves everything as it is, and OneUpDrive keeps waiting.
-* **The version store is full:** files removed in OneDrive don't fit in the room kept for copies on this PC. **Yes** removes them here and keeps copies anyway, **No** removes them without a copy (you're asked once more), **Cancel** decides later. Until then they stay on your PC, untouched.
+* **A safety stop:** many files would be deleted, overwritten or moved at once. Nothing changes until you answer. **Show the files** shows every item and what would happen to it on the Activity page (pressing Enter does this too), then asks again. **Go ahead** carries out exactly the items listed, and the icon stops saying it's waiting at once, even if a large batch takes a while. Anything else that comes up later gets its own stop. **Not now** leaves everything as it is, and OneUpDrive keeps waiting.
+* **The version store is full:** files removed in OneDrive don't fit in the room for kept copies on this PC (**Safety → Kept copies**). **Yes** removes them here and keeps copies anyway, **No** removes them without a copy (you're asked once more), **Cancel** decides later. Until then they stay on your PC, untouched.
 * **Left-out items still in OneDrive**:
   * **Delete from OneDrive** first downloads anything that isn't fully on your PC, then deletes them from OneDrive: they go to OneDrive's recycle bin (kept there for 30 days, less if it fills up) and are no longer on your other devices or on the web. The copies on your PC stay. You're then asked whether to do this automatically from now on.
   * **Keep in OneDrive** (what Enter chooses) leaves them there for good: a change made in OneDrive still comes to this PC, but nothing you change here is sent. You aren't asked about these items again, also after a restart. Items you exclude later are asked about anew.
@@ -58,6 +58,6 @@ It shows a notification once when it needs a decision. Click the notification, o
 It also tells you if OneUpDrive stopped when nobody asked it to. Pausing by itself (a game, battery saver) only changes the icon, since that comes and goes often.
 
 ## Starting and hiding it
-The icon starts with OneUpDrive, from the Start menu or at sign-in (**General → Start OneUpDrive when I sign in**). One icon shows per synced folder pair. **General → Show the OneUpDrive icon** turns it off for good.
+The icon starts with OneUpDrive, from the Start menu or at sign-in (**General → Start with Windows**). One icon shows per account. **General → Show the icon in the taskbar corner** turns it off for good.
 
 The icon is only a window onto the background agent: closing it, or the icon crashing, never stops or changes syncing.
