@@ -28,6 +28,8 @@ url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+# Reading back what was logged (`search_text_never_reaches_errors_or_logs`).
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true
