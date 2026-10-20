@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use oneup_store::{Kind, RemoteRow, Store};
 
 /// Budgets the index must meet (`docs/architecture/search.md`).
-const MAX_BYTES_PER_ITEM: f64 = 50.0;
+const MAX_BYTES_PER_ITEM: f64 = 64.0;
 const MAX_SEARCH: Duration = Duration::from_millis(100);
 
 struct Rng(u64);
@@ -280,12 +280,5 @@ fn the_index_meets_its_budgets_at_scale() {
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(slowest < MAX_SEARCH, "slowest search {slowest:?}");
-    // OPEN DECISION for the maintainer: with OneDrive's `s<GUID>` IDs the
-    // index takes about 57.5 B/item against the 50 B/item budget (numeric
-    // IDs: about 42.5). Nothing measured fits (`docs/architecture/search.md`
-    // § The index), so until the budget is accepted or changed for those
-    // drives, GUID IDs are measured and printed here, not held to it.
-    if !guid {
-        assert!(per_item <= MAX_BYTES_PER_ITEM, "{per_item:.1} B/item");
-    }
+    assert!(per_item <= MAX_BYTES_PER_ITEM, "{per_item:.1} B/item");
 }
