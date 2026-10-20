@@ -22,7 +22,7 @@ use oneup_sync::{
 };
 
 use crate::blocking::{Jobs, OffTask, Settle};
-use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Ours, Replaced, VersionMark};
+use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Replaced, VersionMark};
 use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
@@ -220,8 +220,10 @@ struct Rescue {
     /// The eTag the upload was to replace: still OneDrive's, the upload
     /// never committed.
     etag: String,
-    /// The eTag the upload left, once recorded, and its time and size as
-    /// the version history lists them, once read ([`Ours`]).
+    /// The eTag the upload left, and the version its history lists the
+    /// upload as ([`Cloud::uploaded_version`]), written durably as soon as
+    /// the upload's answer is in. Without it, nothing tells the upload
+    /// apart from a later save, and nothing is kept.
     ours_etag: Option<String>,
     ours: Option<VersionMark>,
     /// Rounds the version history couldn't tell what the upload went over.
@@ -967,14 +969,12 @@ impl<C: Cloud> Executor<C> {
             return Rescued::Later(Box::new(r), format!("{THEIRS_NOT_KEPT}; it {RESCUE_WAITS}"));
         }
         let id = RemoteId(r.id.clone());
-        let found = match &r.theirs {
-            Some(_) => None,
-            None => {
-                let mut ours = Ours { etag: r.ours_etag.clone(), mark: r.ours.clone() };
-                let got = self.cloud.replaced_other(&id, &r.mark, &mut ours).await;
-                r.ours = ours.mark;
-                Some(got)
-            }
+        let found = match (&r.theirs, &r.ours) {
+            (Some(_), _) => None,
+            // Never the file's current version instead: a later save may be
+            // on top of the upload.
+            (None, None) => Some(Ok(Replaced::Unknown)),
+            (None, Some(ours)) => Some(self.cloud.replaced_other(&id, &r.mark, ours).await),
         };
         let theirs = match (&r.theirs, found) {
             (Some(t), _) => t.clone(),
@@ -1954,6 +1954,32 @@ impl<C: Cloud> Executor<C> {
                             }
                             r => r?,
                         };
+                        // The version the upload is, for the rescue record:
+                        // written durably before anything else, so whatever
+                        // happens next, the edit it may have gone over is told
+                        // apart from a later save. Not found: the record stays
+                        // without it (nothing is kept from a guess).
+                        if let (Some(pre), Some(m)) = (replace, &mark) {
+                            self.crash_point()?;
+                            let ours = match self.cloud.uploaded_version(&pre.id, row.etag.as_deref()).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "an upload's version couldn't be read");
+                                    None
+                                }
+                            };
+                            let key = format!("{}.{}.{}", Rescue::KEY, pre.id.0, m.id);
+                            store
+                                .write_ahead(|o| {
+                                    if let Some(mut r) = o.meta_get(&key)?.as_deref().and_then(Rescue::parse) {
+                                        r.ours_etag.clone_from(&row.etag);
+                                        r.ours = ours;
+                                        o.meta_set_ahead(&key, &r.to_json())?;
+                                    }
+                                    Ok::<_, Fail>(())
+                                })
+                                .await?;
+                        }
                         // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
                         (row, sent.unwrap_or_else(|| src.hash.finalize()), src.hash.len(), mark)
                     }
@@ -1968,24 +1994,7 @@ impl<C: Cloud> Executor<C> {
                 let written = !src.get().is_some_and(oneup_effects::UploadSource::unchanged);
                 drop(src);
                 let local_mtime = if written { STAMP_UNKNOWN } else { mtime };
-                // The rescue record learns the eTag the upload left, which
-                // tells it apart from a later save.
-                let rescue_key = match (replace, &mark) {
-                    (Some(pre), Some(m)) => Some(format!("{}.{}.{}", Rescue::KEY, pre.id.0, m.id)),
-                    _ => None,
-                };
-                store
-                    .write(|o| {
-                        o.upsert_item(&row, false)?;
-                        if let Some(key) = &rescue_key
-                            && let Some(mut r) = o.meta_get(key)?.as_deref().and_then(Rescue::parse)
-                        {
-                            r.ours_etag.clone_from(&row.etag);
-                            o.meta_set(key, &r.to_json())?;
-                        }
-                        Ok::<_, Fail>(())
-                    })
-                    .await?;
+                store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
                 if row.qxh != Some(sent) || i64::try_from(sent_len).ok() != Some(size) || row.size != size {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }

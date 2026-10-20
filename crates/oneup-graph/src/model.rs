@@ -70,6 +70,12 @@ pub struct UploadSession {
 }
 
 /// An RFC 3339 time as Unix milliseconds.
+/// [`DriveItem::content_version`] of a cTag.
+pub fn content_version(ctag: &str) -> Option<String> {
+    let n = ctag.trim_matches('"').rsplit_once(',')?.1;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| format!("{n}.0"))
+}
+
 fn parse_time_ms(s: &str) -> Option<i64> {
     let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
     i64::try_from(t.unix_timestamp_nanos() / 1_000_000).ok()
@@ -150,6 +156,10 @@ pub struct DriveItem {
     pub file_system_info: Option<FileSystemInfo>,
     #[serde(default)]
     pub shared: Option<SharedFacet>,
+    /// Content tag (`c:{…},3`): on OneDrive Personal its count is the
+    /// version history's ID for this content ([`DriveItem::content_version`]).
+    #[serde(default, rename = "cTag")]
+    pub c_tag: Option<String>,
 }
 
 /// An item's `shared` facet: Graph's sign that it was shared with others.
@@ -234,6 +244,14 @@ impl DriveItem {
 
     pub fn parent_id(&self) -> Option<&str> {
         self.parent_reference.as_ref()?.id.as_deref()
+    }
+
+    /// The version its history lists this content as (`3.0` for
+    /// `c:{…},3`): OneDrive Personal's cTag counts content changes as the
+    /// history numbers them, while the eTag counts renames and moves too
+    /// (measured).
+    pub fn content_version(&self) -> Option<String> {
+        content_version(self.c_tag.as_deref()?)
     }
 
     /// The decoded 20-byte QuickXorHash, if present and well-formed.
@@ -396,6 +414,16 @@ pub struct Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As measured on OneDrive Personal: the cTag's count is the version
+    /// history's ID.
+    #[test]
+    fn a_ctag_gives_its_version_id() {
+        assert_eq!(content_version("\"c:{00000000-0000-0000-0000-000000000001},3\"").as_deref(), Some("3.0"));
+        assert_eq!(content_version("c:{X},12").as_deref(), Some("12.0"));
+        assert_eq!(content_version("c:{X}"), None);
+        assert_eq!(content_version("c:{X},a1"), None);
+    }
 
     #[test]
     fn shared_folders_are_read_from_their_remote_item() {

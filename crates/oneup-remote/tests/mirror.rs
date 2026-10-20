@@ -153,6 +153,7 @@ impl Inner {
             root: (n.kind == Kind::Root).then(Facet::default),
             file_system_info: None,
             shared: self.shared_facet(id),
+            c_tag: None,
         })
     }
 
@@ -170,6 +171,7 @@ impl Inner {
             root: None,
             file_system_info: None,
             shared: None,
+            c_tag: None,
         }
     }
 }
