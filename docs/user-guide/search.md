@@ -33,7 +33,7 @@ Beside each result:
 * **Files on this PC that haven't been uploaded yet.** Windows Search finds those.
 * **Text inside files**, unless you turn on OneDrive's search (below).
 
-After an update that adds search, OneUpDrive builds its search index once, when it next starts: from a few seconds up to about a minute for the largest drives. A search made before that finishes builds the rest first, and says so.
+The first time OneUpDrive starts with search, it builds the search index: from a few seconds up to about a minute for the largest drives. A search made before that finishes builds the rest first, and says so.
 
 ## Searching inside files with OneDrive
 OneDrive can search the text inside your documents too. This is off until you turn it on, because it **sends what you search for to Microsoft**: on the Search page, turn on **Search inside files with OneDrive**. It runs only when you press **Search** (or Enter), never while you type, and its results are listed under **Inside files (OneDrive's search)**. Each result says where it is, as above.

@@ -3,7 +3,7 @@
 Open it from the OneUpDrive icon's menu: **Settings**, or from OneUpDrive in the Start menu. Changes are saved as you make them, and the background agent picks them up straight away (the few that wait for a restart say so). The window follows Windows' light or dark mode and uses memory only while it's open.
 
 ## Set up
-Shown only until a folder is set up: sign in, choose the folders, what to exclude and Files On-Demand, look at the preview, **Start syncing**. See [Getting started](getting-started.md#setting-up). On a PC with the OneDrive app, it first offers **Move over from the OneDrive app**: your OneDrive folder stays where it is, after a check and unlinking the app. See [Moving over from the OneDrive app](migrating-from-onedrive.md#in-the-settings-window).
+Shown only until a folder is set up: sign in, choose the folders, what to exclude and Files On-Demand, look at the preview, **Start syncing**. See [Getting started](getting-started.md#setting-up). On a PC with the OneDrive app, it first offers **Move over from the OneDrive app** (see the [glossary](glossary.md) for unfamiliar words): your OneDrive folder stays where it is, after a check and unlinking the app. See [Moving over from the OneDrive app](migrating-from-onedrive.md#in-the-settings-window).
 
 At the top of every page, a light and a word say whether OneUpDrive is running and what it's doing. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While there's a problem, a red card above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Search**, **Apps** and **Activity**, then the settings: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**. On the Files page, the magnifier at the right of **All files** and **Exclude** opens a search box when you point at it or Tab to it.
 
@@ -31,7 +31,7 @@ With nothing selected, it shows the folder itself: where it is on this PC and in
 Finds any file or folder in your OneDrive by name as you type, online-only files included, and says where each one is, with **Open**, **Show** and **Sync this first**. Below it: **Search inside files with OneDrive** (off; it sends the search text to Microsoft) and the **Hotkey** that opens this page from any program. See [Finding files](search.md).
 
 ## Apps
-Which programs changed and opened files in your synced folder, over the last day, week, month or 90 days: a chart per day (or hour), and a table per program with files changed, files downloaded on open and their size. **Click a program** to see the files it used lately, newest first (from version 0.1.21 on). The page updates by itself while it's open; a change shows within about 20 seconds.
+Which programs changed and opened files in your synced folder, over the last day, week, month or 90 days: a chart per day (or hour), and a table per program with files changed, files downloaded on open and their size. **Click a program** to see the files it used lately, newest first. The page updates by itself while it's open; a change shows within about 20 seconds.
 
 * **Opened** is exact: Windows tells OneUpDrive which program asked for an online-only file.
 * **Changed** is OneUpDrive's best guess: when a file is written, it asks Windows which programs have the file open, and which program closed it just after. That works even for a program that writes and closes a file in a blink, for files OneUpDrive already synced. A brand-new file that a program creates and closes in a blink may still show as **Not identified**. OneUpDrive's own work (downloading, keeping files on this device, freeing up space) isn't counted.
@@ -50,8 +50,8 @@ Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the
 The numbers on the tabs count sync failures and waiting safety stops.
 
 ## Safety
-* **Stop and ask when**: how many deletions, replacements or moves at once (default 200, or 10% of everything synced) make OneUpDrive stop and ask you first; and the **ransomware guard**: stop when edited files suddenly no longer look like what they are (default: more than 20). See [Syncing in depth](syncing.md#safety-stop).
-* **Kept copies**: what OneUpDrive keeps when it removes a file from this PC, how long, how much room it may take, and what happens when it's full. **Open folder** shows them.
+* **Stop and ask when**: how many deletions, replacements or moves at once make OneUpDrive stop and ask you first (default: more than 200, or more than 10% of everything synced; never for 20 items or fewer); and the **ransomware guard**: stop when edited files suddenly no longer look like what they are (default: more than 20). See [Syncing in depth](syncing.md#safety-stop).
+* **Kept copies** (the version store): what OneUpDrive keeps when it removes a file from this PC, how long, how much room it may take, and what happens when it's full. **Open folder** shows them.
 
 ## Office
 **Open with AutoSave**, **Let OneUpDrive open Office files** (double-click with AutoSave once you pick OneUpDrive as the default program), folders left to the OneDrive app, and, only with experimental options turned on (`oneup settings --experimental on`, for developers), the experimental Office integration. See [Office](office.md).

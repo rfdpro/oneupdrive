@@ -1,6 +1,6 @@
 # Earlier versions and sharing
 
-OneDrive keeps earlier versions of your files, and can make links to share them. OneUpDrive shows both on the settings window's **Files** page: select a file, then **Versions** or **Share**. To get there for one file, right-click it in File Explorer and choose **OneUpDrive → Version history** or **OneUpDrive → Copy share link…**.
+OneDrive keeps earlier versions of your files (the *version history*; not the same as the [kept copies](glossary.md) on this PC), and can make links to share them. OneUpDrive shows both on the settings window's **Files** page: select a file, then **Versions** or **Share**. To get there for one file, right-click it in File Explorer and choose **OneUpDrive → Version history** or **OneUpDrive → Copy share link…**.
 
 ## Version history
 The list shows each version OneDrive keeps: when it was saved, its size and who saved it, newest first.

@@ -12,22 +12,22 @@ A **vault** is a folder whose files are encrypted on your PC before they reach O
 * **Your password is the key.** Forget it, and only the vault's **recovery key** (below) can open it again: not OneUpDrive, not Cryptomator, not Microsoft. Write the password down somewhere safe, and keep the recovery key too.
 
 ## Creating a vault
-In the settings window, **Encrypted vaults → Create a vault**: a new folder in OneDrive, a new or empty folder on this PC, and a password (twice). OneUpDrive makes the vault in OneDrive, starts syncing it, and shows its **recovery key**. From the command line: `oneup vault new /Private C:\Users\me\Private`.
+In the settings window, **Files → Add → Create an encrypted vault**: a new folder in OneDrive, a new or empty folder on this PC, and a password (twice). OneUpDrive makes the vault in OneDrive, starts syncing it, and shows its **recovery key**. From the command line: `oneup vault new /Private C:\Users\me\Private`.
 
 The new vault is a standard Cryptomator vault: Cryptomator's apps on your phone or another computer open it with the same password.
 
 ## The recovery key, and changing the password
 The **recovery key** is a long line of letters and numbers starting with `OUD1-`, shown when you create a vault and any time after with **Recovery key…** (or `oneup vault recovery-key Private`). With it you can set a new password if you forget yours. Print it or write it down, and keep it somewhere safe: **anyone who has it can read the vault**. It's OneUpDrive's own, so Cryptomator's apps don't read it, but the vault itself stays a normal Cryptomator vault.
 
-**Change password…** sets a new password with the current one, or with the recovery key (`oneup vault change-password Private`, add `--recovery-key` to use it). Nothing is re-encrypted; Cryptomator's apps and other PCs use the new password from then on. OneDrive keeps the vault's previous key file in its version history.
+**Change password…** (on the vault's tab) sets a new password with the current one, or with the recovery key (`oneup vault change-password Private`, add `--recovery-key` to use it). Nothing is re-encrypted; Cryptomator's apps and other PCs use the new password from then on. OneDrive keeps the vault's previous key file in its version history.
 
 ## Unlocking with Windows Hello
-Beside a vault, **Unlock with Windows Hello** lets your face, fingerprint or Windows PIN unlock it instead of the password (`oneup vault hello Private on`). It needs Windows Hello set up (Windows Settings → Accounts → Sign-in options), and it asks you to confirm when you turn it on and each time you unlock. The vault's keys are kept on this PC encrypted with a key that only Windows Hello, for you on this PC, can produce. Turning it off removes them.
+On the vault's tab, **Unlock with Windows Hello** lets your face, fingerprint or Windows PIN unlock it instead of the password (`oneup vault hello Private on`). It needs Windows Hello set up (Windows Settings → Accounts → Sign-in options), and it asks you to confirm when you turn it on and each time you unlock. The vault's keys are kept on this PC encrypted with a key that only Windows Hello, for you on this PC, can produce. Turning it off removes them.
 
 ## Syncing a vault with a folder on this PC
 OneUpDrive shows a vault in OneDrive as an ordinary folder on your PC, with its real file names. Programs open and save files there as usual: OneUpDrive decrypts what they open and encrypts what they save. You don't need Cryptomator on this PC.
 
-In the settings window, **Encrypted vaults → Add a vault**: the vault's folder in OneDrive, an empty folder on this PC, the password, and whether to keep every file decrypted here and remember the password. The vaults list then has **Unlock…**, **Lock**, **Open** and **Remove** for each. From the command line:
+In the settings window, **Files → Add → Add an existing vault**: the vault's folder in OneDrive, an empty folder on this PC, the password, and whether to keep every file decrypted here and remember the password. The vault gets a tab on the **Files** page, with **Unlock…**, **Lock** and **Stop syncing…**. From the command line:
 
 ```powershell
 oneup vault add /Vault C:\Users\me\Vault      # asks for the vault's password, then starts syncing
