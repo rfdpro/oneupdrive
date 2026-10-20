@@ -26,9 +26,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 pub use protocol::{
-    Activity, Answer, Call, DatabaseNote, Direction, Event, EventKind, Events, INVALID_PARAMS, INVALID_REQUEST,
-    LastRun, METHOD_NOT_FOUND, NO_SUCH_BATCH, NetStatus, NetWaiting, Overflow, PARSE_ERROR, PauseState, Problem,
-    Progress, PruneOffer, Retrying, RpcError, SafetyStop, Status, Unsynced,
+    Activity, Answer, Call, DataUse, DatabaseNote, Direction, Event, EventKind, Events, INVALID_PARAMS,
+    INVALID_REQUEST, LastRun, METHOD_NOT_FOUND, NO_SUCH_BATCH, NetStatus, NetWaiting, Overflow, PARSE_ERROR,
+    PauseState, Problem, Progress, PruneOffer, Retrying, RpcError, SafetyStop, Status, Unsynced,
 };
 
 /// In the data folder: the name of the running agent's pipe.

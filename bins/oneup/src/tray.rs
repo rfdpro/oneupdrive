@@ -237,6 +237,8 @@ pub mod id {
     pub const REVIEW_PRUNE: u32 = 45;
     pub const LIST_PRUNE: u32 = 46;
     pub const LIST_UNSYNCED: u32 = 47;
+    /// Allow [`crate::netusage::ALLOW_MB`] more on a used-up data budget.
+    pub const ALLOW_DATA: u32 = 48;
     pub const ACTIVITY: u32 = 50;
     pub const PROBLEM: u32 = 51;
     pub const START: u32 = 60;
@@ -299,6 +301,11 @@ fn action(id: u32, label: impl Into<String>, glyph: Glyph) -> Item {
 /// A line that only tells (greyed).
 fn note(label: impl Into<String>) -> Item {
     Item::Action { id: id::NOTE, label: label.into(), enabled: false, glyph: None }
+}
+
+/// The data budget in use, when it's used up.
+fn budget_reached(s: &Status) -> Option<&oneup_ipc::DataUse> {
+    s.network.as_ref()?.data.as_ref().filter(|d| d.reached)
 }
 
 /// The notification for a new safety stop, in `loc`'s language.
@@ -391,6 +398,10 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
             if let Some(u) = &s.unsynced {
                 let label = t!("Sync failure: {items}", items = unsynced_count(u, current()));
                 items.push(action(id::LIST_UNSYNCED, label, glyph::INFO));
+            }
+            if budget_reached(s).is_some() {
+                let label = t!("Allow {mb} MB more", mb = crate::netusage::ALLOW_MB);
+                items.push(action(id::ALLOW_DATA, label, glyph::WARNING));
             }
             if items.len() > waiting {
                 items.push(Item::Separator);
@@ -495,6 +506,21 @@ impl Notices {
                         text: t!(
                             "{n} files deleted in OneDrive don't fit in the version store. They stay here until you decide.",
                             n = o.count
+                        ),
+                        kind: Kind::Warning,
+                    });
+                }
+                if let Some(d) = budget_reached(s)
+                    && self.shown.insert(format!("budget:{}:{}", d.month, d.budget))
+                {
+                    let size = crate::versions::size;
+                    out.push(Notice {
+                        title: t!("Data budget reached"),
+                        text: t!(
+                            "Sync paused: {used} of {budget} used this month on this network. Allow {mb} MB more from this icon's menu.",
+                            used = size(d.up + d.down),
+                            budget = size(d.budget),
+                            mb = crate::netusage::ALLOW_MB
                         ),
                         kind: Kind::Warning,
                     });
@@ -1004,6 +1030,26 @@ mod tests {
         assert_eq!(look(&v), Look::UpToDate);
         assert!(ids(&menu_of(&v)).contains(&id::LIST_UNSYNCED));
         assert!(Notices::default().update(&v).is_empty());
+    }
+
+    /// A used-up data budget is said once (again once more is allowed and
+    /// used up too) and can be answered from the menu.
+    #[test]
+    fn a_reached_data_budget_is_notified_and_answered_from_the_menu() {
+        let mut s = status(Activity::Idle);
+        let data = oneup_ipc::DataUse { month: "2026-10".into(), up: 3, down: 7, budget: 10, reached: true };
+        s.network = Some(oneup_ipc::NetStatus { data: Some(data.clone()), ..oneup_ipc::NetStatus::default() });
+        s.auto_pause = Some("data budget reached".into());
+        let mut n = Notices::default();
+        let first = n.update(&up(s.clone()));
+        assert!(first.iter().any(|x| x.title == "Data budget reached"), "{first:?}");
+        assert!(n.update(&up(s.clone())).is_empty(), "once");
+        assert!(ids(&menu_of(&up(s.clone()))).contains(&id::ALLOW_DATA));
+        let more = oneup_ipc::DataUse { budget: 20, ..data };
+        s.network = Some(oneup_ipc::NetStatus { data: Some(more), ..oneup_ipc::NetStatus::default() });
+        assert_eq!(n.update(&up(s.clone())).len(), 1, "used up again");
+        s.network = None;
+        assert!(!ids(&menu_of(&up(s))).contains(&id::ALLOW_DATA));
     }
 
     #[test]
