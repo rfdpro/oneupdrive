@@ -280,7 +280,15 @@ async fn run(args: Args) -> Result<()> {
     // `control.events`. They mustn't inherit this process's output handle
     // (its log): Windows hands a child every inheritable handle.
     oneup_sys::inherit::keep_std_handles();
-    let mut hooks = oneup_app::hooks::AgentHooks::start(dir, &synced_folder, &control.events);
+    // The hooks' processes share one registry, so the control pipe can
+    // refuse them: a hook can't approve a safety stop or read the status.
+    let hook_jobs = std::sync::Arc::new(oneup_sys::contained::HookJobs::new());
+    {
+        let jobs = std::sync::Arc::clone(&hook_jobs);
+        control.refuse_clients(Box::new(move |pid| jobs.contains(pid)));
+    }
+    let mut hooks =
+        oneup_app::hooks::AgentHooks::start(dir, &synced_folder, &control.events, std::sync::Arc::clone(&hook_jobs));
     let p = control.controls();
     if p.pause_local || p.pause_remote {
         println!("oneupd: {} (`oneup resume` to continue)", describe_pause(p.pause_local, p.pause_remote));

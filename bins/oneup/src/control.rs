@@ -85,6 +85,11 @@ pub struct Control {
     rev: tokio::sync::watch::Sender<u64>,
     /// What happened, for `oneup watch` and hooks (`Call::Events`).
     pub events: Arc<Feed>,
+    /// Whether a client's process may use the pipe: the agent sets this to
+    /// refuse its own hook processes (`crate::hooks`), so a hook can't
+    /// approve a safety stop or read the status. `None` (tests, `oneup
+    /// sync`): everyone may.
+    hook_guard: std::sync::OnceLock<Box<dyn Fn(u32) -> bool + Send + Sync>>,
 }
 
 struct Shared {
@@ -196,7 +201,14 @@ impl Control {
             stopping: AtomicBool::new(false),
             rev: tokio::sync::watch::Sender::new(0),
             events: Arc::new(Feed::new()),
+            hook_guard: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Refuse a client process for which `refuse` returns true (the agent's
+    /// hook processes). Set once, before the pipe serves.
+    pub fn refuse_clients(&self, refuse: Box<dyn Fn(u32) -> bool + Send + Sync>) {
+        let _ = self.hook_guard.set(refuse);
     }
 
     /// Moves the revision on if the status changed, and passes the pause
@@ -622,6 +634,10 @@ impl oneup_ipc::Handler for Control {
 
     fn event_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.events.subscribe())
+    }
+
+    fn permit(&self, pid: u32) -> bool {
+        self.hook_guard.get().is_none_or(|refuse| !refuse(pid))
     }
 }
 

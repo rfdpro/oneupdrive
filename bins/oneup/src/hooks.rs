@@ -4,10 +4,12 @@
 //!
 //! * **Where programs may be.** Every folder OneUpDrive syncs on this PC
 //!   (this account's pairs and vaults, and every other data folder's) is
-//!   found when the hooks load, again when `config.toml` changes and at
-//!   most every [`PLACES_EVERY`] otherwise; a hook whose program (or a
-//!   script its arguments name) is in one is refused, at load and again
-//!   right before each start (`oneup_hooks::program`).
+//!   found, read fresh (by [`PlaceCache`], re-statting the pairs' stamps)
+//!   right before each launch, so a pair added since the hooks loaded is
+//!   seen. A hook whose program (or a script its arguments name) is in one
+//!   is refused, at load and again right before each start. When the folders
+//!   can't be listed in full, every hook is refused rather than risk missing
+//!   one (`oneup_hooks::program`).
 //! * **What it says.** Every run goes to [`LOG_FILE`] in the data folder
 //!   (with the program's output), and to the agent's log at debug level.
 //!   The activity log gets what needs attention: refusals, failed runs (at
@@ -23,8 +25,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use oneup_hooks::program::Places;
-use oneup_hooks::{Contained, HookSpec, Note, Ran, Runner, Settings};
+use oneup_hooks::{Contained, HookSpec, MAX_HOOKS, Note, PlacesSource, Ran, Runner, Settings};
 use oneup_store::{ActivityEntry, ActivityOutcome};
+use oneup_sys::contained::HookJobs;
 
 use crate::config;
 use crate::events::Feed;
@@ -33,20 +36,41 @@ use crate::events::Feed;
 pub const LOG_FILE: &str = "hooks.log";
 /// [`LOG_FILE`] is moved to `hooks.log.1` (replacing it) past this size.
 const LOG_MAX: u64 = 1024 * 1024;
-/// The synced folders are looked up again at most this often while
-/// `config.toml` doesn't change.
-pub const PLACES_EVERY: Duration = Duration::from_secs(10 * 60);
 /// A hook's failures reach the activity log at most this often.
 const FAILURE_EVERY: Duration = Duration::from_secs(60);
 
-/// Every folder OneUpDrive syncs on this PC, with what syncs it: the pairs
-/// and vaults of `dir`'s account, then every other data folder's.
+/// Every folder OneUpDrive syncs on this PC, with what syncs it (the pairs
+/// and vaults of `dir`'s account, then every other data folder's), whether
+/// that list is complete, a safe working folder (the data folder) and a
+/// `PATH` with synced folders removed. If any part can't be read, `complete`
+/// is false and hooks are refused rather than risk missing a folder.
 pub fn places(dir: &Path) -> Places {
+    let mut complete = true;
     let main = crate::vaultpair::main_dir(dir);
-    let mut out: Vec<(PathBuf, String)> = crate::pairs::local_folders(&main, None).unwrap_or_default();
+    let mut out: Vec<(PathBuf, String)> = match crate::pairs::local_folders(&main, None) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "hooks: can't list this account's synced folders");
+            complete = false;
+            Vec::new()
+        }
+    };
     for d in crate::datafolders::all() {
-        let Ok(store) = crate::setup::open_store(&d, 1024) else { continue };
-        let Ok(Some(local)) = store.read(|o| o.meta_get(crate::sync::KEY_LOCAL)) else { continue };
+        let store = match crate::setup::open_store(&d, 1024) {
+            Ok(s) => s,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let local = match store.read(|o| o.meta_get(crate::sync::KEY_LOCAL)) {
+            Ok(l) => l,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        let Some(local) = local else { continue };
         let local = PathBuf::from(local);
         if !out
             .iter()
@@ -55,7 +79,72 @@ pub fn places(dir: &Path) -> Places {
             out.push((local, "a folder another OneUpDrive account syncs".into()));
         }
     }
-    Places::new(out)
+    let synced: Vec<PathBuf> = out.iter().map(|(p, _)| p.clone()).collect();
+    Places::new(out, complete, dir.to_path_buf(), Some(safe_path(&synced)))
+}
+
+/// `PATH` with every directory inside a synced folder removed, so a hook's
+/// program can't reach a cloud-controlled DLL or helper by a `PATH` lookup.
+fn safe_path(synced: &[PathBuf]) -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| !synced.iter().any(|s| oneup_local::coexist::is_within(dir, s)))
+        .collect();
+    std::env::join_paths(kept).unwrap_or(path)
+}
+
+/// Reads the synced folders fresh for each launch, but only re-walks them
+/// when a cheap stamp (the data folders and their pair/config stamps) says
+/// something could have changed; otherwise returns the last reading.
+struct PlaceCache {
+    dir: PathBuf,
+    last: Mutex<(u64, Arc<Places>, Instant)>,
+}
+
+impl PlaceCache {
+    fn new(dir: &Path) -> Arc<Self> {
+        let places = Arc::new(places(dir));
+        Arc::new(Self { dir: dir.to_path_buf(), last: Mutex::new((Self::stamp(dir), places, Instant::now())) })
+    }
+
+    /// A cheap fingerprint of the data folders and their pair lists: the
+    /// modification times of each data folder's `config.toml`, `pairs` and
+    /// `vaults` directories.
+    fn stamp(dir: &Path) -> u64 {
+        let main = crate::vaultpair::main_dir(dir);
+        let mut folders = crate::datafolders::all();
+        folders.push(main.clone());
+        folders.sort();
+        folders.dedup();
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |n: u64| {
+            h = (h ^ n).wrapping_mul(0x0100_0000_01b3);
+        };
+        for f in folders {
+            for name in ["config.toml", "pairs", "vaults"] {
+                let t = std::fs::metadata(f.join(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as u64);
+                mix(t);
+            }
+        }
+        h
+    }
+}
+
+impl PlacesSource for PlaceCache {
+    fn places(&self) -> Arc<Places> {
+        let stamp = Self::stamp(&self.dir);
+        let mut last = self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Re-walk only when the stamp changed, and at most a few times a
+        // second, so a burst of launches is cheap.
+        if stamp != last.0 && last.2.elapsed() >= Duration::from_millis(300) {
+            *last = (stamp, Arc::new(places(&self.dir)), Instant::now());
+        }
+        Arc::clone(&last.1)
+    }
 }
 
 /// What `config.toml` says, the last good version if it can't be read now
@@ -80,43 +169,38 @@ pub struct AgentHooks {
     dir: PathBuf,
     root: PathBuf,
     stamp: Option<SystemTime>,
-    places: Places,
-    places_at: Instant,
+    cache: Arc<PlaceCache>,
 }
 
 impl AgentHooks {
-    /// Starts the hooks of data folder `dir`, whose synced folder is
-    /// `root`, on `feed`'s events.
-    pub fn start(dir: &Path, root: &Path, feed: &Feed) -> Self {
+    /// Starts the hooks of data folder `dir`, whose synced folder is `root`,
+    /// on `feed`'s events. `jobs` is the registry hook processes join, so the
+    /// control pipe can refuse them.
+    pub fn start(dir: &Path, root: &Path, feed: &Feed, jobs: Arc<HookJobs>) -> Self {
         let notes = Notes { dir: dir.to_path_buf(), log: Mutex::new(()), failures: Mutex::default() };
-        let places = places(dir);
+        let cache = PlaceCache::new(dir);
         let h = load(dir);
-        let settings = Settings { hooks: h.list, paused: h.paused, root: root.to_path_buf(), places: places.clone() };
-        let runner = Arc::new(Runner::start(settings, Arc::new(Contained), Box::new(move |n| notes.note(n))));
+        let settings = Settings {
+            hooks: h.list,
+            paused: h.paused,
+            root: root.to_path_buf(),
+            places: (*cache.places()).clone(),
+            source: Some(Arc::clone(&cache) as Arc<dyn PlacesSource>),
+        };
+        let runner =
+            Arc::new(Runner::start(settings, Arc::new(Contained::new(Some(jobs))), Box::new(move |n| notes.note(n))));
         let offer = Arc::clone(&runner);
         feed.add_sink(Arc::new(move |e| offer.offer(e)));
-        Self {
-            runner,
-            dir: dir.to_path_buf(),
-            root: root.to_path_buf(),
-            stamp: stamp(dir),
-            places,
-            places_at: Instant::now(),
-        }
+        Self { runner, dir: dir.to_path_buf(), root: root.to_path_buf(), stamp: stamp(dir), cache }
     }
 
-    /// Reads the hooks again if `config.toml` changed (called at each of
-    /// the agent's wake-ups: a file's time, nothing more, unless it did),
-    /// and the synced folders if they're old.
+    /// Reads the hooks again if `config.toml` changed (called at each of the
+    /// agent's wake-ups: a file's time, nothing more, unless it did). The
+    /// synced folders are read fresh per launch by the runner's source.
     pub fn refresh(&mut self) {
         let now = stamp(&self.dir);
-        let old_places = self.places_at.elapsed() >= PLACES_EVERY;
-        if now == self.stamp && !old_places {
+        if now == self.stamp {
             return;
-        }
-        if now != self.stamp || old_places {
-            self.places = places(&self.dir);
-            self.places_at = Instant::now();
         }
         self.stamp = now;
         let h = load(&self.dir);
@@ -124,7 +208,8 @@ impl AgentHooks {
             hooks: h.list,
             paused: h.paused,
             root: self.root.clone(),
-            places: self.places.clone(),
+            places: (*self.cache.places()).clone(),
+            source: Some(Arc::clone(&self.cache) as Arc<dyn PlacesSource>),
         });
     }
 }
@@ -263,15 +348,22 @@ pub struct Listed {
     pub refused: Option<String>,
 }
 
-/// The hooks, and whether they're paused, each checked as the agent would.
+/// The hooks, and whether they're paused, each checked as the agent would
+/// (including the [`MAX_HOOKS`] limit, so the list shows the same reason the
+/// runner refuses a hook beyond it for).
 pub fn list(dir: &Path) -> Result<(bool, Vec<Listed>)> {
     let h = config::load_hooks(dir)?;
     let places = places(dir);
     let listed = h
         .list
         .into_iter()
-        .map(|spec| {
-            let refused = oneup_hooks::check(&spec, &places).err();
+        .enumerate()
+        .map(|(i, spec)| {
+            let refused = if i >= MAX_HOOKS {
+                Some(format!("more than {MAX_HOOKS} hooks; this one and those after it don't run"))
+            } else {
+                oneup_hooks::check(&spec, &places).err()
+            };
             Listed { spec, refused }
         })
         .collect();
@@ -368,6 +460,27 @@ mod tests {
         assert_eq!(entries.len(), 1, "the second failure within a minute waits: {entries:?}");
         assert!(entries[0].detail.contains("hook h on synced: exit 2") && entries[0].path == "/a.txt");
         drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `oneup hooks` (via [`list`]) marks hooks beyond [`MAX_HOOKS`] refused,
+    /// the same reason the runner refuses to run them for.
+    #[test]
+    fn list_refuses_hooks_beyond_the_limit() {
+        let dir = std::env::temp_dir().join(format!("oneup-app-hooks-many-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut toml = String::new();
+        for i in 0..MAX_HOOKS + 2 {
+            toml.push_str(&format!("[[hook]]\nname = \"h{i}\"\non = [\"synced\"]\nprogram = \"x{i}.exe\"\n\n"));
+        }
+        std::fs::write(config::path(&dir), toml).unwrap();
+        let (_, listed) = list(&dir).unwrap();
+        assert_eq!(listed.len(), MAX_HOOKS + 2);
+        assert!(listed[MAX_HOOKS].refused.as_deref().is_some_and(|w| w.contains("more than")));
+        assert!(listed[MAX_HOOKS + 1].refused.as_deref().is_some_and(|w| w.contains("more than")));
+        // One within the limit is refused for its own reason (no such program).
+        assert!(listed[0].refused.as_deref().is_some_and(|w| !w.contains("more than")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
