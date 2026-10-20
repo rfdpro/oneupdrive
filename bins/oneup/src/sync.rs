@@ -1352,9 +1352,10 @@ impl Engine {
             store = self.remote(store, &pruning).await?;
             // A vault move a crash cut short, recorded where it went before
             // the plan reads its old ID's removal as a deletion.
-            let settled = store.write(oneup_exec::settle_moves)?;
+            let settled = self.exec.settle_moves(&mut store)?;
             if settled != oneup_exec::Settled::default() {
-                tracing::info!(?settled, "settled moves an earlier round cut short");
+                let oneup_exec::Settled { relinked, held, waiting, .. } = settled;
+                tracing::info!(relinked, held, waiting, "settled moves an earlier round cut short");
             }
             let user_rules = self.load_rules(&mut store)?;
             // Changed rules: every folder is planned again, from the
@@ -2158,9 +2159,7 @@ async fn dry_run(
     data_dir: &Path,
     limit: Option<usize>,
 ) -> Result<()> {
-    let mut store = observe(store, rules).await?;
-    // As a round does: a move a crash cut short, recorded where it went.
-    store.write(oneup_exec::settle_moves)?;
+    let store = observe(store, rules).await?;
     let (user_rules, ignored) = crate::rulefiles::load(data_dir, &store, &mut crate::rulefiles::Cache::default())?;
     for (path, why) in ignored {
         println!("Rule file {path} ignored: {why}");

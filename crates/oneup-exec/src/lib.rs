@@ -83,7 +83,7 @@ pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]
 pub use exec::{Executor, FOLLOW_MAX, Follow, Report, Skip, link_roots};
 pub use graph::{GraphCloud, UploadMemory};
-pub use moving::{Settled, settle_moves};
+pub use moving::Settled;
 #[cfg(windows)]
 pub use schedule::Parallel;
 pub use timing::Timings;

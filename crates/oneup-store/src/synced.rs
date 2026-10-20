@@ -469,7 +469,7 @@ impl Ops<'_> {
     }
 
     /// Withdraws cloud deletion evidence for `id`. Only for the executor's
-    /// settling of a vault move cut short (`oneup_exec::settle_moves`):
+    /// settling of a vault move cut short (`oneup_exec::Executor::settle_moves`):
     /// the item was moved under a new ID that can't be found yet, so its
     /// old ID's removal is no evidence of a deletion.
     pub fn unnote_remote_deleted(&self, id: &str) -> Result<()> {
