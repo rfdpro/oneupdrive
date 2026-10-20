@@ -149,6 +149,24 @@ fn templates_in(arg: &str) -> Result<Vec<&'static str>, String> {
     Ok(found)
 }
 
+/// A value made safe to quote in a batch file or a shell: no double quote
+/// (it becomes `'`), so `"%ONEUPHOOK_PATH%"` can't be broken out of, and no
+/// control character (it becomes a space). Windows and OneDrive names can't
+/// hold either; details could, so every value is cleaned the same way.
+fn env_safe(v: &str) -> String {
+    v.chars()
+        .map(|c| {
+            if c == '"' {
+                '\''
+            } else if c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// What a hook's templates stand for, for one event.
 pub struct Fill<'a> {
     pub event: &'a Event,
@@ -185,7 +203,7 @@ impl Fill<'_> {
             ("ONEUPHOOK_DETAIL", e.detail.clone()),
         ]
         .into_iter()
-        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .map(|(k, v)| (OsString::from(k), OsString::from(env_safe(&v))))
         .collect()
     }
 
@@ -263,6 +281,28 @@ mod tests {
 
     fn event(kind: EventKind, path: &str) -> Event {
         Event { seq: 1, at_ms: 0, kind, path: path.into(), action: "upload".into(), detail: "new version".into() }
+    }
+
+    /// No `ONEUPHOOK_*` value can hold a double quote or a control
+    /// character, so a quoted `"%ONEUPHOOK_DETAIL%"` in a batch file stays
+    /// one quoted string.
+    #[test]
+    fn environment_values_hold_no_quotes() {
+        let e = Event {
+            seq: 1,
+            at_ms: 0,
+            kind: EventKind::Failure,
+            path: "/a&b.txt".into(),
+            action: "upload".into(),
+            detail: "said \"no\" & quit\r\nnext".into(),
+        };
+        let env = Fill { event: &e, root: Path::new(r"C:\Sync") }.env();
+        for (k, v) in &env {
+            let v = v.to_string_lossy();
+            assert!(!v.contains('"') && !v.chars().any(char::is_control), "{k:?}={v}");
+        }
+        let detail = env.iter().find(|(k, _)| k == "ONEUPHOOK_DETAIL").unwrap().1.to_string_lossy().into_owned();
+        assert_eq!(detail, "said 'no' & quit  next");
     }
 
     #[test]
