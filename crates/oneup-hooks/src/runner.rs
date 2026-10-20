@@ -81,6 +81,10 @@ pub struct LaunchRequest<'a> {
     pub scripts: &'a [PathBuf],
     pub cwd: &'a Path,
     pub path: Option<&'a OsStr>,
+    /// The event as `ONEUPHOOK_*` variables (never tokens or file contents).
+    pub env: &'a [(OsString, OsString)],
+    /// The event as one JSON line for standard input.
+    pub stdin: &'a [u8],
     pub timeout: Duration,
 }
 
@@ -115,9 +119,12 @@ impl Contained {
 impl Launch for Contained {
     #[cfg(windows)]
     fn launch(&self, req: &LaunchRequest<'_>) -> std::io::Result<Finished> {
+        // `ONEUP_*` is stripped (a vault's recovery key can live there);
+        // the hook's own `ONEUPHOOK_*` variables are set on top.
         let drop_env = |n: &OsStr| n.to_string_lossy().to_ascii_uppercase().starts_with("ONEUP_");
-        let overrides: Vec<(OsString, OsString)> =
+        let mut overrides: Vec<(OsString, OsString)> =
             req.path.map(|p| vec![(OsString::from("PATH"), p.to_os_string())]).unwrap_or_default();
+        overrides.extend(req.env.iter().cloned());
         let f = oneup_sys::contained::run(
             &oneup_sys::contained::Spec {
                 program: req.program,
@@ -126,6 +133,7 @@ impl Launch for Contained {
                 drop_env: &drop_env,
                 env_overrides: &overrides,
                 guard: req.scripts,
+                stdin: req.stdin,
                 timeout: req.timeout,
                 keep_output: KEEP_OUTPUT,
             },
@@ -556,13 +564,26 @@ fn worker(shared: &Shared) {
         let checked = check(&job.spec, &places);
         let result = match &checked {
             Ok(c) => {
-                let args = Fill { event: &job.event, root: &job.root }.args(&job.spec.args);
+                let fill = Fill { event: &job.event, root: &job.root };
+                // The literal prefix (e.g. cmd /c script) then the user's
+                // args; templates are filled only for a plain .exe (the
+                // others have none, having been refused at load).
+                let mut args = c.prefix.clone();
+                if c.templates_ok {
+                    args.extend(fill.args(&job.spec.args));
+                } else {
+                    args.extend(job.spec.args.iter().map(OsString::from));
+                }
+                let env = fill.env();
+                let stdin = fill.json_line();
                 let req = LaunchRequest {
                     program: &c.program,
                     args: &args,
                     scripts: &c.scripts,
                     cwd: &places.cwd,
                     path: places.safe_path.as_deref(),
+                    env: &env,
+                    stdin: &stdin,
                     timeout: job.spec.timeout,
                 };
                 shared.launch.launch(&req).map_err(|e| format!("couldn't start: {e}"))
@@ -871,5 +892,52 @@ mod tests {
         assert_eq!(f.started.lock().unwrap().len(), 20);
         // Two at once (one per hook): about 10 runs' time, not 20.
         assert!(t.elapsed() < Duration::from_millis(550), "{:?}", t.elapsed());
+    }
+
+    /// A `.bat` hook runs (wrapped in `cmd /c`) and gets a cloud-set event
+    /// value through the environment, never on the command line: a path like
+    /// `a&calc.exe&.txt` can't inject a command.
+    #[test]
+    fn a_bat_hook_gets_the_event_by_environment_not_on_the_command_line() {
+        let dir = std::env::temp_dir().join(format!("oneup-hooks-bat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.txt");
+        let bat = dir.join("hook.bat");
+        // `set VAR` prints the value literally (no re-parsing); the command
+        // line (%CMDCMDLINE%) holds no cloud value, so echoing it is safe.
+        std::fs::write(
+            &bat,
+            format!(
+                "@echo off\r\nset ONEUPHOOK_RELPATH> \"{out}\"\r\necho cmdline=%CMDCMDLINE%>> \"{out}\"\r\n",
+                out = out.display()
+            ),
+        )
+        .unwrap();
+        let spec = HookSpec {
+            coalesce: Duration::ZERO,
+            ..HookSpec::new("b", &[EventKind::Synced], &bat.to_string_lossy(), &[])
+        };
+        let places = Places::new(Vec::new(), true, dir.clone(), None);
+        let settings = Settings { hooks: vec![spec], root: dir.clone(), places, ..Settings::default() };
+        let r = Runner::start(settings, Arc::new(Contained::new(None)), Box::new(|_| {}));
+        r.offer(&[synced("/a&calc.exe&.txt")]);
+        assert!(r.wait_idle(Duration::from_secs(30)), "{:?}", r.backlog());
+        // The run writes the file; give the handle a moment to flush/close.
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(&out).unwrap_or_default();
+            if text.contains("cmdline=") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The value arrived in the environment...
+        assert!(text.contains("ONEUPHOOK_RELPATH=a&calc.exe&.txt"), "{text}");
+        // ...and the command line is only cmd /c <bat>, without the value.
+        let cmdline = text.lines().find(|l| l.starts_with("cmdline=")).unwrap_or("");
+        assert!(!cmdline.contains("calc.exe"), "the event value must not be on the command line: {cmdline}");
+        assert!(cmdline.to_lowercase().contains("hook.bat"), "{cmdline}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -162,16 +162,67 @@ impl Fill<'_> {
         args.iter().map(|a| self.arg(a)).collect()
     }
 
+    /// The item's full path on this PC (empty for an event without a path).
+    pub fn full_path(&self) -> String {
+        let rel = self.event.path.trim_start_matches('/');
+        if rel.is_empty() {
+            String::new()
+        } else {
+            let p = self.root.join(rel.replace('/', "\\"));
+            oneup_local::coexist::plain(&p).to_string_lossy().into_owned()
+        }
+    }
+
+    /// The event as the environment variables a hook reads (`ONEUPHOOK_*`),
+    /// never carrying tokens or file contents.
+    pub fn env(&self) -> Vec<(OsString, OsString)> {
+        let e = self.event;
+        [
+            ("ONEUPHOOK_EVENT", e.kind.name().to_string()),
+            ("ONEUPHOOK_PATH", self.full_path()),
+            ("ONEUPHOOK_RELPATH", e.path.trim_start_matches('/').to_string()),
+            ("ONEUPHOOK_ACTION", e.action.clone()),
+            ("ONEUPHOOK_DETAIL", e.detail.clone()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect()
+    }
+
+    /// The event as one JSON line for standard input.
+    pub fn json_line(&self) -> Vec<u8> {
+        fn esc(s: &str) -> String {
+            let mut o = String::with_capacity(s.len() + 2);
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    '\r' => o.push_str("\\r"),
+                    '\t' => o.push_str("\\t"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o
+        }
+        let e = self.event;
+        format!(
+            "{{\"event\":\"{}\",\"path\":\"{}\",\"relpath\":\"{}\",\"action\":\"{}\",\"detail\":\"{}\",\"seq\":{},\"at_ms\":{}}}\n",
+            e.kind.name(),
+            esc(&self.full_path()),
+            esc(e.path.trim_start_matches('/')),
+            esc(&e.action),
+            esc(&e.detail),
+            e.seq,
+            e.at_ms,
+        )
+        .into_bytes()
+    }
+
     fn arg(&self, a: &str) -> OsString {
         let rel = self.event.path.trim_start_matches('/');
-        let full = || {
-            if rel.is_empty() {
-                String::new()
-            } else {
-                let p = self.root.join(rel.replace('/', "\\"));
-                oneup_local::coexist::plain(&p).to_string_lossy().into_owned()
-            }
-        };
+        let full = || self.full_path();
         let mut out = String::new();
         let mut rest = a;
         while let Some(i) = rest.find('{') {
