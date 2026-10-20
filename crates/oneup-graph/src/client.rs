@@ -1436,6 +1436,11 @@ impl Graph {
         format!("{}/delta?$top={PAGE_SIZE}&$select=id,shared,deleted", self.top_url())
     }
 
+    /// An item's URL (`items/{id}`), for a request of the caller's own.
+    pub fn item_url(&self, id: &str) -> String {
+        format!("{}/items/{}", self.drive_url(), encode_id(id))
+    }
+
     /// First page URL for a folder's direct children.
     pub fn children_url(&self, folder_id: &str) -> String {
         format!("{}/items/{}/children?$top={PAGE_SIZE}&$select={ITEM_SELECT}", self.drive_url(), encode_id(folder_id))
