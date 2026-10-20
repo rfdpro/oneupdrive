@@ -340,6 +340,23 @@ impl Databases {
         self.recognise(path, None, false)
     }
 
+    /// What decides which files are databases by name and pattern, as one
+    /// string (empty without patterns): when it changes, planning parks
+    /// SQLite's working files differently, so every folder is planned again.
+    pub fn fingerprint(&self) -> String {
+        self.rules
+            .iter()
+            .map(|(preset, r)| {
+                format!(
+                    "{}:{}
+",
+                    preset.unwrap_or(""),
+                    r.text
+                )
+            })
+            .collect()
+    }
+
     /// The patterns, as written, with the preset each came from.
     pub fn patterns(&self) -> impl Iterator<Item = (Option<&'static str>, &str)> {
         self.rules.iter().map(|(p, r)| (*p, r.text.as_str()))

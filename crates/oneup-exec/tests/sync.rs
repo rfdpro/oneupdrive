@@ -985,7 +985,7 @@ impl Sync {
             decisions: Vec::new(),
             overflow: None,
             rules: RuleSet::default(),
-            planned_rules: RuleSet::default().fingerprint(),
+            planned_rules: format!("{} ", RuleSet::default().fingerprint()),
             pull: false,
             follow: true,
             follow_max: oneup_exec::FOLLOW_MAX,
@@ -1149,7 +1149,9 @@ impl Sync {
         self.cloud.pull(store);
         // Only the folders the store marked dirty are planned, as the
         // background agent does; `settle` checks a full plan agrees.
-        let fingerprint = self.rules.fingerprint();
+        // The database patterns too, as the agent does: they decide which
+        // working files are parked.
+        let fingerprint = format!("{} {}", self.rules.fingerprint(), self.exec.local().databases().fingerprint());
         let all = fingerprint != self.planned_rules || std::mem::take(&mut self.stops.full_next);
         let rules = &self.rules;
         let dbs = self.exec.local().databases();
@@ -6739,4 +6741,72 @@ async fn a_downloaded_outlook_file_is_known_by_its_content() {
         matches!(op, Op::Download { name, .. } if name == "mail.dat") && *f == oneup_rules::database::Format::Outlook
     });
     assert!(known, "{r:?}");
+}
+
+/// Removing a database pattern, with nothing else changing, plans every
+/// folder again: a working file it had parked syncs from then on.
+#[tokio::test]
+async fn a_database_pattern_removed_unparks_its_working_files_at_once() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("db-pattern-change", cloud.clone());
+    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["*.ledger"]).unwrap());
+    write(&s.p("books.ledger"), b"2026-10-01 coffee 3.50\n");
+    write(&s.p("books.ledger-wal"), b"");
+    for _ in 0..3 {
+        s.round().await;
+    }
+    assert!(!cloud.tree().contains_key("/books.ledger-wal"), "parked beside a database");
+    s.exec.set_databases(oneup_rules::database::Databases::default());
+    s.round().await;
+    assert!(cloud.tree().contains_key("/books.ledger-wal"), "synced as soon as it's an ordinary file");
+}
+
+/// The names a move uses are judged each on its own: a file a `!` pattern
+/// opts out where it is still isn't renamed to a database's name beside
+/// changes waiting there (SQLite would apply them to it).
+#[tokio::test]
+async fn an_opted_out_file_isnt_renamed_into_a_databases_name_beside_changes() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("db-opted-out-move", cloud.clone());
+    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["!old.txt"]).unwrap());
+    write(&s.p("old.txt"), b"notes, not a database");
+    write(&s.p("app.db-wal"), b"another database's changes");
+    s.settle().await;
+    cloud.rename("old.txt", "app.db");
+    let mut waits = 0;
+    for _ in 0..2 {
+        let r = s.round().await;
+        assert!(!r.done.iter().any(|op| matches!(op, Op::MoveLocal { .. })), "{r:?}");
+        waits += r.databases.iter().filter(|(op, _)| matches!(op, Op::MoveLocal { .. })).count();
+    }
+    assert!(s.p("old.txt").exists() && !s.p("app.db").exists());
+    assert!(waits > 0, "said why");
+}
+
+/// Another provider's placeholder in a database's place, hydrated, is
+/// never read: it can't be told from a database, so a working file from
+/// OneDrive isn't placed beside it. (Simulated: a file another program
+/// makes there, made a placeholder with an identity that isn't
+/// OneUpDrive's.)
+#[tokio::test]
+async fn another_providers_placeholder_where_a_database_would_be_is_never_read() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let (od, mut s) = on_demand_sync("db-foreign-placeholder", &cloud);
+    s.quiesce().await;
+    cloud.add("app.data-wal", Some(b"from another PC"));
+    // After the round looked at this PC: an ordinary text file, made a
+    // placeholder of another provider's.
+    let main = s.p("app.data");
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        let st =
+            std::process::Command::new("cmd").raw_arg(format!("/C echo plain text>\"{}\"", main.display())).status();
+        assert!(st.unwrap().success());
+        provider::Exclusive::open(&main).unwrap().convert(b"another provider's identity").unwrap();
+    }));
+    let r = s.round().await;
+    assert!(!s.p("app.data-wal").exists(), "not placed beside what may be a database: {r:?}");
+    assert!(db_waits(&r, "app.data-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Behind), "{r:?}");
+    drop(s);
+    drop(od);
 }
