@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 oneup-cfapi = { path = "../oneup-cfapi" }
 oneup-gate = { path = "../oneup-gate" }
+# Removing a sharing link or setting its expiry (`sharing`).
+oneup-graph = { path = "../oneup-graph" }
 oneup-hash = { path = "../oneup-hash" }
 oneup-ntfs = { path = "../oneup-ntfs" }
 oneup-rules = { path = "../oneup-rules" }
@@ -24,6 +26,8 @@ tracing = "0.1"
 # process had been killed there (`oneup-exec`'s `crash-test` turns it on;
 # production builds never do).
 crash-test = []
+# Test support: `sharing::fake`, an in-memory OneDrive's sharing.
+fake = []
 
 [lints]
 workspace = true
