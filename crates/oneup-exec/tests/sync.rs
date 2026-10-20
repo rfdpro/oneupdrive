@@ -4872,7 +4872,7 @@ type Fired = Arc<Mutex<BTreeMap<String, (u32, u32)>>>;
 struct NoProgram;
 
 impl oneup_hooks::Launch for NoProgram {
-    fn launch(&self, _: &Path, _: &[std::ffi::OsString], _: Duration) -> std::io::Result<oneup_hooks::Finished> {
+    fn launch(&self, _: &oneup_hooks::LaunchRequest<'_>) -> std::io::Result<oneup_hooks::Finished> {
         Ok(oneup_hooks::Finished { exit_code: Some(0), timed_out: false, output: Vec::new(), truncated: false })
     }
 }
@@ -4912,12 +4912,16 @@ fn burst_hook(
         }
         other => panic!("{other:?}"),
     };
-    let settings = oneup_hooks::Settings {
-        hooks: vec![spec],
-        paused: false,
-        root: root.to_path_buf(),
-        places: oneup_hooks::program::Places::default(),
-    };
+    // No synced folders, known complete (the temp dirs here aren't synced),
+    // so the hook is allowed; a safe working folder for the program.
+    let places = oneup_hooks::program::Places::new(
+        Vec::new(),
+        true,
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32"),
+        None,
+    );
+    let settings =
+        oneup_hooks::Settings { hooks: vec![spec], paused: false, root: root.to_path_buf(), places, source: None };
     (oneup_hooks::Runner::start(settings, launch, Box::new(notes)), fired, bad)
 }
 
@@ -4971,8 +4975,8 @@ async fn bench_hooks_under_a_10000_file_burst() {
     async fn burst(tag: &str, with_hook: bool) -> (Duration, Option<Hook>) {
         let cloud = Fake::new();
         let mut s = Sync::new(tag, cloud.clone());
-        let hook =
-            with_hook.then(|| burst_hook(&s.dir.0, Duration::from_millis(500), Arc::new(oneup_hooks::Contained)));
+        let hook = with_hook
+            .then(|| burst_hook(&s.dir.0, Duration::from_millis(500), Arc::new(oneup_hooks::Contained::new(None))));
         let mut synced = Duration::ZERO;
         for w in 0..WAVES {
             for i in 0..FILES / WAVES {
