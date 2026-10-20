@@ -1336,22 +1336,25 @@ impl Job {
     /// doing what was approved for its item.
     pub fn accepts(&self, op: &Op) -> bool {
         let Some((key, mark)) = mark_of(op) else { return false };
-        let from = self.approved.get(&key) == Some(&mark)
-            || self.between.get(&key) == Some(&mark)
-            || self.left.get(&key) == Some(&mark);
-        from && effect_of(op).is_some_and(|(_, e)| self.does_as_approved(&key, &e))
+        // From where the rewind's own steps left it (or between a step's
+        // two parts), rather than the state the preview showed.
+        let progressed = self.between.get(&key) == Some(&mark) || self.left.get(&key) == Some(&mark);
+        let from = progressed || self.approved.get(&key) == Some(&mark);
+        from && effect_of(op).is_some_and(|(_, e)| self.does_as_approved(&key, &e, progressed))
     }
 
     /// Whether effect `e` on item `key` is what its approval covers, or the
-    /// part of it left after the rewind's own steps: content already put
-    /// back (the rest of a two-part step), the move on from a temporary
-    /// name, and, for a removal, folders above it that only the rewind's own
-    /// steps moved (each where its last step left it). Nothing else.
-    fn does_as_approved(&self, key: &Key, e: &Effect) -> bool {
+    /// part of it left after the rewind's own steps (`progressed`: the item
+    /// is in a state those steps left it in): content already put back (the
+    /// rest of a two-part step), the move on from a temporary name, and, for
+    /// a removal, folders above it that only the rewind's own steps moved
+    /// (each where its last step left it). Nothing else: from the state the
+    /// preview showed, a step must do all of what was approved.
+    fn does_as_approved(&self, key: &Key, e: &Effect, progressed: bool) -> bool {
         let Some(approved) = self.effects.get(key) else { return false };
         match (approved, e) {
             (Effect::Place { to, name, content }, Effect::Place { to: t, name: n, content: c }) => {
-                to == t && same_name(name, n) && (c == content || c.is_none())
+                to == t && same_name(name, n) && (c == content || (c.is_none() && progressed))
             }
             (Effect::Place { content: Some(a), .. } | Effect::Content(a), Effect::Content(c)) => a == c,
             (Effect::Remove { up: a }, Effect::Remove { up: b }) => a == b || self.moved_by_us(a, b),
@@ -1477,10 +1480,27 @@ mod tests {
                 },
             )
         };
-        let job = Job::approve(&[reset(Some(("docs", "a.txt.oneup-rewind-1")), Some(c))]);
-        assert!(job.accepts(&reset(Some(("docs", "a.txt")), None)), "on from the temporary name");
-        assert!(job.accepts(&reset(None, Some(c))), "the content alone");
+        let approved = reset(Some(("docs", "a.txt.oneup-rewind-1")), Some(c));
+        let mut job = Job::approve(std::slice::from_ref(&approved));
+        // From the state the preview showed: all of it, or nothing.
+        assert!(!job.accepts(&reset(Some(("docs", "a.txt")), None)), "the move without the content");
+        assert!(job.accepts(&reset(None, Some(c))), "the content alone, then the move");
         assert!(!job.accepts(&reset(None, Some((3, [8; 20])))), "other content");
+        // Once the rewind's own step put the content back and the item under
+        // its temporary name: the move on, without the content, is what's left.
+        let there = Spot { parent: id("docs"), name: "a.txt.oneup-rewind-1".into(), size: 3, hash: Some([7; 20]) };
+        job.ran(&approved, Mark::Cloud(there.clone()));
+        let on = Op::rewind(
+            1,
+            Step::Reset {
+                remote: RemotePre { id: id("f"), etag: "e2".into() },
+                from: there,
+                place: Some((id("docs"), "a.txt".into())),
+                content: None,
+                toward: None,
+            },
+        );
+        assert!(job.accepts(&on), "on from the temporary name");
         assert!(!job.accepts(&reset(Some(("other", "a.txt")), None)), "another folder");
     }
 }
