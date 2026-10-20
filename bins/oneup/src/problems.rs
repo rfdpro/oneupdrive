@@ -361,9 +361,18 @@ fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
     if let Some(d) = budget {
         out.push(Item::new(
             "data_budget",
-            "Data budget used up",
-            format!("{} of {} used this month on this network; sync is paused.", size(d.up + d.down), size(d.budget)),
-            format!("Allow {} MB more from the icon, or run `oneup network allow-more`.", crate::netusage::ALLOW_MB),
+            t_in!(loc, "Data budget used up"),
+            t_in!(
+                loc,
+                "{used} of {budget} used this month on this network; sync is paused.",
+                used = size(d.up + d.down),
+                budget = size(d.budget)
+            ),
+            t_in!(
+                loc,
+                "Allow {mb} MB more from the icon, or run `oneup network allow-more`.",
+                mb = crate::netusage::ALLOW_MB
+            ),
         ));
     } else if let Some(why) = &s.auto_pause {
         out.push(Item::new(
@@ -376,17 +385,20 @@ fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
     if net.is_some_and(|n| n.offline) {
         out.push(Item::new(
             "working_offline",
-            "Working offline",
-            "Nothing syncs over the network; changes wait.",
-            "Go back online from the icon, or run `oneup offline off`.",
+            t_in!(loc, "Working offline"),
+            t_in!(loc, "Nothing syncs over the network; changes wait."),
+            t_in!(loc, "Go back online from the icon, or run `oneup offline off`."),
         ));
     }
     if let Some(w) = net.and_then(|n| n.waiting.as_ref()) {
         out.push(Item::new(
             "waiting_network",
-            format!("Waiting: {} files", w.count),
-            format!("{} in all: {}.", size(w.bytes), w.why),
-            "`oneup offline` or `oneup network waiting` lists them; `oneup network` changes what syncs here.",
+            t_in!(loc, "{n, plural, one {Waiting: # file} other {Waiting: # files}}", n = w.count),
+            t_in!(loc, "{size} in all: {why}.", size = size(w.bytes), why = w.why.as_str()),
+            t_in!(
+                loc,
+                "`oneup offline` or `oneup network waiting` lists them; `oneup network` changes what syncs here."
+            ),
         ));
     }
     if let Some(u) = &s.unsynced {

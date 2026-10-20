@@ -8,6 +8,8 @@
 
 **Conflict copy**: when a file changed on both sides, you get both. One keeps its name; the other becomes `name (conflict 1).ext`.
 
+**Data budget**: a monthly limit, in MB, on what OneUpDrive sends and receives on a network. When it's used up, syncing pauses there until you allow more or the month ends. See [Slow and metered connections](slow-and-metered-networks.md#data-budget).
+
 **Database** (file): a file a program keeps open and changes bit by bit, such as a password vault, a mailbox or an app's SQLite data. OneUpDrive sends one only when it's whole and replaces it only while it's closed. See [Databases](databases.md).
 
 **Data folder**: where OneUpDrive keeps its settings, records and log (`%LOCALAPPDATA%\OneUpDrive`). Each account has its own. It is not your synced folder.
@@ -26,6 +28,10 @@
 
 **Kept copies** (also *version store*, `.oneup\versions`): copies that OneUpDrive keeps on this PC of files it removed or replaced, so you can get them back. Not the same as *version history*.
 
+**Metered connection**: a network Windows says costs per byte or has a data limit, such as a phone hotspot. By default OneUpDrive pauses on one. See [Slow and metered connections](slow-and-metered-networks.md).
+
+**Network settings** (`profile` in commands): what syncs on a network, its speed limits, sync interval and data budget. A network you haven't set up uses the default settings, or the metered ones. See [Slow and metered connections](slow-and-metered-networks.md#settings-for-each-network).
+
 **Online-only**: the file is in OneDrive and shows on this PC, but takes no space until you open it.
 
 **Paused folder**: a folder whose changes wait until you resume it.
@@ -42,6 +48,8 @@
 
 **Sync failure**: an item that can't sync until you change something, such as a name OneDrive doesn't allow. See [Syncing in depth](syncing.md#what-cant-sync).
 
+**Sync interval**: sync every so many minutes instead of within seconds of a change. See [Slow and metered connections](slow-and-metered-networks.md#sync-every-few-minutes).
+
 **Synced** (a status): the file on this PC and the one in OneDrive are the same.
 
 **Synced folder**: the folder on this PC that OneUpDrive keeps the same as a OneDrive folder.
@@ -51,3 +59,5 @@
 **Working files** (SQLite's): the `-wal`, `-shm` and `-journal` files beside a database (`app.db-wal` beside `app.db`), holding changes on their way into it. They never sync. See [Databases](databases.md).
 
 **Version history**: the earlier versions of a file that OneDrive itself keeps. See [Earlier versions and sharing](versions-and-sharing.md).
+
+**Work offline**: nothing syncs over the network until you go back online; changes wait in a queue. Opening an online-only file still downloads it. See [Slow and metered connections](slow-and-metered-networks.md#work-offline).
