@@ -41,6 +41,8 @@ pub mod locale;
 #[cfg(windows)]
 pub mod mutex;
 #[cfg(windows)]
+pub mod network;
+#[cfg(windows)]
 pub mod processes;
 #[cfg(windows)]
 pub mod shortcut;

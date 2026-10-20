@@ -101,6 +101,8 @@ pub struct Controls {
     /// The pause as it changes while a round runs (the agent's; `None`:
     /// nothing pauses mid-round).
     pub live: Option<Arc<crate::control::LivePause>>,
+    /// What the network's profile lets through (`crate::network`).
+    pub net: crate::network::Policy,
 }
 
 /// Who the messages are for: `oneup sync` takes answers on its next run,
@@ -1615,8 +1617,10 @@ impl Engine {
             let settings = crate::config::kept(&self.data_dir, crate::config::load_agent(&self.data_dir))?;
             let capped = crate::autopause::caps_apply(&settings, crate::autopause::local_minute_of_day());
             let cap = |kib: u64| if capped { kib.saturating_mul(1024) } else { 0 };
-            self.graph.upload.set(cap(settings.upload_kib));
-            self.graph.download.set(cap(settings.download_kib));
+            // The network's profile may set its own (`crate::network`).
+            let (up, down) = controls.net.caps.unwrap_or((settings.upload_kib, settings.download_kib));
+            self.graph.upload.set(cap(up));
+            self.graph.download.set(cap(down));
             let pruning = self.update_pruning(&store)?;
             store = observe(store, &pruning).await?;
             store = self.remote(store, &pruning).await?;

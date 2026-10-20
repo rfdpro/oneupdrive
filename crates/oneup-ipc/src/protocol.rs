@@ -438,6 +438,21 @@ pub struct DatabaseNote {
 /// How the agent uses the network now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetStatus {
+    /// The network's name as Windows shows it (empty: not told).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub metered: bool,
+    /// Which profile applies: `default`, `metered` or `own`.
+    #[serde(default)]
+    pub profile: String,
+    /// What transfers, for people ("names and folders only").
+    #[serde(default)]
+    pub transfer: String,
+    /// `internet`, `constrained` (a network to sign in to), `local`,
+    /// `none` or `unknown`.
+    #[serde(default)]
+    pub connectivity: String,
     /// Sync every this many minutes; 0: within seconds of a change.
     #[serde(default)]
     pub interval_min: u32,

@@ -1,5 +1,6 @@
-//! Automatic pauses (`rules.md` § User controls): on a metered connection, with battery
-//! saver on, and in quiet hours, all as set in `config.toml` `[agent]`.
+//! Automatic pauses (`rules.md` § User controls): on a network whose profile pauses
+//! sync (a metered connection, by default; `crate::network`), with battery
+//! saver on, and in quiet hours, all as set in `config.toml`.
 //! Pure: the agent passes in what the PC is doing.
 
 use anyhow::{Result, bail};
@@ -18,7 +19,7 @@ pub struct Reason {
 }
 
 impl Reason {
-    fn fixed(key: &'static str) -> Reason {
+    pub fn fixed(key: &'static str) -> Reason {
         Reason { key, hours: None }
     }
 
@@ -42,9 +43,11 @@ pub fn said(key: &str, hours: Option<&str>, loc: &Locale) -> String {
 }
 
 /// What the PC is doing now.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Conditions {
-    pub metered: bool,
+    /// Why the network's profile pauses sync, if it does
+    /// (`crate::network::pause_reason`).
+    pub network: Option<Reason>,
     pub battery_saver: bool,
     /// What has the whole screen (a game or presentation, a video).
     pub full_screen: oneup_sys::conditions::FullScreen,
@@ -54,8 +57,8 @@ pub struct Conditions {
 
 /// Why the agent pauses by itself now, if it does.
 pub fn reason(a: &Agent, c: &Conditions) -> Option<Reason> {
-    if a.pause_on_metered && c.metered {
-        return Some(Reason::fixed(t_key!("on a metered connection")));
+    if let Some(why) = &c.network {
+        return Some(why.clone());
     }
     if a.pause_on_battery_saver && c.battery_saver {
         return Some(Reason::fixed(t_key!("battery saver is on")));
@@ -113,7 +116,7 @@ pub fn parse_quiet_hours(s: &str) -> Result<(u32, u32)> {
 impl Default for Conditions {
     fn default() -> Self {
         Self {
-            metered: false,
+            network: None,
             battery_saver: false,
             full_screen: oneup_sys::conditions::FullScreen::None,
             minute_of_day: 0,
@@ -134,8 +137,8 @@ mod tests {
     fn each_condition_pauses_only_when_its_setting_is_on() {
         use oneup_sys::conditions::FullScreen::{self, Program, Video};
         let on = Agent::default();
-        let c = |metered, battery_saver, full_screen: FullScreen| Conditions {
-            metered,
+        let c = |metered: bool, battery_saver, full_screen: FullScreen| Conditions {
+            network: metered.then(|| Reason::fixed(t_key!("on a metered connection"))),
             battery_saver,
             full_screen,
             minute_of_day: 600,
@@ -157,7 +160,7 @@ mod tests {
             pause_on_full_screen_video: false,
             ..Agent::default()
         };
-        assert_eq!(reason(&off, &c(true, true, Program)), None);
+        assert_eq!(reason(&off, &c(false, true, Program)), None);
         assert_eq!(reason(&off, &c(false, false, Video)), None);
     }
 
@@ -165,7 +168,7 @@ mod tests {
     fn quiet_hours_are_a_fixed_message_with_the_hours_put_in() {
         let quiet = Agent { quiet_hours: Some("22:00-07:00".into()), ..Agent::default() };
         let night = Conditions {
-            metered: false,
+            network: None,
             battery_saver: false,
             full_screen: oneup_sys::conditions::FullScreen::None,
             minute_of_day: 23 * 60,

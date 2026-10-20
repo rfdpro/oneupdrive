@@ -114,7 +114,7 @@ Everything here is in `config.toml` (or the data folder's database, for the safe
 | Transparency | `oneup status`, `oneup problems` ([control-api.md](control-api.md#the-problems-list)), `oneup activity`, `oneup explain`, `oneup unsynced`, `oneup apps`, plan previews (`--dry-run`, the setup preview), notifications |
 | Safety knobs | `oneup safety --max-changes/--max-percent/--content-guard` (store `meta safety.*`, window **Safety**); version store: `oneup versions --set-*` |
 
-**Not built:** per-network bandwidth profiles (the metered-connection pause covers the common case).
+**Network profiles** (`oneup_app::network`): see [network.md](network.md).
 
 ## Choosing in the file tree
 The settings window's tree (`oneup_app::filetree`, [settings-window.md](settings-window.md#the-file-tree-oneup_appfiletree)) shows each item's verdict as a checkbox, and every tick goes through `set_sync`, the same rule change as `oneup rules --exclude-path/--include-path`:

@@ -2219,6 +2219,36 @@
                 <div class="row">
                     <div class="label"><b>Get OneDrive's changes at once</b><small>Keeps push notifications on</small></div><label class="toggle"><input type="checkbox" data-sync="keep_push" aria-label="Get OneDrive's changes at once"><span></span></label></div>
             </div>
+            <div id="net-this">
+            <h3>This network</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b id="net-name"></b><small id="net-detail"></small></div><button class="btn" id="net-forget" hidden>Forget</button></div>
+                <div class="row">
+                    <div class="label"><b>What syncs</b></div><select data-net-this="transfer"><option value="">As other networks</option><option value="everything">Everything</option><option value="metadata">Names and folders only</option><option value="small">Files under the size limit</option><option value="opened">Only files I open or change</option><option value="paused">Nothing (paused)</option></select></div>
+                <div class="row">
+                    <div class="label"><b>Size limit</b><small>MB, for files under the size limit</small></div><input type="number" min="1" data-net-this="small_mb" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Sync every (minutes)</b></div><input type="number" min="0" max="1440" data-net-this="interval_minutes" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Upload limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-net-this="upload_kib" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Download limit</b><small>KB/s, 0 for none</small></div><input type="number" min="0" data-net-this="download_kib" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Monthly data budget</b><small>MB, 0 for none</small></div><input type="number" min="0" data-net-this="budget_mb" placeholder="As other networks"></div>
+            </div>
+            </div>
+            <h3>Metered connections</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>What syncs</b><small>Opening an online-only file always downloads it</small></div><select data-net-metered="transfer"><option value="paused">Nothing (paused)</option><option value="everything">Everything</option><option value="metadata">Names and folders only</option><option value="small">Files under the size limit</option><option value="opened">Only files I open or change</option></select></div>
+                <div class="row">
+                    <div class="label"><b>Size limit</b><small>MB, for files under the size limit</small></div><input type="number" min="1" data-net-metered="small_mb" placeholder="10"></div>
+                <div class="row">
+                    <div class="label"><b>Sync every (minutes)</b></div><input type="number" min="0" max="1440" data-net-metered="interval_minutes" placeholder="As other networks"></div>
+                <div class="row">
+                    <div class="label"><b>Monthly data budget</b><small>MB, 0 for none</small></div><input type="number" min="0" data-net-metered="budget_mb" placeholder="None"></div>
+            </div>
         </section>
 
         <!-- General -->
@@ -2985,7 +3015,39 @@
                 const v = s.sync[e.dataset.sync];
                 e.type === "checkbox" ? e.checked = !!v : e.value = v ?? 0;
             });
+            const n = s.network;
+            $("#net-this").hidden = !n.this.id;
+            $("#net-name").textContent = n.this.name || "This network";
+            const reach = {
+                constrained: "sign in to it first",
+                local: "no internet",
+                none: "not connected"
+            }[n.this.connectivity];
+            $("#net-detail").textContent = [n.this.metered ? "Metered" : "Not metered", reach].filter(Boolean).join(" · ");
+            $("#net-forget").hidden = !n.own;
+            $$("[data-net-this]").forEach(e => e.value = (n.own && n.own[e.dataset.netThis]) ?? "");
+            $$("[data-net-metered]").forEach(e => e.value = n.metered[e.dataset.netMetered] ?? "");
         }
+
+        function saveNet(e, target, key) {
+            const v = e.value.trim();
+            run(call("save", {
+                section: "network",
+                value: {
+                    target,
+                    [key]: e.type === "number" ? (v === "" ? null : Number(v)) : v
+                }
+            }), "Saved").then(load, load);
+        }
+        $$("[data-net-this]").forEach(e => e.onchange = () => saveNet(e, "this", e.dataset.netThis));
+        $$("[data-net-metered]").forEach(e => e.onchange = () => saveNet(e, "metered", e.dataset.netMetered));
+        $("#net-forget").onclick = () => run(call("save", {
+            section: "network",
+            value: {
+                target: "this",
+                forget: true
+            }
+        }), "Forgotten").then(load, load);
         $$("[data-sync]").forEach(e => e.onchange = () => saveField(e, "sync", e.dataset.sync));
         $("#autostart").onchange = e => run(call("save", {
             section: "autostart",

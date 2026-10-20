@@ -30,6 +30,7 @@ mod duplicates_cmd;
 mod find;
 mod hooks_cmd;
 mod migrate;
+mod netcmd;
 mod pair;
 mod rules;
 mod settings;
@@ -440,6 +441,12 @@ enum Cmd {
     Hooks {
         #[command(subcommand)]
         cmd: Option<HooksCmd>,
+    },
+    /// Show the network this PC is on and what syncs on it, or change that
+    /// for metered networks, this network or the default
+    Network {
+        #[command(subcommand)]
+        cmd: Option<NetworkCmd>,
     },
     /// Check the state database's internal consistency
     Verify(ProfileArg),
@@ -1175,6 +1182,83 @@ impl ResolveArgs {
         .into_iter()
         .find_map(|(on, c)| on.then_some(c))
     }
+}
+
+/// Which network profile to change.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct NetworkTarget {
+    /// The network this PC is on now (by Windows' ID for it)
+    #[arg(long)]
+    this: bool,
+    /// Every metered network without settings of its own
+    #[arg(long)]
+    metered: bool,
+    /// Networks that aren't metered and have no settings of their own
+    #[arg(long)]
+    default: bool,
+    /// A network by Windows' ID, as `oneup network` shows it
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+}
+
+impl NetworkTarget {
+    fn target(&self) -> oneup_app::network::Target {
+        match (&self.id, self.this, self.metered) {
+            (Some(id), ..) => oneup_app::network::Target::Id(id.clone()),
+            (None, true, _) => oneup_app::network::Target::This,
+            (None, false, true) => oneup_app::network::Target::Metered,
+            _ => oneup_app::network::Target::Default,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TransferArg {
+    /// Nothing syncs (opening an online-only file still downloads it)
+    Paused,
+    Everything,
+    /// Names, folders and online-only files; no file contents
+    Metadata,
+    /// Contents of files under --small-mb
+    Small,
+    /// Only files you open or change
+    Opened,
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Change what syncs on a network
+    Set {
+        #[command(flatten)]
+        target: NetworkTarget,
+        /// What transfers
+        #[arg(long, value_enum)]
+        transfer: Option<TransferArg>,
+        /// With --transfer small: the size limit in MB (default 10)
+        #[arg(long, value_name = "MB")]
+        small_mb: Option<u64>,
+        /// Upload cap in KiB/s (0 = none)
+        #[arg(long, value_name = "KIB_PER_S")]
+        upload_kib: Option<u64>,
+        /// Download cap in KiB/s (0 = none)
+        #[arg(long, value_name = "KIB_PER_S")]
+        download_kib: Option<u64>,
+        /// Sync every this many minutes; `off` (or 0): within seconds of a change
+        #[arg(long, value_name = "MINUTES|off", value_parser = parse_interval)]
+        sync_interval: Option<u32>,
+        /// With a sync interval, still sync OneDrive's changes at once
+        #[arg(long, value_enum)]
+        keep_push: Option<Toggle>,
+        /// A monthly data budget in MB; `off` (or 0): none
+        #[arg(long, value_name = "MB|off", value_parser = parse_guard)]
+        budget_mb: Option<usize>,
+    },
+    /// Remove a network's own settings (it then gets the default or metered profile)
+    Forget {
+        #[command(flatten)]
+        target: NetworkTarget,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2311,6 +2395,41 @@ async fn run() -> Result<()> {
                 yes: r.yes,
             };
             unsynced_cmd::resolve(&data_dir(&cli)?, open_store(&cli, r.profile.memory_profile)?, ask).await
+        }
+        Cmd::Network { cmd: None } => netcmd::show(&data_dir(&cli)?),
+        Cmd::Network {
+            cmd:
+                Some(NetworkCmd::Set {
+                    target,
+                    transfer,
+                    small_mb,
+                    upload_kib,
+                    download_kib,
+                    sync_interval,
+                    keep_push,
+                    budget_mb,
+                }),
+        } => {
+            use oneup_app::network::Transfer;
+            let changes = oneup_app::network::Changes {
+                transfer: transfer.map(|t| match t {
+                    TransferArg::Paused => Transfer::Paused,
+                    TransferArg::Everything => Transfer::Everything,
+                    TransferArg::Metadata => Transfer::Metadata,
+                    TransferArg::Small => Transfer::Small,
+                    TransferArg::Opened => Transfer::Opened,
+                }),
+                small_mb: *small_mb,
+                upload_kib: *upload_kib,
+                download_kib: *download_kib,
+                interval: *sync_interval,
+                keep_push: keep_push.map(Toggle::on),
+                budget_mb: budget_mb.map(|n| n as u64),
+            };
+            netcmd::set(&data_dir(&cli)?, &target.target(), &changes).await
+        }
+        Cmd::Network { cmd: Some(NetworkCmd::Forget { target }) } => {
+            netcmd::forget(&data_dir(&cli)?, &target.target()).await
         }
         Cmd::Verify(p) => verify(&cli, p.memory_profile),
         Cmd::Diagnose { top, profile } => diagnose(&cli, *top, profile.memory_profile),

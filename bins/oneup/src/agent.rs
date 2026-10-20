@@ -275,6 +275,18 @@ fn print_status(s: &Status) {
         let why = oneup_app::autopause::said(why, s.auto_pause_hours.as_deref(), oneup_app::l10n::current());
         println!("  paused by itself  {why}; resumes when that ends (`oneup settings` to change this)");
     }
+    if let Some(n) = &s.network
+        && !n.profile.is_empty()
+    {
+        let name = if n.name.is_empty() { "this network" } else { n.name.as_str() };
+        let metered = if n.metered { ", metered" } else { "" };
+        let profile = match n.profile.as_str() {
+            "own" => "its own settings",
+            "metered" => "the metered profile",
+            _ => "the default profile",
+        };
+        println!("  network           {name}{metered}: {} ({profile}; `oneup network`)", n.transfer);
+    }
     let interval = s.network.as_ref().map_or(0, |n| n.interval_min);
     println!(
         "  OneDrive changes  {}",
