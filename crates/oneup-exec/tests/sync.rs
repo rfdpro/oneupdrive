@@ -6301,6 +6301,42 @@ async fn files_named_like_working_files_stay_beside_their_namesake_unless_opted_
     assert!(t.keys().any(|k| k.starts_with("/travel-journal (conflict")), "both kept: {:?}", names(&t));
 }
 
+/// Whether a working file stays here is one decision for its name: once its
+/// namesake is on either side, or in the Synced tree, the file here, the one
+/// in OneDrive and their Synced row are all set aside together. A working
+/// file synced while alone, whose namesake then appears on only one side
+/// (either one), is neither sent nor brought as new, nothing halts, and
+/// both copies keep their bytes.
+#[tokio::test]
+async fn a_synced_working_file_stays_put_when_its_namesake_appears_on_one_side() {
+    for there in [true, false] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(if there { "names-one-side-cloud" } else { "names-one-side-here" }, cloud.clone());
+        write(&s.p("travel-journal"), b"day one");
+        s.settle().await;
+        assert_eq!(cloud.tree()["/travel-journal"].as_deref(), Some(&b"day one"[..]), "synced while alone");
+
+        if there {
+            cloud.add("travel", Some(b"plans from another PC"));
+        } else {
+            write(&s.p("travel"), b"plans");
+        }
+        for _ in 0..3 {
+            let r = s.round().await;
+            let touched = r.done.iter().chain(r.skipped.iter().map(|(op, _)| op)).any(|op| match op {
+                Op::Upload { name, .. } | Op::Download { name, .. } => name == "travel-journal",
+                Op::DeleteRemote { .. } | Op::RecycleLocal { .. } | Op::ConflictCopy { .. } => true,
+                _ => false,
+            });
+            assert!(!touched, "{r:?}");
+        }
+        assert_eq!(std::fs::read(s.p("travel-journal")).unwrap(), b"day one");
+        let t = cloud.tree();
+        assert_eq!(t["/travel-journal"].as_deref(), Some(&b"day one"[..]));
+        assert!(!t.keys().any(|k| k.contains("conflict")), "{:?}", names(&t));
+    }
+}
+
 /// A database's upload is cancelled before it commits when, while it's
 /// read, another program writes its `-journal` (which stays as it was in
 /// meaning: zeroed, no transaction): the joint watch, not a state check,

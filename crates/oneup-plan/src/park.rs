@@ -28,8 +28,9 @@
 //! doesn't belong to. The database itself goes up only once everything is
 //! in it (`docs/architecture/databases.md`), so it needs none of them.
 //! The rule is the name alone: a file named `<X>-wal`, `<X>-shm` or
-//! `<X>-journal` whose sibling `<X>` exists, on its side or in the Synced
-//! tree, whatever `<X>` holds; a `!` pattern in `[databases]` naming `<X>`
+//! `<X>-journal` whose folder has a file `<X>` on either side or in the
+//! Synced tree, whatever `<X>` holds; one decision per name, so the file
+//! here, the file in OneDrive and the Synced record are hidden together; a `!` pattern in `[databases]` naming `<X>`
 //! (given with [`Parked::with_databases`]) opts it out. Siblings are found
 //! with the trees' exact-name lookups (`Trees::local_has_file`, indexed in
 //! the store); the Synced tree, which has no name index, is read one folder
@@ -248,12 +249,9 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         {
             return Ok(false);
         }
-        if self.inner.local_has_file(p, main)? {
-            return Ok(true);
-        }
         match self.inner.base_by_local(p)? {
-            Some(b) => self.base_has_file(b.sid, main),
-            None => Ok(false),
+            Some(b) => self.namesake(Some(p), b.remote.as_ref(), Some(b.sid), main),
+            None => self.namesake(Some(p), None, None, main),
         }
     }
 
@@ -267,12 +265,9 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
                 return Ok(false);
             }
         }
-        if self.inner.remote_has_file(p, main)? {
-            return Ok(true);
-        }
         match self.inner.base_by_remote(p)? {
-            Some(b) => self.base_has_file(b.sid, main),
-            None => Ok(false),
+            Some(b) => self.namesake(b.local, Some(p), Some(b.sid), main),
+            None => self.namesake(None, Some(p), None, main),
         }
     }
 
@@ -285,18 +280,36 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         {
             return Ok(false);
         }
-        if self.base_has_file(p, main)? {
-            return Ok(true);
+        match self.inner.base(p)? {
+            Some(folder) => self.namesake(folder.local, folder.remote.as_ref(), Some(p), main),
+            None => self.base_has_file(p, main),
         }
-        // A database here or in OneDrive that isn't synced (yet).
-        let Some(folder) = self.inner.base(p)? else { return Ok(false) };
-        if let Some(l) = folder.local
+    }
+
+    /// Whether a folder has a file named `main` on any side: here (`local`),
+    /// in OneDrive (`remote`), or in the Synced tree (`sid`). One decision
+    /// for a working-file name, whichever side asks, so its file here, its
+    /// file in OneDrive and its Synced record are hidden together: one side
+    /// visible beside a hidden record would look new.
+    fn namesake(
+        &self,
+        local: Option<LocalId>,
+        remote: Option<&RemoteId>,
+        sid: Option<Sid>,
+        main: &str,
+    ) -> Result<bool, T::Error> {
+        if let Some(l) = local
             && self.inner.local_has_file(l, main)?
         {
             return Ok(true);
         }
-        match &folder.remote {
-            Some(r) => self.inner.remote_has_file(r, main),
+        if let Some(r) = remote
+            && self.inner.remote_has_file(r, main)?
+        {
+            return Ok(true);
+        }
+        match sid {
+            Some(sid) => self.base_has_file(sid, main),
             None => Ok(false),
         }
     }
