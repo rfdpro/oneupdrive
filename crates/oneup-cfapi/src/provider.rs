@@ -752,6 +752,37 @@ pub fn set_pin_tree(f: &File, pin: Pin) -> Result<()> {
     win("CfSetPinState", unsafe { CfSetPinState(handle(f), pin.raw(), CF_SET_PIN_FLAG_RECURSE, None) })
 }
 
+/// The open item's identity: its 128-bit file ID and creation time
+/// (FILETIME), read from the handle, so a caller acting through that same
+/// handle knows which item it has. A file ID can be reused once its file is
+/// gone; with the creation time, a replacement is told apart.
+pub fn identity(f: &File) -> Result<(u128, i64)> {
+    use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx};
+    let mut id = FILE_ID_INFO::default();
+    // SAFETY: a valid handle; the output buffer is a properly sized, writable struct.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle(f),
+            FileIdInfo,
+            std::ptr::from_mut(&mut id).cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(|e| Error::Win { what: "GetFileInformationByHandleEx(FileIdInfo)", source: e })?;
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: as above.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle(f),
+            FileBasicInfo,
+            std::ptr::from_mut(&mut basic).cast::<c_void>(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .map_err(|e| Error::Win { what: "GetFileInformationByHandleEx(FileBasicInfo)", source: e })?;
+    Ok((u128::from_le_bytes(id.FileId.Identifier), basic.CreationTime))
+}
+
 /// Sets the pin state ("Always keep on this device" / "Free up space").
 pub fn set_pin(f: &File, pin: Pin) -> Result<()> {
     // SAFETY: a valid handle; synchronous.
@@ -886,6 +917,25 @@ impl Exclusive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handle tells which item it has: a file put in place of another
+    /// under the same name has another identity.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn identity_tells_a_replacement_apart() {
+        let dir = std::env::temp_dir().join(format!("oneup-cfapi-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, b"one").unwrap();
+        let first = identity(&open(&p).unwrap()).unwrap();
+        assert_eq!(identity(&open(&p).unwrap()).unwrap(), first, "the same item");
+        std::fs::remove_file(&p).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&p, b"two").unwrap();
+        assert_ne!(identity(&open(&p).unwrap()).unwrap(), first, "another item");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_hold_and_a_fetch_of_one_identity_exclude_each_other() {
