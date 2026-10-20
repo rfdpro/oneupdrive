@@ -10,9 +10,11 @@
 
 **Data folder**: where OneUpDrive keeps its settings, records and log (`%LOCALAPPDATA%\OneUpDrive`). Each account has its own. It is not your synced folder.
 
-**Exclude** (also *rule*, *preset*): leave a file or folder out of syncing. Excluding never deletes anything. A *preset* is a ready-made list of rules, such as `dev`. See [Choosing what syncs](excluding-files.md).
+**Exclude** (also *rule*, *preset*): leave a file or folder out of syncing. Excluding alone deletes nothing. The one exception is the optional **prune** setting, which removes OneDrive's copies of excluded items into OneDrive's recycle bin once they are on this PC ([details](excluding-files.md#what-happens-to-onedrives-copies)). A *preset* is a ready-made list of rules, such as `dev`. See [Choosing what syncs](excluding-files.md).
 
 **Files On-Demand**: files show in File Explorer with their real names but download only when you open them. See [Files On-Demand](files-on-demand.md).
+
+**Held**: an item OneUpDrive leaves unchanged because there is no evidence it was deleted (for example, it is gone from one side with no recorded deletion). Nothing is deleted on a guess. Resolve it on the **Activity** page, **Sync failures** tab, or see [What can't sync](syncing.md#what-cant-sync).
 
 **Folder pair** (`pair` in commands): a folder on this PC and the OneDrive folder it is kept the same as. Your main folder is one; each folder you add is another. See [More folders](folders.md).
 

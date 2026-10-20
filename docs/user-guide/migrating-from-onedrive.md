@@ -2,7 +2,7 @@
 
 You can switch to OneUpDrive without re-downloading your files.
 
-In short: sign in with the same account the OneDrive app uses, let OneUpDrive check that everything online-only is safely in OneDrive, unlink the OneDrive app, then start syncing the same folder. Plan on an hour for a big OneDrive; the check and the first sync are the slow parts.
+In short: sign in with the same account the OneDrive app uses, let OneUpDrive check that everything online-only is safely in OneDrive, unlink the OneDrive app, then start syncing the same folder. How long it takes depends on the number of items and on the PC; the check and the first sync are the slow parts.
 
 ## Before you start
 * **The OneDrive app and OneUpDrive must never sync the same folder at the same time.** OneUpDrive will refuse to start on a folder the OneDrive app still manages.
@@ -59,7 +59,7 @@ Sometimes the OneDrive app says **Signing out** and never finishes, even after h
 2. **The app's own reset** (Microsoft's `OneDrive.exe /reset`), and waits again. This is skipped if a work or school account is also set up in the app, because the reset would unlink that too. If the app then opens asking you to sign in, close it.
 3. **OneUpDrive finishes it itself.** It stops the app, looks through the folder again and brings its OneDrive listing up to date, and goes ahead only if every online-only file is in your OneDrive. Then Windows does what unlinking does: it removes the online-only files from this PC (they stay in OneDrive and come back as OneUpDrive's), and files on this PC stay as ordinary files. This is noted in **Recent activity**.
 
-   This last part can take a long time on a big folder: a quarter of an hour for a couple of hundred thousand online-only files. Leave it running; the command line prints a line every minute. Online-only files inside folders you chose to leave out (such as `node_modules` with the `dev` choice) are removed from this PC too. Their content stays in OneDrive, but as you left those folders out, OneUpDrive doesn't bring them back.
+   This last part can take a long time on a big folder: many minutes when there are hundreds of thousands of online-only files. Leave it running; the command line prints a line every minute. Online-only files inside folders you chose to leave out (such as `node_modules` with the `dev` choice) are removed from this PC too. Their content stays in OneDrive, but as you left those folders out, OneUpDrive doesn't bring them back.
 
 To skip the first two, use **Finish it now** in Set up, or `oneup migrate finish-unlink --step release`. Windows skips any folder a program has open at that moment (often Documents) and leaves its files as they were. OneUpDrive looks again afterwards and finishes those itself, file by file, which programs that are open don't get in the way of: you don't need to close anything or restart. If an unlinking left files like that behind earlier, running `oneup migrate finish-unlink` again finishes them; until then, OneUpDrive won't start syncing the folder. Inside folders you chose to leave out (such as `node_modules`), OneUpDrive doesn't look, so files left behind there stay as they are: their content is in OneDrive, but they can't be opened on this PC.
 
