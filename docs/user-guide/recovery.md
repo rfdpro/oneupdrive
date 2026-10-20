@@ -5,7 +5,7 @@ The settings window's **Recovery** page gathers every way to get something back.
 ## Rewind a folder
 Puts a folder back the way it was at a moment you choose: files deleted since come back, edited files get their content of then, moved and renamed files go back where they were, and files created since are removed. It's the way back from ransomware, a script gone wrong, or a sync that did something you didn't want.
 
-1. Type the folder (`/Documents`, or `/` for everything) and pick the moment, then **Preview**. The list shows every change the rewind would make, grouped (restore deleted, revert edited, move back, remove created since), with sizes and where each old version comes from: OneDrive's recycle bin or the file's version history in OneDrive.
+1. Type the folder (`/Documents`, or `/` for everything) and pick the moment, then **Preview**. The list shows every change (a page at a time; **Rewind** appears once you've seen them all) the rewind would make, grouped (restore deleted, revert edited, move back, remove created since), with sizes and where each old version comes from: OneDrive's recycle bin or the file's version history in OneDrive.
 2. **Rewind**. Nothing changes yet: the rewind waits for your approval as a [safety stop](syncing.md#safety-stop), and sync waits with it.
 3. **Approve**. OneUpDrive carries it out in OneDrive, and your PC follows. A big folder takes a few rounds.
 
@@ -14,6 +14,7 @@ Nothing is destroyed. What the rewind replaces stays in OneDrive's version histo
 What it leaves alone:
 * **Anything that changes after the preview.** If you (or anyone) edit, move or delete a file between **Preview** and **Approve**, that file is left as it is; the rest goes ahead. The activity log says how many were left alone.
 * **Changes not synced yet.** A file changed in OneDrive that your PC hasn't fetched yet is skipped, and listed as such. A file you changed on this PC since the last sync, without it reaching OneDrive (as when the [content guard](syncing.md#the-content-guard-ransomware) holds scrambled files back), is **set aside**: it goes to kept copies, and OneDrive's copy comes back.
+* **What was there but only started syncing since** (a file a rule left out, say): a file last saved before the moment you picked isn't removed, and a folder holding such a file stays. They're listed as left alone.
 * **What OneUpDrive never saw.** The rewind works from OneUpDrive's own history of what it synced. That history starts when a folder's first sync finishes and keeps 30 days (at most a million changes), so you can't rewind further back than that. Files that were never synced aren't touched.
 * **What OneDrive no longer has.** OneDrive keeps deleted items in its recycle bin for a limited time (30 days for personal accounts, less if the bin is full) and a limited number of versions. What's gone from there can't come back; the rest of the rewind still runs, and the activity log says what couldn't be done.
 

@@ -528,6 +528,10 @@ pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Repor
     if !tried && steps.waiting > 0 {
         job.stalls += 1;
     }
+    // Folders that wait to be emptied with nothing else to run: a stall too.
+    if !tried && steps.waiting == 0 && !steps.later.is_empty() {
+        job.stalls += 1;
+    }
     let finished = (!tried && steps.later.is_empty() && steps.waiting == 0) || job.stalls >= STALLS;
     if !finished {
         save(o, job)?;
@@ -623,6 +627,8 @@ pub fn describe(p: &Preview) -> Vec<String> {
             Skip::NoCloudItem => "never in OneDrive",
             Skip::NotSyncedYet => "in OneDrive, not synced yet",
             Skip::UnknownContent => "its content then wasn't recorded",
+            Skip::ExistedBefore => "was there then, not synced",
+            Skip::Keeps => "holds what's left alone",
         };
         out.push(format!("skipped    {path}  ({why})"));
     }

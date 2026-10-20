@@ -3895,7 +3895,9 @@
             FolderGone: "Its folder then is gone",
             NoCloudItem: "Never in OneDrive",
             NotSyncedYet: "In OneDrive, not synced yet",
-            UnknownContent: "Its content then wasn't recorded"
+            UnknownContent: "Its content then wasn't recorded",
+            ExistedBefore: "Was there then, not synced",
+            Keeps: "Holds what's left alone"
         };
         let RW = {
             preview: null
@@ -3922,9 +3924,13 @@
             loadBin();
         }
 
-        function rewindRows(p) {
+        // A page of the preview's list: every change is shown, a page at a
+        // time, before the rewind can be asked for.
+        const RW_PAGE = 500;
+
+        function rewindRows(p, from, to) {
             const rows = [];
-            for (const c of p.changes.slice(0, 500)) {
+            for (const c of p.changes.slice(from, to)) {
                 const where = c.kind === "MoveBack" || (c.kind === "Revert" && c.then !== c.now) ? `${c.now}  →  ${c.then}` : (c.then || c.now);
                 rows.push(el("tr", {}, el("td", {
                     textContent: RW_KIND[c.kind]
@@ -3933,11 +3939,14 @@
                     textContent: c.folder ? "" : size(c.size)
                 })));
             }
-            for (const s of p.skipped.slice(0, 200)) rows.push(el("tr", {}, el("td", {
+            return rows;
+        }
+
+        function skippedRows(p) {
+            return p.skipped.map(s => el("tr", {}, el("td", {
                 className: "muted",
                 textContent: "Skipped"
             }), cell(s.path, RW_SKIP[s.why] || s.why, "wrap path"), el("td")));
-            return rows;
         }
 
         function showRewind(p, actions) {
@@ -3953,10 +3962,23 @@
             $("#rw-groups").replaceChildren(...Object.keys(RW_GROUP).filter(k => groups[k]).map(k => el("li", {
                 textContent: `${groups[k].n.toLocaleString()} ${RW_GROUP[k]} (${size(groups[k].bytes)})`
             })));
-            $("#rw-table tbody").replaceChildren(...rewindRows(p));
-            $("#rw-note").textContent = !p.changes.length ? "Nothing to change: the folder is as it was then." :
-                p.changes.length > 500 ? `The first 500 of ${p.changes.length.toLocaleString()} are listed.` : "";
-            $("#rw-actions").replaceChildren(...actions);
+            const body = $("#rw-table tbody");
+            const total = p.changes.length;
+            let shown = 0;
+            const page = () => {
+                body.append(...rewindRows(p, shown, shown + RW_PAGE));
+                shown = Math.min(shown + RW_PAGE, total);
+                if (shown < total) {
+                    $("#rw-note").textContent = `${shown.toLocaleString()} of ${total.toLocaleString()} listed. See them all to rewind.`;
+                    $("#rw-actions").replaceChildren(smallBtn("Show more", page));
+                } else {
+                    body.append(...skippedRows(p));
+                    $("#rw-note").textContent = total ? "" : "Nothing to change: the folder is as it was then.";
+                    $("#rw-actions").replaceChildren(...actions);
+                }
+            };
+            body.replaceChildren();
+            page();
             $("#rw-result").hidden = false;
         }
 

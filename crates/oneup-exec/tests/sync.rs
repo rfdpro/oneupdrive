@@ -6243,6 +6243,39 @@ async fn everyday_what_a_restore_brings_back_is_checked_not_assumed() {
     assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"b", "nothing lost");
 }
 
+
+#[tokio::test]
+async fn everyday_a_rewind_keeps_what_was_there_then_but_synced_only_since() {
+    // old.txt was on this PC at the moment, left out by a rule; the rule
+    // went since, and it synced. Its record is newer than the moment, its
+    // content isn't: the rewind leaves it (and says so), and removes only
+    // what's new.
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-existed", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a");
+    write(&s.p("docs/old.txt"), b"left out by a rule");
+    s.rules = user_rules(&["/docs/old.txt"]);
+    s.settle().await;
+    assert!(!cloud.tree().contains_key("/docs/old.txt"));
+    let at = moment();
+    s.rules = RuleSet::default();
+    s.settle().await;
+    write(&s.p("docs/new.txt"), b"new since");
+    s.settle().await;
+    let skipped = s.obs.store().read(|o| {
+        let sid = oneup_sync::rewind::folder_at(o, o, &["docs"], at)?.unwrap();
+        oneup_sync::rewind::plan(o, o, sid, at, 1000).map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
+    });
+    let r = skipped.unwrap();
+    assert!(
+        r.skipped.iter().any(|(_, p, why)| p == "/docs/old.txt" && *why == oneup_sync::rewind::Skip::ExistedBefore)
+    );
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    let t = local_tree(&s.dir.0);
+    assert_eq!(t.get("/docs/old.txt"), Some(&Some(b"left out by a rule".to_vec())), "it was there then");
+    assert!(!t.contains_key("/docs/new.txt"), "removed: created since");
+}
+
 // ---------------------------------------------------------------- duplicates
 // Copies the user chose to remove (`oneup_exec::dupes`): the gate holds them
 // until the user approves exactly that batch, whatever the circuit breakers'
