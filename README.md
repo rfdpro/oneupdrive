@@ -53,7 +53,7 @@ Same OneDrive cloud with a lighter, faster, and more careful engine that syncs w
 | **Leaving things out** | Not really | `.oneupignore` files (gitignore syntax), ready-made lists like `dev`, paused folders |
 | **Files On-Demand** | ✅ | ✅ Same Windows Cloud Files API, plus "free up files I haven't used in 30 days" and "free space when the disk is nearly full" |
 | **Explorer** | ✅ | ✅ Navigation pane, status icons, the status button, and a right-click menu with **Version history**, **Share**, **Open with AutoSave** and **Why does this sync?** |
-| **Which folders** | One folder per account (plus Desktop/Documents/Pictures, moved into it) | Any number of folder pairs per account, **one-way backups** (deleting here never deletes there), your Desktop and Documents backed up *where they are*, folders others shared with you, several accounts |
+| **Which folders** | One folder per account (plus Desktop/Documents/Pictures, moved into it) | Any number of folders per account, **one-way backups** (deleting here never deletes there), your Desktop and Documents backed up *where they are*, folders others shared with you, several accounts |
 | **Control** | Pause | Pause (whole, per direction, per folder, timed), automatic pauses for games, battery saver and metered networks, quiet hours, bandwidth caps, sync order |
 | **Ransomware** | Detects afterwards and offers a restore (Microsoft 365 plans) | **Stops first.** Edited files that suddenly stop looking like what they are (a `.docx` that isn't a zip anymore) are held back and you're asked |
 | **Knowing what's going on** | A spinner | An activity log, `explain` for any file, and which programs change and open your files, with a chart |
@@ -84,8 +84,8 @@ OneUpDrive's data-safety rules are enforced in code, not in good intentions ([de
 - **Every change re-checked right before it happens.** OneDrive changes carry eTag preconditions; local changes re-check file ID, size and time.
 - **Every transfer verified** by OneDrive's own content hash.
 - **Conflicts keep both copies.** Always.
-- **Circuit breakers.** Too many deletions, overwrites or moves at once, or edited files that look encrypted, and OneUpDrive stops and asks.
-- **Anything it removes from your PC is kept** in a local version store first, unless OneDrive provably has the exact same content.
+- **Safety stops.** Too many deletions, overwrites or moves at once, or edited files that look encrypted, and OneUpDrive stops and asks.
+- **Anything it removes from your PC is kept** as a copy on your PC first, unless OneDrive provably has the exact same content.
 - **One gatekeeper.** All destructive operations live in one small module, behind tokens only the safety gate can issue.
 
 ## 📚 Documentation
