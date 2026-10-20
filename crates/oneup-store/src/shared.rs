@@ -482,12 +482,21 @@ mod tests {
 
     #[test]
     fn a_v19_store_upgrades() {
-        upgrades_from(19, &format!("{} {} {}", crate::pins::UNDO_V22, super::UNDO_V21, crate::dupes::UNDO_V20));
+        upgrades_from(
+            19,
+            &format!(
+                "{} {} {} {}",
+                crate::history::UNDO_V23,
+                crate::pins::UNDO_V22,
+                super::UNDO_V21,
+                crate::dupes::UNDO_V20
+            ),
+        );
     }
 
     #[test]
     fn a_v20_store_upgrades() {
-        upgrades_from(20, &format!("{} {}", crate::pins::UNDO_V22, super::UNDO_V21));
+        upgrades_from(20, &format!("{} {} {}", crate::history::UNDO_V23, crate::pins::UNDO_V22, super::UNDO_V21));
     }
 
     /// A mark written again after it was read (the item shared again)

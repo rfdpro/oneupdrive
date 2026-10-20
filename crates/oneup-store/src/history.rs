@@ -561,7 +561,15 @@ mod tests {
                 o.synced_put(&base(1, ROOT, "a.txt", 3))
             })
             .unwrap();
-            let undo = format!("{UNDO_V23} DELETE FROM meta; PRAGMA user_version = {from};");
+            // The versions between undone too (v20 duplicates, v21 sharing,
+            // v22 pin rules).
+            let between = match from {
+                19 => format!("{} {} {}", crate::pins::UNDO_V22, crate::shared::UNDO_V21, crate::dupes::UNDO_V20),
+                20 => format!("{} {}", crate::pins::UNDO_V22, crate::shared::UNDO_V21),
+                21 => crate::pins::UNDO_V22.to_string(),
+                _ => String::new(),
+            };
+            let undo = format!("{UNDO_V23} {between} DELETE FROM meta; PRAGMA user_version = {from};");
             s.read(|o| Ok(o.c.execute_batch(&undo)?)).unwrap();
         }
         let mut s = Store::open(&path, 1024).unwrap();

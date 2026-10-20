@@ -6414,7 +6414,6 @@ async fn everyday_an_edit_after_a_rewind_ran_is_judged_on_its_own() {
     assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Mass), "a stop of its own");
 }
 
-
 #[tokio::test]
 async fn everyday_what_a_restore_brings_back_is_checked_not_assumed() {
     // OneDrive brings a deleted file back under another name than asked:
@@ -6450,7 +6449,6 @@ async fn everyday_what_a_restore_brings_back_is_checked_not_assumed() {
     }
     assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"b", "nothing lost");
 }
-
 
 #[tokio::test]
 async fn a_folder_moved_after_the_rewind_was_approved_isnt_removed() {

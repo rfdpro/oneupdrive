@@ -444,7 +444,8 @@ mod tests {
             .unwrap();
             s.read(|o| {
                 let undo = format!(
-                    "{} {} {UNDO_V20} PRAGMA user_version = 19;",
+                    "{} {} {} {UNDO_V20} PRAGMA user_version = 19;",
+                    crate::history::UNDO_V23,
                     crate::pins::UNDO_V22,
                     crate::shared::UNDO_V21
                 );
