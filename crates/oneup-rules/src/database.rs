@@ -84,7 +84,7 @@ impl Format {
     pub fn of_name(name: &str) -> Option<Format> {
         let (_, ext) = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())?;
         Some(match ext.to_ascii_lowercase().as_str() {
-            "sqlite" | "sqlite3" | "db3" => Format::Sqlite,
+            "sqlite" | "sqlite3" | "db" | "db3" => Format::Sqlite,
             "kdbx" | "kdb" => Format::KeePass,
             "accdb" | "accde" | "mdb" | "mde" => Format::Access,
             "msf" => Format::Thunderbird,
@@ -385,6 +385,7 @@ mod tests {
         assert_eq!(Format::of_name("archive.pst"), Some(Format::Outlook));
         assert_eq!(Format::of_name("win11.vhdx"), Some(Format::VirtualDisk));
         assert_eq!(Format::of_name("places.sqlite"), Some(Format::Sqlite));
+        assert_eq!(Format::of_name("app.db"), Some(Format::Sqlite));
         assert_eq!(Format::of_name("notes.txt"), None);
         assert_eq!(Format::of_name(".pst"), None, "a name that is all extension");
         assert_eq!(Format::of_name("pst"), None);

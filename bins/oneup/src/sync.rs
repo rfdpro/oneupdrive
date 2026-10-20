@@ -1967,7 +1967,10 @@ fn plan_round<'a>(
         ..crate::versions::policy(store)?
     };
     let synced = store.read(|o| o.synced_stats())?.items.max(0) as u64;
-    let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?);
+    // Databases as the executor has them (`[databases]`): their SQLite
+    // working files are parked beside them.
+    let databases = fs.map(LocalFs::databases).unwrap_or_default();
+    let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?, databases);
     let (ops, problems, upto, pending) = store.read(|o| {
         let dirty = o.dirty_scope()?;
         let folders = match scope {
@@ -1978,7 +1981,8 @@ fn plan_round<'a>(
         // The folders its deletions empty, for a stop to list with them.
         // What a folder holds is read unfiltered: an excluded or parked
         // item keeps it from being emptied.
-        let pending = oneup_sync::pending_deletes(&Parked::with_rules(o, &planning.hide), o, &ops, planning.flow)?;
+        let parked = Parked::with_rules(o, &planning.hide).with_databases(&planning.databases);
+        let pending = oneup_sync::pending_deletes(&parked, o, &ops, planning.flow)?;
         add_extra(&mut ops, modes.extra.clone());
         // Removing chosen duplicates waits for a round whose plan doesn't
         // touch what it removes or keeps (`oneup_exec::dupes::touched`):
@@ -2061,12 +2065,20 @@ struct Planning<'a> {
     hide: RuleSet,
     judge: Option<&'a RuleSet>,
     flow: oneup_sync::Flow,
+    /// What counts as a database (`oneup_plan::park`: SQLite's working
+    /// files beside one are parked).
+    databases: oneup_rules::database::Databases,
 }
 
 impl<'a> Planning<'a> {
-    fn new(rules: &'a RuleSet, pull: bool, flow: oneup_sync::Flow) -> Self {
+    fn new(
+        rules: &'a RuleSet,
+        pull: bool,
+        flow: oneup_sync::Flow,
+        databases: oneup_rules::database::Databases,
+    ) -> Self {
         let hide = if pull { rules.upload_only() } else { rules.clone() };
-        Self { hide, judge: pull.then_some(rules), flow }
+        Self { hide, judge: pull.then_some(rules), flow, databases }
     }
 
     /// The plan for `folders`, and the items parking kept out of it.
@@ -2076,7 +2088,7 @@ impl<'a> Planning<'a> {
         o: &Ops<'_>,
         folders: Vec<oneup_sync::Sid>,
     ) -> oneup_store::Result<(Vec<Op>, Vec<(LocalId, String, Why)>)> {
-        let p = Parked::with_rules(o, &self.hide);
+        let p = Parked::with_rules(o, &self.hide).with_databases(&self.databases);
         let mut ops = plan_flow(&p, folders, self.flow)?;
         if let Some(rules) = self.judge {
             let judge = Parked::with_rules(o, rules);

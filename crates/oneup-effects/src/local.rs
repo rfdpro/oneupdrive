@@ -510,7 +510,8 @@ impl LocalFs {
         *self.databases.write().unwrap_or_else(std::sync::PoisonError::into_inner) = d;
     }
 
-    pub(crate) fn databases(&self) -> oneup_rules::database::Databases {
+    /// What counts as a database now ([`LocalFs::set_databases`]).
+    pub fn databases(&self) -> oneup_rules::database::Databases {
         self.databases.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
