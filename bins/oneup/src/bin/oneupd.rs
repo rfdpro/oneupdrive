@@ -578,9 +578,11 @@ async fn agent(
         // Explorer's entry was brought up to date before connecting
         // (`prepare_registration`).
         let stale = Arc::clone(&remote);
-        let h = oneup_exec::hydrate::Hydrator::new(
-            // Decrypting, for a vault pair.
+        let h = oneup_exec::hydrate::Hydrator::with_ours(
+            // Decrypting, for a vault pair. Programs opening files aren't
+            // held by the data budget; OneUpDrive's own downloads are.
             engine.hydration_cloud(),
+            Some(engine.pinning_cloud()),
             setup::open_store(dir, 4 * 1024)?,
             dir.join("hydration"),
             Path::new(&root.path),
@@ -609,6 +611,16 @@ async fn agent(
     // What the last pass held for another network (`oneup_app::network`).
     let mut waiting = oneup_app::network::load_waiting(&store)?;
     let mut net_use = NetUse::new(dir, graph)?;
+    // Windows' network changes, as they happen (`oneup_sys::network`): a
+    // switch to a metered network, or the internet coming back, takes
+    // effect within seconds, whether the agent waits or rounds run.
+    let net_events = Arc::new(oneup_app::network::Events::default());
+    let _net_watch = {
+        let ev = Arc::clone(&net_events);
+        oneup_sys::network::watch(move || ev.changed())
+            .inspect_err(|e| tracing::warn!(error = %e, "network changes are noticed at each wake-up only"))
+            .ok()
+    };
     // How good the link is, judged after each pass (`oneup_app::link`).
     let mut link = oneup_app::link::Link::default();
     control.set_on_demand(engine.local().on_demand());
@@ -703,16 +715,20 @@ async fn agent(
                 control,
                 graph,
                 &mut net_use,
+                &net_events,
             )
             .await;
             // Before the error, if any: the retry must still count them.
             window.add(executed, now_ms());
             // Approvals used are dropped: a code approves its list once.
             control.forget_approvals(&engine.spent_answers());
+            // What the rounds used, recorded now (a stop or an error next
+            // keeps it too: `NetUse` charges once more as it goes).
+            net_use.charge_now();
             let (s, out) = rounds?;
             store = s;
             waiting.clone_from(&out.waiting);
-            adapt(&mut store, graph, &mut link, &counted.since(graph, started.elapsed()), control);
+            adapt(&mut store, graph, &mut link, &counted.since(graph), control);
             if executed != Recent::default() {
                 window.save(&mut store).context("can't record the safety window")?;
             }
@@ -771,7 +787,20 @@ async fn agent(
             match out.end {
                 End::Settled => {
                     control.clear_first();
-                    store = engine.placement(store, &|| control.controls()).await?;
+                    // Pinned files download under the network as it is
+                    // before each one: Windows' events are followed meanwhile.
+                    let placed = watching_auto_pause(
+                        engine.placement(store, &|| control.controls()),
+                        dir,
+                        &settings,
+                        control,
+                        graph,
+                        &mut net_use,
+                        &net_events,
+                    )
+                    .await;
+                    net_use.charge_now();
+                    store = placed?;
                     // Removes kept copies on this PC: not while changes
                     // to it are paused.
                     if !control.controls().pause_local {
@@ -829,7 +858,8 @@ async fn agent(
         control.set_network(net_status(&pacer, &net, &profile, waiting.as_ref(), &usage));
 
         // ---- wait for something to do
-        let (s, w) = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer).await?;
+        let (s, w) =
+            wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer, &net_events).await?;
         store = s;
         woke = if w == Woke::Timer && continuing { Woke::Continue } else { w };
         if stop.requested() {
@@ -903,6 +933,7 @@ async fn watching_auto_pause<T>(
     control: &Control,
     graph: &Graph,
     net_use: &mut NetUse,
+    net_events: &oneup_app::network::Events,
 ) -> T {
     tokio::pin!(rounds);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + AUTO_PAUSE_CHECK, AUTO_PAUSE_CHECK);
@@ -910,11 +941,26 @@ async fn watching_auto_pause<T>(
     loop {
         tokio::select! {
             r = &mut rounds => return r,
-            _ = tick.tick() => {
-                // Also counts the data used so far, so a budget reached
-                // mid-round pauses it.
+            () = net_events.next() => {
+                // Another network, mid-round: its policy (and a pause, if
+                // it pauses) applies from the next operation on.
                 let why = match tokio::task::block_in_place(|| net_use.look(dir, settings, graph, control)) {
                     Ok(l) => l.why,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't read the network");
+                        None
+                    }
+                };
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day(), why) {
+                    control.set_auto_pause(Some(why));
+                }
+            }
+            _ = tick.tick() => {
+                // Also counts the data used so far, so a budget reached
+                // mid-round pauses it (the network itself is read only
+                // when Windows reports a change).
+                let why = match tokio::task::block_in_place(|| net_use.count(settings, graph, control)) {
+                    Ok(why) => why,
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "couldn't count the data used");
                         None
@@ -949,6 +995,7 @@ async fn wait(
     control: &Notify,
     timeout: Duration,
     pacer: &Pacer,
+    net: &oneup_app::network::Events,
 ) -> Result<(Store, Woke)> {
     let deadline = tokio::time::Instant::now() + timeout;
     let seen = store.read(|o| o.dirty_last())?;
@@ -959,6 +1006,10 @@ async fn wait(
             _ = control.notified() => {
                 tracing::debug!("control call");
                 return Ok((store, Woke::User));
+            }
+            () = net.next() => {
+                tracing::debug!("network change");
+                return Ok((store, Woke::Network));
             }
             _ = remote.notified() => {
                 // Something changed in OneDrive (or the channel dropped). A
@@ -1164,6 +1215,7 @@ async fn push(graph: Arc<Graph>, remote: Arc<Notify>, up: Arc<AtomicBool>) {
             Ok(ep) => {
                 oneup_graph::push::listen(
                     &ep,
+                    &graph.stats,
                     || {
                         up.store(true, Relaxed);
                         tracing::info!("push channel live");
@@ -1279,8 +1331,11 @@ fn end_flyout(dir: &Path, task: Option<tokio::task::JoinHandle<()>>) {
 /// (`oneup_app::netusage`), with its own database connection: it's asked
 /// while rounds hold the agent's.
 struct NetUse {
-    db: Store,
-    meter: oneup_app::netusage::Meter,
+    /// Charged once more when this attempt ends, however it ends.
+    ledger: oneup_app::netusage::Ledger,
+    /// The network and profile last read: what the timed count between
+    /// network changes goes by.
+    last: Option<(oneup_sys::network::Network, oneup_app::network::Profile)>,
 }
 
 /// The network now, its profile, this month's use there, and why sync
@@ -1293,14 +1348,86 @@ struct Looked {
 }
 
 impl NetUse {
-    fn new(dir: &Path, graph: &Graph) -> Result<Self> {
-        let (up, down) = Self::counters(graph);
-        Ok(Self { db: setup::open_store(dir, 1024)?, meter: oneup_app::netusage::Meter::new(up, down) })
+    fn new(dir: &Path, graph: &Arc<Graph>) -> Result<Self> {
+        let g = Arc::clone(graph);
+        let counters = Box::new(move || Self::counters(&g));
+        Ok(Self { ledger: oneup_app::netusage::Ledger::new(setup::open_store(dir, 1024)?, counters), last: None })
     }
 
-    /// Bytes sent (file contents) and received (every response) so far.
+    /// Adds what went since the last charge to the profile in effect
+    /// meanwhile (`netusage::Account`).
+    fn charge(&mut self) -> Result<()> {
+        Ok(self.ledger.charge()?)
+    }
+
+    /// [`NetUse::charge`], saying so if it fails (charged at the next).
+    fn charge_now(&mut self) {
+        if let Err(e) = tokio::task::block_in_place(|| self.charge()) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't record the data used; it's counted next time");
+        }
+    }
+
+    /// This month's use on `profile`, with what the user allowed since the
+    /// last look added to it, and why sync pauses (the connection, the
+    /// profile, or the budget), applying the profile.
+    fn settle(
+        &mut self,
+        net: &oneup_sys::network::Network,
+        profile: &oneup_app::network::Profile,
+        settings: &oneup_app::config::Agent,
+        graph: &Graph,
+        control: &Control,
+    ) -> Result<(oneup_app::netusage::Usage, Option<autopause::Reason>)> {
+        use oneup_app::netusage;
+        let month = netusage::month_of(now_ms());
+        let mb = control.take_allowed_mb();
+        let extra = mb.saturating_mul(1_000_000);
+        let usage = match netusage::add(self.ledger.db(), profile.key.id(), &month, 0, 0, extra) {
+            Ok(u) => u,
+            Err(e) => {
+                // Not lost: asked again at the next look.
+                control.allow_mb_again(mb);
+                return Err(e.into());
+            }
+        };
+        if extra > 0 {
+            println!("oneupd: {} more allowed this month on this network", oneup_app::versions::size(extra));
+        }
+        let budget = profile.budget_bytes();
+        let why = oneup_app::network::connection_reason(net.connectivity)
+            .or_else(|| oneup_app::network::pause_reason(profile))
+            .or_else(|| netusage::pause_reason(&usage, budget));
+        oneup_app::network::apply_profile(
+            control,
+            &graph.upload,
+            &graph.download,
+            &graph.budget,
+            settings,
+            profile,
+            usage.left(budget),
+            autopause::local_minute_of_day(),
+        );
+        Ok((usage, why))
+    }
+
+    /// Between network changes (the timer while rounds run): counts the
+    /// data used and judges the budget, by the network last read. Doesn't
+    /// ask Windows anything.
+    fn count(
+        &mut self,
+        settings: &oneup_app::config::Agent,
+        graph: &Graph,
+        control: &Control,
+    ) -> Result<Option<autopause::Reason>> {
+        self.charge()?;
+        let Some((net, profile)) = self.last.clone() else { return Ok(None) };
+        Ok(self.settle(&net, &profile, settings, graph, control)?.1)
+    }
+
+    /// Bytes sent (every request body, each attempt) and received (every
+    /// response, as it arrives) so far.
     fn counters(graph: &Graph) -> (u64, u64) {
-        (graph.upload.moved(), graph.stats.bytes.load(Relaxed))
+        (graph.stats.sent.load(Relaxed), graph.stats.bytes.load(Relaxed))
     }
 
     /// Reads the network and its profile, adds what was used since the last
@@ -1313,21 +1440,12 @@ impl NetUse {
         graph: &Graph,
         control: &Control,
     ) -> Result<Looked> {
-        use oneup_app::netusage;
+        // What went until now is the profile's that was in effect.
+        self.charge()?;
         let (net, profile) = oneup_app::network::situation(dir, settings);
-        let (cu, cd) = Self::counters(graph);
-        let (up, down) = self.meter.take(cu, cd);
-        let extra = control.take_allowed_mb().saturating_mul(1_000_000);
-        let month = netusage::month_of(now_ms());
-        let usage = netusage::add(&mut self.db, profile.key.id(), &month, up, down, extra)?;
-        if extra > 0 {
-            println!("oneupd: {} more allowed this month on this network", oneup_app::versions::size(extra));
-        }
-        let budget = profile.budget_bytes();
-        let why = oneup_app::network::pause_reason(&profile).or_else(|| netusage::pause_reason(&usage, budget));
-        let mut policy = oneup_app::network::Policy::of(&profile);
-        policy.budget_left = usage.left(budget);
-        control.set_policy(policy);
+        self.ledger.switch(profile.key.id());
+        let (usage, why) = self.settle(&net, &profile, settings, graph, control)?;
+        self.last = Some((net.clone(), profile.clone()));
         Ok(Looked { net, profile, usage, why })
     }
 }
@@ -1340,6 +1458,8 @@ struct LinkCounters {
     timed: u64,
     timed_ms: u64,
     bytes: u64,
+    /// How long transfers were under way (side by side counted once).
+    busy: Duration,
 }
 
 impl LinkCounters {
@@ -1351,11 +1471,13 @@ impl LinkCounters {
             timed: s.timed.load(Relaxed),
             timed_ms: s.timed_ms.load(Relaxed),
             bytes: graph.upload.moved() + graph.download.moved(),
+            busy: graph.transferring.total(),
         }
     }
 
-    /// What the requests since saw, over `took`.
-    fn since(&self, graph: &Graph, took: Duration) -> oneup_app::link::Sample {
+    /// What the requests since saw. Speed is over the time transfers were
+    /// under way, not the whole pass (planning, listing).
+    fn since(&self, graph: &Graph) -> oneup_app::link::Sample {
         let now = Self::of(graph);
         oneup_app::link::Sample {
             requests: now.requests.saturating_sub(self.requests),
@@ -1363,7 +1485,7 @@ impl LinkCounters {
             timed: now.timed.saturating_sub(self.timed),
             timed_ms: now.timed_ms.saturating_sub(self.timed_ms),
             bytes: now.bytes.saturating_sub(self.bytes),
-            secs: took.as_secs_f64(),
+            secs: now.busy.saturating_sub(self.busy).as_secs_f64(),
             capped: graph.upload.get() > 0 || graph.download.get() > 0,
         }
     }

@@ -65,7 +65,8 @@ A network's settings (or the metered ones) can have a **monthly data budget** in
 
 * A sync only starts transfers that fit in what's left; the rest waits.
 * When the budget is used up, OneUpDrive pauses on that network and tells you (a notification from the OneUpDrive icon). **Allow 500 MB more** (in the icon's menu, on the Network page, or `oneup network allow-more`) adds to this month's budget and syncing goes on.
-* Opening an online-only file always downloads it, and counts toward the budget.
+* Opening an online-only file always downloads it, and counts toward the budget. Files set to **Always keep on this device** download only while the budget lasts.
+* Everything OneUpDrive sends and receives on that network counts, also a download that fails halfway and is tried again. Updates of OneUpDrive itself aren't counted.
 
 ```
 oneup network set --metered --budget-mb 2000      # 2 GB a month on metered networks
@@ -78,3 +79,9 @@ oneup network set --metered --budget-mb off
 OneUpDrive watches how its requests go. When many fail, answers come slowly or files move very slowly, it sends fewer requests at once, sends large files in smaller pieces (so a dropped connection costs less to send again) and waits longer before trying again. `oneup status` then shows **connection: poor**, and the activity log notes it. It goes back to normal once the connection has been good for a while.
 
 A large file whose upload the connection cut off goes on from where it stopped, not from its first byte, as long as OneUpDrive keeps running and the file hasn't changed.
+
+## Changing networks, and hotel Wi-Fi
+
+Windows tells OneUpDrive when the network changes, so switching to a phone hotspot, back to your home Wi-Fi or getting the internet back takes effect within seconds, also in the middle of a sync.
+
+On a network that wants you to sign in first (a hotel's, a train's or an airport's Wi-Fi page), OneUpDrive waits instead of trying and failing: `oneup status` says **paused by itself: waiting for the internet: sign in to this network first**. Once you've signed in, it goes on by itself. With no network at all it waits the same way.

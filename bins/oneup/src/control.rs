@@ -446,6 +446,13 @@ impl Control {
         std::mem::take(&mut self.lock().allowed_mb)
     }
 
+    /// Megabytes taken but not recorded (the write failed): handed out
+    /// again at the next [`Control::take_allowed_mb`].
+    pub fn allow_mb_again(&self, mb: u64) {
+        let mut s = self.lock();
+        s.allowed_mb = s.allowed_mb.saturating_add(mb);
+    }
+
     /// The folder uses Files On-Demand (cloud files arrive as placeholders,
     /// which move no contents).
     pub fn set_on_demand(&self, on: bool) {

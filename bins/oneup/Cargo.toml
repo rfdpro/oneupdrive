@@ -76,6 +76,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # The sharing audit's tests run against an in-memory OneDrive's sharing.
 oneup-effects = { path = "../../crates/oneup-effects", features = ["fake"] }
+# Simulated time for the agent's waits (tests only).
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

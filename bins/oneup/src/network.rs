@@ -474,6 +474,73 @@ pub fn check(l: &Layer) -> Result<()> {
     Ok(())
 }
 
+/// What the agent does with the profile it just read (at a wake-up, on
+/// Windows' event, or when it counted the data used): hands the rounds its
+/// policy with what's left of the budget, and applies its caps and budget
+/// to the transport at once, so a round under way follows them from its
+/// next byte. `cap_hours` still decides whether the caps apply now.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_profile(
+    control: &crate::control::Control,
+    up: &oneup_graph::throttle::Throttle,
+    down: &oneup_graph::throttle::Throttle,
+    budget: &oneup_graph::budget::Budget,
+    agent: &Agent,
+    p: &Profile,
+    budget_left: Option<u64>,
+    minute_of_day: u32,
+) {
+    let capped = crate::autopause::caps_apply(agent, minute_of_day);
+    let cap = |kib: u64| if capped { kib.saturating_mul(1024) } else { 0 };
+    up.set(cap(p.upload_kib));
+    down.set(cap(p.download_kib));
+    budget.set(budget_left);
+    let mut policy = Policy::of(p);
+    policy.budget_left = budget_left;
+    control.set_policy(policy);
+}
+
+/// Windows' network-change events, for the agent to wait on: what the
+/// handler `oneup_sys::network::watch` calls pings it, and [`Events::next`]
+/// waits for the next change.
+#[derive(Debug, Default)]
+pub struct Events {
+    notify: tokio::sync::Notify,
+}
+
+impl Events {
+    /// Windows reported a change (any thread).
+    pub fn changed(&self) {
+        self.notify.notify_one();
+    }
+
+    /// Waits for a change. At once, not after letting a burst settle:
+    /// what the old network's profile allowed must stop as soon as the new
+    /// one applies (each change of a burst is read again; that costs a
+    /// look, not a request).
+    pub async fn next(&self) {
+        self.notify.notified().await;
+    }
+}
+
+/// Why sync waits for the connection itself, if it does: a network that
+/// wants a sign-in first (a captive portal), or none at all. Retrying then
+/// only collects errors; Windows reports when that changes. A network
+/// Windows says reaches only local addresses isn't waited for: a blocked
+/// connectivity probe looks the same, and sync may still work there.
+#[cfg(windows)]
+pub fn connection_reason(c: oneup_sys::network::Connectivity) -> Option<crate::autopause::Reason> {
+    use crate::autopause::Reason;
+    use oneup_sys::network::Connectivity;
+    match c {
+        Connectivity::Constrained => {
+            Some(Reason::fixed(crate::t_key!("waiting for the internet: sign in to this network first")))
+        }
+        Connectivity::None => Some(Reason::fixed(crate::t_key!("waiting for a network connection"))),
+        _ => None,
+    }
+}
+
 /// Why the profile pauses sync, if it does (for `crate::autopause`).
 pub fn pause_reason(p: &Profile) -> Option<crate::autopause::Reason> {
     use crate::autopause::Reason;
@@ -756,6 +823,86 @@ mod tests {
         assert_eq!(back.items[0].1, 3 * WAITING_MAX as u64 - 1, "largest first");
         save_waiting(&mut store, None).unwrap();
         assert!(load_waiting(&store).unwrap().is_none());
+    }
+
+    /// The roadmap's exit test for network changes: Windows reporting a
+    /// metered network (an injected event, simulated time) stops the next
+    /// upload of a round under way within 10 s, and pauses sync where the
+    /// metered profile pauses. The agent reacts to [`Events::next`] by
+    /// reading the network and handing the profile's policy and pause to
+    /// its control state, as here.
+    #[tokio::test(start_paused = true)]
+    async fn a_metered_switch_takes_effect_within_10_seconds() {
+        use oneup_sync::{Link, LocalId, LocalPre, Op, RemoteId};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let control = Arc::new(crate::control::Control::new(None, "L".into(), "/R".into(), Default::default()));
+        let events = Arc::new(Events::default());
+        let metered = Arc::new(AtomicBool::new(false));
+        let free = Agent { pause_on_metered: false, ..Agent::default() };
+        let nets = Networks {
+            metered: Layer { transfer: Some(Transfer::Metadata), upload_kib: Some(100), ..Layer::default() },
+            own: Vec::new(),
+        };
+        // The agent's reaction, for two agents: metadata only on metered
+        // networks, and the default (paused there).
+        let up = Arc::new(oneup_graph::throttle::Throttle::default());
+        let down = Arc::new(oneup_graph::throttle::Throttle::default());
+        let budget = Arc::new(oneup_graph::budget::Budget::default());
+        let react = |agent: Agent| {
+            let (control, events, metered, nets) =
+                (Arc::clone(&control), Arc::clone(&events), Arc::clone(&metered), nets.clone());
+            let (up, down, budget) = (Arc::clone(&up), Arc::clone(&down), Arc::clone(&budget));
+            tokio::spawn(async move {
+                loop {
+                    events.next().await;
+                    let seen = Seen { id: Some(HOME.into()), name: "Phone".into(), metered: metered.load(Relaxed) };
+                    let p = active(&agent, Interval::default(), &nets, &seen);
+                    apply_profile(&control, &up, &down, &budget, &agent, &p, None, 600);
+                    control.set_auto_pause(pause_reason(&p));
+                }
+            })
+        };
+        let upload = Op::Upload {
+            local: LocalPre { id: LocalId(1), stamp: Some((50_000_000, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let task = react(free);
+        let live = control.controls().live.unwrap();
+        let check = live.round_check();
+        assert!(check(&upload), "everything goes before the switch");
+        let at = tokio::time::Instant::now();
+        metered.store(true, Relaxed);
+        events.changed();
+        while check(&upload) {
+            assert!(at.elapsed() < std::time::Duration::from_secs(10), "not within 10 s");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(control.controls().net.transfer == Transfer::Metadata && !control.controls().pause_remote);
+        // Uncapped to capped, for a round under way: the transport has the
+        // cap at once (rounds otherwise set it as they begin).
+        assert_eq!((up.get(), down.get()), (100 * 1024, 0));
+        task.abort();
+
+        // With the default, metered pauses: both sides, at once.
+        let task = react(Agent::default());
+        metered.store(false, Relaxed);
+        events.changed();
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        assert!(!control.controls().pause_remote);
+        let at = tokio::time::Instant::now();
+        metered.store(true, Relaxed);
+        events.changed();
+        while !control.controls().pause_remote {
+            assert!(at.elapsed() < std::time::Duration::from_secs(10), "not within 10 s");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!live.round_check()(&upload));
+        task.abort();
     }
 
     #[test]

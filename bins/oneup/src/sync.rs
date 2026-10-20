@@ -1046,6 +1046,17 @@ impl Engine {
         }
     }
 
+    /// The cloud OneUpDrive's own hydrations (files set to always stay on
+    /// this device) go through: on the data budget
+    /// (`oneup_exec::hydrate::Hydrator::with_ours`).
+    pub fn pinning_cloud(&self) -> crate::vaultpair::PairCloud {
+        let plain = GraphCloud::new(Arc::clone(&self.graph));
+        match &self.vault {
+            Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
+            None => crate::vaultpair::PairCloud::Plain(plain),
+        }
+    }
+
     /// The cloud side brought up to date: the mirror, or for a vault pair
     /// its decrypted view. The store's invariants are checked in the first
     /// round only: the check reads every row of all three trees, so at every
