@@ -152,59 +152,23 @@ pub async fn open_version(path: &Path, version: &str, label: &str) -> Result<Pat
 /// Makes version `version` the file's current one in OneDrive (see the
 /// module docs).
 pub async fn restore_version(path: &Path, version: &str) -> Result<()> {
-    use oneup_exec::Cloud as _;
     let it = Item::at(path)?;
     crate::setup::require_test_account(&it.dir)?;
     if it.folder {
         bail!("folders have no versions");
     }
-    let graph = it.graph()?;
-    let now = graph.item(&it.remote).await?.context("it's no longer in OneDrive")?;
-    let etag = now.e_tag.clone().context("OneDrive gave no version tag")?;
-    let parent = now.parent_id().context("it has no folder in OneDrive")?.to_string();
-    let name = now.name.clone().context("it has no name in OneDrive")?;
+    let cloud = oneup_exec::GraphCloud::new(it.graph()?);
     // Downloaded into the data folder (OneUpDrive's own), never the synced one.
     let staged = it.dir.join(format!("restore-{}.tmp", std::process::id()));
-    let result = async {
-        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&staged)?;
-        let mut hashing = HashingWrite { inner: &mut f, hash: oneup_hash::QuickXorHash::new() };
-        let len = graph.download_version(&it.remote, version, &mut hashing).await?;
-        let hash = hashing.hash.finalize();
-        std::io::Seek::rewind(&mut f)?;
-        let size = i64::try_from(len)?;
-        let pre = oneup_sync::RemotePre { id: oneup_sync::RemoteId(it.remote.clone()), etag };
-        let cloud = oneup_exec::GraphCloud::new(Arc::clone(&graph));
-        let (row, _) = cloud.upload(&oneup_sync::RemoteId(parent), &name, Some(&pre), size, &mut f).await.map_err(
-            |e| match e {
-                oneup_exec::CloudError::Changed => anyhow::anyhow!("it changed in OneDrive meanwhile; look again"),
-                e => anyhow::anyhow!("{e}"),
-            },
-        )?;
-        if row.qxh != Some(hash) || row.size != size {
-            bail!("OneDrive's copy doesn't match the version sent; look at the file's versions again");
-        }
-        Ok(())
-    }
-    .await;
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&staged)?;
+    let id = oneup_sync::RemoteId(it.remote.clone());
+    let result = oneup_exec::recover::restore_version(&cloud, &id, version, &mut f).await;
+    drop(f);
     let _ = std::fs::remove_file(&staged);
-    result
-}
-
-/// Hashes what's written through it.
-struct HashingWrite<'a> {
-    inner: &'a mut std::fs::File,
-    hash: oneup_hash::QuickXorHash,
-}
-
-impl std::io::Write for HashingWrite<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.hash.update(&buf[..n]);
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
+    result.map(|_| ()).map_err(|e| match e {
+        oneup_exec::CloudError::Changed => anyhow::anyhow!("it changed in OneDrive meanwhile; look again"),
+        e => anyhow::anyhow!("{e}"),
+    })
 }
 
 /// The Office program for a file name (Microsoft's Office URI schemes),

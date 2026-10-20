@@ -13,7 +13,9 @@ pub mod autopause;
 pub mod backoff;
 pub mod busy;
 pub mod carryover;
+pub mod cloudbin;
 pub mod config;
+pub mod conflicts;
 pub mod control;
 #[cfg(windows)]
 pub mod databases;
@@ -53,6 +55,7 @@ pub mod prune;
 #[cfg(windows)]
 pub mod recyclebin;
 pub mod resolve;
+pub mod rewind;
 pub mod rulefiles;
 pub mod safetywindow;
 pub mod search;

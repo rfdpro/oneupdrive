@@ -515,6 +515,66 @@ enum Cmd {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// Rewind a folder to how it was at an earlier moment: lists what would
+    /// change; `--start` has the agent do it, once you approve it as a
+    /// safety stop (`oneup approve CODE`). Nothing is destroyed: what it
+    /// replaces or removes goes to the version store or OneDrive's recycle
+    /// bin and version history
+    Rewind {
+        /// The folder, relative to the synced folder (`/docs`; `/` for all of it)
+        #[arg(required_unless_present_any = ["before_stop", "cancel", "set_history_days", "set_history_changes"])]
+        folder: Option<String>,
+        /// The moment, in this PC's time: `2026-10-19 14:05`
+        #[arg(long, required_unless_present_any = ["before_stop", "cancel", "set_history_days", "set_history_changes"])]
+        to: Option<String>,
+        /// The content guard's stop CODE: its folder, to just before its batch
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["folder", "to"])]
+        before_stop: Option<String>,
+        /// Have the agent do it (it waits for your approval)
+        #[arg(long)]
+        start: bool,
+        /// Cancel the rewind under way (what it did stays done)
+        #[arg(long, conflicts_with = "start")]
+        cancel: bool,
+        /// Keep this many days of history to rewind with [default: 30];
+        /// 0 turns rewinding off and drops the history
+        #[arg(long, value_name = "DAYS")]
+        set_history_days: Option<u32>,
+        /// Keep at most this many changes of history (about 165 bytes
+        /// each) [default: 1000000]; 0 turns rewinding off
+        #[arg(long, value_name = "N")]
+        set_history_changes: Option<u64>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Files changed on both sides, kept as two copies (`name (conflict
+    /// N).ext`): list them, or keep one (the other goes to the version
+    /// store and OneDrive's recycle bin)
+    Conflicts {
+        /// The file whose conflict to answer, relative to the synced folder
+        path: Option<String>,
+        /// Which copy to keep: `original`, `copy` or `both`
+        #[arg(long, value_name = "ORIGINAL|COPY|BOTH", requires = "path")]
+        keep: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Items deleted from OneDrive since OneUpDrive began keeping their
+    /// history (OneDrive's own recycle bin can't be listed); `--restore N`
+    /// brings one back from it
+    RecycleBin {
+        /// Bring back this item (its number from the list)
+        #[arg(long, value_name = "N")]
+        restore: Option<usize>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// A file's versions in OneDrive; open a copy of one, or make one the
     /// current version again (the replaced one stays in the history)
     History {
@@ -2047,6 +2107,42 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::History { path, open, restore } => history(path, *open, *restore).await,
+        Cmd::Rewind { set_history_days, set_history_changes, profile, .. }
+            if set_history_days.is_some() || set_history_changes.is_some() =>
+        {
+            let mut store = open_store(&cli, profile.memory_profile)?;
+            oneup_app::rewind::set_history(&mut store, *set_history_days, *set_history_changes)?;
+            match store.read(oneup_app::rewind::history_keep)? {
+                Some(k) => println!("History kept for rewinds: {} days, at most {} changes.", k.days, k.rows),
+                None => println!("Rewinding is off: no history is kept."),
+            }
+            Ok(())
+        }
+        Cmd::Rewind { folder, to, before_stop, start, cancel, json, profile, .. } => {
+            let dir = data_dir(&cli)?;
+            let ask = RewindAsk {
+                folder: folder.as_deref(),
+                to: to.as_deref(),
+                before_stop: before_stop.as_deref(),
+                start: *start,
+                cancel: *cancel,
+                json: *json,
+            };
+            rewind(&dir, open_store(&cli, profile.memory_profile)?, ask).await
+        }
+        Cmd::Conflicts { path, keep, json, profile } => {
+            conflicts(
+                &data_dir(&cli)?,
+                open_store(&cli, profile.memory_profile)?,
+                path.as_deref(),
+                keep.as_deref(),
+                *json,
+            )
+            .await
+        }
+        Cmd::RecycleBin { restore, json, profile } => {
+            recycle_bin(&data_dir(&cli)?, &open_store(&cli, profile.memory_profile)?, *restore, *json).await
+        }
         Cmd::OnedriveApp { add, remove, top_files } => {
             let dir = data_dir(&cli)?;
             let mut a = oneup_app::config::load_onedrive_app(&dir)?;
@@ -2554,6 +2650,179 @@ async fn run() -> Result<()> {
             }
         }
     }
+}
+
+/// What `oneup rewind` was asked.
+struct RewindAsk<'a> {
+    folder: Option<&'a str>,
+    to: Option<&'a str>,
+    before_stop: Option<&'a str>,
+    start: bool,
+    cancel: bool,
+    json: bool,
+}
+
+/// `oneup rewind FOLDER --to TIME [--start]`, `--before-stop CODE`, `--cancel`.
+async fn rewind(dir: &std::path::Path, mut store: Store, ask: RewindAsk<'_>) -> Result<()> {
+    use oneup_app::rewind as rw;
+    let now = oneup_app::sync::now_ms();
+    if ask.cancel {
+        if rw::cancel(&mut store, now)? {
+            agent::nudge(dir).await;
+            println!("Rewind cancelled. What it did stays done.");
+        } else {
+            println!("No rewind is under way.");
+        }
+        return Ok(());
+    }
+    let (folder, at) = match ask.before_stop {
+        Some(code) => rw::before_stop(&store, dir, code, now)?,
+        None => {
+            (ask.folder.unwrap_or("/").to_string(), rw::parse_when(ask.to.context("--to: the moment to rewind to")?)?)
+        }
+    };
+    let (rules, _) = oneup_app::rulefiles::load(dir, &store, &mut oneup_app::rulefiles::Cache::default())?;
+    let p = if ask.start {
+        let p = rw::start(&mut store, dir, &rules, &folder, at, now)?;
+        agent::nudge(dir).await;
+        p
+    } else {
+        rw::preview(&store, &rules, &folder, at, now)?
+    };
+    if ask.json {
+        let changes: Vec<serde_json::Value> = p
+            .changes
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "kind": format!("{:?}", c.kind), "folder": c.item == oneup_sync::NodeKind::Folder,
+                    "then": c.then, "now": c.now, "size": c.size, "source": format!("{:?}", c.source),
+                })
+            })
+            .collect();
+        let skipped: Vec<serde_json::Value> = p
+            .skipped
+            .iter()
+            .map(|(path, why)| serde_json::json!({ "path": path, "why": format!("{why:?}") }))
+            .collect();
+        let v = serde_json::json!({
+            "folder": p.folder, "at_ms": p.at_ms, "code": format!("{:016x}", p.code),
+            "started": ask.start, "changes": changes, "skipped": skipped, "lines": rw::describe(&p),
+        });
+        println!("{v}");
+        return Ok(());
+    }
+    let shown = if folder.trim_matches('/').is_empty() { "the whole folder".to_string() } else { folder.clone() };
+    println!("Rewinding {shown} to {}:", rw::when(at));
+    for l in rw::describe(&p) {
+        println!("  {l}");
+    }
+    if p.changes.is_empty() {
+        println!("Nothing to change.");
+    } else if ask.start {
+        println!("The agent waits for your approval and changes nothing until then: `oneup approve {:016x}`.", p.code);
+    } else {
+        println!("Nothing changed. To do it, run this again with --start.");
+    }
+    Ok(())
+}
+
+/// `oneup conflicts [PATH --keep original|copy|both]`.
+async fn conflicts(
+    dir: &std::path::Path,
+    mut store: Store,
+    path: Option<&str>,
+    keep: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use oneup_app::conflicts as cf;
+    let listed = store.read(cf::list)?;
+    if let (Some(path), Some(keep)) = (path, keep) {
+        let want = format!("/{}", path.replace('\\', "/").trim_matches('/'));
+        let c = listed
+            .iter()
+            .find(|l| oneup_sync::same_name(&l.path, &want) || oneup_sync::same_name(&l.copy_path, &want))
+            .with_context(|| format!("no conflict for {want}"))?;
+        match cf::parse_keep(keep)? {
+            None => println!("Both copies stay as they are."),
+            Some(k) => {
+                cf::answer(&mut store, &c.conflict, k)?;
+                if agent::nudge(dir).await {
+                    println!("The agent keeps the copy you chose; the other goes to the version store.");
+                } else {
+                    println!("Queued: the next sync keeps the copy you chose (the agent isn't running).");
+                }
+            }
+        }
+        return Ok(());
+    }
+    if json {
+        let v: Vec<serde_json::Value> = listed.iter().map(cf::to_json).collect();
+        println!("{}", serde_json::Value::Array(v));
+        return Ok(());
+    }
+    if listed.is_empty() {
+        println!("No conflicts.");
+        return Ok(());
+    }
+    let when = |ft: i64| oneup_app::rewind::when(cf::filetime_ms(ft));
+    for l in &listed {
+        let c = &l.conflict;
+        let newer = match c.original.mtime.cmp(&c.copy.mtime) {
+            std::cmp::Ordering::Greater => " (newer)",
+            _ => "",
+        };
+        let copy_newer = if c.copy.mtime > c.original.mtime { " (newer)" } else { "" };
+        println!("{}", l.path);
+        println!(
+            "  original  {}  {}{newer}",
+            oneup_app::versions::size(c.original.size.max(0) as u64),
+            when(c.original.mtime)
+        );
+        println!(
+            "  copy      {}  {}{copy_newer}  {}",
+            oneup_app::versions::size(c.copy.size.max(0) as u64),
+            when(c.copy.mtime),
+            l.copy_path
+        );
+    }
+    println!("Keep one with `oneup conflicts PATH --keep original` (or `copy`).");
+    Ok(())
+}
+
+/// `oneup recycle-bin [--restore N]`.
+async fn recycle_bin(dir: &std::path::Path, store: &Store, restore: Option<usize>, json: bool) -> Result<()> {
+    use oneup_app::cloudbin;
+    let listed = store.read(|o| cloudbin::list(o, cloudbin::MAX))?;
+    if let Some(n) = restore {
+        let d =
+            listed.get(n.wrapping_sub(1)).with_context(|| format!("there's no item {n} (1 to {})", listed.len()))?;
+        let to = cloudbin::restore(dir, d.seq).await?;
+        agent::nudge(dir).await;
+        println!("Back in OneDrive as {to}; this PC gets it with the next sync.");
+        return Ok(());
+    }
+    if json {
+        let v: Vec<serde_json::Value> = listed.iter().map(cloudbin::to_json).collect();
+        println!("{}", serde_json::Value::Array(v));
+        return Ok(());
+    }
+    if listed.is_empty() {
+        println!("Nothing deleted from OneDrive since OneUpDrive began keeping its history.");
+        return Ok(());
+    }
+    for (i, d) in listed.iter().enumerate() {
+        let gone = if d.folder.is_some() { "" } else { "  (its folder is gone too)" };
+        println!(
+            "  {:>3}  {}  {:>10}  {}{gone}",
+            i + 1,
+            oneup_app::rewind::when(d.at_ms),
+            oneup_app::versions::size(d.size.max(0) as u64),
+            d.path
+        );
+    }
+    println!("Only items OneUpDrive saw deleted are listed; OneDrive's website shows its whole recycle bin.");
+    Ok(())
 }
 
 /// `oneup history PATH [--open N | --restore N]`.
