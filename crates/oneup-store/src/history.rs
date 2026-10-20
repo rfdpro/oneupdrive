@@ -180,6 +180,18 @@ impl Ops<'_> {
         }
     }
 
+    /// See [`History::changed_after`]: through the index on the time, so
+    /// it reads the rows since the moment only.
+    pub fn history_changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>> {
+        let over = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut st = self.c.prepare_cached(
+            "SELECT DISTINCT sid FROM synced_history INDEXED BY synced_history_at WHERE at_ms > ?1 LIMIT ?2",
+        )?;
+        let rows = st.query_map(rusqlite::params![at, over], |r| r.get::<_, i64>(0))?;
+        let out = rows.map(|r| Ok(sid_out(r?))).collect::<Result<Vec<_>>>()?;
+        Ok((out.len() <= limit).then_some(out))
+    }
+
     /// See [`History::children_after`].
     pub fn history_children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>> {
         let mut st =
@@ -349,6 +361,14 @@ impl History for Ops<'_> {
 
     fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>> {
         self.history_children_after(parent, at)
+    }
+
+    fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>> {
+        self.history_changed_after(at, limit)
+    }
+
+    fn unsettled(&self) -> Result<Vec<Sid>> {
+        Ok(self.dirty_scope()?.folders)
     }
 
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>> {
