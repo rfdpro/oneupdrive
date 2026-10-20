@@ -572,6 +572,12 @@ pub struct Engine {
     /// Whether applying pin rules or downloading what they keep has work
     /// left ([`Engine::pins_pending`]; the walk's own state is in the store).
     pin_more: std::sync::atomic::AtomicBool,
+    /// A rewind's steps this round, with the paths its stop shows for
+    /// them (`crate::rewind`), for the stop's saved list.
+    rewind_lines: std::sync::Mutex<Vec<(Op, String)>>,
+    /// Items a finished rewind changed in OneDrive: this PC following them
+    /// was approved with it, until a sequence of rounds settles.
+    rewound: std::sync::Mutex<Vec<oneup_sync::Sid>>,
 }
 
 /// What stop `i` of `review` lists this round: exactly the operations its
@@ -640,14 +646,15 @@ impl Stops {
 
     /// Takes in the user's approvals (`codes`): the lists of stops raised
     /// here become approved, and their codes are spent.
-    fn answer(&mut self, codes: &[u64]) {
+    fn answer(&mut self, codes: &[u64]) -> Vec<Breaker> {
         let codes = self.live(codes);
         let (taken, kept): (Vec<Breaker>, Vec<Breaker>) =
             std::mem::take(&mut self.raised).into_iter().partition(|b| codes.contains(&b.fingerprint.0));
         self.raised = kept;
-        for b in taken {
-            self.approve(&b);
+        for b in &taken {
+            self.approve(b);
         }
+        taken
     }
 
     /// A list approved (by a code this engine raised, or one the gate
@@ -657,6 +664,15 @@ impl Stops {
         self.approved.sort_unstable();
         self.approved.dedup();
         let code = b.fingerprint.0;
+        if !self.spent.contains(&code) {
+            self.spent.push(code);
+            self.to_drop.push(code);
+        }
+    }
+
+    /// Code `code` was taken in by something other than a raised stop's
+    /// list (a rewind's approval, `crate::rewind`): spent like one.
+    fn spend(&mut self, code: u64) {
         if !self.spent.contains(&code) {
             self.spent.push(code);
             self.to_drop.push(code);
@@ -898,6 +914,8 @@ impl Engine {
             db_waits: std::sync::Mutex::default(),
             db_live: std::sync::Mutex::default(),
             pin_more: std::sync::atomic::AtomicBool::new(false),
+            rewind_lines: std::sync::Mutex::default(),
+            rewound: std::sync::Mutex::default(),
         }
     }
 
@@ -1590,11 +1608,24 @@ impl Engine {
                 continue;
             }
             let held = stop_ops(review, i);
+            // A rewind's steps are listed where its plan names them.
+            let rewind = self.rewind_lines.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let shown = |o: &Ops<'_>, op: &Op| {
+                let mut l = describe(o, op);
+                if let Some((_, p)) = rewind.iter().find(|(r, _)| r == op) {
+                    l.path.clone_from(p);
+                }
+                l
+            };
             let lines = store.read(|o| {
                 Ok(held
                     .iter()
-                    .map(|op| if b.kind == BreakerKind::Removal { removal_line(o, op) } else { describe(o, op) })
-                    .chain(b.later.iter().map(|op| later_line(o, op)))
+                    .map(|op| if b.kind == BreakerKind::Removal { removal_line(o, op) } else { shown(o, op) })
+                    .chain(
+                        b.later
+                            .iter()
+                            .map(|op| if op.rewind_step().is_some() { shown(o, op) } else { later_line(o, op) }),
+                    )
                     .take(crate::stoplist::MAX_LINES)
                     .map(|l| l.to_string())
                     .collect::<Vec<_>>())
@@ -1754,15 +1785,77 @@ impl Engine {
             };
             extra.extend(chosen.ops.iter().map(|(op, _)| op.clone()));
             let removal_ops = removal.as_ref().map(|r| r.plan.ops.clone()).unwrap_or_default();
-            let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra, removal: removal_ops };
+            // Conflicts the user answered (`crate::conflicts`): their
+            // steps join the round, approved by the answer.
+            let conflicts = crate::conflicts::queued(&mut store)?;
+            log_activity(&mut store, conflicts.log.clone())?;
+            extra.extend(conflicts.ops.iter().cloned());
+            // A rewind under way (`crate::rewind`): its steps for this round.
+            let mut rewinding = store.read(crate::rewind::load)?;
+            let mut steps = match &rewinding {
+                Some(j) => match store.read(|o| Ok(crate::rewind::steps(o, &user_rules, j)))? {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // Can't be planned any more (the history pruned, say):
+                        // it ends, and says why.
+                        let folder = j.folder.clone();
+                        store.write(|o| o.meta_delete(crate::rewind::KEY))?;
+                        let entry = ActivityEntry {
+                            path: folder,
+                            ..notice(ActivityOutcome::Failed, "rewind", format!("ended: {e:#}"))
+                        };
+                        log_activity(&mut store, vec![entry])?;
+                        rewinding = None;
+                        None
+                    }
+                },
+                None => None,
+            };
             // Stops approved since the last round: their lists are approved.
             // Codes already used approve nothing again.
             let (listed, controls) = {
                 let mut stops = self.stops_lock();
-                stops.answer(&controls.answers.approve);
+                let taken = stops.answer(&controls.answers.approve);
+                // The rewind's stop: its approval binds the steps it showed,
+                // planned again now; a list that changed meanwhile has
+                // another code and needs a new answer.
+                if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref())
+                    && j.approval.is_none()
+                    && let Some((code, all)) = &s.preview
+                    && (taken.iter().any(|b| b.fingerprint.0 == *code)
+                        || stops.live(&controls.answers.approve).contains(code))
+                {
+                    j.approval = Some(oneup_sync::rewind::Job::approve(all));
+                    stops.spend(*code);
+                }
                 let mut c = controls.clone();
                 c.answers.approve = stops.live(&c.answers.approve);
                 (stops.approved.clone(), c)
+            };
+            if let Some(j) = &rewinding
+                && j.approval.is_some()
+                && steps.as_ref().is_some_and(|s| s.preview.is_some())
+            {
+                store.write(|o| crate::rewind::save(o, j))?;
+                steps = Some(store.read(|o| Ok(crate::rewind::steps(o, &user_rules, j)))??);
+                let entry = ActivityEntry {
+                    path: j.folder.clone(),
+                    ..notice(ActivityOutcome::Note, "rewind", "approved".into())
+                };
+                log_activity(&mut store, vec![entry])?;
+            }
+            if let Some(s) = &steps {
+                *self.rewind_lines.lock().unwrap_or_else(|p| p.into_inner()) =
+                    s.ops.iter().cloned().zip(s.paths.iter().cloned()).chain(s.later.iter().cloned()).collect();
+            }
+            let rewound = self.rewound.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let modes = Modes {
+                pull: mode != crate::config::CloudCopies::Keep,
+                extra,
+                rewind: steps.clone(),
+                answered: conflicts.ops.clone(),
+                rewound,
+                removal: removal_ops,
             };
             let controls = &controls;
             let t = std::time::Instant::now();
@@ -1772,6 +1865,15 @@ impl Engine {
             // stay approved for the folders they empty in later rounds.
             for b in &review.answered {
                 self.stops_lock().approve(b);
+                // The rewind's, approved by its code in this very round.
+                if b.kind == BreakerKind::Rewind
+                    && let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref())
+                    && let Some((code, all)) = &s.preview
+                    && *code == b.fingerprint.0
+                {
+                    j.approval = Some(oneup_sync::rewind::Job::approve(all));
+                    store.write(|o| crate::rewind::save(o, j))?;
+                }
             }
             // Said, so a slow start can be told from a slow round (one
             // can take minutes on a large folder).
@@ -2038,6 +2140,16 @@ impl Engine {
                 let log = crate::duplicates::ran(&mut store, r, &report)?;
                 log_activity(&mut store, log)?;
             }
+
+            crate::conflicts::ran(&mut store, &conflicts, &report)?;
+            if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref()) {
+                let finished = store.write(|o| Ok(crate::rewind::ran(o, j, s, &report, now_ms())))??;
+                if finished {
+                    // Its follow-ups here stay approved until the rounds settle.
+                    let mut rw = self.rewound.lock().unwrap_or_else(|p| p.into_inner());
+                    rw.extend(j.approval.iter().flat_map(|a| a.rewound.iter().copied()));
+                }
+            }
             let mut log = print_round(n, &planned, &report);
             self.note_databases(&mut store, &planned, &report, &db_settings.keep_syncing, &user_rules)?;
             for name in &report.kept_later {
@@ -2120,6 +2232,10 @@ impl Engine {
                 if end == End::Settled {
                     // Everything approved ran, or no longer applies.
                     self.stops_lock().settled();
+                    self.rewound.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                    // A first sync has settled: from now on, the history of
+                    // what's synced is kept, for rewinds, to its limits.
+                    crate::rewind::keep_history(&mut store, now_ms())?;
                 }
                 out.end = end;
                 return Ok((store, out));
@@ -2338,7 +2454,8 @@ fn plan_round<'a>(
     // working files are parked beside them.
     let databases = fs.map(LocalFs::databases).unwrap_or_default();
     let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?, databases);
-    let (ops, problems, upto, pending) = store.read(|o| {
+    let Modes { extra, rewind, answered, rewound: done_rewound, removal, .. } = modes;
+    let (ops, problems, upto, mut pending) = store.read(|o| {
         let dirty = o.dirty_scope()?;
         let folders = match scope {
             Scope::All => all_folders(&Parked::with_rules(o, &planning.hide))?,
@@ -2350,13 +2467,25 @@ fn plan_round<'a>(
         // item keeps it from being emptied.
         let parked = Parked::with_rules(o, &planning.hide).with_databases(&planning.databases);
         let pending = oneup_sync::pending_deletes(&parked, o, &ops, planning.flow)?;
-        add_extra(&mut ops, modes.extra.clone());
+        // A rewind's items are the rewind's: what the planner would do to
+        // them (send an edit the rewind sets aside, say) waits for it.
+        if let Some(r) = &rewind {
+            let theirs = |op: &Op| {
+                let (s, l, rm) = op.subjects();
+                r.ops.iter().any(|st| {
+                    let (ss, sl, srm) = st.subjects();
+                    (s.is_some() && s == ss) || (l.is_some() && l == sl) || (rm.is_some() && rm == srm)
+                })
+            };
+            ops.retain(|op| !op.is_action() || !theirs(op));
+        }
+        add_extra(&mut ops, extra);
         // Removing chosen duplicates waits for a round whose plan doesn't
         // touch what it removes or keeps (`oneup_exec::dupes::touched`):
         // the plan's own deletion of the copy that stays, or a move of one
         // that goes, could otherwise run in the same round.
-        if !oneup_exec::dupes::touched(&ops, &modes.removal) {
-            ops.extend(modes.removal.iter().cloned());
+        if !oneup_exec::dupes::touched(&ops, &removal) {
+            ops.extend(removal.iter().cloned());
         }
         let problems = problems
             .into_iter()
@@ -2373,26 +2502,60 @@ fn plan_round<'a>(
         _ => Vec::new(),
     };
     // The paths a stop's list shows are part of what an approval covers.
-    // Read only when something could trip or a list is approved.
     // A removal the user chose always is (`oneup_gate::always_stops`).
-    let (paths, pending_paths) =
-        if oneup_gate::may_stop(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty()) {
-            store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+    // Read only when something could trip or a list is approved (a
+    // rewind's or an answered conflict's steps are always a list).
+    let mut ops = ops;
+    let steps_at = ops.len();
+    let listed_steps = rewind.is_some() || !answered.is_empty();
+    if let Some(r) = &rewind {
+        ops.extend(r.ops.iter().cloned());
+    }
+    let (mut paths, mut pending_paths) = if listed_steps
+        || oneup_gate::may_stop(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty())
+    {
+        store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut approved = approved.to_vec();
+    let mut rewound = done_rewound;
+    if let Some(r) = &rewind {
+        // Shown where the rewind's plan names them: where they were then.
+        paths.truncate(steps_at);
+        paths.extend(r.paths.iter().cloned());
+        for (op, p) in &r.later {
+            pending.push(op.clone());
+            pending_paths.push(p.clone());
+        }
+        approved.extend(r.keys.iter().copied());
+        rewound.extend(r.rewound.iter().copied());
+    }
+    if !answered.is_empty() {
+        let (o, p): (Vec<Op>, Vec<String>) = ops
+            .iter()
+            .zip(&paths)
+            .filter(|(op, _)| answered.contains(op))
+            .map(|(op, p)| (op.clone(), p.clone()))
+            .unzip();
+        approved.extend(oneup_gate::rewind_keys(&o, &p));
+    }
+    approved.sort_unstable();
+    approved.dedup();
+    rewound.sort_unstable();
+    rewound.dedup();
     let cx = GateContext {
         synced_items: synced,
         recent,
         approvals: &approvals,
-        approved,
+        approved: &approved,
         pending: &pending,
         paths: &paths,
         pending_paths: &pending_paths,
         decisions: &decisions,
         room,
         suspicious: &suspicious,
-        rewound: &[],
+        rewound: &rewound,
     };
     let review = review_in(&policy, &cx, ops);
     Ok(Planned { review, problems, upto, suspicious, policy, synced, planning })
@@ -2593,6 +2756,14 @@ struct Modes {
     /// The removal of duplicates the user chose, added unless the plan
     /// touches what it removes or keeps.
     removal: Vec<Op>,
+    /// A rewind's steps (`crate::rewind::steps`): added to the plan, and
+    /// what the planner would do to the same items waits for them.
+    rewind: Option<crate::rewind::Steps>,
+    /// Of `extra`, the steps of conflicts the user answered: the answer
+    /// approves them (`oneup_exec::recover::conflict_ops`).
+    answered: Vec<Op>,
+    /// Items a finished rewind changed (see [`Engine::rewound`]).
+    rewound: Vec<oneup_sync::Sid>,
 }
 
 /// One round's reviewed plan.

@@ -95,6 +95,14 @@ impl SafetyWindow {
         self.done.values().fold(Recent::default(), |a, r| a.plus(*r))
     }
 
+    /// The start of the first minute in the window at `now_ms` in which a
+    /// file was sent with content that didn't look like its type (the
+    /// content guard's count), if any.
+    pub fn first_suspicious(&mut self, now_ms: i64) -> Option<i64> {
+        self.trim(now_ms);
+        self.done.iter().find(|(_, r)| r.suspicious > 0).map(|(at, _)| *at)
+    }
+
     /// Saves the window with `extra` added at `now_ms` (a sequence of
     /// rounds' counts so far, or what a round is about to carry out),
     /// leaving this copy as it is.
