@@ -193,7 +193,7 @@ Status mapping: 412 and 404 → *changed*, 409 → *name taken*, except that One
 `Parked` wraps the store's `Trees` and hides items a sync must not transfer:
 * **Problem items**, local only: names OneDrive refuses (`names::is_invalid`: forbidden characters, reserved names, leading or trailing spaces, trailing dots) and files over 250 GB. They're collected (`Parked::problems`) so the user can be told and can fix them.
 * **Local-by-nature files**, on both sides: `desktop.ini`, Office lock files (`~$…`), `*.tmp` and the OneDrive app's marker file. The official client doesn't sync these either. They're also hidden in the cloud, so a stray cloud copy isn't downloaded onto the local one every round. They're skipped silently.
-* **SQLite's working files** (`-wal`, `-shm`, `-journal`) beside a database told by its name or a `[databases]` pattern, on each side, with their Synced record beside the database's ([databases.md](databases.md#sqlites-working-files-never-sync-beside-their-database-oneup_planpark)).
+* **Working files**: a file named `<X>-wal`, `<X>-shm` or `<X>-journal` beside `<X>`, on each side, with its Synced record ([databases.md](databases.md#working-files-never-travel-oneup_planpark)).
 * **The user's rules** ([rules.md](rules.md#where-rules-apply)).
 
 A hidden item reads as **Missing** (the `Trees` contract). So a synced file that *becomes* parked, say renamed to `report.tmp`, is held on both sides and never deleted in the cloud. The store's own filtering (links, excluded folders, lossy names, packages) is separate; parking is a pure layer, so the rule list lives with the planner's other OneDrive limits.
