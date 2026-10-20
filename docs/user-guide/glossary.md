@@ -46,6 +46,6 @@
 
 **Vault**: a folder whose files are encrypted before they reach OneDrive. See [Encrypted vaults](vaults.md).
 
-**Working files** (SQLite's): the `-wal`, `-shm` and `-journal` files beside a SQLite database, holding changes on their way into it. They never sync. See [Databases](databases.md).
+**Working files** (SQLite's): the `-wal`, `-shm` and `-journal` files beside a database (`app.db-wal` beside `app.db`), holding changes on their way into it. They never sync. See [Databases](databases.md).
 
 **Version history**: the earlier versions of a file that OneDrive itself keeps. See [Earlier versions and sharing](versions-and-sharing.md).
