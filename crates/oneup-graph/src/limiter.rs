@@ -137,6 +137,20 @@ impl Aimd {
         }
     }
 
+    /// Waits until no pause the service asked for (`Retry-After`) is in
+    /// effect, without taking a permit: for a request that skips the
+    /// limit on requests at once but must still never hammer the service
+    /// (a file the user opens).
+    pub async fn unpaused(&self) {
+        loop {
+            let until = self.lock().paused_until.filter(|t| *t > Instant::now());
+            match until {
+                Some(t) => tokio::time::sleep_until(t.into()).await,
+                None => return,
+            }
+        }
+    }
+
     fn effective_ceiling(&self, s: &State, now: Instant) -> f64 {
         let most = s.cap.unwrap_or(self.max).min(self.max);
         match s.ceiling {
