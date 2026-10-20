@@ -836,7 +836,8 @@ impl LocalFs {
     /// otherwise it goes into the version store.
     pub fn recycle(&self, a: &Approved, synced: Option<&Hash>) -> Result<Done> {
         match a.op() {
-            Op::RecycleLocal { local, .. } => self.recycle_item(local, a.old_copy(), synced, None),
+            // One that follows a rewind only from where it was then (`at`).
+            Op::RecycleLocal { local, .. } => self.recycle_item(local, a.old_copy(), synced, a.at()),
             // A rewind sets a copy changed here aside: it's never the synced
             // version, so it's always kept.
             Op::Rewind { step, .. } => match &**step {

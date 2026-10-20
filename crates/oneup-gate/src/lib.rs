@@ -473,6 +473,9 @@ pub struct Breaker {
 pub struct Approved {
     op: Op,
     old: OldCopy,
+    /// For a recycling that follows a rewind ([`Follow::Recycle`]): the
+    /// path it was approved at, which the copy must still be at.
+    at: Option<String>,
     _seal: Seal,
 }
 
@@ -488,6 +491,13 @@ impl Approved {
     /// replaces (meaningless for other operations).
     pub fn old_copy(&self) -> OldCopy {
         self.old
+    }
+
+    /// Where the item must be (from the synced folder, as a stop's list
+    /// shows it) for this to act on it: set for a recycling that follows a
+    /// rewind, which its approval covers only there.
+    pub fn at(&self) -> Option<&str> {
+        self.at.as_deref()
     }
 }
 
@@ -577,8 +587,11 @@ pub enum Follow {
     /// folder and name).
     Move { sid: Sid, parent: Sid, name: String },
     /// Recycle this PC's copy of `sid`, as it was (ID and stamp) when the
-    /// rewind removed it in OneDrive.
-    Recycle { sid: Sid, local: oneup_sync::LocalPre },
+    /// rewind removed it in OneDrive, from where it was then (`at`, its
+    /// path as a stop's list shows it): moved since (a folder above it
+    /// renamed, say), it's another operation, and the approval's token
+    /// carries `at` so the copy is taken only from there ([`Approved::at`]).
+    Recycle { sid: Sid, local: oneup_sync::LocalPre, at: String },
 }
 
 impl Follow {
@@ -589,9 +602,23 @@ impl Follow {
                 Follow::Download { sid: *sid, remote: remote.clone() }
             }
             Op::MoveLocal { sid, parent, name, .. } => Follow::Move { sid: *sid, parent: *parent, name: name.clone() },
-            Op::RecycleLocal { sid, local } => Follow::Recycle { sid: *sid, local: local.clone() },
+            // Its key needs its path ([`Follow::of_at`]).
+            Op::RecycleLocal { .. } => return None,
             _ => return None,
         })
+    }
+}
+
+impl Follow {
+    /// [`Follow::of`], with the path a stop's list shows `op` at, which a
+    /// recycling's key includes.
+    pub fn of_at(op: &Op, path: &str) -> Option<Follow> {
+        match op {
+            Op::RecycleLocal { sid, local } => {
+                Some(Follow::Recycle { sid: *sid, local: local.clone(), at: path.to_string() })
+            }
+            _ => Follow::of(op),
+        }
     }
 }
 
@@ -610,8 +637,8 @@ pub fn follow_key(f: &Follow) -> ItemKey {
 /// Whether `op` is exactly one of the follow-ups in `rewound` (sorted).
 /// It still runs under its own preconditions and keeps what it replaces
 /// as any download or recycling does.
-pub fn follows_rewind(op: &Op, rewound: &[ItemKey]) -> bool {
-    !rewound.is_empty() && Follow::of(op).is_some_and(|f| rewound.binary_search(&follow_key(&f)).is_ok())
+pub fn follows_rewind(op: &Op, path: &str, rewound: &[ItemKey]) -> bool {
+    !rewound.is_empty() && Follow::of_at(op, path).is_some_and(|f| rewound.binary_search(&follow_key(&f)).is_ok())
 }
 
 /// Whether `op` removes a duplicate copy the user chose to remove: an
@@ -679,8 +706,11 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     for side in [Side::Local, Side::Remote] {
         // A removal the user chose has a list of its own: a mass list's
         // approval never covers it.
-        let on_side = |(_, o, _): &Item<'_>| {
-            Side::changed_by(o) == Some(side) && is_mass_sensitive(o) && !removal(o) && !follows_rewind(o, cx.rewound)
+        let on_side = |(_, o, p): &Item<'_>| {
+            Side::changed_by(o) == Some(side)
+                && is_mass_sensitive(o)
+                && !removal(o)
+                && !follows_rewind(o, p, cx.rewound)
         };
         let batch: Vec<Item<'_>> = items.iter().copied().filter(on_side).collect();
         if batch.is_empty() {
@@ -864,7 +894,11 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
                 if old == OldCopy::Keep {
                     out.store_bytes += store_size(policy, &op).unwrap_or(0);
                 }
-                out.approved.push(Approved { op, old, _seal: Seal });
+                // A recycling that follows a rewind: only from where it was
+                // when the rewind removed it in OneDrive.
+                let at = (matches!(op, Op::RecycleLocal { .. }) && follows_rewind(&op, path(i), cx.rewound))
+                    .then(|| path(i).to_string());
+                out.approved.push(Approved { op, old, at, _seal: Seal });
             }
         }
     }
@@ -1250,7 +1284,7 @@ mod tests {
     }
 
     fn keys(ops: &[Op]) -> Vec<ItemKey> {
-        let mut k: Vec<ItemKey> = ops.iter().filter_map(Follow::of).map(|f| follow_key(&f)).collect();
+        let mut k: Vec<ItemKey> = ops.iter().filter_map(|o| Follow::of_at(o, "")).map(|f| follow_key(&f)).collect();
         k.sort_unstable();
         k
     }
@@ -1295,6 +1329,27 @@ mod tests {
         assert!(
             review_in(&p, &Context { rewound: &rewound, ..cx }, (1..=30).map(recycle).collect()).breakers.is_empty()
         );
+    }
+
+    /// A recycling that follows a rewind is covered only at the path it had
+    /// when the rewind removed it in OneDrive, and its token carries that
+    /// path for the effects layer to check on the handle; a folder above it
+    /// renamed since makes it another operation, counted as ever.
+    #[test]
+    fn a_rewind_s_recycling_is_covered_only_where_it_was() {
+        let cx = Context { synced_items: 100, ..Context::default() };
+        let p = Policy::default();
+        let ops: Vec<Op> = (1..=30).map(recycle).collect();
+        let at: Vec<String> = (1..=30).map(|i| format!("/docs/sub/f{i}")).collect();
+        let mut rewound: Vec<ItemKey> =
+            ops.iter().zip(&at).filter_map(|(o, a)| Follow::of_at(o, a)).map(|f| follow_key(&f)).collect();
+        rewound.sort_unstable();
+        let r = review_in(&p, &Context { rewound: &rewound, paths: &at, ..cx }, ops.clone());
+        assert!(r.breakers.is_empty());
+        assert!(r.approved.iter().zip(&at).all(|(a, p)| a.at() == Some(p.as_str())), "the token carries the path");
+        let moved: Vec<String> = (1..=30).map(|i| format!("/docs-keep/sub/f{i}")).collect();
+        let r = review_in(&p, &Context { rewound: &rewound, paths: &moved, ..cx }, ops);
+        assert_eq!(r.breakers.len(), 1, "not what the rewind's approval covers");
     }
 
     #[test]

@@ -342,7 +342,10 @@ pub fn rewind_follows(o: &oneup_store::Ops<'_>, op: &Op) -> oneup_store::Result<
                 && let Some(row) = o.local_get(l.0)?
             {
                 let stamp = (row.kind == oneup_store::LocalKind::File).then_some((row.size, row.mtime));
-                out.push(Follow::Recycle { sid: *sid, local: LocalPre { id: l, stamp } });
+                // Where it is now, as a stop's list shows it: the follow-up
+                // takes the copy only from there.
+                let at = o.local_path_of(l.0)?.unwrap_or_default();
+                out.push(Follow::Recycle { sid: *sid, local: LocalPre { id: l, stamp }, at });
             }
         }
         _ => {}
