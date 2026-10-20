@@ -905,8 +905,8 @@ enum VaultCmd {
     /// Read and verify every file in the vault
     Check { folder: PathBuf },
     /// Sync a vault in OneDrive with a folder on this PC, decrypted
-    /// (experimental; test accounts only, for now). Files are online-only and decrypted when
-    /// opened, unless --full-files
+    /// (experimental). Files are online-only and decrypted when opened, unless
+    /// --full-files
     Add {
         /// The vault's folder in OneDrive (the one with vault.cryptomator)
         remote: String,
@@ -924,7 +924,7 @@ enum VaultCmd {
         no_start: bool,
     },
     /// Create a new vault in OneDrive and sync it with a new or empty folder
-    /// here (experimental; test accounts only, for now). Shows its recovery key
+    /// here (experimental). Shows its recovery key
     New {
         /// A new or empty folder in OneDrive, e.g. /Private
         remote: String,
