@@ -103,7 +103,18 @@ program = 'C:\Tools\thumbnail.exe'
 args = ["--out", 'C:\Thumbs', "{path}"]
 ```
 
-A `.bat` or `.cmd` works as the program directly (read `%ONEUPHOOK_PATH%`); for a `.ps1`/`.vbs`/`.js`, name its interpreter (`powershell.exe -File …`, `wscript.exe …`).
+A `.bat` or `.cmd` works as the program directly; for a `.ps1`/`.vbs`/`.js`, name its interpreter (`powershell.exe -File …`, `wscript.exe …`).
+
+In a batch file, take care how you read the variables. `cmd` expands `%NAME%` *before* it reads the line, so an unquoted `%ONEUPHOOK_PATH%` with a `&` in a file name (`a&calc.exe&.txt`) runs a command. Turn on delayed expansion and write `"!NAME!"`: cmd then reads the line first and puts the value in afterwards, so nothing in it can act as a command:
+
+```bat
+@echo off
+setlocal EnableDelayedExpansion
+copy "!ONEUPHOOK_PATH!" "D:\Backup" >nul
+echo !ONEUPHOOK_EVENT! "!ONEUPHOOK_RELPATH!">> "D:\Backup\log.txt"
+```
+
+A quoted `"%ONEUPHOOK_PATH%"` is safe too, because OneUpDrive guarantees no `ONEUPHOOK_*` value contains a double quote or a control character (a `"` in a detail becomes `'`). Never use a variable unquoted, and don't pass it on to `call`, `for /f` or another `cmd` line, which read it again.
 
 ### What a hook runs like
 * In the background: below normal priority, power-saving, no window. It doesn't slow syncing down: OneUpDrive never waits for a hook.
