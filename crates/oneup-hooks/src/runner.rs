@@ -17,7 +17,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -40,16 +40,26 @@ pub const KEEP_OUTPUT: usize = 8 * 1024;
 /// An event's detail, at most (characters).
 const MAX_DETAIL: usize = 300;
 
+/// Where the synced folders (and the safe working folder and `PATH`) are
+/// read from, fresh, right before each launch, so a pair added since the
+/// hooks loaded is still seen ([`Runner`] re-checks against it).
+pub trait PlacesSource: Send + Sync {
+    fn places(&self) -> std::sync::Arc<Places>;
+}
+
 /// What the runner works with; given again whenever it changes
 /// ([`Runner::configure`]).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Settings {
     pub hooks: Vec<HookSpec>,
     /// Nothing starts, and nothing is queued, while paused.
     pub paused: bool,
     /// The synced folder on this PC, for `{path}`.
     pub root: PathBuf,
+    /// The synced folders as last read (used when there's no source).
     pub places: Places,
+    /// Read again before each launch, if given.
+    pub source: Option<Arc<dyn PlacesSource>>,
 }
 
 /// How a program ended.
@@ -62,34 +72,70 @@ pub struct Finished {
     pub truncated: bool,
 }
 
-/// Starts a hook's program and waits for it (or its timeout).
-pub trait Launch: Send + Sync {
-    fn launch(&self, program: &Path, args: &[OsString], timeout: Duration) -> std::io::Result<Finished>;
+/// What to start: the program, its filled arguments, the scripts to guard
+/// (verified outside synced folders), the safe working folder, and a `PATH`
+/// with synced folders removed.
+pub struct LaunchRequest<'a> {
+    pub program: &'a Path,
+    pub args: &'a [OsString],
+    pub scripts: &'a [PathBuf],
+    pub cwd: &'a Path,
+    pub path: Option<&'a OsStr>,
+    pub timeout: Duration,
 }
 
-/// Starts programs contained (`oneup_sys::contained`): in their own
-/// folder, without OneUpDrive's environment variables (`ONEUP_*`, which
-/// can hold a vault's recovery key), output kept up to [`KEEP_OUTPUT`].
-pub struct Contained;
+/// Starts a hook's program and waits for it (or its timeout).
+pub trait Launch: Send + Sync {
+    fn launch(&self, req: &LaunchRequest<'_>) -> std::io::Result<Finished>;
+}
+
+/// Starts programs contained (`oneup_sys::contained`): in a safe folder,
+/// without OneUpDrive's environment variables (`ONEUP_*`, which can hold a
+/// vault's recovery key), with synced folders off `PATH`, in a job so a
+/// hook can't reach the control pipe, output kept up to [`KEEP_OUTPUT`].
+pub struct Contained {
+    #[cfg(windows)]
+    jobs: Option<Arc<oneup_sys::contained::HookJobs>>,
+}
+
+impl Contained {
+    /// `jobs`: the registry the run's job joins, so the control pipe can
+    /// tell hook processes apart (`None` leaves them untracked, for tests).
+    #[cfg(windows)]
+    pub fn new(jobs: Option<Arc<oneup_sys::contained::HookJobs>>) -> Self {
+        Self { jobs }
+    }
+
+    #[cfg(not(windows))]
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
 impl Launch for Contained {
     #[cfg(windows)]
-    fn launch(&self, program: &Path, args: &[OsString], timeout: Duration) -> std::io::Result<Finished> {
-        let cwd = program.parent().unwrap_or(program);
-        let drop_env = |n: &std::ffi::OsStr| n.to_string_lossy().to_ascii_uppercase().starts_with("ONEUP_");
-        let f = oneup_sys::contained::run(&oneup_sys::contained::Spec {
-            program,
-            args,
-            cwd,
-            drop_env: &drop_env,
-            timeout,
-            keep_output: KEEP_OUTPUT,
-        })?;
+    fn launch(&self, req: &LaunchRequest<'_>) -> std::io::Result<Finished> {
+        let drop_env = |n: &OsStr| n.to_string_lossy().to_ascii_uppercase().starts_with("ONEUP_");
+        let overrides: Vec<(OsString, OsString)> =
+            req.path.map(|p| vec![(OsString::from("PATH"), p.to_os_string())]).unwrap_or_default();
+        let f = oneup_sys::contained::run(
+            &oneup_sys::contained::Spec {
+                program: req.program,
+                args: req.args,
+                cwd: req.cwd,
+                drop_env: &drop_env,
+                env_overrides: &overrides,
+                guard: req.scripts,
+                timeout: req.timeout,
+                keep_output: KEEP_OUTPUT,
+            },
+            self.jobs.as_deref(),
+        )?;
         Ok(Finished { exit_code: f.exit_code, timed_out: f.timed_out, output: f.output, truncated: f.truncated })
     }
 
     #[cfg(not(windows))]
-    fn launch(&self, _: &Path, _: &[OsString], _: Duration) -> std::io::Result<Finished> {
+    fn launch(&self, _: &LaunchRequest<'_>) -> std::io::Result<Finished> {
         Err(std::io::Error::other("hooks run on Windows only"))
     }
 }
@@ -141,6 +187,7 @@ struct State {
     paused: bool,
     root: PathBuf,
     places: Arc<Places>,
+    source: Option<Arc<dyn PlacesSource>>,
     /// Runs waiting, across hooks.
     pending: usize,
     /// Orders the queue's entries (newer replaces older).
@@ -155,8 +202,8 @@ struct State {
 struct Slot {
     spec: HookSpec,
     rules: Option<RuleSet>,
-    /// The program to start, or why the hook can't run.
-    ok: Result<PathBuf, String>,
+    /// What it starts, or why the hook can't run.
+    ok: Result<program::Checked, String>,
     /// The reason last reported, so each is said once.
     said: Option<String>,
     /// One pending run per item (by folded path), and when each is due.
@@ -185,7 +232,7 @@ struct Job {
 }
 
 impl Slot {
-    fn new(spec: HookSpec, ok: Result<PathBuf, String>, now: Instant) -> Self {
+    fn new(spec: HookSpec, ok: Result<program::Checked, String>, now: Instant) -> Self {
         let rules = (!spec.paths.is_empty()).then(|| RuleSet::new(&[] as &[String], &spec.paths).unwrap_or_default());
         let tokens = Self::capacity(&spec);
         Self {
@@ -253,13 +300,11 @@ impl Slot {
     }
 }
 
-/// Whether a hook may run: its settings, its program (where it is) and the
-/// files its arguments name. The program to start if so.
-pub fn check(spec: &HookSpec, places: &Places) -> Result<PathBuf, String> {
+/// Whether a hook may run: its settings, and its program and scripts (where
+/// they are, and that no cloud value can run as code). What it starts if so.
+pub fn check(spec: &HookSpec, places: &Places) -> Result<program::Checked, String> {
     spec.check()?;
-    let program = program::check(&spec.program, places).map_err(|r| r.0)?;
-    program::check_args(&spec.args, places).map_err(|r| r.0)?;
-    Ok(program)
+    program::check(&spec.program, &spec.args, &places.cwd, places).map_err(|r| r.0)
 }
 
 /// What runs are coalesced by: the item, or for events about sync itself
@@ -383,6 +428,7 @@ impl Runner {
             st.paused = s.paused;
             st.root = s.root;
             st.places = places;
+            st.source = s.source;
         }
         self.shared.wake.notify_all();
         for n in notes {
@@ -501,13 +547,25 @@ fn worker(shared: &Shared) {
         };
         let name = job.spec.name.clone();
         let started = Instant::now();
-        // Checked again right before the start: the program, or a folder on
-        // its way, may have moved into a synced folder since it was loaded.
-        let checked = check(&job.spec, &job.places);
+        // The synced folders, read fresh if a source is set, so a pair added
+        // since the hooks loaded is seen. Checked again right before the
+        // start: the program (or a script, or a folder on its way) may have
+        // moved into a synced folder since it was loaded.
+        let source = shared.lock().source.clone();
+        let places = source.map_or_else(|| job.places.clone(), |s| s.places());
+        let checked = check(&job.spec, &places);
         let result = match &checked {
-            Ok(program) => {
+            Ok(c) => {
                 let args = Fill { event: &job.event, root: &job.root }.args(&job.spec.args);
-                shared.launch.launch(program, &args, job.spec.timeout).map_err(|e| format!("couldn't start: {e}"))
+                let req = LaunchRequest {
+                    program: &c.program,
+                    args: &args,
+                    scripts: &c.scripts,
+                    cwd: &places.cwd,
+                    path: places.safe_path.as_deref(),
+                    timeout: job.spec.timeout,
+                };
+                shared.launch.launch(&req).map_err(|e| format!("couldn't start: {e}"))
             }
             Err(why) => Err(why.clone()),
         };
@@ -547,11 +605,34 @@ mod tests {
     }
 
     impl Launch for Fake {
-        fn launch(&self, program: &Path, args: &[OsString], _: Duration) -> std::io::Result<Finished> {
-            self.started.lock().unwrap().push((program.to_path_buf(), args.to_vec(), Instant::now()));
+        fn launch(&self, req: &LaunchRequest<'_>) -> std::io::Result<Finished> {
+            self.started.lock().unwrap().push((req.program.to_path_buf(), req.args.to_vec(), Instant::now()));
             std::thread::sleep(self.delay);
             Ok(Finished { exit_code: Some(0), timed_out: false, output: Vec::new(), truncated: false })
         }
+    }
+
+    /// A launcher whose runs never finish, to prove rounds never wait on
+    /// hooks: offering stays non-blocking and bounded while workers are stuck.
+    struct Blocked {
+        ran: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Launch for Blocked {
+        fn launch(&self, _: &LaunchRequest<'_>) -> std::io::Result<Finished> {
+            self.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Blocks until the test lets go, so the worker is stuck in a run.
+            while !self.release.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(Finished { exit_code: Some(0), timed_out: false, output: Vec::new(), truncated: false })
+        }
+    }
+
+    /// Places with no synced folders, known complete, so test hooks run.
+    fn open_places() -> Places {
+        Places::new(Vec::new(), true, std::env::temp_dir(), None)
     }
 
     fn fake(delay: Duration) -> Arc<Fake> {
@@ -590,7 +671,7 @@ mod tests {
     fn runner(hooks: Vec<HookSpec>, launch: Arc<Fake>) -> (Runner, Notes) {
         let notes: Notes = Arc::default();
         let sink = Arc::clone(&notes);
-        let s = Settings { hooks, root: PathBuf::from(r"C:\Sync"), ..Settings::default() };
+        let s = Settings { hooks, root: PathBuf::from(r"C:\Sync"), places: open_places(), ..Settings::default() };
         (Runner::start(s, launch, Box::new(move |n| sink.lock().unwrap().push(n))), notes)
     }
 
@@ -660,7 +741,8 @@ mod tests {
         let (r, _) = runner(vec![hook("h", 60_000, 60)], Arc::clone(&f));
         r.offer(&[synced("/a.txt")]);
         assert_eq!(r.backlog().0, 1);
-        let mut s = Settings { hooks: vec![hook("h", 60_000, 60)], paused: true, ..Settings::default() };
+        let mut s =
+            Settings { hooks: vec![hook("h", 60_000, 60)], paused: true, places: open_places(), ..Settings::default() };
         r.configure(s.clone());
         assert_eq!(r.backlog().0, 0);
         r.offer(&[synced("/a.txt")]);
@@ -673,9 +755,18 @@ mod tests {
         assert!(f.started.lock().unwrap().is_empty());
     }
 
+    /// A [`PlacesSource`] the test can flip.
+    struct FlipPlaces(Mutex<Arc<Places>>);
+    impl PlacesSource for FlipPlaces {
+        fn places(&self) -> Arc<Places> {
+            Arc::clone(&self.0.lock().unwrap())
+        }
+    }
+
     /// The program is checked when the hook is loaded and again right
-    /// before each start: one that a synced folder holds by then never
-    /// starts, and the hook says why once.
+    /// before each start, against the synced folders read fresh then: one
+    /// that a synced folder holds by the time it would run never starts, and
+    /// the hook says why once.
     #[test]
     fn a_program_that_moved_into_a_synced_folder_is_refused_at_its_next_start() {
         let dir = std::env::temp_dir().join(format!("oneup-hooks-moved-{}", std::process::id()));
@@ -684,18 +775,32 @@ mod tests {
         std::fs::create_dir_all(&tools).unwrap();
         let exe = tools.join("run.exe");
         std::fs::write(&exe, b"MZ").unwrap();
-        let f = fake(Duration::ZERO);
-        let spec = HookSpec { coalesce: Duration::from_millis(300), ..hook("h", 0, 60) };
+        let f = fake(Duration::from_millis(0));
+        let spec = HookSpec { coalesce: Duration::from_millis(400), ..hook("h", 0, 60) };
         let spec = HookSpec { program: exe.to_string_lossy().into_owned(), ..spec };
-        let (r, notes) = runner(vec![spec.clone()], Arc::clone(&f));
+        // A source that starts with nothing synced (so the hook loads), and
+        // the test flips to "Tools is synced" before the run is due.
+        let open = Arc::new(Places::new(Vec::new(), true, std::env::temp_dir(), None));
+        let source = Arc::new(FlipPlaces(Mutex::new(Arc::clone(&open))));
+        let notes: Notes = Arc::default();
+        let sink = Arc::clone(&notes);
+        let settings = Settings {
+            hooks: vec![spec.clone()],
+            paused: false,
+            root: PathBuf::from(r"C:\Sync"),
+            places: (*open).clone(),
+            source: Some(Arc::clone(&source) as Arc<dyn PlacesSource>),
+        };
+        let r =
+            Runner::start(settings, Arc::clone(&f) as Arc<dyn Launch>, Box::new(move |n| sink.lock().unwrap().push(n)));
         r.offer(&[synced("/a.txt")]);
-        // Before it's due, its folder becomes a synced one (the places
-        // the runner knows are the ones the agent found at load).
-        let synced_places = Places::new(vec![(tools.clone(), "the folder pair Tools".into())]);
-        {
-            let mut st = r.shared.lock();
-            st.places = Arc::new(synced_places);
-        }
+        // Before it's due, the fresh reading has Tools as a synced folder.
+        *source.0.lock().unwrap() = Arc::new(Places::new(
+            vec![(tools.clone(), "the folder pair Tools".into())],
+            true,
+            std::env::temp_dir(),
+            None,
+        ));
         assert!(r.wait_idle(Duration::from_secs(10)));
         assert!(f.started.lock().unwrap().is_empty(), "never started");
         let refused: Vec<String> = notes
@@ -709,12 +814,50 @@ mod tests {
         // And at load, with the same places: refused at once, said once.
         r.configure(Settings {
             hooks: vec![spec],
-            places: Places::new(vec![(tools, "the folder pair Tools".into())]),
+            places: Places::new(vec![(tools, "the folder pair Tools".into())], true, std::env::temp_dir(), None),
             ..Settings::default()
         });
         r.offer(&[synced("/b.txt")]);
         assert_eq!(r.backlog().0, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Offering events never blocks on hook work: with every worker stuck
+    /// in a run that never returns, more events still queue in O(1) and are
+    /// bounded, and offering returns at once. This is what keeps hooks from
+    /// slowing a sync round, whatever a hook does.
+    #[test]
+    fn offering_never_waits_on_hooks_and_stays_bounded() {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notes: Notes = Arc::default();
+        let sink = Arc::clone(&notes);
+        // One hook runs one at a time, so two hooks fill both workers.
+        let s = Settings {
+            hooks: vec![hook("a", 0, 6000), hook("b", 0, 6000)],
+            root: PathBuf::from(r"C:\Sync"),
+            places: open_places(),
+            ..Settings::default()
+        };
+        let blocked = Arc::new(Blocked { ran: Arc::clone(&ran), release: Arc::clone(&release) });
+        let r = Runner::start(s, blocked, Box::new(move |n| sink.lock().unwrap().push(n)));
+        // Both workers get stuck on the first two runs.
+        r.offer(&[synced("/a.txt")]);
+        while ran.load(std::sync::atomic::Ordering::Relaxed) < WORKERS {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Now offer a flood; each call must return at once though no worker
+        // is free, and the queue must stay bounded.
+        for i in 0..(MAX_PENDING + 1000) {
+            let t = Instant::now();
+            r.offer(&[synced(&format!("/f{i}.txt"))]);
+            assert!(t.elapsed() < Duration::from_millis(200), "offer blocked: {:?}", t.elapsed());
+        }
+        assert!(r.backlog().0 <= MAX_PENDING, "bounded: {}", r.backlog().0);
+        // Only two ever started; the rest wait or were dropped.
+        assert_eq!(ran.load(std::sync::atomic::Ordering::Relaxed), WORKERS);
+        // Let the stuck runs finish so the worker threads can exit.
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]

@@ -27,7 +27,9 @@ use oneup_ipc::{Event, EventKind};
 pub mod program;
 mod runner;
 
-pub use runner::{Contained, Finished, Launch, MAX_PENDING, Note, Ran, Runner, Settings, check};
+pub use runner::{
+    Contained, Finished, Launch, LaunchRequest, MAX_PENDING, Note, PlacesSource, Ran, Runner, Settings, check,
+};
 
 /// At most this many hooks.
 pub const MAX_HOOKS: usize = 32;
@@ -110,7 +112,7 @@ impl HookSpec {
         for a in &self.args {
             templates_in(a)?;
         }
-        check_interpreter(&self.program, &self.args)
+        Ok(())
     }
 
     /// Whether `e` starts it.
@@ -127,11 +129,6 @@ impl HookSpec {
 
 /// The templates an argument may hold (`{{` is a plain `{`).
 pub const TEMPLATES: [&str; 5] = ["{event}", "{path}", "{relpath}", "{action}", "{detail}"];
-
-/// Templates whose text comes from names and messages that a change in
-/// OneDrive can set (a file someone shared with you can be called
-/// anything).
-const FROM_THE_CLOUD: [&str; 3] = ["{path}", "{relpath}", "{detail}"];
 
 /// The templates in `arg`, or why it's wrong (an unknown or unclosed one).
 fn templates_in(arg: &str) -> Result<Vec<&'static str>, String> {
@@ -150,45 +147,6 @@ fn templates_in(arg: &str) -> Result<Vec<&'static str>, String> {
         rest = &tail[t.len()..];
     }
     Ok(found)
-}
-
-/// Programs that read their arguments as commands: `cmd.exe` and batch
-/// files (`a&b.txt` runs `b.txt`), and PowerShell unless it runs a script
-/// file (`-File`), whose arguments then stay plain text. Given a name from
-/// OneDrive, they could run something a change in OneDrive chose; refused
-/// when an argument carries one.
-fn check_interpreter(program: &str, args: &[String]) -> Result<(), String> {
-    let carries = |a: &String| FROM_THE_CLOUD.iter().any(|t| a.contains(t));
-    let Some(first) = args.iter().position(carries) else { return Ok(()) };
-    let file =
-        Path::new(program.trim()).file_name().map(|f| f.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let stem = file.trim_end_matches(".exe");
-    let ext = Path::new(&file).extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-    if stem == "cmd" || ext == "bat" || ext == "cmd" {
-        return Err(
-            "cmd.exe and batch files read their arguments as commands, and a name from OneDrive could run one; \
-             run a program, or powershell.exe -File script.ps1"
-                .into(),
-        );
-    }
-    if stem == "powershell" || stem == "pwsh" {
-        let before = &args[..first];
-        let file_flag = before.iter().position(|a| {
-            let a = a.to_ascii_lowercase();
-            a == "-file" || a == "-f" || a == "/file"
-        });
-        let command = before.iter().any(|a| {
-            let a = a.to_ascii_lowercase();
-            ["-command", "-c", "-encodedcommand", "-e", "-ec", "/command", "/c"].contains(&a.as_str())
-        });
-        if file_flag.is_none() || command {
-            return Err(format!(
-                "{file} reads its arguments as commands unless it runs a script: put -File script.ps1 before {}",
-                FROM_THE_CLOUD.iter().find(|t| args[first].contains(**t)).copied().unwrap_or("{path}")
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// What a hook's templates stand for, for one event.
@@ -285,24 +243,6 @@ mod tests {
         assert!(bad(&|h| h.per_minute = 0).contains("per_minute"));
         assert!(bad(&|h| h.paths = vec!["  ".into()]).contains("path rule"));
         assert!(bad(&|h| h.name = " ".into()).contains("name"));
-    }
-
-    /// A file in OneDrive can be named `a&calc.exe&.txt`: given to cmd.exe,
-    /// that name runs a program. Such hooks are refused; plain programs and
-    /// PowerShell running a script file get names as plain text.
-    #[test]
-    fn programs_that_read_arguments_as_commands_cant_get_names_from_onedrive() {
-        let hook = |program: &str, args: &[&str]| HookSpec::new("h", &[EventKind::Synced], program, args).check();
-        assert!(hook(r"C:\Windows\System32\cmd.exe", &["/c", "echo", "{path}"]).unwrap_err().contains("cmd.exe"));
-        assert!(hook("CMD", &["/c", "{relpath}"]).is_err());
-        assert!(hook(r"C:\Tools\notify.bat", &["{detail}"]).is_err());
-        assert!(hook("powershell.exe", &["-Command", "Write-Host {path}"]).unwrap_err().contains("-File"));
-        assert!(hook("pwsh", &["{path}"]).is_err());
-        assert!(hook("powershell.exe", &["-File", "-Command", "{path}"]).is_err());
-        assert_eq!(hook("powershell.exe", &["-NoProfile", "-File", r"C:\Tools\a.ps1", "{path}"]), Ok(()));
-        // Our own words are safe anywhere.
-        assert_eq!(hook("cmd.exe", &["/c", "echo", "{event}", "{action}"]), Ok(()));
-        assert_eq!(hook(r"C:\Tools\thumb.exe", &["{path}"]), Ok(()));
     }
 
     #[test]
