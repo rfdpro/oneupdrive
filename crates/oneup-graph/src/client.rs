@@ -354,7 +354,14 @@ impl Graph {
         // transfers hold its permits, and near the data budget's limit
         // they may hold them while they wait their turn to read
         // ([`crate::budget`]). The user's own action comes first.
-        let _permit = if budgeted { Some(self.limiter.acquire().await) } else { None };
+        // It still waits out any pause the service asked for (429/503 with
+        // `Retry-After`): never hammer the service, whoever asks.
+        let _permit = if budgeted {
+            Some(self.limiter.acquire().await)
+        } else {
+            self.limiter.unpaused().await;
+            None
+        };
         if budgeted && self.budget.left() == Some(0) {
             return Err(Error::OverBudget);
         }
@@ -1587,6 +1594,21 @@ mod tests {
         g.budget.set(Some(100_000));
         let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
         assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+    }
+
+    /// A file the user opens skips the limit on requests at once, but
+    /// still waits out a pause the service asked for (`Retry-After`).
+    #[tokio::test]
+    async fn a_file_the_user_opens_still_waits_out_the_services_pause() {
+        let g = graph();
+        let _held = g.limiter().acquire().await;
+        let url = serve_body(1000, 1000).await;
+        g.limiter().on_throttle(Duration::from_millis(800));
+        let started = std::time::Instant::now();
+        let opened =
+            tokio::time::timeout(Duration::from_secs(5), g.download_within(&url, &mut Vec::new(), false)).await;
+        assert_eq!(opened.expect("not held up by the permits").unwrap(), 1000);
+        assert!(started.elapsed() >= Duration::from_millis(700), "waited {:?}", started.elapsed());
     }
 
     /// With every request permit held by background transfers, a file the
