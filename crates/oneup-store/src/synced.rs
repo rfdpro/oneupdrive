@@ -240,6 +240,24 @@ const REMOTE_SYNCABLE: &str = "is_excluded = 0";
 
 /// The children lists the reconciler reads ([`Trees`]), each from a parent
 /// index.
+/// A child of `?1` named `?2` as SQLite's `NOCASE` compares (ASCII).
+fn named_sql() -> String {
+    format!(
+        "SELECT {BASE_COLS} FROM synced_item INDEXED BY synced_item_name WHERE parent_sid = ?1 AND name = ?2 COLLATE NOCASE"
+    )
+}
+
+/// A child of `?1` whose name, with letters other than ASCII, folds to `?2`.
+fn folded_sql() -> String {
+    format!("SELECT {BASE_COLS} FROM synced_item INDEXED BY synced_item_fold WHERE parent_sid = ?1 AND fold = ?2")
+}
+
+/// What `synced_item.fold` holds for `name`: its folded form if it has a
+/// letter SQLite's `NOCASE` doesn't fold, else nothing.
+fn folded(name: &str) -> Option<String> {
+    (!name.is_ascii()).then(|| oneup_sync::fold(name))
+}
+
 fn base_children_sql() -> String {
     format!("SELECT {BASE_COLS} FROM synced_item WHERE parent_sid = ?1")
 }
@@ -363,13 +381,13 @@ impl Ops<'_> {
         self.c
             .prepare_cached(
                 "INSERT INTO synced_item (sid, parent_sid, name, kind, size, qxh, local_id, local_mtime,
-                                          remote_id, remote_etag)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                          remote_id, remote_etag, fold)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(sid) DO UPDATE SET
                     parent_sid = excluded.parent_sid, name = excluded.name, kind = excluded.kind,
                     size = excluded.size, qxh = excluded.qxh, local_id = excluded.local_id,
                     local_mtime = excluded.local_mtime, remote_id = excluded.remote_id,
-                    remote_etag = excluded.remote_etag",
+                    remote_etag = excluded.remote_etag, fold = excluded.fold",
             )?
             .execute(params![
                 sid_in(b.sid),
@@ -382,6 +400,7 @@ impl Ops<'_> {
                 b.local_mtime,
                 b.remote.as_ref().map(|r| r.0.as_str()),
                 b.remote_etag,
+                folded(&b.name),
             ])?;
         Ok(())
     }
@@ -613,24 +632,22 @@ impl Trees for Ops<'_> {
         self.synced_children(sid)
     }
 
-    /// Through the index on (folder, name): only the matches are read.
-    /// SQLite's `NOCASE` folds ASCII only, so a name with other letters,
-    /// not found that way, is looked for as the planner folds names, among
-    /// the folder's children in SQLite (still only matches come back).
+    /// Through the indexes on (folder, name): only the matches are read.
+    /// SQLite's `NOCASE` folds ASCII only, so names with other letters are
+    /// also looked for by their folded form (`synced_item.fold`, which only
+    /// they have).
     fn base_named(&self, parent: Sid, name: &str) -> Result<Vec<Base>> {
-        let mut st = self.c.prepare_cached(&format!(
-            "SELECT {BASE_COLS} FROM synced_item INDEXED BY synced_item_name
-             WHERE parent_sid = ?1 AND name = ?2 COLLATE NOCASE"
-        ))?;
-        let rows = st.query_map(rusqlite::params![sid_in(parent), name], base_from_row)?;
-        let mut out = rows.map(|r| fix_base(r?)).collect::<Result<Vec<_>>>()?;
-        if out.is_empty() && !name.is_ascii() {
-            let mut st = self.c.prepare_cached(&format!(
-                "SELECT {BASE_COLS} FROM synced_item
-                 WHERE parent_sid = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3"
-            ))?;
-            let params = rusqlite::params![sid_in(parent), crate::char_count(name), oneup_sync::fold(name)];
-            out = st.query_map(params, base_from_row)?.map(|r| fix_base(r?)).collect::<Result<Vec<_>>>()?;
+        let mut out = Vec::new();
+        let mut st = self.c.prepare_cached(&named_sql())?;
+        for r in st.query_map(rusqlite::params![sid_in(parent), name], base_from_row)? {
+            out.push(fix_base(r?)?);
+        }
+        let mut st = self.c.prepare_cached(&folded_sql())?;
+        for r in st.query_map(rusqlite::params![sid_in(parent), oneup_sync::fold(name)], base_from_row)? {
+            let b = fix_base(r?)?;
+            if !out.iter().any(|x: &Base| x.sid == b.sid) {
+                out.push(b);
+            }
         }
         out.retain(|b| oneup_sync::same_name(&b.name, name));
         Ok(out)
@@ -756,6 +773,51 @@ pub(crate) mod tests {
             remote: Some(RemoteId(remote.into())),
             remote_etag: "e".into(),
         }
+    }
+
+    /// A child is found by name, as Windows compares names, through the
+    /// indexes on (folder, name) and (folder, folded name): with 50,000
+    /// siblings whose names have letters other than ASCII, the lookups'
+    /// plans read neither the folder's other children nor the table, and
+    /// a name written before the upgrade is found as one written after.
+    #[test]
+    fn a_child_is_found_by_its_name_without_reading_its_siblings() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.synced_put(&base(ROOT, None, "", NodeKind::Folder, 1, "root"))?;
+            for i in 0..50_000u64 {
+                let name = format!("Überblick {i}.txt");
+                o.synced_put(&base(10 + i, Some(ROOT), &name, NodeKind::File, u128::from(i) + 100, &format!("r{i}")))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let found = s.read(|o| Trees::base_named(o, ROOT, "üBERBLICK 25000.TXT")).unwrap();
+        assert_eq!(found.iter().map(|b| b.sid).collect::<Vec<_>>(), [25_010]);
+        let ascii = s.read(|o| Trees::base_named(o, ROOT, "")).unwrap();
+        assert_eq!(ascii.iter().map(|b| b.sid).collect::<Vec<_>>(), Vec::<Sid>::new());
+        // The plans: each a search of its own index on folder and name.
+        for (sql, index) in [(named_sql(), "synced_item_name"), (folded_sql(), "synced_item_fold")] {
+            let plan: Vec<String> = s
+                .read(|o| {
+                    let mut st = o.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = st.query_map(rusqlite::params![0, "x"], |r| r.get::<_, String>(3))?;
+                    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                })
+                .unwrap();
+            assert!(
+                plan.iter().all(|p| p.starts_with("SEARCH") && p.contains(index) && p.contains("parent_sid=? AND")),
+                "{plan:?}"
+            );
+        }
+        // Written before the upgrade (no folded form): filled in by it.
+        s.write(|o| Ok(o.c.execute("UPDATE synced_item SET fold = NULL", [])?)).unwrap();
+        assert!(s.read(|o| Trees::base_named(o, ROOT, "überblick 7.txt")).unwrap().is_empty());
+        s.write(|o| {
+            Ok(o.c.execute("UPDATE synced_item SET fold = oneup_fold(name) WHERE name GLOB '*[^ -~]*'", [])?)
+        })
+        .unwrap();
+        assert_eq!(s.read(|o| Trees::base_named(o, ROOT, "überblick 7.txt")).unwrap().len(), 1);
     }
 
     pub(crate) fn lrow(id: u128, parent: Option<u128>, name: &str, kind: LocalKind) -> LocalRow {

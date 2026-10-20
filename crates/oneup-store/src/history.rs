@@ -37,8 +37,13 @@ const CREATED: i64 = 0;
 const CHANGED: i64 = 1;
 const REMOVED: i64 = 2;
 
-/// v23: the history table, its indexes and its triggers, the index on
-/// Synced names and the item marks. It touches only `synced_item`,
+/// v23: the history table, its indexes and its triggers, the indexes on
+/// Synced names and the item marks. A name with letters SQLite's `NOCASE`
+/// doesn't fold (anything but ASCII) also keeps its folded form
+/// (`synced_item.fold`, written with the row by `Ops::synced_put`, filled
+/// here once with the store's own `oneup_fold`, a query, not part of the
+/// schema), indexed by folder, so a lookup by name never reads a folder's
+/// other children. It touches only `synced_item`,
 /// `local_item`, `remote_item` and `meta`, all there since v9, so it runs
 /// on v19 as on any version after it. It doesn't start the history: an
 /// upgrade can come in the middle of a first sync, whose records are of
@@ -69,6 +74,9 @@ CREATE INDEX synced_history_parent ON synced_history(parent_sid, at_ms) WHERE pa
 CREATE INDEX synced_history_at ON synced_history(at_ms);
 CREATE INDEX synced_history_remote ON synced_history(remote_id) WHERE remote_id IS NOT NULL;
 CREATE INDEX synced_item_name ON synced_item(parent_sid, name COLLATE NOCASE);
+ALTER TABLE synced_item ADD COLUMN fold TEXT;
+UPDATE synced_item SET fold = oneup_fold(name) WHERE name GLOB '*[^ -~]*';
+CREATE INDEX synced_item_fold ON synced_item(parent_sid, fold) WHERE fold IS NOT NULL;
 CREATE TABLE synced_unsettled (sid INTEGER PRIMARY KEY);
 {unsettled}
 CREATE TRIGGER synced_history_ins AFTER INSERT ON synced_item WHEN {on}
@@ -159,6 +167,7 @@ fn unsettled_triggers(on: &str) -> String {
 #[cfg(test)]
 pub(crate) const UNDO_V23: &str = "DROP TRIGGER synced_history_ins; DROP TRIGGER synced_history_upd;
     DROP TRIGGER synced_history_del; DROP TABLE synced_history; DROP INDEX synced_item_name;
+    DROP INDEX synced_item_fold; ALTER TABLE synced_item DROP COLUMN fold;
     DROP TRIGGER unsettled_local_ins; DROP TRIGGER unsettled_local_upd; DROP TRIGGER unsettled_local_del;
     DROP TRIGGER unsettled_remote_ins; DROP TRIGGER unsettled_remote_upd; DROP TRIGGER unsettled_remote_del;
     DROP TRIGGER unsettled_synced_upd; DROP TABLE synced_unsettled;";
