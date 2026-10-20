@@ -29,6 +29,8 @@ jobs:
       - name: Test
         env:
           RUST_TEST_THREADS: "1"
+          # The settings window's keyboard test (headless Edge) must run, not skip.
+          ONEUP_REQUIRE_EDGE: "1"
         run: >-
           cargo test --workspace --no-fail-fast --
           --skip data_access_hydrates_and_holds_refuse_fetches
