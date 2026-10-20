@@ -1867,7 +1867,8 @@ impl Engine {
             // File contents the network's profile doesn't let through wait
             // for another network (`crate::network`). Their folders stay
             // marked too, so a round on such a network plans them again.
-            let (planned, for_network) = store.read(|o| hold_for_network(o, &controls.net, planned, on_demand))?;
+            let (planned, for_network, budget_left) =
+                store.read(|o| hold_for_network(o, &controls.net, planned, on_demand))?;
             let mut later: Vec<Op> = waiting.iter().map(|(op, _)| op.clone()).collect();
             later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
             later.extend(for_network.iter().map(|(a, _, _)| a.op().clone()));
@@ -1968,6 +1969,7 @@ impl Engine {
                 order: &order,
                 on_demand,
                 net: &controls.net,
+                budget_left: std::sync::Mutex::new(budget_left),
                 taken: std::sync::Mutex::default(),
                 items: std::sync::atomic::AtomicU64::new(0),
                 bytes: std::sync::atomic::AtomicU64::new(0),
@@ -2427,6 +2429,9 @@ struct Follower<'a> {
     on_demand: bool,
     /// What the network lets through (`crate::network`).
     net: &'a crate::network::Policy,
+    /// What's left of the month's data budget after what the round and
+    /// earlier new folders took (`None`: no budget).
+    budget_left: std::sync::Mutex<Option<u64>>,
     /// What it took in, described, in the order it was taken in.
     taken: std::sync::Mutex<Vec<(Op, Line)>>,
     /// How many operations, and the bytes their transfers add up to.
@@ -2472,7 +2477,11 @@ impl Follower<'_> {
         let (planned, _, _) = self.engine.hold_failed(o, planned.collect())?;
         // What waits for another network stays in the new folders, whose
         // marks bring it to the next round.
-        let (planned, _) = hold_for_network(o, self.net, planned, self.on_demand)?;
+        let mut left = self.budget_left.lock().unwrap_or_else(|p| p.into_inner());
+        let net = crate::network::Policy { budget_left: *left, ..self.net.clone() };
+        let (planned, _, after) = hold_for_network(o, &net, planned, self.on_demand)?;
+        *left = after;
+        drop(left);
         let (approved, lines): (Vec<Approved>, Vec<(Op, Line)>) = planned
             .into_iter()
             .take(room)
@@ -3323,16 +3332,17 @@ pub fn now_ms() -> i64 {
 
 /// What the network's profile holds back (`crate::network::Policy`): the
 /// transfers of file contents it doesn't let through, with which way each
-/// goes and its size; everything else goes, in order.
+/// goes and its size; everything else goes, in order. Also what's left of
+/// the data budget after what goes.
 #[allow(clippy::type_complexity)]
 fn hold_for_network(
     o: &Ops<'_>,
     net: &crate::network::Policy,
     planned: Vec<(Approved, Line)>,
     on_demand: bool,
-) -> oneup_store::Result<(Vec<(Approved, Line)>, Vec<(Approved, Line, (crate::network::Way, u64))>)> {
-    if net.transfer == crate::network::Transfer::Everything && net.budget_left.is_none() {
-        return Ok((planned, Vec::new()));
+) -> oneup_store::Result<(Vec<(Approved, Line)>, Vec<(Approved, Line, (crate::network::Way, u64))>, Option<u64>)> {
+    if net.transfer == crate::network::Transfer::Everything && net.budget_left.is_none() && !net.offline {
+        return Ok((planned, Vec::new(), None));
     }
     // What the round may still transfer of the month's data budget.
     let mut left = net.budget_left;
@@ -3360,7 +3370,7 @@ fn hold_for_network(
             None => go.push((a, l)),
         }
     }
-    Ok((go, held))
+    Ok((go, held, left))
 }
 
 /// Splits `items` into those that go now and those `until` holds back,
@@ -4462,12 +4472,12 @@ mod tests {
             link: Link::New,
         };
         let ops = vec![up(1, 5_000_000), up(2, 50_000_000), down, mkdir];
-        let run_within = |transfer, on_demand, budget_left| {
+        let run_as = |transfer, on_demand, budget_left, offline| {
             let review = review_in(&oneup_gate::Policy::default(), &GateContext::default(), ops.clone());
             let planned: Vec<(Approved, Line)> =
                 review.approved.into_iter().map(|a| (a, Line::new("x", "/p".into(), ""))).collect();
-            let net = Policy { transfer, small_bytes: 10_000_000, budget_left, ..Policy::default() };
-            let (go, held) = s.read(|o| hold_for_network(o, &net, planned, on_demand)).unwrap();
+            let net = Policy { transfer, small_bytes: 10_000_000, budget_left, offline, ..Policy::default() };
+            let (go, held, _) = s.read(|o| hold_for_network(o, &net, planned, on_demand)).unwrap();
             let names = |v: Vec<Op>| -> Vec<String> {
                 v.iter()
                     .map(|op| match op {
@@ -4485,6 +4495,7 @@ mod tests {
                 sizes,
             )
         };
+        let run_within = |transfer, on_demand, budget_left| run_as(transfer, on_demand, budget_left, false);
         let run = |transfer, on_demand| run_within(transfer, on_demand, None);
         let (go, held, _) = run(Transfer::Everything, false);
         assert_eq!((go.len(), held.len()), (4, 0));
@@ -4494,6 +4505,10 @@ mod tests {
         assert_eq!((go, held), (vec!["f1".to_string(), "film.mp4".into(), "d".into()], vec!["f2".to_string()]));
         let (go, held, _) = run_within(Transfer::Everything, false, Some(0));
         assert_eq!((go, held.len()), (vec!["d".to_string()], 3), "used up: no contents at all");
+        // Working offline: no contents either way, whatever the profile
+        // (the gate holds the rest of OneDrive's side).
+        let (go, held, _) = run_as(Transfer::Everything, false, None, true);
+        assert_eq!((go, held.len()), (vec!["d".to_string()], 3));
         let (go, held, sizes) = run(Transfer::Small, false);
         assert_eq!((go, held), (vec!["f1".to_string(), "d".into()], vec!["f2".to_string(), "film.mp4".into()]));
         assert_eq!(sizes, [(Way::Up, 50_000_000), (Way::Down, 20_000_000)]);
