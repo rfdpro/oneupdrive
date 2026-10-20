@@ -376,15 +376,19 @@ fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
         ));
     }
     for d in s.databases.iter().filter(|d| d.why == "live") {
-        let label = crate::databases::format_named(&d.format).map_or("Database", |f| f.label());
+        let detail = if d.format == "outlook" {
+            t_in!(loc, "Outlook writes it for as long as it runs, so it syncs only while Outlook is closed.")
+        } else {
+            t_in!(loc, "A virtual disk is written for as long as it's in use, so it syncs only while it isn't.")
+        };
         out.push(Item::new(
             "live_database",
-            format!("Syncs only while closed: {}", d.path),
-            format!("{}.", crate::databases::detail(d)),
-            format!(
-                "`oneup databases --exclude \"{0}\"` excludes it; `oneup databases --keep-syncing \"{0}\"` keeps it \
-                 syncing without this note ({label}).",
-                d.path
+            t_in!(loc, "Syncs only while closed: {path}", path = d.path.as_str()),
+            detail,
+            t_in!(
+                loc,
+                "`oneup databases --exclude \"{path}\"` excludes it; `oneup databases --keep-syncing \"{path}\"` keeps it syncing without this note.",
+                path = d.path.as_str()
             ),
         ));
     }
