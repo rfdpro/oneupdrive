@@ -707,6 +707,36 @@
             font-weight: 600;
         }
 
+        /* Shared: one row per link, its buttons on one line */
+        #sg-table td.when {
+            white-space: nowrap;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+
+        #sg-table td.wrap {
+            overflow-wrap: anywhere;
+        }
+
+        #sg-table td.item {
+            min-width: 160px;
+        }
+
+        #sg-table td small {
+            display: block;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        #sg-table td.act {
+            white-space: nowrap;
+            text-align: right;
+        }
+
+        #sg-table td.act .btn+.btn {
+            margin-left: 6px;
+        }
+
         .tag {
             display: inline-block;
             font-size: 12px;
@@ -1840,6 +1870,7 @@
         <button data-page="find">Search</button>
         <button data-page="apps">Apps</button>
         <button data-page="lists">Activity</button>
+        <button data-page="shared">Shared</button>
         <hr>
         <button data-page="general">General</button>
         <button data-page="accounts">Accounts</button>
@@ -2063,6 +2094,26 @@
                 </table>
             </div>
             <div class="actions" id="ls-more"></div>
+        </section>
+
+        <!-- Shared: what this account shares and who can open it; what others share with it -->
+        <section class="page" id="shared">
+            <h2>Shared</h2>
+            <div class="ls-bar">
+                <div class="seg" id="sg-tabs" role="group" aria-label="List">
+                    <button type="button" data-tab="by" aria-pressed="true">Shared by you</button>
+                    <button type="button" data-tab="with" aria-pressed="false">Shared with you</button>
+                </div>
+                <button class="btn" id="sg-refresh">Refresh</button>
+            </div>
+            <p class="lead" id="sg-sum"></p>
+            <div class="card" id="sg-card" hidden>
+                <table class="list" id="sg-table">
+                    <thead></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="actions" id="sg-more"></div>
         </section>
 
         <!-- Safety -->
@@ -2398,6 +2449,18 @@
             <div class="df"><span class="muted" id="dp-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="dp-go">Remove</button></div>
         </form>
     </dialog>
+    <dialog id="dlg-sharing" aria-labelledby="sx-title">
+        <form method="dialog">
+            <div class="dh">
+                <h3 id="sx-title"></h3>
+            </div>
+            <div class="db">
+                <ul class="facts" id="sx-facts"></ul>
+                <div class="field" id="sx-date-box"><input type="date" id="sx-date" aria-label="Last day"></div>
+            </div>
+            <div class="df"><span class="muted" id="sx-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="sx-go"></button></div>
+        </form>
+    </dialog>
     <dialog id="dlg-recovery" aria-labelledby="dlg-recovery-t">
         <form method="dialog">
             <div class="dh">
@@ -2731,6 +2794,7 @@
             if (page === "general") loadHooks();
             if (page === "lists") loadList(true);
             if (page === "lists") loadAttention();
+            if (page === "shared") loadSharing();
         }
         $$("nav button").forEach(b => b.onclick = () => show(b.dataset.page));
         document.addEventListener("click", e => {
@@ -3137,6 +3201,210 @@
         $("#sc-undo").onclick = () => scChange("shortcuts_undo", {}, n => tr("Restored {n, plural, one {# shortcut} other {# shortcuts}}", {
             n
         }));
+
+        // ---- shared: what this account shares (the list from OneUpDrive's
+        // listing, who can open each item read from OneDrive when shown),
+        // and what others share with it. Stop sharing and Set expiry run
+        // `oneup shared` for a link as listed (its code).
+        // "Shared by you" comes a bounded page at a time (`next` says where
+        // the following one starts); pages with nothing shared on its own
+        // (a shared folder's contents) are passed over by themselves, up to
+        // SG_SKIP of them, then **Show more** goes on.
+        const SG = {
+            tab: "by",
+            data: null,
+            items: [],
+            next: null,
+            checked: 0,
+            seq: 0
+        };
+        const SG_SKIP = 20;
+        // The most items the page holds: more than that is for
+        // `oneup shared` (which prints page after page, holding one).
+        const SG_MAX = 500;
+        $$("#sg-tabs button").forEach(b => b.onclick = () => {
+            SG.tab = b.dataset.tab;
+            loadSharing();
+        });
+        $("#sg-refresh").onclick = () => loadSharing();
+
+        async function loadSharing(more = false) {
+            $$("#sg-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tab === SG.tab));
+            const my = ++SG.seq;
+            if (!more) {
+                SG.items = [];
+                SG.next = null;
+                SG.checked = 0;
+                $("#sg-card").hidden = true;
+            }
+            $("#sg-more").replaceChildren();
+            $("#sg-sum").textContent = tr("Asking OneDrive…");
+            try {
+                if (SG.tab === "with") {
+                    const r = await call("sharing_with_me", {
+                        room: SG_MAX
+                    });
+                    if (my !== SG.seq) return;
+                    SG.data = r;
+                } else {
+                    for (let n = 0; n < SG_SKIP; n++) {
+                        // Only as many as the page still has room for.
+                        const room = SG_MAX - SG.items.length;
+                        if (room <= 0) break;
+                        const r = await call("sharing_list", more || n ? {
+                            after: SG.next,
+                            room
+                        } : {
+                            room
+                        });
+                        if (my !== SG.seq) return;
+                        SG.items.push(...r.items);
+                        SG.next = r.next;
+                        SG.checked += r.checked;
+                        if (r.items.length || !r.next) break;
+                        $("#sg-sum").textContent = tr("Checking… {n, plural, one {# item} other {# items}} read.", {
+                            n: SG.checked
+                        });
+                    }
+                }
+                renderSharing();
+            } catch (e) {
+                if (my === SG.seq) $("#sg-sum").textContent = e.message;
+            }
+        }
+
+        const day = ms => ms ? new Date(ms).toLocaleDateString(FMT, {
+            dateStyle: "medium"
+        }) : "–";
+
+        function sharingTable(head, rows) {
+            $("#sg-table thead").replaceChildren(el("tr", {}, ...head.map(h => el("th", {
+                textContent: h
+            }))));
+            $("#sg-table tbody").replaceChildren(...rows);
+            $("#sg-card").hidden = !rows.length;
+        }
+
+        function renderSharing() {
+            const r = SG.data;
+            if (SG.tab === "with") {
+                sharingTable([tr("Item"), tr("Shared by"), tr("Shared")], r.items.map(i => el("tr", {},
+                    cell(i.name, i.folder ? tr("Folder") : i.size != null ? size(i.size) : null, "wrap path"),
+                    el("td", {
+                        textContent: i.owner || "–"
+                    }),
+                    el("td", {
+                        className: "when",
+                        textContent: day(i.shared_ms)
+                    }))));
+                $("#sg-sum").textContent = !r.items.length ? tr("Nothing found.") : r.more ? tr("The first {n, number}.", {
+                    n: r.items.length
+                }) : "";
+                return;
+            }
+            const rows = [];
+            let open = 0;
+            const items = [...SG.items].sort((a, b) => a.path.localeCompare(b.path));
+            for (const i of items) {
+                if (i.error) {
+                    rows.push(el("tr", {}, cell(i.path, null, "wrap path"), el("td", {
+                        colSpan: 5,
+                        textContent: i.error
+                    })));
+                    continue;
+                }
+                i.links.forEach((k, at) => {
+                    if (k.anyone && !k.expires_ms) open++;
+                    const acts = el("td", {
+                        className: "act"
+                    }, smallBtn(tr("Stop sharing"), () => sharingAsk("stop", i, k)));
+                    // Graph doesn't document changing an expiry: experimental.
+                    if (snap && snap.experimental) acts.append(smallBtn(tr("Set expiry"), () => sharingAsk("expire", i, k)));
+                    rows.push(el("tr", {},
+                        at ? el("td") : cell(i.path, i.folder ? tr("Folder") : null, "wrap path item"),
+                        cell(tr(k.kind), k.who.length ? k.who.join(", ") : null),
+                        el("td", {
+                            textContent: k.password ? tr("{access}, password", {
+                                access: tr(k.access)
+                            }) : tr(k.access)
+                        }),
+                        el("td", {
+                            className: "when",
+                            textContent: k.expires_ms ? day(k.expires_ms) : tr("Never")
+                        }),
+                        el("td", {
+                            className: "when",
+                            textContent: at ? "" : day(i.shared_ms)
+                        }),
+                        acts));
+                });
+            }
+            sharingTable([tr("Item"), tr("Who"), tr("Access"), tr("Expires"), tr("Shared"), tr("Actions")], rows);
+            const shared = !items.length && !SG.next ? tr("Nothing found.") : SG.next ?
+                tr("{n, plural, one {# item} other {# items}} shared so far.", {
+                    n: items.length
+                }) : tr("{n, plural, one {# item} other {# items}} shared.", {
+                    n: items.length
+                });
+            $("#sg-sum").textContent = open ? tr("{text} {n, plural, one {# link} other {# links}} open to anyone, with no expiry.", {
+                text: shared,
+                n: open
+            }) : shared;
+            if (SG.next && items.length >= SG_MAX) $("#sg-more").append(el("p", {
+                className: "muted",
+                textContent: tr("The first {n, number} are shown. oneup shared lists them all.", {
+                    n: items.length
+                })
+            }));
+            else if (SG.next) $("#sg-more").append(el("button", {
+                className: "btn",
+                textContent: tr("Show more"),
+                onclick: () => loadSharing(true)
+            }));
+        }
+
+        function sharingAsk(what, i, k) {
+            const li = t => el("li", {
+                textContent: t
+            });
+            const stop = what === "stop";
+            $("#sx-title").textContent = stop ? tr("Stop sharing?") : tr("Set expiry");
+            $("#sx-facts").replaceChildren(li(i.path), li(tr(k.kind)), ...(k.who.length ? [li(k.who.join(", "))] : []), li(tr(k.access)));
+            $("#sx-date-box").hidden = stop;
+            const d = $("#sx-date");
+            d.value = "";
+            // Tomorrow on this PC's calendar (an ISO string would be UTC's
+            // date, a day off in the evening west of Greenwich).
+            const t = new Date();
+            t.setDate(t.getDate() + 1);
+            d.min = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+            $("#sx-busy").textContent = "";
+            const go = $("#sx-go");
+            go.textContent = stop ? tr("Stop sharing") : tr("Set");
+            go.disabled = false;
+            go.onclick = async() => {
+                if (!stop && !d.value) return d.focus();
+                go.disabled = true;
+                $("#sx-busy").textContent = tr("Asking OneDrive…");
+                try {
+                    const msg = await call("sharing_change", {
+                        what,
+                        item: i.id,
+                        permission: k.id,
+                        code: k.code,
+                        on: stop ? undefined : d.value
+                    });
+                    $("#dlg-sharing").close();
+                    toast(msg);
+                } catch (e) {
+                    toast(e.message, true);
+                    $("#dlg-sharing").close();
+                }
+                loadSharing();
+            };
+            $("#dlg-sharing").showModal();
+            if (!stop) d.focus();
+        }
 
         // ---- activity: what sync did, and the lists the icon's menu used
         // to show in a console or Notepad. It opens the window on one of

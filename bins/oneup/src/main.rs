@@ -496,6 +496,14 @@ enum Cmd {
         #[arg(long)]
         edit: bool,
     },
+    /// What you share in OneDrive and who can open it (links, people,
+    /// expiry); stop sharing or set an expiry
+    Shared {
+        #[command(subcommand)]
+        cmd: Option<SharedCmd>,
+        #[command(flatten)]
+        list: SharedList,
+    },
     /// Files On-Demand: always keep this file or folder on this PC
     Pin {
         /// A full path, or one inside the synced folder
@@ -1119,6 +1127,61 @@ impl ResolveArgs {
 }
 
 #[derive(Subcommand)]
+enum SharedCmd {
+    /// Stop sharing: remove one link, or one person's or group's access, as
+    /// `oneup shared` lists it
+    Stop(SharedChange),
+    /// Experimental: set the last day a link or access works
+    Expire {
+        #[command(flatten)]
+        change: SharedChange,
+        /// The last day it works (YYYY-MM-DD; it stops at the end of that day)
+        #[arg(long, value_name = "DATE")]
+        on: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct SharedList {
+    /// Print JSON: one page, with where the next starts (`next`, for --after)
+    #[arg(long)]
+    json: bool,
+    /// Start after this item (a page's `next`)
+    #[arg(long, value_name = "NEXT", conflicts_with = "with_me")]
+    after: Option<String>,
+    /// With --json: at most this many items in the page
+    #[arg(long, default_value_t = 50, requires = "json")]
+    limit: usize,
+    /// List what others share with you instead
+    #[arg(long)]
+    with_me: bool,
+    /// List all of OneDrive once to find items shared before OneUpDrive
+    /// kept track of sharing (slow on a large OneDrive)
+    #[arg(long, conflicts_with = "with_me")]
+    scan: bool,
+}
+
+#[derive(clap::Args)]
+struct SharedChange {
+    /// The item as `oneup shared` lists it (its path in OneDrive), or its ID
+    item: String,
+    /// The link's or access's ID, as listed
+    permission: String,
+    /// The code shown without --yes: go ahead only if it's still exactly
+    /// as it was then
+    #[arg(long, value_name = "CODE", value_parser = parse_share_code)]
+    expect: Option<u64>,
+    /// Go ahead (needs --expect; without it, only shows what would be done
+    /// and its code)
+    #[arg(long, requires = "expect")]
+    yes: bool,
+}
+
+fn parse_share_code(s: &str) -> Result<u64, String> {
+    u64::from_str_radix(s.trim(), 16).map_err(|_| "expected the 16-character code `oneup shared` printed".into())
+}
+
+#[derive(Subcommand)]
 enum CloudCmd {
     /// List the items in OneDrive that your rules exclude; with --yes,
     /// remove them once they are on this PC (whatever is not is brought here
@@ -1198,6 +1261,80 @@ fn shortcuts_cmd(dir: &Path, fix: bool, undo: bool, from: Option<&Path>, json: b
         skipped(&o);
     } else {
         println!("Update: oneup shortcuts --fix");
+    }
+    Ok(())
+}
+
+/// `oneup shared`: the sharing audit (`oneup_app::sharing`).
+async fn shared_cmd(dir: &Path, cmd: Option<&SharedCmd>, list: &SharedList) -> Result<()> {
+    use oneup_app::sharing;
+    let graph = sharing::graph(dir)?;
+    let offset = activity::local_offset();
+    let day = |ms: Option<i64>| ms.map_or_else(|| "–".to_string(), |t| activity::when(t, offset));
+    if let Some(SharedCmd::Stop(c) | SharedCmd::Expire { change: c, .. }) = cmd
+        && c.yes
+    {
+        setup::require_test_account(dir)?;
+    }
+    // Whatever the command, changes an earlier one left unsettled are
+    // settled first (`sharing::begin`). Notes go to stderr: stdout may be JSON.
+    let mut store = setup::open_store(dir, 4 * 1024)?;
+    let mode = if cmd.is_some() { sharing::Mode::Change } else { sharing::Mode::Look };
+    let begun = sharing::begin(dir, &mut store, &graph, mode).await?;
+    for line in sharing::settled_text(begun.settled) {
+        eprintln!("{line}");
+    }
+    if let Some(c) = cmd {
+        let (change, at) = match c {
+            SharedCmd::Stop(change) => (change, oneup_gate::sharing::Change::Stop),
+            SharedCmd::Expire { change, on } => {
+                (change, oneup_gate::sharing::Change::Expire(sharing::end_of_day(on, sharing::local_offset_on)?))
+            }
+        };
+        let lock = begun.lock.as_ref().context("the sharing lock wasn't taken")?;
+        let ask = sharing::Ask {
+            item: &change.item,
+            permission: &change.permission,
+            expect: change.expect,
+            change: at,
+            yes: change.yes,
+            experimental: oneup_app::config::load_experimental(dir)?,
+            now_ms: time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
+        };
+        match sharing::change(&mut store, &graph, lock, &ask).await? {
+            sharing::Outcome::Would { what, code } if code.is_empty() => bail!("{what}"),
+            sharing::Outcome::Would { what, code } => println!("{}", sharing::would_text(&what, &code)),
+            sharing::Outcome::Done(msg) => println!("{msg}"),
+        }
+        return Ok(());
+    }
+    if list.with_me {
+        let found = sharing::with_me_json(&graph, sharing::WITH_ME_MAX).await?;
+        if list.json {
+            println!("{found}");
+        } else {
+            for line in sharing::with_me_text(&found, &day) {
+                println!("{line}");
+            }
+        }
+        return Ok(());
+    }
+    if list.scan {
+        let n = sharing::scan(&mut store, &graph).await?;
+        if !list.json {
+            println!("{}", sharing::scanned_text(n));
+        }
+    }
+    if list.json {
+        // One page; `next` says where the following one starts (--after).
+        let p = sharing::list_page(&mut store, &graph, list.after.as_deref(), list.limit.max(1), sharing::PAGE_CHECKS)
+            .await?;
+        println!("{}", sharing::page_json(&p));
+        return Ok(());
+    }
+    // One page, and how to go on (`--after`): one run's cost stays bounded.
+    for line in sharing::listing_text(&mut store, &graph, list.after.as_deref(), &day).await? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1365,6 +1502,7 @@ async fn run() -> Result<()> {
                 | Cmd::Cloud(_)
                 | Cmd::Migrate(_)
                 | Cmd::Vault(_)
+                | Cmd::Shared { .. }
         )
     {
         bail!(
@@ -2025,6 +2163,7 @@ async fn run() -> Result<()> {
         Cmd::Shortcuts { fix, undo, from, json } => {
             shortcuts_cmd(&data_dir(&cli)?, *fix, *undo, from.as_deref(), *json)
         }
+        Cmd::Shared { cmd, list } => shared_cmd(&data_dir(&cli)?, cmd.as_ref(), list).await,
         Cmd::Accounts { add } => match add {
             Some(AccountsCmd::Add { name }) => {
                 let dir = oneup_app::accounts::add(name)?;
