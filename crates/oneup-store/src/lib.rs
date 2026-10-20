@@ -65,6 +65,10 @@ pub enum Error {
     TooNew { found: i64, supported: i64 },
     #[error("corrupt row: {0}")]
     Corrupt(String),
+    /// A write-ahead record ([`Ops::meta_set_ahead`]) outside a durable
+    /// transaction ([`Store::durably`]): a bug, refused before it's written.
+    #[error("write-ahead record outside a durable transaction")]
+    NotDurable,
 }
 
 impl Error {
@@ -493,8 +497,12 @@ impl Store {
             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|s| oneup_sync::fold(&s))),
         )?;
-        // The mirror is rebuildable from the cloud, so NORMAL durability (WAL)
-        // is sufficient here. The future op journal will use FULL.
+        // NORMAL: a commit survives the process dying but not a power cut
+        // or an OS crash, which may roll back the last commits (WAL keeps
+        // them in order, so it's always the newest that go). Enough for the
+        // mirror and everything the next round finds again. Write-ahead
+        // records must outlive their effect, so they commit at FULL
+        // (`Store::durably`).
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -575,6 +583,30 @@ impl Store {
             Err(e) => return Ok(Err(e)),
         };
         Ok(commit(tx).map(|()| out).map_err(Into::into))
+    }
+
+    /// Runs `f` with this connection's commits durable (`synchronous =
+    /// FULL`): each is on disk, the WAL flushed, before it returns, so it
+    /// survives a power cut or an OS crash, and so does every commit before
+    /// it. For transactions that write a record ahead of an effect
+    /// (`data-safety.md` invariant 7): the effect starts only after the
+    /// commit, so the record can't be lost while the effect stays done.
+    /// Everything else commits at NORMAL, which skips the flush.
+    ///
+    /// Back to NORMAL afterwards, whatever `f` returned. Should that fail,
+    /// the connection stays at FULL: slower, never less safe.
+    pub fn durably<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
+        // SQLite refuses this inside a transaction, and none is open here:
+        // every one is begun and ended within a call.
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let out = f(self);
+        let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
+        Ok(out)
+    }
+
+    /// [`Store::write`], committed durably ([`Store::durably`]).
+    pub fn write_durable<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
+        self.durably(|s| s.write(f))?
     }
 
     /// Reads this connection's pages through a memory map of up to `bytes`
@@ -757,6 +789,19 @@ impl Ops<'_> {
             [key, value],
         )?;
         Ok(())
+    }
+
+    /// [`Ops::meta_set`] for a record written ahead of an effect, which
+    /// must be on disk before the effect starts (`data-safety.md`
+    /// invariant 7): refused ([`Error::NotDurable`]) unless the transaction
+    /// commits durably ([`Store::durably`]).
+    pub fn meta_set_ahead(&self, key: &str, value: &str) -> Result<()> {
+        // 2 is FULL, 3 EXTRA.
+        let level: i64 = self.c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        if level < 2 {
+            return Err(Error::NotDurable);
+        }
+        self.meta_set(key, value)
     }
 
     pub fn meta_delete(&self, key: &str) -> Result<()> {
@@ -1389,6 +1434,119 @@ mod tests {
         .unwrap();
         let keys: Vec<String> = s.read(|o| o.meta_under("exec.pending")).unwrap().into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["exec.pending", "exec.pending.a", "exec.pending.b"]);
+    }
+
+    fn synchronous(s: &Store) -> i64 {
+        s.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap()
+    }
+
+    /// A write-ahead record's transaction commits at FULL (2), and the
+    /// connection is back at NORMAL (1) afterwards, also after the
+    /// transaction failed or the busy path handed the closure back.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn durable_writes_commit_at_full_and_go_back_to_normal() {
+        let path = std::env::temp_dir().join(format!("oneup-store-durable-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        assert_eq!(synchronous(&s), 1);
+        s.write_durable(|o| {
+            assert_eq!(o.c.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?, 2);
+            o.meta_set_ahead("exec.pending.1", "evidence 1")
+        })
+        .unwrap();
+        assert_eq!(synchronous(&s), 1);
+        assert_eq!(s.read(|o| o.meta_get("exec.pending.1")).unwrap().as_deref(), Some("evidence 1"));
+
+        let failed = s.write_durable(|o| {
+            o.meta_set_ahead("exec.pending.2", "evidence 2")?;
+            Err::<(), _>(Error::Corrupt("injected".into()))
+        });
+        assert!(matches!(failed, Err(Error::Corrupt(_))));
+        assert_eq!(synchronous(&s), 1, "back to NORMAL after an error");
+        assert_eq!(s.read(|o| o.meta_get("exec.pending.2")).unwrap(), None, "rolled back");
+
+        // The executor's way in: without waiting, the closure handed back.
+        let other = Store::open(&path, 1024).unwrap();
+        other.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let busy = s.durably(|s| s.try_write_now(|o| o.meta_set_ahead("exec.pending.3", "x"))).unwrap();
+        assert!(matches!(busy, Err((_, ref e)) if e.is_busy()));
+        assert_eq!(synchronous(&s), 1, "back to NORMAL after a busy try");
+        other.conn.execute_batch("ROLLBACK").unwrap();
+        s.durably(|s| s.try_write_now(|o| o.meta_set_ahead("exec.pending.3", "x")))
+            .unwrap()
+            .map_err(|(_, e)| e)
+            .unwrap()
+            .unwrap();
+        assert_eq!(synchronous(&s), 1);
+        drop((s, other));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// A write-ahead record outside a durable transaction is a bug: refused,
+    /// and nothing of the transaction is kept.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_write_ahead_record_outside_a_durable_transaction_is_refused() {
+        let mut s = Store::open_in_memory().unwrap();
+        let r = s.write(|o| {
+            o.meta_set("other", "1")?;
+            o.meta_set_ahead("exec.pending.1", "evidence 1")
+        });
+        assert!(matches!(r, Err(Error::NotDurable)), "{r:?}");
+        assert_eq!(s.read(|o| o.meta_under("exec.pending")).unwrap(), vec![]);
+        assert_eq!(s.read(|o| o.meta_get("other")).unwrap(), None);
+    }
+
+    /// What a durable write-ahead record costs: `n` operations' records,
+    /// each written (at NORMAL, or durably at FULL) and then cleared at
+    /// NORMAL as the final record does, on a file in the temp folder. A
+    /// measurement, not a check: `cargo test -p oneup-store --release --lib
+    /// -- --ignored --nocapture durable_commit_cost`.
+    #[test]
+    #[ignore = "measurement"]
+    #[allow(clippy::unwrap_used)]
+    fn durable_commit_cost() {
+        let n: u32 = 1_000;
+        let path = std::env::temp_dir().join(format!("oneup-store-cost-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        let mut run = |durable: bool| {
+            let started = std::time::Instant::now();
+            for i in 0..n {
+                // A new key each time, as a record is: rewriting an unchanged
+                // row writes no page, so would commit without a flush.
+                let key = format!("exec.pending.{i:x}");
+                let value = format!("evidence {i:x}");
+                if durable {
+                    s.write_durable(|o| o.meta_set_ahead(&key, &value)).unwrap();
+                } else {
+                    s.write(|o| o.meta_set(&key, &value)).unwrap();
+                }
+                s.write(|o| o.meta_delete(&key)).unwrap();
+            }
+            started.elapsed()
+        };
+        run(false);
+        let (mut normal, mut full) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        // Alternated, so neither has a quieter disk to itself.
+        for _ in 0..3 {
+            normal += run(false);
+            full += run(true);
+        }
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / f64::from(3 * n);
+        println!(
+            "record + clear, per operation: NORMAL {:.0} us, FULL {:.0} us ({} operations each)",
+            per(normal),
+            per(full),
+            3 * n
+        );
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 
     #[test]
