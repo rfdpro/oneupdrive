@@ -730,10 +730,12 @@ impl Graph {
     /// Brings deleted item `id` back from the OneDrive recycle bin into
     /// folder `parent` as `name` (`POST /items/{id}/restore`, documented for
     /// OneDrive Personal only). 404: it's no longer in the recycle bin; 409:
-    /// the name is taken.
+    /// the name is taken. The one remote change without `If-Match` (an item
+    /// in the recycle bin has no eTag Graph takes): it only adds, and never
+    /// asks for anything to be replaced (`data-safety.md` invariant 2).
     pub async fn restore_deleted(&self, id: &str, parent: &str, name: &str) -> Result<DriveItem> {
         let url = format!("{}/items/{}/restore", self.drive_url(), encode_id(id));
-        let body = serde_json::json!({ "parentReference": { "id": parent }, "name": name });
+        let body = restore_body(parent, name);
         let req = Req { json: Some(&body), ..Req::new(reqwest::Method::POST, &url) };
         self.json(&req).await
     }
@@ -786,6 +788,13 @@ impl Graph {
         let (_, body) = self.send(req).await?;
         Ok(serde_json::from_slice(&body)?)
     }
+}
+
+/// The body of a restore ([`Graph::restore_deleted`]): where to, and
+/// nothing about a name that's taken, so OneDrive refuses one (409) rather
+/// than replace or rename anything.
+fn restore_body(parent: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({ "parentReference": { "id": parent }, "name": name })
 }
 
 impl Graph {
@@ -2073,6 +2082,16 @@ mod tests {
         let f = fragment(url).await.unwrap();
         assert!(f.item.is_none());
         assert_eq!(count.load(Relaxed), 2, "the throttled send was waited out and sent again");
+    }
+
+    /// A restore asks for nothing to be replaced: its body names the folder
+    /// and the name only (no conflict behaviour), so a taken name is
+    /// refused.
+    #[test]
+    fn a_restore_never_asks_to_replace() {
+        let body = restore_body("P", "a.txt");
+        assert_eq!(body, serde_json::json!({ "parentReference": { "id": "P" }, "name": "a.txt" }));
+        assert!(!body.to_string().contains("conflictBehavior"));
     }
 
     #[tokio::test]
