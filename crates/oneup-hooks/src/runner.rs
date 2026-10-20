@@ -594,8 +594,7 @@ fn worker(shared: &Shared) {
         let refused = checked.err();
         {
             let mut st = shared.lock();
-            let State { hooks, pending, running, .. } = &mut *st;
-            *running -= 1;
+            let State { hooks, pending, .. } = &mut *st;
             if let Some(slot) = hooks.iter_mut().find(|s| s.spec.name == name) {
                 slot.running = false;
                 if let Some(why) = &refused {
@@ -610,6 +609,10 @@ fn worker(shared: &Shared) {
             Some(why) => (shared.notes)(Note::Refused { hook: name, why }),
             None => (shared.notes)(Note::Ran(Ran { hook: name, event: job.event, merged: job.merged, took, result })),
         }
+        // Counted as under way until its note is out, so `wait_idle` means
+        // every run has also been reported.
+        shared.lock().running -= 1;
+        shared.wake.notify_all();
     }
 }
 
@@ -623,12 +626,18 @@ mod tests {
     struct Fake {
         started: Mutex<Vec<(PathBuf, Vec<OsString>, Instant)>>,
         delay: Duration,
+        /// Runs under way now, and the most at once.
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
     }
 
     impl Launch for Fake {
         fn launch(&self, req: &LaunchRequest<'_>) -> std::io::Result<Finished> {
             self.started.lock().unwrap().push((req.program.to_path_buf(), req.args.to_vec(), Instant::now()));
+            let n = self.now.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            self.most.fetch_max(n, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(self.delay);
+            self.now.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Finished { exit_code: Some(0), timed_out: false, output: Vec::new(), truncated: false })
         }
     }
@@ -657,7 +666,12 @@ mod tests {
     }
 
     fn fake(delay: Duration) -> Arc<Fake> {
-        Arc::new(Fake { started: Mutex::new(Vec::new()), delay })
+        Arc::new(Fake {
+            started: Mutex::new(Vec::new()),
+            delay,
+            now: std::sync::atomic::AtomicUsize::new(0),
+            most: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
     fn cmd() -> String {
@@ -883,15 +897,14 @@ mod tests {
 
     #[test]
     fn hooks_run_one_at_a_time_each_and_in_turn() {
-        let f = fake(Duration::from_millis(30));
+        let f = fake(Duration::from_millis(100));
         let (r, _) = runner(vec![hook("a", 0, 6000), hook("b", 0, 6000)], Arc::clone(&f));
         let events: Vec<Event> = (0..10).map(|i| synced(&format!("/{i}.txt"))).collect();
-        let t = Instant::now();
         r.offer(&events);
-        assert!(r.wait_idle(Duration::from_secs(10)));
+        assert!(r.wait_idle(Duration::from_secs(30)));
         assert_eq!(f.started.lock().unwrap().len(), 20);
-        // Two at once (one per hook): about 10 runs' time, not 20.
-        assert!(t.elapsed() < Duration::from_millis(550), "{:?}", t.elapsed());
+        // Two at once (one per hook, both workers busy), never more.
+        assert_eq!(f.most.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// A `.bat` hook runs (wrapped in `cmd /c`) and gets a cloud-set event
@@ -910,7 +923,9 @@ mod tests {
         std::fs::write(
             &bat,
             format!(
-                "@echo off\r\nset ONEUPHOOK_RELPATH> \"{out}\"\r\necho cmdline=%CMDCMDLINE%>> \"{out}\"\r\n",
+                "@echo off\r\nset ONEUPHOOK_RELPATH> \"{out}\"\r\necho cmdline=%CMDCMDLINE%>> \"{out}\"\r\n\
+                 setlocal EnableDelayedExpansion\r\necho quoted=\"%ONEUPHOOK_RELPATH%\">> \"{out}\"\r\n\
+                 echo delayed=\"!ONEUPHOOK_RELPATH!\">> \"{out}\"\r\n",
                 out = out.display()
             ),
         )
@@ -939,6 +954,10 @@ mod tests {
         let cmdline = text.lines().find(|l| l.starts_with("cmdline=")).unwrap_or("");
         assert!(!cmdline.contains("calc.exe"), "the event value must not be on the command line: {cmdline}");
         assert!(cmdline.to_lowercase().contains("a,b hook.bat"), "{cmdline}");
+        // The forms the user guide recommends keep the value whole (an
+        // injected `&` would cut the line short and run `calc.exe`).
+        assert!(text.contains("quoted=\"a&calc.exe&.txt\""), "{text}");
+        assert!(text.contains("delayed=\"a&calc.exe&.txt\""), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
