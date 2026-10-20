@@ -950,15 +950,16 @@ impl History for World {
         Ok((sids.len() <= limit).then(|| sids.into_iter().collect()))
     }
 
-    /// As the planner's marks have them: the folders of records whose item
-    /// differs from the record on either side (and such folders themselves).
-    fn unsettled(&self) -> Result<Vec<Sid>, Infallible> {
-        Ok(self.unsettled_folders())
+    /// As the store finds them: records whose item differs from the record
+    /// on either side.
+    fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>, Infallible> {
+        let v = self.unsettled_items();
+        Ok((v.len() <= limit).then_some(v))
     }
 }
 
 impl World {
-    fn unsettled_folders(&self) -> Vec<Sid> {
+    fn unsettled_items(&self) -> Vec<Sid> {
         let mut out = BTreeSet::new();
         for b in self.bases.values() {
             let parent_local = b.parent.and_then(|p| self.bases.get(&p)).and_then(|p| p.local);
@@ -975,10 +976,7 @@ impl World {
                 _ => false,
             };
             if !(local_ok && remote_ok) {
-                out.insert(b.parent.unwrap_or(ROOT));
-                if b.kind == NodeKind::Folder {
-                    out.insert(b.sid);
-                }
+                out.insert(b.sid);
             }
         }
         out.into_iter().collect()
@@ -1642,7 +1640,7 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
         if check_store() {
             let mut s = store_of(&snap);
             s.write(|o| o.history_replace(&snap.history)).expect("writing the history");
-            let marks = snap.unsettled_folders();
+            let marks = snap.unsettled_items();
             let from_store = s
                 .read(|o| {
                     oneup_sync::rewind::plan(o, &OwnClock(o, &marks), folder, at, 1 << 20)
@@ -1735,8 +1733,8 @@ impl History for OwnClock<'_, '_> {
         self.0.changed_after(at, limit)
     }
 
-    fn unsettled(&self) -> Result<Vec<Sid>, oneup_store::Error> {
-        Ok(self.1.to_vec())
+    fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>, oneup_store::Error> {
+        Ok((self.1.len() <= limit).then(|| self.1.to_vec()))
     }
 }
 

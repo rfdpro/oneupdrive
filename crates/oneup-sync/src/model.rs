@@ -120,6 +120,12 @@ pub trait Trees {
     fn base(&self, sid: Sid) -> Result<Option<Base>, Self::Error>;
     /// Synced rows whose agreed parent is `sid`.
     fn base_children(&self, sid: Sid) -> Result<Vec<Base>, Self::Error>;
+    /// Synced rows whose agreed parent is `parent` and whose name is `name`
+    /// as Windows compares names ([`same_name`]). The default reads every
+    /// child; a backend with an index on names reads only the matches.
+    fn base_named(&self, parent: Sid, name: &str) -> Result<Vec<Base>, Self::Error> {
+        Ok(self.base_children(parent)?.into_iter().filter(|b| same_name(&b.name, name)).collect())
+    }
     fn base_by_local(&self, id: LocalId) -> Result<Option<Base>, Self::Error>;
     fn base_by_remote(&self, id: &RemoteId) -> Result<Option<Base>, Self::Error>;
 

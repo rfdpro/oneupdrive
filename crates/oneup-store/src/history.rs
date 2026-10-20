@@ -44,6 +44,7 @@ const REMOVED: i64 = 2;
 /// folder's would fill the history at once.
 pub(crate) fn migrate_v22() -> String {
     let on = format!("EXISTS (SELECT 1 FROM meta WHERE key = '{ON}')");
+    let unsettled = unsettled_triggers(&on);
     format!(
         "
 CREATE TABLE synced_history (
@@ -62,6 +63,9 @@ CREATE INDEX synced_history_sid ON synced_history(sid, seq);
 CREATE INDEX synced_history_parent ON synced_history(parent_sid, at_ms) WHERE parent_sid IS NOT NULL;
 CREATE INDEX synced_history_at ON synced_history(at_ms);
 CREATE INDEX synced_history_remote ON synced_history(remote_id) WHERE remote_id IS NOT NULL;
+CREATE INDEX synced_item_name ON synced_item(parent_sid, name COLLATE NOCASE);
+CREATE TABLE synced_unsettled (sid INTEGER PRIMARY KEY);
+{unsettled}
 CREATE TRIGGER synced_history_ins AFTER INSERT ON synced_item WHEN {on}
 BEGIN
     INSERT INTO synced_history(at_ms, sid, change) VALUES ({NOW_MS}, NEW.sid, {CREATED});
@@ -84,10 +88,77 @@ INSERT OR REPLACE INTO meta(key, value) SELECT '{ON}', '1' WHERE EXISTS (SELECT 
     )
 }
 
+/// Whether record `s` (parent `p`) differs from its items `l` and `r`:
+/// gone or unlinked, another folder or name, a file's size or last-write
+/// time (here) or eTag (in OneDrive). More rather than fewer: one that
+/// doesn't differ is only read for nothing.
+const DIFFERS: &str = "(
+        l.file_id IS NULL OR l.skip != 0 OR l.name_lossy != 0
+        OR l.parent_id IS NOT p.local_id OR l.name IS NOT s.name
+        OR (s.kind = 0 AND (l.size IS NOT s.size OR l.mtime IS NOT s.local_mtime))
+        OR r.id IS NULL OR r.parent_id IS NOT p.remote_id OR r.name IS NOT s.name
+        OR (s.kind = 0 AND r.etag IS NOT s.remote_etag))";
+
+/// The marked records and their items, by mark.
+const MARKED: &str = "FROM synced_unsettled u
+    JOIN synced_item s ON s.sid = u.sid
+    LEFT JOIN synced_item p ON p.sid = s.parent_sid
+    LEFT JOIN local_item l ON l.file_id = s.local_id
+    LEFT JOIN remote_item r ON r.id = s.remote_id";
+
+/// Item marks for what may differ from its record (`synced_unsettled`):
+/// a local or cloud item a record links that appears, changes or goes,
+/// and a record whose links or stamps change. Each is one probe of the
+/// unique index on the link. What a rewind reads for changes not synced
+/// yet ([`Ops::history_unsettled`]); a mark goes once its item agrees with
+/// its record again ([`Ops::history_settle_marks`]), and any later change
+/// marks it again. Kept only while the history is (`on`).
+fn unsettled_triggers(on: &str) -> String {
+    let local_changed = "OLD.parent_id IS NOT NEW.parent_id OR OLD.name IS NOT NEW.name
+        OR OLD.name_lossy IS NOT NEW.name_lossy OR OLD.kind IS NOT NEW.kind OR OLD.size IS NOT NEW.size
+        OR OLD.mtime IS NOT NEW.mtime OR OLD.skip IS NOT NEW.skip";
+    let remote_changed = "OLD.parent_id IS NOT NEW.parent_id OR OLD.name IS NOT NEW.name OR OLD.kind IS NOT NEW.kind
+        OR OLD.size IS NOT NEW.size OR OLD.etag IS NOT NEW.etag OR OLD.qxh IS NOT NEW.qxh";
+    let synced_changed = "OLD.local_id IS NOT NEW.local_id OR OLD.remote_id IS NOT NEW.remote_id
+        OR OLD.local_mtime IS NOT NEW.local_mtime OR OLD.remote_etag IS NOT NEW.remote_etag";
+    // Not `OR IGNORE`: an outer upsert's conflict handling would override
+    // it (see `dirty::mark`).
+    let mark = |by: &str| {
+        format!(
+            "INSERT INTO synced_unsettled(sid) SELECT s.sid FROM synced_item s WHERE s.{by}
+             AND NOT EXISTS (SELECT 1 FROM synced_unsettled u WHERE u.sid = s.sid);"
+        )
+    };
+    let t = |name: &str, event: &str, table: &str, when: &str, body: String| {
+        format!("CREATE TRIGGER {name} AFTER {event} ON {table} WHEN ({when}) AND {on}\nBEGIN\n    {body}\nEND;\n")
+    };
+    [
+        t("unsettled_local_ins", "INSERT", "local_item", "1", mark("local_id = NEW.file_id")),
+        t("unsettled_local_upd", "UPDATE", "local_item", local_changed, mark("local_id = NEW.file_id")),
+        t("unsettled_local_del", "DELETE", "local_item", "1", mark("local_id = OLD.file_id")),
+        t("unsettled_remote_ins", "INSERT", "remote_item", "1", mark("remote_id = NEW.id")),
+        t("unsettled_remote_upd", "UPDATE", "remote_item", remote_changed, mark("remote_id = NEW.id")),
+        t("unsettled_remote_del", "DELETE", "remote_item", "1", mark("remote_id = OLD.id")),
+        t(
+            "unsettled_synced_upd",
+            "UPDATE",
+            "synced_item",
+            synced_changed,
+            "INSERT INTO synced_unsettled(sid) SELECT NEW.sid
+             WHERE NOT EXISTS (SELECT 1 FROM synced_unsettled WHERE sid = NEW.sid);"
+                .into(),
+        ),
+    ]
+    .concat()
+}
+
 /// Undoes [`migrate_v22`], for tests that make an older store.
 #[cfg(test)]
 pub(crate) const UNDO_V22: &str = "DROP TRIGGER synced_history_ins; DROP TRIGGER synced_history_upd;
-    DROP TRIGGER synced_history_del; DROP TABLE synced_history;";
+    DROP TRIGGER synced_history_del; DROP TABLE synced_history; DROP INDEX synced_item_name;
+    DROP TRIGGER unsettled_local_ins; DROP TRIGGER unsettled_local_upd; DROP TRIGGER unsettled_local_del;
+    DROP TRIGGER unsettled_remote_ins; DROP TRIGGER unsettled_remote_upd; DROP TRIGGER unsettled_remote_del;
+    DROP TRIGGER unsettled_synced_upd; DROP TABLE synced_unsettled;";
 
 /// An item whose record went, with its OneDrive ID: deleted (or set aside)
 /// at `at_ms`, as it was until then.
@@ -190,6 +261,34 @@ impl Ops<'_> {
         let rows = st.query_map(rusqlite::params![at, over], |r| r.get::<_, i64>(0))?;
         let out = rows.map(|r| Ok(sid_out(r?))).collect::<Result<Vec<_>>>()?;
         Ok((out.len() <= limit).then_some(out))
+    }
+
+    /// See [`History::unsettled`]: the marked records whose item differs
+    /// from them now, read by mark (item-level, through the marks' key and
+    /// the links' unique indexes), however large their folders.
+    pub fn history_unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>> {
+        let over = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut st = self.c.prepare_cached(&format!("SELECT s.sid {MARKED} WHERE {DIFFERS} LIMIT ?1"))?;
+        let out = st.query_map([over], |r| r.get::<_, i64>(0))?.map(|r| Ok(sid_out(r?))).collect::<Result<Vec<_>>>()?;
+        Ok((out.len() <= limit).then_some(out))
+    }
+
+    /// Drops at most `budget` marks of records whose items agree with them
+    /// again, or that went (the history has those): each round, so the
+    /// marks stay as few as what waits to sync. A change after this marks
+    /// the record again.
+    pub fn history_settle_marks(&self, budget: usize) -> Result<usize> {
+        let budget = i64::try_from(budget).unwrap_or(i64::MAX);
+        Ok(self
+            .c
+            .prepare_cached(&format!(
+                "DELETE FROM synced_unsettled WHERE sid IN (
+                SELECT u.sid FROM synced_unsettled u WHERE NOT EXISTS (SELECT 1 FROM synced_item WHERE sid = u.sid)
+                UNION ALL
+                SELECT u.sid {MARKED} WHERE NOT {DIFFERS}
+                LIMIT ?1)"
+            ))?
+            .execute([budget])?)
     }
 
     /// See [`History::children_after`].
@@ -342,6 +441,7 @@ impl Ops<'_> {
             return Ok(());
         }
         self.c.execute("DELETE FROM synced_history", [])?;
+        self.c.execute("DELETE FROM synced_unsettled", [])?;
         self.meta_delete(ON)?;
         self.meta_delete(SINCE)
     }
@@ -367,8 +467,8 @@ impl History for Ops<'_> {
         self.history_changed_after(at, limit)
     }
 
-    fn unsettled(&self) -> Result<Vec<Sid>> {
-        Ok(self.dirty_scope()?.folders)
+    fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>> {
+        self.history_unsettled(limit)
     }
 
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>> {

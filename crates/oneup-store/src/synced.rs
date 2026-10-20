@@ -613,6 +613,29 @@ impl Trees for Ops<'_> {
         self.synced_children(sid)
     }
 
+    /// Through the index on (folder, name): only the matches are read.
+    /// SQLite's `NOCASE` folds ASCII only, so a name with other letters,
+    /// not found that way, is looked for as the planner folds names, among
+    /// the folder's children in SQLite (still only matches come back).
+    fn base_named(&self, parent: Sid, name: &str) -> Result<Vec<Base>> {
+        let mut st = self.c.prepare_cached(&format!(
+            "SELECT {BASE_COLS} FROM synced_item INDEXED BY synced_item_name
+             WHERE parent_sid = ?1 AND name = ?2 COLLATE NOCASE"
+        ))?;
+        let rows = st.query_map(rusqlite::params![sid_in(parent), name], base_from_row)?;
+        let mut out = rows.map(|r| fix_base(r?)).collect::<Result<Vec<_>>>()?;
+        if out.is_empty() && !name.is_ascii() {
+            let mut st = self.c.prepare_cached(&format!(
+                "SELECT {BASE_COLS} FROM synced_item
+                 WHERE parent_sid = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3"
+            ))?;
+            let params = rusqlite::params![sid_in(parent), crate::char_count(name), oneup_sync::fold(name)];
+            out = st.query_map(params, base_from_row)?.map(|r| fix_base(r?)).collect::<Result<Vec<_>>>()?;
+        }
+        out.retain(|b| oneup_sync::same_name(&b.name, name));
+        Ok(out)
+    }
+
     fn base_by_local(&self, id: LocalId) -> Result<Option<Base>> {
         self.synced_by_local(id.0)
     }
@@ -867,11 +890,10 @@ pub(crate) mod tests {
                 o.c.execute_batch(crate::dupes::UNDO_V20)?;
                 o.c.execute_batch(crate::choose::UNDO_V19)?;
                 o.c.execute_batch(crate::search::UNDO_V18)?;
+                o.c.execute_batch(crate::history::UNDO_V22)?;
                 o.c.execute_batch(
                     "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
                      DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;
-                     DROP TRIGGER synced_history_ins; DROP TRIGGER synced_history_upd;
-                     DROP TRIGGER synced_history_del; DROP TABLE synced_history;
                      INSERT INTO remote_gone(id) VALUES ('f'), ('gone');
                      INSERT INTO synced_item(sid, parent_sid, name, kind, remote_id) VALUES (9, 0, 'gone', 0, 'gone');
                      PRAGMA user_version = 15;",

@@ -401,6 +401,8 @@ const SMALL_TABLES: &[&str] = &[
     "local_root",
     "remote_orphan",
     "dirty",
+    // Records whose items wait to sync: as few as what waits.
+    "synced_unsettled",
     "t_sub",
     "search_queue",
     "remote_name_config",
