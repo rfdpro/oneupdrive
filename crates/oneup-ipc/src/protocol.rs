@@ -391,6 +391,38 @@ pub struct Status {
     pub unsynced: Option<Unsynced>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrying: Option<Retrying>,
+    /// Database files held back, or warned about
+    /// (`docs/architecture/databases.md`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<DatabaseNote>,
+}
+
+/// A database file the agent holds back until it's in a state to sync, or
+/// one that shouldn't sync while in use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseNote {
+    /// Relative to the synced folder (`/Mail/archive.pst`).
+    pub path: String,
+    /// `sqlite`, `keepass`, `access`, `thunderbird`, `outlook`,
+    /// `virtual-disk` or `other` (a `[databases]` pattern).
+    pub format: String,
+    /// Why it waits: `wal` (SQLite changes not yet in the file), `journal`
+    /// (a SQLite transaction under way), `open` (open in another program),
+    /// `behind` (a SQLite working file from OneDrive whose database here
+    /// isn't OneDrive's version yet).
+    /// `live`: a format that shouldn't sync while in use (Outlook data
+    /// files, virtual disks), whether it waits or not.
+    pub why: String,
+    /// The programs that have it open, as Windows names them
+    /// (`KeePass.exe`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<String>,
+    /// What waits: `up` (sending it), `down` (OneDrive's newer version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// All of it in a sentence, as the activity log says it.
+    #[serde(default)]
+    pub detail: String,
 }
 
 /// Items whose operations failed and wait before they're tried again (a

@@ -24,6 +24,7 @@ mod activity;
 mod agent;
 mod cloud_check;
 mod cloud_prune;
+mod databases_cmd;
 mod dev_remote;
 mod duplicates_cmd;
 mod find;
@@ -349,6 +350,37 @@ enum Cmd {
         /// Remove a priority rule
         #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
         remove: Vec<String>,
+    },
+    /// Show or change how database files sync: sent only in a consistent
+    /// state, replaced only while closed (config.toml [databases])
+    Databases {
+        /// Databases other than SQLite wait for their programs to close them
+        /// (on, the default); SQLite databases always wait until consistent
+        #[arg(long, value_enum)]
+        wait: Option<Toggle>,
+        /// Turn a database preset on (finance, firebird, filemaker, dbase, lotus-notes)
+        #[arg(long, value_name = "PRESET")]
+        on: Vec<String>,
+        /// Turn a database preset off
+        #[arg(long, value_name = "PRESET")]
+        off: Vec<String>,
+        /// Treat files this pattern matches as databases, gitignore style (e.g. "*.ledger"; "!x" for one that isn't)
+        #[arg(long, value_name = "PATTERN", allow_hyphen_values = true)]
+        add: Vec<String>,
+        /// Remove one of your patterns
+        #[arg(long, value_name = "PATTERN", allow_hyphen_values = true)]
+        remove: Vec<String>,
+        /// Exclude this file (an Outlook data file, a virtual disk) from sync
+        #[arg(long, value_name = "PATH")]
+        exclude: Vec<String>,
+        /// Keep this Outlook data file or virtual disk syncing, without the warning
+        #[arg(long, value_name = "PATH")]
+        keep_syncing: Vec<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
     },
     /// Why a file or folder does or doesn't sync
     Explain {
@@ -2198,6 +2230,19 @@ async fn run() -> Result<()> {
             }),
         ),
         Cmd::Priority { first, last, remove } => rules::priority(&data_dir(&cli)?, first, last, remove).await,
+        Cmd::Databases { wait, on, off, add, remove, exclude, keep_syncing, json, profile } => {
+            let changes = databases_cmd::Changes {
+                wait: wait.map(Toggle::on),
+                on: on.clone(),
+                off: off.clone(),
+                add: add.clone(),
+                remove: remove.clone(),
+                exclude: exclude.clone(),
+                keep_syncing: keep_syncing.clone(),
+            };
+            let store = open_store(&cli, profile.memory_profile)?;
+            databases_cmd::run(&data_dir(&cli)?, &store, &changes, *json).await
+        }
         Cmd::Explain { path, profile } => {
             rules::explain(&data_dir(&cli)?, open_store(&cli, profile.memory_profile)?, path).await
         }

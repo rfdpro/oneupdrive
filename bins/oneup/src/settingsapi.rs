@@ -144,6 +144,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "office_opener": { "registered": crate::officeopen::is_registered(), "defaults": crate::officeopen::defaults() },
         "priority": { "first": first, "last": last },
         "search": { "onedrive": search.onedrive, "hotkey": search.hotkey },
+        "databases": databases_json(dir)?,
         "kept_folder": local.as_deref().map(|l| shown(&Path::new(l).join(oneup_rules::ENGINE_DIR).join("versions").to_string_lossy())),
     }))
 }
@@ -533,6 +534,60 @@ pub fn search_with(mut s: config::Search, v: &Value) -> Result<config::Search> {
     Ok(s)
 }
 
+/// The `[databases]` settings, with every database preset (on or not),
+/// for **Files → Exclude → Databases**. What waits comes from the agent's
+/// status (`databases`).
+pub fn databases_json(dir: &Path) -> Result<Value> {
+    let d = config::load_databases(dir)?;
+    let presets: Vec<Value> = oneup_rules::database::DATABASE_PRESETS
+        .iter()
+        .map(|p| {
+            json!({ "name": p.name, "summary": p.summary, "lines": p.lines, "on": d.presets.iter().any(|x| x == p.name) })
+        })
+        .collect();
+    Ok(json!({ "wait": d.wait, "presets": presets, "patterns": d.patterns, "keep_syncing": d.keep_syncing }))
+}
+
+/// The `[databases]` section changed by the fields present in `v`:
+/// `wait`, `presets` (the names on), `patterns`, and `keep_syncing` (a
+/// path, `/Mail/archive.pst`, added to the list).
+pub fn databases_with(mut d: config::DatabaseSettings, v: &Value) -> Result<config::DatabaseSettings> {
+    if let Some(w) = get(v, "wait") {
+        d.wait = w.as_bool().context("wait: on or off")?;
+    }
+    let list = |k: &str| -> Result<Option<Vec<String>>> {
+        get(v, k)
+            .map(|x| {
+                let all = x.as_array().with_context(|| format!("{k}: expected a list"))?;
+                Ok(all
+                    .iter()
+                    .filter_map(|l| l.as_str())
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect())
+            })
+            .transpose()
+    };
+    if let Some(p) = list("presets")? {
+        d.presets = p;
+    }
+    if let Some(p) = list("patterns")? {
+        for l in &p {
+            config::check_rule(l)?;
+        }
+        d.patterns = p;
+    }
+    if let Some(k) = get(v, "keep_syncing") {
+        let k = k.as_str().context("keep_syncing: a path")?;
+        let k = crate::databases::rel_path(k);
+        if !crate::databases::kept_syncing(&d.keep_syncing, &k) {
+            d.keep_syncing.push(k);
+        }
+    }
+    d.databases()?;
+    Ok(d)
+}
+
 /// The version-store changes in `v`.
 pub fn versions_changes(v: &Value) -> Result<crate::versions::Changes> {
     let flag = |k: &str| get(v, k).map(|x| x.as_bool().with_context(|| format!("{k}: expected on or off"))).transpose();
@@ -885,6 +940,22 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
             }
             config::save_onedrive_app(dir, &a)
         }
+        "databases" => {
+            let d = databases_with(config::load_databases(dir)?, v)?;
+            config::save_databases(dir, &d)?;
+            // Excluding one of the files warned about: a rule for that file.
+            if let Some(p) = get(v, "exclude").and_then(Value::as_str) {
+                let store = crate::setup::open_store(dir, 1024)?;
+                let mut r = config::load_rules(dir, &store)?;
+                if let Some(rule) = oneup_rules::literal_path_rules(&crate::databases::rel_path(p)).pop()
+                    && !r.exclude.contains(&rule)
+                {
+                    r.exclude.push(rule);
+                    config::save_rules(dir, &r)?;
+                }
+            }
+            Ok(())
+        }
         "autostart" => {
             let on = v.as_bool().context("autostart: expected on or off")?;
             let launcher = if on { Some(crate::launch::sibling("oneupd-start.exe")?) } else { None };
@@ -1073,6 +1144,22 @@ mod tests {
         assert_eq!((s.onedrive, s.hotkey.as_str()), (true, ""));
         assert!(search_with(config::Search::default(), &json!({ "hotkey": "F" })).is_err());
         assert!(search_with(config::Search::default(), &json!({ "onedrive": "yes" })).is_err());
+    }
+
+    #[test]
+    fn database_changes_are_checked() {
+        let v = json!({ "wait": false, "presets": ["firebird"], "patterns": ["*.ledger", " "], "keep_syncing": "VM\\disk.vhdx" });
+        let d = databases_with(config::DatabaseSettings::default(), &v).unwrap();
+        assert!(!d.wait);
+        assert_eq!(
+            (d.presets.as_slice(), d.patterns.as_slice()),
+            (&["firebird".to_string()][..], &["*.ledger".to_string()][..])
+        );
+        assert_eq!(d.keep_syncing, ["/VM/disk.vhdx"]);
+        let d = databases_with(d, &json!({ "keep_syncing": "/vm/DISK.vhdx" })).unwrap();
+        assert_eq!(d.keep_syncing.len(), 1, "already kept");
+        assert!(databases_with(config::DatabaseSettings::default(), &json!({ "presets": ["nope"] })).is_err());
+        assert!(databases_with(config::DatabaseSettings::default(), &json!({ "patterns": ["#x"] })).is_err());
     }
 
     #[test]

@@ -679,6 +679,7 @@ async fn agent(
             // wait below ends when the first one's comes (`held_until`).
             let (count, next_ms) = store.read(|o| o.retry_waiting(now_ms()))?;
             control.set_retrying(next_ms.filter(|_| count > 0).map(|next_ms| oneup_ipc::Retrying { count, next_ms }));
+            control.set_databases(engine.database_notes());
             if !out.totals.is_quiet() {
                 out.totals.print(out.rounds);
             }
