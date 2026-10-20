@@ -692,11 +692,13 @@
             vertical-align: top;
         }
 
-        #ls-table td.wrap {
+        #ls-table td.wrap,
+        #recovery td.wrap {
             overflow-wrap: anywhere;
         }
 
-        #ls-table td small {
+        #ls-table td small,
+        #recovery td small {
             display: block;
             color: var(--muted);
             font-size: 12px;
@@ -1871,6 +1873,7 @@
         <button data-page="apps">Apps</button>
         <button data-page="lists">Activity</button>
         <button data-page="shared">Shared</button>
+        <button data-page="recovery">Recovery</button>
         <hr>
         <button data-page="general">General</button>
         <button data-page="accounts">Accounts</button>
@@ -2114,6 +2117,43 @@
                 </table>
             </div>
             <div class="actions" id="sg-more"></div>
+        </section>
+
+        <!-- Recovery: rewind a folder, kept copies, OneDrive versions and recycle bin, conflicts -->
+        <section class="page" id="recovery">
+            <h2>Recovery</h2>
+            <h3>Rewind a folder</h3>
+            <div class="card">
+                <div class="row block">
+                    <div class="label"><small id="rw-since">Puts a folder back the way it was at a moment you choose. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.</small></div>
+                    <div class="field"><input type="text" id="rw-folder" placeholder="Folder, like /Documents (/ for everything)" spellcheck="false" aria-label="Folder"><input type="datetime-local" id="rw-at" step="1" aria-label="Moment"><button class="btn" id="rw-preview">Preview</button></div>
+                </div>
+                <div class="row block" id="rw-result" hidden>
+                    <ul class="facts" id="rw-groups"></ul>
+                    <table class="list" id="rw-table"><tbody></tbody></table>
+                    <p class="note" id="rw-note"></p>
+                    <div class="actions" id="rw-actions"></div>
+                </div>
+            </div>
+            <h3>Conflicts</h3>
+            <div class="card" id="cf-card">
+                <p class="say" id="cf-sum">Looking…</p>
+                <table class="list" id="cf-table" hidden>
+                    <thead><tr><th>File</th><th>Original</th><th>Conflict copy</th><th></th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <h3>Kept on this PC</h3>
+            <div class="card" id="rc-kept"></div>
+            <h3>OneDrive versions</h3>
+            <div class="card">
+                <div class="row block">
+                    <div class="field"><input type="text" id="rv-path" placeholder="A file in a synced folder, like C:\Users\you\OneUpDrive\report.docx" spellcheck="false" aria-label="File"><button class="btn" id="rv-show">Show</button></div>
+                    <div id="rv-list"></div>
+                </div>
+            </div>
+            <h3>Deleted from OneDrive</h3>
+            <div class="card" id="rc-bin"></div>
         </section>
 
         <!-- Safety -->
@@ -2849,6 +2889,7 @@
             if (page === "lists") loadList(true);
             if (page === "lists") loadAttention();
             if (page === "shared") loadSharing();
+            if (page === "recovery") loadRecovery();
         }
         $$("nav button").forEach(b => b.onclick = () => show(b.dataset.page));
         document.addEventListener("click", e => {
@@ -3815,6 +3856,277 @@
                 if (matching > shown) moreBtn(tr("Show more ({shown} of {all})", {
                     shown,
                     all: matching
+                }));
+                // The content guard's: rewind the folder to just before it.
+                for (const st of r.filter(s => s.header.includes("look like their type"))) $("#ls-more").append(el("button", {
+                    className: "btn",
+                    textContent: "Rewind",
+                    title: "Rewind the folder these files are in to just before them",
+                    onclick: () => rewindBeforeStop(st.code)
+                }));
+            }
+        }
+
+        // ---- Recovery: rewinding a folder (`oneup rewind`), conflicts,
+        // kept copies, OneDrive versions and items deleted from OneDrive.
+        const RW_KIND = {
+            Restore: "Restore",
+            Revert: "Revert",
+            MoveBack: "Move back",
+            Remove: "Remove",
+            SetAside: "Set aside"
+        };
+        const RW_GROUP = {
+            Restore: "deleted, restored",
+            Revert: "edited, reverted",
+            MoveBack: "moved, moved back",
+            Remove: "created since, removed",
+            SetAside: "changed here and not synced, set aside"
+        };
+        const RW_FROM = {
+            RecycleBin: "OneDrive's recycle bin",
+            Versions: "OneDrive's version history",
+            InPlace: ""
+        };
+        const RW_SKIP = {
+            ChangedInCloud: "Changed in OneDrive, not synced yet",
+            ChangedHere: "Moved on this PC, not synced yet",
+            Missing: "Missing, held",
+            FolderGone: "Its folder then is gone",
+            NoCloudItem: "Never in OneDrive",
+            NotSyncedYet: "In OneDrive, not synced yet",
+            UnknownContent: "Its content then wasn't recorded"
+        };
+        let RW = {
+            preview: null
+        };
+
+        function localInput(ms) {
+            const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60000);
+            return d.toISOString().slice(0, 19);
+        }
+
+        async function loadRecovery() {
+            const st = await call("rewind_state").catch(() => null);
+            if (st) {
+                $("#rw-since").textContent = st.since_ms ?
+                    `Puts a folder back the way it was at a moment you choose, back to ${when(st.since_ms)}. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.` :
+                    "Rewinding starts once the first sync has finished.";
+                if (!$("#rw-at").value) $("#rw-at").value = localInput(Date.now() - 3600000);
+                if (st.job) rewindUnderWay(st);
+            }
+            loadConflicts();
+            keptInto($("#rc-kept"), {
+                id: "main"
+            });
+            loadBin();
+        }
+
+        function rewindRows(p) {
+            const rows = [];
+            for (const c of p.changes.slice(0, 500)) {
+                const where = c.kind === "MoveBack" || (c.kind === "Revert" && c.then !== c.now) ? `${c.now}  →  ${c.then}` : (c.then || c.now);
+                rows.push(el("tr", {}, el("td", {
+                    textContent: RW_KIND[c.kind]
+                }), cell(where + (c.folder ? "/" : ""), RW_FROM[c.source] || null, "wrap path"), el("td", {
+                    className: "num",
+                    textContent: c.folder ? "" : size(c.size)
+                })));
+            }
+            for (const s of p.skipped.slice(0, 200)) rows.push(el("tr", {}, el("td", {
+                className: "muted",
+                textContent: "Skipped"
+            }), cell(s.path, RW_SKIP[s.why] || s.why, "wrap path"), el("td")));
+            return rows;
+        }
+
+        function showRewind(p, actions) {
+            const groups = {};
+            for (const c of p.changes) {
+                const g = groups[c.kind] || (groups[c.kind] = {
+                    n: 0,
+                    bytes: 0
+                });
+                g.n++;
+                g.bytes += c.folder ? 0 : c.size;
+            }
+            $("#rw-groups").replaceChildren(...Object.keys(RW_GROUP).filter(k => groups[k]).map(k => el("li", {
+                textContent: `${groups[k].n.toLocaleString()} ${RW_GROUP[k]} (${size(groups[k].bytes)})`
+            })));
+            $("#rw-table tbody").replaceChildren(...rewindRows(p));
+            $("#rw-note").textContent = !p.changes.length ? "Nothing to change: the folder is as it was then." :
+                p.changes.length > 500 ? `The first 500 of ${p.changes.length.toLocaleString()} are listed.` : "";
+            $("#rw-actions").replaceChildren(...actions);
+            $("#rw-result").hidden = false;
+        }
+
+        async function rewindPreview(args) {
+            const p = await run(call("rewind_preview", args));
+            RW.preview = {
+                args,
+                p
+            };
+            const go = smallBtn("Rewind", async() => {
+                if (!confirm(`Rewind ${p.folder === "/" ? "everything" : p.folder} to ${when(p.at_ms)}? It waits for your approval next, and nothing changes until then.`)) return;
+                const s = await run(call("rewind_start", args));
+                RW.preview.p = s;
+                rewindWaiting(s.code);
+            }, "primary");
+            showRewind(p, p.changes.length ? [go] : []);
+        }
+
+        function rewindWaiting(code) {
+            $("#rw-actions").replaceChildren(el("span", {
+                    className: "muted",
+                    textContent: `Waiting for your approval (code ${code}). Sync waits too.`
+                }),
+                smallBtn("Approve", async() => {
+                    await run(call("rewind_approve", {
+                        code
+                    }), "Approved");
+                    setTimeout(loadRecovery, 2000);
+                }, "primary"),
+                smallBtn("Cancel", async() => {
+                    await run(call("rewind_cancel"), "Cancelled");
+                    $("#rw-result").hidden = true;
+                }));
+        }
+
+        function rewindUnderWay(st) {
+            const j = st.job;
+            $("#rw-folder").value = j.folder;
+            $("#rw-at").value = localInput(j.at_ms);
+            const say = j.approved ? `Rewinding ${j.folder || "/"} to ${when(j.at_ms)}: ${j.ran.toLocaleString()} changes made` +
+                (j.left_alone ? `, ${j.left_alone.toLocaleString()} changed since the preview left alone` : "") + "." : null;
+            if (!j.approved && st.code) {
+                if (RW.preview && RW.preview.p.code === st.code) showRewind(RW.preview.p, []);
+                else {
+                    $("#rw-groups").replaceChildren();
+                    $("#rw-table tbody").replaceChildren();
+                    $("#rw-note").textContent = `A rewind of ${j.folder || "/"} to ${when(j.at_ms)} waits for your approval. Its list is on the Activity page (Safety stops).`;
+                    $("#rw-result").hidden = false;
+                }
+                rewindWaiting(st.code);
+            } else if (say) {
+                $("#rw-groups").replaceChildren();
+                $("#rw-table tbody").replaceChildren();
+                $("#rw-note").textContent = say;
+                $("#rw-actions").replaceChildren(smallBtn("Cancel", async() => {
+                    await run(call("rewind_cancel"), "Cancelled");
+                    $("#rw-result").hidden = true;
+                }));
+                $("#rw-result").hidden = false;
+            }
+        }
+
+        $("#rw-preview").onclick = () => {
+            const at = new Date($("#rw-at").value).getTime();
+            if (!at) return toast("Choose a moment", true);
+            rewindPreview({
+                folder: $("#rw-folder").value.trim() || "/",
+                at_ms: at
+            });
+        };
+
+        // A content guard stop: rewind its folder to just before its batch.
+        function rewindBeforeStop(code) {
+            show("recovery");
+            rewindPreview({
+                before_stop: code
+            });
+        }
+
+        async function loadConflicts() {
+            const sum = $("#cf-sum"),
+                t = $("#cf-table");
+            try {
+                const list = await call("conflicts");
+                sum.textContent = list.length ? "" : "No conflicts.";
+                sum.hidden = !list.length ? false : true;
+                t.hidden = !list.length;
+                const side = (x, ms, newer) => cell(`${size(x.size)}, saved ${when(ms)}`, newer ? "Newer" : null);
+                $("#cf-table tbody").replaceChildren(...list.map(c => el("tr", {},
+                    cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
+                    side(c.original, c.original_ms, c.newer === "original"),
+                    side(c.copy, c.copy_ms, c.newer === "copy"),
+                    el("td", {}, el("div", {
+                            className: "actions"
+                        },
+                        smallBtn("Keep original", () => keep(c, "original")),
+                        smallBtn("Keep copy", () => keep(c, "copy")),
+                        smallBtn("Keep both", () => keep(c, "both")))))));
+            } catch (e) {
+                sum.textContent = e.message;
+                t.hidden = true;
+            }
+            async function keep(c, which) {
+                if (which === "both") {
+                    toast("Both copies stay.");
+                    return;
+                }
+                const other = which === "original" ? c.copy_path : c.path;
+                if (!confirm(`Keep the ${which === "original" ? "original" : "conflict copy"} of ${c.path}? ${other} goes to kept copies on this PC and to OneDrive's recycle bin.`)) return;
+                await run(call("conflict_keep", {
+                    conflict: c,
+                    keep: which
+                }), "Done with the next sync");
+                setTimeout(loadConflicts, 2000);
+            }
+        }
+
+        $("#rv-show").onclick = () => {
+            const path = $("#rv-path").value.trim().replace(/^"|"$/g, "");
+            if (path) versionsInto($("#rv-list"), {
+                path
+            });
+        };
+
+        async function loadBin() {
+            const b = $("#rc-bin");
+            try {
+                const list = await call("cloud_bin");
+                const note = el("p", {
+                    className: "note",
+                    textContent: "Only items OneUpDrive saw deleted are listed: OneDrive's recycle bin can't be read in full. OneDrive's website shows all of it."
+                });
+                if (!list.length) return b.replaceChildren(el("p", {
+                    className: "say",
+                    textContent: "Nothing deleted."
+                }), note);
+                const body = el("tbody", {}, ...list.map(x => el("tr", {},
+                    cell(x.path + (x.folder ? "/" : ""), null, "wrap path"),
+                    el("td", {
+                        className: "num",
+                        textContent: x.folder ? "" : size(x.size)
+                    }),
+                    el("td", {
+                        textContent: when(x.at_ms),
+                        style: "white-space:nowrap"
+                    }),
+                    el("td", {}, x.restorable ? smallBtn("Restore", async() => {
+                        const at = await run(call("cloud_bin_restore", {
+                            seq: x.seq
+                        }));
+                        toast("Back in OneDrive as " + at);
+                        loadBin();
+                    }) : el("small", {
+                        className: "muted",
+                        textContent: "Its folder is gone too"
+                    })))));
+                b.replaceChildren(el("table", {
+                    className: "list"
+                }, el("thead", {}, el("tr", {}, el("th", {
+                    textContent: "Item"
+                }), el("th", {
+                    className: "num",
+                    textContent: "Size"
+                }), el("th", {
+                    textContent: "Deleted"
+                }), el("th"))), body), note);
+            } catch (e) {
+                b.replaceChildren(el("div", {
+                    className: "muted",
+                    textContent: e.message
                 }));
             }
         }
