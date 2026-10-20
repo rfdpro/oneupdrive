@@ -25,6 +25,7 @@ const HOST_LISTENERS = [];
 const HOST_ANSWERS = {
   status: null, stopped: null,
   snapshot: a => a && a.root ? {rules: {presets: [], exclude: [], paused: [], cloud: "pull"}, priority: {first: [], last: []},
+      databases: {wait: true, presets: [], patterns: [], keep_syncing: []},
       space: {free_unused_days: 0, low_disk_percent: 10, free_when_low: false}} :
     {pair: {local: "C:\\Sync"}, agent: {memory: "balanced"}, versions: {}, safety: {max_changes: 200, max_percent: 10, content_guard: 20},
       updates: {auto: true, channel: "stable"}, onedrive_app: {folders: [], top_files: false}, office_opener: {registered: false, defaults: []},
