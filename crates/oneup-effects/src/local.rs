@@ -1192,25 +1192,13 @@ impl LocalFs {
         }
     }
 
-    /// Runs an approved [`Step::RestoreKept`]: [`LocalFs::restore`] of the
-    /// slot it names. Returns the path it was restored to.
-    pub fn restore_approved(&self, a: &Approved) -> Result<String> {
-        match a.op() {
-            Op::Rewind { step, .. } => match &**step {
-                Step::RestoreKept { slot, to } => self.restore(slot, to.as_deref()),
-                _ => Err(Error::WrongOp),
-            },
-            _ => Err(Error::WrongOp),
-        }
-    }
-
-    /// Moves a kept item back into the sync folder: to `to` (a path relative
-    /// to the sync folder, `\` or `/` separated) or else where it came from.
-    /// Never replaces anything: if the name is taken, the item is restored
-    /// as `name (restored N).ext` beside it. The folder it goes into must
-    /// exist. Returns the path it was restored to, relative to the sync
-    /// folder. The next sync uploads it like any new file.
-    pub fn restore(&self, slot_id: &str, to: Option<&str>) -> Result<String> {
+    /// What putting kept item `slot_id` back would move, and where: to `to`
+    /// (a path relative to the sync folder, `\\` or `/` separated) or else
+    /// where it came from. The kept item by its file ID and stamp (size and
+    /// last-write time; none for a folder) and the destination folder by its
+    /// file ID, for a [`Step::RestoreKept`] that acts on exactly these. The
+    /// folder must exist.
+    pub fn kept_target(&self, slot_id: &str, to: Option<&str>) -> Result<crate::KeptTarget> {
         if !is_valid_name(slot_id, false) {
             return Err(Error::BadName);
         }
@@ -1231,7 +1219,6 @@ impl LocalFs {
                 return Err(Error::BadName);
             }
         }
-        // Pin the destination folder so it can't be swapped while we move.
         let mut dir = self.root.clone();
         for f in folders {
             dir.push(f);
@@ -1239,19 +1226,56 @@ impl LocalFs {
         let probe = win::open_dir(&dir).map_err(|_| Error::Changed)?;
         let (_, dir_id) = win::file_id(&probe)?;
         drop(probe);
-        let (_pin, dir_path) = self.pin_folder(LocalId(dir_id.0))?;
-
+        // An ordinary folder in the sync folder.
+        drop(self.pin_folder(LocalId(dir_id.0))?);
         let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
         let h = win::open_path_for_change(&item.path(), is_dir)?;
+        let (_, id) = win::file_id(&h)?;
+        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        let stamp = if is_dir { None } else { Some((i64::try_from(entry.size).unwrap_or(i64::MAX), entry.modified)) };
+        check_placeholder(&entry, stamp, false)?;
+        Ok(crate::KeptTarget {
+            item: LocalPre { id: LocalId(id.0), stamp },
+            dir: LocalId(dir_id.0),
+            name: (*name).to_string(),
+            rel: parts.join("\\"),
+        })
+    }
+
+    /// Runs an approved [`Step::RestoreKept`]: the kept item, opened by its
+    /// file ID and checked on that handle (in its slot, its size and
+    /// last-write time as chosen), moves into the destination folder, pinned
+    /// by its file ID. Never replaces anything: if the name is taken, it's
+    /// restored as `name (restored N).ext` beside it. Returns the path it
+    /// was restored to, relative to the sync folder. The next sync uploads
+    /// it like any new file.
+    pub fn restore_approved(&self, a: &Approved) -> Result<String> {
+        let Op::Rewind { step, .. } = a.op() else { return Err(Error::WrongOp) };
+        let Step::RestoreKept { slot, item, dir, name } = &**step else { return Err(Error::WrongOp) };
+        if !is_valid_name(slot, false) {
+            return Err(Error::BadName);
+        }
+        let is_dir = item.stamp.is_none();
+        let slot_dir = self.engine.join(VERSIONS).join(slot);
+        let id = FileId(item.id.0);
+        let h = self.volume.open_for_change(id, is_dir, None).map_err(|_| Error::Changed)?;
+        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        check_placeholder(&entry, item.stamp, false)?;
+        let at = long(&win::final_path(&h)?);
+        if at.parent() != Some(slot_dir.as_path()) {
+            return Err(Error::Changed);
+        }
+        let name = self.checked_name(*dir, name)?;
+        // The destination pinned so it can't be swapped while we move.
+        let (_pin, dir_path) = self.pin_folder(*dir)?;
+        let rel_dir = dir_path.strip_prefix(&self.root).map(Path::to_path_buf).unwrap_or_default();
         for n in 0..100 {
-            let candidate = if n == 0 { (*name).to_string() } else { restored_name(name, n, is_dir) };
+            let candidate = if n == 0 { name.to_string() } else { restored_name(name, n, is_dir) };
             match win::rename_handle(&h, &dir_path.join(&candidate)) {
                 Ok(()) => {
                     drop(h);
-                    self.drop_slot(&slot.join(item.file_name()));
-                    let mut out: Vec<&str> = folders.to_vec();
-                    out.push(&candidate);
-                    return Ok(out.join("\\"));
+                    self.drop_slot(&at);
+                    return Ok(rel_dir.join(&candidate).to_string_lossy().into_owned());
                 }
                 Err(e) if e.is_exists() => continue,
                 Err(e) => return Err(e.into()),

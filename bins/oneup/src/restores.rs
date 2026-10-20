@@ -13,7 +13,7 @@
 use anyhow::{Result, bail};
 use oneup_store::{ActivityEntry, ActivityOutcome, Ops, Store};
 use oneup_sync::rewind::{Spot, Step};
-use oneup_sync::{NodeKind, Op, RemoteId, RemotePre};
+use oneup_sync::{LocalId, LocalPre, NodeKind, Op, RemoteId, RemotePre};
 use serde_json::{Value, json};
 
 /// In `meta`: the restores waiting for the agent (JSON).
@@ -39,7 +39,10 @@ fn kind_name(k: NodeKind) -> &'static str {
 fn to_json(a: &Asked) -> Option<Value> {
     let Op::Rewind { sid, step } = &a.op else { return None };
     Some(match &**step {
-        Step::RestoreKept { slot, to } => json!({ "kept": slot, "to": to, "path": a.path }),
+        Step::RestoreKept { slot, item, dir, name } => json!({
+            "kept": slot, "item": format!("{:x}", item.id.0), "stamp": item.stamp.map(|(s, m)| [s, m]),
+            "dir": format!("{:x}", dir.0), "name": name, "path": a.path,
+        }),
         Step::RevertTo { remote, version } => json!({
             "sid": sid, "version": version, "id": remote.id.0, "etag": remote.etag, "path": a.path,
         }),
@@ -70,7 +73,13 @@ fn from_json(v: &Value) -> Option<Asked> {
         let remote = RemotePre { id: RemoteId(id), etag: s("etag")? };
         Op::rewind(sid, Step::Reset { remote, from, place: Some((RemoteId(s("parent")?), s("name")?)), content: None })
     } else if let Some(slot) = s("kept") {
-        oneup_exec::recover::kept_op(&slot, s("to").as_deref())
+        let id = |k: &str| u128::from_str_radix(v.get(k)?.as_str()?, 16).ok();
+        let stamp = match v.get("stamp").and_then(Value::as_array) {
+            Some(a) => Some((a.first()?.as_i64()?, a.get(1)?.as_i64()?)),
+            None => None,
+        };
+        let item = LocalPre { id: LocalId(id("item")?), stamp };
+        Op::rewind(0, Step::RestoreKept { slot, item, dir: LocalId(id("dir")?), name: s("name")? })
     } else if let Some(version) = s("version") {
         let remote = RemotePre { id: RemoteId(s("id")?), etag: s("etag")? };
         Op::rewind(sid, Step::RevertTo { remote, version })
@@ -148,11 +157,16 @@ pub fn waiting(o: &Ops<'_>) -> oneup_store::Result<Vec<Asked>> {
 /// folder, at `to` or where it came from. Returns that path.
 pub fn kept(store: &mut Store, slot: &str, to: Option<&str>) -> Result<String> {
     let fs = crate::sync::open_paired(store)?;
-    let Some(s) = fs.versions()?.into_iter().find(|s| s.id == slot) else {
+    if !fs.versions()?.iter().any(|s| s.id == slot) {
         bail!("there's no kept item {slot} (see `oneup versions`)");
-    };
-    let path = to.map(str::to_string).or(s.origin).unwrap_or(s.name);
-    ask(store, Asked { op: oneup_exec::recover::kept_op(slot, to), path: path.clone() })?;
+    }
+    // Bound to the kept item and the folder it goes into, by their IDs.
+    let t = fs.kept_target(slot, to).map_err(|e| match e {
+        oneup_effects::Error::Changed => anyhow::anyhow!("the folder it goes into isn't there; give another (--to)"),
+        e => anyhow::anyhow!("{e}"),
+    })?;
+    let path = format!("/{}", t.rel.replace('\\', "/"));
+    ask(store, Asked { op: oneup_exec::recover::kept_op(slot, &t), path: path.clone() })?;
     Ok(path)
 }
 
@@ -266,8 +280,24 @@ mod tests {
     #[test]
     fn a_queued_restore_reads_back_as_the_same_step() {
         let ops = [
-            oneup_exec::recover::kept_op("slot-1", Some("docs/a.txt")),
-            oneup_exec::recover::kept_op("slot-2", None),
+            Op::rewind(
+                0,
+                Step::RestoreKept {
+                    slot: "slot-1".into(),
+                    item: LocalPre { id: LocalId(0xabc), stamp: Some((3, 99)) },
+                    dir: LocalId(0x12),
+                    name: "a.txt".into(),
+                },
+            ),
+            Op::rewind(
+                0,
+                Step::RestoreKept {
+                    slot: "slot-2".into(),
+                    item: LocalPre { id: LocalId(0xdef), stamp: None },
+                    dir: LocalId(0x5),
+                    name: "d".into(),
+                },
+            ),
             Op::rewind(
                 7,
                 Step::RevertTo {
