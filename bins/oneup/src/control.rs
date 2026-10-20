@@ -26,6 +26,8 @@ use crate::sync::{Answers, Controls, Offer};
 
 /// In the data folder: the agent's pause (JSON), while there is one.
 pub const PAUSE_FILE: &str = "agent-pause.json";
+/// In the data folder while the user works offline (empty).
+pub const OFFLINE_FILE: &str = "agent-offline";
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -102,6 +104,8 @@ pub struct Control {
     live: Arc<LivePause>,
     /// Where the pause is saved (`None`: nowhere, in tests).
     pause_file: Option<PathBuf>,
+    /// Where working offline is noted (`None`: nowhere, in tests).
+    offline_file: Option<PathBuf>,
     /// Pinged when a call changed something the loop must act on.
     pub wake: Notify,
     /// Whether the push channel is live (set by the push task).
@@ -164,6 +168,8 @@ struct Shared {
     /// Megabytes the user allowed on top of the data budget, for the agent
     /// to add (`crate::netusage`).
     allowed_mb: u64,
+    /// The user chose to work offline (kept in [`OFFLINE_FILE`]).
+    offline: bool,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
     /// The sides paused when that was last told as an event, and why.
@@ -178,7 +184,8 @@ fn code(f: u64) -> String {
 /// both).
 fn paused_sides(s: &Shared) -> (bool, bool) {
     let auto = s.auto_pause.is_some();
-    (s.pause.local || auto, s.pause.remote || auto)
+    // Offline, nothing changes OneDrive; this PC's side still runs.
+    (s.pause.local || auto, s.pause.remote || auto || s.offline)
 }
 
 /// Whether the user paused sync (either side) in data folder `dir`, as
@@ -212,9 +219,11 @@ impl Control {
     /// those given on the command line.
     pub fn new(data_dir: Option<&Path>, local: String, remote: String, answers: Answers) -> Self {
         let pause_file = data_dir.map(|d| d.join(PAUSE_FILE));
+        let offline_file = data_dir.map(|d| d.join(OFFLINE_FILE));
+        let offline = offline_file.as_deref().is_some_and(Path::exists);
         let pause = pause_file.as_deref().map(load_pause).unwrap_or_default();
         let live = LivePause::default();
-        live.set(pause.local, pause.remote);
+        live.set(pause.local, pause.remote || offline);
         Self {
             live: Arc::new(live),
             state: Mutex::new(Shared {
@@ -242,10 +251,12 @@ impl Control {
                 net: oneup_ipc::NetStatus::default(),
                 policy: crate::network::Policy::default(),
                 allowed_mb: 0,
+                offline,
                 shown: None,
                 paused_told: (pause.local, pause.remote, None),
             }),
             pause_file,
+            offline_file,
             wake: Notify::new(),
             push_up: Arc::new(AtomicBool::new(false)),
             stop: Notify::new(),
@@ -348,7 +359,7 @@ impl Control {
             pause_remote,
             first: s.first.clone(),
             live: Some(Arc::clone(&self.live)),
-            net: s.policy.clone(),
+            net: crate::network::Policy { offline: s.offline, ..s.policy.clone() },
         }
     }
 
@@ -417,15 +428,16 @@ impl Control {
     pub fn set_network(&self, n: oneup_ipc::NetStatus) {
         let mut s = self.lock();
         let link = std::mem::take(&mut s.net.link);
-        s.net = oneup_ipc::NetStatus { link, ..n };
+        s.net = oneup_ipc::NetStatus { link, offline: s.offline, ..n };
         self.publish(&mut s);
     }
 
     /// What the network's profile lets rounds do: the next ones, and the
     /// one under way from its next operation on.
     pub fn set_policy(&self, p: crate::network::Policy) {
-        self.live.set_net(&p);
-        self.lock().policy = p;
+        let mut s = self.lock();
+        self.live.set_net(&crate::network::Policy { offline: s.offline, ..p.clone() });
+        s.policy = p;
     }
 
     /// Whether the link to OneDrive is poor (`crate::link`).
@@ -439,6 +451,11 @@ impl Control {
 
     pub fn poor_link(&self) -> bool {
         self.poor_link.load(Relaxed)
+    }
+
+    /// Whether the user chose to work offline.
+    pub fn offline(&self) -> bool {
+        self.lock().offline
     }
 
     /// The megabytes allowed on top of the data budget since last asked.
@@ -631,6 +648,27 @@ impl Control {
             // `serve` answers a watch itself; here it is a status.
             Call::Status | Call::Watch { .. } | Call::Events { .. } => wake = false,
             Call::SyncNow => {}
+            Call::Offline { on } => {
+                if s.offline != on {
+                    s.offline = on;
+                    if let Some(f) = &self.offline_file {
+                        let saved = if on {
+                            crate::ownfile::write(f, b"")
+                        } else {
+                            match std::fs::remove_file(f) {
+                                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                                _ => Ok(()),
+                            }
+                        };
+                        if let Err(e) = saved {
+                            tracing::warn!(error = %e, "can't save working offline; it lasts until oneupd stops");
+                        }
+                    }
+                    tracing::info!(on, "working offline");
+                    s.net.offline = on;
+                    self.live.set_net(&crate::network::Policy { offline: on, ..s.policy.clone() });
+                }
+            }
             Call::AllowData { mb } => {
                 if !(1..=1_000_000).contains(&mb) {
                     return Err(RpcError::new(INVALID_PARAMS, "allow from 1 MB to 1,000,000 MB"));
@@ -935,6 +973,35 @@ mod tests {
         let check = live.round_check();
         c.set_policy(Policy::default());
         assert!(check(&upload));
+    }
+
+    /// Working offline holds every change to OneDrive (mid-round too) and
+    /// every transfer, keeps this PC's side going, and lasts across a
+    /// restart until the user goes back online.
+    #[test]
+    fn working_offline_holds_onedrive_and_is_kept_until_turned_off() {
+        use oneup_sync::{LocalId, LocalPre, RemoteId, RemotePre};
+        let dir = std::env::temp_dir().join(format!("oneup-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = control(Some(&dir));
+        let live = c.controls().live.unwrap();
+        let check = live.round_check();
+        let here = Op::RecycleLocal { sid: 1, local: LocalPre { id: LocalId(1), stamp: None } };
+        let there = Op::DeleteRemote { sid: 2, remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() } };
+        let s = c.call(Call::Offline { on: true }, 0).unwrap();
+        assert!(s.network.is_some_and(|n| n.offline));
+        assert!(!check(&there) && check(&here), "mid-round: OneDrive's side stops");
+        let k = c.controls();
+        assert!(k.pause_remote && !k.pause_local && k.net.offline);
+        assert!(!k.net.allows(crate::network::Way::Down, Some(1)));
+        // Kept: an agent started now works offline too.
+        let again = control(Some(&dir));
+        assert!(again.offline() && again.controls().pause_remote);
+        again.call(Call::Offline { on: false }, 0).unwrap();
+        assert!(!control(Some(&dir)).offline());
+        assert!(!again.controls().pause_remote);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

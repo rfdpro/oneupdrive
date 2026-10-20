@@ -885,6 +885,7 @@ mod win {
                     Some("stop") => Call::Stop,
                     // More on the network's used-up data budget.
                     Some("allow_data") => Call::AllowData { mb: oneup_app::netusage::ALLOW_MB },
+                    Some("offline") => Call::Offline { on: args.get("on").and_then(Value::as_bool).unwrap_or(false) },
                     // Accepts the agent's offer to bring excluded items here
                     // and remove them from OneDrive (by its code).
                     Some("prune") => Call::Answer { code: text(args, "code"), answer: Answer::Prune },

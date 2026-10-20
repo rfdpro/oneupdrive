@@ -24,6 +24,7 @@ Every call but `events` returns the agent's **status** after it took effect.
 | `sync_now` | none | Checks both sides now (no effect while fully paused), and cuts an error pause short |
 | `sync_first` | `path` | Puts the path first in the agent's transfers until a round settles ([rules.md § User controls](rules.md#user-controls)) |
 | `stop` | none | The agent ends after its current round (`activity: stopping` until then), like Ctrl+C |
+| `offline` | `on` | Work offline, or go back online: nothing goes to or comes from OneDrive but files opened; kept across restarts in `agent-offline` ([network.md](network.md#work-offline)) |
 | `allow_data` | `mb` (1 to 1,000,000) | Allows that much more this month on the network profile's data budget; a pause for a used-up budget ends ([network.md](network.md#data-budget)) |
 | `watch` | `since`: a status `rev` | Waits until the status's `rev` differs from `since` (at once if it already does), or 50 s at most, then returns it. Long-polling: a client follows the agent without polling |
 | `events` | `since`: an event's `seq` (optional) | Returns **events**, not the status: `{next, missed, items}`, the events after `since`, waiting for one as `watch` waits (50 s at most); without `since`, at once, none, and `next` is where the feed is now. `missed`: some were dropped before they were read, or the agent restarted. A page fits in one reply line; read on from `next`. `oneup watch` and scripts use it ([hooks.md](hooks.md#the-event-feed)) |

@@ -1258,7 +1258,8 @@ impl Engine {
                     // file's contents through (`crate::network`), asked again
                     // before each: a change of network applies from the next.
                     let c = controls();
-                    let paused = c.pause_local || c.net.transfer != crate::network::Transfer::Everything;
+                    let paused =
+                        c.pause_local || c.net.transfer != crate::network::Transfer::Everything || c.net.offline;
                     let free = crate::pinrules::free_space(&root_path);
                     let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
                     l.may(size, paused, free, std::time::Instant::now())
@@ -1621,7 +1622,10 @@ impl Engine {
         };
         let mut scope = first;
         let mut changed_rounds = 0;
-        self.check_room(&mut store).await?;
+        // Offline (the user's choice): OneDrive isn't asked anything.
+        if !controls().net.offline {
+            self.check_room(&mut store).await?;
+        }
         self.stops_lock().begin();
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
@@ -1643,7 +1647,9 @@ impl Engine {
             self.graph.download.set(cap(down));
             let pruning = self.update_pruning(&store)?;
             store = observe(store, &pruning).await?;
-            store = self.remote(store, &pruning).await?;
+            if !controls.net.offline {
+                store = self.remote(store, &pruning).await?;
+            }
             // A vault move a crash cut short, recorded where it went before
             // the plan reads its old ID's removal as a deletion.
             let settled = self.exec.settle_moves(&mut store)?;
@@ -1865,7 +1871,31 @@ impl Engine {
             let mut later: Vec<Op> = waiting.iter().map(|(op, _)| op.clone()).collect();
             later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
             later.extend(for_network.iter().map(|(a, _, _)| a.op().clone()));
-            let held_here = (!for_network.is_empty()).then(|| {
+            // Offline, the gate holds every change to OneDrive (as paused):
+            // they're the queue too, with what they'd send.
+            let queued: Vec<(String, u64, crate::network::Way)> = if controls.net.offline {
+                store.read(|o| {
+                    let mut v = Vec::new();
+                    for (op, w) in &review.withheld {
+                        if !matches!(w, Withheld::Paused(_)) {
+                            continue;
+                        }
+                        let size = match op {
+                            Op::Download { remote, .. } => {
+                                o.get_item(&remote.id.0)?.and_then(|r| u64::try_from(r.size).ok())
+                            }
+                            _ => None,
+                        };
+                        let (way, bytes) = crate::network::content(op, on_demand, |_| size)
+                            .map_or((crate::network::Way::Up, 0), |(w, b)| (w, b.unwrap_or(0)));
+                        v.push((describe(o, op).path, bytes, way));
+                    }
+                    Ok(v)
+                })?
+            } else {
+                Vec::new()
+            };
+            let held_here = (!for_network.is_empty() || !queued.is_empty()).then(|| {
                 // The profile's choice, or else the budget, held them.
                 let why = if for_network.iter().any(|(_, _, (way, b))| !controls.net.allows(*way, Some(*b))) {
                     controls.net.why()
@@ -1875,6 +1905,9 @@ impl Engine {
                 let mut w = crate::network::Waiting { why, ..Default::default() };
                 for (_, l, (way, bytes)) in &for_network {
                     w.add(l.path.clone(), *bytes, *way);
+                }
+                for (path, bytes, way) in &queued {
+                    w.add(path.clone(), *bytes, *way);
                 }
                 w
             });

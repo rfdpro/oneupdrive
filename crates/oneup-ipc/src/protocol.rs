@@ -63,6 +63,12 @@ pub enum Call {
     },
     /// Stop the agent after the current round.
     Stop,
+    /// Work offline (`on`), or go back online: offline, nothing goes over
+    /// the network but files the user opens; changes queue up. Kept
+    /// across restarts.
+    Offline {
+        on: bool,
+    },
     /// Allow `mb` more megabytes this month on the network's data budget
     /// (`NetStatus::data`); the agent goes on if it had paused for it.
     AllowData {
@@ -92,6 +98,11 @@ struct WatchParams {
 struct EventsParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     since: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OfflineParams {
+    on: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +146,7 @@ impl Call {
             Call::Watch { .. } => "watch",
             Call::Events { .. } => "events",
             Call::AllowData { .. } => "allow_data",
+            Call::Offline { .. } => "offline",
         }
     }
 
@@ -150,6 +162,7 @@ impl Call {
             Call::Watch { since } => serde_json::to_value(WatchParams { since: *since }),
             Call::Events { since } => serde_json::to_value(EventsParams { since: *since }),
             Call::AllowData { mb } => serde_json::to_value(AllowParams { mb: *mb }),
+            Call::Offline { on } => serde_json::to_value(OfflineParams { on: *on }),
         };
         v.unwrap_or(Value::Null)
     }
@@ -174,6 +187,10 @@ impl Call {
                 // No params at all reads as "from now".
                 let EventsParams { since } = if params.is_null() { EventsParams { since: None } } else { p(params)? };
                 Call::Events { since }
+            }
+            "offline" => {
+                let OfflineParams { on } = p(params)?;
+                Call::Offline { on }
             }
             "allow_data" => {
                 let AllowParams { mb } = p(params)?;
@@ -481,6 +498,9 @@ pub struct NetStatus {
     /// Data used this month on this network's profile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<DataUse>,
+    /// The user chose to work offline.
+    #[serde(default)]
+    pub offline: bool,
     /// `poor` while the agent has adapted to a poor link; empty otherwise.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,

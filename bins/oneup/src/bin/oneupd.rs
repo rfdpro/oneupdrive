@@ -637,7 +637,7 @@ async fn agent(
         pacer.set(profile.interval);
         // A folder in someone else's drive has no push channel for us: the
         // timer covers it.
-        let want_push = !args.no_push && !graph.is_other_drive() && pacer.wants_push();
+        let want_push = !args.no_push && !graph.is_other_drive() && pacer.wants_push() && !control.offline();
         if want_push != push_channel.is_some() {
             push_channel = want_push
                 .then(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
@@ -903,8 +903,10 @@ fn net_status(
         next_ms,
         waiting: waiting.map(|w| oneup_ipc::NetWaiting { count: w.count, bytes: w.bytes, why: w.why.clone() }),
         data,
-        // Kept by `Control::set_network`, which `set_poor_link` sets.
+        // Kept by `Control::set_network` (`set_poor_link` and the user's
+        // offline call set them).
         link: String::new(),
+        offline: false,
     }
 }
 
@@ -1299,7 +1301,10 @@ async fn publish_flyout(dir: PathBuf, token: String, control: Arc<Control>, grap
     let mut shown: Option<ShellStatus> = None;
     loop {
         // Someone else's drive (a shared folder) has no quota of ours.
-        if !graph.is_other_drive() && quota_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
+        if !graph.is_other_drive()
+            && !control.offline()
+            && quota_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3600))
+        {
             if let Ok(q) = graph.quota().await {
                 quota = q;
             }

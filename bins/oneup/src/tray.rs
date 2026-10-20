@@ -239,6 +239,8 @@ pub mod id {
     pub const LIST_UNSYNCED: u32 = 47;
     /// Allow [`crate::netusage::ALLOW_MB`] more on a used-up data budget.
     pub const ALLOW_DATA: u32 = 48;
+    /// Work offline, or go back online.
+    pub const OFFLINE: u32 = 49;
     pub const ACTIVITY: u32 = 50;
     pub const PROBLEM: u32 = 51;
     pub const START: u32 = 60;
@@ -411,6 +413,8 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
             if s.paused.local || s.paused.remote {
                 items.push(action(id::RESUME, t!("Resume"), glyph::PLAY));
             }
+            let offline = s.network.as_ref().is_some_and(|n| n.offline);
+            items.push(action(id::OFFLINE, if offline { "Go back online" } else { "Work offline" }, glyph::CLOUD));
             if !(s.paused.local && s.paused.remote) {
                 let choices = PAUSES
                     .iter()

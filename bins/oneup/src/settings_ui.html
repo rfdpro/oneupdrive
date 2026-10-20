@@ -2242,6 +2242,11 @@
                     <div class="label"><b>Monthly data budget</b><small>MB, 0 for none</small></div><input type="number" min="0" data-net-this="budget_mb" placeholder="As other networks"></div>
             </div>
             </div>
+            <h3>Work offline</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Work offline</b><small>Nothing syncs over the network. Opening an online-only file still downloads it.</small></div><label class="toggle"><input type="checkbox" id="net-offline" aria-label="Work offline"><span></span></label></div>
+            </div>
             <h3>Metered connections</h3>
             <div class="card">
                 <div class="row">
@@ -3044,10 +3049,16 @@
                 $("#net-data").textContent = size(d.up + d.down) + of + " · " + size(d.up) + " up, " + size(d.down) + " down" + (d.reached ? " · Used up" : "");
                 $("#net-allow").hidden = !d.reached;
             }
+            $("#net-offline").checked = !!(n && n.offline);
+            $("#net-offline").disabled = !st;
             const w = n && n.waiting;
             $("#net-waiting-row").hidden = !w;
             if (w) $("#net-waiting").textContent = w.count + " files (" + size(w.bytes) + "): " + w.why;
         }
+        $("#net-offline").onchange = e => run(call("control", {
+            call: "offline",
+            on: e.target.checked
+        }), e.target.checked ? "Working offline" : "Back online").then(load, load);
         $("#net-allow").onclick = () => run(call("control", {
             call: "allow_data"
         }), "Allowed 500 MB more").then(load, load);

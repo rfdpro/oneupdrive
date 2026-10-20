@@ -72,6 +72,22 @@ pub async fn answer(data_dir: &Path, code: u64, answer: Answer) -> Result<()> {
     }
 }
 
+/// `oneup offline on|off`.
+pub async fn offline(data_dir: &Path, on: bool) -> Result<()> {
+    match call(data_dir, Call::Offline { on }).await {
+        Ok(_) if on => {
+            println!("Working offline: changes wait until `oneup offline off`; files you open still download.");
+            Ok(())
+        }
+        Ok(_) => {
+            println!("Back online: what waited syncs now.");
+            Ok(())
+        }
+        Err(ClientError::NotRunning) => Err(not_running("there's nothing to take offline")),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `oneup network allow-more`: `mb` more this month on the data budget.
 pub async fn allow_data(data_dir: &Path, mb: u64) -> Result<()> {
     match call(data_dir, Call::AllowData { mb }).await {
@@ -298,6 +314,9 @@ fn print_status(s: &Status) {
             _ => "the default profile",
         };
         println!("  network           {name}{metered}: {} ({profile}; `oneup network`)", n.transfer);
+    }
+    if s.network.as_ref().is_some_and(|n| n.offline) {
+        println!("  offline           your choice; changes wait  (`oneup offline` lists them, `oneup offline off`)");
     }
     if s.network.as_ref().is_some_and(|n| n.link == "poor") {
         println!("  connection        poor: fewer requests at once, smaller upload pieces, longer waits");
