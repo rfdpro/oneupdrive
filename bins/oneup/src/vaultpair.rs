@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, bail};
-use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone, Replaced, VersionMark};
+use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone, Ours, Replaced, VersionMark};
 use oneup_graph::Graph;
 use oneup_store::{RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
@@ -449,10 +449,10 @@ impl Cloud for PairCloud {
         }
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Replaced, CloudError> {
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark, ours: &mut Ours) -> Result<Replaced, CloudError> {
         match self {
-            PairCloud::Plain(c) => c.replaced_other(id, mark).await,
-            PairCloud::Vault(c) => c.replaced_other(id, mark).await,
+            PairCloud::Plain(c) => c.replaced_other(id, mark, ours).await,
+            PairCloud::Vault(c) => c.replaced_other(id, mark, ours).await,
         }
     }
 
