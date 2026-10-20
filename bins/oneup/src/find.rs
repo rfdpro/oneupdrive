@@ -6,6 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use oneup_app::search::{self, Found, Item};
+use oneup_app::t;
 
 /// Lists what's found: placement, then the path (a folder ends in `/`).
 fn print(found: &Found) {
@@ -32,10 +33,10 @@ pub async fn run(
     let store = search::open(dir, |n| {
         if !json {
             if !told {
-                eprintln!("Building the search index (first search only)...");
+                eprintln!("{}", t!("Building the search index (first search only)..."));
                 told = true;
             }
-            eprint!("\r{n} items");
+            eprint!("\r{}", t!("{n, plural, one {# item} other {# items}}", n = n));
             let _ = std::io::stderr().flush();
         }
     })?;
@@ -61,16 +62,16 @@ pub async fn run(
     if found.too_many {
         println!("{}", search::TOO_MANY);
     } else if found.items.is_empty() {
-        println!("Nothing found.");
+        println!("{}", t!("Nothing found."));
     }
     print(&found);
     if found.more && !found.too_many {
-        println!("More found: add to the search to narrow it, or use --limit.");
+        println!("{}", t!("More found: add to the search to narrow it, or use --limit."));
     }
     if let Some(f) = &inside {
-        println!("\nInside files (OneDrive's search):");
+        println!("\n{}", t!("Inside files (OneDrive's search):"));
         if f.items.is_empty() {
-            println!("Nothing found.");
+            println!("{}", t!("Nothing found."));
         }
         print(f);
     }
@@ -98,12 +99,16 @@ pub fn settings(dir: &Path, onedrive: Option<bool>, hotkey: Option<&str>) -> Res
         oneup_app::tray::settings_changed(dir);
     }
     println!(
-        "Search inside files with OneDrive: {}",
-        if s.onedrive { "on (sends the search text to Microsoft)" } else { "off" }
+        "{}",
+        if s.onedrive {
+            t!("Search inside files with OneDrive: on (sends the search text to Microsoft)")
+        } else {
+            t!("Search inside files with OneDrive: off")
+        }
     );
     match s.hotkey.as_str() {
-        "" => println!("Hotkey: none"),
-        h => println!("Hotkey: {h} (while OneUpDrive's icon is in the notification area)"),
+        "" => println!("{}", t!("Hotkey: none")),
+        h => println!("{}", t!("Hotkey: {keys} (while OneUpDrive's icon is in the notification area)", keys = h)),
     }
     Ok(())
 }

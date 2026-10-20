@@ -2091,6 +2091,9 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
             })
             .unwrap_or_else(|| "?".into())
     };
+    // On screen, in the regional format (`when` also names saved copies).
+    let shown =
+        |x: &serde_json::Value| x["modified_ms"].as_i64().map_or_else(|| "?".into(), oneup_app::l10n::date_time);
     if let Some(n) = open {
         let x = pick(n)?;
         let to = oneup_app::item::open_version(path, x["id"].as_str().unwrap_or_default(), &when(x).replace(':', ""))
@@ -2105,7 +2108,7 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
         }
         let x = pick(n)?;
         oneup_app::item::restore_version(path, x["id"].as_str().unwrap_or_default()).await?;
-        println!("Version {n} ({}) is the current version again; this PC gets it with the next sync.", when(x));
+        println!("Version {n} ({}) is the current version again; this PC gets it with the next sync.", shown(x));
         return Ok(());
     }
     println!("{} in OneDrive:", v["path"].as_str().unwrap_or_default());
@@ -2113,7 +2116,7 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
         println!(
             "  {:>3}  {}  {:>10}  {}{}",
             i + 1,
-            when(x),
+            shown(x),
             oneup_app::versions::size(x["size"].as_u64().unwrap_or(0)),
             x["by"].as_str().unwrap_or(""),
             if i == 0 { "  (current)" } else { "" }
