@@ -363,8 +363,13 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
         // own mark, not a partly ticked box.
         let partial = folder && !verdict.is_excluded() && set.has_rules_inside(&child);
         let rule_file_below = folder && l.as_ref().is_some_and(|l| ruled.contains(&l.file_id));
-        // The pin rule keeping it on this PC.
-        let pinned_by = if on_demand { pins.pinned_by(&child, folder) } else { None };
+        // The pin rule keeping it on this PC (none for a file freed by name:
+        // the rule leaves it until it's kept again).
+        let released = match &l {
+            Some(l) if on_demand => store.read(|o| o.pin_released_has(l.file_id))?,
+            _ => false,
+        };
+        let pinned_by = pinned_label(&pins, &child, folder, on_demand, released);
         items.push(json!({
             "partial": partial,
             "rule_file_below": rule_file_below,
@@ -624,6 +629,18 @@ pub fn exclude_checked(data_dir: &Path, expect: &Value) -> Result<String> {
     set_sync(data_dir, &rel, folder, false)
 }
 
+/// The pin rule shown as keeping an item: with Files On-Demand, and not
+/// for a file freed by name (released from the rules until kept again).
+fn pinned_label(
+    pins: &oneup_rules::PinSet,
+    rel: &str,
+    folder: bool,
+    on_demand: bool,
+    released: bool,
+) -> Option<String> {
+    if !on_demand || released { None } else { pins.pinned_by(rel, folder) }
+}
+
 /// The Local row at `rel` (relative to the synced folder), by name as
 /// Windows compares names: the exact spelling, else the only one alike.
 pub fn row_at(o: &oneup_store::Ops<'_>, root: u128, rel: &str) -> oneup_store::Result<Option<LocalRow>> {
@@ -776,6 +793,15 @@ fn shown(p: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A file freed by name isn't shown as kept by its pin rule.
+    #[test]
+    fn a_released_file_isnt_shown_as_kept_by_a_rule() {
+        let pins = oneup_rules::PinSet::new(&["*.psd"]);
+        assert_eq!(super::pinned_label(&pins, "a.psd", false, true, false).as_deref(), Some("*.psd"));
+        assert_eq!(super::pinned_label(&pins, "a.psd", false, true, true), None);
+        assert_eq!(super::pinned_label(&pins, "a.psd", false, false, false), None);
+    }
+
     #[test]
     fn rules_name_exactly_one_item() {
         assert_eq!(super::rule_for("a/b", true), "/a/b/");

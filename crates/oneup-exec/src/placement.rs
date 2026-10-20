@@ -57,6 +57,9 @@ pub enum Stop {
 pub struct Fetched {
     /// Downloaded: path relative to the synced folder, file ID and size.
     pub done: Vec<(String, u128, u64)>,
+    /// Tried but not downloaded (failed or cut short): file IDs. Some of
+    /// their bytes may have come.
+    pub attempted: Vec<u128>,
     /// Why it stopped early, if it did.
     pub stopped: Option<Stop>,
     /// More may be waiting: the batch was full, or it stopped early.
@@ -99,6 +102,7 @@ pub async fn fetch_pinned(
         if ok {
             out.done.push((rel, id, size));
         } else {
+            out.attempted.push(id);
             tracing::debug!("a pinned file couldn't be downloaded now; tried again next pass");
         }
     }

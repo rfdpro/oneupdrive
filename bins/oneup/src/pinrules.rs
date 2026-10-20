@@ -689,11 +689,13 @@ pub fn kept_by_rule(store: &Store, pins: &PinSet, id: u128, rel: &str) -> Result
 /// themselves, so it's theirs: no rule's note, retry or release stays on it
 /// or, for a folder, on anything in it (which `oneup pin` pins too). Read a
 /// page at a time. Returns how many items it made the user's.
+/// Each page's claims are one durable transaction (written ahead of the
+/// pin the caller sets).
 pub fn claim_for_user(store: &mut Store, rel: &str) -> Result<usize> {
     let rel = crate::filetree::clean(rel);
     let Some(r) = store.read(|o| o.local_root())? else { return Ok(0) };
     let Some(row) = store.read(|o| row_at(o, r.root_file_id, &rel))? else { return Ok(0) };
-    store.write(|o| o.pin_claim_for_user(row.file_id))?;
+    store.write_durable(|o| o.pin_claim_for_user(row.file_id))?;
     let mut n = 1;
     if row.kind != LocalKind::Folder {
         return Ok(n);
@@ -705,23 +707,54 @@ pub fn claim_for_user(store: &mut Store, rel: &str) -> Result<usize> {
             stack.pop();
             continue;
         }
-        let mut down = None;
-        for c in page {
-            store.write(|o| o.pin_claim_for_user(c.file_id))?;
-            n += 1;
-            if let Some(f) = stack.last_mut() {
-                f.after = Some(c.file_id);
+        // Up to the first folder (which the walk goes into next): claimed in
+        // one transaction; the rest of the page is read again from there.
+        let upto = page.iter().position(|c| c.kind == LocalKind::Folder && c.skip == Skip::None);
+        let take = upto.map_or(page.len(), |i| i + 1);
+        store.write_durable(|o| {
+            for c in &page[..take] {
+                o.pin_claim_for_user(c.file_id)?;
             }
-            if c.kind == LocalKind::Folder && c.skip == Skip::None {
-                down = Some(Frame { id: c.file_id, rel: String::new(), after: None });
-                break;
-            }
+            Ok(())
+        })?;
+        n += take;
+        let last = &page[take - 1];
+        if let Some(f) = stack.last_mut() {
+            f.after = Some(last.file_id);
         }
-        if let Some(f) = down {
-            stack.push(f);
+        if upto.is_some() {
+            stack.push(Frame { id: last.file_id, rel: String::new(), after: None });
         }
     }
     Ok(n)
+}
+
+/// `oneup pin PATH`: the person's claim on the item (and a folder's
+/// contents) is recorded first, durably ([`claim_for_user`]), then `pin`
+/// sets the pin. A crash or an agent pass in between finds the item the
+/// user's, so no rule undoes the pin; running it again finishes it.
+pub fn keep_by_hand(store: &mut Store, rel: &str, pin: &mut dyn FnMut() -> Result<()>) -> Result<usize> {
+    let n = claim_for_user(store, rel)?;
+    pin()?;
+    Ok(n)
+}
+
+/// Whether the rules' note on item `id` at `rel` still names that item:
+/// its file ID and creation time, read on a handle, are the recorded ones.
+/// A note that doesn't (a rescan put it back on an ID another file reuses)
+/// is dropped: the item is the user's. What counts against the rules'
+/// download budget asks this first.
+pub fn owned_verified(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str) -> Result<bool> {
+    let Some(created) = store.read(|o| o.pin_owned_created(id))? else { return Ok(false) };
+    match pinner.identify(rel, id) {
+        Ok((got, c)) if got == id && c == created => Ok(true),
+        Ok(_) => {
+            store.write(|o| o.pin_owned_remove(id))?;
+            Ok(false)
+        }
+        // Can't be read now: counted as the rule's, the cautious side for a budget.
+        Err(_) => Ok(true),
+    }
 }
 
 /// What `oneup free PATH` did ([`free_plan`]).
@@ -744,7 +777,7 @@ pub struct FreePlan {
 /// `free(rel)` sets one item to "free up space"; the plan is read from the
 /// database a page at a time, never held whole.
 pub fn free_plan(
-    store: &Store,
+    store: &mut Store,
     pins: &PinSet,
     rel: &str,
     free: &mut dyn FnMut(&str) -> Result<()>,
@@ -755,11 +788,18 @@ pub fn free_plan(
         free(&rel)?;
         return Ok(FreePlan { freed: 1, ..FreePlan::default() });
     };
-    free(&rel)?;
     if row.kind == LocalKind::File {
+        // The release is recorded first, durably, then the pin changed: a
+        // crash or an agent pass in between finds the file released, never
+        // pins it again, and running it again finishes it.
         let released = (row.attributes & PINNED != 0 || pins.pins(&rel, false)).then_some(row.file_id);
+        if let Some(id) = released {
+            store.write_durable(|o| o.pin_released_add(id))?;
+        }
+        free(&rel)?;
         return Ok(FreePlan { freed: 1, released, skipped: 0 });
     }
+    free(&rel)?;
     let mut plan = FreePlan { freed: 1, ..FreePlan::default() };
     let mut stack = vec![Frame { id: row.file_id, rel, after: None }];
     while let Some(top) = stack.last().cloned() {
@@ -1573,7 +1613,7 @@ mod tests {
     /// folder, or by a pin rule) is skipped and counted.
     #[test]
     fn freeing_by_name_frees_the_file_and_through_a_folder_skips_what_is_kept() {
-        let s = store(&[
+        let mut s = store(&[
             row(2, 1, "Docs", LocalKind::Folder, 0x10),
             row(3, 2, "a.txt", LocalKind::File, 0),
             row(4, 2, "mine.txt", LocalKind::File, PINNED),
@@ -1586,7 +1626,7 @@ mod tests {
         ]);
         let pins = PinSet::new(&["*.psd"]);
         let mut freed = Vec::new();
-        let plan = free_plan(&s, &pins, "Docs", &mut |r| {
+        let plan = free_plan(&mut s, &pins, "Docs", &mut |r| {
             freed.push(r.to_string());
             Ok(())
         })
@@ -1595,13 +1635,13 @@ mod tests {
         assert_eq!(freed, ["Docs", "Docs/Sub", "Docs/Sub/b.txt", "Docs/a.txt"]);
         assert_eq!((plan.skipped, plan.released), (4, None), "mine.txt, art.psd, Kept's two files");
         let mut freed = Vec::new();
-        let plan = free_plan(&s, &pins, "Docs/art.psd", &mut |r| {
+        let plan = free_plan(&mut s, &pins, "Docs/art.psd", &mut |r| {
             freed.push(r.to_string());
             Ok(())
         })
         .unwrap();
         assert_eq!((freed, plan.released), (vec!["Docs/art.psd".to_string()], Some(5)));
-        let plan = free_plan(&s, &pins, "Docs/mine.txt", &mut |_| Ok(())).unwrap();
+        let plan = free_plan(&mut s, &pins, "Docs/mine.txt", &mut |_| Ok(())).unwrap();
         assert_eq!(plan.released, Some(4), "a pinned file named itself is freed too");
     }
 
@@ -1964,6 +2004,80 @@ mod tests {
         fake.set.clear();
         run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
         assert!(fake.set.is_empty(), "{:?}", fake.set);
+    }
+
+    /// `oneup pin` records the person's claim before the pin, `oneup free`
+    /// the release: a crash right after leaves the record, so an agent pass
+    /// neither undoes the user's pin nor pins the freed file again.
+    #[test]
+    fn hand_pins_and_frees_are_recorded_before_acting() {
+        let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL), row(3, 1, "b.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "a.psd"), (3, "b.psd")]);
+        // `oneup pin a.psd`, crashing before the pin is set.
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            keep_by_hand(&mut s, "a.psd", &mut || panic!("the process ends here"))
+        }));
+        assert!(crash.is_err());
+        assert!(s.read(|o| Ok(o.pin_user_has(2)? && !o.pin_owned_has(2)?)).unwrap(), "the claim is there");
+        // `oneup free b.psd`, crashing before the pin is changed.
+        let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            free_plan(&mut s, &pins, "b.psd", &mut |_| panic!("the process ends here"))
+        }));
+        assert!(crash.is_err());
+        assert!(s.read(|o| o.pin_released_has(3)).unwrap(), "the release is there");
+        // The agent: the rule removed later leaves a.psd pinned; b.psd, once
+        // freed, isn't pinned again.
+        fake.set.clear();
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(fake.set.is_empty(), "{:?}", fake.set);
+        explorer_free(&mut s, &[3]);
+        run(&mut s, &mut fake, &pins, 0);
+        assert!(fake.set.is_empty(), "{:?}", fake.set);
+    }
+
+    /// Claiming a folder of many files takes a durable transaction per page
+    /// (and per folder gone into), not one per item.
+    #[test]
+    fn claiming_a_big_folder_commits_a_page_at_a_time() {
+        let n = PAGE as u128 * 4 + 3;
+        let mut rows = vec![row(2, 1, "Big", LocalKind::Folder, 0x10)];
+        rows.extend((0..n).map(|i| row(100 + i, 2, &format!("f{i}"), LocalKind::File, 0)));
+        let mut s = store(&rows);
+        let before = s.read(|o| o.durable_commits()).unwrap();
+        assert_eq!(claim_for_user(&mut s, "Big").unwrap(), n as usize + 1);
+        let commits = s.read(|o| o.durable_commits()).unwrap() - before;
+        assert!(commits <= 6, "{commits} commits for {n} files");
+        assert!(s.read(|o| o.pin_user_has(100 + n - 1)).unwrap());
+    }
+
+    /// The rules' budget counts an item only while its note still names it:
+    /// a file that reuses the ID after a rescan is the user's, and its note
+    /// goes.
+    #[test]
+    fn the_budget_counts_only_what_the_rule_provably_pinned() {
+        let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
+        assert!(owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap());
+        fake.others.insert("a.psd".into(), (2, 9));
+        assert!(!owned_verified(&mut s, &mut fake, 2, "a.psd").unwrap());
+        assert!(!s.read(|o| o.pin_owned_has(2)).unwrap());
+    }
+
+    /// Bytes of a download that was tried count, whether it finished or not:
+    /// failures can't download past the approval again and again.
+    #[test]
+    fn a_tried_download_keeps_its_reservation() {
+        let mut s = store(&[]);
+        approve(&mut s, &PinSet::new(&["*.psd"]).fingerprint(), 100).unwrap();
+        take_approval(&mut s, &PinSet::new(&["*.psd"]).fingerprint()).unwrap();
+        reserve_budget(&mut s, &[(1, 60, true), (2, 30, true)]).unwrap();
+        // 1 was tried (and failed partway); 2 never started.
+        settle(&mut s, &[1], &|_| false).unwrap();
+        assert_eq!(budget(&s).unwrap(), 40);
     }
 
     #[test]
