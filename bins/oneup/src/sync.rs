@@ -522,7 +522,7 @@ pub struct Engine {
     /// `oneup sync`).
     events: std::sync::OnceLock<Arc<crate::events::Feed>>,
     /// Databases the last round held back (`crate::databases`).
-    db_waits: std::sync::Mutex<Vec<oneup_ipc::DatabaseNote>>,
+    db_waits: std::sync::Mutex<(Vec<oneup_ipc::DatabaseNote>, u64)>,
     /// Files that shouldn't sync while in use, seen since the agent
     /// started, until excluded or kept syncing (at most
     /// [`crate::databases::MAX_LIVE`]).
@@ -789,10 +789,12 @@ impl Engine {
 
     /// The databases held back by the last round, and the files warned
     /// about (`crate::databases`), for the status.
-    pub fn database_notes(&self) -> Vec<oneup_ipc::DatabaseNote> {
-        let waits = self.db_waits.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    /// The notes, and how many more databases were held back than they
+    /// list (at most [`crate::databases::MAX_WAITS`] are).
+    pub fn database_notes(&self) -> (Vec<oneup_ipc::DatabaseNote>, u64) {
+        let (waits, more) = self.db_waits.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let live = self.db_live.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        [waits, live].concat()
+        ([waits, live].concat(), more)
     }
 
     /// After a round: notes the databases it held back, and warns (once)
@@ -807,10 +809,11 @@ impl Engine {
         keep: &[String],
         rules: &RuleSet,
     ) -> Result<()> {
-        let path_of = |op: &Op| planned.iter().find(|(o, _)| o == op).map(|(_, l)| l.path.clone());
-        let waits: Vec<oneup_ipc::DatabaseNote> =
-            report.databases.iter().filter_map(|(op, db)| crate::databases::note(path_of(op)?, op, db)).collect();
-        *self.db_waits.lock().unwrap_or_else(|p| p.into_inner()) = waits;
+        // Looked up by operation once: a large round has many.
+        let paths: std::collections::HashMap<&Op, &str> = planned.iter().map(|(o, l)| (o, l.path.as_str())).collect();
+        let path_of = |op: &Op| paths.get(op).map(|p| (*p).to_string());
+        let found = crate::databases::Found::of(report);
+        *self.db_waits.lock().unwrap_or_else(|p| p.into_inner()) = crate::databases::held_notes(report, &paths);
         let mut new = Vec::new();
         {
             let mut live = self.db_live.lock().unwrap_or_else(|p| p.into_inner());
@@ -819,7 +822,7 @@ impl Engine {
             });
             let ops = report.done.iter().chain(report.skipped.iter().map(|(op, _)| op));
             for op in ops {
-                let (Some(format), Some(path)) = (crate::databases::live_format(report, op), path_of(op)) else {
+                let (Some(format), Some(path)) = (crate::databases::live_format(&found, op), path_of(op)) else {
                     continue;
                 };
                 if crate::databases::kept_syncing(keep, &path)
@@ -2957,6 +2960,7 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
         log.push(ActivityEntry { seq: 0, at_ms, outcome, action: line.action.into(), path: line.path.clone(), detail });
     };
     println!("Round {n}:");
+    let found = crate::databases::Found::of(r);
     let mut done = r.done.iter().peekable();
     let mut skipped = r.skipped.iter().peekable();
     let mut failed = r.failed.iter().peekable();
@@ -2991,7 +2995,7 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
                 }
             }
         } else if let Some((_, s)) = skipped.next_if(|(o, _)| o == op) {
-            match crate::databases::skip_detail(r, op).filter(|_| *s == Skip::Database) {
+            match crate::databases::skip_detail(&found, op).filter(|_| *s == Skip::Database) {
                 // Waiting, not failing: it goes once the database is ready.
                 Some(why) => {
                     println!("  wait  {line}  ({why})");

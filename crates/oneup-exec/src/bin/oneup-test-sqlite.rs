@@ -3,14 +3,15 @@
 //! test, as a user's program would be (AGENTS.md). Never built into a
 //! release.
 //!
-//! * `write DB SECONDS [wal|delete]`: writes transactions without pause
+//! * `write DB SECONDS [wal|delete] [STOPS]`: writes transactions without pause
 //!   for `SECONDS`, each adding a row and raising a counter in the same
 //!   transaction (so a consistent copy has as many rows as the counter
 //!   says). In WAL mode the `-wal` is truncated now and then (`PRAGMA
 //!   wal_checkpoint(TRUNCATE)`) and the database closed and opened again,
 //!   so there are moments when a copy may be sent; SQLite's own
 //!   checkpoints (every 20 pages) write the file while the `-wal` still
-//!   holds changes. Prints `done N`.
+//!   holds changes. At its first `STOPS` quiet moments it prints `quiet`
+//!   and waits for a line on its input. Prints `done N`.
 //! * `hold DB ROWS`: adds `ROWS` rows in WAL mode without a checkpoint,
 //!   prints `held`, keeps the database open until a line arrives on its
 //!   input, then closes it (which checkpoints and removes the `-wal`) and
@@ -52,6 +53,9 @@ fn main() -> rusqlite::Result<()> {
         Some("write") => {
             let (path, secs) = (&args[2], args[3].parse::<u64>().unwrap_or(5));
             let mode = args.get(4).map_or("wal", String::as_str);
+            // The first quiet moments wait for the test to say go, so it can
+            // run a round at each, whatever the machine's load.
+            let mut stops = args.get(5).and_then(|n| n.parse::<u32>().ok()).unwrap_or(0);
             let end = Instant::now() + Duration::from_secs(secs);
             // Checkpoints of its own as well (into the file, the -wal left
             // as it is), so the file changes while the -wal holds more.
@@ -65,11 +69,19 @@ fn main() -> rusqlite::Result<()> {
             while Instant::now() < end {
                 add(&mut c, i)?;
                 i += 1;
-                if mode == "wal" && i.is_multiple_of(50) {
-                    c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-                    // A moment with nothing outside the database, long
-                    // enough for a round to send it on a busy machine.
-                    std::thread::sleep(Duration::from_millis(400));
+                if i.is_multiple_of(50) {
+                    if mode == "wal" {
+                        c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+                    }
+                    // A moment with nothing outside the database.
+                    if stops > 0 {
+                        stops -= 1;
+                        println!("quiet");
+                        let mut line = String::new();
+                        let _ = std::io::stdin().lock().read_line(&mut line);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
                 }
                 if i.is_multiple_of(400) {
                     drop(c);

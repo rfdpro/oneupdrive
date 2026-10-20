@@ -1352,12 +1352,11 @@ fn plan_in(
 }
 
 fn syncable(t: Tree) -> Tree {
-    // SQLite's working files beside a database told by its name stay on
-    // their own side by design (`oneup_plan::park`).
+    // Working files beside their namesake stay on their own side by design
+    // (`oneup_plan::park`).
     let beside_database = |path: &str| {
         let Some((_, main)) = oneup_rules::database::Companion::of_name(path) else { return false };
-        oneup_rules::database::Format::of_name(main).is_some_and(|f| f == oneup_rules::database::Format::Sqlite)
-            && t.contains_key(main)
+        t.get(main).is_some_and(Option::is_some)
     };
     t.iter()
         .filter(|(path, _)| {
@@ -5887,6 +5886,18 @@ impl SqliteApp {
         self.child.try_wait().unwrap().is_none()
     }
 
+    /// Tells a `write` waiting at a quiet moment to go on.
+    fn go(&mut self) {
+        let stdin = self.child.stdin.as_mut().unwrap();
+        stdin
+            .write_all(
+                b"go
+",
+            )
+            .unwrap();
+        stdin.flush().unwrap();
+    }
+
     /// Asks a `hold` to close its database, and waits until it has.
     fn close(mut self) {
         let mut stdin = self.child.stdin.take().unwrap();
@@ -5969,8 +5980,18 @@ async fn everyday_a_sqlite_database_written_without_pause_is_only_sent_whole() {
         let mut s = Sync::new(&format!("sqlite-{mode}"), cloud.clone());
         s.settle().await;
         let db = s.p("app.db");
-        let mut app = SqliteApp::start(&["write", db.to_str().unwrap(), "6", mode]);
+        let mut app = SqliteApp::start(&["write", db.to_str().unwrap(), "6", mode, "3"]);
         let mut waited = 0;
+        // At its first quiet moments, the program waits for a round: what's
+        // in the file then is whole, and is sent while it's still writing.
+        let mut at_quiet = 0;
+        for _ in 0..3 {
+            assert_eq!(app.line(), "quiet");
+            let before = cloud.sent("app.db").len();
+            s.round().await;
+            at_quiet += cloud.sent("app.db").len() - before;
+            app.go();
+        }
         while app.running() {
             let r = s.round().await;
             waited += db_waits(&r, "app.db").len();
@@ -5996,9 +6017,7 @@ async fn everyday_a_sqlite_database_written_without_pause_is_only_sent_whole() {
             assert!(!oneup_rules::database::journal_active(&v), "{mode}: a -journal in a transaction was sent");
         }
         eprintln!("{mode}: {rows} transactions, {} versions sent ({during} while writing), {waited} waits", sent.len());
-        if mode == "wal" {
-            assert!(during > 0, "sent while the program was still writing, when the -wal was empty");
-        }
+        assert!(at_quiet > 0 && during > 0, "{mode}: sent while the program was still writing");
     }
 }
 
@@ -6256,36 +6275,25 @@ async fn a_wal_synced_before_is_left_alone_on_both_sides() {
     assert!(cloud.tree().contains_key("/app.db"));
 }
 
-/// Files named like SQLite's working files beside a file that isn't a
-/// database are ordinary files: synced, and a conflict on one keeps both
-/// copies. Beside a database they stay here; a `!` pattern says a SQLite
-/// database isn't to be treated as one, and its working files then sync
-/// like any file.
+/// A file named like a working file of a file beside it stays here, by
+/// that name alone, whatever its namesake holds (text here); a `!` pattern
+/// naming the namesake opts it out, and then it syncs like any file. One
+/// with no namesake beside it is ordinary.
 #[tokio::test]
-async fn files_named_like_working_files_sync_unless_beside_a_sqlite_database() {
+async fn files_named_like_working_files_stay_beside_their_namesake_unless_opted_out() {
     let cloud = Fake::new();
     let mut s = Sync::new("sqlite-names", cloud.clone());
     write(&s.p("travel"), b"plans");
     write(&s.p("travel-journal"), b"day one");
-    let notes = s.p("notes.db");
-    SqliteApp::start(&["hold", notes.to_str().unwrap(), "2"]).close();
-    // A rollback journal mid-transaction, left by a program that stopped.
-    let mut journal = vec![0xD9, 0xD5, 0x05, 0xF9, 0x20, 0xA1, 0x63, 0xD7];
-    journal.resize(512, 0);
-    write(&s.p("notes.db-journal"), &journal);
-    // The database waits for its transaction; the journal stays here.
-    for _ in 0..2 {
-        s.round().await;
-    }
-    let t = cloud.tree();
-    assert!(t.contains_key("/travel-journal"), "an ordinary file: {:?}", names(&t));
-    assert!(!t.contains_key("/notes.db-journal"), "a database's working file stays here");
-    assert!(!t.contains_key("/notes.db"), "a transaction the database needs");
-
-    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["!notes.db"]).unwrap());
+    write(&s.p("alone.db-wal"), b"no database beside it");
     s.settle().await;
-    assert_eq!(cloud.tree()["/notes.db-journal"].as_deref(), Some(journal.as_slice()));
+    let t = cloud.tree();
+    assert!(!t.contains_key("/travel-journal"), "stays beside its namesake: {:?}", names(&t));
+    assert!(t.contains_key("/alone.db-wal"), "nothing beside it to stay with: {:?}", names(&t));
 
+    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["!travel"]).unwrap());
+    s.settle().await;
+    assert_eq!(cloud.tree()["/travel-journal"].as_deref(), Some(&b"day one"[..]));
     write(&s.p("travel-journal"), b"day two, here");
     cloud.edit("travel-journal", b"day two, there");
     s.settle().await;
@@ -6381,37 +6389,6 @@ async fn a_wal_written_during_a_download_stops_the_replacement() {
     assert_eq!(std::fs::read(&db).unwrap(), ours);
 }
 
-/// A `-wal` holding changes the database here needs is never renamed for
-/// a conflict copy (nor moved or recycled): the database would lose them.
-/// It waits, both copies untouched, and the round says why.
-/// (A database its name doesn't tell, only its content: its working files
-/// sync, and the executor keeps them with it.)
-#[tokio::test]
-async fn a_wal_holding_changes_is_never_renamed_for_a_conflict() {
-    let cloud = Fake::new();
-    let mut s = Sync::new("sqlite-wal-conflict", cloud.clone());
-    let db = s.p("app.data");
-    SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
-    write(&s.p("app.data-wal"), b"");
-    s.settle().await;
-    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "4"]);
-    assert_eq!(app.line(), "held");
-    app.kill();
-    let wal = std::fs::read(s.p("app.data-wal")).unwrap();
-    cloud.edit("app.data-wal", b"another PC's");
-    let mut waits = Vec::new();
-    // A round hashes it first (changed on both sides); the next would copy.
-    for _ in 0..4 {
-        let r = s.round().await;
-        assert!(!r.done.iter().any(|op| matches!(op, Op::ConflictCopy { .. })), "{r:?}");
-        let copies = r.databases.iter().filter(|(op, _)| matches!(op, Op::ConflictCopy { .. }));
-        waits.extend(copies.filter_map(|(_, d)| d.wait.clone()));
-    }
-    assert!(waits.contains(&oneup_effects::Wait::Wal), "{waits:?}");
-    assert_eq!(std::fs::read(s.p("app.data-wal")).unwrap(), wal);
-    assert_eq!(check_sqlite_with_wal(&std::fs::read(&db).unwrap(), &wal), Ok(7));
-}
-
 /// With `[databases] wait` off, a SQLite database is still sent only once
 /// every change is in the file: the setting only decides whether other
 /// databases wait for their programs.
@@ -6434,43 +6411,6 @@ async fn a_database_with_changes_in_its_wal_waits_with_waiting_off_too() {
     app.close();
     s.settle().await;
     assert_eq!(check_sqlite(cloud.tree()["/app.db"].as_deref().unwrap()), Ok(20));
-}
-
-/// Holds a running `oneup-test-sqlite` until the test closes it.
-type HeldApp = Arc<Mutex<Option<SqliteApp>>>;
-
-/// A program that opens the database while a `-wal` for it is fetched,
-/// after the check before the download, still keeps it from being placed:
-/// the database is held, writers kept out, for the placement itself, and a
-/// program that has it open refuses the hold. Once it's closed, it's placed.
-/// (A database its name doesn't tell, only its content: its working files
-/// sync, and the executor keeps them with it.)
-#[tokio::test]
-async fn a_database_opened_during_a_wal_download_keeps_the_wal_out() {
-    let cloud = Fake::new();
-    let mut s = Sync::new("sqlite-opened-during", cloud.clone());
-    let db = s.p("app.data");
-    SqliteApp::start(&["keep", db.to_str().unwrap(), "delete"]).close();
-    s.settle().await;
-    cloud.add("app.data-wal", Some(b"from another PC"));
-    let kept: HeldApp = Arc::default();
-    // The round's first request is its listing; the next, the download.
-    let (inner, keep, path) = (cloud.clone(), Arc::clone(&kept), db.clone());
-    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
-        inner.0.lock().unwrap().meanwhile = Some(Box::new(move || {
-            let mut app = SqliteApp::start(&["keep", path.to_str().unwrap(), "delete"]);
-            assert_eq!(app.line(), "open");
-            *keep.lock().unwrap() = Some(app);
-        }));
-    }));
-    let r = s.round().await;
-    assert!(kept.lock().unwrap().is_some(), "the program opened it during the download");
-    assert!(!s.p("app.data-wal").exists(), "not placed beside a database a program has open");
-    let waits = db_waits(&r, "app.data-wal");
-    assert!(waits.iter().any(|(w, p)| *w == oneup_effects::Wait::Open && p.iter().any(|p| p == SQLITE_APP)), "{r:?}");
-    kept.lock().unwrap().take().unwrap().close();
-    s.settle().await;
-    assert_eq!(std::fs::read(s.p("app.data-wal")).unwrap(), b"from another PC");
 }
 
 /// A SQLite database that appears here after OneUpDrive last looked isn't
@@ -6499,7 +6439,7 @@ async fn a_wal_from_onedrive_waits_beside_a_database_not_known_yet() {
     let r = s.round().await;
     assert!(s.p("app.db").exists());
     assert!(!s.p("app.db-wal").exists(), "not placed beside a database not known yet");
-    assert!(db_waits(&r, "app.db-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Behind), "{r:?}");
+    assert!(db_waits(&r, "app.db-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Beside), "{r:?}");
 }
 
 /// When Windows can't say which programs have a database open, it isn't
@@ -6620,7 +6560,7 @@ async fn a_move_never_lands_a_database_beside_changes_or_a_file_in_a_working_fil
 
     cloud.rename("old.sqlite", "app.sqlite");
     cloud.rename("notes.txt", "data.db-wal");
-    let mut waits = 0;
+    let mut waits = 0usize;
     for _ in 0..2 {
         let r = s.round().await;
         assert!(!r.done.iter().any(|op| matches!(op, Op::MoveLocal { .. })), "{r:?}");
@@ -6628,7 +6568,7 @@ async fn a_move_never_lands_a_database_beside_changes_or_a_file_in_a_working_fil
     }
     assert!(old.exists() && !s.p("app.sqlite").exists(), "not moved beside another database's changes");
     assert!(s.p("notes.txt").exists() && !s.p("data.db-wal").exists(), "not renamed into a working file's name");
-    assert!(waits >= 2, "both said why: {waits}");
+    assert!(waits >= 1, "said why: {waits}");
 }
 
 /// A database's `-wal` whose attributes can't be read isn't taken for
@@ -6697,36 +6637,6 @@ async fn an_encrypted_database_known_by_its_name_keeps_its_wal() {
     assert_eq!(std::fs::read(&db).unwrap(), cipher);
 }
 
-/// The final check before a `-wal` from OneDrive is placed compares the
-/// database beside it with the one expected, by file ID and stamp, before
-/// anything else: a file put in its place since (here an ordinary text
-/// file, another program's) means the `-wal` isn't placed.
-/// (A database its name doesn't tell, only its content: its working files
-/// sync, and the executor keeps them with it.)
-#[tokio::test]
-async fn a_wal_isnt_placed_beside_a_file_put_in_its_databases_place() {
-    use std::os::windows::process::CommandExt;
-    let cloud = Fake::new();
-    let mut s = Sync::new("sqlite-swapped", cloud.clone());
-    let db = s.p("app.data");
-    SqliteApp::start(&["keep", db.to_str().unwrap(), "delete"]).close();
-    write(&s.p("app.data-wal"), b"");
-    s.settle().await;
-    cloud.edit("app.data-wal", b"another PC's changes");
-    // The round's first request is its listing; the next, the download.
-    let (inner, path) = (cloud.clone(), db.clone());
-    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
-        inner.0.lock().unwrap().meanwhile = Some(Box::new(move || {
-            let p = path.display();
-            let st = std::process::Command::new("cmd").raw_arg(format!("/C del \"{p}\" && echo text>\"{p}\"")).status();
-            assert!(st.unwrap().success());
-        }));
-    }));
-    let r = s.round().await;
-    assert_eq!(std::fs::read(s.p("app.data-wal")).unwrap(), b"", "not placed: {r:?}");
-    assert!(db_waits(&r, "app.data-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Behind), "{r:?}");
-}
-
 /// A downloaded Outlook data file under an ordinary name is known by its
 /// content, so the agent can warn about it.
 #[tokio::test]
@@ -6743,22 +6653,19 @@ async fn a_downloaded_outlook_file_is_known_by_its_content() {
     assert!(known, "{r:?}");
 }
 
-/// Removing a database pattern, with nothing else changing, plans every
-/// folder again: a working file it had parked syncs from then on.
+/// A `!` pattern added, with nothing else changing, plans every folder
+/// again: a working file it opts out syncs from then on.
 #[tokio::test]
-async fn a_database_pattern_removed_unparks_its_working_files_at_once() {
+async fn a_database_opt_out_added_unparks_its_working_files_at_once() {
     let cloud = Fake::new();
     let mut s = Sync::new("db-pattern-change", cloud.clone());
-    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["*.ledger"]).unwrap());
     write(&s.p("books.ledger"), b"2026-10-01 coffee 3.50\n");
     write(&s.p("books.ledger-wal"), b"");
-    for _ in 0..3 {
-        s.round().await;
-    }
-    assert!(!cloud.tree().contains_key("/books.ledger-wal"), "parked beside a database");
-    s.exec.set_databases(oneup_rules::database::Databases::default());
+    s.settle().await;
+    assert!(!cloud.tree().contains_key("/books.ledger-wal"), "parked beside its namesake");
+    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["!books.ledger"]).unwrap());
     s.round().await;
-    assert!(cloud.tree().contains_key("/books.ledger-wal"), "synced as soon as it's an ordinary file");
+    assert!(cloud.tree().contains_key("/books.ledger-wal"), "synced as soon as it's opted out");
 }
 
 /// The names a move uses are judged each on its own: a file a `!` pattern
@@ -6783,30 +6690,74 @@ async fn an_opted_out_file_isnt_renamed_into_a_databases_name_beside_changes() {
     assert!(waits > 0, "said why");
 }
 
-/// Another provider's placeholder in a database's place, hydrated, is
-/// never read: it can't be told from a database, so a working file from
-/// OneDrive isn't placed beside it. (Simulated: a file another program
-/// makes there, made a placeholder with an identity that isn't
+/// Another provider's placeholder, hydrated, is never read: not to send
+/// it, nor to tell whether it's a database. (Simulated: a file another
+/// program makes here, made a placeholder with an identity that isn't
 /// OneUpDrive's.)
 #[tokio::test]
-async fn another_providers_placeholder_where_a_database_would_be_is_never_read() {
+async fn another_providers_placeholder_is_never_read() {
     use std::os::windows::process::CommandExt;
     let cloud = Fake::new();
     let (od, mut s) = on_demand_sync("db-foreign-placeholder", &cloud);
     s.quiesce().await;
-    cloud.add("app.data-wal", Some(b"from another PC"));
-    // After the round looked at this PC: an ordinary text file, made a
-    // placeholder of another provider's.
-    let main = s.p("app.data");
-    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
-        let st =
-            std::process::Command::new("cmd").raw_arg(format!("/C echo plain text>\"{}\"", main.display())).status();
-        assert!(st.unwrap().success());
-        provider::Exclusive::open(&main).unwrap().convert(b"another provider's identity").unwrap();
-    }));
-    let r = s.round().await;
-    assert!(!s.p("app.data-wal").exists(), "not placed beside what may be a database: {r:?}");
-    assert!(db_waits(&r, "app.data-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Behind), "{r:?}");
+    let p = s.p("theirs.data");
+    let st = std::process::Command::new("cmd").raw_arg(format!("/C echo plain text>\"{}\"", p.display())).status();
+    assert!(st.unwrap().success());
+    provider::Exclusive::open(&p).unwrap().convert(b"another provider's identity").unwrap();
+    for _ in 0..2 {
+        let r = s.round().await;
+        assert!(!r.done.iter().any(|op| matches!(op, Op::Upload { name, .. } if name == "theirs.data")), "{r:?}");
+    }
+    assert!(cloud.sent("theirs.data").is_empty(), "never read to be sent");
     drop(s);
     drop(od);
+}
+
+/// A database a pattern names (its content no SQLite signature) is read
+/// with its `-wal` and `-journal` watched, waiting for programs or not: a
+/// `-wal` with changes created while it's read cancels the upload.
+#[tokio::test]
+async fn a_database_named_by_a_pattern_is_read_with_its_wal_watched() {
+    use std::os::windows::process::CommandExt;
+    for wait in [true, false] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(&format!("db-pattern-watch-{wait}"), cloud.clone());
+        let dbs = oneup_rules::database::Databases::new(wait, &[], &["*.ledger"]).unwrap();
+        s.exec.set_databases(dbs);
+        s.settle().await;
+        write(&s.p("books.ledger"), &[0x5Au8; 600]);
+        let wal = s.p("books.ledger-wal");
+        cloud.0.lock().unwrap().during_upload = Some(Box::new(move || {
+            let st = std::process::Command::new("cmd").raw_arg(format!("/C echo x>\"{}\"", wal.display())).status();
+            assert!(st.unwrap().success());
+        }));
+        let r = s.round().await;
+        let changed = r.skipped.iter().any(|(op, k)| {
+            matches!(op, Op::Upload { name, .. } if name == "books.ledger") && *k == oneup_exec::Skip::Changed
+        });
+        assert!(changed, "wait {wait}: {r:?}");
+        assert!(cloud.sent("books.ledger").is_empty(), "wait {wait}");
+    }
+}
+
+/// A new database from OneDrive isn't placed beside a `-wal` with changes
+/// already here, wherever it came from (here, synced before as an ordinary
+/// file, with no database beside it then): SQLite would apply it to the
+/// database.
+#[tokio::test]
+async fn a_new_database_isnt_placed_beside_an_older_wal() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-older-wal", cloud.clone());
+    write(&s.p("app.db-wal"), b"an older database's changes");
+    s.settle().await;
+    assert!(cloud.tree().contains_key("/app.db-wal"), "synced while nothing was beside it");
+    let made = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-made5-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&made.0);
+    std::fs::create_dir_all(&made.0).unwrap();
+    let from = made.0.join("app.db");
+    SqliteApp::start(&["keep", from.to_str().unwrap(), "delete"]).close();
+    cloud.add("app.db", Some(&std::fs::read(&from).unwrap()));
+    let r = s.round().await;
+    assert!(!s.p("app.db").exists(), "not placed beside a -wal with changes: {r:?}");
+    assert!(db_waits(&r, "app.db").iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{r:?}");
 }

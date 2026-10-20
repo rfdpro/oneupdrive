@@ -1024,9 +1024,10 @@ impl LocalFs {
             return Err(Error::Changed);
         }
         // Databases and their working files, judged on the actual names
-        // right before the move (`database::check_move`); the database
-        // beside a working file moved away stays held until it's done.
-        let _hold = if entry.is_dir() { None } else { Some(self.check_move(&h, &path, entry.size, Some(&target))?) };
+        // right before the move (`database::check_move`).
+        if !entry.is_dir() {
+            self.check_move(&h, &path, entry.size, Some(&target))?;
+        }
         let was_in_sync = self.on_demand && self.is_in_sync(&h);
         win::rename_handle(&h, &target)?;
         if was_in_sync {
@@ -1039,7 +1040,9 @@ impl LocalFs {
     fn recycle_item(&self, pre: &LocalPre, old: OldCopy, synced: Option<&Hash>) -> Result<Done> {
         let (h, entry, path) = self.open_item(pre)?;
         // As for a move (`database::check_move`).
-        let _hold = if entry.is_dir() { None } else { Some(self.check_move(&h, &path, entry.size, None)?) };
+        if !entry.is_dir() {
+            self.check_move(&h, &path, entry.size, None)?;
+        }
         if entry.is_dir() {
             // Children can still be added after this check (the folder is
             // shared for writing); they would then move along into the
@@ -1334,10 +1337,13 @@ impl LocalFs {
         Ok((h, entry, path))
     }
 
-    /// Whether all of an opened file's content is on disk
-    /// ([`LocalFs::fully_on_disk`]), asked through its own handle.
+    /// Whether an opened file's content may be read: all of it on disk, and
+    /// an ordinary file or one of OneUpDrive's own placeholders (its
+    /// identity decodes as ours, `LocalFs::readable_here`), asked through
+    /// its own handle. Every read of user content in on-demand mode (an
+    /// upload, a hash, a sample) goes through this.
     fn on_disk(&self, opened: &OpenedToRead) -> bool {
-        opened.file.with_handle(|h| self.fully_on_disk(h, opened.size)).unwrap_or(false)
+        opened.file.with_handle(|h| self.readable_here(h, opened.size)).unwrap_or(false)
     }
 
     fn open_for_read(&self, pre: &LocalPre) -> Result<OpenedToRead> {

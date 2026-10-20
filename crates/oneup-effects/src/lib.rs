@@ -57,7 +57,7 @@ mod ondemand;
 pub mod release;
 
 #[cfg(windows)]
-pub use database::{CompanionCheck, CompanionHold, DbState, MainExpect, UploadCheck, Wait, staged_format};
+pub use database::{DbState, UploadCheck, Wait, staged_format};
 #[cfg(all(windows, feature = "crash-test"))]
 pub use local::Crashed;
 #[cfg(windows)]

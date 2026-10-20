@@ -9,7 +9,7 @@
 use crate::model::{Base, Hash, LocalId, NodeKind, RemoteId, Sid};
 
 /// A local item must still be exactly this when the operation runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalPre {
     pub id: LocalId,
     /// `(size, last-write time)` for files. `None` for folders, whose
@@ -18,14 +18,14 @@ pub struct LocalPre {
 }
 
 /// A cloud item must still have this eTag when the operation runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemotePre {
     pub id: RemoteId,
     pub etag: String,
 }
 
 /// How a created or transferred item is recorded in the Synced tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Link {
     /// A new Synced row.
     New,
@@ -35,7 +35,7 @@ pub enum Link {
 }
 
 /// Why an item is left alone and reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HoldReason {
     /// Gone from one side without evidence of deletion. Never acted on.
     MissingWithoutEvidence,
@@ -50,7 +50,7 @@ pub enum HoldReason {
 
 /// The copy that stays when a duplicate is removed ([`Op::RemoveCopy`]):
 /// it must still be exactly this when the removal runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Keep {
     /// A file in OneDrive, by ID and eTag.
     Remote(RemotePre),
@@ -72,7 +72,7 @@ impl Keep {
 /// own first, then each one above, up to its tree's root (the synced
 /// folder here, the drive's root in OneDrive), which isn't listed. With
 /// the copy's name, the full path the user was shown ([`Up::path`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Up<I>(pub Vec<(I, String)>);
 
 impl<I> Default for Up<I> {
@@ -107,7 +107,7 @@ pub enum Dir {
     Remote(RemoteId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Op {
     // ------------------------------------------------ bookkeeping (no I/O
     // on user content)
