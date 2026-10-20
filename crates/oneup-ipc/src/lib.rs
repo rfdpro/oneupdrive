@@ -303,7 +303,10 @@ mod win {
                 // safety stop) by any path other programs don't have.
                 use std::os::windows::io::AsRawHandle as _;
                 let pid = oneup_sys::pipe::client_process_id(conn.as_raw_handle() as isize);
-                let permitted = pid.is_none_or(|p| handler.permit(p));
+                // A client whose process id can't be read, or which the
+                // handler won't vouch for, isn't served: a hook that fired a
+                // request and exited before this ran can't slip through.
+                let permitted = pid.is_some_and(|p| handler.permit(p));
                 match Arc::clone(&slots).try_acquire_owned() {
                     Ok(permit) if permitted => {
                         let handler = Arc::clone(&handler);
