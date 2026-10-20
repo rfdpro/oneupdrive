@@ -35,7 +35,7 @@ pub fn item(op: &Op) -> Option<RetryItem<'_>> {
         | Op::DeleteRemote { remote, .. }
         | Op::PruneRemote { remote, .. } => RetryItem::Remote(&remote.id),
         Op::Rewind { step, .. } => match &**step {
-            oneup_sync::rewind::Step::SetAside { local } | oneup_sync::rewind::Step::Discard { local } => {
+            oneup_sync::rewind::Step::SetAside { local, .. } | oneup_sync::rewind::Step::Discard { local, .. } => {
                 RetryItem::Local(local.id)
             }
             oneup_sync::rewind::Step::Restore { id, .. } => RetryItem::Remote(id),

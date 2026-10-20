@@ -3245,10 +3245,10 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
                     Line::new("revert", rp(&remote.id), "rewind; old version from OneDrive's history")
                 }
                 Step::Remove { remote, .. } => Line::new("remove", rp(&remote.id), "rewind; to OneDrive's recycle bin"),
-                Step::SetAside { local } => {
+                Step::SetAside { local, .. } => {
                     Line::new("set aside", lp(local.id.0), "rewind; to .oneup\\versions, OneDrive's copy comes back")
                 }
-                Step::Discard { local } => Line::new(
+                Step::Discard { local, .. } => Line::new(
                     "remove",
                     lp(local.id.0),
                     "the copy you didn't keep; to .oneup\\versions, OneDrive's copy to its recycle bin",

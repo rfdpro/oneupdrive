@@ -356,7 +356,7 @@ impl Op {
             | Op::DeleteRemote { remote, .. }
             | Op::PruneRemote { remote, .. } => Some(Vacates::Remote(remote.id.clone())),
             Op::Rewind { step, .. } => match &**step {
-                Step::SetAside { local } | Step::Discard { local } => Some(Vacates::Local(local.id)),
+                Step::SetAside { local, .. } | Step::Discard { local, .. } => Some(Vacates::Local(local.id)),
                 Step::Reset { remote, place: Some(_), .. } | Step::Remove { remote, .. } => {
                     Some(Vacates::Remote(remote.id.clone()))
                 }
@@ -412,7 +412,7 @@ impl Op {
             Op::Rewind { sid, step } => match &**step {
                 Step::Restore { id, .. } => (Some(*sid), None, Some(id.clone())),
                 Step::Reset { remote, .. } | Step::Remove { remote, .. } => (Some(*sid), None, r(remote)),
-                Step::SetAside { local } | Step::Discard { local } => (Some(*sid), l(local), None),
+                Step::SetAside { local, .. } | Step::Discard { local, .. } => (Some(*sid), l(local), None),
                 Step::Forget => (Some(*sid), None, None),
                 Step::RestoreKept { .. } => (None, None, None),
                 Step::RevertTo { remote, .. } => (None, None, r(remote)),

@@ -74,7 +74,7 @@ impl<C: Cloud> Executor<C> {
                 }
                 Ok(())
             }
-            Step::Reset { remote, from: _, place, content } => {
+            Step::Reset { remote, place, content, .. } => {
                 let mut pre = remote.clone();
                 if let Some((size, hash)) = content {
                     let row = store.read(|o| o.get_item(&remote.id.0))?.ok_or(Fail::Skip(Skip::Changed))?;
@@ -90,20 +90,34 @@ impl<C: Cloud> Executor<C> {
                 }
                 Ok(())
             }
-            Step::Remove { remote, from } => {
-                let kind = store.read(|o| o.get_item(&remote.id.0))?.map(|r| r.kind);
-                let pre = if kind == Some(Kind::Folder) {
+            Step::Remove { remote, from, up } => {
+                // Only from where the approval saw it: its folder and name,
+                // and every folder above it up to the drive's root, read
+                // again now (a move above it keeps its eTag). Moved since,
+                // it's left alone.
+                let now = self.cloud.item(&remote.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
+                need(now.parent_id.as_deref() == Some(from.parent.0.as_str()) && now.name == from.name)?;
+                need(up.first().is_some_and(|(id, _)| *id == from.parent))?;
+                for (i, (id, name)) in up.iter().enumerate() {
+                    let x = self.cloud.item(id).await?.ok_or(Fail::Skip(Skip::Changed))?;
+                    match up.get(i + 1) {
+                        Some((above, _)) => need(
+                            x.kind == Kind::Folder
+                                && x.parent_id.as_deref() == Some(above.0.as_str())
+                                && oneup_sync::same_name(&x.name, name),
+                        )?,
+                        None => need(x.kind == Kind::Root)?,
+                    }
+                }
+                let pre = if now.kind == Kind::Folder {
                     // Its eTag moved as the rewind emptied it: what counts is
-                    // that OneDrive has nothing in it now, and that it's
-                    // where the approval saw it (moved since, it's left).
-                    let now = self.cloud.item(&remote.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
-                    need(now.kind == Kind::Folder)?;
-                    need(now.parent_id.as_deref() == Some(from.parent.0.as_str()) && now.name == from.name)?;
+                    // that OneDrive has nothing in it now.
                     if !self.cloud.children(&remote.id).await?.is_empty() {
                         return Err(Fail::Skip(Skip::NotEmpty));
                     }
                     pre_of(&now)
                 } else {
+                    // A file under the eTag the approval saw.
                     remote.clone()
                 };
                 self.cloud.delete(&pre).await?;
@@ -112,7 +126,7 @@ impl<C: Cloud> Executor<C> {
                 // this PC's copy into the version store.
                 store.write(|o| Ok::<_, Fail>(o.delete_subtree(&remote.id.0).map(|_| ())?)).await
             }
-            Step::SetAside { local } => {
+            Step::SetAside { local, .. } => {
                 // Written ahead: a crash after the move into the version
                 // store, before the record goes, finishes the job when the
                 // record is settled (`Executor::recover`). Durable: a power
@@ -135,7 +149,7 @@ impl<C: Cloud> Executor<C> {
                 let id = local.id;
                 store.write(|o| Ok::<_, Fail>(forget_aside(o, sid, id)?)).await
             }
-            Step::Discard { local } => {
+            Step::Discard { local, .. } => {
                 // As a deletion made here: noted ahead (the change journal
                 // sees only a move out of the folder), settled like a
                 // recycling's if the move doesn't happen. Durable, as above.
@@ -308,7 +322,7 @@ pub fn rewind_follows(o: &oneup_store::Ops<'_>, op: &Op) -> oneup_store::Result<
 /// record ahead).
 pub(super) fn aside_of(op: &Op) -> Option<&LocalPre> {
     match op.rewind_step() {
-        Some(Step::SetAside { local } | Step::Discard { local }) => Some(local),
+        Some(Step::SetAside { local, .. } | Step::Discard { local, .. }) => Some(local),
         _ => None,
     }
 }
