@@ -172,9 +172,10 @@ pub struct Report {
     /// file in OneDrive that keeps the edited version.
     pub kept_theirs: Vec<(Op, String)>,
     /// Uploads that went over such an edit whose version couldn't be kept
-    /// as a new file, and why. The upload itself is done (they're in
-    /// [`Report::done`] too), and the edit is in the file's version
-    /// history in OneDrive.
+    /// as a new file yet, and why. The upload itself is done (they're in
+    /// [`Report::done`] too); the edit is in the file's version history in
+    /// OneDrive, and keeping it is tried again at every later round until
+    /// it's done ([`Executor`]'s rescues, kept in the store).
     pub theirs_not_kept: Vec<(Op, String)>,
     /// Skipped ([`Skip::Database`]) operations' databases, and why they
     /// wait (`oneup_effects::DbState`).
@@ -182,12 +183,84 @@ pub struct Report {
     /// Uploads done of files recognised as databases, by content or name,
     /// and the format: an Outlook data file renamed `.dat` is one too.
     pub recognised: Vec<(Op, oneup_rules::database::Format)>,
+    /// Edits gone over by an earlier upload, kept this round as new files
+    /// in OneDrive (their names).
+    pub kept_later: Vec<String>,
 }
 
 impl Report {
     /// Whether the round changed nothing at all.
     pub fn is_idle(&self) -> bool {
         self.done.is_empty()
+    }
+}
+
+/// An edit an upload may have gone over, to keep as a new file
+/// (`Executor::rescue`): kept in `meta` (`exec.rescue.<item>.<version>`)
+/// until it's done, so a failure (the data budget used up, the network
+/// gone) never drops it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rescue {
+    /// The file uploaded over.
+    id: String,
+    /// The version the upload meant to replace.
+    mark: VersionMark,
+    /// The version it went over instead, once found.
+    theirs: Option<VersionMark>,
+    parent: Sid,
+    to: String,
+    name: String,
+}
+
+fn mark_json(m: &VersionMark) -> serde_json::Value {
+    serde_json::json!({ "id": m.id, "modified_ms": m.modified_ms, "size": m.size })
+}
+
+fn mark_of(v: &serde_json::Value) -> Option<VersionMark> {
+    Some(VersionMark {
+        id: v["id"].as_str()?.to_string(),
+        modified_ms: v["modified_ms"].as_i64(),
+        size: v["size"].as_i64(),
+    })
+}
+
+impl Rescue {
+    const KEY: &'static str = "exec.rescue";
+
+    fn key(&self) -> String {
+        format!("{}.{}.{}", Self::KEY, self.id, self.mark.id)
+    }
+
+    fn to_json(&self) -> String {
+        serde_json::json!({
+            "id": self.id, "mark": mark_json(&self.mark), "theirs": self.theirs.as_ref().map(mark_json),
+            "parent": self.parent, "to": self.to, "name": self.name,
+        })
+        .to_string()
+    }
+
+    fn parse(text: &str) -> Option<Rescue> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        Some(Rescue {
+            id: v["id"].as_str()?.to_string(),
+            mark: mark_of(&v["mark"])?,
+            theirs: mark_of(&v["theirs"]),
+            parent: v["parent"].as_u64()?,
+            to: v["to"].as_str()?.to_string(),
+            name: v["name"].as_str()?.to_string(),
+        })
+    }
+
+    fn save(&self, o: &Ops<'_>) -> oneup_store::Result<()> {
+        o.meta_set(&self.key(), &self.to_json())
+    }
+}
+
+fn fail_text(f: &Fail) -> String {
+    match f {
+        Fail::Skip(s) => format!("{s:?}"),
+        Fail::Failed(m) | Fail::Halt(m) => m.clone(),
+        Fail::NotNow => "not now".into(),
     }
 }
 
@@ -797,25 +870,71 @@ impl<C: Cloud> Executor<C> {
     /// version as a new file next to it, named as conflict copies are, and
     /// returns its name. Only a free name is taken; nothing is replaced. The
     /// next round brings it here like any new file in OneDrive.
-    async fn keep_replaced(
+    /// Keeps the edit an upload may have gone over (`r`): finds it (unless
+    /// `r` already names it) and uploads it as a new file. `Ok(None)`: it
+    /// went over nothing else. On failure, the rescue as far as it got, for
+    /// the caller to keep and try again.
+    async fn rescue(&self, store: &Db<'_>, mut r: Rescue) -> Result<Option<String>, Box<(Fail, Rescue)>> {
+        let id = RemoteId(r.id.clone());
+        let theirs = match &r.theirs {
+            Some(t) => t.clone(),
+            None => match self.cloud.replaced_other(&id, &r.mark).await {
+                Ok(Some(v)) => v,
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    tracing::warn!(error = %e, "an upload's replaced version couldn't be checked");
+                    return Err(Box::new((Fail::Failed(format!("{THEIRS_NOT_KEPT}: {e}")), r)));
+                }
+            },
+        };
+        r.theirs = Some(theirs.clone());
+        let (parent, to, name) = (r.parent, RemoteId(r.to.clone()), r.name.clone());
+        match self.keep_version(store, &id, parent, &to, &name, &theirs).await {
+            Ok(copy) => Ok(Some(copy)),
+            Err(f) => Err(Box::new((f, r))),
+        }
+    }
+
+    /// The rescues earlier rounds couldn't finish, tried again (oldest
+    /// first); one that works, or finds nothing to keep, is done with.
+    async fn retry_rescues(&self, store: &Db<'_>, report: &mut Report) -> Result<(), String> {
+        let waiting = store.read(|o| o.meta_under(Rescue::KEY)).map_err(|e| e.to_string())?;
+        for (key, text) in waiting {
+            let Some(r) = Rescue::parse(&text) else {
+                let _ = store.write(|o| Ok::<_, Fail>(o.meta_delete(&key)?)).await;
+                continue;
+            };
+            match self.rescue(store, r).await {
+                Ok(kept) => {
+                    store.write(|o| Ok::<_, Fail>(o.meta_delete(&key)?)).await.map_err(|e| fail_text(&e))?;
+                    if let Some(copy) = kept {
+                        tracing::info!("an edit an earlier upload went over was kept as a new file");
+                        report.kept_later.push(copy);
+                    }
+                }
+                Err(failed) => {
+                    let (fail, r) = *failed;
+                    if let Fail::Halt(m) = fail {
+                        return Err(m);
+                    }
+                    // Where it got to (the version found) is kept.
+                    store.write(|o| Ok::<_, Fail>(o.meta_set(&key, &r.to_json())?)).await.map_err(|e| fail_text(&e))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Uploads version `theirs` of file `id` as a new file next to it.
+    async fn keep_version(
         &self,
         store: &Db<'_>,
         id: &RemoteId,
         parent: Sid,
         to: &RemoteId,
         name: &str,
-        mark: &VersionMark,
-    ) -> Res<Option<String>> {
-        let theirs = match self.cloud.replaced_other(id, mark).await {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(None),
-            // The upload is done; an edit it may have gone over is in the
-            // file's version history either way.
-            Err(e) => {
-                tracing::warn!(error = %e, "an upload's replaced version couldn't be checked");
-                return Ok(None);
-            }
-        };
+        theirs: &VersionMark,
+    ) -> Res<String> {
         let lost = |e: String| Fail::Failed(format!("{THEIRS_NOT_KEPT}: {e}"));
         let mut staged = self.fs.stage()?;
         let Some(file) = staged.file() else { return Err(odd()) };
@@ -860,7 +979,7 @@ impl<C: Cloud> Executor<C> {
                         return Err(lost("OneDrive's copy didn't match what was sent".into()));
                     }
                     tracing::info!("a file changed in OneDrive while its upload committed; that version was kept");
-                    return Ok(Some(copy));
+                    return Ok(copy);
                 }
                 Err(CloudError::NameTaken) => continue,
                 Err(e) => return Err(lost(e.to_string())),
@@ -1005,6 +1124,11 @@ impl<C: Cloud> Executor<C> {
         let db = Db::new(store);
         // Records left by a round that was cut short.
         if let Err(Fail::Halt(m) | Fail::Failed(m)) = self.recover_all(&db).await {
+            report.halted = Some(m);
+            return report;
+        }
+        // Edits earlier uploads went over that couldn't be kept then.
+        if let Err(m) = self.retry_rescues(&db, &mut report).await {
             report.halted = Some(m);
             return report;
         }
@@ -1678,14 +1802,35 @@ impl<C: Cloud> Executor<C> {
                 // file's version history), not as the upload failing, which
                 // would leave it out of what the round did.
                 if let (Some(pre), Some(mark)) = (replace, mark) {
-                    match self.keep_replaced(store, &pre.id, *parent, to, name, &mark).await {
+                    let r = Rescue {
+                        id: pre.id.0.clone(),
+                        mark,
+                        theirs: None,
+                        parent: *parent,
+                        to: to.0.clone(),
+                        name: name.clone(),
+                    };
+                    match self.rescue(store, r).await {
                         Ok(kept) => notes.theirs = kept,
-                        Err(Fail::Failed(why)) => notes.theirs_not_kept = Some(why),
-                        Err(Fail::Skip(s)) => notes.theirs_not_kept = Some(format!("{THEIRS_NOT_KEPT}: {s:?}")),
-                        Err(Fail::NotNow) => notes.theirs_not_kept = Some(THEIRS_NOT_KEPT.into()),
-                        Err(Fail::Halt(m)) => {
-                            notes.theirs_not_kept = Some(format!("{THEIRS_NOT_KEPT}: {m}"));
-                            notes.halt = Some(m);
+                        Err(failed) => {
+                            let (fail, pending) = *failed;
+                            // Never dropped: kept in the store and tried
+                            // again at every later round (the data budget
+                            // used up, the network gone, OneDrive busy).
+                            let saved = store.write(|o| Ok::<_, Fail>(pending.save(o)?)).await;
+                            let why = match &fail {
+                                Fail::Failed(why) => why.clone(),
+                                Fail::Skip(s) => format!("{THEIRS_NOT_KEPT}: {s:?}"),
+                                Fail::NotNow => THEIRS_NOT_KEPT.into(),
+                                Fail::Halt(m) => format!("{THEIRS_NOT_KEPT}: {m}"),
+                            };
+                            notes.theirs_not_kept = Some(match saved {
+                                Ok(()) => format!("{why}; kept as a new file once it can be, tried again next round"),
+                                Err(_) => why,
+                            });
+                            if let Fail::Halt(m) = fail {
+                                notes.halt = Some(m);
+                            }
                         }
                     }
                 }

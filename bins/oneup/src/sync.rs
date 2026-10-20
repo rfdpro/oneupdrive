@@ -1996,6 +1996,11 @@ impl Engine {
             }
             let mut log = print_round(n, &planned, &report);
             self.note_databases(&mut store, &planned, &report, &db_settings.keep_syncing, &user_rules)?;
+            for name in &report.kept_later {
+                let detail = format!("an edit made in OneDrive that an earlier upload went over, kept as {name}");
+                println!("  {detail}");
+                log.push(notice(ActivityOutcome::Done, "keep", detail));
+            }
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
                 println!("  {detail}");
@@ -3358,10 +3363,20 @@ fn hold_for_network(
             Some((way, bytes)) if !net.allows(way, bytes) => held.push((a, l, (way, bytes.unwrap_or(0)))),
             Some((way, bytes)) => {
                 let bytes = bytes.unwrap_or(0);
+                // A large replacement may go over an edit made in OneDrive
+                // as it commits; keeping that edit downloads its version
+                // and uploads it again. It starts only if the budget has
+                // room for that too, so the edit can be kept at once.
+                let need = match a.op() {
+                    Op::Upload { replace: Some(_), .. } if bytes > oneup_graph::client::SIMPLE_UPLOAD_MAX as u64 => {
+                        bytes.saturating_mul(3)
+                    }
+                    _ => bytes,
+                };
                 match &mut left {
-                    Some(n) if *n < bytes => held.push((a, l, (way, bytes))),
+                    Some(n) if *n < need => held.push((a, l, (way, bytes))),
                     Some(n) => {
-                        *n -= bytes;
+                        *n -= need;
                         go.push((a, l));
                     }
                     None => go.push((a, l)),
@@ -4505,6 +4520,26 @@ mod tests {
         assert_eq!((go, held), (vec!["f1".to_string(), "film.mp4".into(), "d".into()], vec!["f2".to_string()]));
         let (go, held, _) = run_within(Transfer::Everything, false, Some(0));
         assert_eq!((go, held.len()), (vec!["d".to_string()], 3), "used up: no contents at all");
+        // A large replacement needs room to keep an edit it may go over
+        // too (its version down and up again): three times its size.
+        let replace = Op::Upload {
+            local: LocalPre { id: LocalId(7), stamp: Some((8_000_000, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "big.bin".into(),
+            replace: Some(RemotePre { id: RemoteId("b".into()), etag: "e".into() }),
+            link: Link::New,
+        };
+        let one = |left| {
+            let review = review_in(&oneup_gate::Policy::default(), &GateContext::default(), vec![replace.clone()]);
+            let planned: Vec<(Approved, Line)> =
+                review.approved.into_iter().map(|a| (a, Line::new("x", "/p".into(), ""))).collect();
+            let net = Policy { budget_left: Some(left), ..Policy::default() };
+            let (go, _, _) = s.read(|o| hold_for_network(o, &net, planned, false)).unwrap();
+            go.len()
+        };
+        assert_eq!(one(20_000_000), 0, "8 MB to send, but no room to keep an edit it may go over");
+        assert_eq!(one(24_000_000), 1);
         // Working offline: no contents either way, whatever the profile
         // (the gate holds the rest of OneDrive's side).
         let (go, held, _) = run_as(Transfer::Everything, false, None, true);
