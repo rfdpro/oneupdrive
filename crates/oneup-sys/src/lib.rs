@@ -27,6 +27,8 @@ pub mod clipboard;
 #[cfg(windows)]
 pub mod contained;
 #[cfg(windows)]
+pub mod fs_links;
+#[cfg(windows)]
 pub mod hello;
 #[cfg(windows)]
 pub mod identity;
