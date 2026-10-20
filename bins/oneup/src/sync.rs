@@ -1350,6 +1350,12 @@ impl Engine {
             let pruning = self.update_pruning(&store)?;
             store = observe(store, &pruning).await?;
             store = self.remote(store, &pruning).await?;
+            // A vault move a crash cut short, recorded where it went before
+            // the plan reads its old ID's removal as a deletion.
+            let settled = store.write(oneup_exec::settle_moves)?;
+            if settled != oneup_exec::Settled::default() {
+                tracing::info!(?settled, "settled moves an earlier round cut short");
+            }
             let user_rules = self.load_rules(&mut store)?;
             // Changed rules: every folder is planned again, from the
             // database (rules.md § Changing rules without a rescan).

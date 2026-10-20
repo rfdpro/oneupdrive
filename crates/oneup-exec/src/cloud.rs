@@ -146,6 +146,13 @@ pub trait Cloud: Send + Sync {
     /// that didn't pass a `false` on would run its cloud concurrently.
     fn concurrent(&self) -> bool;
 
+    /// Whether a move keeps the item's ID, as OneDrive's does. `false` for
+    /// a vault, where a move can rebuild the entry under a new ID: the
+    /// executor then writes the move ahead (see `crate::moving`). No
+    /// default, like [`Cloud::concurrent`]: a wrapper that didn't pass a
+    /// `false` on would lose that record.
+    fn moves_keep_ids(&self) -> bool;
+
     /// Downloads coming up in the round, in the planner's order: a hint, so
     /// a cloud that reads each download's link first may read the coming
     /// ones together. By default nothing; a wrapper that doesn't pass it

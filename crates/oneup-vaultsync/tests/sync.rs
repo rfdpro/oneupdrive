@@ -100,9 +100,16 @@ impl Pair {
     }
 
     /// One round as the agent runs it for a vault pair: the local journal,
-    /// the decrypted view of the cloud listing, a plan, the gate, the
-    /// executor.
+    /// the decrypted view of the cloud listing, the settling of moves a
+    /// round cut short, a plan, the gate, the executor.
     async fn round(&mut self) -> Report {
+        let report = self.attempt().await;
+        assert!(report.halted.is_none() && report.failed.is_empty(), "{report:?}");
+        report
+    }
+
+    /// [`Pair::round`], however it ends.
+    async fn attempt(&mut self) -> Report {
         self.obs.catch_up().unwrap();
         let mut cache = oneup_vaultsync::project::Cache::default();
         let p = project(&self.s.src, &self.s.vault, &mut cache).await.unwrap();
@@ -110,6 +117,7 @@ impl Pair {
         *self.s.nodes.write().unwrap() = p.nodes.clone();
         let store = self.obs.store_mut();
         apply(store, &self.s.src, &p).unwrap();
+        store.write(oneup_exec::settle_moves).unwrap();
         let ops = store
             .read(|o| {
                 let p = Parked::new(o);
@@ -118,9 +126,12 @@ impl Pair {
             .unwrap();
         let r = review_in(&Policy::default(), &Context::default(), ops);
         assert!(r.breakers.is_empty(), "{:?}", r.breakers);
-        let report = self.exec.run(store, r.approved).await;
-        assert!(report.halted.is_none() && report.failed.is_empty(), "{report:?}");
-        report
+        self.exec.run(store, r.approved).await
+    }
+
+    /// What the version store holds (recycled or replaced items).
+    fn versions(&self) -> usize {
+        std::fs::read_dir(self.p(".oneup/versions")).map_or(0, |d| d.flatten().count())
     }
 
     /// Rounds until one does nothing.
@@ -385,4 +396,46 @@ async fn a_vault_move_to_an_entry_left_without_its_contents_is_not_followed() {
     );
     assert!(p.p(&format!("A/{long}")).exists(), "the file stays where it is");
     assert!(!p.p(&format!("B/{long}")).exists());
+}
+
+/// A vault move that rebuilds the entry under a new ID (a name that becomes
+/// too long to store as it is, or a long name that no longer is), with the
+/// process killed after the move and before its record: the next round
+/// records it where it went (`oneup_exec::settle_moves`) instead of reading
+/// the old ID's removal as a deletion. Nothing is recycled or duplicated,
+/// a folder's contents included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vault_move_cut_short_by_a_crash_is_recorded_where_it_went() {
+    let long = format!("{}.txt", "a long name ".repeat(20));
+    let long_dir = format!("{}end", "a long folder name ".repeat(12));
+    // (before, after): a file whose name becomes long, a folder whose long
+    // name becomes short.
+    let cases = [("f.txt".to_string(), long.clone()), (long_dir.clone(), "short".to_string())];
+    for (i, (from, to)) in cases.into_iter().enumerate() {
+        let mut s = setup();
+        s.refresh().await;
+        let mut p = Pair::new(&format!("move-crash{i}"), s, false);
+        let folder = from == long_dir;
+        if folder {
+            write(&p.p(&format!("{from}/inner.txt")), b"inner");
+        } else {
+            write(&p.p(&from), b"content");
+        }
+        p.quiesce().await;
+        let before = p.local();
+
+        std::fs::rename(p.p(&from), p.p(&to)).unwrap();
+        p.exec.crash_after(Some(0));
+        let r = p.attempt().await;
+        assert_eq!(r.halted.as_deref(), Some(oneup_exec::CRASHED), "case {i}: {r:?}");
+        p.exec.crash_after(None);
+        p.quiesce().await;
+
+        let want: BTreeMap<String, Option<Vec<u8>>> =
+            before.into_iter().map(|(k, v)| (k.replacen(&format!("/{from}"), &format!("/{to}"), 1), v)).collect();
+        assert_eq!(p.local(), want, "case {i}: here");
+        assert_eq!(p.vault(), want, "case {i}: in the vault");
+        assert_eq!(p.versions(), 0, "case {i}: nothing recycled");
+        assert!(p.obs.store().read(|o| o.meta_under("exec.moving")).unwrap().is_empty(), "case {i}");
+    }
 }

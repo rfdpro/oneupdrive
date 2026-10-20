@@ -1,5 +1,6 @@
 //! The executor proper (see the crate docs).
 
+use crate::moving::{MoveIntent, moving_of};
 use std::collections::VecDeque;
 use std::io::Seek as _;
 use std::sync::Arc;
@@ -1148,8 +1149,27 @@ impl<C: Cloud> Executor<C> {
                     .await?;
                 Ok(Meta::Mkdir { parent: to.clone(), name: name.clone() })
             }
-            Op::MoveRemote { sid, remote, to, name, .. } => {
-                store.write(|o| need(o.synced_get(*sid)?.is_some())).await?;
+            Op::MoveRemote { sid, remote, to, parent, name, .. } => {
+                if self.cloud.moves_keep_ids() {
+                    store.write(|o| need(o.synced_get(*sid)?.is_some())).await?;
+                } else {
+                    // The move may give the item a new ID: written ahead,
+                    // durably, so a move cut short is recorded where it went
+                    // before the next plan (`crate::moving`).
+                    let m = MoveIntent {
+                        sid: *sid,
+                        old: remote.id.0.clone(),
+                        to: to.0.clone(),
+                        parent: *parent,
+                        name: name.clone(),
+                    };
+                    store
+                        .write_ahead(|o| {
+                            need(o.synced_get(*sid)?.is_some())?;
+                            Ok::<_, Fail>(o.meta_set_ahead(&moving_of(*sid), &m.encode())?)
+                        })
+                        .await?;
+                }
                 Ok(Meta::Move { pre: remote.clone(), to: to.clone(), name: name.clone() })
             }
             Op::DeleteRemote { sid, remote } => {
@@ -1199,6 +1219,7 @@ impl<C: Cloud> Executor<C> {
                             b.remote = Some(RemoteId(row.id.clone()));
                         }
                         o.synced_put(&b)?;
+                        o.meta_delete(&moving_of(*sid))?;
                         let local = match b.local {
                             Some(l) if renewed => o.local_get(l.0)?,
                             _ => None,

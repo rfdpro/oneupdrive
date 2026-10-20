@@ -18,7 +18,8 @@
 //! `.c9r` file, or `dir.c9r`) is moved into it under its If-Match, and the
 //! old entry, by then holding nothing but its name, is removed. The
 //! decrypted item then has a new ID (the new entry's); the executor records
-//! it. An interruption leaves either the old entry whole and a new one
+//! it, having written the move ahead (`Cloud::moves_keep_ids`), so a crash
+//! before that record doesn't read as a deletion. An interruption leaves either the old entry whole and a new one
 //! without content (shown as a problem; the retry uses it), or the new
 //! entry whole and the old one without content (removed by the retry or
 //! reported).
@@ -307,6 +308,12 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
     /// made in several requests, which two uploads into one folder could
     /// interleave.
     fn concurrent(&self) -> bool {
+        false
+    }
+
+    /// A move that changes an entry's shape rebuilds it under a new ID
+    /// (see the module docs).
+    fn moves_keep_ids(&self) -> bool {
         false
     }
 

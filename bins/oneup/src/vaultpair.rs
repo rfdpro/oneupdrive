@@ -483,6 +483,13 @@ impl Cloud for PairCloud {
         }
     }
 
+    fn moves_keep_ids(&self) -> bool {
+        match self {
+            PairCloud::Plain(c) => c.moves_keep_ids(),
+            PairCloud::Vault(c) => c.moves_keep_ids(),
+        }
+    }
+
     fn can_copy(&self) -> bool {
         match self {
             PairCloud::Plain(c) => c.can_copy(),

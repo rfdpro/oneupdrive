@@ -600,6 +600,10 @@ impl Cloud for GraphCloud {
         true
     }
 
+    fn moves_keep_ids(&self) -> bool {
+        true
+    }
+
     fn upcoming(&self, downloads: &[RemotePre]) {
         self.links().announce(downloads.iter().map(|p| p.id.0.clone()), Instant::now());
     }

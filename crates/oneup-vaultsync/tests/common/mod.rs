@@ -90,6 +90,10 @@ impl Cloud for Fake {
     fn concurrent(&self) -> bool {
         true
     }
+
+    fn moves_keep_ids(&self) -> bool {
+        true
+    }
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
         let c = self.0.lock().unwrap().check(pre)?.content.clone();
         out.write_all(&c)?;

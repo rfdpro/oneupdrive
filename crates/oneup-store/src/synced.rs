@@ -468,6 +468,15 @@ impl Ops<'_> {
         Ok(())
     }
 
+    /// Withdraws cloud deletion evidence for `id`. Only for the executor's
+    /// settling of a vault move cut short (`oneup_exec::settle_moves`):
+    /// the item was moved under a new ID that can't be found yet, so its
+    /// old ID's removal is no evidence of a deletion.
+    pub fn unnote_remote_deleted(&self, id: &str) -> Result<()> {
+        self.c.prepare_cached("DELETE FROM remote_gone WHERE id = ?1")?.execute([id])?;
+        Ok(())
+    }
+
     /// Records that cloud item `id` was deleted, with evidence (a delta
     /// `deleted` facet). See [`Ops::note_local_deleted`].
     pub fn note_remote_deleted(&self, id: &str) -> Result<bool> {
