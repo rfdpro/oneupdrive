@@ -75,7 +75,9 @@ mod win {
         let page = PAGE
             .replace("{{START_PAGE}}", &start)
             // A JSON string inside the page's script; `<` escaped so it can't end it.
-            .replace("\"{{START_ITEM}}\"", &Value::from(item).to_string().replace('<', "\\u003c"));
+            .replace("\"{{START_ITEM}}\"", &Value::from(item).to_string().replace('<', "\\u003c"))
+            // The language's translations and the regional format (`oneup_app::l10n`).
+            .replace("\"{{L10N}}\"", &oneup_app::l10n::current().page_json());
         let opts =
             webview::Options { title: "OneUpDrive", width: 1140, height: 760, data_dir: &webdata, html: &page, dark };
         let mut watching = false;
