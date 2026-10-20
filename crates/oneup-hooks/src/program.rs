@@ -1,25 +1,30 @@
-//! Where a hook's program is, and whether it may run from there.
+//! Where a hook's program is, how it's launched, and whether a cloud value
+//! can ever reach it as code.
 //!
-//! The safety rule ([`docs/architecture/data-safety.md`] invariant 17): a
-//! change in the cloud must never become code that runs. Two ways it could:
+//! The rule ([`docs/architecture/data-safety.md`] invariant 17): **cloud
+//! data never reaches a code position.** Two parts:
 //!
-//! * the program itself (or a script an interpreter runs) living where a
-//!   cloud change can replace it: inside a folder any pair of ours syncs, or
-//!   one another sync app manages. [`cloud_place`] finds that; the program
-//!   is resolved first (absolute path, or a bare name looked up on `PATH` by
-//!   us, never by Windows), symlinks and junctions followed, compared as
-//!   written and as resolved, case-insensitively.
-//! * a value a cloud change controls (a shared file's name in `{path}`, an
-//!   error in `{detail}`) landing where an interpreter treats it as code.
-//!   [`check`] classifies known interpreters and loaders ([`interpreter`])
-//!   and allows a template only as a data argument *after* a literal script
-//!   file that is itself outside every synced folder; a program or shape it
-//!   can't classify as safe is refused.
+//! * The program (and any script) must live outside every folder a cloud
+//!   change can touch: a folder any pair of ours syncs, or one another sync
+//!   app manages. The program is resolved (absolute, or a bare name looked
+//!   up on `PATH` by us), symlinks and junctions followed, every hard link
+//!   enumerated (a second name inside a synced folder is refused too), and
+//!   compared case-insensitively.
+//! * Template values (`{path}`, `{detail}`, …) carry text a cloud change
+//!   controls. They are allowed in `args` **only** when the program is a
+//!   real `.exe` that isn't a known shell, interpreter or loader
+//!   ([`is_interpreter`]). For an interpreter, or any non-`.exe` program,
+//!   templates in `args` are refused at load; the event reaches the program
+//!   as data instead (environment variables and a JSON line on standard
+//!   input, `oneup_hooks::runner`). Literal arguments (the user's own switches
+//!   and script path) stay allowed, and a literal script file must itself be
+//!   outside every synced folder.
 //!
-//! The paths [`check`] returns (the program, and any script) are opened and
-//! re-checked against a hard link and a swap immediately before the launch
-//! (`oneup_sys::contained`), so nothing moved in between.
+//! The paths [`check`] returns (the program and any script) are opened and
+//! re-checked against a swap immediately before the launch
+//! (`oneup_sys::contained`).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use oneup_local::coexist::{self, OtherEngine};
@@ -30,10 +35,10 @@ use oneup_local::coexist::{self, OtherEngine};
 pub struct Refusal(pub String);
 
 /// The folders this PC syncs with OneUpDrive, each with what syncs it ("the
-/// vault Taxes"), and a safe working folder for hook programs (OneUpDrive's
-/// data folder, never synced). `complete` is false when the set of synced
-/// folders couldn't be worked out in full: hooks are then refused, never
-/// run against a folder we might have missed.
+/// vault Taxes"), a safe working folder for hook programs (the data folder,
+/// never synced), and a `PATH` with synced folders removed. `complete` is
+/// false when the set of synced folders couldn't be worked out in full:
+/// hooks are then refused, never run against a folder we might have missed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Places {
     pub synced: Vec<(PathBuf, String)>,
@@ -42,18 +47,13 @@ pub struct Places {
     /// Where a hook runs (its current folder); must not be synced.
     pub cwd: PathBuf,
     /// A `PATH` with synced folders removed, for the hook's environment.
-    pub safe_path: Option<std::ffi::OsString>,
+    pub safe_path: Option<OsString>,
 }
 
 impl Places {
     /// Adds each folder in its resolved form too, so a folder reached
     /// through a link is recognised either way.
-    pub fn new(
-        synced: Vec<(PathBuf, String)>,
-        complete: bool,
-        cwd: PathBuf,
-        safe_path: Option<std::ffi::OsString>,
-    ) -> Self {
+    pub fn new(synced: Vec<(PathBuf, String)>, complete: bool, cwd: PathBuf, safe_path: Option<OsString>) -> Self {
         let mut all = Vec::with_capacity(synced.len() * 2);
         for (p, what) in synced {
             if let Ok(real) = std::fs::canonicalize(&p)
@@ -67,13 +67,63 @@ impl Places {
     }
 }
 
-/// What a hook will start: the program and any scripts, by full resolved
-/// paths, to open and guard at launch.
+/// What a hook will start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checked {
+    /// The real executable to run (the program, or `cmd.exe` when it wraps a
+    /// `.bat`/`.cmd`).
     pub program: PathBuf,
-    /// Scripts an interpreter runs (verified outside synced folders).
+    /// Literal arguments before the user's (e.g. `["/c", script]`).
+    pub prefix: Vec<OsString>,
+    /// Scripts (and a non-`.exe` program) to open and verify at launch.
     pub scripts: Vec<PathBuf>,
+    /// Whether the user's `args` may hold templates (a real non-interpreter
+    /// `.exe`); false means the event reaches it as data only.
+    pub templates_ok: bool,
+}
+
+/// Whether `stem` (a program's file name without extension, lower-cased) is
+/// a known shell, interpreter or loader: its arguments can become code, so
+/// a cloud value must never be one of them. Matched generously by family —
+/// when in doubt, an interpreter.
+pub fn is_interpreter(stem: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "cmd",
+        "powershell",
+        "powershell_ise",
+        "pwsh",
+        "wscript",
+        "cscript",
+        "mshta",
+        "rundll32",
+        "regsvr32",
+        "regsvcs",
+        "installutil",
+        "msiexec",
+        "wmic",
+        "forfiles",
+        "hh",
+        "wsl",
+        "wslconfig",
+        "nodejs",
+        "deno",
+        "bun",
+        "dotnet",
+        "scriptrunner",
+        "dllhost",
+        "conhost",
+        "cmd.exe",
+    ];
+    if EXACT.contains(&stem) {
+        return true;
+    }
+    // Families named by a prefix: python / python3 / python3.12 / pythonw /
+    // py / pyw, node, ruby, perl, php, java / javaw, (ba)sh, zsh.
+    const PREFIX: &[&str] = &["python", "pyw", "py", "node", "ruby", "perl", "php", "java"];
+    if PREFIX.iter().any(|p| stem.starts_with(p)) {
+        return true;
+    }
+    matches!(stem, "sh" | "bash" | "zsh" | "dash" | "ksh")
 }
 
 /// The file `program` names: a full path as given, or a bare name found on
@@ -109,9 +159,10 @@ pub fn resolve(program: &str) -> Result<PathBuf, Refusal> {
 }
 
 /// Whether `path` (as written or resolved) is somewhere a cloud change can
-/// replace it, and if so, where.
-fn cloud_place(path: &Path, places: &Places) -> Option<String> {
-    for (folder, what) in &places.synced {
+/// replace it, and if so, where. Uses the known synced folders and the OS's
+/// record of every cloud provider's sync roots.
+pub fn cloud_place(path: &Path, synced: &[(PathBuf, String)]) -> Option<String> {
+    for (folder, what) in synced {
         if coexist::is_within(path, folder) {
             return Some(format!("{} ({what})", coexist::plain(folder).display()));
         }
@@ -126,16 +177,22 @@ fn cloud_place(path: &Path, places: &Places) -> Option<String> {
     }
 }
 
-/// A file (the program or a script), resolved and shown not to be anywhere
-/// a cloud change can replace it. Returns its canonical path, to guard at
-/// launch.
+/// A file (the program or a script), resolved and shown not to be anywhere a
+/// cloud change can replace it: the resolved path, every hard link, and the
+/// path as written must all be outside the synced folders. Returns the
+/// canonical path, to guard at launch.
 fn safe_file(given: &Path, what: &str, places: &Places) -> Result<PathBuf, Refusal> {
     let real = std::fs::canonicalize(given).map_err(|e| Refusal(format!("{what} {}: {e}", given.display())))?;
     if !real.is_file() {
         return Err(Refusal(format!("{what} {} isn't a file", given.display())));
     }
-    for p in [given, real.as_path()] {
-        if let Some(place) = cloud_place(p, places) {
+    // Every name the file has: a second one inside a synced folder could be
+    // replaced by a cloud change too. (System interpreters have several
+    // links, all under %SystemRoot%, which pass.)
+    let links = oneup_sys::fs_links::all_links(&real)
+        .map_err(|e| Refusal(format!("{what} {}: can't check its names: {e}", given.display())))?;
+    for p in links.iter().map(PathBuf::as_path).chain([given, real.as_path()]) {
+        if let Some(place) = cloud_place(p, &places.synced) {
             return Err(Refusal(format!(
                 "{what} {} is in {place}: a change in the cloud could replace it, so it never runs as a hook. \
                  Move it to a folder that isn't synced",
@@ -146,14 +203,10 @@ fn safe_file(given: &Path, what: &str, places: &Places) -> Result<PathBuf, Refus
     Ok(real)
 }
 
-/// The program to start for a hook (and any script it runs), by full
-/// resolved paths; refused if anything can't be found, a change in a cloud
-/// folder could replace it, or an argument could make a cloud value run as
-/// code. `cwd` is where a relative script argument is resolved from (the
-/// hook's working folder).
+/// The program to start for a hook (and any script it runs), and whether its
+/// arguments may carry templates. `cwd` is where a relative literal script
+/// argument is resolved.
 pub fn check(program: &str, args: &[String], cwd: &Path, places: &Places) -> Result<Checked, Refusal> {
-    // The synced folders must be known in full, or a program could sit in
-    // one we didn't see.
     if !places.complete {
         return Err(Refusal(
             "OneUpDrive can't list all the folders it syncs right now, so it won't run hooks (it can't be sure a \
@@ -162,221 +215,160 @@ pub fn check(program: &str, args: &[String], cwd: &Path, places: &Places) -> Res
         ));
     }
     let given = resolve(program)?;
-    let program_path = safe_file(&given, "the program", places)?;
-    let scripts = check_args(&program_path, args, cwd, places)?;
-    Ok(Checked { program: program_path, scripts })
-}
+    let real = safe_file(&given, "the program", places)?;
+    let ext = real.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let stem = real.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let templates_ok = ext == "exe" && !is_interpreter(&stem);
 
-/// What the interpreter treats its arguments as, so a cloud value never
-/// lands where it's run as code.
-struct Interpreter {
-    /// Flags whose value, or whose presence, runs arguments as code: never
-    /// allowed for a hook (compared whole, case-insensitively).
-    code_flags: &'static [&'static str],
-    /// The script file is the value of one of these flags (e.g. `-File`),
-    /// or, when empty, the first argument that isn't a switch.
-    script_flags: &'static [&'static str],
-    /// Switches (value-less) allowed before the script for a first-positional
-    /// interpreter; an unrecognised token before the script is refused.
-    /// Empty with `script_flags` set (that form finds the script by flag).
-    safe_switches: &'static [&'static str],
-}
-
-/// A program whose arguments it reads as a command line, so a cloud value
-/// anywhere in them could run: allowed only with no templates at all.
-fn is_command_shell(stem: &str) -> bool {
-    matches!(
-        stem,
-        "cmd"
-            | "wsl"
-            | "wslconfig"
-            | "rundll32"
-            | "regsvr32"
-            | "regsvcs"
-            | "installutil"
-            | "mshta"
-            | "msiexec"
-            | "wmic"
-            | "forfiles"
-            | "hh"
-            | "powershell_ise"
-            | "scriptrunner"
-            | "dllhost"
-            | "conhost"
-    )
-}
-
-/// The known interpreter `stem` is, if it's one with a safe script-file
-/// shape (`None`: not a known script interpreter).
-fn interpreter(stem: &str) -> Option<Interpreter> {
-    Some(match stem {
-        "powershell" | "pwsh" => Interpreter {
-            code_flags: &["-command", "-c", "-e", "-ec", "-enc", "-encodedcommand", "/command", "/c"],
-            script_flags: &["-file", "-f"],
-            safe_switches: &[],
-        },
-        "wscript" | "cscript" => Interpreter { code_flags: &[], script_flags: &[], safe_switches: &[] },
-        "python" | "python3" | "py" | "pythonw" => Interpreter {
-            code_flags: &["-c", "-m"],
-            script_flags: &[],
-            safe_switches: &["-b", "-bb", "-e", "-s", "-i", "-o", "-oo", "-q", "-u", "-v", "-x", "-s", "-ss"],
-        },
-        "node" | "nodejs" => Interpreter {
-            code_flags: &["-e", "--eval", "-p", "--print", "--input-type"],
-            script_flags: &[],
-            safe_switches: &[],
-        },
-        "ruby" => Interpreter { code_flags: &["-e"], script_flags: &[], safe_switches: &["-w", "-v"] },
-        "perl" => Interpreter { code_flags: &["-e", "-e"], script_flags: &[], safe_switches: &["-w"] },
-        "php" => Interpreter { code_flags: &["-r", "-a"], script_flags: &["-f"], safe_switches: &[] },
-        "bash" | "sh" | "zsh" | "dash" => {
-            Interpreter { code_flags: &["-c"], script_flags: &[], safe_switches: &["-l", "-i", "-e", "-x"] }
-        }
-        _ => return None,
-    })
-}
-
-/// Checks a hook's arguments and returns the scripts an interpreter runs,
-/// to guard at launch. `program` is the resolved program.
-fn check_args(program: &Path, args: &[String], cwd: &Path, places: &Places) -> Result<Vec<PathBuf>, Refusal> {
-    let has_template = |a: &str| a.contains('{');
-    let stem = program
-        .file_name()
-        .map(|f| f.to_string_lossy().to_ascii_lowercase())
-        .map(|f| f.trim_end_matches(".exe").to_string())
-        .unwrap_or_default();
-
-    // A command shell: a cloud value anywhere in the line could run, so only
-    // a line with no templates is allowed (the user's own literal command).
-    if is_command_shell(&stem) {
-        if let Some(a) = args.iter().find(|a| has_template(a)) {
-            return Err(Refusal(format!(
-                "{stem} reads its arguments as a command, so a value from the cloud in `{a}` could run. \
-                 Run a program directly, or an interpreter with a script file (e.g. powershell.exe -File script.ps1)"
-            )));
-        }
-        // A literal file it names, if any, still mustn't be in a synced
-        // folder (its contents would be cloud-controlled).
-        return literal_scripts_outside(args, cwd, places);
-    }
-
-    let Some(interp) = interpreter(&stem) else {
-        // An ordinary program: it gets templates as data arguments (argv),
-        // never as code. A literal absolute path it reads is data, not code,
-        // so it isn't restricted; only interpreters and shells are.
-        return Ok(Vec::new());
-    };
-
-    // No code flag, ever (abbreviations of powershell's -Command included via
-    // its own set; we also refuse an unrecognised switch before the script).
-    for a in args {
-        let low = a.to_ascii_lowercase();
-        if interp.code_flags.iter().any(|f| low == *f) {
-            return Err(Refusal(format!(
-                "{stem} runs the value of {a} as code, which a cloud value could reach. Put your code in a script \
-                 file and run that file instead"
-            )));
-        }
-    }
-
-    // Find the script argument.
-    let script_index = if !interp.script_flags.is_empty() {
-        // The token after the script flag.
-        let flag = args.iter().position(|a| {
-            let low = a.to_ascii_lowercase();
-            interp.script_flags.iter().any(|f| low == *f)
-        });
-        let Some(flag) = flag else {
-            return Err(Refusal(format!(
-                "a {stem} hook must run a script file: put {} before it (e.g. {stem} {} script.ps1 {{path}})",
-                interp.script_flags[0], interp.script_flags[0]
-            )));
-        };
-        // Nothing templated before or at the flag's value.
-        if args[..flag].iter().any(|a| has_template(a)) {
-            return Err(Refusal(format!("a template before {} could choose what {stem} runs", interp.script_flags[0])));
-        }
-        flag + 1
-    } else {
-        // The first token that isn't a safe switch is the script.
-        let mut i = 0;
-        while i < args.len() {
-            let a = &args[i];
-            if a.starts_with('-') || a.starts_with('/') {
-                let low = a.to_ascii_lowercase();
-                if !interp.safe_switches.iter().any(|s| low == *s) {
-                    return Err(Refusal(format!(
-                        "{stem}: OneUpDrive doesn't recognise {a} as safe before the script. Run a script file with \
-                         only plain switches before it"
-                    )));
-                }
-                if has_template(a) {
-                    return Err(Refusal(format!("a template in {a} could reach {stem} as code")));
-                }
-                i += 1;
-                continue;
-            }
-            break;
-        }
-        i
-    };
-
-    let Some(script) = args.get(script_index) else {
+    if !templates_ok && let Some(a) = args.iter().find(|a| has_template(a)) {
+        let kind = if ext == "exe" { "an interpreter" } else { "a script, not a plain .exe" };
         return Err(Refusal(format!(
-            "a {stem} hook must name a script file to run (OneUpDrive won't let it read code from its input or a \
-             cloud value)"
-        )));
-    };
-    if has_template(script) {
-        return Err(Refusal(format!(
-            "the script {stem} runs can't be a template like {script}: a cloud value could choose the file. Name a \
-             fixed script file; pass {{path}} after it as an argument"
+            "{program} is {kind}, so a value from the cloud in `{a}` could run as code. OneUpDrive passes the event \
+             to it instead: as environment variables (ONEUPHOOK_PATH, ONEUPHOOK_EVENT, ...) and a JSON line on \
+             standard input. Remove the template; keep only fixed arguments (switches, a script path)"
         )));
     }
-    // The script must be a real file outside every synced folder.
-    let path = resolve_literal(script, cwd);
-    let real = safe_file(&path, "the script", places)?;
-    // Everything after the script is data to it (templates allowed).
-    Ok(vec![real])
+
+    // Literal script/path arguments must be outside every synced folder.
+    let mut scripts = literal_scripts(args, cwd, places)?;
+
+    // How it actually launches.
+    let (launch, prefix) = match ext.as_str() {
+        "exe" => (real.clone(), Vec::new()),
+        "bat" | "cmd" => {
+            // Run the batch through cmd, with only the literal (verified)
+            // script path on the line; the event is data (env + stdin). cmd
+            // doesn't understand an extended `\\?\` path, so the argument is
+            // the plain form; the guard still holds the canonical file.
+            scripts.insert(0, real.clone());
+            let plain = coexist::plain(&real).into_os_string();
+            (cmd_exe()?, vec![OsString::from("/c"), plain])
+        }
+        _ => {
+            return Err(Refusal(format!(
+                "{program} is a {ext} script; run it through its interpreter instead (for example powershell.exe \
+                 -File your-script.ps1, or python.exe your-script.py)"
+            )));
+        }
+    };
+    Ok(Checked { program: launch, prefix, scripts, templates_ok })
 }
 
-/// A literal argument as a path: absolute as given, or relative to `cwd`.
-fn resolve_literal(arg: &str, cwd: &Path) -> PathBuf {
-    let a = arg.trim().trim_matches('"');
-    let p = Path::new(a);
-    if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
+/// `System32\cmd.exe`, to wrap a `.bat`/`.cmd` program.
+fn cmd_exe() -> Result<PathBuf, Refusal> {
+    let root = std::env::var_os("SystemRoot").ok_or_else(|| Refusal("SystemRoot isn't set".into()))?;
+    let p = Path::new(&root).join("System32").join("cmd.exe");
+    std::fs::canonicalize(&p).map_err(|e| Refusal(format!("{}: {e}", p.display())))
 }
 
-/// For a command shell with no templates: any literal argument that is a
-/// file in a synced folder is refused (its contents are cloud-controlled),
-/// and such files are returned to guard. Arguments that aren't paths are
-/// left alone.
-fn literal_scripts_outside(args: &[String], cwd: &Path, places: &Places) -> Result<Vec<PathBuf>, Refusal> {
+/// Whether `arg` holds a template (`{...}`, but not an escaped `{{`).
+fn has_template(arg: &str) -> bool {
+    let mut rest = arg;
+    while let Some(i) = rest.find('{') {
+        let tail = &rest[i..];
+        if let Some(after) = tail.strip_prefix("{{") {
+            rest = after;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Literal arguments that name a file: each is verified to be outside every
+/// synced folder (its contents would otherwise be cloud-controlled), and
+/// collected to guard at launch. Drive-relative paths (`C:script.py`) are
+/// refused; a leading `/c`/`/k` on the token is stripped first.
+fn literal_scripts(args: &[String], cwd: &Path, places: &Places) -> Result<Vec<PathBuf>, Refusal> {
     let mut scripts = Vec::new();
     for a in args {
-        let candidates = [Some(a.as_str()), a.split_once('=').map(|(_, v)| v), a.split_once(':').map(|(_, v)| v)];
-        for c in candidates.into_iter().flatten() {
-            let p = resolve_literal(c, cwd);
-            if !p.is_absolute() {
+        if has_template(a) {
+            continue;
+        }
+        for cand in arg_paths(a) {
+            let p = Path::new(&cand);
+            // A drive-relative path (`C:foo`, no separator after the colon)
+            // resolves against that drive's current directory, which we
+            // can't vouch for.
+            if is_drive_relative(&cand) {
+                return Err(Refusal(format!(
+                    "{a}: `{cand}` is a drive-relative path; give a full path (`C:\\folder\\file`) so it can't \
+                     resolve into a synced folder"
+                )));
+            }
+            if !p.is_absolute() && !cand.contains(['\\', '/']) {
+                // A bare switch or word, not a path.
                 continue;
             }
-            if let Ok(real) = std::fs::canonicalize(&p) {
-                if real.is_file()
-                    && let Some(place) = cloud_place(&real, places).or_else(|| cloud_place(&p, places))
-                {
-                    return Err(Refusal(format!(
-                        "{} is in {place}: a change in the cloud could replace what the hook runs. Move it to a \
-                         folder that isn't synced",
-                        p.display()
-                    )));
-                }
-                if real.is_file() && (c.ends_with(".bat") || c.ends_with(".cmd") || c.ends_with(".ps1")) {
-                    scripts.push(real);
-                }
+            let full = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+            let Ok(real) = std::fs::canonicalize(&full) else { continue };
+            if !real.is_file() {
+                continue;
+            }
+            if let Some(place) = cloud_place(&real, &places.synced).or_else(|| cloud_place(&full, &places.synced)) {
+                return Err(Refusal(format!(
+                    "{} is in {place}: a change in the cloud could replace what the hook runs. Move it to a folder \
+                     that isn't synced",
+                    full.display()
+                )));
+            }
+            if is_script_name(&real) {
+                scripts.push(real);
             }
         }
     }
     Ok(scripts)
+}
+
+/// The path-like candidates in a literal argument: the whole thing, the part
+/// after `=` (`--file=x`), and the part after a leading `/c`/`/k` switch.
+fn arg_paths(arg: &str) -> Vec<String> {
+    let a = arg.trim().trim_matches('"');
+    let mut out = vec![a.to_string()];
+    if let Some((_, v)) = a.split_once('=') {
+        out.push(v.trim_matches('"').to_string());
+    }
+    let low = a.to_ascii_lowercase();
+    if let Some(rest) = low.strip_prefix("/c").or_else(|| low.strip_prefix("/k")) {
+        let rest = rest.trim_start();
+        if !rest.is_empty() {
+            // Keep the original case by slicing the tail of `a`.
+            out.push(a[a.len() - rest.len()..].to_string());
+        }
+    }
+    out
+}
+
+/// A drive-relative path like `C:script.py` (a colon after one letter, not
+/// followed by a separator).
+fn is_drive_relative(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && !matches!(b.get(2), Some(b'\\' | b'/'))
+}
+
+/// Whether a file's extension marks it as a script an interpreter runs
+/// (case-insensitive).
+fn is_script_name(path: &Path) -> bool {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "bat"
+            | "cmd"
+            | "ps1"
+            | "psm1"
+            | "vbs"
+            | "vbe"
+            | "js"
+            | "jse"
+            | "wsf"
+            | "wsh"
+            | "py"
+            | "pyw"
+            | "rb"
+            | "pl"
+            | "php"
+            | "sh"
+    )
 }
 
 #[cfg(test)]
@@ -402,6 +394,10 @@ mod tests {
         Places::new(synced, true, std::env::temp_dir(), None)
     }
 
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
     fn mklink(args: &[&std::ffi::OsStr]) {
         let ok = std::process::Command::new("cmd.exe")
             .arg("/c")
@@ -414,9 +410,44 @@ mod tests {
         assert!(ok, "mklink {args:?}");
     }
 
-    /// A program in a synced folder is refused, however it's reached: by its
-    /// path, in another case, through a junction or a symbolic link, or as a
-    /// script an interpreter runs.
+    #[test]
+    fn interpreter_families_are_recognised_generously() {
+        for s in [
+            "cmd",
+            "powershell",
+            "pwsh",
+            "python",
+            "python3",
+            "python3.12",
+            "pythonw",
+            "py",
+            "pyw",
+            "node",
+            "ruby",
+            "perl",
+            "php",
+            "java",
+            "javaw",
+            "wscript",
+            "cscript",
+            "mshta",
+            "rundll32",
+            "regsvr32",
+            "msiexec",
+            "wsl",
+            "bash",
+            "sh",
+            "deno",
+            "bun",
+        ] {
+            assert!(is_interpreter(s), "{s} should be an interpreter");
+        }
+        for s in ["thumb", "mytool", "ffmpeg", "notify", "7z"] {
+            assert!(!is_interpreter(s), "{s} should not be an interpreter");
+        }
+    }
+
+    /// A program or script in a synced folder is refused, however reached.
     #[test]
     fn a_program_or_script_in_a_synced_folder_is_refused() {
         let t = tmp("refused");
@@ -441,99 +472,111 @@ mod tests {
         let junction = t.0.join("Linked");
         mklink(&["/J".as_ref(), junction.as_os_str(), synced.join("bin").as_os_str()]);
         assert!(check(&junction.join("run.exe").to_string_lossy(), &[], &t.0, &pl).is_err(), "through a junction");
-
-        // A PowerShell script in the synced folder.
-        let ps = synced.join("x.ps1");
-        std::fs::write(&ps, b"echo hi").unwrap();
-        let args = vec!["-File".to_string(), ps.to_string_lossy().into_owned(), "{path}".into()];
-        let e = check("powershell.exe", &args, &tools, &pl).unwrap_err();
-        assert!(e.0.contains("could replace it"), "{e}");
-        // The same script outside is fine, and returned to guard.
-        let ps2 = tools.join("x.ps1");
-        std::fs::write(&ps2, b"echo hi").unwrap();
-        let ok = check(
-            "powershell.exe",
-            &["-File".into(), ps2.to_string_lossy().into_owned(), "{path}".into()],
-            &tools,
-            &pl,
-        )
-        .unwrap();
-        assert_eq!(ok.scripts, vec![std::fs::canonicalize(&ps2).unwrap()]);
     }
 
+    /// A program with a second hard link inside a synced folder is refused;
+    /// one with extra links all outside is fine.
     #[test]
-    fn interpreters_refuse_code_from_the_cloud_but_allow_a_script_with_data() {
-        let t = tmp("interp");
+    fn a_hard_link_into_a_synced_folder_is_refused() {
+        let t = tmp("links");
+        let synced = t.0.join("Synced");
         let tools = t.0.join("Tools");
-        std::fs::create_dir_all(&tools).unwrap();
-        let script = |name: &str| {
-            let p = tools.join(name);
-            std::fs::write(&p, b"x").unwrap();
-            p.to_string_lossy().into_owned()
-        };
-        let synced = t.0.join("Synced");
         std::fs::create_dir_all(&synced).unwrap();
-        std::fs::write(synced.join("evil.py"), b"x").unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let exe = tools.join("run.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
         let pl = places(vec![(synced.clone(), "the folder pair Work".into())]);
-        let hook =
-            |prog: &str, a: &[&str]| check(prog, &a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &tools, &pl);
-
-        // cmd / shells: a template anywhere is refused; a plain command is fine.
-        assert!(hook("cmd.exe", &["/c", "echo", "{path}"]).unwrap_err().0.contains("reads its arguments as a command"));
-        assert!(hook("wsl.exe", &["{path}"]).is_err());
-        assert!(hook("mshta.exe", &["{path}"]).is_err());
-        assert!(hook("rundll32.exe", &["{path}"]).is_err());
-        assert!(hook("regsvr32.exe", &["/s", "{path}"]).is_err());
-
-        // powershell: -Command refused; -File <literal outside> ok; templated script refused.
-        assert!(hook("powershell.exe", &["-Command", "Write-Host {path}"]).unwrap_err().0.contains("runs the value"));
-        assert!(hook("powershell.exe", &["-EncodedCommand", "{path}"]).is_err());
-        assert!(hook("powershell.exe", &["-NoProfile", "-File", &script("a.ps1"), "{path}"]).is_ok());
-        assert!(hook("powershell.exe", &["-File", "{path}"]).unwrap_err().0.contains("can't be a template"));
-        // A template standing in for a switch before -File is refused.
-        assert!(hook("powershell.exe", &["{path}", "-File", &script("b.ps1")]).is_err());
-
-        // python: first positional is the script; -c and -m refused; data after ok.
-        assert!(hook("python.exe", &["-c", "import os"]).is_err());
-        assert!(hook("python.exe", &["-m", "{path}"]).is_err());
-        assert!(hook("python.exe", &[&script("s.py"), "{path}", "{event}"]).is_ok());
-        assert!(hook("python.exe", &["{path}"]).unwrap_err().0.contains("can't be a template"));
-        // An unknown switch before the script is refused (can't classify).
-        assert!(hook("python.exe", &["-W", "ignore", &script("s2.py")]).is_err());
-
-        // node -e refused; node script ok.
-        assert!(hook("node.exe", &["-e", "{path}"]).is_err());
-        assert!(hook("node.exe", &["--eval", "x"]).is_err());
-        assert!(hook("node.exe", &[&script("s.js"), "{detail}"]).is_ok());
-
-        // wscript/cscript: first positional script.
-        assert!(hook("wscript.exe", &["{path}"]).unwrap_err().0.contains("can't be a template"));
-        assert!(hook("cscript.exe", &["//nologo", &script("s.vbs"), "{path}"]).is_err(), "// switch not recognised");
-        assert!(hook("cscript.exe", &[&script("s2.vbs"), "{path}"]).is_ok());
-
-        // A script in a synced folder, even literal, is refused.
-        assert!(
-            hook("python.exe", &[&synced.join("evil.py").to_string_lossy()])
-                .unwrap_err()
-                .0
-                .contains("could replace it")
-        );
-
-        // An ordinary program gets {path} as data: allowed.
-        let tool = tools.join("thumb.exe");
-        std::fs::write(&tool, b"MZ").unwrap();
-        assert!(check(&tool.to_string_lossy(), &["{path}".into()], &tools, &pl).unwrap().scripts.is_empty());
+        // Outside only: fine.
+        let also = tools.join("also.exe");
+        std::fs::hard_link(&exe, &also).unwrap();
+        assert!(check(&exe.to_string_lossy(), &[], &t.0, &pl).is_ok(), "extra link, still outside");
+        // A link inside the synced folder: refused.
+        let inside = synced.join("run.exe");
+        std::fs::hard_link(&exe, &inside).unwrap();
+        let e = check(&exe.to_string_lossy(), &[], &t.0, &pl).unwrap_err();
+        assert!(e.0.contains("the folder pair Work"), "{e}");
     }
 
+    /// Templates are allowed only for a real, non-interpreter .exe.
     #[test]
-    fn a_relative_script_resolves_against_the_working_folder() {
-        let t = tmp("relscript");
+    fn templates_are_only_for_a_plain_exe() {
+        let t = tmp("templates");
+        std::fs::create_dir_all(&t.0).unwrap();
+        let exe = t.0.join("thumb.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let bat = t.0.join("hook.bat");
+        std::fs::write(&bat, b"@exit /b 0").unwrap();
+        let pl = places(vec![]);
+        // Plain exe: templates fine.
+        let c = check(&exe.to_string_lossy(), &args(&["{path}"]), &t.0, &pl).unwrap();
+        assert!(c.templates_ok && c.prefix.is_empty() && c.scripts.is_empty());
+        // Interpreter: a template is refused with guidance.
+        let e = check("powershell.exe", &args(&["-File", "x.ps1", "{path}"]), &t.0, &pl).unwrap_err();
+        assert!(e.0.contains("ONEUPHOOK_PATH") && e.0.contains("interpreter"), "{e}");
+        assert!(check("cmd.exe", &args(&["/c", "echo {relpath}"]), &t.0, &pl).is_err());
+        // A .bat program: templates refused, wrapped in cmd /c, guarded.
+        let e = check(&bat.to_string_lossy(), &args(&["{detail}"]), &t.0, &pl).unwrap_err();
+        assert!(e.0.contains("script, not a plain .exe"), "{e}");
+        let c = check(&bat.to_string_lossy(), &[], &t.0, &pl).unwrap();
+        assert!(!c.templates_ok);
+        assert!(c.program.to_string_lossy().to_lowercase().ends_with(r"\cmd.exe"));
+        let plain_bat = coexist::plain(&std::fs::canonicalize(&bat).unwrap()).into_os_string();
+        assert_eq!(c.prefix, vec![OsString::from("/c"), plain_bat]);
+        assert_eq!(c.scripts, vec![std::fs::canonicalize(&bat).unwrap()]);
+        // A .ps1 program (not .bat): refused, pointed at an interpreter.
+        let ps = t.0.join("x.ps1");
+        std::fs::write(&ps, b"x").unwrap();
+        assert!(check(&ps.to_string_lossy(), &[], &t.0, &pl).unwrap_err().0.contains("run it through its interpreter"));
+    }
+
+    /// A literal script an interpreter runs must be outside synced folders;
+    /// drive-relative paths and a `/c`-attached script are caught.
+    #[test]
+    fn literal_scripts_are_checked() {
+        let t = tmp("literal");
         let synced = t.0.join("Synced");
+        let tools = t.0.join("Tools");
         std::fs::create_dir_all(&synced).unwrap();
-        std::fs::write(synced.join("s.py"), b"x").unwrap();
-        // cwd is the synced folder: a relative script resolves into it and is refused.
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(synced.join("evil.ps1"), b"x").unwrap();
+        let good = tools.join("good.ps1");
+        std::fs::write(&good, b"x").unwrap();
         let pl = places(vec![(synced.clone(), "the main folder".into())]);
-        assert!(check("python.exe", &["s.py".into()], &synced, &pl).unwrap_err().0.contains("could replace it"));
+        // Script inside the synced folder: refused.
+        let e = check("powershell.exe", &args(&["-File", &synced.join("evil.ps1").to_string_lossy()]), &tools, &pl)
+            .unwrap_err();
+        assert!(e.0.contains("could replace what the hook runs"), "{e}");
+        // Outside: fine, and guarded.
+        let c = check("powershell.exe", &args(&["-NoProfile", "-File", &good.to_string_lossy()]), &tools, &pl).unwrap();
+        assert_eq!(c.scripts, vec![std::fs::canonicalize(&good).unwrap()]);
+        // A drive-relative path is refused.
+        assert!(check("cmd.exe", &args(&["/c", "C:evil.bat"]), &tools, &pl).unwrap_err().0.contains("drive-relative"));
+        // A script attached to /c, inside the synced folder, is caught.
+        let attached = format!("/c{}", synced.join("evil.ps1").to_string_lossy());
+        assert!(check("cmd.exe", &args(&[&attached]), &tools, &pl).unwrap_err().0.contains("could replace"));
+    }
+
+    /// However the template is positioned, an interpreter refuses it — the
+    /// old switch-by-switch allow-list is gone.
+    #[test]
+    fn interpreters_refuse_a_template_in_any_position() {
+        let t = tmp("positions");
+        std::fs::create_dir_all(&t.0).unwrap();
+        let pl = places(vec![]);
+        let refused = |prog: &str, a: &[&str]| check(prog, &args(a), &t.0, &pl).is_err();
+        // PowerShell: abbreviated/positional/after other switches.
+        assert!(refused("powershell.exe", &["-co", "{path}"]));
+        assert!(refused("powershell.exe", &["{path}"]));
+        assert!(refused("powershell.exe", &["-ExecutionPolicy", "Bypass", "-File", "x.ps1", "{path}"]));
+        // php -B (run code before), python-family variants, pyw -c, node -e.
+        assert!(refused("php.exe", &["-B", "{detail}"]));
+        assert!(refused("php.exe", &["-d", "auto_prepend_file={path}"]));
+        assert!(refused("pyw.exe", &["-c", "{path}"]));
+        assert!(refused("python3.12.exe", &["{relpath}"]));
+        assert!(refused("node.exe", &["-e", "{detail}"]));
+        // A literal interpreter command with no template is fine (the user's
+        // own code), e.g. cmd echoing a fixed string.
+        assert!(check("cmd.exe", &args(&["/c", "echo done"]), &t.0, &pl).is_ok());
     }
 
     #[test]
@@ -556,5 +599,12 @@ mod tests {
         let found = resolve("cmd").unwrap();
         assert!(found.to_string_lossy().to_ascii_lowercase().ends_with(r"\cmd.exe"), "{found:?}");
         assert!(resolve("no-such-program-oneup").unwrap_err().0.contains("isn't on PATH"));
+    }
+
+    #[test]
+    fn drive_relative_and_escaped_templates() {
+        assert!(is_drive_relative("C:evil.bat") && is_drive_relative("c:x"));
+        assert!(!is_drive_relative(r"C:\ok") && !is_drive_relative("plain") && !is_drive_relative("/c"));
+        assert!(has_template("{path}") && !has_template("{{literal}}") && !has_template("plain"));
     }
 }
