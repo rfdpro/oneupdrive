@@ -36,9 +36,9 @@ oneup --data-dir … rules --unpin "*.psd"
 * Adding or removing a rule says how many files it would download and how much, and asks first (`oneup rules --pin` needs `--yes`).
 * Matching files show **Always keep on this device** in File Explorer and download a share at a time: downloads stop when you pause, and leave at least 1 GB (or the low-disk share below) free.
 * If the rules want to download more than 1 GB beyond what you agreed to (files that keep arriving, say), they wait: **Exclude** shows **Waiting to download** with **Download**, and `oneup rules --allow-downloads` does the same.
-* A pin rule wins over freeing space: the automatic policies below skip them, choosing **Free up space** in File Explorer on one is undone, and `oneup free` refuses one (remove the rule first). `oneup explain` says so for the file.
+* What wins: a pin from a rule, or from a folder above (**Always keep on this device** on the folder), wins over the automatic policies below and over **Free up space** chosen on a folder above. **Free up space** on the file itself wins: the file is freed and no longer kept, and its pin rule leaves it freed until you keep it on this device again. In File Explorer that's choosing **Free up space** on the file; OneUpDrive tells it from a folder's by the folder: Explorer marks the folder too when the folder was chosen. So freeing a folder first and then one file in it counts as the folder's choice, and the file stays kept; keep the folder on this device again, then free the file. `oneup free FILE` works the same, and `oneup free FOLDER` frees what's in it except what's kept, and says how many it skipped.
 * Removing a rule sets what it pinned back to the default: the files stay on this PC until something frees them. Files you had set to **Always keep on this device** yourself stay that way, also inside a folder a rule keeps. Moving a file or folder out of a rule's place does the same for what the rule pinned; moving one in pins it and everything in it.
-* `oneup explain PATH` names the pin rule keeping a file.
+* `oneup explain PATH` names the pin rule keeping a file, or says that it was freed on request and isn't kept until you keep it again.
 
 ## Freeing space by itself
 On the **Files** page, in the folder's settings (nothing selected), under **Free up space**:

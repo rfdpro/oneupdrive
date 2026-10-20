@@ -5916,7 +5916,7 @@
             if (F.root.on_demand) {
                 box.append(el("div", {
                     className: "group",
-                    textContent: "Always on this PC"
+                    textContent: tr("Always on this PC")
                 }));
                 const pins = rs.rules.pin || [];
                 // Any change that would download files says so and asks;
@@ -5926,37 +5926,46 @@
                         root: F.root.id,
                         pin: next
                     }));
-                    if (pv.ask && !confirm(`Download ${pv.all ? "" : "at least "}${pv.files.toLocaleString()} online-only files (${size(pv.bytes)})${pv.free != null ? ", with " + size(pv.free) + " free" : ""}?`)) return;
+                    // Whole sentences, one per case, for translators.
+                    const args = {
+                        n: pv.files,
+                        size: size(pv.bytes),
+                        free: pv.free != null ? size(pv.free) : ""
+                    };
+                    const ask = pv.free == null ? (pv.all ? tr("Download {n, plural, one {# online-only file} other {# online-only files}} ({size})?", args) : tr("Download at least {n, plural, one {# online-only file} other {# online-only files}} ({size})?", args)) : pv.all ? tr("Download {n, plural, one {# online-only file} other {# online-only files}} ({size})? {free} free.", args) : tr("Download at least {n, plural, one {# online-only file} other {# online-only files}} ({size})? {free} free.", args);
+                    if (pv.ask && !confirm(ask)) return;
                     run(call("pin_save", {
                         root: F.root.id,
                         pin: next,
                         bytes: pv.bytes
                     }), ok).then(() => afterChange(""));
                 };
-                if (rs.rules.pin_waiting != null) box.append(flatRow("Waiting to download", `Pin rules want more than you approved (${size(rs.rules.pin_waiting)} next).`, el("button", {
+                if (rs.rules.pin_waiting != null) box.append(flatRow(tr("Waiting to download"), tr("Pin rules want more than you approved ({size} next).", {
+                    size: size(rs.rules.pin_waiting)
+                }), el("button", {
                     className: "btn small",
-                    textContent: "Download",
+                    textContent: tr("Download"),
                     onclick: () => run(call("pin_allow", {
                         root: F.root.id
-                    }), "Downloading").then(() => afterChange(""))
+                    }), tr("Downloading")).then(() => afterChange(""))
                 })));
                 const add = el("input", {
                     type: "text",
                     spellcheck: false,
-                    placeholder: "*.psd or /Work/",
-                    "aria-label": "Pin rule"
+                    placeholder: tr("*.psd or /Work/"),
+                    "aria-label": tr("Pin rule")
                 });
                 const addBtn = el("button", {
                     className: "btn small",
-                    textContent: "Add",
-                    onclick: () => add.value.trim() && savePins([...pins, add.value.trim()], "Kept on this PC")
+                    textContent: tr("Add"),
+                    onclick: () => add.value.trim() && savePins([...pins, add.value.trim()], tr("Kept on this PC"))
                 });
-                box.append(flatRow(pins.length ? "Add a pin rule" : "No pin rules", "Matching files stay downloaded. Space policies never free them.", add, addBtn));
-                for (const r of pins) box.append(flatRow(r, "Pin rule", el("button", {
+                box.append(flatRow(pins.length ? tr("Add a pin rule") : tr("No pin rules"), tr("Matching files stay downloaded. Space policies never free them."), add, addBtn));
+                for (const r of pins) box.append(flatRow(r, tr("Pin rule"), el("button", {
                     className: "btn small",
-                    textContent: "Remove",
+                    textContent: tr("Remove"),
                     // Removing a `!` rule can pin more: the same question.
-                    onclick: () => savePins(pins.filter(x => x !== r), "Pin rule removed")
+                    onclick: () => savePins(pins.filter(x => x !== r), tr("Pin rule removed"))
                 })));
             }
             box.append(el("div", {

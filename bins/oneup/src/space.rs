@@ -152,7 +152,8 @@ fn freeable(
         return Ok(None);
     }
     let Some(path) = path else { return Ok(None) };
-    if kept(&path) {
+    // A pin rule's file, unless it was freed by name since.
+    if kept(&path) && !store.read(|o| o.pin_released_has(r.file_id))? {
         return Ok(None);
     }
     if accessed(&path).is_some_and(|a| a >= cutoff) {
@@ -278,5 +279,10 @@ mod tests {
         let disk = Disk { free: 1, total: 1_000_000 };
         let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &kept).unwrap();
         assert_eq!(freed(&sel), vec![10]);
+        // Freed by name since: the rule doesn't keep it any more.
+        s.write(|o| o.pin_released_add(11)).unwrap();
+        s.write(|o| o.meta_delete(KEY_CURSOR)).unwrap();
+        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &kept).unwrap();
+        assert_eq!(freed(&sel), vec![10, 11]);
     }
 }

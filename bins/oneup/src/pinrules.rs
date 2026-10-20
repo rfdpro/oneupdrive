@@ -25,9 +25,17 @@
 //! growing back-off; when that table is full, another walk follows as soon
 //! as it has room again.
 //!
-//! **A rule wins over "Free up space".** An item a rule pinned that loses
-//! its pin (File Explorer's "Free up space", seen in the change journal) is
-//! queued by the store (`pin_changed`) and pinned again by the next pass.
+//! **"Free up space" on the file itself wins; on a folder, the rule does.**
+//! A file a rule keeps that someone frees by name (`oneup free FILE`, or
+//! File Explorer's "Free up space" on the file) is released from the rules
+//! (`pin_released`): it's freed and stays so until someone keeps it on this
+//! device again. Freed through a folder above it, it keeps its pin: the
+//! rule's pin, like a pin a folder passes on, wins over a folder's "Free up
+//! space" and over the automatic space policies. File Explorer doesn't say
+//! which was chosen; it marks every item it frees "free up space", the
+//! folder too when the folder was chosen, so a file whose folder isn't
+//! marked was freed by name ([`freed_by_name`]). Items losing a rule's pin
+//! are queued by the store from the change journal (`pin_changed`).
 //!
 //! **Downloads are asked for.** Saving pin rules that add pins shows what
 //! they'd download and needs a yes ([`preview`], [`approve`]); the agent
@@ -93,8 +101,10 @@ const PER_PASS: usize = 2_000;
 pub const PAGE: usize = 256;
 /// Retries looked at per pass.
 const RETRIES: usize = 256;
-/// `FILE_ATTRIBUTE_PINNED`, `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
+/// `FILE_ATTRIBUTE_PINNED`, `FILE_ATTRIBUTE_UNPINNED`,
+/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
 const PINNED: u32 = 0x0008_0000;
+const UNPINNED: u32 = 0x0010_0000;
 const RECALL: u32 = 0x0040_0000;
 
 /// What an item's pin should become.
@@ -190,8 +200,11 @@ pub struct Pass {
     pub unpinned: usize,
     /// Pins that couldn't be set now; tried again later.
     pub waiting: usize,
-    /// Items a rule keeps that lost their pin ("Free up space"), pinned again.
+    /// Items a rule keeps that lost their pin through a folder's "Free up
+    /// space", pinned again.
     pub repinned: usize,
+    /// Files a rule kept that were freed by name: released from the rules.
+    pub released: usize,
     /// Work is left for the next pass.
     pub more: bool,
 }
@@ -454,8 +467,9 @@ fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
             store.write(|o| o.pin_retry_remove(id))?;
             continue;
         };
-        let matches = pins.pins(&rel, row.kind != LocalKind::File);
         let pinned = row.attributes & PINNED != 0;
+        let released = !pinned && store.read(|o| o.pin_released_has(id))?;
+        let matches = !released && pins.pins(&rel, row.kind != LocalKind::File);
         let owned = store.read(|o| o.pin_owned_has(id))?;
         let change = match op {
             PinOp::Pin if matches && !pinned => Change::Pin,
@@ -520,6 +534,15 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
             store.write(|o| o.pin_changed_done(id))?;
             continue;
         }
+        if freed_by_name(store, &row)? {
+            // "Free up space" on the file itself: the person's choice wins.
+            store.write(|o| {
+                o.pin_released_add(id)?;
+                o.pin_changed_done(id)
+            })?;
+            pass.released += 1;
+            continue;
+        }
         if pinner.set(&rel, Change::Pin).is_ok() {
             store.write(|o| o.pin_changed_done(id))?;
             pass.repinned += 1;
@@ -536,6 +559,129 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
         }
     }
     Ok(())
+}
+
+/// Whether `row`, set to "free up space" and not pinned, was freed by name
+/// rather than through a folder above it: File Explorer marks each item it
+/// frees, the chosen folder too, so a file whose folder isn't marked was
+/// chosen itself (a folder freed later, on its own, can't be told apart).
+pub fn freed_by_name(store: &Store, row: &LocalRow) -> Result<bool> {
+    if row.attributes & PINNED != 0 || row.attributes & UNPINNED == 0 {
+        return Ok(false);
+    }
+    let parent = match row.parent_id {
+        Some(p) => store.read(|o| o.local_get(p))?,
+        None => None,
+    };
+    Ok(parent.is_none_or(|p| p.kind == LocalKind::Root || p.attributes & UNPINNED == 0))
+}
+
+/// Whether a pin rule keeps the file `id` at `rel`: the rules match it and
+/// it wasn't freed by name since (`pin_released`).
+pub fn kept_by_rule(store: &Store, pins: &PinSet, id: u128, rel: &str) -> Result<bool> {
+    Ok(pins.pins(rel, false) && !store.read(|o| o.pin_released_has(id))?)
+}
+
+/// What `oneup free PATH` did ([`free_plan`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FreePlan {
+    /// Items set to "free up space".
+    pub freed: usize,
+    /// Kept: pinned, inside a pinned folder, or kept by a pin rule; files.
+    pub skipped: usize,
+    /// The file named, kept on this device before: released from its pin
+    /// (and from the pin rule that kept it, if one did).
+    pub released: Option<u128>,
+}
+
+/// What freeing `rel` does. A file named itself is freed even if it's kept
+/// on this device (its pin is dropped; one a pin rule keeps is released from
+/// it, so the rule doesn't pin it again). A folder is freed with what's in
+/// it, except what's kept: a pinned file or folder (and what's inside a
+/// pinned folder) and what a pin rule keeps are skipped and counted.
+/// `free(rel)` sets one item to "free up space"; the plan is read from the
+/// database a page at a time, never held whole.
+pub fn free_plan(
+    store: &Store,
+    pins: &PinSet,
+    rel: &str,
+    free: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<FreePlan> {
+    let rel = crate::filetree::clean(rel);
+    let Some(r) = store.read(|o| o.local_root())? else { return Ok(FreePlan::default()) };
+    let Some(row) = store.read(|o| row_at(o, r.root_file_id, &rel))? else {
+        free(&rel)?;
+        return Ok(FreePlan { freed: 1, ..FreePlan::default() });
+    };
+    free(&rel)?;
+    if row.kind == LocalKind::File {
+        let released = (row.attributes & PINNED != 0 || pins.pins(&rel, false)).then_some(row.file_id);
+        return Ok(FreePlan { freed: 1, released, skipped: 0 });
+    }
+    let mut plan = FreePlan { freed: 1, ..FreePlan::default() };
+    let mut stack = vec![Frame { id: row.file_id, rel, after: None }];
+    while let Some(top) = stack.last().cloned() {
+        let page = store.read(|o| o.local_children_page(top.id, top.after, PAGE))?;
+        if page.is_empty() {
+            stack.pop();
+            continue;
+        }
+        let mut down = None;
+        for c in page {
+            if let Some(f) = stack.last_mut() {
+                f.after = Some(c.file_id);
+            }
+            let child = format!("{}/{}", top.rel, c.name);
+            let folder = c.kind == LocalKind::Folder;
+            let kept = c.attributes & PINNED != 0
+                || (pins.pins(&child, folder) && !store.read(|o| o.pin_released_has(c.file_id))?);
+            if kept {
+                plan.skipped += if folder { count_files(store, c.file_id)? } else { 1 };
+                continue;
+            }
+            free(&child)?;
+            plan.freed += 1;
+            if folder && c.skip == Skip::None {
+                down = Some(Frame { id: c.file_id, rel: child, after: None });
+                break;
+            }
+        }
+        if let Some(f) = down {
+            stack.push(f);
+        }
+    }
+    Ok(plan)
+}
+
+/// The files inside the folder `id`, at any depth (paged).
+fn count_files(store: &Store, id: u128) -> Result<usize> {
+    let mut n = 0;
+    let mut stack = vec![Frame { id, rel: String::new(), after: None }];
+    while let Some(top) = stack.last().cloned() {
+        let page = store.read(|o| o.local_children_page(top.id, top.after, PAGE))?;
+        if page.is_empty() {
+            stack.pop();
+            continue;
+        }
+        let mut down = None;
+        for c in page {
+            if let Some(f) = stack.last_mut() {
+                f.after = Some(c.file_id);
+            }
+            match c.kind {
+                LocalKind::File => n += 1,
+                LocalKind::Folder if c.skip == Skip::None => {
+                    down = Some(Frame { id: c.file_id, rel: String::new(), after: None });
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(f) = down {
+            stack.push(f);
+        }
+    }
+    Ok(n)
 }
 
 /// Records the person's yes to downloading `bytes` for the pin rules whose
@@ -708,7 +854,9 @@ fn reconcile(
     }
     let id = row.file_id;
     let pinned = row.attributes & PINNED != 0;
-    if !pins.pins(rel, row.kind != LocalKind::File) {
+    // Freed by name: no rule keeps it until it's pinned again.
+    let released = !pinned && store.read(|o| o.pin_released_has(id))?;
+    if released || !pins.pins(rel, row.kind != LocalKind::File) {
         if store.read(|o| o.pin_owned_has(id))? {
             unpin(store, pinner, row, rel, now_ms, pass)?;
         }
@@ -1031,6 +1179,7 @@ mod tests {
             total.unpinned += p.unpinned;
             total.waiting += p.waiting;
             total.repinned += p.repinned;
+            total.released += p.released;
             if !p.more {
                 break;
             }
@@ -1197,26 +1346,101 @@ mod tests {
         assert_eq!(got, want, "the left-out ones are pinned");
     }
 
-    /// "Free up space" on a file a rule keeps, seen only as an attribute
-    /// change from the journal (no sync activity), is undone by the next pass.
+    /// Sets "free up space" on items, as File Explorer does (recorded by the
+    /// observer from the journal).
+    fn explorer_free(s: &mut Store, ids: &[u128]) {
+        s.write(|o| {
+            for id in ids {
+                let mut r = o.local_get(*id)?.unwrap();
+                r.attributes = (r.attributes & !PINNED) | UNPINNED;
+                o.local_update(&r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// "Free up space" through a folder (File Explorer marks the folder and
+    /// everything in it) doesn't free a file a rule keeps: seen only as
+    /// attribute changes from the journal, it's pinned again by the next pass.
     #[test]
-    fn free_up_space_on_a_rule_pinned_file_is_undone() {
-        let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
+    fn free_up_space_through_a_folder_leaves_the_rules_files_pinned() {
+        let mut s = store(&[row(2, 1, "Art", LocalKind::Folder, 0x10), row(3, 2, "a.psd", LocalKind::File, RECALL)]);
         let mut fake = Fake::default();
         let pins = PinSet::new(&["*.psd"]);
         run(&mut s, &mut fake, &pins, 0);
-        observe(&mut s, &fake, &[(2, "a.psd")]);
-        // File Explorer's "Free up space": unpinned (as the observer records it).
+        observe(&mut s, &fake, &[(3, "Art/a.psd")]);
+        explorer_free(&mut s, &[2, 3]);
+        fake.set.clear();
+        let p = run(&mut s, &mut fake, &pins, 0);
+        assert_eq!((p.repinned, p.released), (1, 0));
+        assert_eq!(fake.set, [("Art/a.psd".to_string(), Change::Pin)]);
+    }
+
+    /// "Free up space" on the file itself drops the rule's pin: the file is
+    /// released, and neither the next pass nor a new walk of the rules pins
+    /// it again, until someone keeps it on this device again.
+    #[test]
+    fn free_up_space_on_the_file_itself_releases_it_from_the_rule() {
+        let mut s = store(&[row(2, 1, "Art", LocalKind::Folder, 0x10), row(3, 2, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(3, "Art/a.psd")]);
+        explorer_free(&mut s, &[3]);
+        fake.set.clear();
+        let p = run(&mut s, &mut fake, &pins, 0);
+        assert_eq!((p.repinned, p.released), (0, 1));
+        assert!(fake.set.is_empty());
+        assert!(s.read(|o| o.pin_released_has(3)).unwrap() && !s.read(|o| o.pin_owned_has(3)).unwrap());
+        // The rules change (a walk): still released.
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd", "*.png"]), 0);
+        assert!(fake.set.is_empty(), "{:?}", fake.set);
+        // Kept again in File Explorer: the release ends.
         s.write(|o| {
-            let mut r = o.local_get(2)?.unwrap();
-            r.attributes = (r.attributes & !PINNED) | 0x0010_0000;
+            let mut r = o.local_get(3)?.unwrap();
+            r.attributes = (r.attributes & !UNPINNED) | PINNED;
             o.local_update(&r)
         })
         .unwrap();
-        fake.set.clear();
-        let p = run(&mut s, &mut fake, &pins, 0);
-        assert_eq!(p.repinned, 1);
-        assert_eq!(fake.set, [("a.psd".to_string(), Change::Pin)]);
+        assert!(!s.read(|o| o.pin_released_has(3)).unwrap());
+    }
+
+    /// `oneup free`: a file named itself is freed even if kept (and released
+    /// from the rule); through a folder, what's kept (pinned, in a pinned
+    /// folder, or by a pin rule) is skipped and counted.
+    #[test]
+    fn freeing_by_name_frees_the_file_and_through_a_folder_skips_what_is_kept() {
+        let s = store(&[
+            row(2, 1, "Docs", LocalKind::Folder, 0x10),
+            row(3, 2, "a.txt", LocalKind::File, 0),
+            row(4, 2, "mine.txt", LocalKind::File, PINNED),
+            row(5, 2, "art.psd", LocalKind::File, 0),
+            row(6, 2, "Kept", LocalKind::Folder, 0x10 | PINNED),
+            row(7, 6, "x.txt", LocalKind::File, 0),
+            row(8, 6, "y.txt", LocalKind::File, 0),
+            row(9, 2, "Sub", LocalKind::Folder, 0x10),
+            row(10, 9, "b.txt", LocalKind::File, 0),
+        ]);
+        let pins = PinSet::new(&["*.psd"]);
+        let mut freed = Vec::new();
+        let plan = free_plan(&s, &pins, "Docs", &mut |r| {
+            freed.push(r.to_string());
+            Ok(())
+        })
+        .unwrap();
+        freed.sort();
+        assert_eq!(freed, ["Docs", "Docs/Sub", "Docs/Sub/b.txt", "Docs/a.txt"]);
+        assert_eq!((plan.skipped, plan.released), (4, None), "mine.txt, art.psd, Kept's two files");
+        let mut freed = Vec::new();
+        let plan = free_plan(&s, &pins, "Docs/art.psd", &mut |r| {
+            freed.push(r.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((freed, plan.released), (vec!["Docs/art.psd".to_string()], Some(5)));
+        let plan = free_plan(&s, &pins, "Docs/mine.txt", &mut |_| Ok(())).unwrap();
+        assert_eq!(plan.released, Some(4), "a pinned file named itself is freed too");
     }
 
     /// What the rules download is counted against what was approved, across

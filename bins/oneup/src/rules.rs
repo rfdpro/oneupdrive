@@ -353,23 +353,45 @@ pub async fn pin(data_dir: &Path, store: &Store, path: &str, keep: bool) -> Resu
         bail!("Files On-Demand is off for this folder: every file is kept on this PC already (`oneup on-demand on`)");
     }
     let rel = crate::activity::normalize(&crate::activity::within(&pair.local, path)?);
-    let full =
-        rel.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).fold(pair.local.clone(), |p, x| p.join(x));
-    if !keep {
-        // A pin rule wins: the agent would pin it again.
-        let pins = config::load_rules(data_dir, store)?.pin_set();
-        if let Some(rule) = pins.pinned_by(&rel, full.is_dir()) {
-            bail!("{rel} is kept on this PC by the pin rule `{rule}`; remove that rule first (oneup rules --unpin)");
-        }
-    }
-    let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
-    let pin = if keep { provider::Pin::Pinned } else { provider::Pin::Unpinned };
-    if full.is_dir() { provider::set_pin_tree(&f, pin) } else { provider::set_pin(&f, pin) }
-        .with_context(|| format!("{rel} isn't an online-only-capable item"))?;
+    let at = |rel: &str| {
+        rel.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).fold(pair.local.clone(), |p, x| p.join(x))
+    };
+    let full = at(&rel);
     if keep {
+        let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
+        if full.is_dir() {
+            provider::set_pin_tree(&f, provider::Pin::Pinned)
+        } else {
+            provider::set_pin(&f, provider::Pin::Pinned)
+        }
+        .with_context(|| format!("{rel} isn't an online-only-capable item"))?;
+        // Kept again: a pin rule keeps it again too.
+        let root = store.read(|o| o.local_root())?;
+        if let Some(r) = root
+            && let Some(row) = store.read(|o| oneup_app::filetree::row_at(o, r.root_file_id, &rel))?
+        {
+            oneup_app::setup::open_store(data_dir, 1024)?.write(|o| o.pin_released_remove(row.file_id))?;
+        }
         println!("{rel}: always kept on this device; the background agent downloads what isn't here yet.");
     } else {
+        // A file named itself is freed even if kept on this device (a pin
+        // rule then leaves it freed); in a folder, what's kept is skipped.
+        let pins = config::load_rules(data_dir, store)?.pin_set();
+        let mut set = |rel: &str| -> Result<()> {
+            let full = at(rel);
+            let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
+            provider::set_pin(&f, provider::Pin::Unpinned)
+                .with_context(|| format!("{rel} isn't an online-only-capable item"))
+        };
+        let plan = oneup_app::pinrules::free_plan(store, &pins, &rel, &mut set)?;
+        if let Some(id) = plan.released {
+            oneup_app::setup::open_store(data_dir, 1024)?.write(|o| o.pin_released_add(id))?;
+            println!("{rel}: no longer kept on this device; it stays online-only until you keep it again (oneup pin).");
+        }
         println!("{rel}: online-only; the background agent frees the space (what's in OneDrive stays there).");
+        if plan.skipped > 0 {
+            println!("  {} kept file(s) skipped (always kept on this device, or by a pin rule).", plan.skipped);
+        }
     }
     if !crate::agent::nudge(data_dir).await {
         println!("(The background agent isn't running; it does this when it starts: `oneup start`.)");
@@ -508,11 +530,18 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     if engine {
         return Ok(());
     }
-    if let Some(rule) = config::load_rules(data_dir, store)?.pin_set().pinned_by(rel, is_dir) {
+    let released = match &row {
+        Some(r) => store.read(|o| o.pin_released_has(r.file_id))?,
+        None => false,
+    };
+    if released {
+        println!("  freed on request: no pin rule keeps it until you keep it on this device again (oneup pin)");
+    } else if let Some(rule) = config::load_rules(data_dir, store)?.pin_set().pinned_by(rel, is_dir) {
         println!("  always kept on this PC: pin rule {rule} (with Files On-Demand)");
-        // The rule wins over a later "Free up space" (File Explorer's or
-        // `oneup free`): said here, where someone looks for why.
-        println!("  \"Free up space\" on it is undone while that rule stays (oneup rules --unpin to change it)");
+        // What wins over what, said where someone looks for why.
+        println!(
+            "  \"Free up space\" on this file itself frees it and the rule leaves it freed; through a folder, the rule keeps it"
+        );
     }
     let listed = skipped_at.is_none();
     if let Some(at) = skipped_at {

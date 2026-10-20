@@ -13,6 +13,10 @@
 //!   once its item was pinned again or handed to `pin_retry`.
 //! * `pin_subtree`: folders moved (or newly pinned) since, whose contents
 //!   the rules must be checked against.
+//! * `pin_released`: files freed on request by name ("Free up space" on
+//!   the file itself) that a pin rule matches: the rule leaves them freed
+//!   until someone keeps them on this device again (a trigger drops the
+//!   row when the file is pinned again).
 //! * `pin_user`: items found pinned already in a folder a rule pinned,
 //!   when the rules first looked at them: the user's own, never taken as
 //!   having inherited the folder's pin.
@@ -68,7 +72,8 @@ pub(crate) fn migrate_v22() -> String {
         DELETE FROM pin_retry WHERE file_id = OLD.file_id;
         DELETE FROM pin_changed WHERE file_id = OLD.file_id;
         DELETE FROM pin_subtree WHERE file_id = OLD.file_id;
-        DELETE FROM pin_user WHERE file_id = OLD.file_id;";
+        DELETE FROM pin_user WHERE file_id = OLD.file_id;
+        DELETE FROM pin_released WHERE file_id = OLD.file_id;";
     format!(
         "CREATE TABLE pin_owned (file_id BLOB PRIMARY KEY, at_seq INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
          CREATE TABLE pin_retry (
@@ -81,6 +86,7 @@ pub(crate) fn migrate_v22() -> String {
          CREATE TABLE pin_changed (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_subtree (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_user (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
+         CREATE TABLE pin_released (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_owned_hold (file_id BLOB PRIMARY KEY, at_seq INTEGER NOT NULL) WITHOUT ROWID;
          CREATE TABLE pin_retry_hold (file_id BLOB PRIMARY KEY, op INTEGER NOT NULL) WITHOUT ROWID;
          CREATE TRIGGER pin_item_gone AFTER DELETE ON local_item BEGIN {gone} END;
@@ -92,6 +98,11 @@ pub(crate) fn migrate_v22() -> String {
          BEGIN
              DELETE FROM pin_changed WHERE file_id = NEW.file_id;
              INSERT INTO pin_changed(file_id) VALUES (NEW.file_id);
+         END;
+         CREATE TRIGGER pin_released_pinned AFTER UPDATE OF attributes ON local_item
+             WHEN (OLD.attributes & {PINNED}) = 0 AND (NEW.attributes & {PINNED}) != 0
+         BEGIN
+             DELETE FROM pin_released WHERE file_id = NEW.file_id;
          END;"
     )
 }
@@ -99,7 +110,7 @@ pub(crate) fn migrate_v22() -> String {
 /// Takes [`migrate_v22`] back out, for tests that make an older database.
 #[cfg(test)]
 pub(crate) const UNDO_V22: &str = "DROP TRIGGER pin_item_gone; DROP TRIGGER pin_item_kind;
-    DROP TRIGGER pin_owned_lost; DROP TABLE pin_owned; DROP TABLE pin_retry; DROP TABLE pin_changed;
+    DROP TRIGGER pin_owned_lost; DROP TRIGGER pin_released_pinned; DROP TABLE pin_released; DROP TABLE pin_owned; DROP TABLE pin_retry; DROP TABLE pin_changed;
     DROP TABLE pin_subtree; DROP TABLE pin_user; DROP TABLE pin_owned_hold; DROP TABLE pin_retry_hold;";
 
 /// At most this many items wait for a pin to be retried.
@@ -268,6 +279,26 @@ impl Ops<'_> {
 
     pub fn pin_subtree_has(&self, id: u128) -> Result<bool> {
         Ok(self.c.prepare_cached("SELECT 1 FROM pin_subtree WHERE file_id = ?1")?.exists([blob(id)])?)
+    }
+
+    /// File `id` was freed on request by name: no pin rule keeps it until
+    /// it's pinned again (the rule's note on it goes).
+    pub fn pin_released_add(&self, id: u128) -> Result<()> {
+        self.c
+            .prepare_cached(
+                "INSERT OR IGNORE INTO pin_released(file_id) SELECT file_id FROM local_item WHERE file_id = ?1",
+            )?
+            .execute([blob(id)])?;
+        self.pin_owned_remove(id)
+    }
+
+    pub fn pin_released_has(&self, id: u128) -> Result<bool> {
+        Ok(self.c.prepare_cached("SELECT 1 FROM pin_released WHERE file_id = ?1")?.exists([blob(id)])?)
+    }
+
+    pub fn pin_released_remove(&self, id: u128) -> Result<()> {
+        self.c.prepare_cached("DELETE FROM pin_released WHERE file_id = ?1")?.execute([blob(id)])?;
+        Ok(())
     }
 
     /// Item `id` was found pinned already where a rule pins: the user's.
@@ -487,6 +518,63 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// A file freed by name stays released from the rules until it's pinned
+    /// again (the trigger), and the release goes with its row.
+    #[test]
+    fn a_release_lasts_until_the_file_is_pinned_again() {
+        let mut s = store();
+        s.write(|o| {
+            o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
+            o.pin_owned_add(7, 1)?;
+            o.pin_released_add(7)?;
+            assert!(o.pin_released_has(7)? && !o.pin_owned_has(7)?, "no longer the rule's");
+            o.local_update(&row(7, 1, LocalKind::File, 0x0010_0000))?;
+            assert!(o.pin_released_has(7)?, "freed: still released");
+            o.local_update(&row(7, 1, LocalKind::File, PINNED as u32))?;
+            assert!(!o.pin_released_has(7)?, "pinned again: the release ends");
+            o.pin_released_add(7)?;
+            o.local_remove_subtree(7)?;
+            assert!(!o.pin_released_has(7)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A database at v19 (choose-what-syncs, before duplicates' v20 and the
+    /// pin tables) gets them on opening, triggers included.
+    #[test]
+    fn a_v19_database_upgrades() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-pins-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let s = Store::open(&path, 1024).unwrap();
+            s.read(|o| {
+                Ok(o.c.execute_batch(&format!(
+                    "{UNDO_V22} {} {} PRAGMA user_version = 19;",
+                    crate::shared::UNDO_V21,
+                    crate::dupes::UNDO_V20
+                ))?)
+            })
+            .unwrap();
+        }
+        let mut s = Store::open(&path, 1024).unwrap();
+        let v: i64 = s.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, crate::SCHEMA_VERSION);
+        s.write(|o| {
+            o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
+            o.pin_owned_add(7, 1)?;
+            assert!(o.pin_owned_has(7)?);
+            o.local_remove_subtree(7)?;
+            assert!(!o.pin_owned_has(7)?, "the triggers are there");
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

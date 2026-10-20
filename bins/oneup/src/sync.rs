@@ -742,7 +742,17 @@ fn keep_pinned(
             _ => None,
         };
         match path {
-            Some((id, p)) if pins.pins(&p, false) => {
+            Some((id, p)) if crate::pinrules::kept_by_rule(store, pins, id, &p)? => {
+                // Freed by name ("Free up space" on the file itself): the
+                // person's choice wins, and the rule leaves it freed.
+                let row = store.read(|o| o.local_get(id))?;
+                if let Some(row) = row
+                    && crate::pinrules::freed_by_name(store, &row)?
+                {
+                    store.write(|o| o.pin_released_add(id))?;
+                    out.push(op);
+                    continue;
+                }
                 kept += 1;
                 if !crate::pinrules::pin_back(store, pinner, id, &crate::filetree::clean(&p))? {
                     tracing::debug!("a file a pin rule keeps couldn't be pinned again now");
@@ -1150,8 +1160,18 @@ impl Engine {
             let detail = format!("{} item(s) no longer kept on this PC: their pin rule was removed", pass.unpinned);
             notes.push(notice(ActivityOutcome::Note, "keep", detail));
         }
+        if pass.released > 0 {
+            let detail = format!(
+                "{} file(s) freed on request: no longer kept on this PC by pin rules until kept again",
+                pass.released
+            );
+            notes.push(notice(ActivityOutcome::Note, "keep", detail));
+        }
         if pass.repinned > 0 {
-            let detail = format!("{} item(s) kept on this PC by pin rules, though set to free up space", pass.repinned);
+            let detail = format!(
+                "{} item(s) kept on this PC by pin rules, though a folder above was set to free up space",
+                pass.repinned
+            );
             notes.push(notice(ActivityOutcome::Note, "keep", detail));
         }
         log_activity(&mut store, notes)?;
