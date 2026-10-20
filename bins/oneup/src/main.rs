@@ -44,7 +44,7 @@ use oneup_app::{setup, sync, test_account, versions};
 const RULE_CHANGES: [&str; 5] = ["cloud", "on", "off", "add", "remove"];
 
 #[derive(Parser)]
-#[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (pre-alpha, read-only)")]
+#[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (beta)")]
 struct Cli {
     /// Where OneUpDrive keeps its state [default: %LOCALAPPDATA%\OneUpDrive]
     #[arg(long, global = true)]
