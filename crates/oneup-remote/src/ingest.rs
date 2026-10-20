@@ -86,6 +86,7 @@ pub fn to_row(item: &DriveItem) -> Option<RemoteRow> {
 pub fn apply(ops: &Ops<'_>, rules: &ExcludeSet, mode: Mode, item: &DriveItem, t: &mut Tally) -> Result<()> {
     if item.is_deleted() {
         ops.delete_subtree(&item.id)?;
+        ops.unmark_shared(&item.id)?;
         t.deleted += 1;
         return Ok(());
     }
@@ -94,7 +95,24 @@ pub fn apply(ops: &Ops<'_>, rules: &ExcludeSet, mode: Mode, item: &DriveItem, t:
         return Ok(());
     };
     let child_count = item.folder.as_ref().and_then(|f| f.child_count);
-    apply_row(ops, rules, mode, row, child_count, t)
+    let placed = place_row(ops, rules, mode, row, child_count, t)?;
+    // Every entry says whether it's shared now (`ITEM_SELECT` asks for the
+    // facet), so the mark follows each change: kept for an item stored, or
+    // waiting as an orphan (whose mark goes if it's dropped or pruned when
+    // placed), never for one discarded inside an excluded folder.
+    match (placed, item.sharing()) {
+        (Placed::Kept, Some(at)) => ops.mark_shared(&item.id, at),
+        _ => ops.unmark_shared(&item.id),
+    }
+}
+
+/// Where [`place_row`] put an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placed {
+    /// Stored, or waiting for its parent in the orphan buffer.
+    Kept,
+    /// Dropped: inside an excluded folder, or not placeable.
+    Discarded,
 }
 
 /// Applies one row (from Graph or from the orphan buffer). `child_count` is
@@ -107,14 +125,29 @@ pub fn apply_row(
     child_count: Option<i64>,
     t: &mut Tally,
 ) -> Result<()> {
+    let id = row.id.clone();
+    if place_row(ops, rules, mode, row, child_count, t)? == Placed::Discarded {
+        ops.unmark_shared(&id)?;
+    }
+    Ok(())
+}
+
+fn place_row(
+    ops: &Ops<'_>,
+    rules: &ExcludeSet,
+    mode: Mode,
+    row: RemoteRow,
+    child_count: Option<i64>,
+    t: &mut Tally,
+) -> Result<Placed> {
     if row.kind == Kind::Root {
         ops.upsert_item(&row, false)?;
         t.stored += 1;
-        return Ok(());
+        return Ok(Placed::Kept);
     }
     let Some(parent) = row.parent_id.clone() else {
         t.ignored += 1;
-        return Ok(());
+        return Ok(Placed::Discarded);
     };
     let was = ops.item_state(&row.id)?;
     match ops.item_state(&parent)? {
@@ -127,6 +160,7 @@ pub fn apply_row(
                 ops.add_pruned(&row.id, &parent)?;
             }
             t.pruned += 1;
+            return Ok(Placed::Discarded);
         }
         ItemState::Absent => {
             ops.put_orphan(&row, mode == Mode::CatchUp)?;
@@ -165,7 +199,7 @@ pub fn apply_row(
             }
         }
     }
-    Ok(())
+    Ok(Placed::Kept)
 }
 
 /// Whether a folder named `name` in folder `parent` is excluded: by the

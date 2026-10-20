@@ -103,9 +103,31 @@ impl Ops<'_> {
         let last: Option<i64> =
             self.c.query_row("SELECT max(seq) FROM activity", [], |r| r.get(0)).optional()?.flatten();
         if let Some(last) = last {
-            self.c.prepare_cached("DELETE FROM activity WHERE seq <= ?1")?.execute([last - KEEP])?;
+            // An entry a pending sharing change will settle stays: its
+            // outcome must have somewhere to go.
+            self.c
+                .prepare_cached("DELETE FROM activity WHERE seq <= ?1 AND seq NOT IN (SELECT seq FROM sharing_intent)")?
+                .execute([last - KEEP])?;
         }
         Ok(())
+    }
+
+    /// Adds one entry for something about to be done, before it's done, and
+    /// returns its sequence number for [`Ops::activity_settle`]: if the
+    /// process dies in between, the record of the attempt stays.
+    pub fn activity_begin(&self, e: &Entry) -> Result<i64> {
+        self.activity_add(std::slice::from_ref(e))?;
+        Ok(self.c.query_row("SELECT max(seq) FROM activity", [], |r| r.get(0))?)
+    }
+
+    /// How an entry [`Ops::activity_begin`] added ended. Returns whether
+    /// the entry was there to settle.
+    pub fn activity_settle(&self, seq: i64, outcome: Outcome, detail: &str) -> Result<bool> {
+        let n = self
+            .c
+            .prepare_cached("UPDATE activity SET outcome = ?2, detail = ?3 WHERE seq = ?1")?
+            .execute(rusqlite::params![seq, outcome.code(), detail])?;
+        Ok(n == 1)
     }
 
     /// The latest `limit` entries, newest first; only those for `path` (the
@@ -206,6 +228,17 @@ mod tests {
         let next = s.read(|o| o.activity_done("keep both", 0, Some(first[0].seq), 1)).unwrap();
         assert_eq!(next[0].at_ms, 1);
         assert!(s.read(|o| o.activity_done("keep both", 0, Some(next[0].seq), 1)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_entry_begun_first_is_settled_in_place() {
+        let mut s = Store::open_in_memory().unwrap();
+        let seq = s.write(|o| o.activity_begin(&Entry { outcome: Outcome::Waiting, ..e(1, "/a") })).unwrap();
+        s.write(|o| o.activity_add(&[e(2, "/b")])).unwrap();
+        assert_eq!(s.read(|o| o.activity_recent(Some("/a"), 1)).unwrap()[0].outcome, Outcome::Waiting);
+        s.write(|o| o.activity_settle(seq, Outcome::Done, "done")).unwrap();
+        let a = &s.read(|o| o.activity_recent(Some("/a"), 1)).unwrap()[0];
+        assert_eq!((a.outcome, a.detail.as_str(), a.at_ms), (Outcome::Done, "done", 1));
     }
 
     #[test]

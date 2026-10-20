@@ -20,8 +20,9 @@
 //! v17 when failed operations are tried again (see [`retry`]), since v18
 //! an index of the Remote tree's names for search (see [`search`]), since
 //! v19 the cloud folders by size, for rule suggestions (see [`choose`]),
-//! and since v20 the hashes of local-only files made for finding
-//! duplicates (see [`dupes`]).
+//! since v20 the hashes of local-only files made for finding duplicates
+//! (see [`dupes`]), and since v21 which cloud items are shared (see
+//! [`shared`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -53,11 +54,13 @@ pub mod dupes;
 pub mod retry;
 mod rulefile;
 pub mod search;
+pub mod shared;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
 pub use dupes::{DupCursor, DupGroup, DupSummary};
 pub use retry::{Item as RetryItem, Retry};
 pub use search::{Found, Hit, IndexState};
+pub use shared::{IntendedChange, Intent, MarkPage, SharedRow};
 pub use usage::{AppFile, AppUse, UseKind};
 
 #[derive(Debug, thiserror::Error)]
@@ -112,7 +115,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -398,6 +401,7 @@ const SMALL_TABLES: &[&str] = &[
     "t_sub",
     "search_queue",
     "remote_name_config",
+    "sharing_intent",
 ];
 
 #[cfg(feature = "statement-log")]
@@ -734,7 +738,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 20] = [
+    let steps: [(i64, String); 21] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -755,6 +759,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (18, search::MIGRATE_V18.into()),
         (19, choose::MIGRATE_V19.into()),
         (20, dupes::MIGRATE_V20.into()),
+        (21, shared::MIGRATE_V21.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1017,6 +1022,7 @@ impl Ops<'_> {
             [],
         )?;
         self.c.execute("DELETE FROM remote_orphan WHERE id IN (SELECT id FROM t_sub)", [])?;
+        self.unmark_shared_subtree()?;
         Ok(self.c.execute("DELETE FROM remote_item WHERE id IN (SELECT id FROM t_sub)", [])?)
     }
 
@@ -1030,6 +1036,7 @@ impl Ops<'_> {
             self.c.execute("DELETE FROM t_sub WHERE id = ?1", [id])?;
         }
         self.c.execute(PRUNE_TOMBSTONES, [])?;
+        self.unmark_shared_subtree()?;
         Ok(self.c.execute("DELETE FROM remote_item WHERE id IN (SELECT id FROM t_sub)", [])?)
     }
 
@@ -1226,6 +1233,11 @@ impl Ops<'_> {
     /// Drops orphans waiting on `parent_id` (used when the parent turns out
     /// to no longer exist). Returns how many were dropped.
     pub fn drop_orphans_of(&self, parent_id: &str) -> Result<usize> {
+        // Their shared marks go too: they'll never be placed.
+        self.c.execute(
+            "DELETE FROM remote_shared WHERE id IN (SELECT id FROM remote_orphan WHERE parent_id = ?1)",
+            [parent_id],
+        )?;
         Ok(self.c.execute("DELETE FROM remote_orphan WHERE parent_id = ?1", [parent_id])?)
     }
 
@@ -1343,7 +1355,8 @@ impl Ops<'_> {
         self.search_clear_with(|| {
             self.c.execute_batch(
                 "DELETE FROM remote_item; DELETE FROM remote_pruned; DELETE FROM remote_orphan;
-                 DELETE FROM enum_unit; DELETE FROM cursor; DELETE FROM meta WHERE key = 'rules';",
+                 DELETE FROM enum_unit; DELETE FROM cursor; DELETE FROM meta WHERE key = 'rules';
+                 DELETE FROM remote_shared;",
             )?;
             Ok(())
         })
