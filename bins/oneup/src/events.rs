@@ -65,8 +65,23 @@ impl New {
 /// `detail` without links (an error may quote a download link, which
 /// works as a credential for a while), and short.
 fn clean(detail: &str) -> String {
-    let mut out = String::with_capacity(detail.len().min(MAX_DETAIL + 8));
-    for (i, word) in detail.split(' ').enumerate() {
+    // Control characters (NUL included) become spaces and `"` becomes `'`,
+    // so a detail can't break a log line, a JSON consumer or an environment
+    // block; any word with a link is left out.
+    let plain: String = detail
+        .chars()
+        .map(|c| {
+            if c.is_control() {
+                ' '
+            } else if c == '"' {
+                '\''
+            } else {
+                c
+            }
+        })
+        .collect();
+    let mut out = String::with_capacity(plain.len().min(MAX_DETAIL + 8));
+    for (i, word) in plain.split(' ').enumerate() {
         if i > 0 {
             out.push(' ');
         }
@@ -77,6 +92,8 @@ fn clean(detail: &str) -> String {
             out.push_str(word);
         }
     }
+    // Cut by characters, never bytes, so a multi-byte character at the limit
+    // can't panic.
     if out.chars().count() > MAX_DETAIL {
         out = out.chars().take(MAX_DETAIL).collect::<String>() + "…";
     }
@@ -272,6 +289,16 @@ mod tests {
         // A number from before a restart.
         let r = f.page(Some(1_000_000));
         assert!(r.missed && r.items[0].seq == f.page(None).next - KEEP as u64 + 1);
+    }
+
+    #[test]
+    fn details_are_cleaned_and_cut_by_characters() {
+        // A multi-byte character straddling the limit doesn't panic.
+        let long = format!("{}€€€", "a".repeat(MAX_DETAIL - 1));
+        let c = clean(&long);
+        assert!(c.ends_with('…') && c.chars().count() == MAX_DETAIL + 1, "{c}");
+        assert_eq!(clean("a\u{0}b\r\nc\"d\""), "a b  c'd'");
+        assert_eq!(clean("see HTTPS://x.example/a?k=1 now"), "see (link) now");
     }
 
     #[test]
