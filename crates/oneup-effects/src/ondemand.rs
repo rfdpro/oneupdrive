@@ -390,6 +390,18 @@ impl LocalFs {
             && win::attribute_tag(h).is_ok_and(|(attributes, tag)| !looks_like_placeholder(attributes, tag))
     }
 
+    /// Whether the open file's content may be read: an ordinary file, or
+    /// one of OneUpDrive's own placeholders (its identity decodes as ours)
+    /// with all its content here. Another provider's placeholder, hydrated
+    /// or not, never is (AGENTS.md); any doubt answers false.
+    pub(crate) fn readable_here(&self, h: &win::Handle, size: i64) -> bool {
+        match provider::info(&h.as_file()) {
+            Ok(Some(i)) => Identity::decode(&i.identity).is_some() && i.on_disk >= size,
+            Ok(None) => win::attribute_tag(h).is_ok_and(|(attributes, tag)| !looks_like_placeholder(attributes, tag)),
+            Err(_) => false,
+        }
+    }
+
     /// Whether the open placeholder holds no content here (dehydrated).
     pub(crate) fn is_dehydrated(&self, h: &win::Handle) -> bool {
         matches!(provider::info(&h.as_file()), Ok(Some(i)) if i.on_disk == 0)

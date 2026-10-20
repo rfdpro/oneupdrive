@@ -52,11 +52,12 @@
 //! operation instead.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use oneup_rules::RuleSet;
 use oneup_rules::database::{Companion, Databases, Format};
-use oneup_sync::{Base, LocalId, LocalNode, NodeKind, Op, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, same_name};
+use oneup_sync::{Base, LocalId, LocalNode, NodeKind, Op, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold};
 
 use crate::names;
 
@@ -95,6 +96,12 @@ pub struct Parked<'a, T: ?Sized> {
     /// No rules: what folders' paths are worked out with when there are
     /// none.
     no_rules: RuleSet,
+    /// Per folder a round visits, the (folded) names of the files there
+    /// that a working file there is named after: two passes over the
+    /// folder once, whatever how many working files it holds.
+    local_mains: RefCell<BTreeMap<LocalId, Rc<BTreeSet<String>>>>,
+    remote_mains: RefCell<BTreeMap<RemoteId, Rc<BTreeSet<String>>>>,
+    base_mains: RefCell<BTreeMap<Sid, Rc<BTreeSet<String>>>>,
 }
 
 /// A folder as the rules see it.
@@ -118,6 +125,9 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
             databases: None,
             default_databases: Databases::default(),
             no_rules: RuleSet::default(),
+            local_mains: RefCell::default(),
+            remote_mains: RefCell::default(),
+            base_mains: RefCell::default(),
         }
     }
 
@@ -223,7 +233,16 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         if !self.is_database(&dir.path, main) {
             return Ok(false);
         }
-        self.inner.any_local_child(p, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, main)))
+        let cached = self.local_mains.borrow().get(&p).cloned();
+        let mains = match cached {
+            Some(m) => m,
+            None => {
+                let m = Rc::new(mains_of(|f| self.inner.any_local_child(p, &mut |c| Ok(f(c.kind, &c.name))))?);
+                self.local_mains.borrow_mut().insert(p, Rc::clone(&m));
+                m
+            }
+        };
+        Ok(mains.contains(&fold(main)))
     }
 
     fn remote_companion(&self, n: &RemoteNode) -> Result<bool, T::Error> {
@@ -234,7 +253,16 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         if !self.is_database(&dir.path, main) {
             return Ok(false);
         }
-        self.inner.any_remote_child(p, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, main)))
+        let cached = self.remote_mains.borrow().get(p).cloned();
+        let mains = match cached {
+            Some(m) => m,
+            None => {
+                let m = Rc::new(mains_of(|f| self.inner.any_remote_child(p, &mut |c| Ok(f(c.kind, &c.name))))?);
+                self.remote_mains.borrow_mut().insert(p.clone(), Rc::clone(&m));
+                m
+            }
+        };
+        Ok(mains.contains(&fold(main)))
     }
 
     fn base_companion(&self, b: &Base) -> Result<bool, T::Error> {
@@ -245,7 +273,16 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         if !self.is_database(&dir.path, main) {
             return Ok(false);
         }
-        self.inner.any_base_child(p, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, main)))
+        let cached = self.base_mains.borrow().get(&p).cloned();
+        let mains = match cached {
+            Some(m) => m,
+            None => {
+                let m = Rc::new(mains_of(|f| self.inner.any_base_child(p, &mut |c| Ok(f(c.kind, &c.name))))?);
+                self.base_mains.borrow_mut().insert(p, Rc::clone(&m));
+                m
+            }
+        };
+        Ok(mains.contains(&fold(main)))
     }
 
     /// Whether the Synced record `b` is hidden (see the module docs).
@@ -366,6 +403,37 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         }
         is_local_by_nature(&n.name)
     }
+}
+
+/// The folded names of the files in a folder that working files in it are
+/// named after, those present (`walk` calls its argument with each child's
+/// kind and name; returning `false` goes on): one pass for the working
+/// files' names, and only if there are any, one for those files.
+fn mains_of<E>(
+    walk: impl Fn(&mut dyn FnMut(NodeKind, &str) -> bool) -> Result<bool, E>,
+) -> Result<BTreeSet<String>, E> {
+    let mut wanted = BTreeSet::new();
+    walk(&mut |kind, name| {
+        if kind == NodeKind::File
+            && let Some((_, main)) = Companion::of_name(name)
+        {
+            wanted.insert(fold(main));
+        }
+        false
+    })?;
+    let mut present = BTreeSet::new();
+    if !wanted.is_empty() {
+        walk(&mut |kind, name| {
+            if kind == NodeKind::File {
+                let f = fold(name);
+                if wanted.contains(&f) {
+                    present.insert(f);
+                }
+            }
+            false
+        })?;
+    }
+    Ok(present)
 }
 
 /// Files the official client never syncs, on either side.
@@ -504,6 +572,8 @@ mod tests {
         /// A Synced record that must never be read: stands for the rest of
         /// a long children list, which an emptiness check shouldn't need.
         poison: Option<Sid>,
+        /// How many times a local folder's children were listed.
+        listings: std::cell::Cell<usize>,
     }
 
     fn lroot() -> LocalNode {
@@ -576,6 +646,7 @@ mod tests {
             Ok(self.remote.iter().find(|n| &n.id == id).cloned().map_or(Seen::Missing, Seen::Present))
         }
         fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>, Self::Error> {
+            self.listings.set(self.listings.get() + 1);
             Ok(self.local.iter().filter(|n| n.parent == Some(id)).cloned().collect())
         }
         fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>, Self::Error> {
@@ -596,7 +667,7 @@ mod tests {
             remote: Some(RemoteId("r".into())),
             remote_etag: "e".into(),
         };
-        World { local: vec![lroot()], remote: vec![rroot()], base: vec![root], poison: None }
+        World { local: vec![lroot()], remote: vec![rroot()], base: vec![root], poison: None, ..World::default() }
     }
 
     fn uploads(ops: &[Op]) -> Vec<String> {
@@ -692,6 +763,20 @@ mod tests {
         assert!(matches!(p.local(LocalId(14)).unwrap(), Seen::Present(_)));
         assert!(matches!(p.remote(&RemoteId("xw".into())).unwrap(), Seen::Missing));
         assert!(p.base_by_local(LocalId(31)).unwrap().is_none());
+    }
+
+    /// A folder of many databases and their working files is listed a
+    /// fixed number of times, not once per working file.
+    #[test]
+    fn a_folder_of_databases_is_listed_a_fixed_number_of_times() {
+        let mut w = world();
+        for i in 0..200u128 {
+            w.local.push(lfile(10 + 2 * i, &format!("db{i}.db"), 5));
+            w.local.push(lfile(11 + 2 * i, &format!("db{i}.db-wal"), 5));
+        }
+        let ops = plan(&Parked::new(&w), [ROOT]).unwrap();
+        assert_eq!(uploads(&ops).len(), 200);
+        assert!(w.listings.get() <= 10, "listed {} times", w.listings.get());
     }
 
     /// Only a database told by its name or the user's patterns has its

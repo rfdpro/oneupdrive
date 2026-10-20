@@ -1425,10 +1425,12 @@ impl Engine {
             // Databases: what counts as one, and whether they wait
             // (`[databases]`, read every round like the rest).
             let db_settings = crate::config::kept(&self.data_dir, crate::config::load_databases(&self.data_dir))?;
-            self.exec.set_databases(db_settings.databases()?);
-            // Changed rules: every folder is planned again, from the
+            let databases = db_settings.databases()?;
+            // Changed rules, or database patterns (they decide which working
+            // files are parked): every folder is planned again, from the
             // database (rules.md § Changing rules without a rescan).
-            let fingerprint = user_rules.fingerprint();
+            let fingerprint = planning_fingerprint(&user_rules, &databases);
+            self.exec.set_databases(databases);
             let rules_changed = store.read(|o| o.meta_get(KEY_RULES))?.as_deref() != Some(fingerprint.as_str());
             if rules_changed {
                 scope = Scope::All;
@@ -1948,6 +1950,20 @@ impl Engine {
 /// store has (only listed when the plan would add to it; without it, the
 /// store is taken to have no limit, which only a first dry run does).
 /// `approved`: items on lists the user approved (sorted).
+/// The fingerprint a round plans with: the rules', and the database
+/// patterns' (`oneup_plan::park` parks SQLite's working files by them), so
+/// a change to either plans every folder again. Without database patterns,
+/// the rules' alone, as before there were any.
+fn planning_fingerprint(rules: &RuleSet, databases: &oneup_rules::database::Databases) -> String {
+    let d = databases.fingerprint();
+    if d.is_empty() {
+        return rules.fingerprint();
+    }
+    // FNV-1a: short enough to keep in `meta`.
+    let h = d.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{} databases {h:016x}", rules.fingerprint())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_round<'a>(
     store: &Store,
@@ -4122,6 +4138,21 @@ mod tests {
         ];
         add_extra(&mut ops, extra);
         assert_eq!(&ops[2..], [rename(6, "free.txt")]);
+    }
+
+    /// A change to the database patterns alone (no other event) plans
+    /// every folder again: they decide which working files are parked.
+    #[test]
+    fn database_patterns_are_part_of_the_planning_fingerprint() {
+        use oneup_rules::database::Databases;
+        let rules = RuleSet::default();
+        let none = Databases::default();
+        let ledger = Databases::new(true, &[], &["*.ledger"]).unwrap();
+        let finance = Databases::new(true, &["finance"], &[]).unwrap();
+        assert_eq!(planning_fingerprint(&rules, &none), rules.fingerprint(), "unchanged without patterns");
+        let all = [&none, &ledger, &finance].map(|d| planning_fingerprint(&rules, d));
+        assert!(all[0] != all[1] && all[1] != all[2] && all[0] != all[2], "{all:?}");
+        assert_eq!(planning_fingerprint(&rules, &ledger), planning_fingerprint(&rules, &ledger.clone()));
     }
 
     #[test]

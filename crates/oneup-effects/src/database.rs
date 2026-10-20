@@ -409,22 +409,29 @@ impl LocalFs {
         DbState { recognised, wait: Some(wait), programs }
     }
 
-    /// Whether the file open (exclusively) as `h` at `path`, `size` bytes,
-    /// is to be treated as a SQLite database with working files: the
-    /// configured recognition (no `!` pattern; its content, if all of it is
-    /// here; the patterns; its name, or `also_named`'s, where it goes) says
-    /// SQLite or another database the user named, or its content can't
-    /// say (not all here, empty).
-    fn sqlite_like_on(&self, h: &win::Handle, path: &Path, size: u64, also_named: Option<&Path>) -> Result<bool> {
+    /// Whether the file open (exclusively) as `h`, `size` bytes, is to be
+    /// treated as a SQLite database with working files under any of
+    /// `names` (where it is, where it goes), each judged on its own: a `!`
+    /// pattern for that name opts it out; otherwise the configured
+    /// recognition (its content, if it may be read; patterns; the name)
+    /// saying SQLite or another database the user named, or content that
+    /// can't say (not all here, empty, another provider's placeholder),
+    /// counts.
+    fn sqlite_like_on(&self, h: &win::Handle, size: u64, names: &[&Path]) -> Result<bool> {
         let dbs = self.databases();
-        if dbs.opted_out(&self.relative(path)) {
-            return Ok(false);
-        }
         let size = i64::try_from(size).unwrap_or(i64::MAX);
-        let head = if size > 0 && self.fully_on_disk(h, size) { Some(head_of(h)?) } else { None };
-        let Some(head) = head.filter(|h| !h.is_empty()) else { return Ok(true) };
-        let by = |p: &Path| dbs.recognise(&self.relative(p), Some(&head), false).is_some_and(|r| may_be_sqlite(&r));
-        Ok(by(path) || also_named.is_some_and(by))
+        let head = if size > 0 && self.readable_here(h, size) { Some(head_of(h)?) } else { None };
+        let head = head.filter(|h| !h.is_empty());
+        Ok(names.iter().any(|p| {
+            let rel = self.relative(p);
+            if dbs.opted_out(&rel) {
+                return false;
+            }
+            match &head {
+                Some(head) => dbs.recognise(&rel, Some(head), false).is_some_and(|r| may_be_sqlite(&r)),
+                None => true,
+            }
+        }))
     }
 
     /// For a replacement, move or recycling of the file open (exclusively)
@@ -435,7 +442,7 @@ impl LocalFs {
         if self.look().sqlite_wait(path)?.is_none() {
             return Ok(false);
         }
-        self.sqlite_like_on(h, path, size, None)
+        self.sqlite_like_on(h, size, &[path])
     }
 
     /// What's in a database's place at `main`, beside a working file, from
@@ -472,13 +479,18 @@ impl LocalFs {
         if dbs.recognise(&self.relative(main), None, false).is_some_and(|r| may_be_sqlite(&r)) {
             return Ok((Main::Database, Some(ident)));
         }
-        if size == 0 || !self.fully_on_disk(&attrs, size) {
+        if size == 0 {
             return Ok((Main::Database, Some(ident)));
         }
         drop(attrs);
         let mut w = self.volume().open_watched_path(main).map_err(|_| Error::Busy)?;
         if w.with_handle(|h| win::file_id(h).map(|(_, i)| i)).and_then(Result::ok) != Some(id) {
             return Err(Error::Changed);
+        }
+        // On the handle it's read through: an ordinary file, or our own
+        // placeholder all here; anything else isn't read, and may be one.
+        if !w.with_handle(|h| self.readable_here(h, size)).unwrap_or(false) {
+            return Ok((Main::Database, Some(ident)));
         }
         let mut head = [0u8; 16];
         let mut n = 0;
@@ -749,7 +761,8 @@ impl LocalFs {
             Some(t) if !same => look.sqlite_wait(t)?.is_some(),
             _ => false,
         };
-        if (pending_here || pending_there) && self.sqlite_like_on(h, from, size, to)? {
+        let names: Vec<&Path> = std::iter::once(from).chain(to.filter(|_| !same)).collect();
+        if (pending_here || pending_there) && self.sqlite_like_on(h, size, &names)? {
             return Err(Error::DatabaseWaits);
         }
         if let Some(t) = to.filter(|_| !same)
