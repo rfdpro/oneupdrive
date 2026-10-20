@@ -25,6 +25,17 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1"
+# Only for the test helper below (feature `test-helpers`).
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+
+[[bin]]
+# Test-only: a program of its own that writes SQLite databases while
+# tests/sync.rs syncs them (AGENTS.md: a different executable from the
+# test). Built only with `test-helpers`, which the tests turn on.
+name = "oneup-test-sqlite"
+path = "src/bin/oneup-test-sqlite.rs"
+required-features = ["test-helpers"]
+test = false
 
 [features]
 # Test-only: `Executor::crash_after` stops a round as if the process had
@@ -32,9 +43,11 @@ tracing = "0.1"
 # `Executor::on_blocking` holds work on its blocking thread as a slow
 # disk would (tests/sync.rs turns it on; production builds never do).
 crash-test = ["oneup-effects/crash-test"]
+test-helpers = ["dep:rusqlite"]
 
 [dev-dependencies]
-oneup-exec = { path = ".", features = ["crash-test"] }
+oneup-exec = { path = ".", features = ["crash-test", "test-helpers"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 oneup-cfapi = { path = "../oneup-cfapi" }
 # The event hooks' burst test and benchmark (tests/sync.rs).
 oneup-hooks = { path = "../oneup-hooks" }

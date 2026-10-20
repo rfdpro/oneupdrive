@@ -2833,6 +2833,7 @@ fn skip_label(s: Skip) -> &'static str {
         Skip::ContentMismatch => "content didn't match; retrying",
         Skip::Refused => "special item or invalid name; retried when it changes",
         Skip::CloudFull => "OneDrive is full; sent once there's room",
+        Skip::Database => "a database not ready to sync; retrying",
     }
 }
 

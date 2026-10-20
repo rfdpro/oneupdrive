@@ -250,6 +250,16 @@ impl LocalFs {
         let Op::Download { to, replace: Some(pre), .. } = a.op() else { return Err(Error::WrongOp) };
         let (h, _entry, path) = self.open_ours(pre)?;
         let info = provider::info(&h.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
+        // As for an ordinary file (`place_download`), under the share-none
+        // handle: changes beside a database that aren't in it would be
+        // applied to the new version. Its first bytes are read only if all
+        // its content is here (reading more would ask the cloud, ourselves,
+        // for it); otherwise it's judged by what's beside it alone.
+        let size = pre.stamp.map_or(0, |(size, _)| u64::try_from(size).unwrap_or(0));
+        let pending = self.pending_beside(&h, &path, size)?;
+        if pending {
+            return Err(Error::DatabaseWaits);
+        }
         let identity = v.identity.encode();
         let mut kept = None;
         if info.on_disk == 0 {

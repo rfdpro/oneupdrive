@@ -10,10 +10,13 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use oneup_cfapi::identity::Identity;
-use oneup_effects::{Done, Error as FxError, LocalFs, Version};
+use oneup_effects::{
+    CompanionCheck, CompanionHold, DbState, Done, Error as FxError, LocalFs, MainExpect, UploadCheck, Version,
+};
 use oneup_gate::{Approved, OldCopy};
 use oneup_graph::client::SIMPLE_UPLOAD_MAX;
 use oneup_rules::ExcludeSet;
+use oneup_rules::database::Databases;
 use oneup_store::{Kind, LocalKind, LocalRow, Ops, RemoteRow, Store};
 use oneup_sync::{
     Base, Dir, Hash, Keep, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, Vacates,
@@ -138,6 +141,11 @@ pub enum Skip {
     /// The OneDrive has no room left: an upload or a new folder refused
     /// for it, or one not tried after OneDrive said so in the same round.
     CloudFull,
+    /// A database not in a state to send or replace: changes not yet in
+    /// it (a SQLite `-wal` or `-journal`), or open in another program for
+    /// one that may only be copied while closed ([`Report::databases`]
+    /// says which).
+    Database,
 }
 
 /// What one round did.
@@ -170,6 +178,12 @@ pub struct Report {
     /// [`Report::done`] too), and the edit is in the file's version
     /// history in OneDrive.
     pub theirs_not_kept: Vec<(Op, String)>,
+    /// Skipped ([`Skip::Database`]) operations' databases, and why they
+    /// wait (`oneup_effects::DbState`).
+    pub databases: Vec<(Op, DbState)>,
+    /// Uploads done of files recognised as databases, by content or name,
+    /// and the format: an Outlook data file renamed `.dat` is one too.
+    pub recognised: Vec<(Op, oneup_rules::database::Format)>,
 }
 
 impl Report {
@@ -198,6 +212,7 @@ impl From<FxError> for Fail {
             FxError::Busy => Fail::Skip(Skip::Busy),
             FxError::NameTaken => Fail::Skip(Skip::NameTaken),
             FxError::NotEmpty => Fail::Skip(Skip::NotEmpty),
+            FxError::DatabaseWaits => Fail::Skip(Skip::Database),
             FxError::BadName | FxError::NotOrdinary | FxError::Outside | FxError::WrongOp => Fail::Skip(Skip::Refused),
             FxError::RootChanged(_) | FxError::OtherEngine(_) => Fail::Halt(e.to_string()),
             FxError::KeptAside { .. } | FxError::Win(_) | FxError::Io(_) => Fail::Failed(e.to_string()),
@@ -254,6 +269,10 @@ struct Notes {
     /// Done, but the round stops after it (the store failed, or the sync
     /// folder its identity check, while keeping such a version).
     halt: Option<String>,
+    /// Skipped: the database it sends or replaces waits.
+    database: Option<DbState>,
+    /// Sent: the database format its content or name says it is.
+    recognised: Option<oneup_rules::database::Format>,
 }
 
 /// Whether an operation's outcome halts the round.
@@ -265,6 +284,9 @@ fn halts(outcome: &Res, notes: &Notes) -> bool {
 fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
     match outcome {
         Ok(()) => {
+            if let Some(f) = notes.recognised {
+                report.recognised.push((op.clone(), f));
+            }
             if notes.kept_instead {
                 report.kept_instead.push(op.clone());
             }
@@ -288,6 +310,9 @@ fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
         }
         Err(Fail::Skip(s)) => {
             tracing::debug!(reason = ?s, "operation skipped");
+            if let (Skip::Database, Some(db)) = (s, notes.database) {
+                report.databases.push((op.clone(), db));
+            }
             report.skipped.push((op, s));
         }
         Err(Fail::Failed(m)) => {
@@ -536,6 +561,37 @@ fn leaves(c: &mut Claims, at: Option<Place>) {
     }
 }
 
+/// The SQLite working files (`-wal`, `-journal`) the state database has
+/// beside `name` in local folder `to`, synced at OneDrive's version: those
+/// a new database from OneDrive may be placed beside
+/// (`LocalFs::check_new_beside`).
+fn known_beside(o: &Ops<'_>, to: LocalId, name: &str) -> oneup_store::Result<Vec<MainExpect>> {
+    use oneup_rules::database::Companion;
+    let mut out = Vec::new();
+    for c in [Companion::Wal, Companion::Journal] {
+        for row in o.local_named(to.0, &c.name_for(name))? {
+            let Some(b) = o.synced_by_local(row.file_id)? else { continue };
+            let remote_now = match &b.remote {
+                Some(r) => o.get_item(&r.0)?.and_then(|r| r.etag),
+                None => None,
+            };
+            if b.local_mtime == row.mtime && b.size == row.size && remote_now.as_deref() == Some(&b.remote_etag) {
+                out.push(MainExpect { id: LocalId(row.file_id), size: row.size, mtime: row.mtime });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// What a SQLite working file that waits reports, when only why is known.
+fn companion_state(wait: oneup_effects::Wait) -> DbState {
+    let recognised = oneup_rules::database::Recognised {
+        format: oneup_rules::database::Format::Sqlite,
+        by: oneup_rules::database::By::Companions,
+    };
+    DbState { recognised, wait: Some(wait), programs: Vec::new() }
+}
+
 /// Skip unless `ok`.
 fn need(ok: bool) -> Res {
     if ok { Ok(()) } else { Err(Fail::Skip(Skip::Changed)) }
@@ -597,6 +653,9 @@ pub struct Executor<C> {
     /// The name-only folder rules the Local tree follows; they can change
     /// between rounds ([`Executor::set_rules`]).
     rules: std::sync::RwLock<ExcludeSet>,
+    /// What counts as a database, and whether databases wait for a
+    /// consistent state ([`Executor::set_databases`]).
+    databases: std::sync::RwLock<Databases>,
     /// How many operations run at once ([`Executor::set_parallel`]).
     parallel: std::sync::Mutex<Parallel>,
     /// How long each kind of operation took ([`Executor::timed`]).
@@ -620,6 +679,7 @@ impl<C: Cloud> Executor<C> {
             fs: Arc::new(fs),
             cloud,
             rules: std::sync::RwLock::new(rules),
+            databases: std::sync::RwLock::default(),
             parallel: std::sync::Mutex::new(Parallel::for_profile("balanced")),
             timings: std::sync::Arc::default(),
             jobs: Arc::default(),
@@ -631,6 +691,140 @@ impl<C: Cloud> Executor<C> {
     /// The rules changed: rows written from now on follow these.
     pub fn set_rules(&self, rules: ExcludeSet) {
         *self.rules.write().unwrap_or_else(|p| p.into_inner()) = rules;
+    }
+
+    /// What counts as a database from now on (`[databases]`; until set,
+    /// the formats recognised by content and name, which wait).
+    pub fn set_databases(&self, d: Databases) {
+        self.fs.set_databases(d.clone());
+        *self.databases.write().unwrap_or_else(|p| p.into_inner()) = d;
+    }
+
+    fn databases(&self) -> Databases {
+        self.databases.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Before a download replaces a file here: skips it while that file is
+    /// a database that must stay as it is (open in another program, or
+    /// with changes beside it not yet in it). Before anything is
+    /// downloaded, so a database open all day isn't fetched every round.
+    /// With `[databases] wait` off, only a SQLite database with changes
+    /// beside it waits (as the replacement's own check would refuse it).
+    async fn database_replace(&self, a: &Arc<Approved>, notes: &mut Notes) -> Res {
+        let dbs = self.databases();
+        if let Some(db) = self.off_task(a, move |fs, a| fs.check_database_replace(a, &dbs)).await?? {
+            notes.database = Some(db);
+            return Err(Fail::Skip(Skip::Database));
+        }
+        Ok(())
+    }
+
+    /// The replacement's own check refused (`Error::DatabaseWaits`): says
+    /// why, for the report, as the check before it would have.
+    async fn database_refused(&self, a: &Arc<Approved>, notes: &mut Notes) -> Fail {
+        if let Ok(db) = self.off_task(a, |fs, a| fs.database_pending(a)).await {
+            notes.database = db;
+        }
+        Fail::Skip(Skip::Database)
+    }
+
+    /// Before a download into a SQLite working file's name (`-wal`,
+    /// `-shm`, `-journal`): it waits while another program has the database
+    /// beside it open, and until the database here is the one the state
+    /// database knows, at the version OneDrive has: placed beside another,
+    /// SQLite would apply it there. `Some`: the placement must run under
+    /// `LocalFs::hold_for_companion` with this expectation, which checks it
+    /// all again with the database held. (Moves and recycling judge working
+    /// files themselves, on the actual names: `LocalFs::check_move`.)
+    async fn companion_change(
+        &self,
+        store: &Db<'_>,
+        a: &Arc<Approved>,
+        notes: &mut Notes,
+    ) -> Res<Option<Option<MainExpect>>> {
+        use oneup_rules::database::Companion;
+        let name = match a.op() {
+            Op::Download { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        let Some(main) = name.as_deref().and_then(Companion::of_name).map(|(_, m)| m.to_string()) else {
+            return Ok(None);
+        };
+        let dbs = self.databases();
+        let proved = match self.off_task(a, move |fs, a| fs.check_companion_change(a, &dbs)).await?? {
+            CompanionCheck::Ordinary => false,
+            CompanionCheck::Go { .. } => true,
+            CompanionCheck::Waits(db) => {
+                notes.database = Some(db);
+                return Err(Fail::Skip(Skip::Database));
+            }
+        };
+        let Op::Download { to, .. } = a.op() else { return Ok(Some(None)) };
+        // The database the state database has there, if it's synced at
+        // the version OneDrive has: what the working file may go beside.
+        let expect = store.read(|o| {
+            let rows = o.local_named(to.0, &main)?;
+            let [row] = rows.as_slice() else { return Ok(Err(rows.is_empty())) };
+            let Some(b) = o.synced_by_local(row.file_id)? else { return Ok(Err(false)) };
+            let remote_now = match &b.remote {
+                Some(r) => o.get_item(&r.0)?.and_then(|r| r.etag),
+                None => None,
+            };
+            if b.local_mtime != row.mtime || b.size != row.size || remote_now.as_deref() != Some(&b.remote_etag) {
+                return Ok(Err(false));
+            }
+            Ok(Ok(MainExpect { id: LocalId(row.file_id), size: row.size, mtime: row.mtime }))
+        })?;
+        match expect {
+            Ok(e) => Ok(Some(Some(e))),
+            // No database known there, and none found: the hold checks
+            // again that there's none.
+            Err(true) if !proved => Ok(Some(None)),
+            // A SQLite database the state database doesn't know (new since
+            // it last looked): nothing says the file belongs to it.
+            Err(_) => {
+                notes.database = Some(companion_state(oneup_effects::Wait::Behind));
+                Err(Fail::Skip(Skip::Database))
+            }
+        }
+    }
+
+    /// An effect's result, with a refusal for changes beside a database
+    /// (`Error::DatabaseWaits`) reported with why.
+    async fn refused_or(&self, a: &Arc<Approved>, r: Result<Done, FxError>, notes: &mut Notes) -> Res<Done> {
+        match r {
+            Err(FxError::DatabaseWaits) => Err(self.database_refused(a, notes).await),
+            r => Ok(r?),
+        }
+    }
+
+    /// For a change to a SQLite working file (`guard`, from
+    /// [`Executor::companion_change`]): the hold on its database, taken
+    /// right before the effect and kept until it's done.
+    async fn take_hold(
+        &self,
+        a: &Arc<Approved>,
+        guard: &Option<Option<MainExpect>>,
+        notes: &mut Notes,
+    ) -> Res<Option<CompanionHold>> {
+        let Some(expect) = guard else { return Ok(None) };
+        match self.fs.hold_for_companion(a, expect.as_ref()) {
+            Ok(h) => Ok(Some(h)),
+            Err(FxError::DatabaseWaits) => Err(self.companion_refused(a, notes).await),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The hold refused (`Error::DatabaseWaits`) a change to a working
+    /// file: says why for the report, as the check before it would have.
+    async fn companion_refused(&self, a: &Arc<Approved>, notes: &mut Notes) -> Fail {
+        let dbs = self.databases();
+        let why = match self.off_task(a, move |fs, a| fs.check_companion_change(a, &dbs)).await {
+            Ok(Ok(CompanionCheck::Waits(db))) => db,
+            _ => companion_state(oneup_effects::Wait::Behind),
+        };
+        notes.database = Some(why);
+        Fail::Skip(Skip::Database)
     }
 
     /// Records how long its operations take in `t`.
@@ -1412,6 +1606,16 @@ impl<C: Cloud> Executor<C> {
         notes: &mut Notes,
         may_run: &(dyn Fn(&Op) -> bool + Sync),
     ) -> Res {
+        // A move, rename, conflict copy or recycling judges databases and
+        // their working files itself, on the actual names right before it
+        // acts (`LocalFs::check_move`); a download into a working file's
+        // name is checked here first, for what the state database knows.
+        let guard = if matches!(a.op(), Op::Download { .. }) {
+            Some(self.companion_change(store, a, notes).await?)
+        } else {
+            None
+        }
+        .flatten();
         match a.op() {
             // ------------------------------------------------ bookkeeping
             Op::Pair { local, remote, parent, name, kind, size, hash } => {
@@ -1487,9 +1691,41 @@ impl<C: Cloud> Executor<C> {
                 store.write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())).await?;
                 // Opened here (an open and an oplock request: short); its
                 // reads run on blocking threads.
-                let opened = self.fs.open_upload(a)?;
-                let (size, mtime) = (opened.size, opened.mtime);
-                let mut src = OffTask::new(opened, &self.jobs);
+                let mut src = OffTask::new(self.fs.open_upload(a)?, &self.jobs);
+                // A database goes only in a consistent state; a SQLite
+                // database's companions are watched with it from here on.
+                let dbs = self.databases();
+                // Consistency whatever `[databases] wait` says; that only
+                // decides whether other databases wait for their programs.
+                let fs = Arc::clone(&self.fs);
+                let checked = match src.with(move |s| fs.check_database_upload(s, &dbs)).await {
+                    Ok(r) => r?,
+                    Err(_) => return Err(Fail::Skip(Skip::Changed)),
+                };
+                match checked {
+                    UploadCheck::Send => {}
+                    UploadCheck::Consistent(r) => notes.recognised = Some(r.format),
+                    UploadCheck::Waits(db) => {
+                        notes.database = Some(db);
+                        return Err(Fail::Skip(Skip::Database));
+                    }
+                    UploadCheck::IfClosed { recognised, path } => {
+                        drop(src);
+                        let format = recognised.format;
+                        let open = self.off_task(a, move |fs, _| fs.database_open_by(recognised, &path)).await??;
+                        if let Some(db) = open {
+                            notes.database = Some(db);
+                            return Err(Fail::Skip(Skip::Database));
+                        }
+                        notes.recognised = Some(format);
+                        // Closed when asked; opened again (at its stamp).
+                        src = OffTask::new(self.fs.open_upload(a)?, &self.jobs);
+                    }
+                }
+                let (size, mtime) = match src.get() {
+                    Some(o) => (o.size, o.mtime),
+                    None => return Err(Fail::Skip(Skip::Changed)),
+                };
                 let (row, sent, sent_len, mark) = match self
                     .copy_instead(store, &mut src, size, to, name, replace.is_none())
                     .await?
@@ -1582,6 +1818,9 @@ impl<C: Cloud> Executor<C> {
             // Files On-Demand: a placeholder instead of the content (no
             // download, nothing written into the sync folder).
             Op::Download { remote, to, parent, name, replace, link } if self.fs.on_demand() => {
+                if replace.is_some() {
+                    self.database_replace(a, notes).await?;
+                }
                 let (expected, synced) = store
                     .write(|o| {
                         need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
@@ -1596,12 +1835,27 @@ impl<C: Cloud> Executor<C> {
                 // Without OneDrive's hash, nothing could vouch for the content
                 // a placeholder stands for.
                 let Some(v) = version(&expected) else { return Err(Fail::Skip(Skip::Refused)) };
+                let hold = self.take_hold(a, &guard, notes).await?;
                 let placed = match replace {
-                    None => self.fs.place_placeholder(a, &v)?,
+                    None => {
+                        let known = store.read(|o| known_beside(o, *to, name))?;
+                        let checked = self.fs.check_new_beside(a, None, &known);
+                        let placed = checked.and_then(|()| self.fs.place_placeholder(a, &v));
+                        self.refused_or(a, placed, notes).await?
+                    }
                     // Reads the old copy, to see whether it can go.
                     Some(_) => {
                         let new = v.clone();
-                        self.off_task(a, move |fs, a| fs.replace_placeholder(a, &new, synced.as_ref())).await??
+                        let placed = self
+                            .off_task(a, move |fs, a| {
+                                let _hold = hold;
+                                fs.replace_placeholder(a, &new, synced.as_ref())
+                            })
+                            .await?;
+                        match placed {
+                            Err(FxError::DatabaseWaits) => return Err(self.database_refused(a, notes).await),
+                            r => r?,
+                        }
                     }
                 };
                 let Done::Placed { entry, kept, .. } = placed else { return Err(odd()) };
@@ -1626,6 +1880,9 @@ impl<C: Cloud> Executor<C> {
                     .await
             }
             Op::Download { remote, to, parent, name, replace, link } => {
+                if replace.is_some() {
+                    self.database_replace(a, notes).await?;
+                }
                 let (expected, synced) = store
                     .write(|o| {
                         need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
@@ -1655,6 +1912,10 @@ impl<C: Cloud> Executor<C> {
                 if i64::try_from(len).ok() != Some(expected.size) || expected.qxh.is_some_and(|q| q != digest) {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }
+                // What its content says it is (verified, in OneUpDrive's own
+                // staging folder): an Outlook data file or a virtual disk
+                // under an ordinary name is warned about too.
+                notes.recognised = oneup_effects::staged_format(&mut staged);
                 if let Some(old) = replace {
                     store
                         .write_ahead(|o| {
@@ -1664,7 +1925,17 @@ impl<C: Cloud> Executor<C> {
                         .await?;
                     self.crash_point()?;
                 }
-                let placed = self.off_task(a, move |fs, a| fs.place_download(a, staged, synced.as_ref())).await?;
+                // Taken once the content is here: never during a transfer.
+                let hold = self.take_hold(a, &guard, notes).await?;
+                let known = if replace.is_none() { store.read(|o| known_beside(o, *to, name))? } else { Vec::new() };
+                let placed = self
+                    .off_task(a, move |fs, a| {
+                        let _hold = hold;
+                        let mut staged = staged;
+                        fs.check_new_beside(a, Some(&mut staged), &known)?;
+                        fs.place_download(a, staged, synced.as_ref())
+                    })
+                    .await?;
                 let entry = match placed {
                     Ok(Done::Placed { entry, kept, .. }) => {
                         notes.kept_instead =
@@ -1672,6 +1943,7 @@ impl<C: Cloud> Executor<C> {
                         entry
                     }
                     Ok(_) => return Err(odd()),
+                    Err(FxError::DatabaseWaits) => return Err(self.database_refused(a, notes).await),
                     Err(e) => return Err(e.into()),
                 };
                 self.crash_point()?;
@@ -1739,7 +2011,10 @@ impl<C: Cloud> Executor<C> {
                     let still = self.cloud.is_at(&RemoteId(row.id.clone()), at, &row.name).await?;
                     need(still != Some(false))?;
                 }
-                let Done::Placed { parent: dir, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
+                let applied = self.fs.apply(a);
+                let Done::Placed { parent: dir, entry, .. } = self.refused_or(a, applied, notes).await? else {
+                    return Err(odd());
+                };
                 self.crash_point()?;
                 store
                     .write(|o| {
@@ -1753,7 +2028,10 @@ impl<C: Cloud> Executor<C> {
                     .await
             }
             Op::RenameLocal { .. } => {
-                let Done::Placed { parent: dir, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
+                let applied = self.fs.apply(a);
+                let Done::Placed { parent: dir, entry, .. } = self.refused_or(a, applied, notes).await? else {
+                    return Err(odd());
+                };
                 self.crash_point()?;
                 store.write(|o| Ok(o.local_update(&self.local_row(&entry, dir))?)).await
             }
@@ -1770,7 +2048,10 @@ impl<C: Cloud> Executor<C> {
                     })
                     .await?;
                 self.crash_point()?;
-                let Done::Placed { parent, entry, .. } = self.fs.apply(a)? else { return Err(odd()) };
+                let applied = self.fs.apply(a);
+                let Done::Placed { parent, entry, .. } = self.refused_or(a, applied, notes).await? else {
+                    return Err(odd());
+                };
                 self.crash_point()?;
                 store
                     .write(|o| {
@@ -1791,7 +2072,9 @@ impl<C: Cloud> Executor<C> {
                     })
                     .await?;
                 self.crash_point()?;
-                match self.off_task(a, move |fs, a| fs.recycle(a, synced.as_ref())).await? {
+                let placed = self.off_task(a, move |fs, a| fs.recycle(a, synced.as_ref())).await?;
+                match placed {
+                    Err(FxError::DatabaseWaits) => return Err(self.database_refused(a, notes).await),
                     Ok(Done::Recycled { kept }) => {
                         notes.kept_instead = kept.is_some() && a.old_copy() == OldCopy::DropIfSynced;
                     }
