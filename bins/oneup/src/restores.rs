@@ -12,7 +12,7 @@
 
 use anyhow::{Result, bail};
 use oneup_store::{ActivityEntry, ActivityOutcome, Ops, Store};
-use oneup_sync::rewind::Step;
+use oneup_sync::rewind::{Spot, Step};
 use oneup_sync::{NodeKind, Op, RemoteId, RemotePre};
 use serde_json::{Value, json};
 
@@ -46,6 +46,11 @@ fn to_json(a: &Asked) -> Option<Value> {
         Step::Restore { id, to, name, kind, content: None, gone: None } => json!({
             "sid": sid, "deleted": id.0, "parent": to.0, "name": name, "kind": kind_name(*kind), "path": a.path,
         }),
+        // A restore's follow-up (`oneup_exec::recover::follow_up`).
+        Step::Reset { remote, from, place: Some((to, name)), content: None } => json!({
+            "sid": sid, "move": remote.id.0, "etag": remote.etag, "parent": to.0, "name": name, "path": a.path,
+            "from": { "parent": from.parent.0, "name": from.name, "size": from.size, "hash": from.hash.map(|h| hex(&h)) },
+        }),
         _ => return None,
     })
 }
@@ -54,7 +59,17 @@ fn from_json(v: &Value) -> Option<Asked> {
     let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     let path = s("path").unwrap_or_default();
     let sid = v.get("sid").and_then(Value::as_u64).unwrap_or(0);
-    let op = if let Some(slot) = s("kept") {
+    let op = if let Some(id) = s("move") {
+        let f = v.get("from")?;
+        let fs = |k: &str| f.get(k).and_then(Value::as_str).map(str::to_string);
+        let hash = match f.get("hash").and_then(Value::as_str) {
+            Some(h) => Some(unhex(h)?),
+            None => None,
+        };
+        let from = Spot { parent: RemoteId(fs("parent")?), name: fs("name")?, size: f.get("size")?.as_i64()?, hash };
+        let remote = RemotePre { id: RemoteId(id), etag: s("etag")? };
+        Op::rewind(sid, Step::Reset { remote, from, place: Some((RemoteId(s("parent")?), s("name")?)), content: None })
+    } else if let Some(slot) = s("kept") {
         oneup_exec::recover::kept_op(&slot, s("to").as_deref())
     } else if let Some(version) = s("version") {
         let remote = RemotePre { id: RemoteId(s("id")?), etag: s("etag")? };
@@ -75,6 +90,21 @@ fn from_json(v: &Value) -> Option<Asked> {
         Op::rewind(sid, step)
     };
     Some(Asked { op, path })
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<[u8; 20]> {
+    let mut out = [0u8; 20];
+    if s.len() != 40 {
+        return None;
+    }
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 fn read_queue(o: &Ops<'_>) -> oneup_store::Result<Vec<Asked>> {
@@ -180,6 +210,7 @@ fn done_detail(op: &Op) -> &'static str {
         Op::Rewind { step, .. } => match &**step {
             Step::RestoreKept { .. } => "from the version store; OneDrive gets it next",
             Step::RevertTo { .. } => "an old version is current again; the one it replaced stays in the history",
+            Step::Reset { .. } => "moved where it was asked back to",
             _ => "from OneDrive's recycle bin",
         },
         _ => "",
@@ -198,7 +229,19 @@ pub fn ran(store: &mut Store, q: &Queued, report: &oneup_exec::Report) -> Result
         let mut log = Vec::new();
         for a in &q.asked {
             if report.done.contains(&a.op) {
-                log.push(entry(ActivityOutcome::Done, a.path.clone(), done_detail(&a.op).into()));
+                // Back somewhere other than asked: its move follows, bound to
+                // it as it came back, through the gate like the restore.
+                if let Some(next) = oneup_exec::recover::follow_up(o, &a.op)? {
+                    let came = match next.rewind_step() {
+                        Some(Step::Reset { from, .. }) => from.name.clone(),
+                        _ => String::new(),
+                    };
+                    let detail = format!("OneDrive brought it back as {came}; moved where asked next");
+                    log.push(entry(ActivityOutcome::Note, a.path.clone(), detail));
+                    left.push(Asked { op: next, path: a.path.clone() });
+                } else {
+                    log.push(entry(ActivityOutcome::Done, a.path.clone(), done_detail(&a.op).into()));
+                }
             } else if let Some((_, s)) = report.skipped.iter().find(|(o, _)| *o == a.op) {
                 let why = format!("not restored: {}", crate::sync::skip_label(*s));
                 log.push(entry(ActivityOutcome::Failed, a.path.clone(), why));
@@ -243,10 +286,66 @@ mod tests {
                     gone: None,
                 },
             ),
+            Op::rewind(
+                9,
+                Step::Reset {
+                    remote: RemotePre { id: RemoteId("A!2".into()), etag: "e2".into() },
+                    from: Spot { parent: RemoteId("A!0".into()), name: "b 1.txt".into(), size: 3, hash: Some([7; 20]) },
+                    place: Some((RemoteId("A!0".into()), "b.txt".into())),
+                    content: None,
+                },
+            ),
         ];
         for op in ops {
             let a = Asked { op, path: "/x".into() };
             assert_eq!(from_json(&to_json(&a).unwrap()).as_ref(), Some(&a));
         }
+    }
+
+    /// Brought back somewhere other than asked: the restore isn't done, its
+    /// move bound to the item as it came back waits in the queue.
+    #[test]
+    fn a_restore_back_elsewhere_queues_its_move() {
+        use oneup_store::{Kind, RemoteRow};
+        let mut store = Store::open_in_memory().unwrap();
+        let row = |name: &str| RemoteRow {
+            id: "A!2".into(),
+            parent_id: Some("A!0".into()),
+            name: name.into(),
+            kind: Kind::File,
+            size: 3,
+            etag: Some("e2".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        store.write(|o| o.upsert_item(&row("b 1.txt"), false).map(|_| ())).unwrap();
+        let restore = Op::rewind(
+            9,
+            Step::Restore {
+                id: RemoteId("A!2".into()),
+                to: RemoteId("A!0".into()),
+                name: "b.txt".into(),
+                kind: NodeKind::File,
+                content: None,
+                gone: None,
+            },
+        );
+        ask(&mut store, Asked { op: restore.clone(), path: "/b.txt".into() }).unwrap();
+        let q = queued(&store).unwrap();
+        let report = oneup_exec::Report { done: vec![restore.clone()], ..Default::default() };
+        ran(&mut store, &q, &report).unwrap();
+        let left = store.read(waiting).unwrap();
+        assert_eq!(left.len(), 1);
+        let Some(Step::Reset { remote, from, place, content: None }) = left[0].op.rewind_step() else {
+            panic!("{left:?}")
+        };
+        assert_eq!((remote.etag.as_str(), from.name.as_str()), ("e2", "b 1.txt"));
+        assert_eq!(place.as_ref().map(|(_, n)| n.as_str()), Some("b.txt"));
+        // Where asked: done.
+        store.write(|o| o.upsert_item(&row("b.txt"), false).map(|_| ())).unwrap();
+        let q = queued(&store).unwrap();
+        let report = oneup_exec::Report { done: q.ops.clone(), ..Default::default() };
+        ran(&mut store, &q, &report).unwrap();
+        assert!(store.read(waiting).unwrap().is_empty());
     }
 }

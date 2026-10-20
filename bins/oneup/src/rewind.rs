@@ -514,7 +514,8 @@ pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Repor
         }
         return Ok(false);
     };
-    let mine = |op: &&Op| matches!(op, Op::Rewind { .. });
+    // Its own steps only (a restore asked for meanwhile is a step too).
+    let mine = |op: &&Op| steps.ops.contains(op);
     let done: Vec<&Op> = report.done.iter().filter(mine).collect();
     for op in &done {
         approval.ran(op, oneup_exec::rewind_mark(o, op)?);
@@ -527,7 +528,7 @@ pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Repor
     }
     job.ran += done.len() as u64;
     job.left_alone = job.left_alone.max(steps.left_alone as u64);
-    job.failed += report.failed.iter().filter(|(op, _)| matches!(op, Op::Rewind { .. })).count() as u64;
+    job.failed += report.failed.iter().filter(|(op, _)| steps.ops.contains(op)).count() as u64;
     let tried = !steps.ops.is_empty();
     job.stalls = if tried && done.is_empty() { job.stalls + 1 } else { 0 };
     // Waiting for this PC to catch up with its own steps (or a change

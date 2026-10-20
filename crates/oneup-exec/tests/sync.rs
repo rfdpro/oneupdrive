@@ -1303,6 +1303,7 @@ impl Sync {
         // Reading OneDrive's changes is a request too (the delta listing).
         self.cloud.request().await;
         let extra = std::mem::take(&mut self.extra);
+        let asked = extra.clone();
         let store = self.obs.store_mut();
         self.cloud.pull(store);
         // Only the folders the store marked dirty are planned, as the
@@ -1477,6 +1478,18 @@ impl Sync {
             r.stalls = if tried && ran.is_empty() { r.stalls + 1 } else { 0 };
             if r.stalls >= STALLS {
                 r.done = true;
+            }
+        }
+        // A restore asked for that came back somewhere other than asked:
+        // its move follows, as the agent queues it (`oneup_app::restores`);
+        // one that didn't run waits, as in the queue.
+        for op in &asked {
+            if report.done.contains(op) {
+                if let Some(next) = store.read(|o| oneup_exec::recover::follow_up(o, op)).unwrap() {
+                    self.extra.push(next);
+                }
+            } else if !report.skipped.iter().any(|(o, _)| o == op) && !report.failed.iter().any(|(o, _)| o == op) {
+                self.extra.push(op.clone());
             }
         }
         let followed = followed.into_inner().unwrap();
@@ -6073,6 +6086,34 @@ async fn everyday_a_restore_asked_for_leaves_a_file_changed_since_alone() {
     assert_eq!(std::fs::read(s.p("docs/k.txt")).unwrap(), b"a new k");
     assert_eq!(std::fs::read(s.p("docs/k (restored 1).txt")).unwrap(), b"kept");
     assert_eq!(s.synced_part(local_tree(&s.dir.0)), s.synced_part(cloud.tree()));
+}
+
+#[tokio::test]
+async fn everyday_a_restore_that_comes_back_elsewhere_is_moved_where_asked() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-restore-asked-odd", cloud.clone());
+    write(&s.p("docs/b.txt"), b"bee");
+    s.settle().await;
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    s.settle().await;
+    let gone = s.obs.store().read(|o| o.history_removed(10, None)).unwrap();
+    let b = gone.iter().find(|r| r.was.name == "b.txt").expect("recorded");
+    let parent = s.obs.store().read(|o| o.synced_get(b.was.parent.unwrap())).unwrap().unwrap().remote.unwrap();
+    let id = b.was.remote.clone().unwrap();
+    let op = s
+        .obs
+        .store()
+        .read(|o| oneup_exec::recover::deleted_op(o, b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File))
+        .unwrap();
+    // OneDrive brings it back under another name than asked.
+    cloud.0.lock().unwrap().restore_odd = Some(("b 1.txt".into(), false));
+    s.extra = vec![op];
+    s.settle().await;
+    let t = local_tree(&s.dir.0);
+    assert_eq!(t.get("/docs/b.txt"), Some(&Some(b"bee".to_vec())), "where asked: {t:?}");
+    assert!(!t.contains_key("/docs/b 1.txt"));
+    assert_eq!(s.synced_part(t), s.synced_part(cloud.tree()));
+    assert!(s.extra.is_empty(), "nothing left to do");
 }
 
 #[tokio::test]
