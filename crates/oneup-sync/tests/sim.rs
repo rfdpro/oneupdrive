@@ -595,10 +595,11 @@ impl World {
                 if !self.rpre_ok(remote) || self.remote.values().any(|it| it.parent.as_deref() == Some(&remote.id.0)) {
                     return false;
                 }
-                let local = self.bases.get(sid).and_then(|b| b.local);
+                // As the executor: only for a Synced row still there.
+                let Some(b) = self.bases.get(sid) else { return false };
                 assert!(
-                    local.is_none_or(|l| self.local_gone.contains(&l.0)),
-                    "invariant 3: deleted in the cloud without evidence of its deletion here: {op:?}"
+                    b.remote.as_ref() == Some(&remote.id) && b.local.is_some_and(|l| self.local_gone.contains(&l.0)),
+                    "invariant 3: deleted in the cloud without evidence of its deletion here: {op:?} {b:?}"
                 );
                 if let Some(it) = self.remote.remove(&remote.id.0)
                     && it.kind == NodeKind::File
@@ -1703,6 +1704,27 @@ fn a_folder_made_in_the_cloud_again_never_lands_below_itself() {
 #[test]
 fn a_folder_made_in_the_cloud_again_for_new_contents_never_lands_below_itself() {
     deleted_there_moved_here(true);
+}
+
+/// A conflict copy detaches the Synced row from the local file it renames.
+/// If the cloud's side then turns out unchanged (the conflict was planned
+/// from a listing behind the cloud, simulation seed 6 of the delta-lag
+/// run), the cloud's file keeps its name and comes back here, as after any
+/// conflict; it isn't deleted as if the file had been deleted here.
+#[test]
+fn a_conflict_copy_never_deletes_the_cloud_original() {
+    let mut w = synced();
+    let (l, r) = (lid(&w, "doc.txt"), rid(&w, "doc.txt"));
+    let original = w.remote[&r].content;
+    let (c, m) = (w.content(), w.tick());
+    edit(w.local.get_mut(&l), |it| (it.content, it.mtime, it.name) = (c, m, "doc (conflict 1).txt".into()));
+    let sid = w.bases.values().find(|b| b.name == "doc.txt").map_or(0, |b| b.sid);
+    edit(w.bases.get_mut(&sid), |b| b.local = None);
+    let ops = plan_both(&w);
+    assert!(!ops.iter().any(|o| matches!(o, Op::DeleteRemote { .. })), "{ops:?}");
+    settle(&mut w, false);
+    assert_converged(&w, &[c].into());
+    assert_eq!(w.remote.get(&r).map(|it| (it.name.as_str(), it.content)), Some(("doc.txt", original)));
 }
 
 /// How a scenario takes an item away from one side.

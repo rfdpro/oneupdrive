@@ -501,7 +501,11 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
     let here = b.parent.map(|p| (p, b.name.clone()));
     let rloc = remote_loc(t, &r)?;
     let rc = b.kind == NodeKind::File && remote_changed(b, &r);
-    if rc || rloc != here {
+    // Detached by a conflict copy: the file here was renamed aside, not
+    // deleted, and the cloud's keeps its name. Unchanged there (the conflict
+    // was planned from a listing behind the cloud), it still comes back.
+    let detached = b.local.is_none();
+    if rc || rloc != here || detached {
         // Changed or moved in the cloud since: that change wins over the
         // deletion. Re-create it here at the cloud's location.
         let Some((psid, name)) = rloc else { return Ok(()) };

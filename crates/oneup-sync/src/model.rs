@@ -238,7 +238,9 @@ pub fn strip_folded_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// A Synced row's local side as it is now. A detached row is "deleted":
-/// the executor itself removed the link, which is evidence.
+/// the executor itself removed the link, which is evidence. (Only a
+/// conflict copy detaches a row, renaming the file aside, so the planner
+/// brings the cloud's side back rather than deleting it: `merge::local_gone`.)
 pub fn local_of<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Seen<LocalNode>, T::Error> {
     match b.local {
         Some(id) => t.local(id),
