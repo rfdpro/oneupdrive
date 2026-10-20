@@ -39,6 +39,11 @@ pub fn now_ms() -> i64 {
 pub struct LivePause {
     local: AtomicBool,
     remote: AtomicBool,
+    /// The network's policy now (`crate::network`), for transfers of file
+    /// contents: set the moment Windows reports another network.
+    net: Mutex<crate::network::Policy>,
+    /// The folder uses Files On-Demand: downloads are placeholders.
+    on_demand: AtomicBool,
 }
 
 impl LivePause {
@@ -47,20 +52,40 @@ impl LivePause {
         self.remote.store(remote, Relaxed);
     }
 
+    fn set_net(&self, p: &crate::network::Policy) {
+        *self.net.lock().unwrap_or_else(|e| e.into_inner()) = p.clone();
+    }
+
+    /// Whether the network lets `op` through now. A download's size isn't
+    /// known here: under a size limit, a download after a change of
+    /// network waits for the next round, which knows it.
+    fn net_allows(&self, op: &Op) -> bool {
+        match crate::network::content(op, self.on_demand.load(Relaxed), |_| None) {
+            Some((way, bytes)) => self.net.lock().unwrap_or_else(|e| e.into_inner()).allows(way, bytes),
+            None => true,
+        }
+    }
+
     /// For one round: whether an operation may run now. Not one that
     /// changes a side paused since the round began, nor, after that, any
     /// other changing that side, even if it resumed meanwhile: they may
     /// depend on one that didn't run. Bookkeeping always may.
+    ///
+    /// The same for a change of network: once its policy differs from the
+    /// one the round was planned under, a transfer of file contents it
+    /// doesn't let through stops that side for the rest of the round.
     pub fn round_check(&self) -> impl Fn(&Op) -> bool + Sync + '_ {
         let stopped = [AtomicBool::new(false), AtomicBool::new(false)];
+        let planned = self.net.lock().unwrap_or_else(|e| e.into_inner()).clone();
         move |op| {
             // A duplicate removed from both sides changes both.
+            let changed = *self.net.lock().unwrap_or_else(|e| e.into_inner()) != planned;
             let mut ok = true;
             for (i, side, paused) in [(0, Side::Local, &self.local), (1, Side::Remote, &self.remote)] {
                 if !oneup_gate::changes(op, side) {
                     continue;
                 }
-                if paused.load(Relaxed) {
+                if paused.load(Relaxed) || (changed && !self.net_allows(op)) {
                     stopped[i].store(true, Relaxed);
                 }
                 ok &= !stopped[i].load(Relaxed);
@@ -388,9 +413,17 @@ impl Control {
         self.publish(&mut s);
     }
 
-    /// What the network's profile lets the next rounds do.
+    /// What the network's profile lets rounds do: the next ones, and the
+    /// one under way from its next operation on.
     pub fn set_policy(&self, p: crate::network::Policy) {
+        self.live.set_net(&p);
         self.lock().policy = p;
+    }
+
+    /// The folder uses Files On-Demand (cloud files arrive as placeholders,
+    /// which move no contents).
+    pub fn set_on_demand(&self, on: bool) {
+        self.live.on_demand.store(on, Relaxed);
     }
 
     /// Why the agent paused by itself, or `None` when it didn't.
@@ -822,6 +855,47 @@ mod tests {
         assert!(live.round_check()(&op));
         c.call(Call::Pause { direction: Direction::Local, minutes: None }, 0).unwrap();
         assert!(!live.round_check()(&op), "only this PC is paused");
+    }
+
+    /// Windows reporting a metered network mid-round (the agent sets the
+    /// new policy at once): the next upload doesn't start, nor anything
+    /// else changing OneDrive for the rest of that round; renames on this
+    /// PC still go. The next round plans what waits under the new policy.
+    #[test]
+    fn a_change_of_network_mid_round_stops_its_transfers_at_the_next_operation() {
+        use crate::network::{Policy, Transfer};
+        use oneup_sync::{Link, LocalId, LocalPre, RemoteId, RemotePre};
+        let c = control(None);
+        let live = c.controls().live.unwrap();
+        let upload = Op::Upload {
+            local: LocalPre { id: LocalId(1), stamp: Some((5_000_000, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let rename = Op::MoveLocal {
+            sid: 2,
+            local: LocalPre { id: LocalId(2), stamp: None },
+            to: LocalId(9),
+            parent: 1,
+            name: "b".into(),
+        };
+        let delete = Op::DeleteRemote { sid: 3, remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() } };
+        let check = live.round_check();
+        assert!(check(&upload), "planned under 'everything'");
+        c.set_policy(Policy { transfer: Transfer::Metadata, ..Policy::default() });
+        assert!(!check(&upload) && !check(&delete), "that side stops for the rest of the round");
+        assert!(check(&rename) && check(&Op::Forget(4)));
+        // The next round is planned under the new policy, which already
+        // left the upload out; what it planned goes.
+        assert!(live.round_check()(&delete));
+        // Back to a network that lets everything through: from the next
+        // operation on.
+        let check = live.round_check();
+        c.set_policy(Policy::default());
+        assert!(check(&upload));
     }
 
     #[test]

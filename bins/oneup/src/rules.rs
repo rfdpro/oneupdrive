@@ -596,6 +596,14 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     if let Some(i) = record.items.iter().find(|i| oneup_sync::same_name(&i.path, &at)) {
         println!("  can't sync: {} (`oneup unsynced resolve` shows what you can do)", i.why.label());
     }
+    // Waiting for a network that lets its contents through
+    // (`oneup_app::network`).
+    if let Some(w) = oneup_app::network::load_waiting(store)?
+        && let Some((_, bytes, up)) = w.items.iter().find(|(p, _, _)| p.eq_ignore_ascii_case(&at))
+    {
+        let way = if *up { "upload" } else { "download" };
+        println!("  waiting: its {way} ({}): {}", oneup_app::versions::size(*bytes), w.why);
+    }
     let queued = store.read(oneup_app::resolve::queued)?;
     if let Some(q) = queued.iter().find(|q| oneup_sync::same_name(&q.path, &at)) {
         println!("  your choice waits for the next round: {}", q.choice.label());

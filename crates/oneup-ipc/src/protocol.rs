@@ -459,6 +459,19 @@ pub struct NetStatus {
     /// When the next pass runs (Unix ms), with an interval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_ms: Option<i64>,
+    /// File contents waiting for a network that lets them through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<NetWaiting>,
+}
+
+/// What waits for another network (`oneup network waiting` lists it, the
+/// largest first).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetWaiting {
+    pub count: u64,
+    pub bytes: u64,
+    /// Why, for people.
+    pub why: String,
 }
 
 /// Items whose operations failed and wait before they're tried again (a

@@ -1259,6 +1259,12 @@ enum NetworkCmd {
         #[command(flatten)]
         target: NetworkTarget,
     },
+    /// List what waits for a network that lets it through, the largest first
+    Waiting {
+        /// How many to list at most
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2427,6 +2433,9 @@ async fn run() -> Result<()> {
                 budget_mb: budget_mb.map(|n| n as u64),
             };
             netcmd::set(&data_dir(&cli)?, &target.target(), &changes).await
+        }
+        Cmd::Network { cmd: Some(NetworkCmd::Waiting { limit }) } => {
+            netcmd::waiting(&open_store(&cli, MemoryProfile::Balanced)?, *limit)
         }
         Cmd::Network { cmd: Some(NetworkCmd::Forget { target }) } => {
             netcmd::forget(&data_dir(&cli)?, &target.target()).await

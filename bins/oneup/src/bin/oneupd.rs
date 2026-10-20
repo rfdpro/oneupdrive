@@ -603,6 +603,9 @@ async fn agent(
     let mut auto_was: Option<autopause::Reason> = None;
     let mut pacer = Pacer::default();
     let mut woke = Woke::Start;
+    // What the last pass held for another network (`oneup_app::network`).
+    let mut waiting = oneup_app::network::load_waiting(&store)?;
+    control.set_on_demand(engine.local().on_demand());
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
         // wake-up; a broken config.toml keeps the last good settings
@@ -700,6 +703,7 @@ async fn agent(
             control.forget_approvals(&engine.spent_answers());
             let (s, out) = rounds?;
             store = s;
+            waiting.clone_from(&out.waiting);
             if executed != Recent::default() {
                 window.save(&mut store).context("can't record the safety window")?;
             }
@@ -811,7 +815,7 @@ async fn agent(
             }
             _ => next,
         };
-        control.set_network(net_status(&pacer, &net, &profile));
+        control.set_network(net_status(&pacer, &net, &profile, waiting.as_ref()));
 
         // ---- wait for something to do
         let (s, w) = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer).await?;
@@ -828,6 +832,7 @@ fn net_status(
     pacer: &Pacer,
     net: &oneup_sys::network::Network,
     profile: &oneup_app::network::Profile,
+    waiting: Option<&oneup_app::network::Waiting>,
 ) -> oneup_ipc::NetStatus {
     let next_ms = pacer.due().map(|d| {
         let left = d.saturating_duration_since(Instant::now());
@@ -846,6 +851,7 @@ fn net_status(
         connectivity: net.connectivity.name().into(),
         interval_min: pacer.interval().minutes,
         next_ms,
+        waiting: waiting.map(|w| oneup_ipc::NetWaiting { count: w.count, bytes: w.bytes, why: w.why.clone() }),
     }
 }
 

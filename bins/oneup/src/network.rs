@@ -490,12 +490,145 @@ pub fn pause_reason(p: &Profile) -> Option<crate::autopause::Reason> {
 pub struct Policy {
     /// Caps in KiB/s (0: none), instead of `[agent]`'s.
     pub caps: Option<(u64, u64)>,
+    pub transfer: Transfer,
+    /// [`Transfer::Small`]'s limit, in bytes.
+    pub small_bytes: u64,
+    /// The name of the network, for saying why something waits.
+    pub network: String,
 }
 
 impl Policy {
     pub fn of(p: &Profile) -> Self {
-        Self { caps: Some((p.upload_kib, p.download_kib)) }
+        Self {
+            caps: Some((p.upload_kib, p.download_kib)),
+            transfer: p.transfer,
+            small_bytes: p.small_bytes(),
+            network: p.network.clone(),
+        }
     }
+
+    /// Whether this policy lets a transfer of `bytes` (`None`: not known
+    /// yet) go `way`. Only what moves file contents is ever held:
+    /// names, folders, moves, deletions and online-only placeholders go.
+    pub fn allows(&self, way: Way, bytes: Option<u64>) -> bool {
+        match self.transfer {
+            Transfer::Everything => true,
+            Transfer::Paused | Transfer::Metadata => false,
+            Transfer::Small => bytes.is_some_and(|b| b < self.small_bytes),
+            Transfer::Opened => way == Way::Up,
+        }
+    }
+
+    /// Why what it holds waits, for `oneup status` and `oneup explain`.
+    pub fn why(&self) -> String {
+        let here = if self.network.is_empty() { "this network".to_string() } else { self.network.clone() };
+        match self.transfer {
+            Transfer::Small => format!(
+                "larger than {} MB: waits for a network that allows it ({here} doesn't)",
+                self.small_bytes / 1_000_000
+            ),
+            Transfer::Opened => {
+                format!("downloads wait for a network that allows them ({here} syncs only files you open or change)")
+            }
+            _ => format!("file contents wait for a network that allows them ({here} syncs names and folders only)"),
+        }
+    }
+}
+
+/// Which way a transfer goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Way {
+    Up,
+    Down,
+}
+
+/// The file contents `op` moves over the network, if it moves any: which
+/// way, and how many bytes (`None`: not known here). An upload's size is
+/// its file's as planned; a download's comes from `remote_size`. With
+/// Files On-Demand, cloud files arrive as online-only placeholders: no
+/// contents.
+pub fn content(
+    op: &oneup_sync::Op,
+    on_demand: bool,
+    remote_size: impl FnOnce(&str) -> Option<u64>,
+) -> Option<(Way, Option<u64>)> {
+    use oneup_sync::Op;
+    match op {
+        Op::Upload { local, .. } => Some((Way::Up, local.stamp.and_then(|(size, _)| u64::try_from(size).ok()))),
+        Op::Download { remote, .. } if !on_demand => Some((Way::Down, remote_size(&remote.id.0))),
+        _ => None,
+    }
+}
+
+/// Bounded list of what waits for another network (`oneup status`,
+/// `oneup explain`, `oneup network waiting`): the largest first.
+pub const WAITING_MAX: usize = 500;
+/// The `meta` key it's kept under.
+pub const KEY_WAITING: &str = "net.waiting";
+
+/// What waits for another network, by size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Waiting {
+    pub count: u64,
+    pub bytes: u64,
+    pub why: String,
+    /// The largest, at most [`WAITING_MAX`]: (path, bytes, upload).
+    pub items: Vec<(String, u64, bool)>,
+}
+
+impl Waiting {
+    /// One more waiting item.
+    pub fn add(&mut self, path: String, bytes: u64, way: Way) {
+        self.count += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.items.push((path, bytes, way == Way::Up));
+        if self.items.len() > 2 * WAITING_MAX {
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        self.items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        self.items.truncate(WAITING_MAX);
+    }
+
+    pub fn to_json(&self) -> String {
+        let items: Vec<serde_json::Value> =
+            self.items.iter().map(|(p, b, up)| serde_json::json!([p, b, if *up { "up" } else { "down" }])).collect();
+        serde_json::json!({ "count": self.count, "bytes": self.bytes, "why": self.why, "items": items }).to_string()
+    }
+
+    pub fn from_json(s: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        let items = v["items"]
+            .as_array()?
+            .iter()
+            .filter_map(|i| Some((i[0].as_str()?.to_string(), i[1].as_u64()?, i[2].as_str()? == "up")))
+            .collect();
+        Some(Self { count: v["count"].as_u64()?, bytes: v["bytes"].as_u64()?, why: v["why"].as_str()?.into(), items })
+    }
+}
+
+/// Keeps the list after a round (`None`: nothing waits); written only when
+/// it changed.
+pub fn save_waiting(store: &mut oneup_store::Store, w: Option<Waiting>) -> oneup_store::Result<()> {
+    let now = w.map(|mut w| {
+        w.trim();
+        w.to_json()
+    });
+    let before = store.read(|o| o.meta_get(KEY_WAITING))?;
+    if before == now {
+        return Ok(());
+    }
+    store.write(|o| match &now {
+        Some(t) => o.meta_set(KEY_WAITING, t),
+        None => o.meta_delete(KEY_WAITING),
+    })
+}
+
+/// What waits for another network, as the last round left it.
+pub fn load_waiting(store: &oneup_store::Store) -> oneup_store::Result<Option<Waiting>> {
+    Ok(store.read(|o| o.meta_get(KEY_WAITING))?.and_then(|s| Waiting::from_json(&s)))
 }
 
 /// The network now and the profile in effect, read fresh: the agent asks
@@ -567,6 +700,52 @@ mod tests {
         let p = active(&agent, Interval::default(), &nets, &Seen { id: None, name: "Wi-Fi".into(), metered: false });
         assert_eq!(p.key, Key::Default);
         assert!(nets.forget(HOME) && !nets.forget(HOME));
+    }
+
+    #[test]
+    fn only_file_contents_wait_and_each_choice_lets_its_own_through() {
+        use oneup_sync::{Link, LocalId, LocalPre, Op, RemoteId, RemotePre};
+        let up = |size: i64| Op::Upload {
+            local: LocalPre { id: LocalId(1), stamp: Some((size, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let down = Op::Download {
+            remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() },
+            to: LocalId(2),
+            parent: 1,
+            name: "b".into(),
+            replace: None,
+            link: Link::New,
+        };
+        assert_eq!(content(&up(5), false, |_| None), Some((Way::Up, Some(5))));
+        assert_eq!(content(&down, false, |_| Some(9)), Some((Way::Down, Some(9))));
+        assert_eq!(content(&down, true, |_| Some(9)), None, "an online-only placeholder moves no contents");
+        assert_eq!(content(&Op::Forget(3), false, |_| None), None);
+        let p = |transfer| Policy { transfer, small_bytes: 10, ..Policy::default() };
+        assert!(p(Transfer::Everything).allows(Way::Down, None));
+        assert!(!p(Transfer::Metadata).allows(Way::Up, Some(1)));
+        assert!(p(Transfer::Small).allows(Way::Down, Some(9)) && !p(Transfer::Small).allows(Way::Down, Some(10)));
+        assert!(!p(Transfer::Small).allows(Way::Down, None), "an unknown size waits");
+        assert!(p(Transfer::Opened).allows(Way::Up, Some(1 << 40)) && !p(Transfer::Opened).allows(Way::Down, Some(1)));
+    }
+
+    #[test]
+    fn the_waiting_list_keeps_the_largest_and_round_trips() {
+        let mut w = Waiting { why: "x".into(), ..Waiting::default() };
+        for i in 0..(3 * WAITING_MAX as u64) {
+            w.add(format!("/f{i}"), i, if i % 2 == 0 { Way::Up } else { Way::Down });
+        }
+        let mut store = oneup_store::Store::open_in_memory().unwrap();
+        save_waiting(&mut store, Some(w.clone())).unwrap();
+        let back = load_waiting(&store).unwrap().unwrap();
+        assert_eq!((back.count, back.bytes, back.items.len()), (w.count, w.bytes, WAITING_MAX));
+        assert_eq!(back.items[0].1, 3 * WAITING_MAX as u64 - 1, "largest first");
+        save_waiting(&mut store, None).unwrap();
+        assert!(load_waiting(&store).unwrap().is_none());
     }
 
     #[test]

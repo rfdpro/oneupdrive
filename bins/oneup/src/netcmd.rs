@@ -104,3 +104,21 @@ pub fn show(dir: &Path) -> Result<()> {
     println!("\n`oneup network set --help` changes these.");
     Ok(())
 }
+
+/// `oneup network waiting`: what the last pass held for another network.
+pub fn waiting(store: &oneup_store::Store, limit: usize) -> Result<()> {
+    let Some(w) = network::load_waiting(store)? else {
+        println!("Nothing waits for another network.");
+        return Ok(());
+    };
+    let size = oneup_app::versions::size;
+    println!("{} files ({}) wait: {}", w.count, size(w.bytes), w.why);
+    for (path, bytes, up) in w.items.iter().take(limit.max(1)) {
+        println!("  {:>10}  {}  {path}", size(*bytes), if *up { "upload  " } else { "download" });
+    }
+    let shown = w.items.len().min(limit.max(1)) as u64;
+    if w.count > shown {
+        println!("  … and {} more", w.count - shown);
+    }
+    Ok(())
+}
