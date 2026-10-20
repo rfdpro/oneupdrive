@@ -90,6 +90,25 @@ fn encode_id(id: &str) -> String {
     encode_drive_path(id)
 }
 
+/// How a search is sent ([`Graph::search`]).
+fn search_req(url: &str) -> Req<'_> {
+    Req { label: Some("OneDrive search"), private: true, retry: false, ..Req::new(reqwest::Method::GET, url) }
+}
+
+/// The URL of a search below `top` (the drive's root or a folder): the
+/// text as an OData string (`'` doubled), percent-encoded whole.
+fn search_url(top: &str, text: &str, n: u32) -> String {
+    let quoted = format!("'{}'", text.replace('\'', "''"));
+    let q: String = quoted
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("{top}/search(q={q})?$top={n}&$select={ITEM_SELECT}")
+}
+
 /// One request, described so it can be rebuilt for each attempt.
 struct Req<'a> {
     method: reqwest::Method,
@@ -103,8 +122,12 @@ struct Req<'a> {
     content_range: Option<String>,
     timeout: Option<Duration>,
     /// Shown in errors instead of the URL (pre-authenticated URLs carry a
-    /// session token and must never be logged).
+    /// session token and must never be logged). With a label, network
+    /// errors are logged and returned without their URL too.
     label: Option<&'static str>,
+    /// The URL holds what the user typed (a search): besides the URL, an
+    /// error leaves out the reply's body, which may repeat it.
+    private: bool,
     /// Sent again after a network error or a server error. Off for an
     /// upload fragment: its upload session owns those retries, asking the
     /// session where it is first, and counts them per fragment. Throttling
@@ -124,8 +147,15 @@ impl<'a> Req<'a> {
             content_range: None,
             timeout: None,
             label: None,
+            private: false,
             retry: true,
         }
+    }
+
+    /// `e` as it may be logged or returned: without the URL when the
+    /// request is labelled.
+    fn plain(&self, e: reqwest::Error) -> reqwest::Error {
+        if self.label.is_some() { e.without_url() } else { e }
     }
 }
 
@@ -723,7 +753,7 @@ impl Graph {
             measure.attempts += 1;
             self.stats.requests.fetch_add(1, Relaxed);
             let sent = rb.send().await;
-            let resp = match sent {
+            let resp = match sent.map_err(|e| req.plain(e)) {
                 Ok(r) => r,
                 Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
@@ -773,7 +803,7 @@ impl Graph {
             } else {
                 crate::error_body(resp).await
             };
-            let body = match body {
+            let body = match body.map_err(|e| req.plain(e)) {
                 Ok(b) => b,
                 Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
@@ -792,7 +822,8 @@ impl Graph {
                     Some(l) => l.to_string(),
                     None => url.split('?').next().unwrap_or(url).to_string(),
                 };
-                return Err(Error::refused(status, what, String::from_utf8_lossy(&body).into_owned()));
+                let body = if req.private { String::new() } else { String::from_utf8_lossy(&body).into_owned() };
+                return Err(Error::refused(status, what, body));
             }
             self.limiter.on_success();
             return Ok((status, body, measure));
@@ -888,14 +919,17 @@ impl Graph {
 
     /// The item's page on OneDrive's website; `None` if it no longer exists.
     pub async fn web_url(&self, id: &str) -> Result<Option<String>> {
-        match self
-            .get::<serde_json::Value>(&format!("{}/items/{}?$select=webUrl", self.drive_url(), encode_id(id)))
-            .await
-        {
+        match self.get::<serde_json::Value>(&self.web_url_request(id)).await {
             Ok(v) => Ok(v.get("webUrl").and_then(|u| u.as_str()).map(str::to_string)),
             Err(e) if e.status() == Some(404) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Where [`Graph::web_url`] asks: the item in the client's drive (another
+    /// person's, for a scoped client of a shared folder).
+    fn web_url_request(&self, id: &str) -> String {
+        format!("{}/items/{}?$select=webUrl", self.drive_url(), encode_id(id))
     }
 
     /// A file's earlier versions in OneDrive, newest first (the current one
@@ -1000,6 +1034,26 @@ impl Graph {
         }
     }
 
+    /// OneDrive's own search (`search(q=…)`, documented for OneDrive
+    /// Personal): items whose name, metadata or **content** match `text`,
+    /// as OneDrive ranks them, up to `top` (one page). Read-only, but the
+    /// text is sent to Microsoft: only on the user's say-so.
+    ///
+    /// The text never reaches a log or an error: they name the request
+    /// "OneDrive search", without its URL or OneDrive's reply. Not retried
+    /// (a network error is logged with its URL otherwise); the person can
+    /// search again.
+    pub async fn search(&self, text: &str, top: u32) -> Result<Vec<DriveItem>> {
+        let url = search_url(&self.top_url(), text, top);
+        self.search_at(&url).await
+    }
+
+    async fn search_at(&self, url: &str) -> Result<Vec<DriveItem>> {
+        let (_, body) = self.send(&search_req(url)).await?;
+        let page: Page = serde_json::from_slice(&body)?;
+        Ok(page.value.into_iter().filter(|it| !it.is_deleted()).map(|it| self.rooted(it)).collect())
+    }
+
     /// First page URL for a folder's direct children.
     pub fn children_url(&self, folder_id: &str) -> String {
         format!("{}/items/{}/children?$top={PAGE_SIZE}&$select={ITEM_SELECT}", self.drive_url(), encode_id(folder_id))
@@ -1058,6 +1112,95 @@ fn backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What's logged, for a test to read back.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
+        type Writer = Logged;
+        fn make_writer(&'a self) -> Logged {
+            self.clone()
+        }
+    }
+
+    /// What someone searches for is sent to OneDrive and nowhere else: a
+    /// failed search's error and the log name the request, not its URL,
+    /// and leave out a reply that repeats the text.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn search_text_never_reaches_errors_or_logs() {
+        use std::io::{Read, Write};
+        let logged = Logged::default();
+        let sub = tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).with_writer(logged.clone()).finish();
+        let _log = tracing::subscriber::set_default(sub);
+        let url = |port: u16| format!("http://127.0.0.1:{port}/me/drive/root/search(q='salary%20review')");
+        let g = graph();
+        // Nobody listening: a network error.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let u = url(port);
+        let refused = g.send(&Req { auth: false, ..search_req(&u) }).await.unwrap_err();
+        // OneDrive refusing it, its reply repeating the text.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let answer = std::thread::spawn(move || {
+            let (mut c, _) = server.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf).unwrap();
+            let body = r#"{"error":{"code":"invalidRequest","message":"bad query: salary review"}}"#;
+            write!(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                .unwrap();
+        });
+        let u = url(port);
+        let bad = g.send(&Req { auth: false, ..search_req(&u) }).await.unwrap_err();
+        answer.join().unwrap();
+        assert!(matches!(&bad, Error::Status { status: 400, what, .. } if what == "OneDrive search"), "{bad:?}");
+        let log = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+        for text in [format!("{refused} {refused:?}"), format!("{bad} {bad:?}"), log] {
+            assert!(!text.contains("salary"), "{text}");
+        }
+    }
+
+    /// A pair's client searches its own folder, in the drive that holds it
+    /// (another person's for a shared folder), and asks that drive for an
+    /// item's web page.
+    #[test]
+    fn a_scoped_client_searches_and_opens_inside_its_folder() {
+        let g = graph();
+        assert!(search_url(&g.top_url(), "tax", 5).starts_with(&format!("{GRAPH}/me/drive/root/search(q=")));
+        assert_eq!(g.web_url_request("A!1"), format!("{GRAPH}/me/drive/items/A%211?$select=webUrl"));
+        let g = graph().scoped(Some("abc!1"), "ABC!7");
+        assert!(
+            search_url(&g.top_url(), "tax", 5).starts_with(&format!("{GRAPH}/drives/abc%211/items/ABC%217/search(q=")),
+            "{}",
+            search_url(&g.top_url(), "tax", 5)
+        );
+        assert_eq!(g.web_url_request("B!2"), format!("{GRAPH}/drives/abc%211/items/B%212?$select=webUrl"));
+        let own = graph().scoped(None, "F!3");
+        assert!(search_url(&own.top_url(), "tax", 5).starts_with(&format!("{GRAPH}/me/drive/items/F%213/search(q=")));
+    }
+
+    #[test]
+    fn a_search_sends_the_text_as_one_quoted_string() {
+        let url = search_url("https://g/me/drive/root", "Bob's tax 2023/€", 50);
+        assert_eq!(
+            url.split('?').next(),
+            Some("https://g/me/drive/root/search(q=%27Bob%27%27s%20tax%202023%2F%E2%82%AC%27)")
+        );
+        assert!(url.contains("$top=50&$select="), "{url}");
+    }
 
     #[test]
     fn path_encoding_normalises_separators() {
