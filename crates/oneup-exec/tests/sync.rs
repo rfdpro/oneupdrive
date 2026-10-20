@@ -97,6 +97,9 @@ struct State {
     /// than what our own requests just got back.
     lagging: bool,
     behind: Option<Listing>,
+    /// Runs at the start of the next request: something a user does while
+    /// a round is under way.
+    meanwhile: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// What one pull delivers: every live item (parents first), then the
@@ -389,6 +392,10 @@ impl Fake {
     /// `latency`).
     async fn request(&self) {
         tokio::task::yield_now().await;
+        let meanwhile = self.0.lock().unwrap().meanwhile.take();
+        if let Some(f) = meanwhile {
+            f();
+        }
         let latency = self.0.lock().unwrap().latency;
         if let Some(d) = latency {
             tokio::time::sleep(d).await;
@@ -985,6 +992,76 @@ impl Sync {
             extra,
             stops,
         }
+    }
+
+    /// The change journal lost track of the folder while a round ran (it
+    /// wrapped past the observer's position): what `oneup_app::sync` does
+    /// then. With `watch`, the agent's journal watcher read the records
+    /// since that position as they were written, keeping the delete records
+    /// of items in the trees (`remember_deletes`); without, it lost them
+    /// too. The folder is rescanned (journal position first), the delete
+    /// records of items the rescan didn't find become evidence
+    /// (`note_seen_deletes`), and the observer goes on from the rescan.
+    /// Returns how many became evidence.
+    fn lose_journal(self, watch: bool) -> (Self, u64) {
+        use oneup_local::observe::{JournalTail, SeenDeletes, note_seen_deletes, remember_deletes};
+        let Self {
+            dir,
+            db,
+            obs,
+            exec,
+            cloud,
+            policy,
+            room,
+            decisions,
+            overflow,
+            rules,
+            planned_rules,
+            pull,
+            follow,
+            follow_max,
+            extra,
+            stops,
+        } = self;
+        let seen = SeenDeletes::new();
+        if watch {
+            let mut tail = JournalTail::open(&dir.0, Some(obs.position())).unwrap();
+            loop {
+                let t = tail.next(false).unwrap();
+                assert!(!t.lost, "the journal wrapped past the watcher");
+                if t.records.is_empty() {
+                    break;
+                }
+                remember_deletes(obs.store(), &seen, tail.position().0, &t.records).unwrap();
+            }
+        }
+        let cfg = Config::new(ExcludeSet::none());
+        let mut scan = Scan::open(obs.into_store(), &dir.0, cfg.clone()).unwrap();
+        assert_eq!(scan.start(), oneup_local::Start::Replaced(oneup_local::Replaced::Finished));
+        assert!(scan.run().unwrap().finished);
+        let mut store = scan.into_store();
+        let noted = note_seen_deletes(&mut store, &seen).unwrap();
+        let mut obs = Observer::open(store, cfg).unwrap();
+        obs.catch_up().unwrap();
+        let s = Self {
+            dir,
+            db,
+            obs,
+            exec,
+            cloud,
+            policy,
+            room,
+            decisions,
+            overflow,
+            rules,
+            planned_rules,
+            pull,
+            follow,
+            follow_max,
+            extra,
+            stops,
+        };
+        (s, noted)
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -2059,6 +2136,112 @@ async fn a_listing_behind_our_own_rename_never_undoes_a_rename_here() {
     s.settle().await;
     assert_eq!(names(&local_tree(&s.dir.0)), BTreeSet::from(["/b3.txt"]));
     assert_eq!(names(&cloud.tree()), BTreeSet::from(["/b3.txt"]));
+}
+
+/// The change journal wraps while a round runs, losing the records of what
+/// people did meanwhile: deleted a file and a folder tree, moved a file out
+/// of the folder (no deletion), moved one out and deleted it there, saved a
+/// file by renaming a new one over it, renamed a file, deleted a file and
+/// made a new one of the same name. The folder is rescanned.
+///
+/// With the agent's journal watcher, the deletions it read are evidence
+/// after the rescan: exactly the deleted items' (the save and the re-made
+/// file keep their names and send their new content; the moved-out file is
+/// held, not deleted), and they're deleted in OneDrive, recoverably.
+/// Without it (the journal wrapped past it too), nothing is deleted in
+/// OneDrive: every missing synced item is held. Nothing is lost either way.
+#[tokio::test]
+async fn a_journal_lost_mid_round_never_invents_or_loses_a_deletion() {
+    for watch in [true, false] {
+        let cloud = Fake::new();
+        let mut s = Sync::on_disk(&format!("journal-loss-{watch}"), cloud.clone());
+        let outside = PathBuf::from(format!("{}-outside", s.dir.0.display()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let _outside = Tmp(outside.clone());
+        let files: &[(&str, &[u8])] = &[
+            ("keep.txt", b"keep"),
+            ("del.txt", b"delete me"),
+            ("deldir/x.txt", b"x"),
+            ("deldir/sub/y.txt", b"y"),
+            ("out.txt", b"moved out"),
+            ("outdel.txt", b"moved out and deleted"),
+            ("save.txt", b"save v1"),
+            ("ren.txt", b"ren"),
+            ("again.txt", b"again v1"),
+        ];
+        for (p, c) in files {
+            write(&s.p(p), c);
+        }
+        s.settle().await;
+        let saved = resolve(&cloud.0.lock().unwrap(), "save.txt");
+
+        // Work for the round, and what people do while it runs.
+        for n in 0..3 {
+            cloud.add(&format!("c{n}.txt"), Some(format!("cloud {n}").as_bytes()));
+        }
+        let (dir, out) = (s.dir.0.clone(), outside.clone());
+        cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+            std::fs::remove_file(dir.join("del.txt")).unwrap();
+            std::fs::remove_dir_all(dir.join("deldir")).unwrap();
+            std::fs::rename(dir.join("out.txt"), out.join("out.txt")).unwrap();
+            std::fs::rename(dir.join("outdel.txt"), out.join("outdel.txt")).unwrap();
+            std::fs::remove_file(out.join("outdel.txt")).unwrap();
+            std::fs::write(dir.join("save.tmp"), b"save v2").unwrap();
+            std::fs::rename(dir.join("save.tmp"), dir.join("save.txt")).unwrap();
+            std::fs::rename(dir.join("ren.txt"), dir.join("ren2.txt")).unwrap();
+            std::fs::remove_file(dir.join("again.txt")).unwrap();
+            std::fs::write(dir.join("again.txt"), b"again v2").unwrap();
+        }));
+        s.round().await;
+        assert!(cloud.0.lock().unwrap().meanwhile.is_none(), "the round made no request");
+
+        let (mut s, noted) = s.lose_journal(watch);
+        // del.txt, deldir, x.txt, sub, y.txt, outdel.txt, and the replaced
+        // save.txt and again.txt.
+        assert_eq!(noted, if watch { 8 } else { 0 }, "watch {watch}");
+        for _ in 0..20 {
+            let r = s.round().await;
+            if r.is_idle() && r.skipped.is_empty() {
+                break;
+            }
+        }
+        let problems = s.obs.store().read(|o| o.check_invariants()).unwrap();
+        assert!(problems.is_empty(), "watch {watch}: {problems:?}");
+
+        let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+        let at = |p: &str| here.get(p).cloned().flatten();
+        for (p, c) in [("/keep.txt", &b"keep"[..]), ("/ren2.txt", b"ren"), ("/c0.txt", b"cloud 0")] {
+            assert_eq!(at(p).as_deref(), Some(c), "watch {watch}: {p} {:?}", names(&here));
+        }
+        if watch {
+            assert_eq!(at("/save.txt").as_deref(), Some(&b"save v2"[..]), "watch {watch}: {:?}", names(&here));
+            assert_eq!(at("/again.txt").as_deref(), Some(&b"again v2"[..]), "watch {watch}: {:?}", names(&here));
+            let now = resolve(&cloud.0.lock().unwrap(), "save.txt");
+            assert_eq!(now, saved, "the save is a new version of the same item");
+        } else {
+            // The old ones are held under their names (their deletion has no
+            // evidence), so the new ones are kept beside them.
+            assert_eq!(at("/save (conflict 1).txt").as_deref(), Some(&b"save v2"[..]), "{:?}", names(&here));
+            assert_eq!(at("/again (conflict 1).txt").as_deref(), Some(&b"again v2"[..]), "{:?}", names(&here));
+            assert_eq!(there.get("/save.txt").cloned().flatten().as_deref(), Some(&b"save v1"[..]));
+        }
+        // Held, never deleted: no evidence says it was.
+        assert_eq!(there.get("/out.txt").cloned().flatten().as_deref(), Some(&b"moved out"[..]), "watch {watch}");
+        for (_, c) in files {
+            assert!(cloud.holds(c), "watch {watch}: {:?} was lost", String::from_utf8_lossy(c));
+        }
+        let deleted = ["/del.txt", "/deldir", "/deldir/x.txt", "/deldir/sub/y.txt", "/outdel.txt"];
+        for p in deleted {
+            assert!(!here.contains_key(p), "watch {watch}: {p} came back");
+            assert_eq!(there.contains_key(p), !watch, "watch {watch}: {p} in OneDrive: {:?}", names(&there));
+        }
+        if watch {
+            let mut agreed = there.clone();
+            agreed.remove("/out.txt");
+            assert_eq!(s.synced_part(here), s.synced_part(agreed), "watch {watch}");
+        }
+    }
 }
 
 fn user_rules(lines: &[&str]) -> RuleSet {
