@@ -267,6 +267,15 @@ pub trait Source: Read + Send {
         let read = read_full(self, &mut buf[..want]);
         Box::pin(std::future::ready((buf, read)))
     }
+
+    /// Whether reading it again gives the same bytes while the file is
+    /// unchanged, so an upload cut short may go on from where it ended
+    /// (`crate::graph`, resumable sessions). Not for content transformed
+    /// on the way (a vault encrypts with fresh randomness each time). Off
+    /// by default.
+    fn resumable(&self) -> bool {
+        false
+    }
 }
 
 impl Source for &[u8] {}

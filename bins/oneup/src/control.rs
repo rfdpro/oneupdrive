@@ -108,6 +108,8 @@ pub struct Control {
     pub push_up: Arc<AtomicBool>,
     /// Pinged once when a `stop` call arrives.
     pub stop: Notify,
+    /// The link to OneDrive is poor (`crate::link`): retries wait longer.
+    poor_link: AtomicBool,
     stopping: AtomicBool,
     /// The status revision, for clients that watch it (`Call::Watch`).
     rev: tokio::sync::watch::Sender<u64>,
@@ -247,6 +249,7 @@ impl Control {
             wake: Notify::new(),
             push_up: Arc::new(AtomicBool::new(false)),
             stop: Notify::new(),
+            poor_link: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             rev: tokio::sync::watch::Sender::new(0),
             events: Arc::new(Feed::new()),
@@ -413,7 +416,8 @@ impl Control {
     /// How the agent uses the network now (`crate::network`, `crate::pace`).
     pub fn set_network(&self, n: oneup_ipc::NetStatus) {
         let mut s = self.lock();
-        s.net = n;
+        let link = std::mem::take(&mut s.net.link);
+        s.net = oneup_ipc::NetStatus { link, ..n };
         self.publish(&mut s);
     }
 
@@ -422,6 +426,19 @@ impl Control {
     pub fn set_policy(&self, p: crate::network::Policy) {
         self.live.set_net(&p);
         self.lock().policy = p;
+    }
+
+    /// Whether the link to OneDrive is poor (`crate::link`).
+    pub fn set_poor_link(&self, poor: bool) {
+        if self.poor_link.swap(poor, Relaxed) != poor {
+            let mut s = self.lock();
+            s.net.link = if poor { "poor".into() } else { String::new() };
+            self.publish(&mut s);
+        }
+    }
+
+    pub fn poor_link(&self) -> bool {
+        self.poor_link.load(Relaxed)
     }
 
     /// The megabytes allowed on top of the data budget since last asked.

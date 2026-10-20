@@ -72,3 +72,9 @@ oneup network set --metered --budget-mb 2000      # 2 GB a month on metered netw
 oneup network allow-more --mb 250
 oneup network set --metered --budget-mb off
 ```
+
+## Unreliable connections
+
+OneUpDrive watches how its requests go. When many fail, answers come slowly or files move very slowly, it sends fewer requests at once, sends large files in smaller pieces (so a dropped connection costs less to send again) and waits longer before trying again. `oneup status` then shows **connection: poor**, and the activity log notes it. It goes back to normal once the connection has been good for a while.
+
+A large file whose upload the connection cut off goes on from where it stopped, not from its first byte, as long as OneUpDrive keeps running and the file hasn't changed.

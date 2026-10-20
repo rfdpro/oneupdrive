@@ -34,6 +34,10 @@ What waits is kept in `meta` (`net.waiting`, the 500 largest, with the count and
 
 What's left goes to the rounds as `Policy::budget_left`: `hold_for_network` lets transfers through in the round's order while they fit and holds the rest, as for the profile's choice, so background transfers stay within the budget (metadata requests and hydration are counted but never held). When nothing is left the agent pauses itself with that reason; the tray notifies once per month and budget, and offers `allow_data`, which `Control` hands to the agent's next look.
 
+## Poor links
+
+After each pass the agent samples the Graph client's counters (requests, retries, the time until answers to bodiless requests began, contents moved and over how long) and `oneup_app::link` judges it: poor when more than 5% of at least 10 requests were retried, when answers took 1.5 s on average, or when at least 1 MiB of contents moved slower than 32 KB/s without a bandwidth cap. One poor pass marks the link poor; two good ones in a row clear it. While it's poor, the AIMD limiter is capped at 2 requests at once (`Aimd::set_cap`), upload fragments at 1.25 MiB (`Graph::set_fragment_cap`, read by each session as it sizes a fragment), and the agent's waits before retrying skipped items and after errors are doubled. Requests and uploads under way finish as they are. Status shows `link: poor`; the change is logged in the activity log. An upload cut off by the network goes on from where it ended rather than from its first byte (see [sync-engine.md](sync-engine.md), upload sessions).
+
 ## Sync interval (`oneup_app::pace`)
 
 The `Pacer` is pure: the agent tells it what ended its wait (`Woke`) and when a pass began. With an interval, a journal change no longer ends the wait (the observer still reads the journal, so marks and the Local tree stay current), a push notification ends it only with `keep_push`, and the push channel is closed otherwise. The user's calls and a pass that hit `MAX_ROUNDS` run at once; retries and held uploads wait for the next pass. A simulated hour of steady edits at 15 minutes runs 4 passes (`pace::tests`).

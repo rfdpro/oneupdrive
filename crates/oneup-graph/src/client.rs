@@ -29,6 +29,14 @@ pub struct NetStats {
     pub retry_after_max_s: AtomicU64,
     /// Responses carrying `RateLimit-*` early-warning headers.
     pub rate_limit_warnings: AtomicU64,
+    /// Request bodies sent, in bytes: every attempt of each, file contents
+    /// and JSON alike (what the data budget counts going up).
+    pub sent: AtomicU64,
+    /// Requests without a body to send that got an answer, and the time
+    /// they took until it began (milliseconds, in all): the round trip
+    /// plus the service's own time, for judging the link.
+    pub timed: AtomicU64,
+    pub timed_ms: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -47,10 +55,19 @@ pub struct Graph {
     /// Bandwidth caps for file content (`rules.md` § User controls).
     pub upload: crate::throttle::Throttle,
     pub download: crate::throttle::Throttle,
+    /// What background transfers may still move on the network's data
+    /// budget, taken from as bytes go ([`crate::budget`]).
+    pub budget: crate::budget::Budget,
+    /// How long transfers of contents were under way, side by side
+    /// counted once.
+    pub transferring: crate::throttle::Active,
     /// How long a download may receive nothing before it's abandoned.
     stall: Duration,
     /// For [`Graph::download_version`], which must see the redirect.
     no_redirect: std::sync::OnceLock<reqwest::Client>,
+    /// The largest upload fragment to send, in bytes (0: as the sizer
+    /// chooses); set lower on a poor link.
+    fragment_cap: std::sync::atomic::AtomicUsize,
 }
 
 /// The settings every OneUpDrive HTTP client starts from: a bounded
@@ -146,6 +163,9 @@ struct Req<'a> {
     /// session where it is first, and counts them per fragment. Throttling
     /// (429, 503) is waited out either way, and isn't a retry.
     retry: bool,
+    /// The body is a file's contents: each attempt waits for the upload
+    /// cap and must fit in the data budget right before it goes.
+    content: bool,
 }
 
 impl<'a> Req<'a> {
@@ -162,6 +182,7 @@ impl<'a> Req<'a> {
             label: None,
             private: false,
             retry: true,
+            content: false,
         }
     }
 
@@ -206,6 +227,8 @@ struct Measure {
     attempts: u32,
     /// Waiting for the limiter: throttling pauses all requests there.
     paused: Duration,
+    /// Waiting for the upload cap (file contents).
+    capped: Duration,
     /// The response's `Location` header (asynchronous jobs).
     location: Option<String>,
 }
@@ -311,7 +334,31 @@ impl Graph {
     /// once bytes have been written: the caller verifies the whole file by
     /// hash and starts over on failure.
     pub async fn download_to(&self, url: &str, out: &mut (dyn std::io::Write + Send)) -> Result<u64> {
-        let _permit = self.limiter.acquire().await;
+        self.download_within(url, out, true).await
+    }
+
+    /// [`Graph::download_to`]; `budgeted`: on the data budget, which stops
+    /// it once used up ([`crate::budget`]). Not for a file the user opens.
+    /// Every byte received counts as it arrives, also of a download that
+    /// fails later.
+    pub async fn download_within(
+        &self,
+        url: &str,
+        out: &mut (dyn std::io::Write + Send),
+        budgeted: bool,
+    ) -> Result<u64> {
+        if budgeted && self.budget.left() == Some(0) {
+            return Err(Error::OverBudget);
+        }
+        // A file the user opens doesn't wait for the limiter: background
+        // transfers hold its permits, and near the data budget's limit
+        // they may hold them while they wait their turn to read
+        // ([`crate::budget`]). The user's own action comes first.
+        let _permit = if budgeted { Some(self.limiter.acquire().await) } else { None };
+        if budgeted && self.budget.left() == Some(0) {
+            return Err(Error::OverBudget);
+        }
+        let _busy = self.transferring.begin();
         self.stats.requests.fetch_add(1, Relaxed);
         // A dead connection holds the limiter's permit while it hangs, so
         // waiting for the answer and for each read is bounded.
@@ -328,13 +375,53 @@ impl Graph {
             return Err(Error::Status { status, what: "download".into(), body: String::new() });
         }
         let mut n = 0u64;
-        while let Some(chunk) = tokio::time::timeout(self.stall, resp.chunk()).await.map_err(stalled)?? {
+        let expected = resp.content_length();
+        // The budget is used up: the download is complete only if nothing
+        // more comes (it was the last chunk), else it stops.
+        let mut over = false;
+        loop {
+            // All of it arrived: done, even with nothing left to spend.
+            if expected.is_some_and(|len| n >= len) {
+                break;
+            }
+            if over && expected.is_some() {
+                return Err(Error::OverBudget);
+            }
+            // Near the limit, budgeted downloads read one at a time, and
+            // only while something is left ([`crate::budget`]). With
+            // nothing left and no length told, one more read tells whether
+            // it was all: the end of the body, or one read too many.
+            let near = match budgeted && !over {
+                false => None,
+                true => match self.budget.before_read().await {
+                    Ok(g) => g,
+                    Err(_) if expected.is_none() => {
+                        over = true;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            let Some(chunk) = tokio::time::timeout(self.stall, resp.chunk()).await.map_err(stalled)?? else {
+                break;
+            };
+            // Counted as it arrives, before anything else is done with it:
+            // a write that fails used the traffic too.
+            self.stats.bytes.fetch_add(chunk.len() as u64, Relaxed);
+            let fit = self.budget.received(chunk.len() as u64);
+            drop(near);
             out.write_all(&chunk).map_err(Error::Local)?;
             n += chunk.len() as u64;
+            if budgeted && (over || !fit) {
+                if over && expected.is_none() {
+                    // More came after the budget was used up.
+                    return Err(Error::OverBudget);
+                }
+                over = true;
+            }
             // Not reading meanwhile slows the sender down (TCP flow control).
             self.download.take(chunk.len() as u64).await;
         }
-        self.stats.bytes.fetch_add(n, Relaxed);
         Ok(n)
     }
 
@@ -356,7 +443,7 @@ impl Graph {
         replace: Option<(&str, &str)>,
         content: &[u8],
     ) -> Result<DriveItem> {
-        self.upload.take(content.len() as u64).await;
+        let _busy = self.transferring.begin();
         let url = match replace {
             Some((id, _)) => format!("{}/items/{}/content", self.drive_url(), encode_id(id)),
             None => format!(
@@ -370,6 +457,7 @@ impl Graph {
             bytes: Some(content),
             if_match: replace.map(|(_, tag)| tag),
             timeout: Some(TRANSFER_TIMEOUT),
+            content: true,
             ..Req::new(reqwest::Method::PUT, &url)
         };
         self.json(&req).await
@@ -405,9 +493,7 @@ impl Graph {
     /// it is ([`Graph::upload_status`]) and goes on from there. Throttling
     /// is still waited out here.
     pub async fn upload_fragment(&self, upload_url: &str, start: u64, total: u64, bytes: &[u8]) -> Result<Fragment> {
-        let capped = std::time::Instant::now();
-        self.upload.take(bytes.len() as u64).await;
-        let capped = capped.elapsed();
+        let _busy = self.transferring.begin();
         let end = start + bytes.len() as u64 - 1;
         let req = Req {
             auth: false,
@@ -416,11 +502,12 @@ impl Graph {
             timeout: Some(TRANSFER_TIMEOUT),
             label: Some("upload session fragment"),
             retry: false,
+            content: true,
             ..Req::new(reqwest::Method::PUT, upload_url)
         };
         let (status, body, m) = self.send_measured(&req).await?;
         let item = if status == 202 { None } else { Some(serde_json::from_slice(&body)?) };
-        Ok(Fragment { item, paused: m.paused, capped })
+        Ok(Fragment { item, paused: m.paused, capped: m.capped })
     }
 
     /// Asks OneDrive to copy file `source` into folder `parent` as `name`
@@ -674,12 +761,25 @@ impl Graph {
             stats: NetStats::default(),
             upload: crate::throttle::Throttle::default(),
             download: crate::throttle::Throttle::default(),
+            budget: crate::budget::Budget::default(),
+            transferring: crate::throttle::Active::default(),
             stall: STALL_TIMEOUT,
             no_redirect: std::sync::OnceLock::new(),
             drive: "/me/drive".into(),
             scope: None,
             base: GRAPH.into(),
+            fragment_cap: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Caps upload fragments at `bytes` (`None`: no cap), so a dropped
+    /// connection on a poor link costs less to send again.
+    pub fn set_fragment_cap(&self, bytes: Option<usize>) {
+        self.fragment_cap.store(bytes.unwrap_or(0), Relaxed);
+    }
+
+    pub fn fragment_cap(&self) -> Option<usize> {
+        Some(self.fragment_cap.load(Relaxed)).filter(|n| *n > 0)
     }
 
     /// Addresses only folder `root` (by ID) of drive `drive` (another
@@ -755,6 +855,12 @@ impl Graph {
         // Throttling is the service pacing us, not a failure: honouring
         // Retry-After doesn't use up attempts (but is bounded, to never hang forever).
         let mut throttled = 0u32;
+        // What each attempt sends (the data budget counts every attempt).
+        let body_len = match (req.json, req.bytes) {
+            (Some(j), _) => serde_json::to_vec(j).map_or(0, |v| v.len()) as u64,
+            (None, Some(b)) => b.len() as u64,
+            (None, None) => 0,
+        };
         loop {
             attempt += 1;
             if attempt > MAX_ATTEMPTS || throttled > MAX_THROTTLES {
@@ -796,12 +902,28 @@ impl Graph {
                 (None, None) if req.method != reqwest::Method::GET => rb.header(reqwest::header::CONTENT_LENGTH, 0),
                 (None, None) => rb,
             };
+            // File contents: each attempt keeps to the upload cap as it is
+            // then (a wait follows a change of cap).
+            if req.content {
+                measure.capped += self.upload.take(body_len).await;
+            }
             let waiting = std::time::Instant::now();
             let permit = self.limiter.acquire().await;
             measure.paused += waiting.elapsed();
+            // ...and must fit in the data budget as it is right before it
+            // goes, which a change of network may have set meanwhile.
+            if req.content && !self.budget.send(body_len) {
+                return Err(Error::OverBudget);
+            }
+            self.stats.sent.fetch_add(body_len, Relaxed);
             measure.attempts += 1;
             self.stats.requests.fetch_add(1, Relaxed);
+            let asked = std::time::Instant::now();
             let sent = rb.send().await;
+            if sent.is_ok() && req.bytes.is_none() {
+                self.stats.timed.fetch_add(1, Relaxed);
+                self.stats.timed_ms.fetch_add(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX), Relaxed);
+            }
             let resp = match sent.map_err(|e| req.plain(e)) {
                 Ok(r) => r,
                 Err(e) if !req.retry => return Err(e.into()),
@@ -847,10 +969,12 @@ impl Graph {
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
+            // Counted chunk by chunk as they arrive: a body cut off midway
+            // used that traffic too.
             let body = if (200..300).contains(&status) {
-                resp.bytes().await.map(Vec::from)
+                self.read_counted(resp).await
             } else {
-                crate::error_body(resp).await
+                crate::error_body_counted(resp, Some(&self.stats.bytes)).await
             };
             let body = match body.map_err(|e| req.plain(e)) {
                 Ok(b) => b,
@@ -864,7 +988,6 @@ impl Graph {
                 }
             };
             drop(permit);
-            self.stats.bytes.fetch_add(body.len() as u64, Relaxed);
             measure.location = location;
             if !(200..300).contains(&status) {
                 let what = match req.label {
@@ -877,6 +1000,17 @@ impl Graph {
             self.limiter.on_success();
             return Ok((status, body, measure));
         }
+    }
+
+    /// A response's body, each chunk counted in `NetStats::bytes` as it
+    /// arrives.
+    async fn read_counted(&self, mut resp: reqwest::Response) -> reqwest::Result<Vec<u8>> {
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            self.stats.bytes.fetch_add(chunk.len() as u64, Relaxed);
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 
     /// OneDrive sends `RateLimit-*` headers (best effort) once usage passes
@@ -1366,9 +1500,229 @@ mod tests {
     }
 
     fn graph() -> Graph {
+        graph_with(1)
+    }
+
+    /// A client for loopback servers, with `n` requests at once.
+    fn graph_with(n: usize) -> Graph {
         let store = crate::DpapiFileStore::new(std::env::temp_dir().join("oneup-graph-test-none.dpapi"));
         let auth = Arc::new(Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
-        Graph::new(reqwest::Client::new(), auth, crate::Aimd::new(1, 1))
+        Graph::new(reqwest::Client::new(), auth, crate::Aimd::new(n, n))
+    }
+
+    /// A loopback server sending `body` bytes of each `size`-byte download,
+    /// then dropping the connection (all of it: a complete download).
+    async fn serve_body(size: usize, body: usize) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = s.read(&mut buf).await;
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {size}\r\n\r\n");
+                    let _ = s.write_all(head.as_bytes()).await;
+                    for c in vec![7u8; body].chunks(64 * 1024) {
+                        if s.write_all(c).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = s.flush().await;
+                });
+            }
+        });
+        url
+    }
+
+    /// A one-connection server answering with `head` then `body` (written
+    /// in the pieces given, a moment apart), then closing.
+    async fn serve_raw(head: String, pieces: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = s.read(&mut buf).await;
+            s.write_all(head.as_bytes()).await.unwrap();
+            for p in pieces {
+                s.write_all(&p).await.unwrap();
+                s.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = s.shutdown().await;
+        });
+        url
+    }
+
+    /// The last chunk of a download that goes past the budget completes it
+    /// (received and counted anyway, so not thrown away); a body of no told
+    /// length that uses the budget up exactly is complete too, the end of
+    /// it told by one more read.
+    #[tokio::test]
+    async fn a_download_completed_by_its_last_chunk_is_kept() {
+        let head = |len: Option<usize>| match len {
+            Some(n) => format!("HTTP/1.1 200 OK\r\ncontent-length: {n}\r\n\r\n"),
+            None => "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_string(),
+        };
+        let url = serve_raw(head(Some(250_100)), vec![vec![1u8; 250_000], vec![2u8; 100]]).await;
+        let g = graph();
+        g.budget.set(Some(250_050));
+        let mut out = Vec::new();
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap();
+        assert_eq!(r.unwrap(), 250_100, "complete, not refused");
+        assert_eq!(g.budget.left(), Some(0));
+
+        let url = serve_raw(head(None), vec![vec![1u8; 100_000]]).await;
+        let g = graph();
+        g.budget.set(Some(100_000));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
+        assert_eq!(r.unwrap(), 100_000, "an exact fit of no told length");
+
+        // ...but one of no told length that goes on is stopped.
+        let url = serve_raw(head(None), vec![vec![1u8; 100_000], vec![2u8; 100_000]]).await;
+        let g = graph();
+        g.budget.set(Some(100_000));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
+        assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+    }
+
+    /// With every request permit held by background transfers, a file the
+    /// user opens still downloads; a background one waits its turn.
+    #[tokio::test]
+    async fn a_file_the_user_opens_doesnt_wait_behind_background_transfers() {
+        let g = graph();
+        let _held = g.limiter().acquire().await;
+        let url = serve_body(1000, 1000).await;
+        let opened =
+            tokio::time::timeout(Duration::from_secs(5), g.download_within(&url, &mut Vec::new(), false)).await;
+        assert_eq!(opened.expect("not held up").unwrap(), 1000);
+        let background = tokio::time::timeout(Duration::from_millis(300), g.download_to(&url, &mut Vec::new())).await;
+        assert!(background.is_err(), "waits for a permit");
+    }
+
+    /// A response cut off midway counts what arrived; the retry counts
+    /// again.
+    #[tokio::test]
+    async fn a_body_cut_off_midway_counts_what_arrived() {
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789012345678901234567890123456789";
+        let whole =
+            "HTTP/1.1 200 OK\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"nextExpectedRanges\":[\"5-\"]}";
+        let (url, count) = serve_each(vec![partial, whole]).await;
+        let g = graph();
+        let next = tokio::time::timeout(Duration::from_secs(30), g.upload_status(&url)).await.unwrap().unwrap();
+        assert_eq!(next, Some(5));
+        assert_eq!(count.load(Relaxed), 2, "read again");
+        assert_eq!(g.stats.bytes.load(Relaxed), 40 + 29, "the cut-off part counts");
+    }
+
+    /// Downloads that use up exactly what's left are complete, not
+    /// refused; one with chunks still to come once the budget is used up is.
+    #[tokio::test]
+    async fn a_download_that_fits_the_budget_exactly_completes() {
+        const SIZE: usize = 300_000;
+        let url = serve_body(SIZE, SIZE).await;
+        let g = graph();
+        g.budget.set(Some(SIZE as u64));
+        let mut out = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap();
+        assert_eq!(n.unwrap(), SIZE as u64);
+        assert_eq!(g.budget.left(), Some(0));
+        g.budget.set(Some(SIZE as u64 / 4));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
+        assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+    }
+
+    /// What arrives counts even when it can't be written (a full disk):
+    /// the traffic was used.
+    #[tokio::test]
+    async fn bytes_received_count_even_when_writing_them_fails() {
+        struct Full;
+        impl std::io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let url = serve_body(200_000, 200_000).await;
+        let g = graph();
+        g.budget.set(Some(10_000_000));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Full)).await.unwrap();
+        assert!(matches!(r, Err(Error::Local(_))), "{r:?}");
+        let got = g.stats.bytes.load(Relaxed);
+        assert!(got > 0, "counted");
+        assert_eq!(g.budget.left(), Some(10_000_000 - got), "and taken from the budget");
+    }
+
+    /// Eight downloads side by side, each dropping at 90%, tried again and
+    /// again: together they pass a 3 MB budget by one read at most, not
+    /// one read each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn downloads_side_by_side_pass_the_budget_by_one_read_at_most() {
+        const SIZE: usize = 1_000_000;
+        const BUDGET: u64 = 3_000_000;
+        let url = serve_body(SIZE, SIZE * 9 / 10).await;
+        let g = Arc::new(graph_with(8));
+        g.budget.set(Some(BUDGET));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (g, url) = (Arc::clone(&g), url.clone());
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        let r = tokio::time::timeout(Duration::from_secs(20), g.download_to(&url, &mut Vec::new()))
+                            .await
+                            .unwrap();
+                        if matches!(r, Err(Error::OverBudget)) {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap(), "each stopped on the budget");
+        }
+        let got = g.stats.bytes.load(Relaxed);
+        assert!(got <= BUDGET + crate::budget::READ_MAX, "{got} bytes on a {BUDGET} budget");
+    }
+
+    /// An upload body counts and is checked against the budget at every
+    /// attempt, right before it goes: a throttled fragment sent twice
+    /// counts twice; a switch to a network whose budget is used up, while
+    /// the fragment waits for the cap, stops it before anything is sent.
+    #[tokio::test]
+    async fn each_attempt_of_an_upload_counts_and_is_checked_as_it_goes() {
+        let throttled =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let accepted = "HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (url, count) = serve_each(vec![throttled, accepted]).await;
+        let g = graph();
+        g.budget.set(Some(100));
+        g.upload_fragment(&url, 0, 10, b"0123456789").await.unwrap();
+        assert_eq!(count.load(Relaxed), 2);
+        assert_eq!(g.stats.sent.load(Relaxed), 20, "both sends");
+        assert_eq!(g.budget.left(), Some(80));
+
+        // Waiting for a 1 KB/s cap; meanwhile another network, no cap, and
+        // its budget used up.
+        let (url, count) = serve_each(vec![accepted]).await;
+        let g = Arc::new(graph());
+        g.upload.set(1000);
+        g.budget.set(Some(1_000_000));
+        let g2 = Arc::clone(&g);
+        let up = tokio::spawn(async move { g2.upload_fragment(&url, 0, 2000, &[0u8; 2000]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        g.budget.set(Some(0));
+        g.upload.set(0);
+        let r = tokio::time::timeout(Duration::from_secs(1), up).await.expect("the new cap applied at once").unwrap();
+        assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+        assert_eq!(count.load(Relaxed), 0, "nothing sent");
+        assert_eq!(g.stats.sent.load(Relaxed), 0);
     }
 
     #[test]
@@ -1422,6 +1776,68 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         url
+    }
+
+    /// The roadmap's flaky-link budget test: a 1 MB download that drops at
+    /// 90% every time (as rounds try it again) and an upload: what they
+    /// use stays within a 3 MB budget (over by one read at most), the
+    /// download stops once it's used up and nothing more is sent, while a
+    /// file the user opens still comes.
+    #[tokio::test]
+    async fn repeated_drops_stay_within_the_data_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const SIZE: usize = 1_000_000;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        let served = Arc::new(AtomicU64::new(0));
+        let s2 = Arc::clone(&served);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = s.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {SIZE}\r\n\r\n");
+                let _ = s.write_all(head.as_bytes()).await;
+                let body = vec![7u8; SIZE * 9 / 10];
+                for c in body.chunks(16 * 1024) {
+                    if s.write_all(c).await.is_err() {
+                        break;
+                    }
+                    s2.fetch_add(c.len() as u64, Relaxed);
+                }
+                // The connection drops.
+                drop(s);
+            }
+        });
+        let g = graph();
+        const BUDGET: u64 = 3_000_000;
+        g.budget.set(Some(BUDGET));
+        let mut tries = 0;
+        let stopped = loop {
+            tries += 1;
+            assert!(tries < 20, "never stopped");
+            let mut out = Vec::new();
+            match tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap() {
+                Err(Error::OverBudget) => break tries,
+                Err(_) => {}
+                Ok(_) => panic!("the server never sends it whole"),
+            }
+        };
+        let got = g.stats.bytes.load(Relaxed);
+        // Over by what one read brings at most.
+        assert!(got <= BUDGET + 512 * 1024, "{got} bytes received on a {BUDGET} budget");
+        assert!(got >= BUDGET - (SIZE as u64), "it used the budget before stopping: {got}");
+        assert!(stopped >= 4, "stopped on try {stopped}");
+        // Used up: nothing more goes out, and no request is made.
+        let before = g.stats.requests.load(Relaxed);
+        assert!(matches!(g.download_to(&url, &mut Vec::new()).await, Err(Error::OverBudget)));
+        assert!(matches!(g.upload_fragment("http://127.0.0.1:9/u", 0, 10, &[0u8; 10]).await, Err(Error::OverBudget)));
+        assert_eq!(g.stats.requests.load(Relaxed), before);
+        // A file the user opens comes anyway (and counts).
+        let mut out = Vec::new();
+        let opened = tokio::time::timeout(Duration::from_secs(10), g.download_within(&url, &mut out, false)).await;
+        assert!(!matches!(opened.unwrap(), Err(Error::OverBudget)));
+        assert!(out.len() >= SIZE / 2);
     }
 
     /// A loopback HTTP server answering each request (one per connection,
