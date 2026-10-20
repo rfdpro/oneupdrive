@@ -34,6 +34,8 @@
 
 **Safety stop**: OneUpDrive stops and asks before it deletes, overwrites or moves many files at once. Nothing changes until you answer. See [Syncing in depth](syncing.md#safety-stop).
 
+**Sharing link**: a link to a file or folder in OneDrive that opens it for whoever has it (*Anyone with the link*) or only for the people you chose (*Specific people*). What's inside a shared folder is shared with it. See [What you share](versions-and-sharing.md#what-you-share).
+
 **Sync failure**: an item that can't sync until you change something, such as a name OneDrive doesn't allow. See [Syncing in depth](syncing.md#what-cant-sync).
 
 **Synced** (a status): the file on this PC and the one in OneDrive are the same.
