@@ -22,8 +22,10 @@ pub struct Changes {
     pub remove: Vec<String>,
     pub pin: Vec<String>,
     pub unpin: Vec<String>,
-    /// Go ahead with pin rules that download a lot.
+    /// Go ahead with pin rules that download files.
     pub yes: bool,
+    /// The go-ahead for the downloads the agent waits at.
+    pub allow_downloads: bool,
 }
 
 impl Changes {
@@ -35,6 +37,7 @@ impl Changes {
             && self.remove.is_empty()
             && self.pin.is_empty()
             && self.unpin.is_empty()
+            && !self.allow_downloads
     }
 }
 
@@ -44,20 +47,38 @@ pub async fn run(data_dir: &Path, store: &Store, changes: &Changes) -> Result<()
     if !changes.is_empty() {
         let before = rules.clone();
         apply(&mut rules, changes)?;
-        if !changes.pin.is_empty() && !pin_go_ahead(store, &rules.pin, changes.yes)? {
-            return Ok(());
+        if changes.allow_downloads {
+            let mut s = oneup_app::setup::open_store(data_dir, 1024)?;
+            oneup_app::pinrules::allow(&mut s, 0)?;
+            println!("Pin rules download what they wait for now.");
         }
+        // Any change of pin rules that would download files is shown and
+        // needs a yes (`--yes`), as is one whose count couldn't finish.
+        let approved = if rules.pin == before.pin {
+            None
+        } else {
+            match pin_go_ahead(store, &rules.pin, changes.yes)? {
+                Some(bytes) => Some(bytes),
+                None => return Ok(()),
+            }
+        };
         if rules == before {
-            println!("Nothing to change.");
+            if !changes.allow_downloads {
+                println!("Nothing to change.");
+            }
         } else {
             config::save_rules(data_dir, &rules)?;
+            if let Some(bytes) = approved {
+                let mut s = oneup_app::setup::open_store(data_dir, 1024)?;
+                oneup_app::pinrules::approve(&mut s, &rules.pin_set().fingerprint(), bytes)?;
+            }
             println!("Saved in {}.", config::path(data_dir).display());
             if crate::agent::nudge(data_dir).await {
                 println!("The background agent applies them now.");
             }
         }
     }
-    show(&rules)
+    show(data_dir, &rules)
 }
 
 fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
@@ -104,7 +125,7 @@ fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
     Ok(())
 }
 
-fn show(rules: &Rules) -> Result<()> {
+fn show(data_dir: &Path, rules: &Rules) -> Result<()> {
     println!("Presets (none is on unless you turn it on: oneup rules --on NAME / --off NAME):");
     for p in PRESETS {
         let on = rules.presets.iter().any(|x| x.eq_ignore_ascii_case(p.name));
@@ -125,6 +146,14 @@ fn show(rules: &Rules) -> Result<()> {
     }
     for r in &rules.pin {
         println!("  {r}");
+    }
+    if let Ok(s) = oneup_app::setup::open_store(data_dir, 1024)
+        && let Some(bytes) = oneup_app::pinrules::waiting(&s)?
+    {
+        println!(
+            "  Waiting for your go-ahead to download more ({} next): oneup rules --allow-downloads",
+            oneup_app::versions::size(bytes)
+        );
     }
     println!(
         "OneDrive's copies of excluded items: {} (oneup rules --cloud keep|prune|pull)",
@@ -169,13 +198,13 @@ pub fn suggest(data_dir: &Path, store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Whether pin rules `lines` may be saved: what they'd download is shown,
-/// and more than `pinrules::ASK_BYTES` (or more than the disk has free)
-/// needs `--yes`.
-fn pin_go_ahead(store: &Store, lines: &[String], yes: bool) -> Result<bool> {
+/// Whether pin rules `lines` may be saved, and the bytes approved with
+/// them: what they'd download is shown, and anything to download (or a
+/// count that couldn't finish) needs `--yes`. `None`: not saved.
+fn pin_go_ahead(store: &Store, lines: &[String], yes: bool) -> Result<Option<u64>> {
     let (files, bytes, all) = oneup_app::pinrules::preview(store, lines, std::time::Duration::from_secs(10))?;
-    if files == 0 {
-        return Ok(true);
+    if !oneup_app::pinrules::must_ask(files, all) {
+        return Ok(Some(0));
     }
     let pair = oneup_app::sync::pairing(store)?;
     let free = oneup_app::pinrules::free_space(&pair.local);
@@ -185,11 +214,11 @@ fn pin_go_ahead(store: &Store, lines: &[String], yes: bool) -> Result<bool> {
         oneup_app::versions::size(bytes),
         free.map(|f| format!(" ({} free)", oneup_app::versions::size(f))).unwrap_or_default()
     );
-    if oneup_app::pinrules::must_ask(bytes, free) && !yes {
+    if !yes {
         println!("Nothing saved. To keep them on this PC: add --yes");
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(true)
+    Ok(Some(bytes))
 }
 
 /// `rel` from a path the user typed (full, or inside the synced folder).
@@ -481,6 +510,9 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     }
     if let Some(rule) = config::load_rules(data_dir, store)?.pin_set().pinned_by(rel, is_dir) {
         println!("  always kept on this PC: pin rule {rule} (with Files On-Demand)");
+        // The rule wins over a later "Free up space" (File Explorer's or
+        // `oneup free`): said here, where someone looks for why.
+        println!("  \"Free up space\" on it is undone while that rule stays (oneup rules --unpin to change it)");
     }
     let listed = skipped_at.is_none();
     if let Some(at) = skipped_at {

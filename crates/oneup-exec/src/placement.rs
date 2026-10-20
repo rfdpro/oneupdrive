@@ -37,30 +37,57 @@ pub fn free_ops(store: &Store) -> oneup_store::Result<Vec<Op>> {
     })
 }
 
+/// Why a pass of downloads stopped before its batch was done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// Changes to this PC were paused meanwhile.
+    Paused,
+    /// The disk would keep too little free space.
+    LowDisk,
+    /// The free space couldn't be read: nothing is downloaded blind.
+    SpaceUnknown,
+    /// The pass used its share of bytes or time; more follows soon.
+    Share,
+    /// Downloading more needs the person's go-ahead.
+    Approval,
+}
+
+/// What a pass of downloads did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fetched {
+    /// Downloaded: path relative to the synced folder, file ID and size.
+    pub done: Vec<(String, u128, u64)>,
+    /// Why it stopped early, if it did.
+    pub stopped: Option<Stop>,
+    /// More may be waiting: the batch was full, or it stopped early.
+    pub more: bool,
+}
+
 /// Downloads pinned files whose content isn't here (through our own
-/// hydration service, which must be connected). Returns their paths
-/// relative to the synced folder. Blocking work runs off the async runtime.
-/// `may(size)` is asked before each file, with its size: the caller stops
-/// the pass there (a pause that came meanwhile, too little free space, the
-/// pass's share of bytes or time used up) by answering `false`; the rest
-/// waits for a later pass.
+/// hydration service, which must be connected). Blocking work runs off the
+/// async runtime. `may(file ID, size)` is asked before each file: an
+/// error stops the pass there (a pause that came meanwhile, too little or
+/// unknown free space, the pass's share used, a download that needs the
+/// person's go-ahead), and says why.
 pub async fn fetch_pinned(
     store: &Store,
     root: &Path,
-    may: &(dyn Fn(u64) -> bool + Send + Sync),
-) -> oneup_store::Result<Vec<String>> {
+    may: &(dyn Fn(u128, u64) -> Result<(), Stop> + Send + Sync),
+) -> oneup_store::Result<Fetched> {
     let rows = store.read(|o| {
         let mut v = Vec::new();
         for r in o.local_to_fetch(BATCH)? {
             if let Some(p) = o.local_path_of(r.file_id)? {
-                v.push((p, u64::try_from(r.size).unwrap_or(0)));
+                v.push((p, r.file_id, u64::try_from(r.size).unwrap_or(0)));
             }
         }
         Ok(v)
     })?;
-    let mut done = Vec::new();
-    for (rel, size) in rows {
-        if !may(size) {
+    let mut out = Fetched { more: rows.len() >= BATCH, ..Fetched::default() };
+    for (rel, id, size) in rows {
+        if let Err(why) = may(id, size) {
+            out.stopped = Some(why);
+            out.more = true;
             break;
         }
         let path: PathBuf = rel.trim_start_matches('/').split('/').fold(root.to_path_buf(), |p, part| p.join(part));
@@ -70,10 +97,10 @@ pub async fn fetch_pinned(
         .await
         .unwrap_or(false);
         if ok {
-            done.push(rel);
+            out.done.push((rel, id, size));
         } else {
             tracing::debug!("a pinned file couldn't be downloaded now; tried again next pass");
         }
     }
-    Ok(done)
+    Ok(out)
 }

@@ -422,10 +422,27 @@ mod win {
                         oneup_app::pinrules::preview(&store, &lines, std::time::Duration::from_secs(10))?;
                     let local = oneup_app::sync::pairing(&store)?.local;
                     let free = oneup_app::pinrules::free_space(&local);
-                    let ask = oneup_app::pinrules::must_ask(bytes, free);
+                    let ask = oneup_app::pinrules::must_ask(files, all);
                     Ok(json!({ "files": files, "bytes": bytes, "all": all, "free": free, "ask": ask }))
                 })
                 .await?
+            }
+            "pin_save" => {
+                // Pin rules the person saw the downloads of, with that yes.
+                let lines: Vec<String> = args["pin"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                let bytes = args.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                settingsapi::save_pins(dir, &lines, bytes)?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
+            "pin_allow" => {
+                let mut store = oneup_app::setup::open_store(dir, 1024)?;
+                oneup_app::pinrules::allow(&mut store, 0)?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
             }
             "rule_suggestions" => {
                 let d = dir.to_path_buf();

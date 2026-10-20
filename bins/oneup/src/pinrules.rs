@@ -16,10 +16,25 @@
 //! match go back to the default, and no other. An item the user had pinned
 //! already isn't noted, so removing a rule never unpins it.
 //!
+//! A placeholder created in a folder a rule pinned takes the pin from
+//! Windows; it's noted as the rule's too when the rules match it, so
+//! removing the rule undoes it with its folder.
+//!
 //! **Nothing is forgotten.** An item whose pin can't be set yet (not a
 //! placeholder yet, say) waits in `pin_retry` and is tried again with a
-//! growing back-off; when that table is full, another walk follows once it
-//! has drained.
+//! growing back-off; when that table is full, another walk follows as soon
+//! as it has room again.
+//!
+//! **A rule wins over "Free up space".** An item a rule pinned that loses
+//! its pin (File Explorer's "Free up space", seen in the change journal) is
+//! queued by the store (`pin_changed`) and pinned again by the next pass.
+//!
+//! **Downloads are asked for.** Saving pin rules that add pins shows what
+//! they'd download and needs a yes ([`preview`], [`approve`]); the agent
+//! counts what it downloads for the rules' items against what was
+//! approved (`meta` [`KEY_BUDGET`]), and past [`ASK_BYTES`] more than that
+//! it stops and waits for a go-ahead ([`KEY_WAITING`], [`allow`]), however
+//! the rules changed (a hand edit of config.toml too).
 //!
 //! Cost follows changes:
 //! * **When the pin rules change** (their fingerprint differs from `meta`
@@ -43,6 +58,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use oneup_exec::placement::Stop;
 use oneup_rules::{ENGINE_DIR, PinSet};
 use oneup_store::{LocalKind, LocalRow, Skip, Store};
 use serde_json::{Value, json};
@@ -53,8 +69,17 @@ pub const KEY_APPLIED: &str = "pins.applied";
 pub const KEY_SEQ: &str = "pins.seq";
 /// A walk under way ([`Walk`], as JSON).
 pub const KEY_WALK: &str = "pins.walk";
-/// Set when `pin_retry` was full: walk again once it has drained.
+/// Set when `pin_retry` was full: walk again as soon as it has room.
 const KEY_REWALK: &str = "pins.rewalk";
+/// Bytes approved for the rules' downloads and not spent yet (negative:
+/// downloaded beyond what was approved).
+pub const KEY_BUDGET: &str = "pins.budget";
+/// An approval for one set of rules: `fingerprint bytes`.
+pub const KEY_APPROVE: &str = "pins.approve";
+/// The download the agent stopped at, waiting for a go-ahead: its bytes.
+pub const KEY_WAITING: &str = "pins.waiting";
+/// Queued items whose pin was lost, looked at per pass.
+const CHANGED: usize = 256;
 /// Activity entries looked at per pass; more wait for the next one.
 const PER_PASS: usize = 2_000;
 /// Children read from the database at a time.
@@ -158,6 +183,8 @@ pub struct Pass {
     pub unpinned: usize,
     /// Pins that couldn't be set now; tried again later.
     pub waiting: usize,
+    /// Items a rule keeps that lost their pin ("Free up space"), pinned again.
+    pub repinned: usize,
     /// Work is left for the next pass.
     pub more: bool,
 }
@@ -168,21 +195,22 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
     let started = Instant::now();
     let out_of_time = || started.elapsed() >= budget;
     let mut pass = Pass::default();
-    retry(store, pinner, pins, now_ms, &mut pass)?;
-
     let fp = pins.fingerprint();
+    take_approval(store, &fp)?;
+    retry(store, pinner, pins, now_ms, &mut pass)?;
+    repin(store, pinner, pins, &mut pass)?;
+
     let last = store.read(|o| o.activity_last_seq())?;
     let seen: Option<i64> = store.read(|o| o.meta_get(KEY_SEQ))?.and_then(|s| s.parse().ok());
     let mut applied = store.read(|o| o.meta_get(KEY_APPLIED))?;
     // Entries dropped from the log before they were looked at, or items
-    // the retry table had no room for: walk again.
-    let rewalk = store.read(|o| Ok(o.meta_get(KEY_REWALK)?.is_some() && o.pin_retry_count()? == 0))?;
-    if seen.is_some_and(|s| last - s > oneup_store::activity::KEEP) || rewalk {
+    // the retry table had no room for (as soon as it has room again): walk
+    // again. The mark stays until that walk is under way.
+    let rewalk = store
+        .read(|o| Ok(o.meta_get(KEY_REWALK)?.is_some() && o.pin_retry_count()? < oneup_store::pins::PIN_RETRY_MAX))?;
+    let lost = seen.is_some_and(|s| last - s > oneup_store::activity::KEEP);
+    if lost || rewalk {
         applied = None;
-        store.write(|o| {
-            o.meta_delete(KEY_REWALK)?;
-            o.meta_delete(KEY_APPLIED)
-        })?;
     }
     if applied.as_deref() != Some(fp.as_str()) {
         let walk = store.read(|o| o.meta_get(KEY_WALK))?.and_then(|t| Walk::from_json(&t));
@@ -195,15 +223,25 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
             return Ok(pass);
         }
         let mut w = match walk {
-            Some(w) if w.fingerprint == fp => w,
+            // A walk under way carries on (a mark set meanwhile brings
+            // another once it's done); entries lost from the log start over.
+            Some(w) if w.fingerprint == fp && !lost => w,
             _ => {
                 let Some(r) = store.read(|o| o.local_root())? else { return Ok(pass) };
-                Walk {
+                let w = Walk {
                     fingerprint: fp.clone(),
                     seq: last,
                     owned: Some(None),
                     stack: vec![Frame { id: r.root_file_id, rel: String::new(), after: None }],
-                }
+                };
+                // Under way, saved: the reasons to walk again are settled.
+                store.write(|o| {
+                    o.meta_set(KEY_WALK, &w.to_json())?;
+                    o.meta_delete(KEY_REWALK)?;
+                    o.meta_delete(KEY_APPLIED)?;
+                    o.meta_set(KEY_SEQ, &last.to_string())
+                })?;
+                w
             }
         };
         // The rules' own pins the new rules don't keep.
@@ -354,6 +392,101 @@ fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
     Ok(())
 }
 
+/// Pins again the items a rule keeps that lost their pin since (queued by
+/// the store from the journal's attribute changes); one no rule keeps any
+/// more isn't the rules' any more.
+fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, pass: &mut Pass) -> Result<()> {
+    for id in store.write(|o| o.pin_changed_take(CHANGED))? {
+        let row = store.read(|o| o.local_get(id))?;
+        let rel = match &row {
+            Some(_) => store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p)),
+            None => None,
+        };
+        let (Some(row), Some(rel)) = (row, rel) else { continue };
+        if !pins.pins(&rel, row.kind != LocalKind::File) {
+            store.write(|o| o.pin_owned_remove(id))?;
+            continue;
+        }
+        if row.attributes & PINNED != 0 {
+            continue;
+        }
+        if pinner.set(&rel, Change::Pin).is_ok() {
+            pass.repinned += 1;
+        } else {
+            store.write(|o| o.pin_retry_put(id, 1, 0).map(|_| ()))?;
+            pass.waiting += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Records the person's yes to downloading `bytes` for the pin rules whose
+/// fingerprint is `fingerprint` (what they were shown before saving them).
+/// The agent adds it to the rules' budget once those are the rules.
+pub fn approve(store: &mut Store, fingerprint: &str, bytes: u64) -> Result<()> {
+    store.write(|o| o.meta_set(KEY_APPROVE, &format!("{fingerprint} {bytes}")))?;
+    Ok(())
+}
+
+/// The go-ahead for the download the agent waits at (and `bytes` more).
+pub fn allow(store: &mut Store, bytes: u64) -> Result<()> {
+    store.write(|o| {
+        let waiting: u64 = o.meta_get(KEY_WAITING)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        let budget: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        let add = i64::try_from(waiting.saturating_add(bytes)).unwrap_or(i64::MAX);
+        o.meta_set(KEY_BUDGET, &budget.max(0).saturating_add(add).to_string())?;
+        o.meta_delete(KEY_WAITING)
+    })?;
+    Ok(())
+}
+
+/// An approval for these rules (`fp`) joins the budget.
+fn take_approval(store: &mut Store, fp: &str) -> Result<()> {
+    store.write(|o| {
+        let Some(a) = o.meta_get(KEY_APPROVE)? else { return Ok(()) };
+        let Some((f, bytes)) = a.split_once(' ') else { return o.meta_delete(KEY_APPROVE) };
+        if f != fp {
+            // For rules that aren't these (not saved yet, or changed since).
+            return Ok(());
+        }
+        let bytes: i64 = bytes.parse().unwrap_or(0);
+        let budget: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        o.meta_set(KEY_BUDGET, &budget.max(0).saturating_add(bytes).to_string())?;
+        o.meta_delete(KEY_WAITING)?;
+        o.meta_delete(KEY_APPROVE)
+    })?;
+    Ok(())
+}
+
+/// The rules' download budget now (bytes; negative: past what was approved).
+pub fn budget(store: &Store) -> Result<i64> {
+    Ok(store.read(|o| o.meta_get(KEY_BUDGET))?.and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Whether the rules may download a file of `size` with `budget` left:
+/// at most [`ASK_BYTES`] past what was approved.
+pub fn within_budget(budget: i64, size: u64) -> bool {
+    budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX)) >= -i64::try_from(ASK_BYTES).unwrap_or(i64::MAX)
+}
+
+/// Spends `bytes` of the rules' budget (what they downloaded).
+pub fn spend(store: &mut Store, bytes: u64) -> Result<()> {
+    let b = budget(store)?.saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
+    store.write(|o| o.meta_set(KEY_BUDGET, &b.to_string()))?;
+    Ok(())
+}
+
+/// Notes the download the agent stopped at for want of a go-ahead.
+pub fn wait_for_go_ahead(store: &mut Store, bytes: u64) -> Result<()> {
+    store.write(|o| o.meta_set(KEY_WAITING, &bytes.to_string()))?;
+    Ok(())
+}
+
+/// What the agent waits for a go-ahead to download, if anything.
+pub fn waiting(store: &Store) -> Result<Option<u64>> {
+    Ok(store.read(|o| o.meta_get(KEY_WAITING))?.and_then(|v| v.parse().ok()))
+}
+
 /// Where an activity entry's item moved to (`-> /new/path; note`).
 fn moved_to(detail: &str) -> Option<&str> {
     let rest = detail.strip_prefix("-> ")?;
@@ -390,16 +523,29 @@ fn visit(
     now_ms: i64,
     pass: &mut Pass,
 ) -> Result<()> {
-    if !matches!(row.kind, LocalKind::File | LocalKind::Folder) || row.attributes & PINNED != 0 {
-        return Ok(());
-    }
-    if !pins.pins(rel, row.kind != LocalKind::File) {
+    if !matches!(row.kind, LocalKind::File | LocalKind::Folder) || !pins.pins(rel, row.kind != LocalKind::File) {
         return Ok(());
     }
     let id = row.file_id;
+    if row.attributes & PINNED != 0 {
+        // Pinned already: the rule's too if it took the pin from a folder
+        // the rule pinned (Windows gives a new placeholder its folder's
+        // pin), so removing the rule undoes it; otherwise the user's.
+        let inherited = match row.parent_id {
+            Some(p) => store.read(|o| Ok(o.pin_owned_has(p)? && !o.pin_owned_has(id)?))?,
+            None => false,
+        };
+        if inherited {
+            store.write(|o| o.pin_owned_add(id))?;
+        }
+        return Ok(());
+    }
     match pinner.set(rel, Change::Pin) {
         Ok(()) => {
-            store.write(|o| o.pin_owned_add(id))?;
+            store.write(|o| {
+                o.pin_owned_add(id)?;
+                o.pin_retry_remove(id)
+            })?;
             pass.pinned += 1;
         }
         Err(e) => {
@@ -473,13 +619,15 @@ pub fn preview(store: &Store, lines: &[String], budget: Duration) -> Result<(u64
     Ok((files, bytes, true))
 }
 
-/// Pin rules that would download more than this ask first.
+/// Downloads for the rules' items past what was approved: this much, then
+/// the agent asks.
 pub const ASK_BYTES: u64 = 1 << 30;
 
-/// Whether downloading `bytes` needs the person's go-ahead: more than
-/// [`ASK_BYTES`], or more than the disk has free.
-pub fn must_ask(bytes: u64, free: Option<u64>) -> bool {
-    bytes > ASK_BYTES || free.is_some_and(|f| bytes > f)
+/// Whether saving pin rules needs the person's yes, from their
+/// [`preview`]: whenever they'd download anything, and always when the
+/// preview couldn't look at everything.
+pub fn must_ask(files: u64, all: bool) -> bool {
+    files > 0 || !all
 }
 
 /// A pass's limits for downloading pinned files: asked before each file
@@ -505,20 +653,22 @@ impl FetchLimit {
         Self { bytes_left: FETCH_BYTES, until: now + FETCH_TIME, reserve, first: true }
     }
 
-    /// Pure: whether a file of `size` may download now.
-    pub fn may(&mut self, size: u64, paused: bool, free: Option<u64>, now: Instant) -> bool {
-        if paused || now >= self.until {
-            return false;
+    /// Pure: whether a file of `size` may download now, or why not. Free
+    /// space that can't be read stops it: nothing is downloaded blind.
+    pub fn may(&mut self, size: u64, paused: bool, free: Option<u64>, now: Instant) -> Result<(), Stop> {
+        if paused {
+            return Err(Stop::Paused);
         }
-        if free.is_some_and(|f| f < size.saturating_add(self.reserve)) {
-            return false;
+        let Some(free) = free else { return Err(Stop::SpaceUnknown) };
+        if free < size.saturating_add(self.reserve) {
+            return Err(Stop::LowDisk);
         }
-        if !self.first && size > self.bytes_left {
-            return false;
+        if now >= self.until || (!self.first && size > self.bytes_left) {
+            return Err(Stop::Share);
         }
         self.first = false;
         self.bytes_left = self.bytes_left.saturating_sub(size);
-        true
+        Ok(())
     }
 }
 
@@ -614,6 +764,17 @@ mod tests {
         }
     }
 
+    fn entry(path: &str) -> ActivityEntry {
+        ActivityEntry {
+            seq: 0,
+            at_ms: 1,
+            outcome: ActivityOutcome::Done,
+            action: "download".into(),
+            path: path.into(),
+            detail: String::new(),
+        }
+    }
+
     fn run(s: &mut Store, fake: &mut Fake, pins: &PinSet, now: i64) -> Pass {
         let mut total = Pass::default();
         for _ in 0..50 {
@@ -621,6 +782,7 @@ mod tests {
             total.pinned += p.pinned;
             total.unpinned += p.unpinned;
             total.waiting += p.waiting;
+            total.repinned += p.repinned;
             if !p.more {
                 break;
             }
@@ -729,6 +891,109 @@ mod tests {
         assert_eq!(s.read(|o| o.meta_get(KEY_APPLIED)).unwrap(), Some(pins.fingerprint()));
     }
 
+    /// A placeholder created in a folder a rule pinned takes the folder's
+    /// pin from Windows: it's the rule's too, so removing the rule undoes it.
+    #[test]
+    fn an_item_that_took_its_pin_from_a_rule_folder_is_the_rules() {
+        let mut s = store(&[row(2, 1, "Work", LocalKind::Folder, 0x10)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["/Work/"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "Work")]);
+        // A new file arrives in Work, pinned by Windows already.
+        s.write(|o| {
+            o.local_put(&row(3, 2, "new.txt", LocalKind::File, PINNED | RECALL))?;
+            o.activity_add(&[entry("/Work/new.txt")])
+        })
+        .unwrap();
+        fake.set.clear();
+        run(&mut s, &mut fake, &pins, 0);
+        assert!(fake.set.is_empty(), "nothing to set");
+        assert!(s.read(|o| o.pin_owned_has(3)).unwrap(), "the rule's");
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.unpinned, 2);
+        assert!(fake.set.contains(&("Work/new.txt".to_string(), Change::Unpin)));
+    }
+
+    /// With the retry table full, another walk starts as soon as it has
+    /// room again, even with rows in it that keep failing.
+    #[test]
+    fn a_full_retry_table_brings_a_walk_as_soon_as_it_has_room() {
+        let max = oneup_store::pins::PIN_RETRY_MAX as u128;
+        let mut rows: Vec<LocalRow> =
+            (0..=max).map(|i| row(100 + i, 1, &format!("f{i}.psd"), LocalKind::File, 0)).collect();
+        rows.push(row(50, 1, "a.psd", LocalKind::File, 0));
+        let mut s = store(&rows);
+        // Every file fails: the table fills, one is left out.
+        let mut fake = Fake { failing: rows.iter().map(|r| r.name.clone()).collect(), ..Fake::default() };
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        assert_eq!(s.read(|o| o.pin_retry_count()).unwrap(), max as usize);
+        assert!(s.read(|o| o.meta_get(KEY_REWALK)).unwrap().is_some(), "one had no room");
+        // The items in the table keep failing for good; the two left out
+        // could be pinned now. One file in the table goes: room again.
+        let waiting: Vec<u128> =
+            s.read(|o| o.pin_retry_due(i64::MAX, max as usize)).unwrap().into_iter().map(|(id, _)| id).collect();
+        let left_out: Vec<String> =
+            rows.iter().filter(|r| !waiting.contains(&r.file_id)).map(|r| r.name.clone()).collect();
+        assert_eq!(left_out.len(), 2);
+        fake.failing.retain(|f| !left_out.contains(f));
+        s.write(|o| o.local_remove_subtree(waiting[0])).unwrap();
+        fake.set.clear();
+        run(&mut s, &mut fake, &pins, 0);
+        assert!(s.read(|o| o.meta_get(KEY_REWALK)).unwrap().is_none(), "walked again");
+        let mut got: Vec<String> = fake.set.iter().map(|(r, _)| r.clone()).collect();
+        got.sort_unstable();
+        let mut want = left_out;
+        want.sort_unstable();
+        assert_eq!(got, want, "the left-out ones are pinned");
+    }
+
+    /// "Free up space" on a file a rule keeps, seen only as an attribute
+    /// change from the journal (no sync activity), is undone by the next pass.
+    #[test]
+    fn free_up_space_on_a_rule_pinned_file_is_undone() {
+        let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "a.psd")]);
+        // File Explorer's "Free up space": unpinned (as the observer records it).
+        s.write(|o| {
+            let mut r = o.local_get(2)?.unwrap();
+            r.attributes = (r.attributes & !PINNED) | 0x0010_0000;
+            o.local_update(&r)
+        })
+        .unwrap();
+        fake.set.clear();
+        let p = run(&mut s, &mut fake, &pins, 0);
+        assert_eq!(p.repinned, 1);
+        assert_eq!(fake.set, [("a.psd".to_string(), Change::Pin)]);
+    }
+
+    /// What the rules download is counted against what was approved, across
+    /// changes of rules; past that by more than [`ASK_BYTES`], it waits.
+    #[test]
+    fn downloads_count_against_the_approval_whatever_changes_the_rules() {
+        let mut s = store(&[]);
+        let a = PinSet::new(&["*.psd"]);
+        approve(&mut s, &a.fingerprint(), 100).unwrap();
+        // An approval for other rules waits for those.
+        take_approval(&mut s, &PinSet::new(&["*.png"]).fingerprint()).unwrap();
+        assert_eq!(budget(&s).unwrap(), 0);
+        take_approval(&mut s, &a.fingerprint()).unwrap();
+        assert_eq!(budget(&s).unwrap(), 100);
+        spend(&mut s, 100).unwrap();
+        assert!(within_budget(budget(&s).unwrap(), ASK_BYTES), "a gibibyte past it");
+        spend(&mut s, ASK_BYTES).unwrap();
+        // Another small change of rules (a hand edit) doesn't start over.
+        assert!(!within_budget(budget(&s).unwrap(), 1), "asks now");
+        wait_for_go_ahead(&mut s, 7).unwrap();
+        assert_eq!(waiting(&s).unwrap(), Some(7));
+        allow(&mut s, 0).unwrap();
+        assert!(within_budget(budget(&s).unwrap(), 7) && waiting(&s).unwrap().is_none());
+    }
+
     #[test]
     fn the_walk_state_round_trips() {
         let w = Walk {
@@ -756,7 +1021,11 @@ mod tests {
             row(5, 1, "d.txt", LocalKind::File, RECALL),
         ]);
         assert_eq!(preview(&s, &["*.psd".into()], Duration::from_secs(5)).unwrap(), (1, 10, true));
-        assert!(must_ask(ASK_BYTES + 1, None) && must_ask(10, Some(5)) && !must_ask(10, Some(50)));
+        // Asked whenever anything would download, and always when the
+        // preview is incomplete, however small what it found.
+        assert!(must_ask(1, true) && must_ask(0, false) && !must_ask(0, true));
+        let (files, _, all) = preview(&s, &["*.psd".into()], Duration::ZERO).unwrap();
+        assert!(!all && must_ask(files, all), "cut short: asked");
     }
 
     /// Downloads stop at a pause, before the disk gets too full, and once a
@@ -764,14 +1033,16 @@ mod tests {
     #[test]
     fn downloads_keep_to_pauses_free_space_and_a_share_per_pass() {
         let now = Instant::now();
+        let big = Some(u64::MAX);
         let mut l = FetchLimit::new(100, now);
-        assert!(!l.may(10, true, None, now), "paused");
-        assert!(!l.may(10, false, Some(105), now), "would leave less than the reserve");
-        assert!(l.may(FETCH_BYTES + 5, false, None, now), "the first file, however large");
-        assert!(!l.may(1, false, None, now), "the share is used");
+        assert_eq!(l.may(10, true, big, now), Err(Stop::Paused));
+        assert_eq!(l.may(10, false, Some(105), now), Err(Stop::LowDisk), "would leave less than the reserve");
+        assert_eq!(l.may(10, false, None, now), Err(Stop::SpaceUnknown), "free space unknown: nothing blind");
+        assert_eq!(l.may(FETCH_BYTES + 5, false, big, now), Ok(()), "the first file, however large");
+        assert_eq!(l.may(1, false, big, now), Err(Stop::Share), "the share is used");
         let mut l = FetchLimit::new(0, now);
-        assert!(l.may(1, false, None, now));
-        assert!(!l.may(1, false, None, now + FETCH_TIME), "the time is up");
+        assert_eq!(l.may(1, false, big, now), Ok(()));
+        assert_eq!(l.may(1, false, big, now + FETCH_TIME), Err(Stop::Share), "the time is up");
         assert_eq!(reserve(Some(100 << 30), 10), 10 << 30);
         assert_eq!(reserve(None, 10), 1 << 30);
     }

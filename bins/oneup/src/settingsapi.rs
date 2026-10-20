@@ -114,6 +114,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "paused": r.paused,
             "cloud": r.cloud.name(),
             "pin": r.pin,
+            "pin_waiting": crate::pinrules::waiting(&store)?,
         },
         "versions": {
             "keep_replaced": policy.keep_replaced,
@@ -472,6 +473,16 @@ pub fn tree_sync(dir: &Path, args: &Value) -> Result<String> {
             crate::filetree::set_sync(dir, rel, folder, on)
         }
     }
+}
+
+/// Saves pin rules `lines` (each checked) the person saw `bytes` of
+/// downloads for, and records that yes for exactly those rules
+/// (`crate::pinrules::approve`).
+pub fn save_pins(dir: &Path, lines: &[String], bytes: u64) -> Result<()> {
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    let r = rules_with(config::load_rules(dir, &store)?, &json!({ "pin": lines }))?;
+    config::save_rules(dir, &r)?;
+    crate::pinrules::approve(&mut store, &r.pin_set().fingerprint(), bytes)
 }
 
 /// The `[space]` changed by the fields present in `v`.
