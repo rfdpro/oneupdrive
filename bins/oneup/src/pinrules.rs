@@ -844,17 +844,31 @@ pub struct Fetch {
     /// The first of the rules' files past the budget (ID, size): the
     /// download that needs a go-ahead.
     pub blocked: Option<(u128, u64)>,
+    /// Files read (at most [`FETCH_READ_MAX`]).
+    pub read: usize,
 }
 
+/// The most files kept on this device a download pass reads (and, for
+/// the rules' own, opens to check), downloaded or passed over.
+pub const FETCH_READ_MAX: usize = 1024;
+
+/// Where the next download pass starts reading (`meta`, a file ID; none:
+/// from the first).
+pub const KEY_FETCH_AFTER: &str = "pins.fetch_after";
+
 /// One pass of downloads of the files kept on this device whose content
-/// isn't here: up to a batch, read a page at a time by file ID. A file
-/// this pass won't download is passed over, not waited on: one of the
-/// rules' past the budget, or one whose identity can't be read now
-/// (neither charged nor fetched). `may` says whether a file of a size may
-/// download now (a pause, the disk, the pass's share), and stops the pass
-/// if not; `fetch` downloads one (whether it's here now). Budget is
-/// reserved durably before any download and each of the rules' own is
-/// marked started before its own; the caller settles after.
+/// isn't here: up to a batch, read a page at a time by file ID from where
+/// the last pass stopped ([`KEY_FETCH_AFTER`], wrapping around at the
+/// end), at most [`FETCH_READ_MAX`] files. A file this pass won't download
+/// is passed over, not waited on: one of the rules' past the budget, or
+/// one whose identity can't be read now (neither charged nor fetched).
+/// `may` says whether a file of a size may download now (a pause, the
+/// disk, the pass's share), and stops the pass if not; `fetch` downloads
+/// one (whether it's here now). Budget is reserved durably before any
+/// download and each of the rules' own is marked started before its own;
+/// the caller settles after. `more` only when this pass downloaded or
+/// tried something: a pass that only passed files over doesn't bring
+/// another soon.
 pub fn fetch_pass(
     store: &mut Store,
     pinner: &mut dyn Pinner,
@@ -864,12 +878,21 @@ pub fn fetch_pass(
     let batch = oneup_exec::placement::BATCH;
     let mut budget = budget(store)?;
     let mut out = Fetch::default();
-    let mut candidates: Vec<(u128, u64, bool)> = Vec::with_capacity(batch);
-    let mut after = None;
+    // Each candidate with the position before it, to resume at.
+    let mut candidates: Vec<(u128, u64, bool, Option<u128>)> = Vec::with_capacity(batch);
+    let start: Option<u128> = store.read(|o| o.meta_get(KEY_FETCH_AFTER))?.and_then(|v| v.parse().ok());
+    let (mut after, mut upto, mut wrapped) = (start, None, start.is_none());
+    let mut read = 0;
+    // Where the next pass starts: after the last file read, or from the
+    // first once every file was read.
+    let mut resume = None;
     'pages: loop {
-        let page = store.read(|o| o.local_to_fetch_after(after, batch))?;
+        let want = batch.min(FETCH_READ_MAX - read);
+        let page = store.read(|o| o.local_to_fetch_after(after, upto, want))?;
         for r in &page {
+            let before = after;
             after = Some(r.file_id);
+            read += 1;
             let size = u64::try_from(r.size).unwrap_or(0);
             let owned = if store.read(|o| o.pin_owned_has(r.file_id))? {
                 // Past the budget: the rest of the rules' files wait for
@@ -892,19 +915,30 @@ pub fn fetch_pass(
                 }
                 budget = budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
             }
-            candidates.push((r.file_id, size, owned));
+            candidates.push((r.file_id, size, owned, before));
             if candidates.len() >= batch {
                 out.more = true;
+                resume = after;
                 break 'pages;
             }
         }
-        if page.len() < batch {
+        if read >= FETCH_READ_MAX {
+            resume = after;
             break;
         }
+        if page.len() < want {
+            // The end: once around from the first, up to where this pass
+            // began.
+            if wrapped {
+                break;
+            }
+            (after, upto, wrapped) = (None, start, true);
+        }
     }
-    let (reserved, blocked) = reserve_budget(store, &candidates)?;
+    let list: Vec<(u128, u64, bool)> = candidates.iter().map(|c| (c.0, c.1, c.2)).collect();
+    let (reserved, blocked) = reserve_budget(store, &list)?;
     out.blocked = out.blocked.or(blocked);
-    for &(id, size, owned) in &candidates {
+    for &(id, size, owned, before) in &candidates {
         // Not reserved after all (the budget changed meanwhile): it waits.
         if owned && !reserved.contains(&id) {
             continue;
@@ -912,6 +946,8 @@ pub fn fetch_pass(
         if let Err(why) = may(size) {
             out.stopped = Some(why);
             out.more = true;
+            // The next pass starts at this file.
+            resume = before;
             break;
         }
         let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
@@ -924,6 +960,14 @@ pub fn fetch_pass(
             out.attempted.push(id);
         }
     }
+    if out.done.is_empty() && out.attempted.is_empty() && out.stopped.is_none() {
+        out.more = false;
+    }
+    out.read = read;
+    store.write(|o| match resume {
+        Some(id) => o.meta_set(KEY_FETCH_AFTER, &id.to_string()),
+        None => o.meta_delete(KEY_FETCH_AFTER),
+    })?;
     Ok(out)
 }
 
@@ -2016,6 +2060,58 @@ mod tests {
         approve(&mut s, &pins.fingerprint(), 1 << 30).unwrap();
         apply(&mut s, &mut fake, &pins, Duration::from_secs(60), 0).unwrap();
         assert_eq!(budget(&s).unwrap(), -900 * MIB + (1 << 30));
+    }
+
+    /// The cost of a pass is bounded, whatever is ahead of the files it
+    /// can download: more rule files than a pass reads, each unreadable,
+    /// ahead (in the index's order) of a file the user pinned. The first
+    /// pass reads at most its bound, opens no more, downloads nothing and
+    /// brings no pass soon; the next resumes where it stopped and reaches
+    /// the user's file.
+    #[test]
+    fn a_download_pass_reads_a_bounded_number_of_files_and_resumes() {
+        struct Counting(Fake, usize);
+        impl Pinner for Counting {
+            fn identify(&mut self, rel: &str, expected: u128) -> std::io::Result<(u128, i64)> {
+                self.1 += 1;
+                self.0.identify(rel, expected)
+            }
+            fn set(&mut self, rel: &str, expect: (u128, Option<i64>), change: Change) -> std::io::Result<()> {
+                self.0.set(rel, expect, change)
+            }
+        }
+        let n = FETCH_READ_MAX as u128 + 50;
+        // Last in the index's order (file ID blobs, low byte first).
+        let user: u128 = 0x00FF_FFFF;
+        let mut rows: Vec<LocalRow> =
+            (10..10 + n).map(|i| row(i, 1, &format!("a{i}.psd"), LocalKind::File, RECALL)).collect();
+        rows.push(row(user, 1, "u.txt", LocalKind::File, RECALL));
+        let mut s = store(&rows);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
+        let names: Vec<String> = (10..10 + n).map(|i| format!("a{i}.psd")).collect();
+        let ids: Vec<(u128, &str)> = (10..10 + n).zip(names.iter().map(String::as_str)).collect();
+        observe(&mut s, &fake, &ids);
+        journal(&mut s, &[(user, RECALL | PINNED)]);
+        fake.failing = names;
+        let mut p = Counting(fake, 0);
+        let mut got = Vec::new();
+        let f = fetch_pass(&mut s, &mut p, &mut |_| Ok(()), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        assert!(got.is_empty());
+        assert_eq!((f.read, f.more), (FETCH_READ_MAX, false), "bounded, and nothing soon");
+        assert!(p.1 <= FETCH_READ_MAX, "opened {}", p.1);
+        p.1 = 0;
+        let f = fetch_pass(&mut s, &mut p, &mut |_| Ok(()), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        assert_eq!(got, ["/u.txt"], "resumed where the last pass stopped");
+        assert!(f.read <= FETCH_READ_MAX && p.1 <= FETCH_READ_MAX);
     }
 
     /// A rescan of the folder (the change journal lost) deletes every Local
