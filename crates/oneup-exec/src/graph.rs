@@ -1000,6 +1000,7 @@ mod tests {
                 deleted: None,
                 root: None,
                 file_system_info: None,
+                shared: None,
             });
             Ok(Fragment { item, paused: Duration::ZERO, capped: Duration::ZERO })
         }

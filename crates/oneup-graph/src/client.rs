@@ -41,6 +41,8 @@ pub struct Graph {
     /// if only a folder is synced ([`Graph::scoped`]).
     drive: String,
     scope: Option<String>,
+    /// Where Graph is: [`GRAPH`], or a loopback server in tests.
+    base: String,
     pub stats: NetStats,
     /// Bandwidth caps for file content (`rules.md` § User controls).
     pub upload: crate::throttle::Throttle,
@@ -107,6 +109,17 @@ fn search_url(top: &str, text: &str, n: u32) -> String {
         })
         .collect();
     format!("{top}/search(q={q})?$top={n}&$select={ITEM_SELECT}")
+}
+
+/// Percent-encodes an ID as exactly one path segment: a `/` in it (a
+/// permission's ID can have one) is encoded too, never a separator.
+fn encode_segment(id: &str) -> String {
+    id.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// One request, described so it can be rebuilt for each attempt.
@@ -611,6 +624,41 @@ impl Graph {
         self.send(&req).await.map(|_| ())
     }
 
+    /// Removes permission `perm` (a sharing link, or people's access) from
+    /// item `id`, if the item's eTag is still `etag` (412 otherwise; Graph
+    /// documents `If-Match` for this request). Only a permission that isn't
+    /// inherited can be removed. Never touches the item's content. Only for
+    /// `oneup_effects::sharing`, behind the gate's token.
+    pub async fn delete_permission(&self, id: &str, perm: &str, etag: &str) -> Result<()> {
+        let url = format!("{}/items/{}/permissions/{}", self.drive_url(), encode_segment(id), encode_segment(perm));
+        let req = Req { if_match: Some(etag), ..Req::new(reqwest::Method::DELETE, &url) };
+        self.send(&req).await.map(|_| ())
+    }
+
+    /// Sets when permission `perm` of item `id` stops working, if the
+    /// item's eTag is still `etag`. **Graph documents only `roles` as
+    /// changeable this way**: OneDrive may ignore the date, so the caller
+    /// checks the permission it returns. Only for `oneup_effects::sharing`,
+    /// behind the gate's token.
+    pub async fn set_permission_expiry(
+        &self,
+        id: &str,
+        perm: &str,
+        etag: &str,
+        expires_ms: i64,
+    ) -> Result<crate::model::Permission> {
+        let when = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_ms) * 1_000_000)
+            .ok()
+            .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+            .ok_or(Error::Invalid("the expiry date is out of range"))?;
+        let url = format!("{}/items/{}/permissions/{}", self.drive_url(), encode_segment(id), encode_segment(perm));
+        let body = serde_json::json!({ "expirationDateTime": when });
+        let req = Req { json: Some(&body), if_match: Some(etag), ..Req::new(reqwest::Method::PATCH, &url) };
+        let v: serde_json::Value = self.json(&req).await?;
+        crate::model::Permission::from_json(&v)
+            .ok_or_else(|| Error::refused(200, "changing a permission", "no permission in the answer".into()))
+    }
+
     async fn json<T: DeserializeOwned>(&self, req: &Req<'_>) -> Result<T> {
         let (_, body) = self.send(req).await?;
         Ok(serde_json::from_slice(&body)?)
@@ -630,6 +678,7 @@ impl Graph {
             no_redirect: std::sync::OnceLock::new(),
             drive: "/me/drive".into(),
             scope: None,
+            base: GRAPH.into(),
         }
     }
 
@@ -659,7 +708,7 @@ impl Graph {
     }
 
     fn drive_url(&self) -> String {
-        format!("{GRAPH}{}", self.drive)
+        format!("{}{}", self.base, self.drive)
     }
 
     /// Makes the scope's root folder look like a drive root.
@@ -1054,6 +1103,109 @@ impl Graph {
         Ok(page.value.into_iter().filter(|it| !it.is_deleted()).map(|it| self.rooted(it)).collect())
     }
 
+    /// The sharing of items `ids`, in the order given: each one's eTag and
+    /// all its permissions (links and people, inherited ones too), or
+    /// `None` if it no longer exists. Read-only, for the sharing audit on
+    /// demand: ten items per round trip (two batched requests each).
+    pub async fn sharing(&self, ids: &[&str]) -> Result<Vec<Result<Option<crate::model::ItemSharing>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(BATCH_MAX / 2) {
+            let reqs: Vec<BatchReq> = chunk
+                .iter()
+                .flat_map(|id| {
+                    let item = format!("{}/items/{}", self.drive, encode_segment(id));
+                    [
+                        BatchReq {
+                            method: reqwest::Method::GET,
+                            url: format!("{item}?$select=id,eTag,root"),
+                            if_match: None,
+                            body: None,
+                        },
+                        BatchReq {
+                            method: reqwest::Method::GET,
+                            url: format!("{item}/permissions"),
+                            if_match: None,
+                            body: None,
+                        },
+                    ]
+                })
+                .collect();
+            let answers = self.batch(&reqs).await?;
+            for pair in answers.chunks(2) {
+                let [item, perms] = pair else { continue };
+                out.push(self.item_sharing(item, perms).await);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn item_sharing(&self, item: &BatchResp, perms: &BatchResp) -> Result<Option<crate::model::ItemSharing>> {
+        // Only the item's own 404 says it's gone. Its permissions not found
+        // while the item is there isn't an answer to act on (a check that
+        // a permission is gone must know the item still exists).
+        if item.status == 404 {
+            return Ok(None);
+        }
+        let it = item.item()?;
+        if !(200..300).contains(&perms.status) {
+            return Err(perms.error("reading who an item is shared with"));
+        }
+        let mut permissions = Vec::new();
+        let mut page = perms.body.clone();
+        loop {
+            permissions.extend(
+                page.get("value")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(crate::model::Permission::from_json),
+            );
+            match page.get("@odata.nextLink").and_then(|n| n.as_str()) {
+                Some(n) => page = self.get(n).await?,
+                None => break,
+            }
+        }
+        let etag = it.e_tag.clone().ok_or_else(|| item.error("an item without an eTag"))?;
+        Ok(Some(crate::model::ItemSharing { etag, root: it.is_root(), permissions }))
+    }
+
+    /// Everything other people shared with the signed-in account, files and
+    /// folders (`sharedWithMe`; see [`Graph::shared_folders`] for the
+    /// permission it needs). Microsoft deprecated the request: it works in a
+    /// degraded state until November 2026 and then returns nothing. At most
+    /// `limit` items; the flag says whether there were more.
+    pub async fn shared_with_me(&self, limit: usize) -> Result<(Vec<crate::model::SharedItem>, bool)> {
+        let mut url = format!("{GRAPH}/me/drive/sharedWithMe");
+        let mut out = Vec::new();
+        loop {
+            let v: serde_json::Value = self.get(&url).await?;
+            out.extend(
+                v.get("value")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(crate::model::SharedItem::from_json),
+            );
+            let next = v.get("@odata.nextLink").and_then(|n| n.as_str());
+            if out.len() >= limit {
+                let more = out.len() > limit || next.is_some();
+                out.truncate(limit);
+                return Ok((out, more));
+            }
+            match next {
+                Some(n) => url = n.to_string(),
+                None => return Ok((out, false)),
+            }
+        }
+    }
+
+    /// First page URL of a listing of the whole drive with only what tells
+    /// shared items apart (`oneup shared --scan`, for items shared before
+    /// the mirror kept the `shared` facet).
+    pub fn shared_scan_url(&self) -> String {
+        format!("{}/delta?$top={PAGE_SIZE}&$select=id,shared,deleted", self.top_url())
+    }
+
     /// First page URL for a folder's direct children.
     pub fn children_url(&self, folder_id: &str) -> String {
         format!("{}/items/{}/children?$top={PAGE_SIZE}&$select={ITEM_SELECT}", self.drive_url(), encode_id(folder_id))
@@ -1208,6 +1360,9 @@ mod tests {
         assert_eq!(encode_drive_path(r"\Trade\Trader"), "Trade/Trader");
         assert_eq!(encode_drive_path("/a b/#c%"), "a%20b/%23c%25");
         assert_eq!(encode_drive_path("/naïve"), "na%C3%AFve");
+        // An ID is one segment, whatever it holds.
+        assert_eq!(encode_segment("aTo/w+I="), "aTo%2Fw%2BI%3D");
+        assert_eq!(encode_segment("ABC!12"), "ABC%2112");
     }
 
     fn graph() -> Graph {
@@ -1240,6 +1395,7 @@ mod tests {
             deleted: None,
             root: None,
             file_system_info: None,
+            shared: None,
         };
         let r = g.rooted(item("ABC!7"));
         assert!(r.is_root() && r.parent_id().is_none(), "the scope's folder stands in for the root");
@@ -1411,6 +1567,140 @@ Content-Length: 50000000
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A loopback server answering each request (one per connection, read
+    /// whole first) with the next of `answers`, the last one again after
+    /// that, and keeping each request as text (request line, headers, body).
+    async fn serve_capture(answers: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&got);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let k = s.read(&mut buf).await.unwrap_or(0);
+                    if k == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..k]);
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let i = {
+                    let mut g = kept.lock().unwrap();
+                    g.push(String::from_utf8_lossy(&req).into_owned());
+                    g.len() - 1
+                };
+                let _ = s.write_all(answers[i.min(answers.len() - 1)].as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (base, got)
+    }
+
+    /// A client signed in (access token `tok`) talking to `base`.
+    fn signed_in(base: &str) -> Graph {
+        let auth = Arc::new(Auth::with_token("tok"));
+        Graph { base: base.into(), ..Graph::new(reqwest::Client::new(), auth, crate::Aimd::new(1, 1)) }
+    }
+
+    fn answer(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// How a batched pair of answers (the item, its permissions) is read:
+    /// only the item's own 404 says it's gone.
+    #[tokio::test]
+    async fn only_the_items_own_not_found_says_it_is_gone() {
+        let g = graph();
+        let resp = |status: u16, body: serde_json::Value| BatchResp { status, body };
+        let item = resp(200, serde_json::json!({ "id": "I!1", "eTag": "\"{E},3\"" }));
+        let perms =
+            resp(200, serde_json::json!({ "value": [{ "id": "p1", "roles": ["read"], "link": { "type": "view" } }] }));
+        let not_found = || resp(404, serde_json::json!({ "error": { "code": "itemNotFound" } }));
+
+        // Both there.
+        let s = g.item_sharing(&item, &perms).await.unwrap().unwrap();
+        assert_eq!((s.etag.as_str(), s.root, s.permissions.len()), ("\"{E},3\"", false, 1));
+        assert_eq!(s.permissions[0].id, "p1");
+        // The item gone (its permissions with it).
+        assert_eq!(g.item_sharing(&not_found(), &not_found()).await.unwrap(), None);
+        assert_eq!(g.item_sharing(&not_found(), &perms).await.unwrap(), None);
+        // The item there, its permissions not found: no answer to act on.
+        let e = g.item_sharing(&item, &not_found()).await.unwrap_err();
+        assert_eq!(e.status(), Some(404));
+        // An item without an eTag can't be acted on either.
+        let e = g.item_sharing(&resp(200, serde_json::json!({ "id": "I!1" })), &perms).await.unwrap_err();
+        assert!(e.status().is_some(), "{e}");
+    }
+
+    /// Removing a permission is a DELETE of exactly that permission,
+    /// conditional on the item's eTag (`If-Match`), with the token.
+    #[tokio::test]
+    async fn a_permission_is_removed_only_under_the_items_etag() {
+        let (base, got) = serve_capture(vec![answer("204 No Content", "")]).await;
+        signed_in(&base).delete_permission("I!1", "p/1", "\"{E},3\"").await.unwrap();
+        let reqs = got.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        let r = reqs[0].to_ascii_lowercase();
+        assert!(r.starts_with("delete /me/drive/items/i%211/permissions/p%2f1 http/1.1\r\n"), "{r}");
+        assert!(r.contains("\r\nif-match: \"{e},3\"\r\n"), "{r}");
+        assert!(r.contains("\r\nauthorization: bearer tok\r\n"), "{r}");
+    }
+
+    /// An eTag that moved on: 412, refused at once, never sent again.
+    #[tokio::test]
+    async fn a_removal_under_a_moved_etag_is_refused_and_not_retried() {
+        let body = r#"{"error":{"code":"resourceModified","message":"x"}}"#;
+        let (base, got) = serve_capture(vec![answer("412 Precondition Failed", body)]).await;
+        let e = signed_in(&base).delete_permission("I!1", "p1", "\"{E},3\"").await.unwrap_err();
+        assert_eq!((e.status(), e.code().as_deref()), (Some(412), Some("resourceModified")));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        let (base, got) = serve_capture(vec![answer("412 Precondition Failed", body)]).await;
+        let e = signed_in(&base).set_permission_expiry("I!1", "p1", "\"{E},3\"", 0).await.unwrap_err();
+        assert_eq!(e.status(), Some(412));
+        assert_eq!(got.lock().unwrap().len(), 1);
+    }
+
+    /// Setting an expiry is a PATCH of that permission's
+    /// `expirationDateTime`, under the item's eTag; OneDrive's answer comes
+    /// back as the permission it now has.
+    #[tokio::test]
+    async fn an_expiry_is_patched_under_the_items_etag() {
+        let when = "2030-01-31T23:59:59Z";
+        let ms = time::OffsetDateTime::parse(when, &time::format_description::well_known::Rfc3339)
+            .map(|t| i64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap())
+            .unwrap();
+        let reply = format!(r#"{{"id":"p1","roles":["read"],"expirationDateTime":"{when}"}}"#);
+        let (base, got) = serve_capture(vec![answer("200 OK", &reply)]).await;
+        let p = signed_in(&base).set_permission_expiry("I!1", "p1", "\"{E},3\"", ms).await.unwrap();
+        assert_eq!((p.id.as_str(), p.expires_ms), ("p1", Some(ms)));
+        let reqs = got.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        let r = &reqs[0];
+        assert!(r.to_ascii_lowercase().starts_with("patch /me/drive/items/i%211/permissions/p1 http/1.1\r\n"), "{r}");
+        assert!(r.to_ascii_lowercase().contains("\r\nif-match: \"{e},3\"\r\n"), "{r}");
+        let body = &r[r.find("\r\n\r\n").unwrap() + 4..];
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v, serde_json::json!({ "expirationDateTime": when }));
     }
 
     #[test]
