@@ -5700,35 +5700,35 @@
             };
             const rows = [el("div", {
                 className: "group",
-                textContent: "Databases"
+                textContent: tr("Databases")
             })];
-            rows.push(toggle("Wait for programs to close databases",
-                "KeePass, Access, Thunderbird mail, Outlook data files and virtual disks sync only while closed. SQLite databases always wait until every change is in the file.",
+            rows.push(toggle(tr("Wait for programs to close databases"),
+                tr("KeePass, Access, Thunderbird mail, Outlook data files and virtual disks sync only while closed. SQLite databases always wait until every change is in the file."),
                 d.wait, on => save({
                     wait: on
-                }, on ? "On" : "Off")));
+                }, on ? tr("On") : tr("Off"))));
             for (const p of d.presets) rows.push(toggle(p.summary, p.lines.join(", "), p.on, on => save({
                 presets: d.presets.filter(x => x.name === p.name ? on : x.on).map(x => x.name)
-            }, on ? "Synced as databases" : "Synced as files")));
-            for (const r of d.patterns) rows.push(flatRow(r, "Your pattern", el("button", {
+            }, on ? tr("Synced as databases") : tr("Synced as files"))));
+            for (const r of d.patterns) rows.push(flatRow(r, tr("Your pattern"), el("button", {
                 className: "btn small",
-                textContent: "Remove",
+                textContent: tr("Remove"),
                 onclick: () => save({
                     patterns: d.patterns.filter(x => x !== r)
-                }, "Removed")
+                }, tr("Removed"))
             })));
             const add = el("input", {
                 type: "text",
                 placeholder: "*.ledger",
                 spellcheck: false,
-                "aria-label": "Database pattern"
+                "aria-label": tr("Database pattern")
             });
-            rows.push(flatRow("Add a pattern", "Files it matches sync as databases.", add, el("button", {
+            rows.push(flatRow(tr("Add a pattern"), tr("Files it matches sync as databases."), add, el("button", {
                 className: "btn small",
-                textContent: "Add",
+                textContent: tr("Add"),
                 onclick: () => add.value.trim() && save({
                     patterns: [...d.patterns, add.value.trim()]
-                }, "Added")
+                }, tr("Added"))
             })));
             for (const n of (st && st.databases) || []) {
                 const rel = n.path.replace(/^\//, "");
@@ -5739,17 +5739,17 @@
                 rows.push(flatRow(n.path, n.detail, showBtn(rel),
                     el("button", {
                         className: "btn small",
-                        textContent: "Exclude",
+                        textContent: tr("Exclude"),
                         onclick: () => save({
                             exclude: n.path
-                        }, "Excluded")
+                        }, tr("Excluded"))
                     }),
                     el("button", {
                         className: "btn small",
-                        textContent: "Keep syncing",
+                        textContent: tr("Keep syncing"),
                         onclick: () => save({
                             keep_syncing: n.path
-                        }, "Kept syncing")
+                        }, tr("Kept syncing"))
                     })));
             }
             return rows;
