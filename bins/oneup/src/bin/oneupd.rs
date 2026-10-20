@@ -728,7 +728,7 @@ async fn agent(
             match out.end {
                 End::Settled => {
                     control.clear_first();
-                    store = engine.placement(store, &control.controls()).await?;
+                    store = engine.placement(store, &|| control.controls()).await?;
                     // Removes kept copies on this PC: not while changes
                     // to it are paused.
                     if !control.controls().pause_local {
@@ -746,7 +746,7 @@ async fn agent(
                     if !control.controls().pause_local {
                         tokio::task::block_in_place(|| engine.clear_excluded_marks(&mut store))?;
                     }
-                    if more { CONVERT_GAP } else { check }
+                    if more || engine.pins_pending() { CONVERT_GAP } else { check }
                 }
                 End::Retry => {
                     let wait = retry.min(check);

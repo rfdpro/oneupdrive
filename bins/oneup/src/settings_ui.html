@@ -4820,6 +4820,9 @@
             if (n.state === "never") return tr("Never synced");
             if (n.partial) return tr("A rule excludes items inside");
             if (n.rule_file_below) return tr("Has a .oneupignore inside");
+            if (n.pinned_by) return tr("Always on this PC: pin rule {rule}", {
+                rule: n.pinned_by
+            });
             return "";
         }
 
@@ -5910,6 +5913,44 @@
                     days: sug.days
                 }), showBtn(s.rel), exBtn(s)));
             }
+            if (F.root.on_demand) {
+                box.append(el("div", {
+                    className: "group",
+                    textContent: "Always on this PC"
+                }));
+                const pins = rs.rules.pin || [];
+                const add = el("input", {
+                    type: "text",
+                    spellcheck: false,
+                    placeholder: "*.psd or /Work/",
+                    "aria-label": "Pin rule"
+                });
+                const addBtn = el("button", {
+                    className: "btn small",
+                    textContent: "Add",
+                    onclick: async() => {
+                        const next = [...pins, add.value.trim()];
+                        if (!add.value.trim()) return;
+                        // A rule that downloads a lot asks first.
+                        const pv = await run(call("pin_preview", {
+                            root: F.root.id,
+                            pin: next
+                        }));
+                        if (pv.ask && !confirm(`Download ${pv.all ? "" : "at least "}${pv.files.toLocaleString()} online-only files (${size(pv.bytes)})${pv.free != null ? ", with " + size(pv.free) + " free" : ""}?`)) return;
+                        save({
+                            pin: next
+                        }, "Kept on this PC");
+                    }
+                });
+                box.append(flatRow(pins.length ? "Add a pin rule" : "No pin rules", "Matching files stay downloaded. Space policies never free them.", add, addBtn));
+                for (const r of pins) box.append(flatRow(r, "Pin rule", el("button", {
+                    className: "btn small",
+                    textContent: "Remove",
+                    onclick: () => save({
+                        pin: pins.filter(x => x !== r)
+                    }, "Pin rule removed")
+                })));
+            }
             box.append(el("div", {
                 className: "group",
                 textContent: tr("Paused")
@@ -6377,6 +6418,14 @@
                     path: n.path,
                     keep: v === "keep"
                 }), v === "keep" ? tr("Downloading") : tr("Freeing up space")).then(() => afterChange(n.rel)));
+            if (n.pinned_by) return acc(tr("On this PC"), [el("p", {
+                className: "say",
+                textContent: tr("Always on this PC: pin rule {rule}. Change it in Exclude.", {
+                    rule: n.pinned_by
+                })
+            })], {
+                note: tr("Pin rule")
+            });
             return acc(tr("On this PC"), [el("p", {
                 className: "say",
                 textContent: n.placement === "online" ? tr("Takes no space. Downloads when you open it.") : n.placement === "always" ? tr("Never freed automatically.") : tr("May be freed automatically when unused.")

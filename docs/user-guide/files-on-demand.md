@@ -22,12 +22,29 @@ Right-click in File Explorer: **Always keep on this device**, or **Free up space
 
 From the command line: `oneup pin "Photos\2024"` (always keep) and `oneup free "Videos"` (free up space).
 
+## Always keeping files by rule
+A **pin rule** keeps everything it matches on this PC, now and later: new files that match are downloaded as they arrive, wherever they are. Rules are written like the [exclusion rules](excluding-files.md#your-own-rules): `*.psd` for every Photoshop file, `/Work/` for the `Work` folder and everything in it, `!/Work/archive/*.zip` to leave some out.
+
+On the **Files** page, under **Exclude**, **Always on this PC** lists them, with **Add** and **Remove**. From the command line:
+
+```powershell
+oneup --data-dir … rules --pin "*.psd"
+oneup --data-dir … rules --unpin "*.psd"
+```
+
+* The last rule that matches a file or a folder above it decides, so `!/Work/archive/*.zip` after `/Work/` leaves those archives out.
+* Adding a rule says how much it would download. If that's more than 1 GB, or more than the disk has free, the window asks first, and `oneup rules --pin` needs `--yes`.
+* Matching files show **Always keep on this device** in File Explorer and download a share at a time: downloads stop when you pause, and leave at least 1 GB (or the low-disk share below) free.
+* A pin rule wins over freeing space: the automatic policies below skip them, choosing **Free up space** in File Explorer on one is undone, and `oneup free` refuses one (remove the rule first).
+* Removing a rule sets what it pinned back to the default: the files stay on this PC until something frees them. Files you had set to **Always keep on this device** yourself stay that way.
+* `oneup explain PATH` names the pin rule keeping a file.
+
 ## Freeing space by itself
 On the **Files** page, in the folder's settings (nothing selected), under **Free up space**:
 * **Make files online-only when unused for** 7 days … 1 year (never, unless you choose).
 * **When the disk is nearly full** (less than 10% free, or the share you choose), the files unused longest are made online-only until there's room again (5 points more free). Anything used in the last day is left alone.
 
-"Used" means the latest of: when the file was last changed, when Windows last saw it read (where the disk keeps track of that), and when OneUpDrive last downloaded it for a program. Files set to **Always keep on this device** are never freed. The activity log notes each round ("12 files (3.1 GiB) not used for 30 days made online-only"). It checks for unused files at most once an hour, and for a full disk each time it has caught up.
+"Used" means the latest of: when the file was last changed, when Windows last saw it read (where the disk keeps track of that), and when OneUpDrive last downloaded it for a program. Files set to **Always keep on this device**, by you or by a pin rule, are never freed. The activity log notes each round ("12 files (3.1 GiB) not used for 30 days made online-only"). It checks for unused files at most once an hour, and for a full disk each time it has caught up.
 
 From the command line: `oneup space --free-unused-days 30`, `oneup space --free-when-low on --low-disk-percent 10`, `oneup space` to show.
 

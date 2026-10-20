@@ -862,6 +862,7 @@ pub(crate) mod tests {
             // Outside `write`, which would look for v18's tables at its end.
             s.read(|o| {
                 // What a v15 database looks like.
+                o.c.execute_batch(crate::pins::UNDO_V22)?;
                 o.c.execute_batch(crate::shared::UNDO_V21)?;
                 o.c.execute_batch(crate::dupes::UNDO_V20)?;
                 o.c.execute_batch(crate::choose::UNDO_V19)?;

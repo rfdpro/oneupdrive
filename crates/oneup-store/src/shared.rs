@@ -439,7 +439,8 @@ mod tests {
         assert_eq!(s.read(|o| o.intents()).unwrap().len(), 1);
     }
 
-    /// A store at version `from` (made by undoing `undo`) upgrades to v21
+    /// A store at version `from` (made by undoing `undo`) upgrades to the
+    /// latest (v21 and the versions after it)
     /// with its tree as it was, nothing marked and nothing pending, and
     /// marks and intents work at once.
     fn upgrades_from(from: i64, undo: &str) {
@@ -459,7 +460,7 @@ mod tests {
         }
         let mut s = Store::open(&path, 1024).unwrap();
         let v: i64 = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
-        assert_eq!(v, 21);
+        assert_eq!(v, crate::SCHEMA_VERSION);
         assert!(s.read(|o| o.get_item("A")).unwrap().is_some(), "the tree is kept");
         assert_eq!(s.read(|o| o.shared_count()).unwrap(), 0);
         assert!(s.read(|o| o.intents()).unwrap().is_empty());
@@ -481,12 +482,12 @@ mod tests {
 
     #[test]
     fn a_v19_store_upgrades() {
-        upgrades_from(19, &format!("{} {}", super::UNDO_V21, crate::dupes::UNDO_V20));
+        upgrades_from(19, &format!("{} {} {}", crate::pins::UNDO_V22, super::UNDO_V21, crate::dupes::UNDO_V20));
     }
 
     #[test]
     fn a_v20_store_upgrades() {
-        upgrades_from(20, super::UNDO_V21);
+        upgrades_from(20, &format!("{} {}", crate::pins::UNDO_V22, super::UNDO_V21));
     }
 
     /// A mark written again after it was read (the item shared again)

@@ -29,6 +29,9 @@ pub struct Rules {
     pub paused: Vec<String>,
     /// What happens to the OneDrive copies of excluded items.
     pub cloud: CloudCopies,
+    /// Pin rules (`[rules] pin`), same syntax: matching items are always
+    /// kept on this PC with Files On-Demand (`crate::pinrules`).
+    pub pin: Vec<String>,
 }
 
 /// `[rules] cloud_copies`: what happens to the OneDrive copies of excluded
@@ -72,6 +75,11 @@ impl Rules {
         let mut set = RuleSet::new(&self.presets, &self.exclude)?;
         set.set_paused(&self.paused);
         Ok(set)
+    }
+
+    /// The pin rules.
+    pub fn pin_set(&self) -> oneup_rules::PinSet {
+        oneup_rules::PinSet::new(&self.pin)
     }
 }
 
@@ -470,6 +478,10 @@ pub fn load_rules(data_dir: &Path, store: &Store) -> Result<Rules> {
         Some(t) => Some((strings(t, "presets")?, strings(t, "exclude")?)),
         None => None,
     };
+    let pin = match rules_table {
+        Some(t) => strings(t, "pin")?.unwrap_or_default(),
+        None => Vec::new(),
+    };
     let cloud = match rules_table.and_then(|t| t.get("cloud_copies")) {
         Some(v) => v
             .as_str()
@@ -488,10 +500,14 @@ pub fn load_rules(data_dir: &Path, store: &Store) -> Result<Rules> {
         })
     };
     let rules = match listed {
-        Some((presets, exclude)) => {
-            Rules { presets: presets.map_or_else(stored, Ok)?, exclude: exclude.unwrap_or_default(), paused, cloud }
-        }
-        None => Rules { presets: stored()?, exclude: Vec::new(), paused, cloud },
+        Some((presets, exclude)) => Rules {
+            presets: presets.map_or_else(stored, Ok)?,
+            exclude: exclude.unwrap_or_default(),
+            paused,
+            cloud,
+            pin,
+        },
+        None => Rules { presets: stored()?, exclude: Vec::new(), paused, cloud, pin },
     };
     rules.rule_set()?; // unknown presets are reported here, not later
     Ok(rules)
@@ -509,16 +525,24 @@ pub fn paused_folders(data_dir: &Path) -> Vec<String> {
 /// as it was.
 pub fn save_rules(data_dir: &Path, rules: &Rules) -> Result<()> {
     let list = |l: &Vec<String>| value(l.iter().collect::<Array>());
+    let mut entries = vec![
+        ("presets", list(&rules.presets)),
+        ("exclude", list(&rules.exclude)),
+        ("cloud_copies", value(rules.cloud.name())),
+    ];
+    // Written once there are pin rules, so other files stay as they were.
+    let has_pin = read_doc(data_dir)?
+        .is_some_and(|d| d.get("rules").and_then(Item::as_table).is_some_and(|t| t.contains_key("pin")));
+    if !rules.pin.is_empty() || has_pin {
+        entries.push(("pin", list(&rules.pin)));
+    }
     save(
         data_dir,
         "rules",
         "# What syncs. presets: dev, temp, os-junk (`oneup rules` explains them).\n\
-         # exclude: your own rules, gitignore style, relative to the synced folder.\n",
-        vec![
-            ("presets", list(&rules.presets)),
-            ("exclude", list(&rules.exclude)),
-            ("cloud_copies", value(rules.cloud.name())),
-        ],
+         # exclude: your own rules, gitignore style, relative to the synced folder.\n\
+         # pin: rules for what Files On-Demand always keeps on this PC.\n",
+        entries,
     )?;
     let has_pause = read_doc(data_dir)?.is_some_and(|d| d.contains_table("pause"));
     if !rules.paused.is_empty() || has_pause {

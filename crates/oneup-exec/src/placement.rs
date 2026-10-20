@@ -40,18 +40,29 @@ pub fn free_ops(store: &Store) -> oneup_store::Result<Vec<Op>> {
 /// Downloads pinned files whose content isn't here (through our own
 /// hydration service, which must be connected). Returns their paths
 /// relative to the synced folder. Blocking work runs off the async runtime.
-pub async fn fetch_pinned(store: &Store, root: &Path) -> oneup_store::Result<Vec<String>> {
+/// `may(size)` is asked before each file, with its size: the caller stops
+/// the pass there (a pause that came meanwhile, too little free space, the
+/// pass's share of bytes or time used up) by answering `false`; the rest
+/// waits for a later pass.
+pub async fn fetch_pinned(
+    store: &Store,
+    root: &Path,
+    may: &(dyn Fn(u64) -> bool + Send + Sync),
+) -> oneup_store::Result<Vec<String>> {
     let rows = store.read(|o| {
         let mut v = Vec::new();
         for r in o.local_to_fetch(BATCH)? {
             if let Some(p) = o.local_path_of(r.file_id)? {
-                v.push(p);
+                v.push((p, u64::try_from(r.size).unwrap_or(0)));
             }
         }
         Ok(v)
     })?;
     let mut done = Vec::new();
-    for rel in rows {
+    for (rel, size) in rows {
+        if !may(size) {
+            break;
+        }
         let path: PathBuf = rel.trim_start_matches('/').split('/').fold(root.to_path_buf(), |p, part| p.join(part));
         let ok = tokio::task::spawn_blocking(move || -> bool {
             oneup_cfapi::provider::open(&path).is_ok_and(|f| oneup_cfapi::provider::hydrate(&f).is_ok())

@@ -409,6 +409,24 @@ mod win {
                 tokio::task::spawn_blocking(move || oneup_app::filetree::preview(&d, &rel, folder, local, remote))
                     .await?
             }
+            "pin_preview" => {
+                // What pin rules would download, before they're saved.
+                let d = dir.to_path_buf();
+                let lines: Vec<String> = args["pin"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let store = oneup_app::setup::open_store(&d, 4 * 1024)?;
+                    let (files, bytes, all) =
+                        oneup_app::pinrules::preview(&store, &lines, std::time::Duration::from_secs(10))?;
+                    let local = oneup_app::sync::pairing(&store)?.local;
+                    let free = oneup_app::pinrules::free_space(&local);
+                    let ask = oneup_app::pinrules::must_ask(bytes, free);
+                    Ok(json!({ "files": files, "bytes": bytes, "all": all, "free": free, "ask": ask }))
+                })
+                .await?
+            }
             "rule_suggestions" => {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || -> Result<Value> {

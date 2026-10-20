@@ -16,11 +16,13 @@ use std::collections::BTreeMap;
 pub mod database;
 mod glob;
 mod pattern;
+mod pin;
 mod presets;
 mod set;
 
 pub use glob::NameGlob;
 pub use pattern::Rule;
+pub use pin::PinSet;
 pub use presets::{DEV_PRESET, PRESETS, Preset, preset};
 pub use set::{IGNORE_FILE, Match, RuleSet, Source, UnknownPreset, Verdict, literal_path_rules};
 

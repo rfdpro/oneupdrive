@@ -22,7 +22,8 @@
 //! v19 the cloud folders by size, for rule suggestions (see [`choose`]),
 //! since v20 the hashes of local-only files made for finding duplicates
 //! (see [`dupes`]), and since v21 which cloud items are shared (see
-//! [`shared`]).
+//! [`shared`]), and since v22 what applying pin rules keeps
+//! (see [`pins`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -49,6 +50,7 @@ pub mod dirty;
 pub use dirty::DirtyScope;
 pub mod activity;
 pub mod choose;
+pub mod pins;
 pub use choose::Totals;
 pub mod dupes;
 pub mod retry;
@@ -115,7 +117,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -738,7 +740,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 21] = [
+    let steps: [(i64, String); 22] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -760,6 +762,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (19, choose::MIGRATE_V19.into()),
         (20, dupes::MIGRATE_V20.into()),
         (21, shared::MIGRATE_V21.into()),
+        (22, pins::migrate_v22()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

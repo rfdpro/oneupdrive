@@ -99,7 +99,7 @@ pub struct LocalRow {
 }
 
 impl LocalRow {
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, i64, Self)> {
+    pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, i64, Self)> {
         let id: Vec<u8> = r.get("file_id")?;
         let parent: Option<Vec<u8>> = r.get("parent_id")?;
         Ok((
@@ -121,7 +121,7 @@ impl LocalRow {
     }
 }
 
-fn fix_local((kind, skip, mut row): (i64, i64, LocalRow)) -> Result<LocalRow> {
+pub(crate) fn fix_local((kind, skip, mut row): (i64, i64, LocalRow)) -> Result<LocalRow> {
     row.kind = LocalKind::try_from(kind)?;
     row.skip = Skip::try_from(skip)?;
     Ok(row)
@@ -213,7 +213,8 @@ pub(crate) fn local_named_sql() -> String {
     format!("SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3")
 }
 
-const LOCAL_COLS: &str = "file_id, parent_id, name, name_lossy, kind, size, mtime, attributes, reparse_tag, skip";
+pub(crate) const LOCAL_COLS: &str =
+    "file_id, parent_id, name, name_lossy, kind, size, mtime, attributes, reparse_tag, skip";
 
 /// `%needle%` for `LIKE … ESCAPE '\'`, with the needle's own `%`, `_` and
 /// `\` taken literally.

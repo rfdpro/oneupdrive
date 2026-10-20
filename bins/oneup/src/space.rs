@@ -68,13 +68,17 @@ pub fn unix_ms(filetime: i64) -> i64 {
 }
 
 /// What this pass should free, if anything. `accessed` gives a file's last
-/// access time (Unix ms) from its path relative to the synced folder.
+/// access time (Unix ms) from its path relative to the synced folder;
+/// `kept` says whether a pin rule keeps it on this PC (`crate::pinrules`),
+/// which wins over every policy here, even before the agent has set the
+/// file's pin.
 pub fn select(
     store: &mut Store,
     s: &Space,
     disk: Option<Disk>,
     now_ms: i64,
     accessed: &dyn Fn(&str) -> Option<i64>,
+    kept: &dyn Fn(&str) -> bool,
 ) -> Result<Selection> {
     let low = disk.filter(|_| s.free_when_low).and_then(|d| {
         let want = d.total / 100 * u64::from(s.low_disk_percent);
@@ -109,7 +113,7 @@ pub fn select(
         for r in page {
             looked += 1;
             after = Some((r.mtime, r.file_id));
-            if let Some(op) = freeable(store, &r, cutoff, accessed)? {
+            if let Some(op) = freeable(store, &r, cutoff, accessed, kept)? {
                 out.bytes += u64::try_from(r.size).unwrap_or(0);
                 out.ops.push(op);
             }
@@ -131,7 +135,13 @@ pub fn select(
 
 /// The operation freeing `r`, if it hasn't been used since `cutoff` and
 /// its content's hash is on record (the effects layer checks it).
-fn freeable(store: &Store, r: &LocalRow, cutoff: i64, accessed: &dyn Fn(&str) -> Option<i64>) -> Result<Option<Op>> {
+fn freeable(
+    store: &Store,
+    r: &LocalRow,
+    cutoff: i64,
+    accessed: &dyn Fn(&str) -> Option<i64>,
+    kept: &dyn Fn(&str) -> bool,
+) -> Result<Option<Op>> {
     if unix_ms(r.mtime) >= cutoff {
         return Ok(None);
     }
@@ -142,6 +152,9 @@ fn freeable(store: &Store, r: &LocalRow, cutoff: i64, accessed: &dyn Fn(&str) ->
         return Ok(None);
     }
     let Some(path) = path else { return Ok(None) };
+    if kept(&path) {
+        return Ok(None);
+    }
     if accessed(&path).is_some_and(|a| a >= cutoff) {
         return Ok(None);
     }
@@ -224,7 +237,7 @@ mod tests {
         s.write(|o| o.local_used_set(13, NOW - DAY_MS)).unwrap();
         let accessed = |p: &str| (p == "/f12").then_some(NOW - 2 * DAY_MS);
         let space = Space { free_unused_days: 30, ..Space::default() };
-        let sel = select(&mut s, &space, None, NOW, &accessed).unwrap();
+        let sel = select(&mut s, &space, None, NOW, &accessed, &|_| false).unwrap();
         assert_eq!(freed(&sel), vec![10]);
         assert_eq!(sel.why, Some(Why::Unused { days: 30 }));
     }
@@ -232,7 +245,8 @@ mod tests {
     #[test]
     fn nothing_happens_unless_asked() {
         let mut s = store(&[file(10, 400)]);
-        let sel = select(&mut s, &Space::default(), Some(Disk { free: 1, total: 1000 }), NOW, &|_| None).unwrap();
+        let sel =
+            select(&mut s, &Space::default(), Some(Disk { free: 1, total: 1000 }), NOW, &|_| None, &|_| false).unwrap();
         assert!(sel.ops.is_empty());
     }
 
@@ -242,12 +256,27 @@ mod tests {
         let space = Space { free_when_low: true, low_disk_percent: 10, ..Space::default() };
         // 1 MB disk, 50 KB free: 100 KB is the line, 150 KB the goal.
         let disk = Disk { free: 50_000, total: 1_000_000 };
-        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None).unwrap();
+        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &|_| false).unwrap();
         // Each file is 1 KB, so all three old enough go (13 is from today).
         assert_eq!(freed(&sel), vec![10, 11, 12]);
         assert_eq!(sel.why, Some(Why::LowDisk));
         // With room enough, nothing.
         let fine = Disk { free: 500_000, total: 1_000_000 };
-        assert!(select(&mut s, &space, Some(fine), NOW, &|_| None).unwrap().ops.is_empty());
+        assert!(select(&mut s, &space, Some(fine), NOW, &|_| None, &|_| false).unwrap().ops.is_empty());
+    }
+
+    /// A pin rule wins over every space policy: what it matches is never
+    /// chosen, though the disk is low and the file unused for a year, and
+    /// though the agent hasn't set its pin yet (the index only leaves out
+    /// files already pinned).
+    #[test]
+    fn a_pin_rule_keeps_files_whatever_the_policy() {
+        let mut s = store(&[file(10, 400), file(11, 400), file(12, 400)]);
+        let pins = oneup_rules::PinSet::new(&["/f11", "*12"]);
+        let kept = |p: &str| pins.pins(p, false);
+        let space = Space { free_unused_days: 1, free_when_low: true, low_disk_percent: 10 };
+        let disk = Disk { free: 1, total: 1_000_000 };
+        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &kept).unwrap();
+        assert_eq!(freed(&sel), vec![10]);
     }
 }
