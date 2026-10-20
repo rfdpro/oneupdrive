@@ -37,7 +37,7 @@ oneup --data-dir … rules --unpin "*.psd"
 * Matching files show **Always keep on this device** in File Explorer and download a share at a time: downloads stop when you pause, and leave at least 1 GB (or the low-disk share below) free.
 * If the rules want to download more than 1 GB beyond what you agreed to (files that keep arriving, say), they wait: **Exclude** shows **Waiting to download** with **Download**, and `oneup rules --allow-downloads` does the same.
 * A pin rule wins over freeing space: the automatic policies below skip them, choosing **Free up space** in File Explorer on one is undone, and `oneup free` refuses one (remove the rule first). `oneup explain` says so for the file.
-* Removing a rule sets what it pinned back to the default: the files stay on this PC until something frees them. Files you had set to **Always keep on this device** yourself stay that way.
+* Removing a rule sets what it pinned back to the default: the files stay on this PC until something frees them. Files you had set to **Always keep on this device** yourself stay that way, also inside a folder a rule keeps. Moving a file or folder out of a rule's place does the same for what the rule pinned; moving one in pins it and everything in it.
 * `oneup explain PATH` names the pin rule keeping a file.
 
 ## Freeing space by itself

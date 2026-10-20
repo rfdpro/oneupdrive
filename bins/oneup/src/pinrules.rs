@@ -60,11 +60,16 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use oneup_exec::placement::Stop;
 use oneup_rules::{ENGINE_DIR, PinSet};
+use oneup_store::pins::PinOp;
 use oneup_store::{LocalKind, LocalRow, Skip, Store};
 use serde_json::{Value, json};
 
-/// The fingerprint of the pin rules last applied in full.
-pub const KEY_APPLIED: &str = "pins.applied";
+/// The fingerprint of the pin rules last applied in full (a rescan of the
+/// folder forgets it, `oneup_store::pins`).
+pub const KEY_APPLIED: &str = oneup_store::pins::KEY_APPLIED;
+/// A walk of a moved folder under way ([`Walk`], as JSON; its fingerprint
+/// is the folder's ID).
+const KEY_SUBWALK: &str = "pins.subwalk";
 /// The last activity-log entry looked at.
 pub const KEY_SEQ: &str = "pins.seq";
 /// A walk under way ([`Walk`], as JSON).
@@ -78,6 +83,8 @@ pub const KEY_BUDGET: &str = "pins.budget";
 pub const KEY_APPROVE: &str = "pins.approve";
 /// The download the agent stopped at, waiting for a go-ahead: its bytes.
 pub const KEY_WAITING: &str = "pins.waiting";
+/// Budget reserved for the downloads under way: `id:size,…`.
+pub const KEY_RESERVED: &str = "pins.reserved";
 /// Queued items whose pin was lost, looked at per pass.
 const CHANGED: usize = 256;
 /// Activity entries looked at per pass; more wait for the next one.
@@ -198,7 +205,7 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
     let fp = pins.fingerprint();
     take_approval(store, &fp)?;
     retry(store, pinner, pins, now_ms, &mut pass)?;
-    repin(store, pinner, pins, &mut pass)?;
+    repin(store, pinner, pins, now_ms, &mut pass)?;
 
     let last = store.read(|o| o.activity_last_seq())?;
     let seen: Option<i64> = store.read(|o| o.meta_get(KEY_SEQ))?.and_then(|s| s.parse().ok());
@@ -215,7 +222,7 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
     if applied.as_deref() != Some(fp.as_str()) {
         let walk = store.read(|o| o.meta_get(KEY_WALK))?.and_then(|t| Walk::from_json(&t));
         // No rules, and none of theirs to undo: nothing to walk for.
-        if pins.is_empty() && walk.is_none() && store.read(|o| o.pin_owned_page(None, 1))?.is_empty() {
+        if pins.is_empty() && walk.is_none() && store.write(|o| o.pins_rebind())? == 0 && no_owned(store)? {
             store.write(|o| {
                 o.meta_set(KEY_APPLIED, &fp)?;
                 o.meta_set(KEY_SEQ, &last.to_string())
@@ -234,8 +241,10 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
                     owned: Some(None),
                     stack: vec![Frame { id: r.root_file_id, rel: String::new(), after: None }],
                 };
-                // Under way, saved: the reasons to walk again are settled.
+                // Under way, saved: the reasons to walk again are settled,
+                // and what a rescan set aside is the rules' again.
                 store.write(|o| {
+                    o.pins_rebind()?;
                     o.meta_set(KEY_WALK, &w.to_json())?;
                     o.meta_delete(KEY_REWALK)?;
                     o.meta_delete(KEY_APPLIED)?;
@@ -261,22 +270,13 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
                     store.write(|o| o.pin_owned_remove(id))?;
                     continue;
                 };
-                if pins.pins(&rel, row.kind != LocalKind::File) {
-                    continue;
+                if !pins.pins(&rel, row.kind != LocalKind::File) {
+                    unpin(store, pinner, &row, &rel, now_ms, &mut pass)?;
                 }
-                if row.attributes & PINNED == 0 {
-                    // Not pinned any more (the user chose otherwise): not ours.
-                    store.write(|o| o.pin_owned_remove(id))?;
-                } else if pinner.set(&rel, Change::Unpin).is_ok() {
-                    store.write(|o| o.pin_owned_remove(id))?;
-                    pass.unpinned += 1;
-                }
-                // A failure keeps the note: the next change of rules
-                // looks at it again.
             }
             w.owned = Some(Some(end));
             if out_of_time() {
-                return save_walk(store, &w, pass);
+                return save_walk(store, KEY_WALK, &w, pass);
             }
         }
         // The tree, depth first, a page of one folder at a time (nothing to
@@ -284,33 +284,8 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
         if pins.is_empty() {
             w.stack.clear();
         }
-        while let Some(top) = w.stack.last().cloned() {
-            let page = store.read(|o| o.local_children_page(top.id, top.after, PAGE))?;
-            if page.is_empty() {
-                w.stack.pop();
-                continue;
-            }
-            let mut down = None;
-            for c in page {
-                if let Some(f) = w.stack.last_mut() {
-                    f.after = Some(c.file_id);
-                }
-                if top.rel.is_empty() && oneup_sync::same_name(&c.name, ENGINE_DIR) {
-                    continue;
-                }
-                let rel = if top.rel.is_empty() { c.name.clone() } else { format!("{}/{}", top.rel, c.name) };
-                visit(store, pinner, &c, &rel, pins, now_ms, &mut pass)?;
-                if c.kind == LocalKind::Folder && c.skip == Skip::None {
-                    down = Some(Frame { id: c.file_id, rel, after: None });
-                    break;
-                }
-            }
-            if let Some(f) = down {
-                w.stack.push(f);
-            }
-            if out_of_time() && !w.stack.is_empty() {
-                return save_walk(store, &w, pass);
-            }
+        if !walk_tree(store, pinner, pins, &mut w, last, now_ms, &out_of_time, &mut pass)? {
+            return save_walk(store, KEY_WALK, &w, pass);
         }
         let seq = w.seq;
         store.write(|o| {
@@ -321,9 +296,14 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
         pass.more = true; // the entries since the walk began
         return Ok(pass);
     }
+    // Folders moved since: their contents at the new place.
+    if !moved_folders(store, pinner, pins, last, now_ms, &out_of_time, &mut pass)? {
+        pass.more = true;
+        return Ok(pass);
+    }
     // The rules are applied: only what changed since.
     let seen = seen.unwrap_or(last);
-    if pins.is_empty() {
+    if pins.is_empty() && no_owned(store)? {
         if seen != last {
             store.write(|o| o.meta_set(KEY_SEQ, &last.to_string()))?;
         }
@@ -338,7 +318,12 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
         for p in std::iter::once(path.as_str()).chain(moved_to(detail)) {
             let rel = crate::filetree::clean(p);
             if let Some(row) = store.read(|o| row_at(o, r.root_file_id, &rel))? {
-                visit(store, pinner, &row, &rel, pins, now_ms, &mut pass)?;
+                reconcile(store, pinner, &row, &rel, pins, Some(*seq), last, now_ms, &mut pass)?;
+                // A folder moved: everything in it, at its new place.
+                if moved_to(detail).is_some() && row.kind == LocalKind::Folder {
+                    store.write(|o| o.pin_subtree_add(row.file_id))?;
+                    pass.more = true;
+                }
             }
         }
         if out_of_time() {
@@ -346,22 +331,120 @@ pub fn apply(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, budget: 
             break;
         }
     }
-    pass.more = cut || entries.len() == PER_PASS;
+    pass.more |= cut || entries.len() == PER_PASS;
     if upto != seen {
         store.write(|o| o.meta_set(KEY_SEQ, &upto.to_string()))?;
     }
     Ok(pass)
 }
 
-fn save_walk(store: &mut Store, w: &Walk, mut pass: Pass) -> Result<Pass> {
-    store.write(|o| o.meta_set(KEY_WALK, &w.to_json()))?;
+fn no_owned(store: &Store) -> Result<bool> {
+    Ok(store.read(|o| o.pin_owned_page(None, 1))?.is_empty())
+}
+
+fn save_walk(store: &mut Store, key: &str, w: &Walk, mut pass: Pass) -> Result<Pass> {
+    store.write(|o| o.meta_set(key, &w.to_json()))?;
     pass.more = true;
     Ok(pass)
 }
 
-/// Tries again the pins that couldn't be set before, those that are due.
+/// Walks `w`'s stack depth first, a page of one folder at a time,
+/// reconciling each item with the rules. `false`: out of time (the walk
+/// holds where it is).
+#[allow(clippy::too_many_arguments)]
+fn walk_tree(
+    store: &mut Store,
+    pinner: &mut dyn Pinner,
+    pins: &PinSet,
+    w: &mut Walk,
+    last: i64,
+    now_ms: i64,
+    out_of_time: &dyn Fn() -> bool,
+    pass: &mut Pass,
+) -> Result<bool> {
+    while let Some(top) = w.stack.last().cloned() {
+        let page = store.read(|o| o.local_children_page(top.id, top.after, PAGE))?;
+        if page.is_empty() {
+            w.stack.pop();
+            continue;
+        }
+        let mut down = None;
+        for c in page {
+            if let Some(f) = w.stack.last_mut() {
+                f.after = Some(c.file_id);
+            }
+            if top.rel.is_empty() && oneup_sync::same_name(&c.name, ENGINE_DIR) {
+                continue;
+            }
+            let rel = if top.rel.is_empty() { c.name.clone() } else { format!("{}/{}", top.rel, c.name) };
+            reconcile(store, pinner, &c, &rel, pins, None, last, now_ms, pass)?;
+            if c.kind == LocalKind::Folder && c.skip == Skip::None {
+                down = Some(Frame { id: c.file_id, rel, after: None });
+                break;
+            }
+        }
+        if let Some(f) = down {
+            w.stack.push(f);
+        }
+        if out_of_time() && !w.stack.is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Checks the contents of the folders moved since against the rules at
+/// their new place (`pin_subtree`), one at a time, a walk saved between
+/// passes. `false`: out of time.
+fn moved_folders(
+    store: &mut Store,
+    pinner: &mut dyn Pinner,
+    pins: &PinSet,
+    last: i64,
+    now_ms: i64,
+    out_of_time: &dyn Fn() -> bool,
+    pass: &mut Pass,
+) -> Result<bool> {
+    loop {
+        let mut w = match store.read(|o| o.meta_get(KEY_SUBWALK))?.and_then(|t| Walk::from_json(&t)) {
+            Some(w) => w,
+            None => {
+                let Some(id) = store.read(|o| o.pin_subtree_next())? else { return Ok(true) };
+                let rel = store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p));
+                let Some(rel) = rel else {
+                    store.write(|o| o.pin_subtree_done(id))?;
+                    continue;
+                };
+                let w = Walk {
+                    fingerprint: id.to_string(),
+                    seq: last,
+                    owned: None,
+                    stack: vec![Frame { id, rel, after: None }],
+                };
+                store.write(|o| o.meta_set(KEY_SUBWALK, &w.to_json()))?;
+                w
+            }
+        };
+        if !walk_tree(store, pinner, pins, &mut w, last, now_ms, out_of_time, pass)? {
+            store.write(|o| o.meta_set(KEY_SUBWALK, &w.to_json()))?;
+            return Ok(false);
+        }
+        let id: u128 = w.fingerprint.parse().unwrap_or(0);
+        store.write(|o| {
+            o.pin_subtree_done(id)?;
+            o.meta_delete(KEY_SUBWALK)
+        })?;
+        if out_of_time() {
+            return Ok(false);
+        }
+    }
+}
+
+/// Tries again what couldn't be set before, those due: pins the rules
+/// still want, and unpins of the rules' own items they no longer match.
 fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64, pass: &mut Pass) -> Result<()> {
-    for (id, tries) in store.read(|o| o.pin_retry_due(now_ms, RETRIES))? {
+    let last = store.read(|o| o.activity_last_seq())?;
+    for (id, op, tries) in store.read(|o| o.pin_retry_due(now_ms, RETRIES))? {
         let row = store.read(|o| o.local_get(id))?;
         let rel = match &row {
             Some(_) => store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p)),
@@ -371,20 +454,39 @@ fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
             store.write(|o| o.pin_retry_remove(id))?;
             continue;
         };
-        if !pins.pins(&rel, row.kind != LocalKind::File) || row.attributes & PINNED != 0 {
-            store.write(|o| o.pin_retry_remove(id))?;
-            continue;
-        }
-        match pinner.set(&rel, Change::Pin) {
-            Ok(()) => {
+        let matches = pins.pins(&rel, row.kind != LocalKind::File);
+        let pinned = row.attributes & PINNED != 0;
+        let owned = store.read(|o| o.pin_owned_has(id))?;
+        let change = match op {
+            PinOp::Pin if matches && !pinned => Change::Pin,
+            PinOp::Unpin if !matches && owned && pinned => Change::Unpin,
+            _ => {
+                // Settled meanwhile (an unpin no longer wanted keeps the note).
                 store.write(|o| {
-                    o.pin_owned_add(id)?;
+                    if op == PinOp::Unpin && !matches && !pinned {
+                        o.pin_owned_remove(id)?;
+                    }
                     o.pin_retry_remove(id)
                 })?;
-                pass.pinned += 1;
+                continue;
+            }
+        };
+        match pinner.set(&rel, change) {
+            Ok(()) => {
+                store.write(|o| {
+                    match change {
+                        Change::Pin => o.pin_owned_add(id, last)?,
+                        Change::Unpin => o.pin_owned_remove(id)?,
+                    }
+                    o.pin_retry_remove(id)
+                })?;
+                match change {
+                    Change::Pin => pass.pinned += 1,
+                    Change::Unpin => pass.unpinned += 1,
+                }
             }
             Err(_) => {
-                store.write(|o| o.pin_retry_put(id, tries + 1, now_ms + back_off_ms(tries)).map(|_| ()))?;
+                store.write(|o| o.pin_retry_put(id, op, tries + 1, now_ms + back_off_ms(tries)).map(|_| ()))?;
                 pass.waiting += 1;
             }
         }
@@ -394,26 +496,42 @@ fn retry(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
 
 /// Pins again the items a rule keeps that lost their pin since (queued by
 /// the store from the journal's attribute changes); one no rule keeps any
-/// more isn't the rules' any more.
-fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, pass: &mut Pass) -> Result<()> {
-    for id in store.write(|o| o.pin_changed_take(CHANGED))? {
+/// more isn't the rules' any more. A queued item leaves the queue only
+/// once pinned, handed to `pin_retry`, or needing nothing.
+fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64, pass: &mut Pass) -> Result<()> {
+    for id in store.read(|o| o.pin_changed_page(CHANGED))? {
         let row = store.read(|o| o.local_get(id))?;
         let rel = match &row {
             Some(_) => store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p)),
             None => None,
         };
-        let (Some(row), Some(rel)) = (row, rel) else { continue };
+        let (Some(row), Some(rel)) = (row, rel) else {
+            store.write(|o| o.pin_changed_done(id))?;
+            continue;
+        };
         if !pins.pins(&rel, row.kind != LocalKind::File) {
-            store.write(|o| o.pin_owned_remove(id))?;
+            store.write(|o| {
+                o.pin_owned_remove(id)?;
+                o.pin_changed_done(id)
+            })?;
             continue;
         }
         if row.attributes & PINNED != 0 {
+            store.write(|o| o.pin_changed_done(id))?;
             continue;
         }
         if pinner.set(&rel, Change::Pin).is_ok() {
+            store.write(|o| o.pin_changed_done(id))?;
             pass.repinned += 1;
         } else {
-            store.write(|o| o.pin_retry_put(id, 1, 0).map(|_| ()))?;
+            // Handed to the retries, durably, before it leaves the queue;
+            // with those full it stays queued for the next pass.
+            store.write(|o| {
+                if o.pin_retry_put(id, PinOp::Pin, 1, now_ms + back_off_ms(0))? {
+                    o.pin_changed_done(id)?;
+                }
+                Ok(())
+            })?;
             pass.waiting += 1;
         }
     }
@@ -469,10 +587,64 @@ pub fn within_budget(budget: i64, size: u64) -> bool {
     budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX)) >= -i64::try_from(ASK_BYTES).unwrap_or(i64::MAX)
 }
 
-/// Spends `bytes` of the rules' budget (what they downloaded).
-pub fn spend(store: &mut Store, bytes: u64) -> Result<()> {
-    let b = budget(store)?.saturating_sub(i64::try_from(bytes).unwrap_or(i64::MAX));
-    store.write(|o| o.meta_set(KEY_BUDGET, &b.to_string()))?;
+/// Reserves budget, durably and before any download, for the rules' own
+/// files among `candidates` (file ID, size, whether the rules' own), in
+/// the order they'd be fetched, while the budget allows: one transaction
+/// takes their sizes off it and records them in `meta` [`KEY_RESERVED`].
+/// Returns the reserved IDs and the first of the rules' files it couldn't
+/// reserve (the download that needs a go-ahead), if any. A crash before
+/// [`settle`] can't let an approval be used twice: the bytes are already
+/// off the budget.
+pub fn reserve_budget(store: &mut Store, candidates: &[(u128, u64, bool)]) -> Result<Reserved> {
+    store
+        .write(|o| {
+            let mut b: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+            let mut taken = Vec::new();
+            let mut blocked = None;
+            for &(id, size, owned) in candidates {
+                if !owned {
+                    continue;
+                }
+                if !within_budget(b, size) {
+                    blocked = Some((id, size));
+                    break;
+                }
+                b = b.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
+                taken.push((id, size));
+            }
+            if !taken.is_empty() {
+                let list = taken.iter().map(|(id, size)| format!("{id}:{size}")).collect::<Vec<_>>().join(",");
+                o.meta_set(KEY_BUDGET, &b.to_string())?;
+                o.meta_set(KEY_RESERVED, &list)?;
+            }
+            Ok((taken.into_iter().map(|(id, _)| id).collect(), blocked))
+        })
+        .map_err(Into::into)
+}
+
+/// What [`reserve_budget`] reserved: the file IDs, and the first of the
+/// rules' files it couldn't (ID, size).
+pub type Reserved = (std::collections::HashSet<u128>, Option<(u128, u64)>);
+
+/// Settles the reservation [`reserve_budget`] made: files in `done`, or that
+/// `hydrated` says are on this PC by now (downloaded before a crash), stay
+/// spent; the rest go back to the budget. Run after each pass and, for a
+/// reservation a crash left, before the next.
+pub fn settle(store: &mut Store, done: &[u128], hydrated: &dyn Fn(u128) -> bool) -> Result<()> {
+    let Some(list) = store.read(|o| o.meta_get(KEY_RESERVED))? else { return Ok(()) };
+    let mut back: i64 = 0;
+    for item in list.split(',').filter(|i| !i.is_empty()) {
+        let Some((id, size)) = item.split_once(':') else { continue };
+        let (Ok(id), Ok(size)) = (id.parse::<u128>(), size.parse::<i64>()) else { continue };
+        if !done.contains(&id) && !hydrated(id) {
+            back = back.saturating_add(size);
+        }
+    }
+    store.write(|o| {
+        let b: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        o.meta_set(KEY_BUDGET, &b.saturating_add(back).to_string())?;
+        o.meta_delete(KEY_RESERVED)
+    })?;
     Ok(())
 }
 
@@ -512,50 +684,124 @@ pub fn row_at(o: &oneup_store::Ops<'_>, root: u128, rel: &str) -> oneup_store::R
     Ok(row)
 }
 
-/// Pins one item if the rules match it and it isn't pinned yet, noting it
-/// as the rules' own; one whose pin can't be set now waits for a retry.
-fn visit(
+/// Brings one item in line with the rules: pinned if they match it and it
+/// isn't (noted as theirs); if they don't and it's theirs, back to the
+/// default. A placeholder already pinned that the rules match counts as
+/// theirs only if it took the pin from a folder they pinned, after it
+/// (`entry` is the activity entry that named it, later than the folder's
+/// note); one pinned before is the user's. What can't be set now waits in
+/// `pin_retry`, with its operation.
+#[allow(clippy::too_many_arguments)]
+fn reconcile(
     store: &mut Store,
     pinner: &mut dyn Pinner,
     row: &LocalRow,
     rel: &str,
     pins: &PinSet,
+    entry: Option<i64>,
+    last: i64,
     now_ms: i64,
     pass: &mut Pass,
 ) -> Result<()> {
-    if !matches!(row.kind, LocalKind::File | LocalKind::Folder) || !pins.pins(rel, row.kind != LocalKind::File) {
+    if !matches!(row.kind, LocalKind::File | LocalKind::Folder) {
         return Ok(());
     }
     let id = row.file_id;
-    if row.attributes & PINNED != 0 {
-        // Pinned already: the rule's too if it took the pin from a folder
-        // the rule pinned (Windows gives a new placeholder its folder's
-        // pin), so removing the rule undoes it; otherwise the user's.
+    let pinned = row.attributes & PINNED != 0;
+    if !pins.pins(rel, row.kind != LocalKind::File) {
+        if store.read(|o| o.pin_owned_has(id))? {
+            unpin(store, pinner, row, rel, now_ms, pass)?;
+        }
+        return Ok(());
+    }
+    if pinned {
+        let Some(seq) = entry else {
+            // Found pinned by a walk (the rules looking at it for the first
+            // time, or a folder's contents after its pin): the user's, unless
+            // it's the rules' already.
+            store.write(|o| if o.pin_owned_has(id)? { Ok(()) } else { o.pin_user_add(id) })?;
+            return Ok(());
+        };
+        // Named by the activity log after its folder took a rule's pin, and
+        // not found pinned before by a walk of that folder: it took the pin
+        // from the folder, so it's the rules'. While the folder's walk is
+        // still due, it waits for that walk instead.
         let inherited = match row.parent_id {
-            Some(p) => store.read(|o| Ok(o.pin_owned_has(p)? && !o.pin_owned_has(id)?))?,
+            Some(p) => store.read(|o| {
+                Ok(o.pin_owned_at(p)?.is_some_and(|at| at < seq)
+                    && !o.pin_subtree_has(p)?
+                    && !o.pin_user_has(id)?
+                    && !o.pin_owned_has(id)?)
+            })?,
             None => false,
         };
         if inherited {
-            store.write(|o| o.pin_owned_add(id))?;
+            store.write(|o| o.pin_owned_add(id, seq))?;
         }
         return Ok(());
     }
     match pinner.set(rel, Change::Pin) {
         Ok(()) => {
             store.write(|o| {
-                o.pin_owned_add(id)?;
-                o.pin_retry_remove(id)
+                o.pin_owned_add(id, last)?;
+                o.pin_retry_remove(id)?;
+                // A folder pinned from a change (not a walk): what's in it
+                // is looked at by a walk of its own, which also tells the
+                // user's pins in it from those it will pass on.
+                if entry.is_some() && row.kind == LocalKind::Folder {
+                    o.pin_subtree_add(id)?;
+                }
+                Ok(())
             })?;
             pass.pinned += 1;
         }
         Err(e) => {
             tracing::debug!(error = %e, "a pin rule's item couldn't be pinned now; tried again later");
-            let kept = store.write(|o| o.pin_retry_put(id, 1, now_ms + back_off_ms(0)))?;
-            if !kept {
-                store.write(|o| o.meta_set(KEY_REWALK, "1"))?;
-            }
+            wait(store, id, PinOp::Pin, now_ms)?;
             pass.waiting += 1;
         }
+    }
+    Ok(())
+}
+
+/// Sets one of the rules' own items (that they no longer match) back to the
+/// default; a failure waits in `pin_retry` as an unpin, keeping the note.
+fn unpin(
+    store: &mut Store,
+    pinner: &mut dyn Pinner,
+    row: &LocalRow,
+    rel: &str,
+    now_ms: i64,
+    pass: &mut Pass,
+) -> Result<()> {
+    let id = row.file_id;
+    if row.attributes & PINNED == 0 {
+        // Not pinned any more (the user chose otherwise): not theirs.
+        store.write(|o| o.pin_owned_remove(id))?;
+        return Ok(());
+    }
+    match pinner.set(rel, Change::Unpin) {
+        Ok(()) => {
+            store.write(|o| {
+                o.pin_owned_remove(id)?;
+                o.pin_retry_remove(id)
+            })?;
+            pass.unpinned += 1;
+        }
+        Err(_) => {
+            wait(store, id, PinOp::Unpin, now_ms)?;
+            pass.waiting += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Puts `op` on `id` in the retries; with them full, another walk follows
+/// as soon as they have room.
+fn wait(store: &mut Store, id: u128, op: PinOp, now_ms: i64) -> Result<()> {
+    let kept = store.write(|o| o.pin_retry_put(id, op, 1, now_ms + back_off_ms(0)))?;
+    if !kept {
+        store.write(|o| o.meta_set(KEY_REWALK, "1"))?;
     }
     Ok(())
 }
@@ -566,7 +812,8 @@ pub fn pin_back(store: &mut Store, pinner: &mut dyn Pinner, id: u128, rel: &str)
     if pinner.set(rel, Change::Pin).is_err() {
         return Ok(false);
     }
-    store.write(|o| o.pin_owned_add(id))?;
+    let last = store.read(|o| o.activity_last_seq())?;
+    store.write(|o| o.pin_owned_add(id, last))?;
     Ok(true)
 }
 
@@ -688,6 +935,7 @@ pub fn free_space(root: &Path) -> Option<u64> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use oneup_store::pins::PinOp;
     use oneup_store::{ActivityEntry, ActivityOutcome, LocalRoot};
 
     /// Pins in memory: which paths are pinned, and which fail.
@@ -933,7 +1181,7 @@ mod tests {
         // The items in the table keep failing for good; the two left out
         // could be pinned now. One file in the table goes: room again.
         let waiting: Vec<u128> =
-            s.read(|o| o.pin_retry_due(i64::MAX, max as usize)).unwrap().into_iter().map(|(id, _)| id).collect();
+            s.read(|o| o.pin_retry_due(i64::MAX, max as usize)).unwrap().into_iter().map(|(id, _, _)| id).collect();
         let left_out: Vec<String> =
             rows.iter().filter(|r| !waiting.contains(&r.file_id)).map(|r| r.name.clone()).collect();
         assert_eq!(left_out.len(), 2);
@@ -983,15 +1231,210 @@ mod tests {
         assert_eq!(budget(&s).unwrap(), 0);
         take_approval(&mut s, &a.fingerprint()).unwrap();
         assert_eq!(budget(&s).unwrap(), 100);
-        spend(&mut s, 100).unwrap();
+        let spend = |s: &mut Store, bytes: u64| {
+            reserve_budget(s, &[(9, bytes, true)]).unwrap();
+            settle(s, &[9], &|_| false).unwrap();
+        };
+        spend(&mut s, 100);
         assert!(within_budget(budget(&s).unwrap(), ASK_BYTES), "a gibibyte past it");
-        spend(&mut s, ASK_BYTES).unwrap();
+        spend(&mut s, ASK_BYTES);
         // Another small change of rules (a hand edit) doesn't start over.
         assert!(!within_budget(budget(&s).unwrap(), 1), "asks now");
         wait_for_go_ahead(&mut s, 7).unwrap();
         assert_eq!(waiting(&s).unwrap(), Some(7));
         allow(&mut s, 0).unwrap();
         assert!(within_budget(budget(&s).unwrap(), 7) && waiting(&s).unwrap().is_none());
+    }
+
+    /// Budget is reserved, durably, before a download: a crash between the
+    /// download and its settling can't let an approval be used twice. What
+    /// wasn't downloaded comes back; what is on this PC by now (downloaded
+    /// before the crash) stays spent.
+    #[test]
+    fn budget_is_reserved_before_downloading_and_settled_after_a_crash() {
+        let mut s = store(&[]);
+        approve(&mut s, &PinSet::new(&["*.psd"]).fingerprint(), 100).unwrap();
+        take_approval(&mut s, &PinSet::new(&["*.psd"]).fingerprint()).unwrap();
+        let (got, blocked) = reserve_budget(&mut s, &[(1, 60, true), (2, 5, false), (3, 30, true)]).unwrap();
+        assert_eq!((got.len(), blocked), (2, None));
+        assert_eq!(budget(&s).unwrap(), 10, "off before any download");
+        // A crash: no settling. The next pass settles first: 1 is on this
+        // PC by now, 3 isn't.
+        settle(&mut s, &[], &|id| id == 1).unwrap();
+        assert_eq!(budget(&s).unwrap(), 40, "only 3's bytes back");
+        assert!(s.read(|o| o.meta_get(KEY_RESERVED)).unwrap().is_none());
+        // Past the budget by more than ASK_BYTES: the first that doesn't fit.
+        let (got, blocked) = reserve_budget(&mut s, &[(4, ASK_BYTES, true), (5, 100, true)]).unwrap();
+        assert_eq!((got.len(), blocked), (1, Some((5, 100))));
+    }
+
+    /// A rescan of the folder (the change journal lost) deletes every Local
+    /// row and so the rules' notes; the rules are applied again and the
+    /// notes put back, so removing the rule later still unpins its items.
+    #[test]
+    fn a_rescan_keeps_the_rules_pins_theirs() {
+        let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "a.psd")]);
+        // The rescan.
+        s.write(|o| {
+            let root = LocalRow { parent_id: None, ..row(1, 0, "", LocalKind::Root, 0x10) };
+            let info = LocalRoot {
+                path: r"C:\Sync".into(),
+                volume_serial: 1,
+                root_file_id: 1,
+                rules: String::new(),
+                journal: None,
+                started_at_ms: 0,
+                finished_at_ms: Some(0),
+                sync_root_provider: None,
+            };
+            o.local_begin(&info, &root)?;
+            o.local_put(&row(2, 1, "a.psd", LocalKind::File, RECALL | PINNED)).map(|_| ())
+        })
+        .unwrap();
+        fake.set.clear();
+        run(&mut s, &mut fake, &pins, 0);
+        assert!(s.read(|o| o.pin_owned_has(2)).unwrap(), "the rule's again");
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.unpinned, 1);
+        assert_eq!(fake.set, [("a.psd".to_string(), Change::Unpin)]);
+    }
+
+    fn moved(from: &str, to: &str) -> ActivityEntry {
+        ActivityEntry { action: "move".into(), detail: format!("-> {to}"), ..entry(from) }
+    }
+
+    /// A folder moved out of a rule's place takes its contents along: the
+    /// rule's pins in it are undone; moved in, its contents are pinned. A
+    /// file the rule pinned moved out is unpinned.
+    #[test]
+    fn moves_bring_whole_folders_in_line_with_the_rules() {
+        let mut s = store(&[
+            row(2, 1, "Work", LocalKind::Folder, 0x10),
+            row(3, 2, "a.txt", LocalKind::File, RECALL),
+            row(4, 1, "Other", LocalKind::Folder, 0x10),
+            row(5, 4, "b.txt", LocalKind::File, RECALL),
+            row(6, 2, "c.txt", LocalKind::File, RECALL),
+        ]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["/Work/"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "Work"), (3, "Work/a.txt"), (6, "Work/c.txt")]);
+        // Work is renamed Old (out of the rule); Other is renamed Work
+        // happens later. And c.txt moves out of Work first.
+        let rename = |s: &mut Store, id: u128, parent: u128, name: &str| {
+            s.write(|o| {
+                let mut r = o.local_get(id)?.unwrap();
+                r.name = name.into();
+                r.parent_id = Some(parent);
+                o.local_update(&r)
+            })
+            .unwrap();
+        };
+        rename(&mut s, 6, 1, "c.txt");
+        s.write(|o| o.activity_add(&[moved("/Work/c.txt", "/c.txt")])).unwrap();
+        rename(&mut s, 2, 1, "Old");
+        s.write(|o| o.activity_add(&[moved("/Work", "/Old")])).unwrap();
+        fake.set.clear();
+        run(&mut s, &mut fake, &pins, 0);
+        let mut got = fake.set.clone();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            [
+                ("Old".to_string(), Change::Unpin),
+                ("Old/a.txt".to_string(), Change::Unpin),
+                ("c.txt".to_string(), Change::Unpin),
+            ]
+        );
+        observe(&mut s, &fake, &[(2, "Old"), (3, "Old/a.txt"), (6, "c.txt")]);
+        // Other becomes Work: it and what's in it are pinned.
+        rename(&mut s, 4, 1, "Work");
+        s.write(|o| o.activity_add(&[moved("/Other", "/Work")])).unwrap();
+        fake.set.clear();
+        run(&mut s, &mut fake, &pins, 0);
+        let mut got = fake.set.clone();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got, [("Work".to_string(), Change::Pin), ("Work/b.txt".to_string(), Change::Pin)]);
+    }
+
+    /// A file the user pinned in a folder before a rule pinned the folder
+    /// stays the user's, whatever the activity log says of it later: only
+    /// what came after takes the folder's pin as the rule's.
+    #[test]
+    fn a_pin_from_before_the_folders_stays_the_users() {
+        let mut s = store(&[
+            row(2, 1, "Work", LocalKind::Folder, 0x10),
+            row(3, 2, "mine.txt", LocalKind::File, PINNED),
+            row(4, 2, "other.txt", LocalKind::File, RECALL),
+        ]);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["/Work/"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "Work"), (4, "Work/other.txt")]);
+        // mine.txt is edited and uploaded: the log names it.
+        s.write(|o| o.activity_add(&[entry("/Work/mine.txt")])).unwrap();
+        run(&mut s, &mut fake, &pins, 0);
+        assert!(!s.read(|o| o.pin_owned_has(3)).unwrap(), "the user's");
+        fake.set.clear();
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(!fake.set.iter().any(|(r, _)| r == "Work/mine.txt"), "{:?}", fake.set);
+    }
+
+    /// An unpin that fails now waits as an unpin and is done later; the
+    /// rules count as applied meanwhile.
+    #[test]
+    fn an_unpin_that_fails_is_tried_again() {
+        let mut s = store(&[row(2, 1, "a.psd", LocalKind::File, RECALL)]);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
+        observe(&mut s, &fake, &[(2, "a.psd")]);
+        fake.failing = vec!["a.psd".into()];
+        let none = PinSet::new::<&str>(&[]);
+        let p = run(&mut s, &mut fake, &none, 0);
+        assert_eq!((p.unpinned, p.waiting), (0, 1));
+        assert_eq!(s.read(|o| o.pin_retry_due(i64::MAX, 10)).unwrap(), [(2, PinOp::Unpin, 1)]);
+        assert!(s.read(|o| o.pin_owned_has(2)).unwrap(), "still the rule's");
+        fake.failing.clear();
+        fake.set.clear();
+        let p = run(&mut s, &mut fake, &none, back_off_ms(0));
+        assert_eq!(p.unpinned, 1);
+        assert_eq!(fake.set, [("a.psd".to_string(), Change::Unpin)]);
+        assert!(!s.read(|o| o.pin_owned_has(2)).unwrap());
+    }
+
+    /// A queued "Free up space" leaves the queue only once pinned again or
+    /// handed to the retries: with those full and the pin failing, it stays.
+    #[test]
+    fn a_lost_pin_stays_queued_until_it_is_handled() {
+        let max = oneup_store::pins::PIN_RETRY_MAX as u128;
+        let mut rows: Vec<LocalRow> =
+            (0..max).map(|i| row(100 + i, 1, &format!("x{i}.bin"), LocalKind::File, 0)).collect();
+        rows.push(row(2, 1, "a.psd", LocalKind::File, RECALL));
+        let mut s = store(&rows);
+        let mut fake = Fake::default();
+        let pins = PinSet::new(&["*.psd"]);
+        run(&mut s, &mut fake, &pins, 0);
+        observe(&mut s, &fake, &[(2, "a.psd")]);
+        s.write(|o| {
+            for i in 0..max {
+                assert!(o.pin_retry_put(100 + i, PinOp::Pin, 1, i64::MAX)?);
+            }
+            let mut r = o.local_get(2)?.unwrap();
+            r.attributes &= !PINNED;
+            o.local_update(&r)
+        })
+        .unwrap();
+        fake.failing = vec!["a.psd".into()];
+        apply(&mut s, &mut fake, &pins, Duration::from_secs(60), 0).unwrap();
+        assert_eq!(s.read(|o| o.pin_changed_page(10)).unwrap(), [2], "still queued");
+        fake.failing.clear();
+        let p = apply(&mut s, &mut fake, &pins, Duration::from_secs(60), 0).unwrap();
+        assert_eq!(p.repinned, 1);
+        assert!(s.read(|o| o.pin_changed_page(10)).unwrap().is_empty());
     }
 
     #[test]
