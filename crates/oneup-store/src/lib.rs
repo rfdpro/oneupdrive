@@ -17,8 +17,10 @@
 //! local folder (see [`local`]), and since v4 the **Synced tree** with the
 //! deletion evidence the reconciler relies on (see [`synced`]), and since v5
 //! the marks of folders that need planning again (see [`dirty`]), since
-//! v17 when failed operations are tried again (see [`retry`]), and since
-//! v18 an index of the Remote tree's names for search (see [`search`]).
+//! v17 when failed operations are tried again (see [`retry`]), since v18
+//! an index of the Remote tree's names for search (see [`search`]), and
+//! since v19 the cloud folders by size, for rule suggestions (see
+//! [`choose`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -44,6 +46,8 @@ pub use synced::SyncedStats;
 pub mod dirty;
 pub use dirty::DirtyScope;
 pub mod activity;
+pub mod choose;
+pub use choose::Totals;
 pub mod retry;
 mod rulefile;
 pub mod search;
@@ -100,7 +104,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -652,7 +656,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 18] = [
+    let steps: [(i64, String); 19] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -671,6 +675,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (16, format!("{} {MIGRATE_V16}", synced::MIGRATE_V16)),
         (17, retry::MIGRATE_V17.into()),
         (18, search::MIGRATE_V18.into()),
+        (19, choose::MIGRATE_V19.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
