@@ -135,15 +135,30 @@ pub enum Step {
     /// Put cloud item `remote`, which is `from` now, back into folder and
     /// name `place`, and (files) back to content `content` from its version
     /// history. The version it replaces stays in that history.
-    Reset { remote: RemotePre, from: Spot, place: Option<(RemoteId, String)>, content: Option<(i64, Hash)> },
+    /// `toward`: when `place` is a temporary name on the way (a name held,
+    /// or a cycle broken), the place it's on its way to, which is what the
+    /// approval covers.
+    Reset {
+        remote: RemotePre,
+        from: Spot,
+        place: Option<(RemoteId, String)>,
+        content: Option<(i64, Hash)>,
+        toward: Option<(RemoteId, String)>,
+    },
     /// Delete cloud item `remote`, which is `from` now, into OneDrive's
     /// recycle bin: it was created since. A folder only once it's empty
     /// (its eTag changes as its contents go, so it's read again first).
-    Remove { remote: RemotePre, from: Spot },
+    /// `up`: the folders above it, by ID and name, from its own up to the
+    /// drive's root: it's removed only from where it was shown, so a
+    /// folder above it moved since leaves it alone (its eTag doesn't
+    /// change with a move above it).
+    Remove { remote: RemotePre, from: Spot, up: Vec<(RemoteId, String)> },
     /// Move this PC's copy, changed since the last sync, into the version
     /// store, and forget the item's record, so OneDrive's copy (as the
-    /// rewind leaves it) comes back as a new file.
-    SetAside { local: LocalPre },
+    /// rewind leaves it) comes back as a new file. `at`: where it is, from
+    /// the synced folder (`/a/b.txt`): moved or renamed since (which keeps
+    /// its ID, size and last-write time), it's left alone.
+    SetAside { local: LocalPre, at: String },
     /// Forget the record of an item deleted on this PC and not yet in
     /// OneDrive, so OneDrive's copy comes back as a new file.
     Forget,
@@ -152,7 +167,7 @@ pub enum Step {
     /// the next round deletes OneDrive's copy too, into its recycle bin.
     /// Not part of a rewind: the copy a user answering a conflict doesn't
     /// keep (`oneup_exec::recover::conflict_ops`).
-    Discard { local: LocalPre },
+    Discard { local: LocalPre, at: String },
     /// Not part of a rewind: put the copy kept in version store slot `slot`
     /// back into the synced folder: the item there with file ID and stamp
     /// `item` (as the user chose it), into the folder with file ID `dir`, as
@@ -745,11 +760,20 @@ impl Builder {
         // An edit here would bring it back to OneDrive (a change beats a
         // deletion), so it's set aside.
         if let Local::Changed(pre) = local {
-            self.aside.push((Op::rewind(sid, Step::SetAside { local: pre }), path.to_string()));
+            let Some(at) = local_path(t, pre.id)? else {
+                self.skip(sid, path, Skip::Missing);
+                return Ok(());
+            };
+            self.aside.push((Op::rewind(sid, Step::SetAside { local: pre, at }), path.to_string()));
         }
+        let Some(up) = remote_up(t, r.parent.as_ref())? else {
+            let why = cloud_skip(t, base)?;
+            self.skip(sid, path, why);
+            return Ok(());
+        };
         self.change(sid, Kind::Remove, base.kind, None, Some(path), base.size);
         let pre = RemotePre { id: r.id.clone(), etag: r.etag.clone() };
-        let op = Op::rewind(sid, Step::Remove { remote: pre, from: Spot::of(&r) });
+        let op = Op::rewind(sid, Step::Remove { remote: pre, from: Spot::of(&r), up });
         if base.kind == NodeKind::Folder {
             self.remove_folders.push((depth_of(path), op, path.to_string()));
         } else {
@@ -841,14 +865,18 @@ impl Builder {
             let kind = if content.is_some() { Kind::Revert } else { Kind::MoveBack };
             self.change(sid, kind, base.kind, Some(path_then), Some(path_now), w.size);
             let pre = RemotePre { id: r.id.clone(), etag: r.etag.clone() };
-            let step = Step::Reset { remote: pre, from: Spot::of(&r), place, content };
+            let step = Step::Reset { remote: pre, from: Spot::of(&r), place, content, toward: None };
             self.resets.push((*depth, Op::rewind(sid, step), path_then.clone()));
         }
         match local {
             Local::Changed(pre) => {
+                let Some(at) = local_path(t, pre.id)? else {
+                    self.skip(sid, path_now, Skip::Missing);
+                    return Ok(());
+                };
                 let size = pre.stamp.map_or(0, |s| s.0);
                 self.change(sid, Kind::SetAside, base.kind, Some(path_then), Some(path_now), size);
-                self.aside.push((Op::rewind(sid, Step::SetAside { local: pre }), path_then.clone()));
+                self.aside.push((Op::rewind(sid, Step::SetAside { local: pre, at }), path_then.clone()));
             }
             Local::Deleted => {
                 self.change(sid, Kind::Restore, base.kind, Some(path_then), None, w.size);
@@ -898,10 +926,11 @@ impl Builder {
         }
         for (_, op, _) in &mut self.resets {
             if let Op::Rewind { sid, step } = op
-                && let Step::Reset { from, place: Some((to, name)), .. } = &mut **step
+                && let Step::Reset { from, place: Some((to, name)), toward, .. } = &mut **step
                 && emptied.contains(&(to.clone(), fold(name)))
                 && !(from.parent == *to && is_temporary(&from.name))
             {
+                *toward = Some((to.clone(), name.clone()));
                 *name = temporary(name, *sid);
             }
         }
@@ -993,13 +1022,16 @@ fn order_moves(mut todo: Vec<(Op, String)>, inside: &BTreeSet<RemoteId>) -> Vec<
             };
             let blocked = !free_to_go(&i);
             if let Op::Rewind { sid, step } = &mut todo[i].0
-                && let Step::Reset { from, place, .. } = &mut **step
+                && let Step::Reset { from, place, toward, .. } = &mut **step
                 && !is_temporary(&from.name)
             {
                 let folder = match place {
                     Some((to, _)) if !blocked => to.clone(),
                     _ => from.parent.clone(),
                 };
+                if toward.is_none() {
+                    *toward = place.clone();
+                }
                 *place = Some((folder, temporary(&from.name, *sid)));
                 if let Some(now) = held.iter().find(|(_, j)| **j == i).map(|(s, _)| s.clone()) {
                     held.remove(&now);
@@ -1072,6 +1104,45 @@ fn local_state<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Local, T::Error> {
     let stamp = (b.kind == NodeKind::File).then_some((node.size, node.mtime));
     let same = placed && (b.kind == NodeKind::Folder || (node.size == b.size && node.mtime == b.local_mtime));
     Ok(if same { Local::Settled } else { Local::Changed(LocalPre { id, stamp }) })
+}
+
+/// Where local item `id` is now, from the synced folder (`/a/b.txt`), by
+/// the Local tree. `None`: it isn't there (or is too deep to say).
+fn local_path<T: Trees + ?Sized>(t: &T, id: LocalId) -> Result<Option<String>, T::Error> {
+    let mut parts = Vec::new();
+    let mut cur = id;
+    for _ in 0..4096 {
+        let Seen::Present(n) = t.local(cur)? else { return Ok(None) };
+        let Some(p) = n.parent else {
+            parts.reverse();
+            return Ok(Some(parts.iter().map(|p: &String| format!("/{p}")).collect()));
+        };
+        parts.push(n.name);
+        cur = p;
+    }
+    Ok(None)
+}
+
+/// Cloud folder `dir` and every folder above it, by ID and name, up to and
+/// including the drive's root (its name empty), by the Remote tree. `None`:
+/// one of them isn't there (or the chain is too deep to say).
+fn remote_up<T: Trees + ?Sized>(t: &T, dir: Option<&RemoteId>) -> Result<Option<Vec<(RemoteId, String)>>, T::Error> {
+    let mut out = Vec::new();
+    let Some(mut cur) = dir.cloned() else { return Ok(None) };
+    for _ in 0..4096 {
+        let Seen::Present(n) = t.remote(&cur)? else { return Ok(None) };
+        match n.parent {
+            Some(p) => {
+                out.push((cur, n.name));
+                cur = p;
+            }
+            None => {
+                out.push((cur, String::new()));
+                return Ok(Some(out));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The cloud item of `b` if it's exactly as synced (place and content).
@@ -1153,13 +1224,64 @@ pub fn mark_of(op: &Op) -> Option<(Key, Mark)> {
     let Op::Rewind { sid, step } = op else { return None };
     Some(match &**step {
         Step::Restore { id, .. } => (Key::Cloud(id.clone()), Mark::Absent),
-        Step::Reset { remote, from, .. } | Step::Remove { remote, from } => {
+        Step::Reset { remote, from, .. } | Step::Remove { remote, from, .. } => {
             (Key::Cloud(remote.id.clone()), Mark::Cloud(from.clone()))
         }
-        Step::SetAside { local } | Step::Discard { local } => (Key::Local(local.id), Mark::Local(local.stamp)),
+        Step::SetAside { local, .. } | Step::Discard { local, .. } => (Key::Local(local.id), Mark::Local(local.stamp)),
         Step::Forget => (Key::Record(*sid), Mark::Record),
         Step::RestoreKept { .. } | Step::RevertTo { .. } => return None,
     })
+}
+
+/// What a step does to its item, apart from the state it starts from (its
+/// [`Mark`]): where it puts it and with what content, where it removes it
+/// from, where a copy here is set aside from. An approval keeps each
+/// item's ([`Job::effects`]), and a later round's step runs only if it
+/// does the same, or what's left of it ([`Job::accepts`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// Into folder `to` as `name` (a temporary name counts as the name it
+    /// waits for), and (files) back to `content`.
+    Place { to: RemoteId, name: String, content: Option<(i64, Hash)> },
+    /// Back to `content`, where it is.
+    Content((i64, Hash)),
+    /// Removed from under these folders ([`Step::Remove`]'s `up`).
+    Remove { up: Vec<(RemoteId, String)> },
+    /// Set aside or discarded from `at`.
+    Local { at: String },
+    /// A record forgotten.
+    Forget,
+}
+
+/// The name a [`temporary`] name waits for (the name itself otherwise).
+fn untemp(name: &str) -> String {
+    if is_temporary(name) {
+        name.rsplit_once(".oneup-rewind-").map_or(name, |(n, _)| n).to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// What `op`'s step does to its item ([`Effect`]).
+pub fn effect_of(op: &Op) -> Option<(Key, Effect)> {
+    let (key, _) = mark_of(op)?;
+    let Op::Rewind { step, .. } = op else { return None };
+    let effect = match &**step {
+        Step::Restore { to, name, content, .. } => {
+            Effect::Place { to: to.clone(), name: untemp(name), content: *content }
+        }
+        Step::Reset { toward: Some((to, name)), content, .. }
+        | Step::Reset { place: Some((to, name)), content, .. } => {
+            Effect::Place { to: to.clone(), name: untemp(name), content: *content }
+        }
+        Step::Reset { place: None, content: Some(c), .. } => Effect::Content(*c),
+        Step::Reset { place: None, content: None, .. } => return None,
+        Step::Remove { up, .. } => Effect::Remove { up: up.clone() },
+        Step::SetAside { at, .. } | Step::Discard { at, .. } => Effect::Local { at: at.clone() },
+        Step::Forget => Effect::Forget,
+        Step::RestoreKept { .. } | Step::RevertTo { .. } => return None,
+    };
+    Some((key, effect))
 }
 
 /// The state a step leaves its item in between its two parts, if it has
@@ -1173,7 +1295,7 @@ pub fn midway(op: &Op) -> Option<(Key, Mark)> {
             Key::Cloud(id.clone()),
             Mark::Cloud(Spot { parent: to.clone(), name: name.clone(), size: g.0, hash: Some(g.1) }),
         )),
-        Step::Reset { remote, from, place: Some(_), content: Some((size, hash)) } => Some((
+        Step::Reset { remote, from, place: Some(_), content: Some((size, hash)), .. } => Some((
             Key::Cloud(remote.id.clone()),
             Mark::Cloud(Spot { parent: from.parent.clone(), name: from.name.clone(), size: *size, hash: Some(*hash) }),
         )),
@@ -1189,6 +1311,8 @@ pub fn midway(op: &Op) -> Option<(Key, Mark)> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Job {
     pub approved: BTreeMap<Key, Mark>,
+    /// What each item's approved step does ([`Effect`]).
+    pub effects: BTreeMap<Key, Effect>,
     pub between: BTreeMap<Key, Mark>,
     pub left: BTreeMap<Key, Mark>,
     /// What this PC is to do to follow the changes its steps made, by key
@@ -1202,17 +1326,52 @@ impl Job {
     pub fn approve(ops: &[Op]) -> Job {
         Job {
             approved: ops.iter().filter_map(mark_of).collect(),
+            effects: ops.iter().filter_map(effect_of).collect(),
             between: ops.iter().filter_map(midway).collect(),
             ..Job::default()
         }
     }
 
-    /// Whether `op` is a step of this rewind from a state it may run from.
+    /// Whether `op` is a step of this rewind from a state it may run from,
+    /// doing what was approved for its item.
     pub fn accepts(&self, op: &Op) -> bool {
         let Some((key, mark)) = mark_of(op) else { return false };
-        self.approved.get(&key) == Some(&mark)
+        let from = self.approved.get(&key) == Some(&mark)
             || self.between.get(&key) == Some(&mark)
-            || self.left.get(&key) == Some(&mark)
+            || self.left.get(&key) == Some(&mark);
+        from && effect_of(op).is_some_and(|(_, e)| self.does_as_approved(&key, &e))
+    }
+
+    /// Whether effect `e` on item `key` is what its approval covers, or the
+    /// part of it left after the rewind's own steps: content already put
+    /// back (the rest of a two-part step), the move on from a temporary
+    /// name, and, for a removal, folders above it that only the rewind's own
+    /// steps moved (each where its last step left it). Nothing else.
+    fn does_as_approved(&self, key: &Key, e: &Effect) -> bool {
+        let Some(approved) = self.effects.get(key) else { return false };
+        match (approved, e) {
+            (Effect::Place { to, name, content }, Effect::Place { to: t, name: n, content: c }) => {
+                to == t && same_name(name, n) && (c == content || c.is_none())
+            }
+            (Effect::Place { content: Some(a), .. } | Effect::Content(a), Effect::Content(c)) => a == c,
+            (Effect::Remove { up: a }, Effect::Remove { up: b }) => a == b || self.moved_by_us(a, b),
+            (a, b) => a == b,
+        }
+    }
+
+    /// Whether every place in chain `now` (folder, name, parent) is one in
+    /// the approved chain `approved`, or where the rewind's own last step
+    /// left that folder ([`Job::ran`]).
+    fn moved_by_us(&self, approved: &[(RemoteId, String)], now: &[(RemoteId, String)]) -> bool {
+        let at =
+            |c: &[(RemoteId, String)], i: usize| (c[i].0.clone(), fold(&c[i].1), c.get(i + 1).map(|x| x.0.clone()));
+        let known: BTreeSet<_> = (0..approved.len()).map(|i| at(approved, i)).collect();
+        (0..now.len()).all(|i| {
+            let (id, name, parent) = at(now, i);
+            known.contains(&(id.clone(), name.clone(), parent.clone()))
+                || matches!(self.left.get(&Key::Cloud(id)), Some(Mark::Cloud(s))
+                    if fold(&s.name) == name && Some(&s.parent) == parent.as_ref())
+        })
     }
 
     /// Of a round's steps `ops` (each shown at the path of the same place
@@ -1232,5 +1391,96 @@ impl Job {
         if let Some((key, _)) = mark_of(op) {
             self.left.insert(key, now);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(s: &str) -> RemoteId {
+        RemoteId(s.into())
+    }
+
+    fn restore(to: &str) -> Op {
+        let step = Step::Restore {
+            id: id("f"),
+            to: id(to),
+            name: "a.txt".into(),
+            kind: NodeKind::File,
+            content: None,
+            gone: None,
+        };
+        Op::rewind(1, step)
+    }
+
+    fn remove(up: &[(&str, &str)]) -> Op {
+        let from = Spot { parent: id(up[0].0), name: "n.txt".into(), size: 1, hash: None };
+        let up = up.iter().map(|(i, n)| (id(i), (*n).to_string())).collect();
+        Op::rewind(2, Step::Remove { remote: RemotePre { id: id("n"), etag: "e".into() }, from, up })
+    }
+
+    /// An approval covers what each step does, not only the state it starts
+    /// from: the same item put somewhere else (its destination folder
+    /// replaced since) isn't taken.
+    #[test]
+    fn an_approval_covers_what_a_step_does() {
+        let job = Job::approve(&[restore("docs")]);
+        assert!(job.accepts(&restore("docs")));
+        assert!(!job.accepts(&restore("docs-made-again")), "another destination");
+    }
+
+    /// A removal is taken from under the folders it was shown under, or
+    /// where the rewind's own steps moved them; a folder above it that
+    /// someone else moved isn't.
+    #[test]
+    fn a_removal_is_taken_only_from_under_the_folders_shown() {
+        let shown = [("sub", "sub"), ("docs", "docs"), ("root", "")];
+        let mut job = Job::approve(&[remove(&shown)]);
+        assert!(job.accepts(&remove(&shown)));
+        let moved = [("sub", "sub"), ("root", "")];
+        assert!(!job.accepts(&remove(&moved)), "sub moved out of docs by someone else");
+        // The rewind itself put sub there (its own last step left it so).
+        let spot = Spot { parent: id("root"), name: "sub".into(), size: 0, hash: None };
+        job.ran(
+            &Op::rewind(
+                3,
+                Step::Reset {
+                    remote: RemotePre { id: id("sub"), etag: "e".into() },
+                    from: spot.clone(),
+                    place: None,
+                    content: None,
+                    toward: None,
+                },
+            ),
+            Mark::Cloud(spot),
+        );
+        assert!(job.accepts(&remove(&moved)), "moved by the rewind's own step");
+    }
+
+    /// What's left of a two-part step, and the move on from a temporary
+    /// name, are what the approval covers; other content isn't.
+    #[test]
+    fn what_is_left_of_an_approved_step_is_taken() {
+        let c = (3, [7u8; 20]);
+        let from = Spot { parent: id("docs"), name: "a.txt".into(), size: 5, hash: Some([1; 20]) };
+        let reset = |place: Option<(&str, &str)>, content| {
+            let place = place.map(|(t, n)| (id(t), n.to_string()));
+            Op::rewind(
+                1,
+                Step::Reset {
+                    remote: RemotePre { id: id("f"), etag: "e".into() },
+                    from: from.clone(),
+                    place,
+                    content,
+                    toward: None,
+                },
+            )
+        };
+        let job = Job::approve(&[reset(Some(("docs", "a.txt.oneup-rewind-1")), Some(c))]);
+        assert!(job.accepts(&reset(Some(("docs", "a.txt")), None)), "on from the temporary name");
+        assert!(job.accepts(&reset(None, Some(c))), "the content alone");
+        assert!(!job.accepts(&reset(None, Some((3, [8; 20])))), "other content");
+        assert!(!job.accepts(&reset(Some(("other", "a.txt")), None)), "another folder");
     }
 }

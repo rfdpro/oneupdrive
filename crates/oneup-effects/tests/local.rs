@@ -81,6 +81,22 @@ fn approve_asked(op: Op) -> Approved {
     r.approved.into_iter().next().unwrap()
 }
 
+/// A copy set aside is taken only from where the approval saw it: renamed
+/// since (same ID, size and last-write time), it stays.
+#[test]
+fn a_copy_set_aside_is_taken_only_from_where_it_was_shown() {
+    let r = Root::new("aside-where");
+    let fs = r.fs();
+    std::fs::write(r.p("a.txt"), b"changed here").unwrap();
+    let local = pre(&r.p("a.txt"));
+    let step = |at: &str| Op::rewind(1, oneup_sync::rewind::Step::SetAside { local: local.clone(), at: at.into() });
+    std::fs::rename(r.p("a.txt"), r.p("b.txt")).unwrap();
+    assert!(matches!(fs.recycle(&approve_asked(step("/a.txt")), None), Err(Error::Changed)));
+    assert!(r.p("b.txt").exists(), "left where it went");
+    assert!(matches!(fs.recycle(&approve_asked(step("/B.TXT")), None), Ok(Done::Recycled { kept: Some(_) })));
+    assert!(!r.p("b.txt").exists(), "taken from where it is, as named");
+}
+
 /// Puts kept item `slot` back at `to` (or where it came from), as a
 /// restore asked for and approved: bound to the item and the folder as
 /// found now.

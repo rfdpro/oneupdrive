@@ -50,7 +50,7 @@ fn to_json(a: &Asked) -> Option<Value> {
             "sid": sid, "deleted": id.0, "parent": to.0, "name": name, "kind": kind_name(*kind), "path": a.path,
         }),
         // A restore's follow-up (`oneup_exec::recover::follow_up`).
-        Step::Reset { remote, from, place: Some((to, name)), content: None } => json!({
+        Step::Reset { remote, from, place: Some((to, name)), content: None, toward: None } => json!({
             "sid": sid, "move": remote.id.0, "etag": remote.etag, "parent": to.0, "name": name, "path": a.path,
             "from": { "parent": from.parent.0, "name": from.name, "size": from.size, "hash": from.hash.map(|h| hex(&h)) },
         }),
@@ -71,7 +71,16 @@ fn from_json(v: &Value) -> Option<Asked> {
         };
         let from = Spot { parent: RemoteId(fs("parent")?), name: fs("name")?, size: f.get("size")?.as_i64()?, hash };
         let remote = RemotePre { id: RemoteId(id), etag: s("etag")? };
-        Op::rewind(sid, Step::Reset { remote, from, place: Some((RemoteId(s("parent")?), s("name")?)), content: None })
+        Op::rewind(
+            sid,
+            Step::Reset {
+                remote,
+                from,
+                place: Some((RemoteId(s("parent")?), s("name")?)),
+                content: None,
+                toward: None,
+            },
+        )
     } else if let Some(slot) = s("kept") {
         let id = |k: &str| u128::from_str_radix(v.get(k)?.as_str()?, 16).ok();
         let stamp = match v.get("stamp").and_then(Value::as_array) {
@@ -323,6 +332,7 @@ mod tests {
                     from: Spot { parent: RemoteId("A!0".into()), name: "b 1.txt".into(), size: 3, hash: Some([7; 20]) },
                     place: Some((RemoteId("A!0".into()), "b.txt".into())),
                     content: None,
+                    toward: None,
                 },
             ),
         ];
@@ -366,7 +376,7 @@ mod tests {
         ran(&mut store, &q, &report).unwrap();
         let left = store.read(waiting).unwrap();
         assert_eq!(left.len(), 1);
-        let Some(Step::Reset { remote, from, place, content: None }) = left[0].op.rewind_step() else {
+        let Some(Step::Reset { remote, from, place, content: None, .. }) = left[0].op.rewind_step() else {
             panic!("{left:?}")
         };
         assert_eq!((remote.etag.as_str(), from.name.as_str()), ("e2", "b 1.txt"));

@@ -6483,6 +6483,68 @@ async fn a_folder_moved_after_the_rewind_was_approved_isnt_removed() {
 }
 
 #[tokio::test]
+async fn a_file_whose_folder_moved_after_the_approval_isnt_removed() {
+    // n.txt was made since the moment in sub/, which was there then; the
+    // rewind removes it. After the approval, before the step runs, someone
+    // moves sub/ out of docs/: n.txt keeps its eTag, but it's no longer
+    // where it was shown, so it stays (and later rounds don't take it up
+    // from there either).
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-ancestor-moved", cloud.clone());
+    write(&s.p("docs/sub/a.txt"), b"a");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/sub/n.txt"), b"new since");
+    s.settle().await;
+    let id = resolve(&cloud.0.lock().unwrap(), "docs/sub/n.txt");
+    let sub = resolve(&cloud.0.lock().unwrap(), "docs/sub");
+    cloud.0.lock().unwrap().on_item = Some((
+        id,
+        Box::new(move |st: &mut State| {
+            let etag = st.bump();
+            let it = st.items.get_mut(&sub).unwrap();
+            it.parent = Some("root".into());
+            it.etag = etag;
+        }),
+    ));
+    s.rewind_to("/docs", at, |_| {}).await;
+    s.settle().await;
+    assert!(cloud.0.lock().unwrap().on_item.is_none(), "the step looked at it");
+    let t = cloud.tree();
+    assert_eq!(t.get("/sub/n.txt"), Some(&Some(b"new since".to_vec())), "not removed from where it went: {t:?}");
+}
+
+#[tokio::test]
+async fn a_copy_moved_here_after_the_approval_isnt_set_aside() {
+    // x.txt was edited here and not synced (the content guard holds it);
+    // the rewind sets it aside. After the approval, before the step runs,
+    // it's renamed: same ID, size and last-write time, but not where it was
+    // shown, so it stays.
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-aside-moved", cloud.clone());
+    write(&s.p("docs/x.txt"), b"x, as written");
+    write(&s.p("docs/y.txt"), b"y, as written");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/x.txt"), b"x \x01\x02scrambled, long enough to judge");
+    write(&s.p("docs/y.txt"), b"y \x01\x02scrambled, long enough to judge");
+    s.policy.max_suspicious = 1;
+    s.start_rewind("/docs", at);
+    s.round().await;
+    s.stops.approve();
+    let (from, to) = (s.p("docs/x.txt"), s.p("docs/x2.txt"));
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || std::fs::rename(&from, &to).unwrap()));
+    s.attempt().await;
+    assert_eq!(
+        std::fs::read(s.p("docs/x2.txt")).unwrap(),
+        b"x \x01\x02scrambled, long enough to judge",
+        "renamed after the approval: left where it went"
+    );
+    assert!(!s.versions().contains(&b"x \x01\x02scrambled, long enough to judge".to_vec()), "not set aside");
+    assert!(s.versions().contains(&b"y \x01\x02scrambled, long enough to judge".to_vec()), "the other one is");
+}
+
+#[tokio::test]
 async fn an_item_someone_else_restored_and_edited_isnt_put_back_over() {
     // a.txt was "first" then, "second" when it was deleted. The rewind
     // restores it and puts "first" back. After the approval, someone else

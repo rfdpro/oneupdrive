@@ -883,7 +883,9 @@ pub fn store_size(policy: &Policy, op: &Op) -> Option<u64> {
             local.stamp.map(|(size, _)| size.max(0) as u64)
         }
         Op::Rewind { step, .. } => match &**step {
-            Step::SetAside { local } | Step::Discard { local } => local.stamp.map(|(size, _)| size.max(0) as u64),
+            Step::SetAside { local, .. } | Step::Discard { local, .. } => {
+                local.stamp.map(|(size, _)| size.max(0) as u64)
+            }
             _ => None,
         },
         Op::Download { replace: Some(local), .. } if policy.keep_replaced => {
@@ -912,7 +914,7 @@ fn malformed(op: &Op) -> bool {
         Op::RemoveCopy { local: None, remote: None, .. } => true,
         // Only files are set aside.
         Op::Rewind { step, .. } => {
-            matches!(&**step, Step::SetAside { local } | Step::Discard { local } if local.stamp.is_none())
+            matches!(&**step, Step::SetAside { local, .. } | Step::Discard { local, .. } if local.stamp.is_none())
         }
         Op::Download { replace: Some(local), .. } => local.stamp.is_none(),
         // Folders are created or empty when they move; anything goes.
@@ -1006,15 +1008,17 @@ pub fn item_key(kind: BreakerKind, op: &Op, path: &str) -> ItemKey {
         // the preview has another `from` anyway.
         Op::Rewind { sid, step } => {
             let unstamped = match &**step {
-                Step::Reset { remote, from, place, content } => Step::Reset {
+                Step::Reset { remote, from, place, content, toward } => Step::Reset {
                     remote: oneup_sync::RemotePre { id: remote.id.clone(), etag: String::new() },
                     from: from.clone(),
                     place: place.clone(),
                     content: *content,
+                    toward: toward.clone(),
                 },
-                Step::Remove { remote, from } => Step::Remove {
+                Step::Remove { remote, from, up } => Step::Remove {
                     remote: oneup_sync::RemotePre { id: remote.id.clone(), etag: String::new() },
                     from: from.clone(),
+                    up: up.clone(),
                 },
                 s => s.clone(),
             };
@@ -1186,6 +1190,7 @@ mod tests {
                 from: Spot { parent: RemoteId("root".into()), name: format!("f{i}"), size: 1, hash: Some([hash; 20]) },
                 place: None,
                 content: Some((1, [0; 20])),
+                toward: None,
             },
         )
     }

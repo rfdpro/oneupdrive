@@ -674,7 +674,7 @@ impl LocalFs {
             Op::RenameLocal { local, dir, name } | Op::ConflictCopy { local, dir, name, .. } => {
                 self.move_item(local, *dir, name, true)
             }
-            Op::RecycleLocal { local, .. } => self.recycle_item(local, OldCopy::Keep, None),
+            Op::RecycleLocal { local, .. } => self.recycle_item(local, OldCopy::Keep, None, None),
             _ => Err(Error::WrongOp),
         }
     }
@@ -836,11 +836,14 @@ impl LocalFs {
     /// otherwise it goes into the version store.
     pub fn recycle(&self, a: &Approved, synced: Option<&Hash>) -> Result<Done> {
         match a.op() {
-            Op::RecycleLocal { local, .. } => self.recycle_item(local, a.old_copy(), synced),
+            Op::RecycleLocal { local, .. } => self.recycle_item(local, a.old_copy(), synced, None),
             // A rewind sets a copy changed here aside: it's never the synced
             // version, so it's always kept.
             Op::Rewind { step, .. } => match &**step {
-                Step::SetAside { local } | Step::Discard { local } => self.recycle_item(local, OldCopy::Keep, None),
+                // Only from where the approval saw it (`at`).
+                Step::SetAside { local, at } | Step::Discard { local, at } => {
+                    self.recycle_item(local, OldCopy::Keep, None, Some(at))
+                }
                 _ => Err(Error::WrongOp),
             },
             _ => Err(Error::WrongOp),
@@ -1044,8 +1047,18 @@ impl LocalFs {
         Ok(Done::Placed { parent: to, entry, kept: None })
     }
 
-    fn recycle_item(&self, pre: &LocalPre, old: OldCopy, synced: Option<&Hash>) -> Result<Done> {
+    /// `at`: where the item must be, from the sync folder (`/a/b.txt`),
+    /// checked on the handle it's moved by: one moved or renamed since (its
+    /// ID, size and last-write time unchanged) is left alone.
+    fn recycle_item(&self, pre: &LocalPre, old: OldCopy, synced: Option<&Hash>, at: Option<&str>) -> Result<Done> {
         let (h, entry, path) = self.open_item(pre)?;
+        if let Some(at) = at {
+            let rel = path.strip_prefix(&self.root).map_err(|_| Error::Outside)?;
+            let rel = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+            if !oneup_sync::same_name(&rel, at) {
+                return Err(Error::Changed);
+            }
+        }
         // As for a move (`database::check_move`).
         if !entry.is_dir() {
             self.check_move(&h, &path, entry.size, None)?;

@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context as _, Result, bail};
 use oneup_rules::RuleSet;
 use oneup_store::{ActivityEntry, ActivityOutcome, Ops, Store};
-use oneup_sync::rewind::{self as core, Change, Job as Approval, Key, Kind, Mark, Shown, Skip, Source, Spot};
+use oneup_sync::rewind::{self as core, Change, Effect, Job as Approval, Key, Kind, Mark, Shown, Skip, Source, Spot};
 use oneup_sync::{LocalId, Op, RemoteId, Sid};
 use serde_json::{Value, json};
 
@@ -152,6 +152,62 @@ fn mark_of(v: &Value) -> Option<Mark> {
     }))
 }
 
+fn effect_json(e: &Effect) -> Value {
+    let content = |c: &Option<(i64, oneup_sync::Hash)>| c.map(|(s, h)| json!([s, hex(&h)]));
+    match e {
+        Effect::Place { to, name, content: c } => {
+            json!({ "place": { "to": to.0, "name": name, "content": content(c) } })
+        }
+        Effect::Content(c) => json!({ "content": content(&Some(*c)) }),
+        Effect::Remove { up } => json!({ "remove": up.iter().map(|(id, n)| json!([id.0, n])).collect::<Vec<_>>() }),
+        Effect::Local { at } => json!({ "local": at }),
+        Effect::Forget => json!("forget"),
+    }
+}
+
+fn effect_of(v: &Value) -> Option<Effect> {
+    let content = |c: &Value| -> Option<Option<(i64, oneup_sync::Hash)>> {
+        match c {
+            Value::Null => Some(None),
+            c => Some(Some((c.get(0)?.as_i64()?, unhex20(c.get(1)?.as_str()?)?))),
+        }
+    };
+    if v.as_str() == Some("forget") {
+        return Some(Effect::Forget);
+    }
+    if let Some(p) = v.get("place") {
+        return Some(Effect::Place {
+            to: RemoteId(p.get("to")?.as_str()?.to_string()),
+            name: p.get("name")?.as_str()?.to_string(),
+            content: content(p.get("content")?)?,
+        });
+    }
+    if let Some(c) = v.get("content") {
+        return Some(Effect::Content(content(c)??));
+    }
+    if let Some(up) = v.get("remove") {
+        let up = up
+            .as_array()?
+            .iter()
+            .map(|e| Some((RemoteId(e.get(0)?.as_str()?.to_string()), e.get(1)?.as_str()?.to_string())))
+            .collect::<Option<Vec<_>>>()?;
+        return Some(Effect::Remove { up });
+    }
+    Some(Effect::Local { at: v.get("local")?.as_str()?.to_string() })
+}
+
+fn effects_json(m: &BTreeMap<Key, Effect>) -> Value {
+    Value::Array(m.iter().map(|(k, v)| json!({ "key": key_json(k), "effect": effect_json(v) })).collect())
+}
+
+fn effects_of(v: Option<&Value>) -> Option<BTreeMap<Key, Effect>> {
+    let mut out = BTreeMap::new();
+    for e in v?.as_array()? {
+        out.insert(key_of(e.get("key")?)?, effect_of(e.get("effect")?)?);
+    }
+    Some(out)
+}
+
 fn marks_json(m: &BTreeMap<Key, Mark>) -> Value {
     Value::Array(m.iter().map(|(k, v)| json!({ "key": key_json(k), "mark": mark_json(v) })).collect())
 }
@@ -169,6 +225,7 @@ impl Job {
         let approval = self.approval.as_ref().map(|a| {
             json!({
                 "approved": marks_json(&a.approved),
+                "effects": effects_json(&a.effects),
                 "between": marks_json(&a.between),
                 "left": marks_json(&a.left),
                 "follows": a.follows.iter().map(|k| format!("{k:032x}")).collect::<Vec<_>>(),
@@ -190,6 +247,7 @@ impl Job {
             None | Some(Value::Null) => None,
             Some(a) => Some(Approval {
                 approved: marks_of(a.get("approved"))?,
+                effects: effects_of(a.get("effects"))?,
                 between: marks_of(a.get("between"))?,
                 left: marks_of(a.get("left"))?,
                 follows: a

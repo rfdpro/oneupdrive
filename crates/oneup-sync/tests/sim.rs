@@ -815,7 +815,7 @@ impl World {
                 }
                 true
             }
-            Step::Reset { remote, from: _, place, content } => {
+            Step::Reset { remote, place, content, .. } => {
                 if !self.rpre_ok(remote) {
                     return false;
                 }
@@ -839,7 +839,7 @@ impl World {
                 }
                 true
             }
-            Step::Remove { remote, from: _ } => {
+            Step::Remove { remote, .. } => {
                 let Some(it) = self.remote.get(&remote.id.0) else { return false };
                 // A folder is re-read (its eTag moves with its contents);
                 // what counts is that it's empty.
@@ -858,7 +858,7 @@ impl World {
                 self.remote_gone.insert(remote.id.0.clone());
                 true
             }
-            Step::SetAside { local } => {
+            Step::SetAside { local, .. } => {
                 if !self.pre_ok(local) || self.bases.get(&sid).and_then(|b| b.local) != Some(local.id) {
                     return false;
                 }

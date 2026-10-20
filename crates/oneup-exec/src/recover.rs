@@ -108,6 +108,7 @@ pub fn follow_up(o: &Ops<'_>, op: &Op) -> oneup_store::Result<Option<Op>> {
         from,
         place: Some((to.clone(), name.clone())),
         content: None,
+        toward: None,
     };
     Ok(Some(Op::rewind(sid, step)))
 }
@@ -211,7 +212,14 @@ pub fn conflict_ops(o: &Ops<'_>, c: &Conflict, keep: Keep) -> oneup_store::Resul
     }
     let Some(dir) = o.synced_get(c.folder)?.and_then(|b| b.local) else { return Ok(None) };
     let pre = |x: &Copy| LocalPre { id: x.local, stamp: Some((x.size, x.mtime)) };
-    let discard = |x: &Copy| Op::rewind(x.sid, Step::Discard { local: pre(x) });
+    // Bound to where each copy is now, as listed: moved or renamed since,
+    // it's left alone.
+    let (Some(at_original), Some(at_copy)) = (o.local_path_of(c.original.local.0)?, o.local_path_of(c.copy.local.0)?)
+    else {
+        return Ok(None);
+    };
+    let at = |x: &Copy| if x == &c.copy { at_copy.clone() } else { at_original.clone() };
+    let discard = |x: &Copy| Op::rewind(x.sid, Step::Discard { local: pre(x), at: at(x) });
     Ok(Some(match keep {
         Keep::Original => vec![discard(&c.copy)],
         Keep::Copy => vec![
