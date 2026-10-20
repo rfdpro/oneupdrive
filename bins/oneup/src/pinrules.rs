@@ -1044,19 +1044,22 @@ pub fn approve(store: &mut Store, fingerprint: &str, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-/// The go-ahead for the download the agent waits at (and `bytes` more).
+/// The go-ahead for the download the agent waits at (and `bytes` more),
+/// added to the budget as it stands: what was spent past the approval
+/// stays spent, so each go-ahead doesn't bring a new cushion.
 pub fn allow(store: &mut Store, bytes: u64) -> Result<()> {
     store.write(|o| {
         let waiting: u64 = o.meta_get(KEY_WAITING)?.and_then(|v| v.parse().ok()).unwrap_or(0);
         let budget: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
         let add = i64::try_from(waiting.saturating_add(bytes)).unwrap_or(i64::MAX);
-        o.meta_set(KEY_BUDGET, &budget.max(0).saturating_add(add).to_string())?;
+        o.meta_set(KEY_BUDGET, &budget.saturating_add(add).to_string())?;
         o.meta_delete(KEY_WAITING)
     })?;
     Ok(())
 }
 
-/// An approval for these rules (`fp`) joins the budget.
+/// An approval for these rules (`fp`) joins the budget as it stands
+/// (spent past an earlier approval: still spent).
 fn take_approval(store: &mut Store, fp: &str) -> Result<()> {
     store.write(|o| {
         let Some(a) = o.meta_get(KEY_APPROVE)? else { return Ok(()) };
@@ -1067,7 +1070,7 @@ fn take_approval(store: &mut Store, fp: &str) -> Result<()> {
         }
         let bytes: i64 = bytes.parse().unwrap_or(0);
         let budget: i64 = o.meta_get(KEY_BUDGET)?.and_then(|v| v.parse().ok()).unwrap_or(0);
-        o.meta_set(KEY_BUDGET, &budget.max(0).saturating_add(bytes).to_string())?;
+        o.meta_set(KEY_BUDGET, &budget.saturating_add(bytes).to_string())?;
         o.meta_delete(KEY_WAITING)?;
         o.meta_delete(KEY_APPROVE)
     })?;
@@ -1984,6 +1987,35 @@ mod tests {
         .unwrap();
         assert!(got.is_empty());
         assert_eq!(f.stopped, Some(Stop::Paused));
+    }
+
+    /// A go-ahead or a new approval is added to the budget as it stands:
+    /// what a pass spent past the approval isn't forgiven.
+    #[test]
+    fn a_go_ahead_doesnt_forgive_what_was_spent_past_the_approval() {
+        const MIB: i64 = 1 << 20;
+        let (mut s, mut fake, _) = many_kept(3, 600 * MIB);
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |_| true).unwrap();
+        let done: Vec<u128> = f.done.iter().map(|d| d.1).collect();
+        settle(&mut s, &done, &|_| false).unwrap();
+        assert_eq!(done, [10, 1000], "the first of the rules', and the user's");
+        assert_eq!(f.blocked, Some((11, 600 << 20)));
+        assert_eq!(budget(&s).unwrap(), -600 * MIB);
+        // Downloaded: the observer sees them here.
+        journal(&mut s, &[(10, PINNED), (1000, PINNED)]);
+        wait_for_go_ahead(&mut s, 600 << 20).unwrap();
+        allow(&mut s, 2 << 30).unwrap();
+        assert_eq!(budget(&s).unwrap(), -600 * MIB + 600 * MIB + (2 << 30));
+        // Spent down past zero again, then a new approval for these rules.
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |_| true).unwrap();
+        let done: Vec<u128> = f.done.iter().map(|d| d.1).collect();
+        settle(&mut s, &done, &|_| false).unwrap();
+        assert_eq!(budget(&s).unwrap(), (2 << 30) - 1200 * MIB);
+        let pins = PinSet::new(&["*.psd"]);
+        s.write(|o| o.meta_set(KEY_BUDGET, &(-900 * MIB).to_string())).unwrap();
+        approve(&mut s, &pins.fingerprint(), 1 << 30).unwrap();
+        apply(&mut s, &mut fake, &pins, Duration::from_secs(60), 0).unwrap();
+        assert_eq!(budget(&s).unwrap(), -900 * MIB + (1 << 30));
     }
 
     /// A rescan of the folder (the change journal lost) deletes every Local
