@@ -301,6 +301,13 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
             return Ok(json!({ "rel": rel, "state": state, "why": why, "items": [], "untracked": true }));
         }
     }
+    // The child folders holding a `.oneupignore` themselves or below (the
+    // rule set above has only those on the way down): partly ticked. Up
+    // from the rule files, as far as this folder, by the primary key.
+    let ruled: HashSet<u128> = match &row {
+        Some(r) => store.read(|o| o.local_children_with_rule_files(r.file_id))?.into_iter().collect(),
+        None => HashSet::new(),
+    };
     let (locals, links): (Vec<LocalRow>, HashMap<u128, Option<String>>) = match &row {
         Some(r) => (
             store.read(|o| o.local_children(r.file_id))?,
@@ -349,7 +356,15 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
         let place = if l.is_some() && on_demand && state == "synced" { placement(&path) } else { None };
         let size = if folder { None } else { l.as_ref().map(|l| l.size).or_else(|| r.as_ref().map(|r| r.0.size)) };
         let modified_ms = r.as_ref().and_then(|r| r.0.mtime_ms);
+        // A ticked folder some rule inside leaves partly out (the tree's
+        // partly ticked box). A `.oneupignore` below isn't read here (it may
+        // exclude nothing: empty, `!` rules only, unreadable), so it's its
+        // own mark, not a partly ticked box.
+        let partial = folder && !verdict.is_excluded() && set.has_rules_inside(&child);
+        let rule_file_below = folder && l.as_ref().is_some_and(|l| ruled.contains(&l.file_id));
         items.push(json!({
+            "partial": partial,
+            "rule_file_below": rule_file_below,
             "name": name,
             "folder": folder,
             "size": size,
@@ -486,6 +501,142 @@ pub fn rule_files(data_dir: &Path) -> Result<Vec<String>> {
     })?;
     out.sort_by_key(|p| p.to_lowercase());
     Ok(out)
+}
+
+/// What excluding the item at `rel` would take out of sync, before it's
+/// done (the window's preview, `oneup rules --exclude-path`): what's inside
+/// it on this PC (and how much of that is online-only) and in OneDrive,
+/// whether it was synced, and what the setting for OneDrive's copies of
+/// excluded items (`[rules] cloud_copies`) then does with them. `local` and
+/// `remote` are the item's row IDs as a listing gave them (`None`: found
+/// by name). Reads the database only; one pass over the item's subtree.
+pub fn preview(data_dir: &Path, rel: &str, folder: bool, local: Option<u128>, remote: Option<String>) -> Result<Value> {
+    let rel = clean(rel);
+    if rel.is_empty() {
+        bail!("that's the whole synced folder");
+    }
+    let store = crate::setup::open_store(data_dir, 4 * 1024)?;
+    let (_, _, on_demand) = pair_info(&store)?;
+    let rules = config::load_rules(data_dir, &store)?;
+    let (local_row, remote_row) = if local.is_some() || remote.is_some() {
+        let l = match local {
+            Some(id) => store.read(|o| o.local_get(id))?,
+            None => None,
+        };
+        let r = match remote {
+            Some(id) => store.read(|o| o.get_item(&id))?,
+            None => None,
+        };
+        (l, r)
+    } else {
+        by_name(&store, &rel)?
+    };
+    let here = match &local_row {
+        Some(l) if folder => store.read(|o| o.local_subtree_totals(l.file_id))?,
+        Some(l) => {
+            let online = l.attributes & RECALL_ON_DATA_ACCESS != 0;
+            let size = u64::try_from(l.size).unwrap_or(0);
+            oneup_store::Totals {
+                files: 1,
+                bytes: size,
+                online_files: u64::from(online),
+                online_bytes: if online { size } else { 0 },
+                ..Default::default()
+            }
+        }
+        None => oneup_store::Totals::default(),
+    };
+    let cloud = match &remote_row {
+        Some(r) if folder => {
+            // OneDrive's own total for the folder covers what isn't listed.
+            let mut t = store.read(|o| o.remote_subtree_totals(&r.id))?;
+            t.bytes = t.bytes.max(u64::try_from(r.size).unwrap_or(0));
+            t
+        }
+        Some(r) => oneup_store::Totals { files: 1, bytes: u64::try_from(r.size).unwrap_or(0), ..Default::default() },
+        None => oneup_store::Totals::default(),
+    };
+    let synced = match (&local_row, &remote_row) {
+        (Some(l), _) => store.read(|o| o.synced_by_local(l.file_id))?.is_some(),
+        (None, Some(r)) => store.read(|o| o.synced_by_remote(&r.id))?.is_some(),
+        _ => false,
+    };
+    let totals = |t: &oneup_store::Totals| {
+        json!({ "files": t.files, "folders": t.folders, "bytes": t.bytes,
+                "online_files": t.online_files, "online_bytes": t.online_bytes, "skipped": t.skipped })
+    };
+    Ok(json!({
+        "rel": rel,
+        "folder": folder,
+        "rule": rule_for(&rel, folder),
+        // What the preview was of: excluding with it refuses if the path
+        // now names something else (`exclude_checked`).
+        "token": token(&rel, folder, local_row.as_ref().map(|l| l.file_id), remote_row.as_ref().map(|r| r.id.as_str())),
+        "here": local_row.as_ref().map(|_| totals(&here)),
+        "cloud": remote_row.as_ref().map(|_| totals(&cloud)),
+        "synced": synced,
+        "on_demand": on_demand,
+        "mode": rules.cloud.name(),
+    }))
+}
+
+/// The items at `rel` (relative to the synced folder) on this PC and in
+/// OneDrive, by name as Windows compares names.
+fn by_name(store: &Store, rel: &str) -> Result<(Option<LocalRow>, Option<RemoteRow>)> {
+    let root = store.read(|o| o.local_root())?.context("this folder hasn't been looked at yet")?;
+    let l = store.read(|o| row_at(o, root.root_file_id, rel))?;
+    let pair = crate::sync::pairing(store)?;
+    let full = format!("{}/{rel}", pair.remote.trim_end_matches('/'));
+    let (parent, name) = full.rsplit_once('/').unwrap_or(("", &full));
+    let r = match crate::sync::find_remote(store, parent)? {
+        Some(p) => store.read(|o| o.remote_named(&p, name))?.into_iter().next(),
+        None => None,
+    };
+    Ok((l, r))
+}
+
+/// What a preview was of: the path, its kind, and the items' IDs on each
+/// side (`null`: none there).
+fn token(rel: &str, folder: bool, local: Option<u128>, remote: Option<&str>) -> Value {
+    json!({ "rel": rel, "folder": folder, "local": local.map(|l| l.to_string()), "remote": remote })
+}
+
+/// Excludes the item a preview showed (`expect`, its `token`): only if the
+/// path still names the same items on both sides, so a folder moved away
+/// and another put in its place since isn't excluded (or, with `prune`,
+/// removed from OneDrive) in its stead. Then as [`set_sync`].
+pub fn exclude_checked(data_dir: &Path, expect: &Value) -> Result<String> {
+    let rel = clean(expect["rel"].as_str().context("the preview names no item")?);
+    let folder = expect["folder"].as_bool().context("the preview names no kind")?;
+    let store = crate::setup::open_store(data_dir, 1024)?;
+    let (l, r) = by_name(&store, &rel)?;
+    let now = token(&rel, folder, l.as_ref().map(|l| l.file_id), r.as_ref().map(|r| r.id.as_str()));
+    let kind_same = l.as_ref().is_none_or(|l| (l.kind != LocalKind::File) == folder)
+        && r.as_ref().is_none_or(|r| (r.kind == Kind::Folder) == folder);
+    if now != *expect || !kind_same {
+        bail!("/{rel} isn't what was shown any more (moved or replaced); look again before excluding it");
+    }
+    drop(store);
+    set_sync(data_dir, &rel, folder, false)
+}
+
+/// The Local row at `rel` (relative to the synced folder), by name as
+/// Windows compares names: the exact spelling, else the only one alike.
+pub fn row_at(o: &oneup_store::Ops<'_>, root: u128, rel: &str) -> oneup_store::Result<Option<LocalRow>> {
+    let mut cur = root;
+    let mut row = None;
+    for part in rel.split('/').filter(|p| !p.is_empty()) {
+        let mut found = o.local_named(cur, part)?;
+        let pick = match found.iter().position(|r| r.name == part) {
+            Some(i) => Some(found.swap_remove(i)),
+            None if found.len() == 1 => found.pop(),
+            None => None,
+        };
+        let Some(r) = pick else { return Ok(None) };
+        cur = r.file_id;
+        row = Some(r);
+    }
+    Ok(row)
 }
 
 /// Whether the item at `rel` syncs, as the rules say.
@@ -829,6 +980,148 @@ mod tests {
         assert_eq!(super::remote_at(&s, &["ΛΟΓΟΣ"], &[]).unwrap(), None);
         // IDs that don't match the path are refused.
         assert!(super::remote_at(&s, &["a", "b"], &[super::Step::default()]).is_err());
+    }
+
+    /// A data folder whose database has a scan of an empty synced folder,
+    /// for the rule changes the tree's checkboxes make.
+    fn data_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("oneup-filetree-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let sync = d.join("sync");
+        std::fs::create_dir_all(&sync).unwrap();
+        let store = crate::setup::open_store(&d, 1024).unwrap();
+        let cfg = oneup_local::Config::new(oneup_rules::ExcludeSet::none());
+        let mut scan = oneup_local::Scan::open(store, &sync, cfg).unwrap();
+        assert!(scan.run().unwrap().finished);
+        drop(scan.into_store());
+        d
+    }
+
+    /// [`data_dir`] with these files (`/`-separated, with their text) in
+    /// the synced folder before its scan, paired with the whole drive.
+    fn paired_dir(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("oneup-filetree-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let sync = d.join("sync");
+        for (rel, text) in files {
+            let p = rel.split('/').fold(sync.clone(), |p, x| p.join(x));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            if !text.is_empty() || rel.ends_with(".oneupignore") {
+                std::fs::write(&p, text).unwrap();
+            } else {
+                std::fs::create_dir_all(&p).unwrap();
+            }
+        }
+        std::fs::create_dir_all(&sync).unwrap();
+        let mut store = crate::setup::open_store(&d, 1024).unwrap();
+        store
+            .write(|o| {
+                o.meta_set(crate::sync::KEY_LOCAL, &sync.to_string_lossy())?;
+                o.meta_set(crate::sync::KEY_REMOTE, "/")
+            })
+            .unwrap();
+        let cfg = oneup_local::Config::new(oneup_rules::ExcludeSet::none());
+        let mut scan = oneup_local::Scan::open(store, &sync, cfg).unwrap();
+        assert!(scan.run().unwrap().finished);
+        drop(scan.into_store());
+        d
+    }
+
+    /// The preview names what it showed; excluding with it (the window's
+    /// `tree_sync`, the CLI's `--exclude-path --yes`) refuses once the path
+    /// names another item: a folder moved away and another put in its place.
+    #[test]
+    fn excluding_after_a_preview_refuses_a_replaced_item() {
+        let d = paired_dir("replaced", &[("Docs", "")]);
+        let pv = super::preview(&d, "Docs", true, None, None).unwrap();
+        let token = pv["token"].clone();
+        assert!(token["local"].is_string(), "{pv}");
+        // Docs is moved away and another folder takes its name.
+        let mut store = crate::setup::open_store(&d, 1024).unwrap();
+        let old: u128 = token["local"].as_str().unwrap().parse().unwrap();
+        store
+            .write(|o| {
+                let mut row = o.local_get(old)?.unwrap();
+                o.local_remove_subtree(old)?;
+                row.file_id = old + 1;
+                o.local_put(&row).map(|_| ())
+            })
+            .unwrap();
+        drop(store);
+        let args = serde_json::json!({ "rel": "Docs", "folder": true, "on": false, "expect": token });
+        let err = crate::settingsapi::tree_sync(&d, &args).unwrap_err();
+        assert!(err.to_string().contains("isn't what was shown"), "{err}");
+        let store = crate::setup::open_store(&d, 1024).unwrap();
+        assert!(crate::config::load_rules(&d, &store).unwrap().exclude.is_empty(), "nothing written");
+        drop(store);
+        // Previewed again: the new folder, and excluding it works.
+        let pv = super::preview(&d, "Docs", true, None, None).unwrap();
+        let args = serde_json::json!({ "rel": "Docs", "folder": true, "on": false, "expect": pv["token"] });
+        crate::settingsapi::tree_sync(&d, &args).unwrap();
+        let store = crate::setup::open_store(&d, 1024).unwrap();
+        assert_eq!(crate::config::load_rules(&d, &store).unwrap().exclude, ["/Docs/"]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A `.oneupignore` below a folder that isn't read for the listing (it
+    /// may exclude nothing) marks it as having one, not as partly ticked; a
+    /// rule of yours inside it does make it partly ticked.
+    #[test]
+    fn a_rule_file_below_is_its_own_mark_not_a_partly_ticked_box() {
+        let d =
+            paired_dir("rulefile", &[("a/sub/.oneupignore", "!keep.txt\n"), ("b/x.txt", "x"), ("c/.oneupignore", "")]);
+        std::fs::write(crate::config::path(&d), "[rules]\nexclude = [\"/b/x.txt\"]\n").unwrap();
+        let v = super::list(&d, "", &[]).unwrap();
+        let item = |name: &str| v["items"].as_array().unwrap().iter().find(|i| i["name"] == name).unwrap().clone();
+        assert_eq!((item("a")["partial"].as_bool(), item("a")["rule_file_below"].as_bool()), (Some(false), Some(true)));
+        assert_eq!((item("c")["partial"].as_bool(), item("c")["rule_file_below"].as_bool()), (Some(false), Some(true)));
+        assert_eq!((item("b")["partial"].as_bool(), item("b")["rule_file_below"].as_bool()), (Some(true), Some(false)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Unticking writes the rule naming exactly that folder, ticking takes
+    /// it out again, and a tick against a preset writes an exception: all
+    /// in `config.toml`, with the user's comments and other settings kept.
+    #[test]
+    fn ticks_write_rules_and_keep_the_users_comments() {
+        let d = data_dir("ticks");
+        let cfg = crate::config::path(&d);
+        std::fs::write(
+            &cfg,
+            "# my settings\n[rules]\n# kept by hand\npresets = [\"dev\"]\nexclude = [\"*.iso\"]\n\n[agent]\nupload_kib_per_s = 7 # cap\n",
+        )
+        .unwrap();
+        let store = crate::setup::open_store(&d, 1024).unwrap();
+        let rules = || crate::config::load_rules(&d, &store).unwrap();
+        let said = super::set_sync(&d, "Docs/Drafts", true, false).unwrap();
+        assert!(said.contains("excluded") && said.contains("Nothing is deleted"), "{said}");
+        assert_eq!(rules().exclude, ["*.iso", "/Docs/Drafts/"]);
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        for kept in ["# my settings", "# kept by hand", "upload_kib_per_s = 7 # cap"] {
+            assert!(text.contains(kept), "{kept}: {text}");
+        }
+        // Unticking it again changes nothing.
+        super::set_sync(&d, "docs/drafts", true, false).unwrap();
+        assert_eq!(rules().exclude, ["*.iso", "/Docs/Drafts/"]);
+
+        super::set_sync(&d, "Docs/Drafts", true, true).unwrap();
+        assert_eq!(rules().exclude, ["*.iso"]);
+        // Left out by a preset: ticking adds an exception, unticking takes it out.
+        let said = super::set_sync(&d, "app/node_modules", true, true).unwrap();
+        assert!(said.contains("exception"), "{said}");
+        assert_eq!(rules().exclude, ["*.iso", "!/app/node_modules/"]);
+        assert!(!rules().rule_set().unwrap().excludes("app/node_modules/x.js", false));
+        super::set_sync(&d, "app/node_modules", true, false).unwrap();
+        assert_eq!(rules().exclude, ["*.iso"]);
+        // Inside an excluded folder: refused, nothing written.
+        super::set_sync(&d, "Docs", true, false).unwrap();
+        assert!(super::set_sync(&d, "Docs/Keep", true, true).is_err());
+        assert_eq!(rules().exclude, ["*.iso", "/Docs/"]);
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("# kept by hand") && text.contains("# cap"), "{text}");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -38,6 +38,11 @@ mod vault;
 use oneup_app::setup::DirLock;
 use oneup_app::{setup, sync, test_account, versions};
 
+/// `oneup rules` options that change the rules: each of --exclude-path,
+/// --include-path and --suggest does one thing, so combining them with
+/// these is refused rather than one of them silently ignored.
+const RULE_CHANGES: [&str; 5] = ["cloud", "on", "off", "add", "remove"];
+
 #[derive(Parser)]
 #[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (pre-alpha, read-only)")]
 struct Cli {
@@ -159,6 +164,19 @@ enum Cmd {
         /// Remove one of your rules
         #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
         remove: Vec<String>,
+        /// Exclude this file or folder (a full path, or one inside the synced
+        /// folder): shows what stops syncing; --yes to do it
+        #[arg(long, value_name = "PATH", conflicts_with_all = RULE_CHANGES)]
+        exclude_path: Option<String>,
+        /// Sync this excluded file or folder again
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["cloud", "on", "off", "add", "remove", "exclude_path", "yes"])]
+        include_path: Option<String>,
+        /// With --exclude-path: exclude it
+        #[arg(long, requires = "exclude_path")]
+        yes: bool,
+        /// Suggest folders to exclude: the largest, and the busiest lately
+        #[arg(long, conflicts_with_all = ["cloud", "on", "off", "add", "remove", "exclude_path", "include_path", "yes"])]
+        suggest: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -1405,7 +1423,17 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Autostart { state } => agent::autostart(&data_dir(&cli)?, state.map(Toggle::on)),
-        Cmd::Rules { cloud, on, off, add, remove, profile } => {
+        Cmd::Rules { cloud, on, off, add, remove, exclude_path, include_path, yes, suggest, profile } => {
+            let dir = data_dir(&cli)?;
+            if *suggest {
+                return rules::suggest(&dir, &open_store(&cli, profile.memory_profile)?);
+            }
+            if let Some(p) = exclude_path {
+                return rules::exclude_path(&dir, &open_store(&cli, profile.memory_profile)?, p, *yes).await;
+            }
+            if let Some(p) = include_path {
+                return rules::include_path(&dir, &open_store(&cli, profile.memory_profile)?, p).await;
+            }
             let changes = rules::Changes {
                 cloud: cloud.clone(),
                 on: on.clone(),
@@ -1413,7 +1441,7 @@ async fn run() -> Result<()> {
                 add: add.clone(),
                 remove: remove.clone(),
             };
-            rules::run(&data_dir(&cli)?, &open_store(&cli, profile.memory_profile)?, &changes).await
+            rules::run(&dir, &open_store(&cli, profile.memory_profile)?, &changes).await
         }
         Cmd::Settings {
             upload_kib,
@@ -2886,5 +2914,29 @@ fn verify(cli: &Cli, profile: MemoryProfile) -> Result<()> {
              again rebuilds a folder scan (problems marked \"local:\")",
             problems.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod rules_args_tests {
+    use clap::Parser;
+
+    fn parses(args: &[&str]) -> bool {
+        super::Cli::try_parse_from(std::iter::once("oneup").chain(args.iter().copied())).is_ok()
+    }
+
+    /// Options of `oneup rules` that do different things can't be combined:
+    /// one of them would be ignored. `--yes` only goes with --exclude-path.
+    #[test]
+    fn rules_options_that_would_be_ignored_are_refused() {
+        assert!(parses(&["rules", "--exclude-path", "x", "--yes"]));
+        assert!(parses(&["rules", "--cloud", "prune", "--add", "*.iso"]));
+        assert!(!parses(&["rules", "--cloud", "prune", "--exclude-path", "x", "--yes"]));
+        assert!(!parses(&["rules", "--suggest", "--add", "*.iso"]));
+        assert!(!parses(&["rules", "--suggest", "--exclude-path", "x"]));
+        assert!(!parses(&["rules", "--include-path", "x", "--remove", "y"]));
+        assert!(!parses(&["rules", "--include-path", "x", "--exclude-path", "y"]));
+        assert!(!parses(&["rules", "--yes"]), "--yes needs --exclude-path");
+        assert!(!parses(&["rules", "--include-path", "x", "--yes"]));
     }
 }

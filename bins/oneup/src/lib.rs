@@ -51,6 +51,7 @@ pub mod shellstatus;
 pub mod shortcuts;
 pub mod space;
 pub mod stoplist;
+pub mod suggest;
 pub mod sync;
 #[cfg(windows)]
 pub mod syncroot;

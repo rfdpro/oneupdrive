@@ -450,6 +450,21 @@ pub fn rules_with(mut r: Rules, v: &Value) -> Result<Rules> {
     Ok(r)
 }
 
+/// The window's `tree_sync`: an item ticked (`on`) or, after its preview,
+/// unticked. Unticking with the preview's token (`expect`) excludes only
+/// the item that preview showed (`filetree::exclude_checked`).
+pub fn tree_sync(dir: &Path, args: &Value) -> Result<String> {
+    let on = args.get("on").and_then(Value::as_bool).unwrap_or(false);
+    match args.get("expect").filter(|e| !e.is_null()) {
+        Some(expect) if !on => crate::filetree::exclude_checked(dir, expect),
+        _ => {
+            let rel = args.get("rel").and_then(Value::as_str).unwrap_or_default();
+            let folder = args.get("folder").and_then(Value::as_bool).unwrap_or(false);
+            crate::filetree::set_sync(dir, rel, folder, on)
+        }
+    }
+}
+
 /// The `[space]` changed by the fields present in `v`.
 pub fn space_with(mut s: config::Space, v: &Value) -> Result<config::Space> {
     if let Some(d) = get(v, "free_unused_days") {
