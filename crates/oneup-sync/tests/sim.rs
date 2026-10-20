@@ -792,7 +792,7 @@ impl World {
     /// for a copy set aside or a record forgotten).
     fn rewind_step(&mut self, sid: Sid, step: &Step) -> bool {
         match step {
-            Step::Restore { id, to, name, kind: _, content } => {
+            Step::Restore { id, to, name, content, .. } => {
                 if !self.remote_bin_items.contains_key(&id.0)
                     || !self.r_is_folder(&to.0)
                     || self.r_child(&to.0, name).is_some()
@@ -819,7 +819,10 @@ impl World {
                 if !self.rpre_ok(remote) {
                     return false;
                 }
-                // The place first: if it can't be taken yet, nothing changed.
+                // Content first, then the place, as the executor does.
+                if let Some((_, hash)) = content {
+                    self.put_back(&remote.id.0, hash);
+                }
                 if let Some((to, name)) = place {
                     if !self.r_is_folder(&to.0)
                         || self.r_within(&to.0, &remote.id.0)
@@ -833,9 +836,6 @@ impl World {
                         it.name.clone_from(name);
                         it.etag = etag;
                     }
-                }
-                if let Some((_, hash)) = content {
-                    self.put_back(&remote.id.0, hash);
                 }
                 true
             }
@@ -923,6 +923,10 @@ impl History for World {
 
     fn change_after(&self, sid: Sid, at: i64) -> Result<Option<Option<Was>>, Infallible> {
         Ok(self.history.iter().find(|(t, s, _)| *s == sid && *t > at).map(|(_, _, w)| w.clone()))
+    }
+
+    fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, Infallible> {
+        Ok(self.history.iter().rev().find_map(|(_, _, w)| w.clone().filter(|w| w.remote.as_ref() == Some(id))))
     }
 
     fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>, Infallible> {

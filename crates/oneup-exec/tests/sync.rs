@@ -1337,7 +1337,8 @@ impl Sync {
                     let (take, leave) = job.take(rw.ops, rw.paths);
                     r.left_alone += leave.len();
                     let later: Vec<(Op, String)> = rw.later.into_iter().filter(|(op, _)| job.accepts(op)).collect();
-                    if take.is_empty() && later.is_empty() {
+                    let waiting = rw.skipped.iter().any(|(_, _, why)| why.passes());
+                    if take.is_empty() && later.is_empty() && !waiting {
                         r.done = true;
                     }
                     let (steps, step_paths): (Vec<Op>, Vec<String>) = take.into_iter().unzip();
@@ -6066,18 +6067,38 @@ async fn everyday_a_large_rewind_takes_one_approval() {
 /// was at the moment chosen.
 #[tokio::test]
 async fn a_crash_at_any_point_of_a_rewind_loses_nothing() {
-    const CONTENTS: [&[u8]; 6] = [b"a, first", b"a, second", b"b", b"new", b"x, first", b"x \x01scrambled"];
+    const CONTENTS: [&[u8]; 10] = [
+        b"a, first",
+        b"a, second",
+        b"b",
+        b"new",
+        b"x, first",
+        b"x \x01scrambled",
+        b"c, first",
+        b"c, second!",
+        b"d, first",
+        b"d, second!",
+    ];
     for n in 0.. {
         let cloud = Fake::new();
         let mut s = Sync::on_disk(&format!("crash-rewind{n}"), cloud.clone());
         write(&s.p("docs/a.txt"), b"a, first");
         write(&s.p("docs/b.txt"), b"b");
         write(&s.p("docs/x.txt"), b"x, first");
+        // Two-part steps: c.txt is restored, then its content put back; d.txt
+        // gets its content back, then its name.
+        write(&s.p("docs/c.txt"), b"c, first");
+        write(&s.p("docs/d.txt"), b"d, first");
         s.settle().await;
         let then = local_tree(&s.dir.0);
         let at = moment();
         write(&s.p("docs/a.txt"), b"a, second");
         std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+        cloud.edit("docs/c.txt", b"c, second!");
+        cloud.edit("docs/d.txt", b"d, second!");
+        cloud.rename("docs/d.txt", "d2.txt");
+        s.settle().await;
+        cloud.delete("docs/c.txt");
         cloud.add("docs/new.txt", Some(b"new"));
         s.settle().await;
         // Not synced: set aside by the rewind.
