@@ -1425,22 +1425,62 @@ mod tests {
         s
     }
 
-    /// Records the attributes a pin set would have (as the observer would).
+    /// Records the attributes a pin set would have, through the observer.
     fn observe(s: &mut Store, fake: &Fake, ids: &[(u128, &str)]) {
+        let mut marks = Vec::new();
         for (id, rel) in ids {
             let last = fake.set.iter().rev().find(|(r, _)| r == rel).map(|(_, c)| *c);
             if let Some(c) = last {
-                s.write(|o| {
-                    let mut r = o.local_get(*id)?.unwrap();
-                    r.attributes = match c {
-                        Change::Pin => r.attributes | PINNED,
-                        Change::Unpin => r.attributes & !PINNED,
-                    };
-                    o.local_update(&r)
-                })
-                .unwrap();
+                let a = s.read(|o| o.local_get(*id)).unwrap().unwrap().attributes;
+                marks.push((*id, if c == Change::Pin { a | PINNED } else { a & !PINNED }));
             }
         }
+        journal(s, &marks);
+    }
+
+    /// Feeds the observer (`apply_records`) one attribute-change record per
+    /// item, as the change journal would after File Explorer or a pin set
+    /// `attributes` on it; the synced folder (ID 1) too.
+    fn journal(s: &mut Store, items: &[(u128, u32)]) {
+        use oneup_ntfs::FileId;
+        use oneup_ntfs::dirent::DirEntry;
+        use oneup_ntfs::record::{UsnRecord, reason};
+        let mut records = Vec::new();
+        let mut live = Vec::new();
+        for &(id, attributes) in items {
+            let r = s.read(|o| o.local_get(id)).unwrap().unwrap();
+            records.push(UsnRecord {
+                major_version: 3,
+                file_id: FileId(id),
+                parent_id: FileId(r.parent_id.unwrap_or(0)),
+                usn: 0,
+                timestamp: 0,
+                reason: reason::BASIC_INFO_CHANGE | reason::CLOSE,
+                source_info: 0,
+                attributes,
+                name: None,
+                name_lossy: false,
+            });
+            live.push(DirEntry {
+                file_id: FileId(id),
+                name: r.name.clone(),
+                name_lossy: false,
+                size: u64::try_from(r.size).unwrap(),
+                attributes,
+                reparse_tag: r.reparse_tag,
+                created: 0,
+                modified: r.mtime,
+                changed: 0,
+            });
+        }
+        let mut stat = |l: &oneup_local::observe::Lookup| match live.iter().find(|e| e.file_id == l.id) {
+            Some(e) => oneup_local::observe::Stat::Found(e.clone()),
+            None => oneup_local::observe::Stat::Gone,
+        };
+        let mut ch = oneup_local::observe::Changes::default();
+        let rules = oneup_rules::ExcludeSet::none();
+        s.try_write(|o| oneup_local::observe::apply_records(o, 1, &rules, &records, &mut stat, &mut ch)).unwrap();
+        assert_eq!(ch.unreadable, 0);
     }
 
     fn entry(path: &str) -> ActivityEntry {
@@ -1629,18 +1669,17 @@ mod tests {
         assert_eq!(got, want, "the left-out ones are pinned");
     }
 
-    /// Sets "free up space" on items, as File Explorer does (recorded by the
-    /// observer from the journal).
+    /// Sets "free up space" on items, as File Explorer does, seen by the
+    /// observer from the journal.
     fn explorer_free(s: &mut Store, ids: &[u128]) {
-        s.write(|o| {
-            for id in ids {
-                let mut r = o.local_get(*id)?.unwrap();
-                r.attributes = (r.attributes & !PINNED) | UNPINNED;
-                o.local_update(&r)?;
-            }
-            Ok(())
-        })
-        .unwrap();
+        let marks: Vec<(u128, u32)> = ids
+            .iter()
+            .map(|id| {
+                let a = s.read(|o| o.local_get(*id)).unwrap().unwrap().attributes;
+                (*id, (a & !PINNED) | UNPINNED)
+            })
+            .collect();
+        journal(s, &marks);
     }
 
     /// "Free up space" through a folder (File Explorer marks the folder and
@@ -2205,6 +2244,21 @@ mod tests {
         fake.set.clear();
         let p = run(&mut s, &mut fake, &pins, 0);
         assert_eq!((p.released, p.repinned), (0, 1));
+    }
+
+    /// ...and a folder the user pinned at the top keeps its pin and stays
+    /// the user's.
+    #[test]
+    fn freeing_the_synced_folder_leaves_a_top_folder_the_user_pinned() {
+        let mut s = store(&[row(2, 1, "Kept", LocalKind::Folder, 0x10)]);
+        journal(&mut s, &[(2, 0x10 | PINNED)]);
+        assert!(s.read(|o| o.pin_user_has(2)).unwrap(), "noted as the user's");
+        explorer_free(&mut s, &[1, 2]);
+        let mut fake = Fake::default();
+        let p = run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(p.repinned, 1);
+        assert_eq!(fake.set, [("Kept".to_string(), Change::Pin)]);
+        assert!(s.read(|o| o.pin_user_has(2)).unwrap(), "still the user's");
     }
 
     /// A started download is never refunded, whatever happened to it.

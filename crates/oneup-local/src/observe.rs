@@ -257,6 +257,10 @@ pub fn reapply_rules(o: &Ops<'_>, rules: &ExcludeSet) -> oneup_store::Result<Opt
     Ok(Some(done))
 }
 
+/// `FILE_ATTRIBUTE_PINNED` and `FILE_ATTRIBUTE_UNPINNED`: the only
+/// attributes of the scanned folder itself that the tree keeps up to date.
+const PIN_MARKS: u32 = 0x0008_0000 | 0x0010_0000;
+
 /// Applies one batch of journal records to the Local tree (see the module
 /// docs). Pure apart from `stat`, which reads an item's current metadata,
 /// so it can be tested with made-up records.
@@ -294,6 +298,18 @@ pub fn apply_records(
             // anything inside: stop and require a rescan.
             if r.has(reason::FILE_DELETE) {
                 return Err(Error::NeedsRescan(Rescan::RootGone));
+            }
+            // Its Files On-Demand marks do count: "Free up space" or "Always
+            // keep on this device" on the synced folder itself sets them,
+            // and pin rules read them to tell a folder-level request from a
+            // file's own. The record carries the attributes as they were
+            // when it was written.
+            if let Some(mut root) = o.local_get(id)? {
+                let marks = (root.attributes & !PIN_MARKS) | (r.attributes & PIN_MARKS);
+                if marks != root.attributes {
+                    root.attributes = marks;
+                    o.local_update(&root)?;
+                }
             }
             continue;
         }
@@ -1160,6 +1176,29 @@ mod tests {
         );
         assert!(s.read(|o| o.local_only_hash_get(3, 0, 5)).unwrap().is_none(), "written");
         assert!(s.read(|o| o.local_only_hash_get(4, 0, 5)).unwrap().is_some(), "only its attributes");
+    }
+
+    /// "Free up space" or "Always keep on this device" on the synced
+    /// folder itself reaches its row; its other attributes and the rest
+    /// of the tree stay as they were.
+    #[test]
+    fn the_synced_folders_own_pin_marks_reach_its_row() {
+        const PINNED: u32 = 0x0008_0000;
+        const UNPINNED: u32 = 0x0010_0000;
+        let mut s = tree();
+        let root = |s: &Store| s.read(|o| o.local_get(ROOT_ID)).unwrap().unwrap();
+        let mut r = rec(ROOT_ID, 0, reason::BASIC_INFO_CHANGE | reason::CLOSE);
+        r.attributes = DIR | UNPINNED | 0x2;
+        let ch = apply(&mut s, &[r.clone()], &[]);
+        assert_eq!(root(&s).attributes, DIR | UNPINNED, "only the marks are taken");
+        assert_eq!((ch.created, ch.updated, ch.deleted), (0, 0, 0));
+        assert_eq!(path(&s, 3).as_deref(), Some("/docs/a.txt"));
+        r.attributes = DIR | PINNED;
+        apply(&mut s, &[r.clone()], &[]);
+        assert_eq!(root(&s).attributes, DIR | PINNED);
+        r.attributes = DIR;
+        apply(&mut s, &[r], &[]);
+        assert_eq!(root(&s).attributes, DIR);
     }
 
     #[test]
