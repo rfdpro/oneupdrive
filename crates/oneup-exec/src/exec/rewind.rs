@@ -37,15 +37,33 @@ impl<C: Cloud> Executor<C> {
                         need(row.parent_id.as_deref() == Some(to.0.as_str()) && row.name == *name)?;
                         row
                     }
-                    Ok(None) => match self.cloud.restore(id, to, name).await {
-                        Err(CloudError::Changed) => {
+                    Ok(None) => {
+                        // OneDrive brings an item back where it was deleted
+                        // from, under the name it had, whatever is asked, and
+                        // renames what holds that name (measured): only when
+                        // that's where this step puts it, and nothing has the
+                        // name there now (`data-safety.md` invariant 2).
+                        let land = store.read(|o| landing(o, id))?;
+                        if land.as_ref().is_none_or(|(p, n)| p != to || !oneup_sync::same_name(n, name)) {
                             return Err(Fail::Failed(
-                                "it's no longer in OneDrive's recycle bin, or the folder it goes back into is gone"
-                                    .into(),
+                                "OneDrive would bring it back where it was deleted, not where it goes".into(),
                             ));
                         }
-                        r => r?,
-                    },
+                        match self.cloud.name_taken(to, name).await? {
+                            Some(false) => {}
+                            Some(true) => return Err(Fail::Skip(Skip::NameTaken)),
+                            None => return Err(Fail::Failed("this cloud can't say whether its name is free".into())),
+                        }
+                        match self.cloud.restore(id, to, name).await {
+                            Err(CloudError::Changed) => {
+                                return Err(Fail::Failed(
+                                    "it's no longer in OneDrive's recycle bin, or the folder it goes back into is gone"
+                                        .into(),
+                                ));
+                            }
+                            r => r?,
+                        }
+                    }
                     Err(e) => return Err(e.into()),
                 };
                 self.crash_point()?;
@@ -282,6 +300,20 @@ pub fn rewind_mark(o: &oneup_store::Ops<'_>, op: &Op) -> oneup_store::Result<Mar
         }),
         None => Mark::Absent,
     })
+}
+
+/// Where OneDrive brings deleted item `id` back to (measured: where it was
+/// deleted from, under the name it had): its last record's folder, by its
+/// OneDrive ID, and name. `None`: not known.
+fn landing(o: &oneup_store::Ops<'_>, id: &RemoteId) -> oneup_store::Result<Option<(RemoteId, String)>> {
+    use oneup_sync::rewind::History as _;
+    let Some(was) = o.last_seen(id)? else { return Ok(None) };
+    let Some(parent) = was.parent else { return Ok(None) };
+    let folder = match o.synced_get(parent)?.and_then(|b| b.remote) {
+        Some(r) => Some(r),
+        None => o.history_remote_of(parent)?,
+    };
+    Ok(folder.map(|f| (f, was.name)))
 }
 
 /// What this PC is to do to follow rewind step `op`, which just ran, bound

@@ -873,19 +873,39 @@ impl Cloud for Fake {
         .await
     }
 
+    async fn name_taken(&self, parent: &RemoteId, name: &str) -> Result<Option<bool>, CloudError> {
+        self.exchange(|| -> Result<Option<bool>, CloudError> {
+            Ok(Some(self.0.lock().unwrap().child(&parent.0, name).is_some()))
+        })
+        .await
+    }
+
+    /// As Graph does (measured, `graph-restore-taken-name`): back where it
+    /// was deleted from, under the name it had, whatever is asked; an item
+    /// holding that name is renamed `name(1)`.
     async fn restore(&self, id: &RemoteId, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        let _ = (parent, name);
         self.exchange(|| -> Result<RemoteRow, CloudError> {
             let mut s = self.0.lock().unwrap();
-            if !s.bin.contains_key(&id.0) || !s.items.get(&parent.0).is_some_and(|p| p.folder) {
+            let Some(land) = s.bin.get(&id.0).and_then(|it| it.parent.clone()) else {
+                return Err(CloudError::Changed);
+            };
+            if !s.items.get(&land).is_some_and(|p| p.folder) {
                 return Err(CloudError::Changed);
             }
-            if s.child(&parent.0, name).is_some() {
-                return Err(CloudError::NameTaken);
+            let own = s.bin[&id.0].name.clone();
+            if let Some(holder) = s.child(&land, &own) {
+                let renamed = match own.rsplit_once('.') {
+                    Some((stem, ext)) if !stem.is_empty() => format!("{stem}(1).{ext}"),
+                    _ => format!("{own}(1)"),
+                };
+                let etag = s.bump();
+                let h = s.items.get_mut(&holder).unwrap();
+                h.name = renamed;
+                h.etag = etag;
             }
             let etag = s.bump();
             let mut it = s.bin.remove(&id.0).unwrap();
-            it.parent = Some(parent.0.clone());
-            it.name = name.into();
             it.etag = etag;
             let mut at = id.0.clone();
             if let Some((other, new_id)) = s.restore_odd.take() {
@@ -6129,7 +6149,9 @@ async fn everyday_restoring_a_onedrive_version_and_a_deleted_item() {
     assert!(cloud.holds(b"version two"), "the version it replaced stays in the history");
 
     // An item deleted here comes back from OneDrive's recycle bin by the ID
-    // the history recorded, beside a new file that took its name meanwhile.
+    // the history recorded, under its name in its folder (OneDrive takes no
+    // other): while a new file has that name, it isn't restored (OneDrive
+    // would rename the new one); once that one is renamed, it is.
     std::fs::remove_file(s.p("docs/b.txt")).unwrap();
     s.settle().await;
     write(&s.p("docs/b.txt"), b"another bee");
@@ -6141,15 +6163,20 @@ async fn everyday_restoring_a_onedrive_version_and_a_deleted_item() {
     let op = s
         .obs
         .store()
-        .read(|o| oneup_exec::recover::deleted_op(o, b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File))
+        .read(|_| Ok(oneup_exec::recover::deleted_op(b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File)))
         .unwrap();
-    assert!(
-        matches!(op.rewind_step(), Some(oneup_sync::rewind::Step::Restore { name, .. }) if name == "b (restored 1).txt")
-    );
+    s.extra = vec![op.clone()];
+    let r = s.attempt().await;
+    assert!(r.skipped.iter().any(|(o, why)| *o == op && *why == oneup_exec::Skip::NameTaken), "{r:?}");
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"another bee", "not renamed, not replaced");
+    assert!(!cloud.tree().keys().any(|p| p.contains("(1)")), "nothing renamed: {:?}", cloud.tree());
+    std::fs::rename(s.p("docs/b.txt"), s.p("docs/b2.txt")).unwrap();
+    s.settle().await;
     s.extra = vec![op];
     s.settle().await;
-    assert_eq!(std::fs::read(s.p("docs/b (restored 1).txt")).unwrap(), b"bee");
-    assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"another bee");
+    assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"bee");
+    assert_eq!(std::fs::read(s.p("docs/b2.txt")).unwrap(), b"another bee");
     let listed = s.obs.store().read(|o| o.history_removed(10, None)).unwrap();
     assert!(listed.iter().all(|r| r.was.remote.as_ref() != Some(&id)), "back in OneDrive: not listed as deleted");
 }
@@ -6202,7 +6229,7 @@ async fn everyday_a_restore_that_comes_back_elsewhere_is_moved_where_asked() {
     let op = s
         .obs
         .store()
-        .read(|o| oneup_exec::recover::deleted_op(o, b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File))
+        .read(|_| Ok(oneup_exec::recover::deleted_op(b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File)))
         .unwrap();
     // OneDrive brings it back under another name than asked.
     cloud.0.lock().unwrap().restore_odd = Some(("b 1.txt".into(), false));
@@ -6560,7 +6587,7 @@ async fn a_restore_into_a_name_taken_meanwhile_replaces_nothing() {
     let op = s
         .obs
         .store()
-        .read(|o| oneup_exec::recover::deleted_op(o, b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File))
+        .read(|_| Ok(oneup_exec::recover::deleted_op(b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File)))
         .unwrap();
     assert!(matches!(op.rewind_step(), Some(oneup_sync::rewind::Step::Restore { name, .. }) if name == "b.txt"));
     let c = cloud.clone();

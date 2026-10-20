@@ -128,6 +128,10 @@ struct World {
     /// only when `track` is set.
     history: Vec<(i64, Sid, Option<Was>)>,
     track: bool,
+    /// Records whose item OneDrive can't bring back where it was deleted
+    /// from (that folder gone, or its name taken there now): a restore
+    /// lands only there, whatever is asked (measured), so it waits.
+    unlanded: BTreeSet<Sid>,
 
     bases: BTreeMap<Sid, Base>,
     next_sid: Sid,
@@ -156,6 +160,7 @@ impl World {
             remote_history: BTreeMap::new(),
             history: Vec::new(),
             track: false,
+            unlanded: BTreeSet::new(),
             bases: BTreeMap::new(),
             next_sid: ROOT + 1,
             next_content: 1,
@@ -793,19 +798,29 @@ impl World {
     fn rewind_step(&mut self, sid: Sid, step: &Step) -> bool {
         match step {
             Step::Restore { id, to, name, content, .. } => {
-                if !self.remote_bin_items.contains_key(&id.0)
-                    || !self.r_is_folder(&to.0)
-                    || self.r_child(&to.0, name).is_some()
+                // As OneDrive does (measured): back into the folder it was
+                // deleted from, under the name it had, whatever was asked;
+                // the executor asks only when that's where the step puts it
+                // and nothing has the name there.
+                let Some((Some(land), land_name)) =
+                    self.remote_bin_items.get(&id.0).map(|it| (it.parent.clone(), it.name.clone()))
+                else {
+                    return false;
+                };
+                if land != to.0
+                    || !oneup_sync::same_name(&land_name, name)
+                    || !self.r_is_folder(&land)
+                    || self.r_child(&land, &land_name).is_some()
                 {
+                    self.unlanded.insert(sid);
                     return false;
                 }
                 let etag = self.etag();
                 let Some(mut it) = self.remote_bin_items.remove(&id.0) else { return false };
-                it.parent = Some(to.0.clone());
-                it.name.clone_from(name);
                 it.etag = etag;
                 self.remote.insert(id.0.clone(), it);
                 self.remote_gone.remove(&id.0);
+
                 // Done once restored: content still to put back is planned
                 // again from what's there.
                 if let Some((_, hash)) = content
@@ -1675,7 +1690,16 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
             return (skipped, sids);
         }
         let mut progress = false;
-        let (todo, _) = job.take(r.ops.clone(), r.paths.clone());
+        let (todo, leave) = job.take(r.ops.clone(), r.paths.clone());
+        // Left alone (not as approved): reported, as the agent does, with
+        // where it is now.
+        for (op, path) in &leave {
+            skipped.insert(path.trim_start_matches('/').to_string());
+            let (_, _, remote) = op.subjects();
+            if let Some(id) = remote.filter(|r| w.remote.contains_key(&r.0)) {
+                skipped.insert(remote_path(w, &id.0));
+            }
+        }
         for (op, path) in &todo {
             if w.apply_logged(op) {
                 job.ran(op, mark_now(w, op));
@@ -1822,7 +1846,9 @@ fn rewinding_a_folder_reproduces_it_and_a_rewind_can_be_rewound() {
             let (skipped, skipped_sids) = rewind(&mut w, folder, at, debug);
             assert_converged(&w, &BTreeSet::new());
             if folder == ROOT {
-                assert!(skipped.is_empty(), "the whole drive is covered: {skipped:?}");
+                // But what OneDrive can't bring back where it was deleted
+                // (and what waits for that), left out of the comparisons.
+                assert!(skipped.is_empty() || !w.unlanded.is_empty(), "the whole drive is covered: {skipped:?}");
             }
             // The folder is back under its name then, wherever the folder
             // it's in is now (that one isn't rewound).
@@ -1856,10 +1882,15 @@ fn rewinding_a_folder_reproduces_it_and_a_rewind_can_be_rewound() {
             assert_eq!(local_view(&w), remote_view(&w));
 
             // Rewinding the rewind: the drive as it was just before.
+            w.unlanded.clear();
             let (skipped, _) = rewind(&mut w, ROOT, before_at, debug);
             assert_converged(&w, &BTreeSet::new());
-            assert!(skipped.is_empty(), "the whole drive is covered: {skipped:?}");
-            assert_eq!(local_view(&w), before, "rewinding the rewind didn't put back what was there");
+            assert!(skipped.is_empty() || !w.unlanded.is_empty(), "the whole drive is covered: {skipped:?}");
+            assert_eq!(
+                without(local_view(&w), &skipped),
+                without(before, &skipped),
+                "rewinding the rewind didn't put back what was there"
+            );
         }));
         if let Err(e) = result {
             eprintln!("rewind simulation failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1");

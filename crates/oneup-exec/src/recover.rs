@@ -60,29 +60,15 @@ pub fn restored_name(name: &str, n: u32, kind: NodeKind) -> String {
 }
 
 /// The step that brings deleted item `id` (record `sid`) back from
-/// OneDrive's recycle bin into folder `parent`, as `name` or, if the store
-/// lists that as taken, `name (restored N)`. Nothing is replaced: a name
-/// taken meanwhile fails it (OneDrive refuses), and it can be asked again.
-pub fn deleted_op(
-    o: &Ops<'_>,
-    sid: Sid,
-    id: &RemoteId,
-    parent: &RemoteId,
-    name: &str,
-    kind: NodeKind,
-) -> oneup_store::Result<Op> {
-    let taken: std::collections::HashSet<String> =
-        o.remote_children(&parent.0)?.into_iter().map(|(r, _)| oneup_sync::fold(&r.name)).collect();
-    let mut chosen = name.to_string();
-    let mut n = 0;
-    while taken.contains(&oneup_sync::fold(&chosen)) {
-        n += 1;
-        chosen = restored_name(name, n, kind);
-    }
-    Ok(Op::rewind(
+/// OneDrive's recycle bin into folder `parent`, the one it was deleted
+/// from, under its `name`: OneDrive takes no other (measured). While an
+/// item has that name there, the step doesn't restore (it would rename that
+/// one); it's skipped, and can be asked again.
+pub fn deleted_op(sid: Sid, id: &RemoteId, parent: &RemoteId, name: &str, kind: NodeKind) -> Op {
+    Op::rewind(
         sid,
-        Step::Restore { id: id.clone(), to: parent.clone(), name: chosen, kind, content: None, gone: None },
-    ))
+        Step::Restore { id: id.clone(), to: parent.clone(), name: name.to_string(), kind, content: None, gone: None },
+    )
 }
 
 /// After restore step `op` (a [`deleted_op`]) ran: if OneDrive brought the

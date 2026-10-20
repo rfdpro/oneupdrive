@@ -1061,6 +1061,10 @@ impl Cloud for GraphCloud {
         Ok(versions.into_iter().map(|v| VersionMark { id: v.id, modified_ms: v.modified_ms, size: v.size }).collect())
     }
 
+    async fn name_taken(&self, parent: &RemoteId, name: &str) -> Result<Option<bool>, CloudError> {
+        Ok(Some(self.graph.child_named(&parent.0, name).await.map_err(map)?.is_some()))
+    }
+
     async fn restore(&self, id: &RemoteId, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
         let item = self.graph.restore_deleted(&id.0, &parent.0, name).await.map_err(map)?;
         self.row_of(item).await

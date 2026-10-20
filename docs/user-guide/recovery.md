@@ -16,6 +16,7 @@ What it leaves alone:
 * **Changes not synced yet.** A file changed in OneDrive that your PC hasn't fetched yet is skipped, and listed as such. A file you changed on this PC since the last sync, without it reaching OneDrive (as when the [content guard](syncing.md#the-content-guard-ransomware) holds scrambled files back), is **set aside**: it goes to kept copies, and OneDrive's copy comes back.
 * **What was there but only started syncing since** (a file a rule left out, say): a file last saved before the moment you picked isn't removed, and a folder holding such a file stays. They're listed as left alone.
 * **What OneUpDrive never saw.** The rewind works from OneUpDrive's own history of what it synced. That history starts when a folder's first sync finishes and keeps 30 days (at most a million changes), so you can't rewind further back than that. Files that were never synced aren't touched.
+* **What OneDrive can only put back elsewhere.** OneDrive brings a deleted item back where it was deleted, under the name it had. An item moved or renamed after the moment and then deleted can't come back to where it was then this way, and one whose name something else has there now isn't brought back (OneDrive would rename that one). They're left, and the activity log says so.
 * **What OneDrive no longer has.** OneDrive keeps deleted items in its recycle bin for a limited time (30 days for personal accounts, less if the bin is full) and a limited number of versions. What's gone from there can't come back; the rest of the rewind still runs, and the activity log says what couldn't be done.
 
 If the list changed between the preview and **Rewind** (something synced meanwhile), nothing starts: the new list is shown to look at again.
@@ -51,7 +52,7 @@ Files sync removed from or replaced on your PC, kept in `.oneup\versions`. **Res
 Type the full path of a file in your synced folder, then **Show**: the versions OneDrive keeps. **Open** saves a copy of one outside your synced folder; **Restore** makes it the current one, and the one it replaces stays in the history. The same as [Version history](versions-and-sharing.md#version-history) on the Files page.
 
 ## Deleted from OneDrive
-Items deleted from OneDrive, newest first, with **Restore**: the next sync brings the item back from OneDrive's recycle bin to the folder it was in (under ` (restored 1)` if the name is taken now), and your PC gets it.
+Items deleted from OneDrive, newest first, with **Restore**: the next sync brings the item back from OneDrive's recycle bin to the folder it was in, under its name, and your PC gets it. If something has that name there now, it isn't restored (OneDrive would rename that one): rename or move it first, then ask again.
 
 Only items OneUpDrive saw deleted are listed: OneDrive doesn't let apps read its recycle bin for personal accounts, only bring back an item it knows. Everything else is in the recycle bin on OneDrive's website. An item whose folder was deleted too can be restored once its folder is back.
 

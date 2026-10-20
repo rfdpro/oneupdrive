@@ -248,6 +248,19 @@ pub trait Cloud: Send + Sync {
         async { Err(CloudError::Other("this cloud can't re-read items".into())) }
     }
 
+    /// Whether folder `parent` has an item named `name` in the cloud now
+    /// (`None`: this cloud can't tell). Read-only; asked right before a
+    /// restore from the recycle bin, which takes the name from whatever
+    /// holds it.
+    fn name_taken(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<bool>, CloudError>> + Send {
+        let _ = (parent, name);
+        async { Ok(None) }
+    }
+
     /// Whether item `id` is in folder `parent` under `name` in the cloud now
     /// (`Some(false)` if it's gone; `None`: this cloud can't tell).
     /// Read-only; for a move here that follows one in the cloud, which a

@@ -727,17 +727,30 @@ impl Graph {
         self.json(&req).await
     }
 
-    /// Brings deleted item `id` back from the OneDrive recycle bin into
-    /// folder `parent` as `name` (`POST /items/{id}/restore`, documented for
-    /// OneDrive Personal only). 404: it's no longer in the recycle bin; 409:
-    /// the name is taken. The one remote change without `If-Match` (an item
-    /// in the recycle bin has no eTag Graph takes): it only adds, and never
-    /// asks for anything to be replaced (`data-safety.md` invariant 2).
+    /// Brings deleted item `id` back from the OneDrive recycle bin
+    /// (`POST /items/{id}/restore`, documented for OneDrive Personal only).
+    /// Measured: it comes back where it was deleted from, under the name it
+    /// had, whatever `parent` and `name` say; an item holding that name is
+    /// renamed `name(1)` (no 409); 404: it's no longer in the recycle bin.
+    /// The one remote change without `If-Match` (an item in the recycle bin
+    /// has no eTag Graph takes); the caller checks the name is free first
+    /// (`data-safety.md` invariant 2).
     pub async fn restore_deleted(&self, id: &str, parent: &str, name: &str) -> Result<DriveItem> {
         let url = format!("{}/items/{}/restore", self.drive_url(), encode_id(id));
         let body = restore_body(parent, name);
         let req = Req { json: Some(&body), ..Req::new(reqwest::Method::POST, &url) };
         self.json(&req).await
+    }
+
+    /// Folder `parent`'s child named `name` (as OneDrive compares names),
+    /// if it has one. Read-only.
+    pub async fn child_named(&self, parent: &str, name: &str) -> Result<Option<DriveItem>> {
+        let url = format!("{}/items/{}:/{}:", self.drive_url(), encode_id(parent), encode_drive_path(name));
+        match self.get(&url).await {
+            Ok(it) => Ok(Some(it)),
+            Err(e) if e.status() == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Deletes an item into the OneDrive recycle bin, if its eTag is still
