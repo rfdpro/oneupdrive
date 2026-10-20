@@ -892,6 +892,19 @@ trace:
                 got.difference(&want).collect::<Vec<_>>()
             );
         }
+        // The name index follows every change the mirror made: each item
+        // is found by its name, and nothing else is in it.
+        m2.read(|o| {
+            assert!(o.search_problems()?.is_empty(), "seed {seed} round {round}: {:?}", o.search_problems()?);
+            for (r, _) in
+                o.all_items()?.into_iter().filter(|(r, _)| r.kind != Kind::Root && r.name.chars().count() >= 3)
+            {
+                let found = o.search_names(&r.name, usize::MAX >> 4)?;
+                assert!(found.hits.iter().any(|h| h.row.id == r.id), "seed {seed} round {round}: {} not found", r.name);
+            }
+            Ok(())
+        })
+        .unwrap();
         drop(m2);
         fake.with(|i| {
             i.during_enumeration.clear();
