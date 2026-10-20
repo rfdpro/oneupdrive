@@ -442,12 +442,16 @@ mod tests {
                 o.local_put(&local(10, 9 * MIB, 100))
             })
             .unwrap();
-            s.read(|o| Ok(o.c.execute_batch(&format!("{UNDO_V20} PRAGMA user_version = 19;"))?)).unwrap();
+            s.read(|o| {
+                let undo = format!("{} {UNDO_V20} PRAGMA user_version = 19;", crate::shared::UNDO_V21);
+                Ok(o.c.execute_batch(&undo)?)
+            })
+            .unwrap();
             assert_eq!(table(&s), 0, "a v19 store");
         }
         let mut s = Store::open(&path, 1024).unwrap();
         let version = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?)).unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, crate::SCHEMA_VERSION, "upgraded to the latest");
         assert_eq!(table(&s), 1);
         assert!(s.write(|o| o.local_only_hash_put(10, 9 * MIB, 100, &[3; 20])).unwrap());
         assert_eq!(s.read(|o| o.local_only_hash_count()).unwrap(), 1);

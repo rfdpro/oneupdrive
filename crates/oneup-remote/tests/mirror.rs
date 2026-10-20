@@ -38,6 +38,9 @@ struct Inner {
     during_enumeration: Vec<Box<dyn FnOnce(&mut Inner) + Send>>,
     /// Human-readable record of mutations, printed when a simulation fails.
     trace: Vec<String>,
+    /// Items shared directly, and when. Like Graph, an item inside a shared
+    /// folder carries the folder's `shared` facet too.
+    shared: BTreeMap<String, i64>,
 }
 
 impl Inner {
@@ -79,6 +82,37 @@ impl Inner {
         self.trace.push(format!("seq {} rename {id} -> {name:?}", self.seq));
     }
 
+    /// Shares (`Some(when)`) or stops sharing an item. Only the item itself
+    /// is reported changed: what inherits its sharing isn't.
+    fn share(&mut self, id: &str, at: Option<i64>) {
+        match at {
+            Some(t) => self.shared.insert(id.to_string(), t),
+            None => self.shared.remove(id),
+        };
+        self.touch(id);
+        self.trace.push(format!("seq {} share {id} {at:?}", self.seq));
+    }
+
+    /// The `shared` facet `id` carries: its own sharing, or the nearest
+    /// shared folder's above it.
+    fn shared_facet(&self, id: &str) -> Option<oneup_graph::model::SharedFacet> {
+        let mut cur = Some(id.to_string());
+        while let Some(c) = cur {
+            if let Some(t) = self.shared.get(&c) {
+                // Times within the first day, in seconds: enough here.
+                let s = t / 1000;
+                let when = format!("1970-01-01T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60);
+                return Some(oneup_graph::model::SharedFacet {
+                    scope: Some("users".into()),
+                    shared_date_time: Some(when),
+                    shared_by: None,
+                });
+            }
+            cur = self.nodes.get(&c).and_then(|n| n.parent.clone());
+        }
+        None
+    }
+
     fn children(&self, id: &str) -> Vec<String> {
         self.nodes.iter().filter(|(_, n)| n.parent.as_deref() == Some(id)).map(|(k, _)| k.clone()).collect()
     }
@@ -118,6 +152,7 @@ impl Inner {
             deleted: None,
             root: (n.kind == Kind::Root).then(Facet::default),
             file_system_info: None,
+            shared: self.shared_facet(id),
         })
     }
 
@@ -134,6 +169,7 @@ impl Inner {
             deleted: Some(Facet::default()),
             root: None,
             file_system_info: None,
+            shared: None,
         }
     }
 }
@@ -430,6 +466,66 @@ async fn changes_during_enumeration_are_caught_up() {
     let m = mirror(&fake, Store::open_in_memory().unwrap(), ExcludeSet::dev());
     m.run().await.unwrap();
     assert_eq!(actual(&m), expected(&fake, &ExcludeSet::dev()));
+}
+
+/// The sharing audit's list comes from the mirror alone: shared items are
+/// marked as delta delivers them, and the marks follow later changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_items_are_marked_from_the_listing_and_follow_changes() {
+    let fake = Arc::new(Fake::new(3, true));
+    populate(&fake);
+    let find = |i: &Inner, name: &str| i.nodes.iter().find(|(_, n)| n.name == name).map(|(k, _)| k.clone()).unwrap();
+    let (docs, notes, f0, code, nm, deep) = fake.with(|i| {
+        let docs = find(i, "Documents");
+        i.share(&docs, Some(1_000_000));
+        let f0 = find(i, "f0.rs");
+        i.share(&f0, Some(2_000_000));
+        // An excluded folder shared, and a file shared inside one.
+        let nm = find(i, "node_modules");
+        i.share(&nm, Some(5_000_000));
+        let deep = find(i, "deep.js");
+        i.share(&deep, Some(6_000_000));
+        (docs, find(i, "notes.txt"), f0, find(i, "Code"), nm, deep)
+    });
+    let path = temp_db("shared");
+    let marked = |m: &Mirror<Fake>, id: &str| m.read(|o| o.is_marked_shared(id)).unwrap();
+    // Every mark is for an item the mirror holds: none leaked.
+    let no_leaks = |m: &Mirror<Fake>| {
+        let mut held = 0;
+        let mut after: Option<String> = None;
+        loop {
+            let page = m.read(|o| o.shared_page(after.as_deref(), 7)).unwrap();
+            assert!(page.unheld.is_empty(), "marks nothing will list: {:?}", page.unheld);
+            let Some(last) = page.last else { break };
+            after = Some(last);
+            held += page.rows.len() as u64;
+        }
+        assert_eq!(m.read(|o| o.shared_count()).unwrap(), held, "marks for items the mirror doesn't hold");
+    };
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), ExcludeSet::dev());
+    m.run().await.unwrap();
+    assert!(marked(&m, &docs) && marked(&m, &f0) && marked(&m, &nm));
+    assert!(marked(&m, &notes), "what inherits a folder's sharing carries the facet too");
+    assert!(!marked(&m, &deep), "nothing inside an excluded folder is kept");
+    no_leaks(&m);
+    drop(m);
+
+    fake.with(|i| i.share(&f0, None));
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), ExcludeSet::dev());
+    m.run().await.unwrap();
+    assert!(!marked(&m, &f0));
+    no_leaks(&m);
+    drop(m);
+
+    // Deleted from OneDrive: the marks go with it.
+    fake.with(|i| {
+        i.delete(&docs);
+        i.share(&code, Some(3_000_000));
+    });
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), ExcludeSet::dev());
+    m.run().await.unwrap();
+    assert!(!marked(&m, &docs) && !marked(&m, &notes) && marked(&m, &code));
+    no_leaks(&m);
 }
 
 #[tokio::test(flavor = "multi_thread")]

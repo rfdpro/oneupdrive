@@ -775,7 +775,8 @@ mod tests {
             drive(&mut s);
             s.read(|o| {
                 let undo = format!(
-                    "{} {} {UNDO_V18} PRAGMA user_version = 17;",
+                    "{} {} {} {UNDO_V18} PRAGMA user_version = 17;",
+                    crate::shared::UNDO_V21,
                     crate::dupes::UNDO_V20,
                     crate::choose::UNDO_V19
                 );
