@@ -119,7 +119,7 @@ impl Pair {
         *self.s.nodes.write().unwrap() = p.nodes.clone();
         let store = self.obs.store_mut();
         apply(store, &self.s.src, &p).unwrap();
-        self.relinked += store.write(oneup_exec::settle_moves).unwrap().relinked;
+        self.relinked += self.exec.settle_moves(store).unwrap().relinked;
         let ops = store
             .read(|o| {
                 let p = Parked::new(o);
@@ -403,7 +403,7 @@ async fn a_vault_move_to_an_entry_left_without_its_contents_is_not_followed() {
 /// A vault move that rebuilds the entry under a new ID (a name that becomes
 /// too long to store as it is, or a long name that no longer is), with the
 /// process killed after the move and before its record: the next round
-/// records it where it went (`oneup_exec::settle_moves`) instead of reading
+/// records it where it went (`Executor::settle_moves`) instead of reading
 /// the old ID's removal as a deletion. Nothing is recycled or duplicated,
 /// a folder's contents included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -441,4 +441,34 @@ async fn a_vault_move_cut_short_by_a_crash_is_recorded_where_it_went() {
         assert_eq!(p.relinked, 1, "case {i}: recorded where it went, not held");
         assert!(p.obs.store().read(|o| o.meta_under("exec.moving")).unwrap().is_empty(), "case {i}");
     }
+}
+
+/// The same with Files On-Demand, for an online-only file: once the move is
+/// recorded where it went, its placeholder names the rebuilt entry, so it
+/// still opens with its content (the old ID is gone; hydrating by it would
+/// be refused for good).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_online_only_file_whose_vault_move_a_crash_cut_short_still_opens() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    s.vc.upload(&root, "f.txt", None, 7, &mut &b"content"[..]).await.unwrap();
+    let mut p = Pair::new("move-crash-ondemand", s, true);
+    p.quiesce().await;
+    let info = |f: &Path| provider::info(&provider::open(f).unwrap()).unwrap().unwrap();
+    assert_eq!(info(&p.p("f.txt")).on_disk, 0, "online-only");
+
+    let long = p.p(&format!("{}.txt", "a long name ".repeat(20)));
+    std::fs::rename(p.p("f.txt"), &long).unwrap();
+    p.exec.crash_after(Some(0));
+    let r = p.attempt().await;
+    assert_eq!(r.halted.as_deref(), Some(oneup_exec::CRASHED), "{r:?}");
+    p.exec.crash_after(None);
+    p.quiesce().await;
+
+    assert_eq!(p.relinked, 1, "recorded where it went");
+    assert_eq!(info(&long).on_disk, 0, "still online-only");
+    assert_eq!(app_read(&long).unwrap(), b"content", "and opens with its content");
+    assert_eq!(p.versions(), 0);
+    drop(p);
 }

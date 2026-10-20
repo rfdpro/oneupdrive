@@ -16,19 +16,21 @@
 //!   plan makes it again;
 //! * the old item is gone and exactly one item where the move took it is
 //!   provably the one moved: the Synced row is relinked to it, at the place
-//!   the move recorded, as the executor would have done. For a file, the
-//!   one item there of that name (as names compare) linked to nothing with
-//!   the Synced row's size and hash; for a folder, the one folder there of
+//!   the move recorded, as the executor would have done (a file's
+//!   placeholder identity included). For a file, the one item there of that
+//!   name (as names compare) linked to nothing with the Synced row's size
+//!   and hash, and none whose hash isn't listed; for a folder, the one folder there of
 //!   that name, none linked. A vault folder can hold names that differ
 //!   only in case, so a name alone proves nothing;
 //! * otherwise the old ID's removal is no evidence of a deletion
 //!   (`data-safety.md` invariant 3): the evidence is withdrawn, so the item
 //!   reads as missing, which holds it. With no candidate at all the record
-//!   goes (the hold stays, for the user to settle); with several, it stays
-//!   for the next round, whose listing may tell them apart.
+//!   goes (the hold stays, for the user to settle); with several, or a file
+//!   whose hash isn't listed, it stays for the next round, whose listing
+//!   may tell them apart.
 
-use oneup_store::{Kind, Ops, Result};
-use oneup_sync::{NodeKind, RemoteId, Sid};
+use oneup_store::{Kind, LocalKind, Ops, RemoteRow, Result};
+use oneup_sync::{LocalId, LocalPre, NodeKind, RemoteId, Sid};
 
 /// Where moves written ahead are kept: `exec.moving.<sid>`.
 pub(crate) const MOVING: &str = "exec.moving";
@@ -68,10 +70,14 @@ impl MoveIntent {
 }
 
 /// What [`settle_moves`] did.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Settled {
     /// Synced rows relinked to the item their move made.
     pub relinked: usize,
+    /// Of those, the files here, with the item each now names: an online-only
+    /// file's placeholder identity follows it, as after a move recorded at
+    /// once (`Executor::settle_moves`).
+    pub files: Vec<(LocalPre, RemoteRow)>,
     /// Moves with nothing where they went that could be their item: held
     /// for the user, the record dropped.
     pub held: usize,
@@ -80,11 +86,13 @@ pub struct Settled {
     pub waiting: usize,
 }
 
-/// Settles the moves a round cut short left (see the module docs). Call it
-/// once the Remote tree is current and before planning. Costs a few
-/// indexed lookups per record left over (the destination's items of that
-/// name only): none in a round that wasn't cut short.
-pub fn settle_moves(o: &Ops<'_>) -> Result<Settled> {
+/// Settles the moves a round cut short left (see the module docs), in the
+/// store only: callers go through `Executor::settle_moves`, which also
+/// renews the placeholders of the files relinked. Call it once the Remote
+/// tree is current and before planning. Costs a few indexed lookups per
+/// record left over (the destination's items of that name only): none in a
+/// round that wasn't cut short.
+pub(crate) fn settle_moves(o: &Ops<'_>) -> Result<Settled> {
     let mut out = Settled::default();
     for (key, value) in o.meta_under(MOVING)? {
         let Some(m) = MoveIntent::decode(&value) else {
@@ -114,12 +122,16 @@ pub fn settle_moves(o: &Ops<'_>) -> Result<Settled> {
                 unlinked.push(r);
             }
         }
-        // What could be the item moved, and whether it's proved to be.
+        // What could be the item moved, and whether it's proved to be. A
+        // file without a hash on either side can't be told apart (Graph
+        // sometimes omits one): it stays a candidate until a listing has it.
         let (candidates, proved) = match b.kind {
             NodeKind::File => {
-                let same: Vec<_> =
-                    unlinked.into_iter().filter(|r| b.hash.is_some() && r.qxh == b.hash && r.size == b.size).collect();
-                let proved = same.len() == 1;
+                let (unproven, hashed): (Vec<_>, Vec<_>) =
+                    unlinked.into_iter().partition(|r| b.hash.is_none() || r.qxh.is_none());
+                let mut same: Vec<_> = hashed.into_iter().filter(|r| r.qxh == b.hash && r.size == b.size).collect();
+                let proved = same.len() == 1 && unproven.is_empty();
+                same.extend(unproven);
                 (same, proved)
             }
             NodeKind::Folder => {
@@ -132,6 +144,12 @@ pub fn settle_moves(o: &Ops<'_>) -> Result<Settled> {
             // Its eTag stays the one last agreed: the planner compares
             // content by hash, and without one an eTag that differs costs
             // a download recognised as identical.
+            if let Some(l) = b.local
+                && let Some(row) = o.local_get(l.0)?
+                && row.kind == LocalKind::File
+            {
+                out.files.push((LocalPre { id: LocalId(row.file_id), stamp: Some((row.size, row.mtime)) }, r.clone()));
+            }
             let parent = Some(m.parent);
             o.synced_put(&oneup_sync::Base { remote: Some(RemoteId(r.id)), parent, name: m.name, ..b })?;
             o.meta_delete(&key)?;
@@ -155,8 +173,8 @@ pub fn settle_moves(o: &Ops<'_>) -> Result<Settled> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use oneup_store::{RemoteRow, Store};
-    use oneup_sync::{Base, LocalId, ROOT};
+    use oneup_store::Store;
+    use oneup_sync::{Base, ROOT};
 
     const H: [u8; 20] = [7; 20];
 
@@ -321,6 +339,28 @@ mod tests {
         assert_eq!(remote_of(&s, 3), "old");
         assert!(!noted_gone(&s, "old"), "held, not deleted");
         assert!(left(&s).is_empty(), "not looked for again");
+    }
+
+    /// A same-name file whose listing has no hash may be it: held, and
+    /// tried again, until a listing has its hash.
+    #[test]
+    fn a_file_without_a_hash_waits_for_one() {
+        let mut s = store(NodeKind::File);
+        s.write(|o| o.upsert_item(&RemoteRow { qxh: None, ..row("new", "b", "a long name.txt", Kind::File) }, false))
+            .unwrap();
+        assert_eq!(s.write(settle_moves).unwrap(), Settled { waiting: 1, ..Settled::default() });
+        assert_eq!(remote_of(&s, 3), "old");
+        assert_eq!(left(&s).len(), 1);
+        // Also next to one that is proved: two that could be it.
+        s.write(|o| o.upsert_item(&row("twin", "b", "A long name.txt", Kind::File), false)).unwrap();
+        assert_eq!(s.write(settle_moves).unwrap(), Settled { waiting: 1, ..Settled::default() });
+        // Its hash listed (other content): the proved one is it.
+        s.write(|o| {
+            o.upsert_item(&RemoteRow { qxh: Some([8; 20]), ..row("new", "b", "a long name.txt", Kind::File) }, false)
+        })
+        .unwrap();
+        assert_eq!(s.write(settle_moves).unwrap(), Settled { relinked: 1, ..Settled::default() });
+        assert_eq!(remote_of(&s, 3), "twin");
     }
 
     /// Nothing there at all: held, and the record goes.

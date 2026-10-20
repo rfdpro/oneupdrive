@@ -565,6 +565,31 @@ pub fn link_roots(o: &Ops<'_>, local_root: u128, remote_root: &str) -> oneup_sto
     }
 }
 
+impl<C: Cloud> Executor<C> {
+    /// Settles the moves a round cut short left (`crate::moving`): call it
+    /// once the Remote tree is current and before planning. A file relinked
+    /// to the item its move made gets that item's placeholder identity, as
+    /// the move's record gives it (else hydrating it would be refused for
+    /// good: the old ID is gone). Best effort, like that: the identity is
+    /// only renewed on a file that is still as recorded.
+    pub fn settle_moves(&self, store: &mut Store) -> oneup_store::Result<crate::Settled> {
+        let settled = store.write(crate::moving::settle_moves)?;
+        if self.fs.on_demand() {
+            for (pre, row) in &settled.files {
+                let Some(mut v) = version(row) else { continue };
+                // Its own time stays: it wasn't changed here.
+                if let Some((_, mtime)) = pre.stamp {
+                    v.modified = mtime;
+                }
+                if let Err(e) = self.fs.renew_identity(pre, &v) {
+                    tracing::debug!(error = %e, "a moved file's placeholder identity wasn't renewed");
+                }
+            }
+        }
+        Ok(settled)
+    }
+}
+
 pub struct Executor<C> {
     /// Shared with the blocking work effects run in ([`Executor::off_task`]).
     fs: Arc<LocalFs>,
