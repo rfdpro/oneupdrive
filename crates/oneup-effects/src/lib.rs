@@ -53,7 +53,7 @@ pub mod release;
 #[cfg(all(windows, feature = "crash-test"))]
 pub use local::Crashed;
 #[cfg(windows)]
-pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource};
+pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource, Witnessed};
 #[cfg(windows)]
 pub use ondemand::{EXCLUDED_MARK, Version};
 pub use oneup_ntfs::dirent::DirEntry;

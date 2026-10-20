@@ -195,6 +195,22 @@ impl std::io::Read for UploadSource {
     }
 }
 
+/// A file read and hashed while its program could go on saving it
+/// ([`LocalFs::witness`]): it stands for that content until written, or
+/// needed closed by another program (its watched handle then closes).
+pub struct Witnessed {
+    /// `None`: a dehydrated placeholder whose identity vouched (nothing
+    /// here to write).
+    file: Option<WatchedFile>,
+}
+
+impl Witnessed {
+    /// No write since it was read.
+    pub fn unchanged(&self) -> bool {
+        self.file.as_ref().is_none_or(|f| !f.broken())
+    }
+}
+
 /// A planned file opened for reading at its checked stamp, watched from
 /// the open on.
 struct OpenedToRead {
@@ -254,6 +270,25 @@ pub struct LocalFs {
     /// Crash points left to pass before the injected crash; negative: off.
     #[cfg(feature = "crash-test")]
     crash: std::sync::atomic::AtomicI64,
+    /// See [`LocalFs::on_removing`].
+    #[cfg(feature = "crash-test")]
+    removing: Removing,
+}
+
+/// Test-only: called with a duplicate's path while [`LocalFs::remove_copy`]
+/// holds it open exclusively, its place checked ([`LocalFs::on_removing`]).
+#[cfg(feature = "crash-test")]
+pub type RemovingHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(feature = "crash-test")]
+#[derive(Default)]
+struct Removing(std::sync::Mutex<Option<RemovingHook>>);
+
+#[cfg(feature = "crash-test")]
+impl std::fmt::Debug for Removing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Removing")
+    }
 }
 
 /// Where the state database last saw a local item: its path relative to
@@ -319,6 +354,8 @@ impl LocalFs {
             locator: Locate::default(),
             #[cfg(feature = "crash-test")]
             crash: std::sync::atomic::AtomicI64::new(-1),
+            #[cfg(feature = "crash-test")]
+            removing: Removing::default(),
         };
         match std::fs::read_to_string(fs.engine.join(MARKER)) {
             Ok(_) => {}
@@ -429,6 +466,15 @@ impl LocalFs {
         self.crash.store(n.map_or(-1, i64::from), Relaxed);
     }
 
+    /// Test-only: `f` runs inside [`LocalFs::remove_copy`] once the copy is
+    /// open exclusively and its place checked, just before it leaves it, so
+    /// a test can try what another program might do in that moment. `None`
+    /// turns it off.
+    #[cfg(feature = "crash-test")]
+    pub fn on_removing(&self, f: Option<RemovingHook>) {
+        *self.removing.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = f;
+    }
+
     /// Test-only: whether a crash is still to come ([`LocalFs::crash_after`]).
     #[cfg(feature = "crash-test")]
     pub fn crash_armed(&self) -> bool {
@@ -536,6 +582,156 @@ impl LocalFs {
             }
             Op::RecycleLocal { local, .. } => self.recycle_item(local, OldCopy::Keep, None),
             _ => Err(Error::WrongOp),
+        }
+    }
+
+    /// Reads file `pre` and hashes it without stopping its program from
+    /// saving it (watched, `win::WatchedFile`, never an exclusive handle): it's
+    /// witnessed if it's still the planned stamp, at path `at` in the synced
+    /// folder ("/A/B/name", by its handle's final path, as Windows compares
+    /// names), and
+    /// hashes to `hash` with no write during the read. The witness then
+    /// stands until the file is written ([`Witnessed::unchanged`]). A
+    /// placeholder is never read: with `vouched`, one whose identity vouches
+    /// for `hash` is witnessed by that (its content is OneDrive's). `None`:
+    /// not witnessed.
+    pub fn witness(&self, pre: &LocalPre, at: &str, hash: &Hash, vouched: bool) -> Result<Option<Witnessed>> {
+        let Some((size, _)) = pre.stamp else { return Err(Error::WrongOp) };
+        if let Some((h, _, path)) = self.open_if_dehydrated(pre)? {
+            let ok = vouched && self.identity_hash(&h, size) == Some(*hash) && self.is_at(&path, at);
+            return Ok(ok.then_some(Witnessed { file: None }));
+        }
+        let mut opened = match self.open_for_read(pre) {
+            Ok(o) => o,
+            Err(Error::Changed | Error::NotOrdinary) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(path) = opened.file.with_handle(win::final_path) else { return Ok(None) };
+        if !self.is_at(&long(&path?), at) {
+            return Ok(None);
+        }
+        let ordinary = opened.file.with_handle(|h| self.is_ordinary(h)).unwrap_or(false);
+        if !ordinary {
+            let vouches = opened.file.with_handle(|h| self.identity_hash(h, size)).flatten() == Some(*hash);
+            let w = Witnessed { file: Some(opened.file) };
+            return Ok((vouched && vouches && w.unchanged()).then_some(w));
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        let got = match oneup_hash::hash_reader(&mut opened.file, &mut buf) {
+            Ok(got) => got,
+            Err(_) if opened.file.broken() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let same = i64::try_from(got.len()).ok() == Some(size) && got.finalize() == *hash;
+        let w = Witnessed { file: Some(opened.file) };
+        Ok((same && w.unchanged()).then_some(w))
+    }
+
+    /// Whether `path` (an item's final path) is `at` in the synced folder
+    /// ("/A/B/name"), every name as Windows compares names: a folder above
+    /// it moved or renamed makes it another path.
+    fn is_at(&self, path: &Path, at: &str) -> bool {
+        let mut want = self.root.clone();
+        want.extend(at.split('/').filter(|p| !p.is_empty()));
+        let fold = |p: &Path| oneup_sync::fold(&p.to_string_lossy());
+        fold(path) == fold(&want)
+    }
+
+    /// Runs the part on this PC of an approved [`Op::RemoveCopy`], once its
+    /// OneDrive copy (if it has one) is gone: the file goes into the version
+    /// store, if it's still the planned stamp, at its planned path (its
+    /// folders' names and its own, by the exclusive handle's final path) and, read
+    /// through that handle, still the chosen content (`hash`): an edit that
+    /// kept the size and restored the time, another file that took the ID,
+    /// or the same file moved elsewhere, is left alone. A placeholder isn't
+    /// read (a dehydrated one would be downloaded): only for a synced copy,
+    /// whose OneDrive copy this same operation removed, and only if its
+    /// identity vouches for the chosen content; a dehydrated one then has
+    /// nothing to keep (OneDrive's recycle bin has its content) and is
+    /// deleted once it's out of its place, and a partly downloaded one is
+    /// left alone. `kept`: the watch on the copy that stays here, if it's
+    /// here; checked once the copy has left its place ([`Self::unless_saved`]):
+    /// saved since it was witnessed, the copy goes back and nothing is
+    /// removed.
+    pub fn remove_copy(&self, a: &Approved, kept: Option<&Witnessed>) -> Result<Done> {
+        let Op::RemoveCopy { local: Some(pre), local_dir: Some(_), local_up, remote, name, hash, .. } = a.op() else {
+            return Err(Error::WrongOp);
+        };
+        let Some((size, _)) = pre.stamp else { return Err(Error::WrongOp) };
+        let (h, entry, path) = self.open_item(pre)?;
+        if entry.is_dir() {
+            return Err(Error::WrongOp);
+        }
+        if !self.is_at(&path, &local_up.path(name)) {
+            return Err(Error::Changed);
+        }
+        // From here on the path checked is the copy's until it leaves it:
+        // while it's open, no folder above it can be moved or renamed
+        // (`a_folder_above_a_copy_being_removed_cant_move`).
+        #[cfg(feature = "crash-test")]
+        if let Some(f) = self.removing.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            f(&path);
+        }
+        if !self.is_ordinary(&h) {
+            if remote.is_none() || !self.on_demand || self.identity_hash(&h, size) != Some(*hash) {
+                return Err(Error::NotOrdinary);
+            }
+            if self.is_dehydrated(&h) {
+                // Under the hold no fetch can bring it content. It leaves its
+                // place the same way, so the survivor's check comes after,
+                // and is deleted from the version store only then.
+                let _hold = self.hold_dehydrated(&h).ok_or(Error::Changed)?;
+                let slot = self.keep(&h, &entry, &path)?;
+                self.unless_saved(kept, &h, &slot, &path)?;
+                win::delete_handle(&h)?;
+                drop(h);
+                self.drop_slot(&slot);
+                return Ok(Done::Recycled { kept: None });
+            }
+            if self.is_partial(&h, size) {
+                return Err(Error::NotOrdinary);
+            }
+            let slot = self.keep(&h, &entry, &path)?;
+            self.unless_saved(kept, &h, &slot, &path)?;
+            drop(h);
+            self.revert_kept(&slot, size);
+            return Ok(Done::Recycled { kept: Some(slot) });
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        let got = oneup_hash::hash_reader(&*h.as_file(), &mut buf)?;
+        if i64::try_from(got.len()).ok() != Some(size) || got.finalize() != *hash {
+            tracing::info!("a duplicate chosen for removal has other content now, so it was left alone");
+            return Err(Error::Changed);
+        }
+        let slot = self.keep(&h, &entry, &path)?;
+        self.unless_saved(kept, &h, &slot, &path)?;
+        Ok(Done::Recycled { kept: Some(slot) })
+    }
+
+    /// A removal's last check, once the copy (open as `h`) has left its
+    /// place `from` for the version store (`slot`): if the copy that stays
+    /// here (`kept`) was saved since it was witnessed, the copy goes back
+    /// where it was, through the same handle and never over anything, and
+    /// nothing is removed ([`Error::Changed`]). So no save of the survivor
+    /// goes unseen while the copy is still in its place: one after this
+    /// check comes after the removal. Couldn't it go back (another file took
+    /// its name in that moment), it stays in the version store.
+    fn unless_saved(&self, kept: Option<&Witnessed>, h: &Handle, slot: &Path, from: &Path) -> Result<()> {
+        if kept.is_none_or(Witnessed::unchanged) {
+            return Ok(());
+        }
+        match win::rename_handle(h, from) {
+            Ok(()) => {
+                self.drop_slot(slot);
+                tracing::info!(
+                    "the copy of a duplicate that stays was saved meanwhile, so the chosen copy was left alone"
+                );
+                Err(Error::Changed)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the copy of a duplicate that stays was saved meanwhile; the chosen copy stays in the version store");
+                Ok(())
+            }
         }
     }
 

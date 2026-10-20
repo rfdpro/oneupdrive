@@ -372,6 +372,14 @@ impl LocalFs {
         }
     }
 
+    /// Whether the open file is an ordinary one: not a placeholder (ours or
+    /// another program's), nothing about it pointing to content kept
+    /// elsewhere. Any doubt answers false.
+    pub(crate) fn is_ordinary(&self, h: &win::Handle) -> bool {
+        matches!(provider::info(&h.as_file()), Ok(None))
+            && win::attribute_tag(h).is_ok_and(|(attributes, tag)| !looks_like_placeholder(attributes, tag))
+    }
+
     /// Whether the open placeholder holds no content here (dehydrated).
     pub(crate) fn is_dehydrated(&self, h: &win::Handle) -> bool {
         matches!(provider::info(&h.as_file()), Ok(Some(i)) if i.on_disk == 0)

@@ -54,15 +54,18 @@ impl LivePause {
     pub fn round_check(&self) -> impl Fn(&Op) -> bool + Sync + '_ {
         let stopped = [AtomicBool::new(false), AtomicBool::new(false)];
         move |op| {
-            let (i, paused) = match Side::changed_by(op) {
-                Some(Side::Local) => (0, &self.local),
-                Some(Side::Remote) => (1, &self.remote),
-                None => return true,
-            };
-            if paused.load(Relaxed) {
-                stopped[i].store(true, Relaxed);
+            // A duplicate removed from both sides changes both.
+            let mut ok = true;
+            for (i, side, paused) in [(0, Side::Local, &self.local), (1, Side::Remote, &self.remote)] {
+                if !oneup_gate::changes(op, side) {
+                    continue;
+                }
+                if paused.load(Relaxed) {
+                    stopped[i].store(true, Relaxed);
+                }
+                ok &= !stopped[i].load(Relaxed);
             }
-            !stopped[i].load(Relaxed)
+            ok
         }
     }
 }
@@ -140,6 +143,13 @@ fn code(f: u64) -> String {
 fn paused_sides(s: &Shared) -> (bool, bool) {
     let auto = s.auto_pause.is_some();
     (s.pause.local || auto, s.pause.remote || auto)
+}
+
+/// Whether the user paused sync (either side) in data folder `dir`, as
+/// saved, at `now`: what other work started by hand stops for.
+pub fn paused_in(dir: &Path, now: i64) -> bool {
+    let p = load_pause(&dir.join(PAUSE_FILE));
+    (p.local || p.remote) && p.until_ms.is_none_or(|u| u > now)
 }
 
 /// Reads a saved pause; anything unreadable counts as "not paused" (it's
@@ -402,6 +412,7 @@ impl Control {
                 kind: match b.kind {
                     oneup_gate::BreakerKind::Mass => "mass".into(),
                     oneup_gate::BreakerKind::Suspicious => "content".into(),
+                    oneup_gate::BreakerKind::Removal => "removal".into(),
                 },
                 side: match b.side {
                     Side::Local => "local".into(),
@@ -749,6 +760,31 @@ mod tests {
         assert!(!c.snapshot().paused.local, "the user's pause is the user's");
         c.set_auto_pause(None);
         assert!(live.round_check()(&here));
+    }
+
+    /// Removing a synced duplicate changes both sides: a pause of either
+    /// stops it.
+    #[test]
+    fn a_pause_of_either_side_stops_removing_a_synced_duplicate() {
+        use oneup_sync::{Keep, LocalId, LocalPre, RemoteId, RemotePre};
+        let remote = RemotePre { id: RemoteId("r".into()), etag: "e".into() };
+        let op = Op::RemoveCopy {
+            sid: Some(1),
+            remote: Some(remote.clone()),
+            remote_dir: None,
+            remote_up: Default::default(),
+            local: Some(LocalPre { id: LocalId(1), stamp: Some((1, 1)) }),
+            local_dir: None,
+            local_up: Default::default(),
+            name: "a".into(),
+            hash: [0; 20],
+            keep: Keep::Remote(remote),
+        };
+        let c = control(None);
+        let live = c.controls().live.unwrap();
+        assert!(live.round_check()(&op));
+        c.call(Call::Pause { direction: Direction::Local, minutes: None }, 0).unwrap();
+        assert!(!live.round_check()(&op), "only this PC is paused");
     }
 
     #[test]

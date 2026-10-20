@@ -31,6 +31,8 @@
 //!   again changes nothing.
 //! * The user's answers for held items ([`resolve`]) only change what the
 //!   planner reads; what they lead to runs as any planned operation does.
+//! * Duplicate copies the user chose to remove ([`dupes`]) become ordinary
+//!   operations too, which the gate holds until the user approves them.
 //! * **Crash safety.** A crash between an effect and its record must not
 //!   leave anything that looks like a deletion without evidence (which would
 //!   be held forever) or, worse, evidence without a deletion. Most effects
@@ -58,6 +60,7 @@
 #[cfg(windows)]
 mod blocking;
 pub mod cloud;
+pub mod dupes;
 #[cfg(windows)]
 mod exec;
 pub mod graph;

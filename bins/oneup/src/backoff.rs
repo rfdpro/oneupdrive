@@ -24,7 +24,10 @@ pub fn item(op: &Op) -> Option<RetryItem<'_>> {
         | Op::MoveLocal { local, .. }
         | Op::RenameLocal { local, .. }
         | Op::ConflictCopy { local, .. }
-        | Op::RecycleLocal { local, .. } => RetryItem::Local(local.id),
+        | Op::RecycleLocal { local, .. }
+        | Op::RemoveCopy { remote: None, local: Some(local), .. } => RetryItem::Local(local.id),
+        Op::RemoveCopy { remote: Some(remote), .. } => RetryItem::Remote(&remote.id),
+        Op::RemoveCopy { remote: None, local: None, .. } => return None,
         Op::Download { remote, .. }
         | Op::MkdirLocal { remote, .. }
         | Op::MoveRemote { remote, .. }

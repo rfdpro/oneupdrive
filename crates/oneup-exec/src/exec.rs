@@ -15,7 +15,7 @@ use oneup_graph::client::SIMPLE_UPLOAD_MAX;
 use oneup_rules::ExcludeSet;
 use oneup_store::{Kind, LocalKind, LocalRow, Ops, RemoteRow, Store};
 use oneup_sync::{
-    Base, Dir, Hash, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, Vacates,
+    Base, Dir, Hash, Keep, Link, LocalId, LocalPre, NodeKind, Op, ROOT, RemoteId, RemotePre, Sid, Vacates,
     conflict_candidate, fold,
 };
 
@@ -351,6 +351,7 @@ fn stage(op: &Op) -> &'static str {
         | Op::ConflictCopy { .. }
         | Op::RecycleLocal { .. }
         | Op::Dehydrate { .. } => "op: local change",
+        Op::RemoveCopy { .. } => "op: duplicate removal",
         Op::Hash(_) => "op: hash",
         Op::Pair { .. } | Op::Record(_) | Op::Forget(_) | Op::Hold { .. } => "op: bookkeeping",
     }
@@ -502,7 +503,8 @@ fn claims_in(o: &Ops<'_>, op: &Op) -> oneup_store::Result<Claims> {
     }
     match op {
         // It removes a whole subtree in OneDrive.
-        Op::PruneRemote { .. } => c.alone = true,
+        // It re-reads the copy that stays, and may change both sides.
+        Op::PruneRemote { .. } | Op::RemoveCopy { .. } => c.alone = true,
         Op::Upload { local, .. } => {
             c.large = local.stamp.is_some_and(|(size, _)| usize::try_from(size).is_ok_and(|s| s > SIMPLE_UPLOAD_MAX));
         }
@@ -1759,6 +1761,180 @@ impl<C: Cloud> Executor<C> {
                     })
                     .await
             }
+            Op::RemoveCopy { sid, remote, remote_dir, remote_up, local, local_dir, local_up, name, hash, keep } => {
+                // The copy that stays, and this one, still as chosen and where
+                // the user was shown it (`crate::dupes`), on both sides: its
+                // folder, name and every folder above.
+                let place_ok = |parent: Option<&str>, n: &str, dir: Option<&str>| {
+                    parent.is_some() && parent == dir && fold(n) == fold(name)
+                };
+                let (kept_at, drive_root) = store
+                    .write(|o| {
+                        need(crate::dupes::keep_stands(o, keep, hash)?)?;
+                        if let Some(d) = remote_dir {
+                            need(crate::dupes::remote_up(o, d)?.as_ref() == Some(remote_up))?;
+                        }
+                        if let Some(d) = local_dir {
+                            need(crate::dupes::local_up(o, *d)?.as_ref() == Some(local_up))?;
+                        }
+                        // The root the folders above OneDrive's copy end at.
+                        let drive_root = match remote_up.0.last() {
+                            Some((top, _)) => o.get_item(&top.0)?.and_then(|r| r.parent_id),
+                            None => remote_dir.as_ref().map(|d| d.0.clone()),
+                        };
+                        match sid {
+                            Some(s) => {
+                                let Some(b) = o.synced_get(*s)? else { return Err(Fail::Skip(Skip::Changed)) };
+                                need(
+                                    b.remote.as_ref() == remote.as_ref().map(|r| &r.id)
+                                        && b.local == local.as_ref().map(|l| l.id),
+                                )?;
+                                let at = crate::dupes::synced_place(o, &b)?;
+                                need(
+                                    at.is_some_and(|(l, r)| Some(l) == *local_dir && Some(&r) == remote_dir.as_ref()),
+                                )?;
+                            }
+                            None => {
+                                if let Some(l) = local {
+                                    need(o.synced_by_local(l.id.0)?.is_none())?;
+                                    let row = o.local_get(l.id.0)?;
+                                    need(row.is_some_and(|r| {
+                                        local_dir.is_some()
+                                            && r.parent_id == local_dir.map(|d| d.0)
+                                            && fold(&r.name) == fold(name)
+                                    }))?;
+                                }
+                                if let Some(r) = remote {
+                                    // Synced since: both sides would go, and
+                                    // only one was shown.
+                                    need(o.synced_by_remote(&r.id.0)?.is_none())?;
+                                    let row = o.get_item(&r.id.0)?;
+                                    let dir = remote_dir.as_ref().map(|d| d.0.as_str());
+                                    need(row.is_some_and(|x| place_ok(x.parent_id.as_deref(), &x.name, dir)))?;
+                                }
+                            }
+                        }
+                        // Where a copy that stays here is now: it may be anywhere.
+                        let kept_at = match keep {
+                            Keep::Local(k) => o.local_path_of(k.id.0)?,
+                            Keep::Remote(_) => None,
+                        };
+                        Ok::<_, Fail>((kept_at, drive_root))
+                    })
+                    .await?;
+                // Just before acting, the copy that stays as it is now:
+                // re-read in OneDrive; here, read and hashed under a write
+                // watch, never an exclusive handle (its program can go on
+                // saving it; a write makes it not count from then on).
+                let kept = match keep {
+                    Keep::Remote(k) => {
+                        let now = self.cloud.item(&k.id).await?;
+                        need(now.is_some_and(|r| r.etag.as_deref() == Some(k.etag.as_str()) && r.qxh == Some(*hash)))?;
+                        None
+                    }
+                    Keep::Local(k) => {
+                        let Some(at) = kept_at else { return Err(Fail::Skip(Skip::Changed)) };
+                        let (k, h) = (k.clone(), *hash);
+                        let w = self.off_task(a, move |fs, _| fs.witness(&k, &at, &h, false)).await??;
+                        Some(w.ok_or(Fail::Skip(Skip::Changed))?)
+                    }
+                };
+                // The copy here, read the same way: OneDrive's copy goes
+                // only while this one is still the chosen content where it
+                // was shown (a placeholder: its identity, never read).
+                let here = match (local, local_dir) {
+                    (Some(l), Some(_)) => {
+                        let (l, at, h, vouched) = (l.clone(), local_up.path(name), *hash, remote.is_some());
+                        let w = self.off_task(a, move |fs, _| fs.witness(&l, &at, &h, vouched)).await??;
+                        Some(w.ok_or(Fail::Skip(Skip::Changed))?)
+                    }
+                    (Some(_), None) => return Err(Fail::Skip(Skip::Changed)),
+                    _ => None,
+                };
+                let unchanged = |w: &Option<oneup_effects::Witnessed>| w.as_ref().is_none_or(|w| w.unchanged());
+                // OneDrive's copy first, re-read where it was shown, then
+                // under If-Match. Refused, nothing here is touched: the
+                // cloud copy only ever goes in this approved removal.
+                if let Some(r) = remote {
+                    let now = self.cloud.item(&r.id).await?;
+                    let dir = remote_dir.as_ref().map(|d| d.0.as_str());
+                    need(now.is_some_and(|x| {
+                        x.etag.as_deref() == Some(r.etag.as_str()) && place_ok(x.parent_id.as_deref(), &x.name, dir)
+                    }))?;
+                    // And every folder above it, up to the drive's root.
+                    for (i, (id, n)) in remote_up.0.iter().enumerate() {
+                        let above = match remote_up.0.get(i + 1) {
+                            Some((p, _)) => Some(p.0.as_str()),
+                            None => drive_root.as_deref(),
+                        };
+                        let now = self.cloud.item(id).await?;
+                        need(now.is_some_and(|x| {
+                            x.kind == oneup_store::Kind::Folder
+                                && fold(&x.name) == fold(n)
+                                && above.is_some()
+                                && x.parent_id.as_deref() == above
+                        }))?;
+                    }
+                    need(unchanged(&kept) && unchanged(&here))?;
+                    // Written ahead: until the copy here has gone too, a
+                    // crash or a refusal undoes the removal (the record goes,
+                    // so the copy here is uploaded again) rather than leave
+                    // a deletion an ordinary round would finish.
+                    if let (Some(s), Some(l)) = (sid, local) {
+                        let p = Pending::Removing { sid: *s, local: l.id };
+                        store.write_ahead(|o| Ok::<_, Fail>(o.meta_set_ahead(&pending_of(l.id), &p.encode())?)).await?;
+                    }
+                    self.cloud.prune(r).await?;
+                    self.crash_point()?;
+                    store
+                        .write(|o| {
+                            // A synced copy keeps its row, and the deletion
+                            // noted, until the copy here goes too.
+                            o.delete_subtree(&r.id.0)?;
+                            if local.is_none()
+                                && let Some(s) = sid
+                            {
+                                o.synced_remove(*s)?;
+                            }
+                            Ok::<_, Fail>(())
+                        })
+                        .await?;
+                }
+                // Our read handles go: the exclusive one can't open beside them.
+                drop(here);
+                let Some(l) = local else { return Ok(()) };
+                need(unchanged(&kept))?;
+                // As for recycling: evidence first, durably, so neither a
+                // crash nor a power cut leaves a deletion without it (the
+                // record written ahead says how to settle it).
+                if sid.is_some() {
+                    store
+                        .write_ahead(|o| {
+                            o.note_local_deleted(l.id.0)?;
+                            Ok::<_, Fail>(o.require_durable()?)
+                        })
+                        .await?;
+                    self.crash_point()?;
+                }
+                // The survivor's watch goes with it: checked again in the
+                // effect, immediately before the copy here goes (saved in
+                // between, the copy stays and the record written ahead
+                // undoes the removal).
+                let Done::Recycled { .. } = self.off_task(a, move |fs, a| fs.remove_copy(a, kept.as_ref())).await??
+                else {
+                    return Err(odd());
+                };
+                self.crash_point()?;
+                store
+                    .write(|o| {
+                        o.local_remove_subtree(l.id.0)?;
+                        if let Some(s) = sid {
+                            o.synced_remove(*s)?;
+                        }
+                        Ok::<_, Fail>(o.meta_delete(&pending_of(l.id))?)
+                    })
+                    .await
+            }
             Op::PruneRemote { remote, forget, keep, .. } => {
                 // Only once the copy here is complete (data-safety.md invariant 1).
                 for pre in keep {
@@ -1843,6 +2019,7 @@ impl<C: Cloud> Executor<C> {
             Some(Pending::Evidence(id)) => self.fs.is_present(*id),
             // A conflict copy renames it in place.
             Some(Pending::Detached { local, name, .. }) => self.fs.name_of(*local).is_some_and(|n| n != *name),
+            Some(Pending::Removing { local, .. }) => self.fs.is_present(*local),
             None => false,
         };
         tracing::debug!(undo, "settling an unfinished write-ahead record");
@@ -1850,6 +2027,12 @@ impl<C: Cloud> Executor<C> {
             .write(|o| {
                 match pending {
                     Some(Pending::Evidence(id)) if undo => o.unnote_local_deleted(id.0)?,
+                    Some(Pending::Removing { sid, local }) if undo => {
+                        o.unnote_local_deleted(local.0)?;
+                        if o.synced_get(sid)?.is_some_and(|b| b.local == Some(local)) {
+                            o.synced_remove(sid)?;
+                        }
+                    }
                     Some(Pending::Detached { sid, local, .. }) if undo => {
                         if let Some(b) = o.synced_get(sid)?
                             && b.local.is_none()
@@ -1893,6 +2076,7 @@ fn pending_key(op: &Op) -> Option<String> {
     match op {
         Op::RecycleLocal { local, .. } | Op::ConflictCopy { local, .. } => Some(pending_of(local.id)),
         Op::Download { replace: Some(old), .. } => Some(pending_of(old.id)),
+        Op::RemoveCopy { sid: Some(_), local: Some(l), .. } => Some(pending_of(l.id)),
         _ => None,
     }
 }
@@ -1903,6 +2087,10 @@ enum Pending {
     Evidence(LocalId),
     /// Synced item `sid` detached from `local`, about to be renamed `name`.
     Detached { sid: Sid, local: LocalId, name: String },
+    /// A duplicate's removal under way (`Op::RemoveCopy`): OneDrive's copy
+    /// of Synced item `sid` goes, then `local`. Left over with `local` still
+    /// here, the removal is undone: the record goes, so it's uploaded again.
+    Removing { sid: Sid, local: LocalId },
 }
 
 impl Pending {
@@ -1910,6 +2098,7 @@ impl Pending {
         match self {
             Pending::Evidence(id) => format!("evidence {:x}", id.0),
             Pending::Detached { sid, local, name } => format!("detached {sid} {:x} {name}", local.0),
+            Pending::Removing { sid, local } => format!("removing {sid} {:x}", local.0),
         }
     }
 
@@ -1921,6 +2110,10 @@ impl Pending {
                 let sid = it.next()?.parse().ok()?;
                 let local = LocalId(u128::from_str_radix(it.next()?, 16).ok()?);
                 Some(Pending::Detached { sid, local, name: it.next()?.to_string() })
+            }
+            "removing" => {
+                let sid = it.next()?.parse().ok()?;
+                Some(Pending::Removing { sid, local: LocalId(u128::from_str_radix(it.next()?, 16).ok()?) })
             }
             _ => None,
         }

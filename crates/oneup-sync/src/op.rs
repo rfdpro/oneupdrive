@@ -48,6 +48,58 @@ pub enum HoldReason {
     OneWay,
 }
 
+/// The copy that stays when a duplicate is removed ([`Op::RemoveCopy`]):
+/// it must still be exactly this when the removal runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Keep {
+    /// A file in OneDrive, by ID and eTag.
+    Remote(RemotePre),
+    /// A file only on this PC, by ID and stamp.
+    Local(LocalPre),
+}
+
+impl Keep {
+    /// The item it is, on its side.
+    pub fn item(&self) -> Vacates {
+        match self {
+            Keep::Remote(r) => Vacates::Remote(r.id.clone()),
+            Keep::Local(l) => Vacates::Local(l.id),
+        }
+    }
+}
+
+/// The folders a copy is in ([`Op::RemoveCopy`]), each by ID and name: its
+/// own first, then each one above, up to its tree's root (the synced
+/// folder here, the drive's root in OneDrive), which isn't listed. With
+/// the copy's name, the full path the user was shown ([`Up::path`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Up<I>(pub Vec<(I, String)>);
+
+impl<I> Default for Up<I> {
+    fn default() -> Self {
+        Up(Vec::new())
+    }
+}
+
+impl<I> Up<I> {
+    /// The path of `name` in these folders from the root: "/A/B/name".
+    pub fn path(&self, name: &str) -> String {
+        let mut p = String::new();
+        for (_, n) in self.0.iter().rev() {
+            p.push('/');
+            p.push_str(n);
+        }
+        p.push('/');
+        p.push_str(name);
+        p
+    }
+
+    /// The folders' IDs.
+    pub fn ids(&self) -> impl Iterator<Item = &I> {
+        self.0.iter().map(|(id, _)| id)
+    }
+}
+
 /// A folder on one side, used to describe where an operation needs a free name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dir {
@@ -174,6 +226,29 @@ pub enum Op {
         sid: Sid,
         local: LocalPre,
     },
+    /// Remove a duplicate copy the user chose (`oneup_exec::dupes`); never
+    /// planned by the reconciler. OneDrive's copy (`remote`) goes to its
+    /// recycle bin under `If-Match`, then the copy here (`local`) to the
+    /// version store, its content checked against `hash` under an exclusive
+    /// handle. Each only where the user was shown it: named `name`, in
+    /// folder `local_dir` here and `remote_dir` in OneDrive, at the full
+    /// path its folders `local_up` and `remote_up` make ([`Up`]), so a
+    /// folder above it moved or renamed meanwhile leaves it alone. `sid`:
+    /// the Synced row linking both (a synced file). Runs only while `keep`,
+    /// a copy of the same content that stays, is still there as chosen:
+    /// checked just before acting.
+    RemoveCopy {
+        sid: Option<Sid>,
+        remote: Option<RemotePre>,
+        remote_dir: Option<RemoteId>,
+        remote_up: Up<RemoteId>,
+        local: Option<LocalPre>,
+        local_dir: Option<LocalId>,
+        local_up: Up<LocalId>,
+        name: String,
+        hash: Hash,
+        keep: Keep,
+    },
     /// Free the content of a placeholder the user set to "Free up space"
     /// (Files On-Demand), keeping the placeholder. Never planned by the
     /// reconciler. Only if its content still hashes to `hash` and that is
@@ -254,6 +329,10 @@ impl Op {
             | Op::RenameLocal { local, .. }
             | Op::ConflictCopy { local, .. }
             | Op::RecycleLocal { local, .. } => Some(Vacates::Local(local.id)),
+            // OneDrive's copy goes first; one only here, from this PC.
+            Op::RemoveCopy { remote: Some(r), .. } => Some(Vacates::Remote(r.id.clone())),
+            Op::RemoveCopy { local: Some(l), .. } => Some(Vacates::Local(l.id)),
+            Op::RemoveCopy { .. } => None,
             Op::MoveRemote { remote, .. }
             | Op::RenameRemote { remote, .. }
             | Op::DeleteRemote { remote, .. }
@@ -301,6 +380,9 @@ impl Op {
             Op::RenameLocal { local, .. } => (None, l(local), None),
             Op::PruneRemote { remote, .. } | Op::RenameRemote { remote, .. } => (None, None, r(remote)),
             Op::Dehydrate { local, .. } => (None, l(local), None),
+            Op::RemoveCopy { sid, remote, local, .. } => {
+                (*sid, local.as_ref().and_then(l), remote.as_ref().and_then(r))
+            }
             Op::Hold { sid, local, remote, .. } => (*sid, *local, remote.clone()),
         }
     }
@@ -316,6 +398,7 @@ impl Op {
                 | Op::RenameLocal { .. }
                 | Op::ConflictCopy { .. }
                 | Op::RecycleLocal { .. }
+                | Op::RemoveCopy { local: Some(_), .. }
                 | Op::Dehydrate { .. }
         )
     }
