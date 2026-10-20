@@ -89,6 +89,12 @@ pub trait History {
     /// went (or was linked to another item): the item as it went into
     /// OneDrive's recycle bin.
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, Self::Error>;
+
+    /// A record's local last-write time (`Base::local_mtime`) in Unix ms,
+    /// to compare with a moment. By default from a Windows FILETIME.
+    fn written_ms(&self, local_mtime: i64) -> i64 {
+        local_mtime / 10_000 - 11_644_473_600_000
+    }
 }
 
 /// One step of a rewind, for [`Op::Rewind`].
@@ -213,6 +219,12 @@ pub enum Skip {
     NotSyncedYet,
     /// Its content then wasn't recorded (no hash), so it can't be checked.
     UnknownContent,
+    /// Its record is newer than the moment, but its content was last
+    /// written before it: it was there then, not synced (left out by a rule,
+    /// say), so it isn't "created since" and stays.
+    ExistedBefore,
+    /// A folder created since that holds what's left alone: it stays.
+    Keeps,
 }
 
 impl Skip {
@@ -462,10 +474,12 @@ where
         let target = then.get(&alias.get(&sid).copied().unwrap_or(sid));
         match (target, current) {
             (None, None) => {}
-            (None, Some((base, path))) => b.created(t, sid, base, path)?,
+            (None, Some((base, path))) => b.created(t, h, Some(at), sid, base, path)?,
             (Some(then_item), None) => b.deleted(t, h, sid, then_item, &dest)?,
             (Some(then_item), Some((base, path))) if split.contains(&sid) => {
-                b.created(t, sid, base, path)?;
+                // Its OneDrive copy since goes whatever its age: the item
+                // then comes back in its place.
+                b.created(t, h, None, sid, base, path)?;
                 b.deleted(t, h, sid, then_item, &dest)?;
             }
             (Some(then_item), Some((base, path))) => b.kept(t, sid, then_item, base, path, &dest)?,
@@ -478,16 +492,24 @@ where
     // round or before: an item moved out of it in OneDrive and not yet on
     // this PC would otherwise have this PC's copy of the folder made again
     // in OneDrive to hold it.
+    // A folder that holds what stays (left alone for good) stays too.
     let mut gone: BTreeSet<Sid> = b.remove_files.iter().filter_map(|(op, _)| sid_of(op)).collect();
+    let mut stays: BTreeSet<Sid> =
+        b.out.skipped.iter().filter(|(_, _, why)| !why.passes()).map(|(sid, _, _)| *sid).collect();
     b.remove_folders.sort_by_key(|(d, _, _)| std::cmp::Reverse(*d));
     let mut folders = Vec::new();
     for (d, op, p) in std::mem::take(&mut b.remove_folders) {
         let Some(sid) = sid_of(&op) else { continue };
-        let mut empty = true;
+        let (mut empty, mut keeps) = (true, false);
         for c in t.base_children(sid)? {
             empty &= gone.contains(&c.sid);
+            keeps |= stays.contains(&c.sid);
         }
-        if empty {
+        if keeps {
+            stays.insert(sid);
+            b.out.changes.retain(|c| c.sid != sid);
+            b.out.skipped.push((sid, p, Skip::Keeps));
+        } else if empty {
             gone.insert(sid);
             folders.push((d, op, p));
         } else {
@@ -542,7 +564,25 @@ impl Builder {
     }
 
     /// Created since: removed (this PC's unsynced edit set aside first).
-    fn created<T: Trees + ?Sized>(&mut self, t: &T, sid: Sid, base: &Base, path: &str) -> Result<(), T::Error> {
+    fn created<T: Trees + ?Sized, H: History<Error = T::Error> + ?Sized>(
+        &mut self,
+        t: &T,
+        h: &H,
+        at: Option<i64>,
+        sid: Sid,
+        base: &Base,
+        path: &str,
+    ) -> Result<(), T::Error> {
+        // A record made since isn't proof the item was: a file last written
+        // before the moment was there then (synced later, as when a rule
+        // that left it out went). Only removed what's surely new.
+        if let Some(at) = at
+            && base.kind == NodeKind::File
+            && h.written_ms(base.local_mtime) <= at
+        {
+            self.skip(sid, path, Skip::ExistedBefore);
+            return Ok(());
+        }
         let local = local_state(t, base)?;
         if matches!(local, Local::Missing) {
             self.skip(sid, path, Skip::Missing);

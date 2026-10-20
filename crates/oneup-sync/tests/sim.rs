@@ -925,6 +925,11 @@ impl History for World {
         Ok(self.history.iter().find(|(t, s, _)| *s == sid && *t > at).map(|(_, _, w)| w.clone()))
     }
 
+    /// The world's last-write times are its own clock, as its moments are.
+    fn written_ms(&self, local_mtime: i64) -> i64 {
+        local_mtime
+    }
+
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, Infallible> {
         Ok(self.history.iter().rev().find_map(|(_, _, w)| w.clone().filter(|w| w.remote.as_ref() == Some(id))))
     }
@@ -1598,7 +1603,7 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
             s.write(|o| o.history_replace(&snap.history)).expect("writing the history");
             let from_store = s
                 .read(|o| {
-                    oneup_sync::rewind::plan(o, o, folder, at, 1 << 20)
+                    oneup_sync::rewind::plan(o, &OwnClock(o), folder, at, 1 << 20)
                         .map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
                 })
                 .expect("planning the rewind from the store");
@@ -1659,6 +1664,29 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
         stuck = BTreeSet::new();
     }
     panic!("the rewind didn't finish");
+}
+
+/// The store's history, with the world's last-write times (its own clock).
+struct OwnClock<'a, 'b>(&'a oneup_store::Ops<'b>);
+
+impl History for OwnClock<'_, '_> {
+    type Error = oneup_store::Error;
+
+    fn change_after(&self, sid: Sid, at: i64) -> Result<Option<Option<Was>>, oneup_store::Error> {
+        self.0.change_after(sid, at)
+    }
+
+    fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>, oneup_store::Error> {
+        self.0.children_after(parent, at)
+    }
+
+    fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, oneup_store::Error> {
+        self.0.last_seen(id)
+    }
+
+    fn written_ms(&self, local_mtime: i64) -> i64 {
+        local_mtime
+    }
 }
 
 /// Cloud item `id`'s path relative to the drive root.
