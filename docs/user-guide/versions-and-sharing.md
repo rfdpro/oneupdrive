@@ -10,6 +10,8 @@ The list shows each version OneDrive keeps: when it was saved, its size and who 
 
 From a terminal: `oneup history "C:\…\Report.docx"` lists the versions, `--open 3` opens a copy of the third, `--restore 3` restores it.
 
+The settings window's **Recovery** page shows the same for any file you name, next to the other ways to get things back: [rewinding a whole folder](recovery.md#rewind-a-folder), conflicts and deleted files.
+
 ## Sharing
 **Copy link** makes a link and puts it on the clipboard: either **anyone with the link can view**, or **can view and edit**. Send it however you like. From a terminal: `oneup share "C:\…\Photos"` (add `--edit` for an editing link).
 
