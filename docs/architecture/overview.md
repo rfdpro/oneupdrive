@@ -15,7 +15,7 @@ This page explains how OneUpDrive works in plain terms. Each section links to th
 |---|---|
 | `oneup-ntfs`, `oneup-local` | The change journal, folder listing and the Local tree ([local-tree.md](local-tree.md)) |
 | `oneup-graph`, `oneup-remote` | Microsoft Graph and the Remote tree ([remote-mirror.md](remote-mirror.md)) |
-| `oneup-store` | The SQLite state database: the three trees, deletion evidence, dirty marks, activity, usage |
+| `oneup-store` | The SQLite state database: the three trees, deletion evidence, dirty marks, activity, usage, the name index for search ([search.md](search.md)) |
 | `oneup-rules` | Exclusion rules, presets and `explain` ([rules.md](rules.md)) |
 | `oneup-plan`, `oneup-sync` | The first-run planner ([planner.md](planner.md)) and the three-tree reconciler ([sync-engine.md](sync-engine.md)); both pure |
 | `oneup-gate` | The safety gate: breakers, the content guard, approvals; pure ([data-safety.md](data-safety.md)) |
@@ -49,6 +49,9 @@ Office edits a file in OneDrive itself when it's opened from its OneDrive addres
 
 ## Encrypted vaults
 Folders encrypted in the Cryptomator format, so OneDrive only ever sees ciphertext. A vault in OneDrive syncs with a folder on the PC, decrypted (online-only files decrypted when opened, by default), by an agent of its own that runs only while the vault is unlocked ([vaults.md](vaults.md)).
+
+## Finding files
+Every name in OneDrive is already in the Remote tree, so search needs no network: a trigram index of those names, kept current by the same kind of database triggers as the dirty marks, finds any part of a name across millions of items in milliseconds, online-only files included, and each result says whether it's here, online-only or excluded. OneDrive's own search inside files is an opt-in extra that sends the search text to Microsoft ([search.md](search.md)).
 
 ## Knowing how files are used
 The agent counts which programs open online-only files (Windows names them in each download request) and which write files (asked of Windows' Restart Manager as the change journal reports each write), per hour, on the PC only. The same records drive the automatic space policies, which make long-unused files online-only, and the content guard reads the start of each edited file before upload to catch files that suddenly look encrypted ([usage.md](usage.md)).

@@ -29,6 +29,7 @@ A unit is finished without its contents only when its folder is gone by its ID. 
 | `enum_unit` | Initial-enumeration work units and their resume points |
 | `cursor` | The delta cursor; `Pending` until the first full catch-up, then `Current` |
 | `meta` | Rules fingerprint and other settings |
+| `remote_name`, `search_queue` | The name index for search, and the changes waiting to reach it (`remote_item.sk` keys an item's entry; [search.md](search.md)) |
 
 **Invariants**, checked by `oneup verify` and in every test:
 1. at most one root;

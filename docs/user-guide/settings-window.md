@@ -5,7 +5,7 @@ Open it from the OneUpDrive icon's menu: **Settings**, or from OneUpDrive in the
 ## Set up
 Shown only until a folder is set up: sign in, choose the folders, what to exclude and Files On-Demand, look at the preview, **Start syncing**. See [Getting started](getting-started.md#setting-up). On a PC with the OneDrive app, it first offers **Move over from the OneDrive app**: your OneDrive folder stays where it is, after a check and unlinking the app. See [Moving over from the OneDrive app](migrating-from-onedrive.md#in-the-settings-window).
 
-At the top of every page, a light and a word say whether OneUpDrive is running and what it's doing. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While there's a problem, a red card above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Apps** and **Activity**, then the settings: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**. On the Files page, the magnifier at the right of **All files** and **Exclude** opens a search box when you point at it.
+At the top of every page, a light and a word say whether OneUpDrive is running and what it's doing. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While there's a problem, a red card above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Search**, **Apps** and **Activity**, then the settings: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**. On the Files page, the magnifier at the right of **All files** and **Exclude** opens a search box when you point at it.
 
 ## Files
 Everything about what syncs, in one place.
@@ -26,6 +26,9 @@ On the right, the details of what you selected:
 * **Why**: which rule applies and what sync last did with it.
 
 With nothing selected, it shows the folder itself: where it is on this PC and in OneDrive, **Both ways** or **Backup**, **Files On-Demand**, **Free up space** automatically (after a week, a month… unused, or when the disk is nearly full; see [Files On-Demand](files-on-demand.md#freeing-space-by-itself)), **Start** and **Pause** for extra folders, and **Stop syncing…** (see [Stopping a folder's sync](folders.md#stopping-a-folders-sync)); **Kept on this PC**, the copies sync kept when it removed or replaced files here, each with **Restore**; and the folder's **Recent activity**. For a vault: **Unlock…**, **Lock**, **Unlock with Windows Hello**, **Recovery key…**, **Change password…** and **Stop syncing…**.
+
+## Search
+Finds any file or folder in your OneDrive by name as you type, online-only files included, and says where each one is, with **Open**, **Show** and **Sync this first**. Below it: **Search inside files with OneDrive** (off; it sends the search text to Microsoft) and the **Hotkey** that opens this page from any program. See [Finding files](search.md).
 
 ## Apps
 Which programs changed and opened files in your synced folder, over the last day, week, month or 90 days: a chart per day (or hour), and a table per program with files changed, files downloaded on open and their size. **Click a program** to see the files it used lately, newest first (from version 0.1.21 on). The page updates by itself while it's open; a change shows within about 20 seconds.
