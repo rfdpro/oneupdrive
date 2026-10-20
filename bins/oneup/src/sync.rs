@@ -204,6 +204,10 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
     if let Some(o) = &out.overflow {
         print_overflow(o, &store, Asker::Sync)?;
     }
+    if out.end != End::Stopped {
+        // Removing chosen duplicates waits without stopping the rest.
+        print_breakers(&out.breakers, Asker::Sync);
+    }
     match out.end {
         End::Stopped => {
             print_breakers(&out.breakers, Asker::Sync);
@@ -1255,7 +1259,7 @@ impl Engine {
             let lines = store.read(|o| {
                 Ok(held
                     .iter()
-                    .map(|op| describe(o, op))
+                    .map(|op| if b.kind == BreakerKind::Removal { removal_line(o, op) } else { describe(o, op) })
                     .chain(b.later.iter().map(|op| later_line(o, op)))
                     .take(crate::stoplist::MAX_LINES)
                     .map(|l| l.to_string())
@@ -1362,6 +1366,11 @@ impl Engine {
             // "Can't tell" counts as here: nothing is noted gone on a doubt.
             let mut chosen = crate::resolve::apply_queued(&mut store, backup, &|id| fs.presence(id) != Some(false))?;
             log_activity(&mut store, std::mem::take(&mut chosen.log))?;
+            // Duplicates the user chose to remove (`crate::duplicates`): the
+            // gate holds them as a stop of their own until approved.
+            let paused = controls.pause_local || controls.pause_remote;
+            let (removal, log) = crate::duplicates::for_round(&self.data_dir, &mut store, backup, paused)?;
+            log_activity(&mut store, log)?;
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;
             let mut extra = match mode {
@@ -1389,7 +1398,8 @@ impl Engine {
                 }
             };
             extra.extend(chosen.ops.iter().map(|(op, _)| op.clone()));
-            let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra };
+            let removal_ops = removal.as_ref().map(|r| r.plan.ops.clone()).unwrap_or_default();
+            let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra, removal: removal_ops };
             // Stops approved since the last round: their lists are approved.
             // Codes already used approve nothing again.
             let (listed, controls) = {
@@ -1417,9 +1427,6 @@ impl Engine {
             scope = Scope::Dirty;
             out.totals.problems = problems;
             if !review.breakers.is_empty() {
-                // Nothing at all runs in a tripped round, not even the side
-                // that didn't trip: the user should see the whole picture
-                // first. The marks stay, so the next try plans it all again.
                 for b in &review.breakers {
                     let detail = format!("{}; nothing was changed (code {:016x})", breaker_what(b), b.fingerprint.0);
                     let e = notice(ActivityOutcome::Waiting, "safety stop", detail);
@@ -1433,12 +1440,22 @@ impl Engine {
                     store.write(|o| o.dirty_mark_synced(&mark))?;
                 }
                 self.save_stop_lists(&store, &review);
+            }
+            if review.breakers.iter().any(|b| b.kind != BreakerKind::Removal) {
+                // Nothing at all runs in a tripped round, not even the side
+                // that didn't trip: the user should see the whole picture
+                // first. The marks stay, so the next try plans it all again.
                 out.breakers = review.breakers;
                 out.end = End::Stopped;
                 return Ok((store, out));
             }
-            // No stop stands: their lists go.
-            crate::stoplist::keep_only(&self.data_dir, &[]);
+            // Removing chosen duplicates waits for its own approval and
+            // holds nothing else back. Otherwise no stop stands: their
+            // lists go.
+            if review.breakers.is_empty() {
+                crate::stoplist::keep_only(&self.data_dir, &[]);
+            }
+            out.breakers.clone_from(&review.breakers);
             out.totals.held = review.withheld.iter().filter(|(_, w)| *w == Withheld::Held).count();
             // Held only for want of evidence, but in the user's Recycle Bin:
             // deleted by the user (`crate::recyclebin`); planned again.
@@ -1508,6 +1525,9 @@ impl Engine {
                         let mut l = describe_approved(o, &a);
                         if chosen.ops.iter().any(|(op, _)| op == a.op()) {
                             l.note = "as you chose".into();
+                        }
+                        if oneup_gate::is_removal(a.op()) {
+                            l = removal_line(o, a.op());
                         }
                         let l = if on_demand { on_demand_line(a.op(), l) } else { l };
                         (a, l)
@@ -1599,6 +1619,10 @@ impl Engine {
             // Approved changes that ran are done with; those that wait stay.
             self.stops_lock().round_ended(listed_ops, &report.done);
             crate::resolve::ran(&mut store, &chosen.ops, &report)?;
+            if let Some(r) = &removal {
+                let log = crate::duplicates::ran(&mut store, r, &report)?;
+                log_activity(&mut store, log)?;
+            }
             let mut log = print_round(n, &planned, &report);
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
@@ -1879,7 +1903,14 @@ fn plan_round<'a>(
         // What a folder holds is read unfiltered: an excluded or parked
         // item keeps it from being emptied.
         let pending = oneup_sync::pending_deletes(&Parked::with_rules(o, &planning.hide), o, &ops, planning.flow)?;
-        add_extra(&mut ops, modes.extra);
+        add_extra(&mut ops, modes.extra.clone());
+        // Removing chosen duplicates waits for a round whose plan doesn't
+        // touch what it removes or keeps (`oneup_exec::dupes::touched`):
+        // the plan's own deletion of the copy that stays, or a move of one
+        // that goes, could otherwise run in the same round.
+        if !oneup_exec::dupes::touched(&ops, &modes.removal) {
+            ops.extend(modes.removal.iter().cloned());
+        }
         let problems = problems
             .into_iter()
             .map(|(id, name, why)| Ok((o.local_path_of(id.0)?.unwrap_or(name), why)))
@@ -1896,6 +1927,7 @@ fn plan_round<'a>(
     };
     // The paths a stop's list shows are part of what an approval covers.
     // Read only when something could trip or a list is approved.
+    // A removal the user chose always is (`oneup_gate::always_stops`).
     let (paths, pending_paths) =
         if oneup_gate::may_stop(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty()) {
             store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
@@ -2087,8 +2119,12 @@ struct Modes {
     /// `pull` or `prune`: bring them here, never send them
     /// (`Parked::sends_excluded`).
     pull: bool,
-    /// `prune`: their removal, added to the plan for the gate.
+    /// `prune`: their removal, added to the plan for the gate; and the
+    /// renames and removals the user chose.
     extra: Vec<Op>,
+    /// The removal of duplicates the user chose, added unless the plan
+    /// touches what it removes or keeps.
+    removal: Vec<Op>,
 }
 
 /// One round's reviewed plan.
@@ -2125,7 +2161,7 @@ async fn dry_run(
     let fs = if first { None } else { open_paired(&store).ok() };
     let controls = Controls { answers: answers.clone(), ..Controls::default() };
     let pull = crate::config::load_rules(data_dir, &store)?.cloud != crate::config::CloudCopies::Keep;
-    let modes = Modes { pull, extra: Vec::new() };
+    let modes = Modes { pull, ..Modes::default() };
     let Planned { review, problems, .. } =
         plan_round(&store, fs.as_ref(), Scope::All, &controls, Recent::default(), &user_rules, modes, &[])?;
     println!("Dry run: nothing is changed. The first round would do:");
@@ -2509,10 +2545,7 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
             Line::new("remove", lp(local.id.0), "no copy kept, as you chose; in OneDrive's recycle bin")
         }
         Op::RecycleLocal { local, .. } => Line::new("recycle", lp(local.id.0), "to .oneup\\versions"),
-        Op::RemoveCopy { remote: Some(r), .. } => Line::new("remove", rp(&r.id), "duplicate, as you chose"),
-        Op::RemoveCopy { local, .. } => {
-            Line::new("remove", local.as_ref().map_or_else(String::new, |l| lp(l.id.0)), "duplicate, as you chose")
-        }
+        Op::RemoveCopy { .. } => removal_line(o, op),
         Op::Pair { local, .. } => Line::new("in sync", lp(local.id.0), ""),
         Op::Hash(p) => Line::new("check", lp(p.id.0), "comparing contents"),
         Op::Record(_) | Op::Forget(_) => Line::new("bookkeeping", String::new(), ""),
@@ -2556,7 +2589,51 @@ fn transfer_bytes(o: &Ops<'_>, approved: &[Approved], on_demand: bool) -> oneup_
 /// The path a stop's list shows for each of `ops` (what [`describe`] says),
 /// for the gate's item keys; empty for what no stop lists.
 fn stop_paths(o: &Ops<'_>, ops: &[Op]) -> Vec<String> {
-    ops.iter().map(|op| if is_mass_sensitive(op) { describe(o, op).path } else { String::new() }).collect()
+    ops.iter()
+        .map(|op| {
+            if oneup_gate::is_removal(op) {
+                removal_line(o, op).path
+            } else if is_mass_sensitive(op) {
+                describe(o, op).path
+            } else {
+                String::new()
+            }
+        })
+        .collect()
+}
+
+/// The path a removal stop's list shows for `op` ([`removal_line`]), part
+/// of its key: a preview works out the stop's code with it. It's the path
+/// the operation carries ([`oneup_sync::Up`]), the one the executor checks
+/// the copy is still at, so an approval names exactly where it acts.
+pub(crate) fn removal_path(o: &Ops<'_>, op: &Op) -> oneup_store::Result<String> {
+    Ok(match op {
+        Op::RemoveCopy { remote: Some(_), remote_up, name, .. } => remote_up.path(name),
+        Op::RemoveCopy { local: Some(_), local_up, name, .. } => local_up.path(name),
+        _ => describe(o, op).path,
+    })
+}
+
+/// [`describe`] for removing a duplicate the user chose, as its stop's list
+/// shows it (and its key holds the path): a cloud copy by its full OneDrive
+/// path, since it may be outside the synced folder.
+fn removal_line(o: &Ops<'_>, op: &Op) -> Line {
+    match op {
+        Op::RemoveCopy { remote: Some(_), local, .. } => {
+            let path = removal_path(o, op).unwrap_or_else(|_| "(OneDrive item)".into());
+            let note = if local.is_some() {
+                "duplicate, as you chose; to OneDrive's recycle bin, the copy here to .oneup\\versions"
+            } else {
+                "duplicate, as you chose; to OneDrive's recycle bin"
+            };
+            Line::new("remove", path, note)
+        }
+        Op::RemoveCopy { local: Some(_), .. } => {
+            let path = removal_path(o, op).unwrap_or_else(|_| "(local item)".into());
+            Line::new("remove", path, "duplicate, as you chose; to .oneup\\versions")
+        }
+        _ => describe(o, op),
+    }
 }
 
 /// A folder a stop lists to delete once the deletions on its list emptied
@@ -2984,6 +3061,18 @@ pub fn print_breakers(breakers: &[Breaker], asker: Asker) {
             n => format!(", on top of {n} done in the last few minutes"),
         };
         let code = format!("{:016x}", b.fingerprint.0);
+        if b.kind == BreakerKind::Removal {
+            // Sync goes on meanwhile: only the removal waits.
+            let how = match asker {
+                Asker::Sync => format!("run `oneup sync` again with --approve {code}"),
+                Asker::Agent => format!("run `oneup approve {code}`"),
+            };
+            println!(
+                "  Safety stop: {}.\n  Nothing was removed yet. If the list is what you chose, {how}",
+                breaker_what(b)
+            );
+            continue;
+        }
         let how = match asker {
             Asker::Sync => format!(
                 "See the list with `oneup sync --dry-run`. If it's what you meant, run `oneup sync` again with \
@@ -3436,6 +3525,71 @@ mod tests {
     /// approving it works the first time (from the agent's list, or by its
     /// code as `oneup sync --approve` does), and a move of a folder above it
     /// between `status` and `approve` makes it a stop of its own again.
+    /// A round whose only change is removing one chosen duplicate, far
+    /// below every limit, still stops for it, keyed with the path its list
+    /// shows (the full OneDrive path), and the preview's code is the stop's.
+    /// Moved meanwhile, the same copy is another list.
+    #[test]
+    fn a_chosen_removal_is_keyed_where_it_is_shown_in_a_round() {
+        use oneup_store::RemoteRow;
+        let row = |id: &str, parent: &str, name: &str, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind,
+            size: if kind == Kind::File { 2 << 20 } else { 0 },
+            etag: Some(format!("e-{id}")),
+            qxh: (kind == Kind::File).then_some([7; 20]),
+            mtime_ms: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                o.upsert_item(&RemoteRow { parent_id: None, ..row("root", "", "", Kind::Root) }, false)?;
+                o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+                o.upsert_item(&row("old", "root", "Old", Kind::Folder), false)?;
+                o.upsert_item(&row("keep", "top", "a.jpg", Kind::File), false)?;
+                o.upsert_item(&row("dup", "old", "a.jpg", Kind::File), false)?;
+                oneup_exec::link_roots(o, 1, "top").map(|_| ())
+            })
+            .unwrap();
+        let chosen = oneup_exec::dupes::Chosen {
+            copy: oneup_exec::dupes::CopyId::Cloud { id: RemoteId("dup".into()), etag: "e-dup".into() },
+            size: 2 << 20,
+            hash: [7; 20],
+        };
+        let plan = store.read(|o| oneup_exec::dupes::plan(o, std::slice::from_ref(&chosen), &[])).unwrap();
+        assert_eq!(plan.ops.len(), 1);
+        let rules = RuleSet::default();
+        let round = |store: &Store, removal: Vec<Op>| {
+            let modes = Modes { removal, ..Modes::default() };
+            plan_round(store, None, Scope::All, &Controls::default(), Recent::default(), &rules, modes, &[])
+                .unwrap()
+                .review
+        };
+        let r = round(&store, plan.ops.clone());
+        assert_eq!(r.breakers.len(), 1);
+        let b = &r.breakers[0];
+        assert_eq!(b.kind, BreakerKind::Removal);
+        let at = |path: &str| oneup_gate::item_key(BreakerKind::Removal, &plan.ops[0], path);
+        assert_eq!(b.items, [at("/Old/a.jpg")], "keyed with the path the list shows");
+        let preview = store.read(|o| crate::duplicates::code(o, &plan)).unwrap();
+        assert_eq!(format!("{:016x}", b.fingerprint.0), preview);
+        // `Old` renamed: the copy is shown elsewhere, another list.
+        store
+            .write(|o| {
+                o.upsert_item(&RemoteRow { name: "Older".into(), ..row("old", "root", "", Kind::Folder) }, false)
+                    .map(|_| ())
+            })
+            .unwrap();
+        // Each round works the choice out again: the path is the one the
+        // operation carries, the one the executor checks it's still at.
+        let again = store.read(|o| oneup_exec::dupes::plan(o, std::slice::from_ref(&chosen), &[])).unwrap();
+        let r = round(&store, again.ops.clone());
+        assert_eq!(r.breakers[0].items, [oneup_gate::item_key(BreakerKind::Removal, &again.ops[0], "/Older/a.jpg")]);
+        assert_ne!(r.breakers[0].fingerprint, b.fingerprint);
+    }
+
     #[test]
     fn a_removal_of_unknown_size_is_approved_where_it_was_shown() {
         use oneup_store::RemoteRow;
@@ -3476,7 +3630,7 @@ mod tests {
         let round = |store: &Store, approved: &[ItemKey], codes: Vec<u64>| {
             let controls =
                 Controls { answers: Answers { approve: codes, ..Answers::default() }, ..Controls::default() };
-            let modes = Modes { pull: true, extra: vec![prune.clone()] };
+            let modes = Modes { pull: true, extra: vec![prune.clone()], ..Modes::default() };
             plan_round(store, None, Scope::All, &controls, Recent::default(), &rules, modes, approved).unwrap().review
         };
 

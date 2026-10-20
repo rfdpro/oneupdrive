@@ -1794,6 +1794,17 @@
                 forced-color-adjust: none;
             }
         }
+
+        /* The removal preview lists every copy that goes. */
+
+        #dp-facts {
+            max-height: 50vh;
+            overflow-y: auto;
+        }
+
+        .fl input[type=checkbox] {
+            flex: none;
+        }
     </style>
 </head>
 
@@ -1957,6 +1968,7 @@
                 <div class="views" role="tablist" aria-label="View">
                     <button role="tab" data-view="all" aria-selected="true">All files</button>
                     <button role="tab" data-view="out">Exclude</button>
+                    <button role="tab" data-view="dupes">Duplicates</button>
                 </div>
                 <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
             </div>
@@ -2375,6 +2387,17 @@
             <div class="df"><span class="muted" id="rs-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rs-go"></button></div>
         </form>
     </dialog>
+    <dialog id="dlg-dupes" aria-labelledby="dp-title">
+        <form method="dialog">
+            <div class="dh">
+                <h3 id="dp-title"></h3>
+            </div>
+            <div class="db">
+                <ul class="facts" id="dp-facts"></ul>
+            </div>
+            <div class="df"><span class="muted" id="dp-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="dp-go">Remove</button></div>
+        </form>
+    </dialog>
     <dialog id="dlg-recovery" aria-labelledby="dlg-recovery-t">
         <form method="dialog">
             <div class="dh">
@@ -2614,6 +2637,7 @@
                 F.rs = await call("snapshot", {
                     root: F.root.id
                 }).catch(() => F.rs);
+                D.stale = true;
                 render();
                 if (tree) tree.scrollTop = scroll;
             }, 1500);
@@ -2622,6 +2646,7 @@
             const m = e.data;
             if (m.event === "status") {
                 followSync(m.status);
+                followDupes(m.status);
                 followLists(m.status);
                 return showStatus(m.status, m.stopped || null);
             }
@@ -4381,6 +4406,7 @@
             renderCols();
             if (!all || F.q) $("#tree").setAttribute("role", "region");
             if (all && F.q) renderFound();
+            else if (F.view === "dupes") renderDupes(!D.page || D.root !== F.root.id || D.stale);
             else if (!all) renderOut();
             else renderTree();
             renderDetails();
@@ -5044,6 +5070,294 @@
                 giveBack(this);
             };
             for (const d of $$("dialog")) d.addEventListener("close", () => giveBack(d));
+        }
+
+        // ---- duplicates (`oneup_app::duplicates`): groups a page at a time,
+        // most space saved first. Removing previews exactly what goes, and
+        // OneUpDrive then waits for approval, as for any safety stop.
+        const D = {
+            page: null,
+            groups: [],
+            picked: new Map(),
+            root: null,
+            stale: false,
+            stop: null
+        };
+        const copiesText = n => tr("{n, plural, one {# copy} other {# copies}}", {
+            n
+        });
+        // A copy's labels (`duplicates::Label`), in the reader's language.
+        const dupLabels = ls => ls.map(l => tr(l.key, {
+            name: l.name || ""
+        })).join("; ");
+
+        async function loadDupes(more) {
+            const r = await call("duplicates", {
+                root: F.root.id,
+                after: more && D.page && D.page.next || ""
+            });
+            if (!more || D.root !== F.root.id) {
+                D.groups = [];
+                D.picked.clear();
+            }
+            D.root = F.root.id;
+            D.page = r;
+            D.stale = false;
+            D.groups.push(...r.page);
+        }
+
+        // The approval waits on the agent's status: shown when it comes.
+        function followDupes(s) {
+            const stop = s && (s.safety_stops || []).find(x => x.kind === "removal");
+            const code = stop ? stop.code : null;
+            if (code === D.stop) return;
+            D.stop = code;
+            if (F.root && F.view === "dupes" && $("#files").classList.contains("on")) renderDupes(true);
+        }
+
+        async function renderDupes(reload) {
+            if (reload) {
+                if (!D.page || D.root !== F.root.id) $("#tree").replaceChildren(el("div", {
+                    className: "msg",
+                    textContent: tr("Looking…")
+                }));
+                try {
+                    await loadDupes(false);
+                } catch (e) {
+                    $("#tree").replaceChildren(el("div", {
+                        className: "msg",
+                        textContent: e.message
+                    }));
+                    return;
+                }
+            }
+            if (F.view !== "dupes") return;
+            const r = D.page;
+            const box = el("div", {
+                className: "flat"
+            });
+            box.append(flatRow(r.groups ? tr("{size} in {n, plural, one {# file} other {# files}}", {
+                    size: size(r.bytes),
+                    n: r.files
+                }) : tr("No duplicates found"),
+                r.groups ? tr("To save by removing all but one copy of each. Files of 1 MB or more. {note}", {
+                    note: tr(r.note)
+                }) : tr("Files of 1 MB or more. {note}", {
+                    note: tr(r.note)
+                })));
+            const hash = el("button", {
+                className: "btn small",
+                textContent: tr("Hash"),
+                title: tr("At background priority, a few thousand at a time. Stops while sync is paused."),
+                onclick: async() => {
+                    hash.disabled = true;
+                    hash.textContent = tr("Hashing…");
+                    try {
+                        const out = await call("duplicates_hash", {
+                            root: F.root.id
+                        });
+                        toast(out.trim().split("\n").filter(Boolean).slice(-2).join(" "));
+                    } catch (e) {
+                        toast(e.message, true);
+                    }
+                    renderDupes(true);
+                }
+            });
+            box.append(flatRow(tr("Files only on this PC"), tr("Hash those of 1 MB or more to compare them too. {n} hashed.", {
+                n: r.hashed
+            }), hash));
+            if (r.waiting) {
+                const st = await call("status", {
+                    root: F.root.id
+                }).catch(() => null);
+                const stop = st && (st.safety_stops || []).find(x => x.kind === "removal");
+                D.stop = stop ? stop.code : null;
+                box.append(flatRow(tr("Removing {n, plural, one {# copy} other {# copies}} waits for your approval", {
+                        n: r.waiting.copies
+                    }),
+                    stop ? tr("Copies in OneDrive go to its recycle bin, copies on this PC to the version store.") : tr("OneUpDrive checks them again first."),
+                    stop ? el("button", {
+                        className: "btn small primary",
+                        textContent: tr("Approve…"),
+                        onclick: () => dupesApprove(stop.code)
+                    }) : null,
+                    el("button", {
+                        className: "btn small",
+                        textContent: tr("Cancel"),
+                        onclick: () => run(call("duplicates_cancel", {
+                            root: F.root.id
+                        }), tr("Cancelled")).then(() => renderDupes(true))
+                    })));
+            }
+            const remove = el("button", {
+                className: "btn small primary",
+                textContent: tr("Remove"),
+                onclick: () => dupesAsk()
+            });
+            const chosen = el("b", {});
+            const update = () => {
+                remove.disabled = !D.picked.size;
+                chosen.textContent = D.picked.size ? tr("{n, plural, one {# copy} other {# copies}} chosen", {
+                    n: D.picked.size
+                }) : tr("Choose the copies to remove");
+            };
+            update();
+            if (D.groups.length) box.append(el("div", {
+                className: "fl"
+            }, el("div", {
+                className: "label"
+            }, chosen, el("small", {
+                textContent: tr("The last copy of a file is never removed.")
+            })), remove));
+            for (const g of D.groups) {
+                const head = tr("{n, plural, one {# copy} other {# copies}} of {size}, {saved} to save", {
+                    n: g.copies,
+                    size: size(g.size),
+                    saved: size(g.saved)
+                });
+                box.append(el("div", {
+                    className: "group",
+                    textContent: g.label_keys.length ? `${head} · ${dupLabels(g.label_keys)}` : head
+                }));
+                for (const c of g.list) {
+                    const id = JSON.stringify(c.key);
+                    const i = el("input", {
+                        type: "checkbox",
+                        checked: D.picked.has(id),
+                        "aria-label": tr("Remove {path}", {
+                            path: c.path
+                        })
+                    });
+                    i.onchange = () => {
+                        i.checked ? D.picked.set(id, c) : D.picked.delete(id);
+                        update();
+                    };
+                    box.append(el("div", {
+                        className: "fl"
+                    }, i, el("div", {
+                        className: "label"
+                    }, el("b", {
+                        className: "path",
+                        textContent: c.path
+                    }), el("small", {
+                        textContent: tr(c.where)
+                    })), ...c.label_keys.map(l => el("span", {
+                        className: "tag wait",
+                        textContent: dupLabels([l])
+                    }))));
+                }
+                if (g.copies > g.list.length) box.append(el("div", {
+                    className: "msg",
+                    textContent: tr("and {n} more", {
+                        n: g.copies - g.list.length
+                    })
+                }));
+            }
+            if (r.next) box.append(el("div", {
+                className: "fl"
+            }, el("button", {
+                className: "btn small",
+                textContent: tr("More"),
+                onclick: async() => {
+                    await run(loadDupes(true));
+                    renderDupes(false);
+                }
+            })));
+            $("#tree").replaceChildren(box);
+        }
+
+        // Approving shows the stop's own list, exactly what its code
+        // approves, and nothing is approved without it.
+        async function dupesApprove(code) {
+            const lists = await run(call("stops", {
+                root: F.root.id,
+                limit: 2000
+            })).catch(() => null);
+            const list = lists && lists.find(l => l.code === code);
+            if (!list) return toast(tr("The list of what goes isn't ready yet. Try again in a moment."), true);
+            const li = t => el("li", {
+                textContent: t
+            });
+            const facts = list.rows.map(r => li(`${r.path} → ${r.note}`));
+            const more = list.matching + list.unwritten - list.rows.length;
+            if (more > 0) facts.push(li(tr("and {n} more", {
+                n: more
+            })));
+            $("#dp-title").textContent = tr("Approve removing {n, plural, one {# copy} other {# copies}}?", {
+                n: list.matching + list.unwritten
+            });
+            $("#dp-facts").replaceChildren(...facts);
+            $("#dp-busy").textContent = "";
+            const go = $("#dp-go");
+            go.textContent = tr("Approve");
+            go.disabled = false;
+            go.onclick = async() => {
+                go.disabled = true;
+                try {
+                    await call("control", {
+                        root: F.root.id,
+                        call: "approve_removal",
+                        code
+                    });
+                    $("#dlg-dupes").close();
+                    toast(tr("Removing"));
+                    renderDupes(true);
+                } catch (e) {
+                    toast(e.message, true);
+                    go.disabled = false;
+                }
+            };
+            $("#dlg-dupes").showModal();
+        }
+
+        // The preview: every copy that goes and where, and what's left and
+        // why. Handed to OneUpDrive only if it's still exactly that.
+        async function dupesAsk() {
+            const copies = [...D.picked.values()].map(c => ({
+                path: c.path,
+                key: c.key
+            }));
+            const pv = await run(call("duplicates_preview", {
+                root: F.root.id,
+                copies
+            })).catch(() => null);
+            if (!pv) return;
+            const li = t => el("li", {
+                textContent: t
+            });
+            const facts = pv.lines.map(l => li(`${l.path} → ${tr(l.to)}`));
+            for (const l of pv.left) facts.push(li(tr("Left: {path} ({why})", {
+                path: l.path,
+                why: tr(l.why)
+            })));
+            if (pv.lines.length) facts.push(li(tr("You approve the removal next.")));
+            $("#dp-title").textContent = pv.lines.length ? tr("Remove {n, plural, one {# copy} other {# copies}} ({size})?", {
+                n: pv.lines.length,
+                size: size(pv.bytes)
+            }) : tr("Nothing to remove");
+            $("#dp-facts").replaceChildren(...facts);
+            $("#dp-busy").textContent = "";
+            const go = $("#dp-go");
+            go.textContent = tr("Remove");
+            go.disabled = !pv.lines.length;
+            go.onclick = async() => {
+                go.disabled = true;
+                try {
+                    await call("duplicates_remove", {
+                        root: F.root.id,
+                        copies,
+                        expect: pv.code
+                    });
+                    $("#dlg-dupes").close();
+                    toast(tr("Waiting for your approval"));
+                    D.picked.clear();
+                    renderDupes(true);
+                } catch (e) {
+                    toast(e.message, true);
+                    go.disabled = false;
+                }
+            };
+            $("#dlg-dupes").showModal();
         }
 
         // ---- flat views: search results, left out, largest

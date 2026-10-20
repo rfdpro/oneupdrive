@@ -25,6 +25,7 @@ mod agent;
 mod cloud_check;
 mod cloud_prune;
 mod dev_remote;
+mod duplicates_cmd;
 mod find;
 mod hooks_cmd;
 mod migrate;
@@ -298,6 +299,29 @@ enum Cmd {
         /// Keys that open search from anywhere (e.g. Ctrl+Alt+F), or `off`
         #[arg(long, value_name = "KEYS|off")]
         hotkey: Option<String>,
+    },
+    /// List files with the same content, most space saved first; or remove
+    /// the copies you choose
+    Duplicates {
+        #[command(subcommand)]
+        cmd: Option<DupCmd>,
+        /// As JSON
+        #[arg(long)]
+        json: bool,
+        /// How many groups
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        /// The next page: the cursor the last page printed
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<String>,
+        /// Instead: hash files on this PC that aren't in OneDrive (1 MiB or
+        /// more), at background priority, so they're compared too. Stops when
+        /// sync is paused; a later run continues
+        #[arg(long)]
+        hash_local: bool,
+        /// With --hash-local: at most this many files this run
+        #[arg(long, value_name = "N", default_value_t = 2000)]
+        max_files: usize,
     },
     /// Show or change the safety stops: when sync stops and asks you first
     Safety {
@@ -1010,6 +1034,25 @@ enum HooksCmd {
 }
 
 #[derive(Subcommand)]
+enum DupCmd {
+    /// Preview removing copies, named as `oneup duplicates` lists them; with
+    /// --yes, hand the removal to OneUpDrive, which asks you to approve it.
+    /// Copies in OneDrive go to its recycle bin, copies on this PC to the
+    /// version store; the last copy never goes
+    Remove {
+        paths: Vec<String>,
+        #[arg(long)]
+        yes: bool,
+        /// The code the preview showed: go ahead only if the removal is still
+        /// exactly that
+        #[arg(long, value_name = "CODE")]
+        expect: Option<String>,
+    },
+    /// Drop the removal waiting for approval
+    Cancel,
+}
+
+#[derive(Subcommand)]
 enum UnsyncedCmd {
     /// Resolve items `oneup unsynced` lists; without a choice, shows each
     /// item's choices. OneUpDrive carries it out in its next round
@@ -1636,6 +1679,19 @@ async fn run() -> Result<()> {
         }
         Cmd::Search { onedrive, hotkey } => {
             find::settings(&data_dir(&cli)?, onedrive.map(Toggle::on), hotkey.as_deref())
+        }
+        Cmd::Duplicates { cmd, json, count, after, hash_local, max_files } => {
+            let dir = data_dir(&cli)?;
+            let store = open_store(&cli, MemoryProfile::Balanced)?;
+            match cmd {
+                Some(DupCmd::Remove { paths, yes, expect }) => {
+                    let a = duplicates_cmd::Remove { paths, yes: *yes, expect: expect.as_deref() };
+                    duplicates_cmd::remove(&dir, store, a).await
+                }
+                Some(DupCmd::Cancel) => duplicates_cmd::cancel(&dir, store).await,
+                None if *hash_local => duplicates_cmd::hash_local(&dir, store, *max_files).await,
+                None => duplicates_cmd::list(&dir, &store, *json, *count, after.as_deref()),
+            }
         }
         Cmd::Safety { max_changes, max_percent, content_guard } => {
             let mut store = open_store(&cli, MemoryProfile::Balanced)?;
