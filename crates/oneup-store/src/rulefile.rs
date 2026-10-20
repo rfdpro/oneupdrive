@@ -70,17 +70,26 @@ impl Ops<'_> {
     }
 
     /// [`Self::local_to_fetch`] a page at a time: up to `limit` of them
-    /// after file ID `after` (none: from the first), in file ID order, so
-    /// a caller can pass over files it won't fetch now and reach the rest.
-    pub fn local_to_fetch_after(&self, after: Option<u128>, limit: usize) -> Result<Vec<LocalRow>> {
+    /// after file ID `after` (none: from the first) and up to `upto` (none:
+    /// to the last), in the index's order (file ID blobs), so a caller can
+    /// pass over files it won't fetch now, resume where it stopped, and
+    /// wrap around.
+    pub fn local_to_fetch_after(&self, after: Option<u128>, upto: Option<u128>, limit: usize) -> Result<Vec<LocalRow>> {
         let ids: Vec<Vec<u8>> = self
             .c
             .prepare_cached(
-                "SELECT file_id FROM local_item INDEXED BY local_to_fetch                  WHERE kind = 0 AND (attributes & 524288) != 0 AND (attributes & 4194304) != 0 AND file_id > ?1                  ORDER BY file_id LIMIT ?2",
+                "SELECT file_id FROM local_item INDEXED BY local_to_fetch \
+                 WHERE kind = 0 AND (attributes & 524288) != 0 AND (attributes & 4194304) != 0 \
+                 AND file_id > ?1 AND (?2 IS NULL OR file_id <= ?2) ORDER BY file_id LIMIT ?3",
             )?
-            .query_map(rusqlite::params![after.map_or(Vec::new(), |a| blob(a).to_vec()), limit as i64], |r| {
-                r.get(0)
-            })?
+            .query_map(
+                rusqlite::params![
+                    after.map_or(Vec::new(), |a| blob(a).to_vec()),
+                    upto.map(|u| blob(u).to_vec()),
+                    limit as i64
+                ],
+                |r| r.get(0),
+            )?
             .collect::<std::result::Result<_, _>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
@@ -229,7 +238,7 @@ mod placement_tests {
         .unwrap();
         let (mut after, mut all) = (None, Vec::new());
         loop {
-            let page = ids(s.read(|o| o.local_to_fetch_after(after, 2)).unwrap());
+            let page = ids(s.read(|o| o.local_to_fetch_after(after, None, 2)).unwrap());
             assert!(page.len() <= 2);
             let Some(&last) = page.last() else { break };
             after = Some(last);
@@ -237,6 +246,9 @@ mod placement_tests {
         }
         all.sort_unstable();
         assert_eq!(all, [2, 12, 13, 14, 15, 16]);
+        // Up to a bound, inclusive.
+        let upto = ids(s.read(|o| o.local_to_fetch_after(None, None, 3)).unwrap())[2];
+        assert_eq!(s.read(|o| o.local_to_fetch_after(None, Some(upto), 10)).unwrap().len(), 3);
         assert_eq!(
             s.read(|o| o.local_online_only_sample(10)).unwrap(),
             [2, 5, 12, 13, 14, 15, 16],
