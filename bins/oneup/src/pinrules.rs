@@ -1063,8 +1063,10 @@ pub fn fetch_pass(
         if let Err(why) = may(size) {
             // The waiting file too big for the disk or the pass's share
             // now: the rest of the batch may still go, and the next pass
-            // tries it first again. Only a pause stops the pass there.
-            if before.is_none() && why != Stop::Paused {
+            // tries it first again. Only a pause stops the pass there. A
+            // file larger than the data budget has left waits (not
+            // started, its allowance not used) while smaller ones go.
+            if why == Stop::Budget || before.is_none() && why != Stop::Paused {
                 continue;
             }
             out.stopped = Some(why);
@@ -2159,6 +2161,58 @@ mod tests {
         .unwrap();
         assert!(got.is_empty());
         assert_eq!(f.stopped, Some(Stop::Paused));
+    }
+
+    /// The network's data budget: a rule file larger than what's left
+    /// isn't started (its allowance isn't charged, and comes back) while a
+    /// smaller one that fits goes; used up, none starts. What a pass lets
+    /// through counts against what's left for the next file.
+    #[test]
+    fn rule_files_wait_for_the_data_budget_without_using_their_allowance() {
+        use std::sync::atomic::AtomicU64;
+        const MIB: i64 = 1 << 20;
+        let rows = vec![
+            LocalRow { size: 800 * MIB, ..row(10, 1, "big.psd", LocalKind::File, RECALL) },
+            LocalRow { size: 10 * MIB, ..row(11, 1, "small.psd", LocalKind::File, RECALL) },
+            LocalRow { size: 30 * MIB, ..row(12, 1, "mid.psd", LocalKind::File, RECALL) },
+        ];
+        let mut s = store(&rows);
+        let mut fake = Fake::default();
+        run(&mut s, &mut fake, &PinSet::new(&["*.psd"]), 0);
+        observe(&mut s, &fake, &[(10, "big.psd"), (11, "small.psd"), (12, "mid.psd")]);
+        let before = budget(&s).unwrap();
+        let started = |s: &Store| s.read(|o| o.meta_get(KEY_STARTED)).unwrap().unwrap_or_default();
+        let pass = |s: &mut Store, fake: &mut Fake, left: u64| {
+            let net = crate::network::Policy { budget_left: Some(left), ..crate::network::Policy::default() };
+            let allowed = AtomicU64::new(0);
+            let mut got = Vec::new();
+            let f = fetch_pass(
+                s,
+                fake,
+                &mut |size| crate::sync::pin_may(&net, false, &allowed, size, || Ok(())),
+                &mut |rel| {
+                    got.push(rel.to_string());
+                    true
+                },
+            )
+            .unwrap();
+            let begun = started(s);
+            let done: Vec<u128> = f.done.iter().map(|d| d.1).chain(f.attempted.iter().copied()).collect();
+            settle(s, &done, &|_| false).unwrap();
+            (got, f, begun)
+        };
+        // Used up: nothing starts, nothing is charged.
+        let (got, f, begun) = pass(&mut s, &mut fake, 0);
+        assert!(got.is_empty(), "{got:?}");
+        assert_eq!((f.stopped, f.done.len(), f.attempted.len()), (None, 0, 0));
+        assert_eq!(begun, "", "none started");
+        assert_eq!(budget(&s).unwrap(), before, "the allowance comes back whole");
+        // 35 MiB left: the big one waits, the small one goes, and the
+        // middle one then no longer fits.
+        let (got, _, begun) = pass(&mut s, &mut fake, 35 << 20);
+        assert_eq!(got, ["/small.psd"]);
+        assert_eq!(begun, "11", "only the small one started");
+        assert_eq!(budget(&s).unwrap(), before - 10 * MIB, "only the small one's bytes are spent");
     }
 
     /// A go-ahead or a new approval is added to the budget as it stands:
