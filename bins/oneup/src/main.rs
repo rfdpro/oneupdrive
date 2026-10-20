@@ -522,10 +522,10 @@ enum Cmd {
     /// bin and version history
     Rewind {
         /// The folder, relative to the synced folder (`/docs`; `/` for all of it)
-        #[arg(required_unless_present_any = ["before_stop", "cancel", "set_history_days", "set_history_changes"])]
+        #[arg(required_unless_present_any = ["before_stop", "cancel", "approve", "set_history_days", "set_history_changes"])]
         folder: Option<String>,
         /// The moment, in this PC's time: `2026-10-19 14:05`
-        #[arg(long, required_unless_present_any = ["before_stop", "cancel", "set_history_days", "set_history_changes"])]
+        #[arg(long, required_unless_present_any = ["before_stop", "cancel", "approve", "set_history_days", "set_history_changes"])]
         to: Option<String>,
         /// The content guard's stop CODE: its folder, to just before its batch
         #[arg(long, value_name = "CODE", conflicts_with_all = ["folder", "to"])]
@@ -540,6 +540,11 @@ enum Cmd {
         /// Cancel the rewind under way (what it did stays done)
         #[arg(long, conflicts_with = "start")]
         cancel: bool,
+        /// Approve the rewind waiting, only if its list is still the one
+        /// with this CODE; otherwise the new list is shown and nothing is
+        /// approved
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["start", "cancel", "before_stop", "folder", "to"])]
+        approve: Option<String>,
         /// Keep this many days of history to rewind with [default: 30];
         /// 0 turns rewinding off and drops the history
         #[arg(long, value_name = "DAYS")]
@@ -2122,18 +2127,18 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Rewind { folder, to, before_stop, start, expect, cancel, json, profile, .. } => {
+        Cmd::Rewind { folder, to, before_stop, start, expect, cancel, approve, json, profile, .. } => {
             let dir = data_dir(&cli)?;
-            let expect = match expect {
-                Some(c) => Some(u64::from_str_radix(c, 16).ok().filter(|_| c.len() == 16).context("not a code")?),
-                None => None,
-            };
+            let code = |c: &String| u64::from_str_radix(c, 16).ok().filter(|_| c.len() == 16).context("not a code");
+            let expect = expect.as_ref().map(code).transpose()?;
+            let approve = approve.as_ref().map(code).transpose()?;
             let ask = RewindAsk {
                 folder: folder.as_deref(),
                 to: to.as_deref(),
                 before_stop: before_stop.as_deref(),
                 start: *start,
                 expect,
+                approve,
                 cancel: *cancel,
                 json: *json,
             };
@@ -2676,6 +2681,8 @@ struct RewindAsk<'a> {
     start: bool,
     /// The code of the preview the user saw.
     expect: Option<u64>,
+    /// Approve the rewind waiting, if its list still has this code.
+    approve: Option<u64>,
     cancel: bool,
     json: bool,
 }
@@ -2693,14 +2700,32 @@ async fn rewind(dir: &std::path::Path, mut store: Store, ask: RewindAsk<'_>) -> 
         }
         return Ok(());
     }
-    let (folder, at) = match ask.before_stop {
-        Some(code) => rw::before_stop(&store, dir, code, now)?,
-        None => {
+    let (folder, at) = match (ask.approve, ask.before_stop) {
+        (Some(_), _) => {
+            let job = store.read(rw::load)?.context("no rewind is waiting for an approval")?;
+            if job.approval.is_some() {
+                bail!("that rewind is approved already");
+            }
+            (job.folder, job.at_ms)
+        }
+        (None, Some(code)) => rw::before_stop(&store, dir, code, now)?,
+        (None, None) => {
             (ask.folder.unwrap_or("/").to_string(), rw::parse_when(ask.to.context("--to: the moment to rewind to")?)?)
         }
     };
     let (rules, _) = oneup_app::rulefiles::load(dir, &store, &mut oneup_app::rulefiles::Cache::default())?;
-    let (p, started) = if ask.start {
+    // Approved only as shown: the list is planned again now, and a change
+    // in the folder since (it syncs meanwhile) gives another list, shown
+    // instead. The agent checks the same again when it takes the answer.
+    let mut approved = false;
+    let (p, started) = if let Some(code) = ask.approve {
+        let p = rw::preview(&store, &rules, &folder, at, now)?;
+        if p.code == code {
+            agent::answer(dir, code, oneup_ipc::Answer::Approve).await?;
+            approved = true;
+        }
+        (p, false)
+    } else if ask.start {
         let (p, started) = rw::start(&mut store, dir, &rules, &folder, at, now, ask.expect)?;
         if started {
             agent::nudge(dir).await;
@@ -2727,7 +2752,8 @@ async fn rewind(dir: &std::path::Path, mut store: Store, ask: RewindAsk<'_>) -> 
             .collect();
         let v = serde_json::json!({
             "folder": p.folder, "at_ms": p.at_ms, "code": format!("{:016x}", p.code),
-            "started": started, "changed": ask.start && !started, "changes": changes, "skipped": skipped, "lines": rw::describe(&p),
+            "started": started, "approved": approved,
+            "changed": (ask.start && !started) || (ask.approve.is_some() && !approved), "changes": changes, "skipped": skipped, "lines": rw::describe(&p),
         });
         println!("{v}");
         return Ok(());
@@ -2737,7 +2763,14 @@ async fn rewind(dir: &std::path::Path, mut store: Store, ask: RewindAsk<'_>) -> 
     for l in rw::describe(&p) {
         println!("  {l}");
     }
-    if ask.start && !started {
+    if ask.approve.is_some() && !approved {
+        println!(
+            "The list changed since it was shown, so nothing was approved. To approve this one: --approve {:016x}.",
+            p.code
+        );
+    } else if approved {
+        // `agent::answer` said so.
+    } else if ask.start && !started {
         println!(
             "The list changed since the preview, so nothing started. To rewind this one: --start --expect {:016x}.",
             p.code
@@ -2745,7 +2778,10 @@ async fn rewind(dir: &std::path::Path, mut store: Store, ask: RewindAsk<'_>) -> 
     } else if p.changes.is_empty() {
         println!("Nothing to change.");
     } else if ask.start {
-        println!("The agent waits for your approval and changes nothing until then: `oneup approve {:016x}`.", p.code);
+        println!(
+            "The rewind waits for your approval and the rest syncs meanwhile: `oneup rewind --approve {:016x}`.",
+            p.code
+        );
     } else {
         println!("Nothing changed. To do it, run this again with --start.");
     }

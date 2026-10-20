@@ -245,7 +245,8 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
         print_overflow(o, &store, Asker::Sync)?;
     }
     if out.end != End::Stopped {
-        // Removing chosen duplicates waits without stopping the rest.
+        // Removing chosen duplicates, or a rewind waiting for its approval,
+        // waits without stopping the rest.
         print_breakers(&out.breakers, Asker::Sync);
     }
     match out.end {
@@ -658,9 +659,14 @@ impl Stops {
     }
 
     /// A list approved (by a code this engine raised, or one the gate
-    /// matched): its items are approved and its code is spent.
+    /// matched): its items are approved and its code is spent. A rewind's
+    /// items aren't: its approval is its job's (`crate::rewind`), taken
+    /// only if the list planned again at the answer has the same code, so
+    /// none of a list that changed since runs.
     fn approve(&mut self, b: &Breaker) {
-        self.approved.extend(&b.items);
+        if b.kind != BreakerKind::Rewind {
+            self.approved.extend(&b.items);
+        }
         self.approved.sort_unstable();
         self.approved.dedup();
         let code = b.fingerprint.0;
@@ -1888,7 +1894,12 @@ impl Engine {
             out.totals.problems = problems;
             if !review.breakers.is_empty() {
                 for b in &review.breakers {
-                    let detail = format!("{}; nothing was changed (code {:016x})", breaker_what(b), b.fingerprint.0);
+                    // A rewind waiting for its approval holds only its own
+                    // steps (the gate withholds them): the rest syncs, and a
+                    // change in the folder changes its list, so an approval
+                    // given for the list before isn't taken (`crate::rewind`).
+                    let what = if b.kind == BreakerKind::Rewind { "the rest syncs meanwhile" } else { "nothing was changed" };
+                    let detail = format!("{}; {what} (code {:016x})", breaker_what(b), b.fingerprint.0);
                     let e = notice(ActivityOutcome::Waiting, "safety stop", detail);
                     self.log_once(&mut store, format!("stop {:x}", b.fingerprint.0), e)?;
                 }
@@ -1901,7 +1912,7 @@ impl Engine {
                 }
                 self.save_stop_lists(&store, &review);
             }
-            if review.breakers.iter().any(|b| b.kind != BreakerKind::Removal) {
+            if review.breakers.iter().any(|b| !matches!(b.kind, BreakerKind::Removal | BreakerKind::Rewind)) {
                 // Nothing at all runs in a tripped round, not even the side
                 // that didn't trip: the user should see the whole picture
                 // first. The marks stay, so the next try plans it all again.
@@ -1909,9 +1920,9 @@ impl Engine {
                 out.end = End::Stopped;
                 return Ok((store, out));
             }
-            // Removing chosen duplicates waits for its own approval and
-            // holds nothing else back. Otherwise no stop stands: their
-            // lists go.
+            // Removing chosen duplicates, or a rewind, waits for its own
+            // approval and holds nothing else back. Otherwise no stop
+            // stands: their lists go.
             if review.breakers.is_empty() {
                 crate::stoplist::keep_only(&self.data_dir, &[]);
             }
@@ -2486,9 +2497,11 @@ fn plan_round<'a>(
         // item keeps it from being emptied.
         let parked = Parked::with_rules(o, &planning.hide).with_databases(&planning.databases);
         let pending = oneup_sync::pending_deletes(&parked, o, &ops, planning.flow)?;
-        // A rewind's items are the rewind's: what the planner would do to
-        // them (send an edit the rewind sets aside, say) waits for it.
-        if let Some(r) = &rewind {
+        // A rewind's items are the rewind's once it's approved: what the
+        // planner would do to them (send an edit the rewind sets aside, say)
+        // waits for it. Before, they sync as ever, and a change changes the
+        // rewind's list (and code), so the approval covers what's shown.
+        if let Some(r) = rewind.as_ref().filter(|r| r.preview.is_none()) {
             let theirs = |op: &Op| {
                 let (s, l, rm) = op.subjects();
                 r.ops.iter().any(|st| {
@@ -4087,6 +4100,22 @@ mod tests {
         );
         assert!(seen.is_empty(), "forgotten once the observer read past it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewind's stop answered approves none of its items by itself: the
+    /// rewind's job takes the approval only if its list, planned again, has
+    /// the code (`crate::rewind`), so a list that changed after it was
+    /// shown runs none of its steps.
+    #[test]
+    fn a_rewind_stop_answered_approves_no_items_by_itself() {
+        let ops = vec![Op::rewind(1, oneup_sync::rewind::Step::Forget)];
+        let breakers = oneup_gate::review(&oneup_gate::Policy::default(), 100, &[], ops).breakers;
+        assert_eq!(breakers[0].kind, BreakerKind::Rewind);
+        let mut s = Stops::default();
+        s.raise(&breakers);
+        let taken = s.answer(&[breakers[0].fingerprint.0]);
+        assert_eq!(taken.len(), 1, "the code is taken in (and spent)");
+        assert!(s.approved.is_empty(), "{:?}", s.approved);
     }
 
     /// A stop's list folders are marked once while it stands; approving its
