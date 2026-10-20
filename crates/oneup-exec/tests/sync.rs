@@ -1084,19 +1084,31 @@ struct Rewinding {
     stalls: usize,
     /// Every step it approved has run, was left alone, or can't be done.
     done: bool,
+    /// The code the user approved, taken at the next round only if the
+    /// list planned then has it (as the agent takes it).
+    answer: Option<u64>,
+    /// Approvals not taken: the list had changed since it was shown.
+    refused: usize,
 }
 
 /// See [`Rewinding::stalls`].
 const STALLS: usize = 3;
 
 impl Stops {
-    /// The user approves the stops standing (a rewind's with them).
+    /// The user approves the stops standing (a rewind's with them: its
+    /// code, which the next round takes only for the same list).
     fn approve(&mut self) {
+        // Asked for a rewind, the user approves that, not other stops.
+        let rewind = self.raised.iter().any(|b| b.kind == BreakerKind::Rewind);
         for b in std::mem::take(&mut self.raised) {
-            if b.kind == BreakerKind::Rewind
-                && let Some(r) = &mut self.rewind
-            {
-                r.job = Some(Job::approve(&r.preview));
+            if rewind && b.kind != BreakerKind::Rewind {
+                continue;
+            }
+            if b.kind == BreakerKind::Rewind {
+                if let Some(r) = &mut self.rewind {
+                    r.answer = Some(b.fingerprint.0);
+                }
+                continue;
             }
             self.approved.extend(b.items);
         }
@@ -1360,6 +1372,19 @@ impl Sync {
         let mut approved = self.stops.approved.clone();
         let mut rewound: Vec<ItemKey> = Vec::new();
         if let (Some(rw), Some(r)) = (planned_rewind, self.stops.rewind.as_mut()) {
+            // An approval is taken for the list as it's planned now, only if
+            // it's the one shown (its code): a change since gives another.
+            if r.job.is_none() {
+                let (all, all_paths): (Vec<Op>, Vec<String>) =
+                    rw.ops.iter().cloned().zip(rw.paths.iter().cloned()).chain(rw.later.iter().cloned()).unzip();
+                let code = oneup_gate::rewind_fingerprint(&all, &all_paths).0;
+                match r.answer.take() {
+                    Some(a) if a == code => r.job = Some(Job::approve(&all)),
+                    Some(_) => r.refused += 1,
+                    None => {}
+                }
+            }
+            let approved_job = r.job.is_some();
             let (steps, step_paths, later): (Vec<Op>, Vec<String>, Vec<(Op, String)>) = match &r.job {
                 None => {
                     r.preview = rw.ops.iter().cloned().chain(rw.later.iter().map(|(o, _)| o.clone())).collect();
@@ -1385,8 +1410,12 @@ impl Sync {
                     (s.is_some() && s == ss) || (l.is_some() && l == sl) || (rm.is_some() && rm == srm)
                 })
             };
-            let kept: Vec<(Op, String)> =
-                ops.into_iter().zip(paths).filter(|(op, _)| !op.is_action() || !subjects(op)).collect();
+            // Approved, its items are its own; before, they sync as ever.
+            let kept: Vec<(Op, String)> = ops
+                .into_iter()
+                .zip(paths)
+                .filter(|(op, _)| !approved_job || !op.is_action() || !subjects(op))
+                .collect();
             (ops, paths) = kept.into_iter().unzip();
             ops.extend(steps);
             paths.extend(step_paths);
@@ -1413,6 +1442,21 @@ impl Sync {
         }
         approved.sort_unstable();
         approved.dedup();
+        // The content guard, as the agent judges uploads (`judge_content`):
+        // a file whose first bytes don't look like its type.
+        let mut suspicious: Vec<LocalId> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Upload { local, name, .. } => {
+                    let rel = store.read(|o| o.local_path_of(local.id.0)).ok().flatten()?;
+                    let mut head = std::fs::read(self.dir.0.join(rel.trim_start_matches(['\\', '/']))).ok()?;
+                    head.truncate(oneup_gate::content::HEAD);
+                    oneup_gate::content::looks_wrong(name, &head).then_some(local.id)
+                }
+                _ => None,
+            })
+            .collect();
+        suspicious.sort_unstable();
         let cx = Context {
             room: self.room,
             decisions: &self.decisions,
@@ -1422,18 +1466,22 @@ impl Sync {
             paths: &paths,
             pending_paths: &pending_paths,
             rewound: &rewound,
+            suspicious: &suspicious,
             ..Context::default()
         };
         let r = review_in(&self.policy, &cx, ops);
-        // Removing chosen duplicates waits for its own approval and holds
-        // nothing else back, as in the agent.
-        let blocking = r.breakers.iter().any(|b| b.kind != oneup_gate::BreakerKind::Removal);
+        // Removing chosen duplicates, or a rewind, waits for its own
+        // approval and holds nothing else back, as in the agent.
+        let blocking = r.breakers.iter().any(|b| !matches!(b.kind, BreakerKind::Removal | BreakerKind::Rewind));
         assert!(self.stops.allowed || !blocking, "{:?}", r.breakers);
-        if blocking {
-            // Nothing runs; the marks stay, and the list's folders are
-            // marked so every round plans all of it.
+        if !r.breakers.is_empty() {
+            // The marks stay, and the list's folders are marked so every
+            // round plans all of it.
             let sids: Vec<oneup_sync::Sid> = r.breakers.iter().flat_map(|b| b.sids.clone()).collect();
             store.write(|o| o.dirty_mark_synced(&sids)).unwrap();
+        }
+        if blocking {
+            // Nothing runs.
             self.stops.raised = r.breakers;
             return Report::default();
         }
@@ -5852,6 +5900,12 @@ impl Sync {
         }
         meanwhile(self);
         self.stops.approve();
+        self.round().await;
+        // Changed since it was shown (`meanwhile`): the approval isn't
+        // taken, and the list shown again is approved in its turn.
+        if self.stops.rewind.as_ref().is_some_and(|r| r.job.is_none()) {
+            self.stops.approve();
+        }
         self.settle().await;
         let r = self.stops.rewind.take().expect("a rewind");
         assert!(r.done, "the rewind finished");
@@ -5901,7 +5955,11 @@ async fn everyday_rewinding_a_folder_puts_back_what_it_held_and_a_rewind_can_be_
 }
 
 #[tokio::test]
-async fn everyday_a_file_changed_after_the_rewind_preview_is_left_alone() {
+async fn everyday_a_change_before_the_approval_shows_the_list_again() {
+    // A rewind waits for its approval while the rest syncs. a.txt is saved
+    // again after the list was shown: it syncs, the list changes, and the
+    // approval given for the old one isn't taken. Nothing runs until the
+    // user approves the list as it is now (which puts a.txt back too).
     let cloud = Fake::new();
     let mut s = Sync::new("everyday-rewind-changed", cloud.clone());
     write(&s.p("docs/a.txt"), b"a, first");
@@ -5911,20 +5969,46 @@ async fn everyday_a_file_changed_after_the_rewind_preview_is_left_alone() {
     write(&s.p("docs/a.txt"), b"a, second");
     write(&s.p("docs/b.txt"), b"b, second");
     s.settle().await;
-
-    // Between the preview and the answer, a.txt is saved again here.
-    let left = s
-        .rewind_to("/docs", at, |s| {
-            std::thread::sleep(Duration::from_millis(20));
-            write(&s.p("docs/a.txt"), b"a, third");
-        })
-        .await;
-    assert!(left > 0, "a step was left alone");
+    s.start_rewind("/docs", at);
+    s.round().await;
+    std::thread::sleep(Duration::from_millis(20));
+    write(&s.p("docs/a.txt"), b"a, third");
+    s.stops.approve();
+    s.settle().await;
+    let r = s.stops.rewind.as_ref().unwrap();
+    assert_eq!((r.refused, r.job.is_some()), (1, false), "the approval of the list before isn't taken");
+    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"a, third".to_vec()), "the edit synced meanwhile");
+    assert_eq!(cloud.tree()["/docs/b.txt"], Some(b"b, second".to_vec()), "nothing of the rewind ran");
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Rewind), "its new list is shown");
+    // The list as it is now, approved.
+    s.stops.approve();
+    s.settle().await;
     let now = local_tree(&s.dir.0);
-    assert_eq!(now["/docs/a.txt"], Some(b"a, third".to_vec()), "the newer edit stays, and is synced");
-    assert_eq!(now["/docs/b.txt"], Some(b"b, first".to_vec()), "the rest of the rewind ran");
-    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"a, third".to_vec()));
-    assert!(!now.keys().any(|p| p.contains("conflict")), "nothing ran on the changed file: {:?}", names(&now));
+    assert_eq!(now["/docs/a.txt"], Some(b"a, first".to_vec()));
+    assert_eq!(now["/docs/b.txt"], Some(b"b, first".to_vec()));
+    assert!(s.versions().contains(&b"a, third".to_vec()) || cloud.holds(b"a, third"), "the newer edit is kept");
+}
+
+#[tokio::test]
+async fn everyday_the_rest_syncs_while_a_rewind_waits() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-waits", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a, first");
+    write(&s.p("other.txt"), b"other");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/a.txt"), b"a, second");
+    s.settle().await;
+    s.start_rewind("/docs", at);
+    s.round().await;
+    // Edits outside the folder, here and in OneDrive, while it waits.
+    write(&s.p("other.txt"), b"other, edited");
+    cloud.add("new.txt", Some(b"new"));
+    s.settle().await;
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Rewind), "still waiting");
+    assert_eq!(cloud.tree()["/other.txt"], Some(b"other, edited".to_vec()), "sent");
+    assert_eq!(std::fs::read(s.p("new.txt")).unwrap(), b"new", "brought here");
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"a, second", "the rewind waits");
 }
 
 #[tokio::test]
@@ -5941,14 +6025,16 @@ async fn everyday_a_rewind_sets_aside_edits_not_synced_yet() {
     let then = local_tree(&s.dir.0);
     let at = moment();
     for f in ["x", "y", "z"] {
-        write(&s.p(&format!("docs/{f}.txt")), format!("{f} \u{1}\u{2}scrambled").as_bytes());
+        write(&s.p(&format!("docs/{f}.txt")), format!("{f} \u{1}\u{2}scrambled, and long enough to judge").as_bytes());
     }
-    // Not synced: the preview's round plans these uploads too, and the stop
-    // holds them with everything else.
+    // Not synced: the content guard holds them (with everything else, as
+    // any stop but a rewind's does) until the rewind is approved, which
+    // takes the items over.
+    s.policy.max_suspicious = 1;
     assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
     assert_eq!(local_tree(&s.dir.0), then, "OneDrive's copies came back");
     for f in ["x", "y", "z"] {
-        let scrambled = format!("{f} \u{1}\u{2}scrambled").into_bytes();
+        let scrambled = format!("{f} \u{1}\u{2}scrambled, and long enough to judge").into_bytes();
         assert!(!cloud.holds(&scrambled), "the scrambled {f} never reached OneDrive");
         assert!(s.versions().contains(&scrambled), "the scrambled {f} is kept in the version store");
     }
@@ -6197,13 +6283,15 @@ async fn everyday_a_large_rewind_takes_one_approval() {
 /// was at the moment chosen.
 #[tokio::test]
 async fn a_crash_at_any_point_of_a_rewind_loses_nothing() {
-    const CONTENTS: [&[u8]; 10] = [
+    const CONTENTS: [&[u8]; 12] = [
         b"a, first",
         b"a, second",
         b"b",
         b"new",
         b"x, first",
-        b"x \x01scrambled",
+        b"x \x01\x02scrambled, long enough to judge",
+        b"y, first",
+        b"y \x01\x02scrambled, long enough to judge",
         b"c, first",
         b"c, second!",
         b"d, first",
@@ -6215,6 +6303,7 @@ async fn a_crash_at_any_point_of_a_rewind_loses_nothing() {
         write(&s.p("docs/a.txt"), b"a, first");
         write(&s.p("docs/b.txt"), b"b");
         write(&s.p("docs/x.txt"), b"x, first");
+        write(&s.p("docs/y.txt"), b"y, first");
         // Two-part steps: c.txt is restored, then its content put back; d.txt
         // gets its content back, then its name.
         write(&s.p("docs/c.txt"), b"c, first");
@@ -6231,8 +6320,10 @@ async fn a_crash_at_any_point_of_a_rewind_loses_nothing() {
         cloud.delete("docs/c.txt");
         cloud.add("docs/new.txt", Some(b"new"));
         s.settle().await;
-        // Not synced: set aside by the rewind.
-        write(&s.p("docs/x.txt"), b"x \x01scrambled");
+        // Not synced (the content guard holds them): set aside by the rewind.
+        write(&s.p("docs/x.txt"), b"x \x01\x02scrambled, long enough to judge");
+        write(&s.p("docs/y.txt"), b"y \x01\x02scrambled, long enough to judge");
+        s.policy.max_suspicious = 1;
         s.start_rewind("/docs", at);
         assert!(s.round().await.done.is_empty());
         s.stops.approve();

@@ -762,14 +762,24 @@ mod win {
                 Ok(Value::from(oneup(a).await?))
             }
             // The page showed the rewind's list and its code; the person
-            // approves exactly that (`oneup approve CODE`).
+            // approves exactly that (`oneup rewind --approve CODE`): a list
+            // that changed meanwhile comes back to be shown instead.
             "rewind_approve" => {
                 let code = text(args, "code");
                 if code.len() != 16 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
                     bail!("not a code");
                 }
-                let a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "approve".into(), code.into()];
-                Ok(Value::from(oneup(a).await?))
+                let a: Vec<std::ffi::OsString> = vec![
+                    "--data-dir".into(),
+                    dir.into(),
+                    "rewind".into(),
+                    "--approve".into(),
+                    code.into(),
+                    "--json".into(),
+                ];
+                let out = oneup(a).await?;
+                let line = out.lines().rev().find(|l| l.starts_with('{')).context("no answer from oneup")?;
+                Ok(serde_json::from_str(line)?)
             }
             "conflicts" => {
                 let d = dir.to_path_buf();

@@ -4049,16 +4049,26 @@
             showRewind(p, p.changes.length ? [go] : [], focus);
         }
 
-        function rewindWaiting(code, focus = false) {
+        // Approve and Cancel for the list with `code`. The approval is
+        // checked against the list planned again: one that changed (the
+        // folder keeps syncing meanwhile) comes back and is shown instead.
+        function waitingActions(code) {
             const approve = smallBtn(tr("Approve"), async() => {
-                await run(call("rewind_approve", {
+                const s = await run(call("rewind_approve", {
                     code
-                }), tr("Approved"));
-                setTimeout(loadRecovery, 2000);
+                }));
+                if (s.approved) {
+                    toast(tr("Approved"));
+                    setTimeout(loadRecovery, 2000);
+                    return;
+                }
+                toast(tr("The list changed before your approval. Here it is again."));
+                if (RW.preview) RW.preview.p = s;
+                showRewind(s, waitingActions(s.code), true);
             }, "primary");
-            $("#rw-actions").replaceChildren(el("span", {
+            return [el("span", {
                     className: "muted",
-                    textContent: tr("Waiting for your approval (code {code}). Sync waits too.", {
+                    textContent: tr("Waiting for your approval (code {code}). The rest keeps syncing.", {
                         code
                     })
                 }),
@@ -4067,8 +4077,13 @@
                     await run(call("rewind_cancel"), tr("Cancelled"));
                     $("#rw-result").hidden = true;
                     $("#rw-preview").focus();
-                }));
-            if (focus) approve.focus();
+                })
+            ];
+        }
+
+        function rewindWaiting(code, focus = false) {
+            $("#rw-actions").replaceChildren(...waitingActions(code));
+            if (focus) $("#rw-actions button")?.focus();
         }
 
         function rewindUnderWay(st) {
@@ -4085,14 +4100,19 @@
                 tr("Rewinding {folder} to {when}: {n, plural, one {# change made} other {# changes made}}; {m, plural, one {# item changed since the preview left alone} other {# items changed since the preview left alone}}.", a) :
                 tr("Rewinding {folder} to {when}: {n, plural, one {# change made} other {# changes made}}.", a);
             if (!j.approved && st.code) {
-                if (RW.preview && RW.preview.p.code === st.code) showRewind(RW.preview.p, []);
-                else {
+                // Its list as it is now: approved only once all of it is shown.
+                const shown = p => p && p.code === st.code ? showRewind(p, waitingActions(st.code)) : (() => {
                     $("#rw-groups").replaceChildren();
                     $("#rw-table tbody").replaceChildren();
                     $("#rw-note").textContent = tr("A rewind of {folder} to {when} waits for your approval. Its list is on the Activity page (Safety stops).", a);
+                    $("#rw-actions").replaceChildren(...waitingActions(st.code));
                     $("#rw-result").hidden = false;
-                }
-                rewindWaiting(st.code);
+                })();
+                if (RW.preview && RW.preview.p.code === st.code) shown(RW.preview.p);
+                else call("rewind_preview", {
+                    folder: j.folder || "/",
+                    at_ms: j.at_ms
+                }).then(shown, () => shown(null));
             } else if (say) {
                 $("#rw-groups").replaceChildren();
                 $("#rw-table tbody").replaceChildren();

@@ -146,7 +146,7 @@ A **safety stop** (see below) doesn't end `oneupd`: it changes nothing and waits
 * **A file that disappeared without a trace** (for example, a disk that wasn't connected) is never taken as a deletion. It's left alone in both places.
 
 ## Safety stop
-A safety stop is OneUpDrive stopping to ask. If a single run would delete, overwrite or move a lot of files at once (more than 200, or more than 20 that are also over 10% of everything synced), it changes **nothing** and waits. Easiest: select the icon's **Review …** (see [When OneUpDrive waits for you](tray-icon.md#when-oneupdrive-waits-for-you)), look at the list and choose **Go ahead** or **Not now**. The commands below do the same for scripts. On the command line it looks like this:
+A safety stop is OneUpDrive stopping to ask. If a single run would delete, overwrite or move a lot of files at once (more than 200, or more than 20 that are also over 10% of everything synced), it changes **nothing** and waits. (A [rewind](recovery.md#rewind-a-folder) waiting for your approval is the exception: it holds only itself, and the rest keeps syncing.) Easiest: select the icon's **Review …** (see [When OneUpDrive waits for you](tray-icon.md#when-oneupdrive-waits-for-you)), look at the list and choose **Go ahead** or **Not now**. The commands below do the same for scripts. On the command line it looks like this:
 
 ```
 Safety stop: this round would delete, overwrite or move 30 items in OneDrive (41 items are synced).

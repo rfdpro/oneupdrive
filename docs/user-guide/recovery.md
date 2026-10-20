@@ -6,13 +6,13 @@ The settings window's **Recovery** page gathers every way to get something back.
 Puts a folder back the way it was at a moment you choose: files deleted since come back, edited files get their content of then, moved and renamed files go back where they were, and files created since are removed. It's the way back from ransomware, a script gone wrong, or a sync that did something you didn't want.
 
 1. Type the folder (`/Documents`, or `/` for everything) and pick the moment, then **Preview**. The list shows every change (a page at a time; **Rewind** appears once you've seen them all) the rewind would make, grouped (restore deleted, revert edited, move back, remove created since), with sizes and where each old version comes from: OneDrive's recycle bin or the file's version history in OneDrive.
-2. **Rewind**. Nothing changes yet: the rewind waits for your approval as a [safety stop](syncing.md#safety-stop), and sync waits with it.
-3. **Approve**. OneUpDrive carries it out in OneDrive, and your PC follows. A big folder takes a few rounds.
+2. **Rewind**. Nothing in the rewind happens yet: it waits for your approval as a [safety stop](syncing.md#safety-stop). Everything else keeps syncing meanwhile, the folder included.
+3. **Approve**. If anything in the folder changed since you looked, the list changes with it: nothing is approved, and the new list is shown to look at again. Otherwise OneUpDrive carries it out in OneDrive, and your PC follows. A big folder takes a few rounds.
 
 Nothing is destroyed. What the rewind replaces stays in OneDrive's version history; what it removes goes to OneDrive's recycle bin and to kept copies on your PC (`.oneup\versions`). So a rewind can be rewound: pick a moment just before it.
 
 What it leaves alone:
-* **Anything that changes after the preview.** If you (or anyone) edit, move or delete a file between **Preview** and **Approve**, that file is left as it is; the rest goes ahead. The activity log says how many were left alone.
+* **Anything that changes after you approve.** A change before **Approve** gives a new list to approve (above). If you (or anyone) edit, move or delete a file after **Approve**, before the rewind gets to it, that file is left as it is; the rest goes ahead. The activity log says how many were left alone.
 * **Changes not synced yet.** A file changed in OneDrive that your PC hasn't fetched yet is skipped, and listed as such. A file you changed on this PC since the last sync, without it reaching OneDrive (as when the [content guard](syncing.md#the-content-guard-ransomware) holds scrambled files back), is **set aside**: it goes to kept copies, and OneDrive's copy comes back.
 * **What was there but only started syncing since** (a file a rule left out, say): a file last saved before the moment you picked isn't removed, and a folder holding such a file stays. They're listed as left alone.
 * **What OneUpDrive never saw.** The rewind works from OneUpDrive's own history of what it synced. That history starts when a folder's first sync finishes and keeps 30 days (at most a million changes), so you can't rewind further back than that. Files that were never synced aren't touched.
@@ -27,7 +27,7 @@ From a terminal:
 oneup rewind /Documents --to "2026-10-19 14:05"            # what would change; nothing changes
 oneup rewind /Documents --to "2026-10-19 14:05" --start --expect 3f2a9c4d5e6f7081
                                                            # ask the agent to do the list with that code
-oneup approve 3f2a9c4d5e6f7081                             # the code it showed
+oneup rewind --approve 3f2a9c4d5e6f7081                    # approve it, if the list is still that one
 oneup rewind --cancel                                      # stop a rewind under way; what it did stays done
 oneup rewind --set-history-days 60                         # keep more history (0 turns rewinding off)
 ```

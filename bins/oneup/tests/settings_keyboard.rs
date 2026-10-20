@@ -55,6 +55,8 @@ const HOST_ANSWERS = {
     changes: Array.from({length: 600}, (_, i) => ({kind: "Revert", folder: false, then: "/Docs/f" + i, now: "/Docs/f" + i,
       size: 10, source: "Versions"}))}),
   rewind_start: a => ({...HOST_ANSWERS.rewind_preview(a), started: true}),
+  // The folder changed before the approval: another list comes back.
+  rewind_approve: a => ({...HOST_ANSWERS.rewind_preview(a), code: "fedcba9876543210", approved: false, changed: true}),
   rewind_cancel: "", conflicts: [],
   cloud_bin: [{seq: 7, at_ms: 5000, path: "/Docs/gone.txt", folder: false, size: 3, restorable: true}],
   cloud_bin_restore: "/Docs/gone.txt",
@@ -203,6 +205,12 @@ const DRIVER: &str = r##"<script>
     check("Show more gives focus to what replaces it", document.activeElement.textContent === "Rewind", at());
     document.activeElement.click(); await sleep(300);
     check("asking for the rewind gives focus to Approve", document.activeElement.textContent === "Approve", at());
+    document.activeElement.click(); await sleep(300);
+    check("a list that changed before the approval is shown again, from its start",
+      document.activeElement.textContent === "Show more" && !document.querySelector("#rw-actions").textContent.includes("Approve"), at());
+    document.activeElement.click(); await sleep(100);
+    check("the new list is offered for approval once all of it is shown",
+      document.activeElement.textContent === "Approve" && document.querySelector("#rw-actions").textContent.includes("fedcba9876543210"), at());
     const cancel = [...document.querySelectorAll("#rw-actions button")].find(b => b.textContent === "Cancel");
     cancel.focus(); cancel.click(); await sleep(300);
     check("cancelling gives focus back to Preview", document.activeElement.id === "rw-preview", at());
