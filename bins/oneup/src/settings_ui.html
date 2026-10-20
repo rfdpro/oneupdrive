@@ -1230,6 +1230,21 @@
         .ti .tw.none {
             visibility: hidden;
         }
+
+        /* Whether the item syncs: ticked, unticked, or partly (a rule inside). */
+        .ti .inc {
+            flex: none;
+            width: 14px;
+            height: 14px;
+            margin: 0 2px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        .ti .inc:disabled {
+            cursor: default;
+            opacity: .45;
+        }
         
         .ti .ic {
             width: 16px;
@@ -2235,6 +2250,25 @@
                 <ul class="facts" id="rm-facts"></ul>
                 <label class="ck" id="rm-full-box"><input type="checkbox" id="rm-full"><span id="rm-full-text"></span></label></div>
             <div class="df"><span class="muted" id="rm-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rm-go">Stop syncing</button></div>
+        </form>
+    </dialog>
+    <dialog id="dlg-exclude">
+        <form method="dialog">
+            <div class="dh">
+                <h3 id="ex-title">Exclude</h3>
+            </div>
+            <div class="db">
+                <ul class="facts" id="ex-facts"></ul>
+                <div class="opt">
+                    <div class="label"><b>OneDrive's copies of excluded items</b><small id="ex-mode-help"></small></div>
+                    <select id="ex-mode" aria-label="OneDrive's copies of excluded items">
+                        <option value="pull">Download, never upload</option>
+                        <option value="keep">Leave both alone</option>
+                        <option value="prune">Download, then remove from OneDrive</option>
+                    </select>
+                </div>
+            </div>
+            <div class="df"><span class="muted" id="ex-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="ex-go">Exclude</button></div>
         </form>
     </dialog>
     <dialog id="dlg-resolve">
@@ -3628,6 +3662,15 @@
         };
 
         function stateOf(n) {
+            const w = n.why || {};
+            // Where an exclusion comes from, in the row itself.
+            if (n.state === "left_out") {
+                if (w.inside) return ["off", "In excluded folder"];
+                if (w.kind === "preset") return ["off", "Excluded by preset"];
+                if (w.kind === "own") return ["off", "Excluded by rule"];
+                if (w.kind === "file") return ["off", "By .oneupignore"];
+            }
+            if (n.state === "synced" && n.partial) return ["ok", "Some excluded"];
             // Folders: only a choice made for the whole folder is worth showing.
             if (n.state === "synced" && n.placement && (!n.folder || n.placement !== "here")) return ["ok", PLACE[n.placement]];
             return STATE[n.state] || ["off", n.state];
@@ -3945,6 +3988,142 @@
             q.addEventListener("search", fold);
         }
 
+        // ---- what syncs: the tree's checkboxes and the exclude preview
+        const OUT_STATES = ["left_out", "paused", "separate", "onedrive_app", "never", "link"];
+
+        function whyShort(n) {
+            const w = n.why || {};
+            if (w.inside) return `Inside excluded ${w.inside}`;
+            if (w.kind === "preset") return `Excluded by the preset ${PRESET_NAMES[w.name] || w.name} (${w.rule})`;
+            if (w.kind === "own") return `Excluded by your rule ${w.rule}`;
+            if (w.kind === "file") return `Excluded by ${w.folder === "/" ? "" : w.folder}/.oneupignore (${w.rule})`;
+            if (w.kind === "pause") return "Paused";
+            if (w.kind === "separate") return "Synced separately";
+            if (w.kind === "onedrive_app") return "Synced by the OneDrive app";
+            if (n.state === "never") return "Never synced";
+            if (n.partial) return "A rule excludes items inside";
+            if (n.rule_file_below) return "Has a .oneupignore inside";
+            return "";
+        }
+
+        function incBox(n) {
+            const w = n.why || {};
+            const on = !OUT_STATES.includes(n.state);
+            const canOff = ["synced", "to_upload", "to_download", "pending"].includes(n.state);
+            const canOn = n.state === "left_out" && !w.inside && (w.kind === "own" || w.kind === "preset");
+            const i = el("input", {
+                type: "checkbox",
+                className: "inc",
+                checked: on,
+                tabIndex: -1,
+                disabled: !(on ? canOff : canOn)
+            });
+            i.indeterminate = on && !!n.partial;
+            const why = whyShort(n);
+            i.title = why || (on ? "Synced" : "Excluded");
+            i.setAttribute("aria-label", (on ? "Synced" : "Excluded") + (why ? ". " + why : ""));
+            i.onclick = e => {
+                e.stopPropagation();
+                e.preventDefault();
+                if (on) openExclude(n);
+                else run(call("tree_sync", {
+                    root: F.root.id,
+                    rel: n.rel,
+                    folder: n.folder,
+                    on: true
+                }), m => m).then(() => afterChange(n.rel));
+            };
+            return i;
+        }
+        const EX_HELP = {
+            pull: "Applies to every excluded item. Only uploads stop.",
+            keep: "Applies to every excluded item. Not synced either way.",
+            prune: "Applies to every excluded item. Safety stops apply."
+        };
+
+        function excludeFacts(pv, mode) {
+            // Folders stored as one row (left out by name) aren't counted inside: "at least".
+            const files = t => `${t.skipped ? "at least " : ""}${t.files.toLocaleString()} file${t.files === 1 ? "" : "s"} (${size(t.bytes)})`;
+            const out = [];
+            if (pv.here) out.push(`On this PC: ${files(pv.here)}.`);
+            if (pv.cloud) out.push(`In OneDrive: ${files(pv.cloud)}.`);
+            if (!pv.here && !pv.cloud) out.push("Not on this PC or in OneDrive yet.");
+            if (mode === "keep") out.push("Both copies stop syncing and stay as they are.");
+            else if (mode === "prune") {
+                if (pv.cloud && pv.cloud.files) out.push(`OneDrive's copies go to its recycle bin once they're on this PC.`);
+                if (pv.here && pv.here.online_files) out.push(`${files({ files: pv.here.online_files, bytes: pv.here.online_bytes })} online-only: downloaded first.`);
+            } else out.push("Changes here stop uploading. OneDrive's copies and changes still come here.");
+            out.push("Nothing is deleted from this PC.");
+            return out;
+        }
+        // Unticking: what stops syncing, before anything changes.
+        async function openExclude(n) {
+            const d = $("#dlg-exclude"),
+                facts = $("#ex-facts"),
+                go = $("#ex-go"),
+                mode = $("#ex-mode");
+            const name = n.name || n.rel.split("/").pop();
+            $("#ex-title").textContent = `Exclude ${name}?`;
+            facts.replaceChildren(el("li", {
+                textContent: "Looking…"
+            }));
+            $("#ex-busy").textContent = "";
+            go.disabled = true;
+            d.showModal();
+            let pv;
+            try {
+                pv = await call("tree_preview", {
+                    root: F.root.id,
+                    rel: n.rel,
+                    folder: !!n.folder,
+                    local_id: n.local_id || null,
+                    remote_id: n.remote_id || null
+                });
+            } catch (e) {
+                facts.replaceChildren(el("li", {
+                    textContent: e.message
+                }));
+                return;
+            }
+            mode.value = pv.mode;
+            const show = () => {
+                facts.replaceChildren(...excludeFacts(pv, mode.value).map(t => el("li", {
+                    textContent: t
+                })));
+                $("#ex-mode-help").textContent = EX_HELP[mode.value] || "";
+            };
+            mode.onchange = show;
+            show();
+            go.disabled = false;
+            go.onclick = async() => {
+                go.disabled = true;
+                try {
+                    if (mode.value !== pv.mode) await call("save", {
+                        root: F.root.id,
+                        section: "rules",
+                        value: {
+                            cloud: mode.value
+                        }
+                    });
+                    // Only the item the preview showed: refused if the path
+                    // names something else by now.
+                    const m = await call("tree_sync", {
+                        root: F.root.id,
+                        rel: n.rel,
+                        folder: !!n.folder,
+                        on: false,
+                        expect: pv.token
+                    });
+                    d.close();
+                    toast(m);
+                    afterChange(n.rel);
+                } catch (e) {
+                    $("#ex-busy").textContent = e.message;
+                    go.disabled = false;
+                }
+            };
+        }
+
         // ---- the tree
         function visible() {
             const out = [];
@@ -4014,6 +4193,7 @@
                     e.stopPropagation();
                     toggle(n.rel);
                 };
+                const ck = incBox(n);
                 const row = el("div", {
                         className: "ti" + (["left_out", "never", "onedrive_app", "link"].includes(n.state) ? " dim" : ""),
                         role: "treeitem",
@@ -4022,12 +4202,13 @@
                     el("div", {
                         className: "nm",
                         style: `padding-left:${(level - 1) * 18}px`
-                    }, tw, svg(n.folder ? "i-folder" : "i-file", "ic" + (n.folder ? " folder" : "")), el("span", {
+                    }, tw, ck, svg(n.folder ? "i-folder" : "i-file", "ic" + (n.folder ? " folder" : "")), el("span", {
                         className: "t",
                         textContent: n.name
                     })),
                     el("span", {
-                        className: "state" + (cls === "ok" ? " ok" : "")
+                        className: "state" + (cls === "ok" ? " ok" : ""),
+                        title: whyShort(n)
                     }, el("span", {
                         className: "dot " + cls
                     }), word),
@@ -4132,6 +4313,10 @@
                 e.preventDefault();
                 if (n.folder && n.expanded) toggle(n.rel);
                 else if (parentOf(n.rel) || n.rel.includes("/")) select(parentOf(n.rel));
+            } else if (e.key === " " && n) {
+                e.preventDefault();
+                const box = $(".inc", cur);
+                if (box && !box.disabled) box.click();
             } else if (e.key === "Enter" && n) {
                 e.preventDefault();
                 n.folder ? toggle(n.rel) : n.path && run(call("open_path", {
@@ -4178,9 +4363,7 @@
                 folder: n.folder,
                 ...args
             }), r => r).then(() => afterChange(n.rel));
-            if (["synced", "to_upload", "to_download", "pending"].includes(n.state)) item("Exclude", () => change({
-                on: false
-            }, "tree_sync"));
+            if (["synced", "to_upload", "to_download", "pending"].includes(n.state)) item("Exclude…", () => openExclude(n));
             if (n.state === "left_out" && !w.inside && (w.kind === "own" || w.kind === "preset")) item("Sync again", () => change({
                 on: true
             }, "tree_sync"));
@@ -4419,6 +4602,27 @@
                             }), "Kept in OneDrive").then(() => afterChange(""));
                         }
                     })));
+            }
+            // Suggestions, never defaults: one click opens the same preview
+            // as unticking the folder.
+            const sug = await call("rule_suggestions", {
+                root: F.root.id
+            }).catch(() => null);
+            if (sug && (sug.largest.length || sug.busiest.length)) {
+                box.append(el("div", {
+                    className: "group",
+                    textContent: "Suggestions"
+                }));
+                const exBtn = s => el("button", {
+                    className: "btn small",
+                    textContent: "Exclude",
+                    onclick: () => openExclude({
+                        rel: s.rel,
+                        folder: true
+                    })
+                });
+                for (const s of sug.largest) box.append(flatRow("/" + s.rel, `Large: ${size(s.bytes)} in OneDrive`, showBtn(s.rel), exBtn(s)));
+                for (const s of sug.busiest) box.append(flatRow("/" + s.rel, `Busy: ${s.changes.toLocaleString()} changes in ${sug.days} days`, showBtn(s.rel), exBtn(s)));
             }
             box.append(el("div", {
                 className: "group",
@@ -4787,13 +4991,19 @@
             let sub = on ? "" : "Excluded. Nothing is deleted.";
             if (w.kind === "file") sub = `Set by .oneupignore in ${w.folder}.`;
             if (w.inside && n.state === "left_out") sub = `${w.inside} is excluded.`;
-            body.push(opt("Sync this " + (n.folder ? "folder" : "file"), sub, toggleEl(on && n.state !== "paused" || n.state === "paused", "Sync this", (v, i) =>
+            body.push(opt("Sync this " + (n.folder ? "folder" : "file"), sub, toggleEl(on && n.state !== "paused" || n.state === "paused", "Sync this", (v, i) => {
+                // Excluding shows what stops syncing first.
+                if (!v) {
+                    i.checked = true;
+                    return openExclude(n);
+                }
                 run(call("tree_sync", {
                     root: F.root.id,
                     rel: n.rel,
                     folder: n.folder,
                     on: v
-                }), m => m).then(() => afterChange(n.rel)).catch(() => i.checked = !v), fixed && !(w.kind === "preset" || w.kind === "own"))));
+                }), m => m).then(() => afterChange(n.rel)).catch(() => i.checked = !v);
+            }, fixed && !(w.kind === "preset" || w.kind === "own"))));
             if (w.inside && n.state === "left_out") body.push(el("div", {
                 className: "actions",
                 style: "margin:2px 0 6px"
