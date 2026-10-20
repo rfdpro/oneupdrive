@@ -52,6 +52,25 @@ pub fn all() -> Vec<PathBuf> {
     out
 }
 
+/// Like [`all`], but strict: a registry read or a pair/vault listing that
+/// fails is an error, not an empty list, so a caller that must not miss a
+/// data folder (the hooks' safety checks) can refuse instead of guessing.
+pub fn all_strict() -> std::io::Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(d) = crate::test_account::default_dir() {
+        out.push(d);
+    }
+    out.extend(oneup_sys::user_registry::values(KEY)?.into_iter().map(|(_, v)| PathBuf::from(v)));
+    let to_io = |e: std::io::Error| e;
+    for m in out.clone() {
+        out.extend(crate::vaultpair::list_strict(&m).map_err(to_io)?.into_iter().map(|v| v.dir));
+        out.extend(crate::pairs::list_strict(&m).map_err(to_io)?.into_iter().map(|p| p.dir));
+    }
+    out.retain(|d| d.join("state.db").exists());
+    out.dedup_by(|a, b| crate::test_account::same_dir(a, b));
+    Ok(out)
+}
+
 /// The data folder whose synced folder holds `path`, and `path` relative
 /// to it (`/`-separated, empty for the folder itself).
 pub fn for_path(path: &Path) -> Option<(PathBuf, String)> {

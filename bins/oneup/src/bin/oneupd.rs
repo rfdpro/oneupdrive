@@ -285,7 +285,7 @@ async fn run(args: Args) -> Result<()> {
     let hook_jobs = std::sync::Arc::new(oneup_sys::contained::HookJobs::new());
     {
         let jobs = std::sync::Arc::clone(&hook_jobs);
-        control.refuse_clients(Box::new(move |pid| jobs.contains(pid)));
+        control.gate_clients(Box::new(move |pid| jobs.may_serve(pid)));
     }
     let mut hooks =
         oneup_app::hooks::AgentHooks::start(dir, &synced_folder, &control.events, std::sync::Arc::clone(&hook_jobs));
