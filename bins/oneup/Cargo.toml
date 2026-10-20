@@ -73,5 +73,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "syn
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+# The sharing audit's tests run against an in-memory OneDrive's sharing.
+oneup-effects = { path = "../../crates/oneup-effects", features = ["fake"] }
+
 [lints]
 workspace = true

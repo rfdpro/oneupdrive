@@ -51,6 +51,7 @@ pub mod safetywindow;
 pub mod search;
 pub mod settingsapi;
 pub mod setup;
+pub mod sharing;
 #[cfg(windows)]
 pub mod shellstatus;
 pub mod shortcuts;

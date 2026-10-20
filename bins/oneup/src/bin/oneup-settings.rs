@@ -39,7 +39,8 @@ mod win {
         #[arg(long)]
         data_dir: Option<PathBuf>,
         /// Open on this page (files, find, apps, activity, unsynced,
-        /// excluded, stops, general, accounts, office, safety, network, about)
+        /// excluded, stops, shared, general, accounts, office, safety,
+        /// network, about)
         #[arg(long, default_value = "")]
         page: String,
         /// For the "item" page: the file or folder to show
@@ -261,6 +262,12 @@ mod win {
     /// (more rows than that is too many for a page).
     fn count(args: &Value, k: &str, default: usize) -> usize {
         args.get(k).and_then(Value::as_u64).map_or(default, |n| n as usize).clamp(1, 20_000)
+    }
+
+    /// How many more items the Shared page can hold (it says; at most its
+    /// own cap).
+    fn room(args: &Value) -> usize {
+        args.get("room").and_then(Value::as_u64).map_or(0, |n| n as usize).min(500)
     }
 
     fn text(args: &Value, k: &str) -> String {
@@ -998,6 +1005,37 @@ mod win {
                         .map(|f| json!({ "name": f.name, "owner": f.owner, "drive_id": f.drive_id, "id": f.id }))
                         .collect::<Vec<_>>(),
                 ))
+            }
+            // The Shared page (`oneup_app::sharing`): what this account
+            // shares and who can open it, and what others share with it.
+            // One bounded page; `after` is the previous page's `next`.
+            // Both tabs go through `sharing::window_tab`, which settles what
+            // an earlier change left unsettled when a tab opens.
+            "sharing_list" => {
+                let after = args.get("after").and_then(Value::as_str);
+                oneup_app::sharing::window_tab_for(dir, oneup_app::sharing::Tab::ByYou, after, room(args)).await
+            }
+            "sharing_with_me" => {
+                oneup_app::sharing::window_tab_for(dir, oneup_app::sharing::Tab::WithMe, None, room(args)).await
+            }
+            // Stop sharing / Set expiry: `oneup shared stop|expire`, with the
+            // same checks as typed, for the permission as the page listed it
+            // (its code). The page asked first, so it goes ahead (`--yes`).
+            "sharing_change" => {
+                let what = text(args, "what");
+                let mut a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "shared".into()];
+                match what.as_str() {
+                    "stop" => a.push("stop".into()),
+                    "expire" => a.push("expire".into()),
+                    _ => bail!("unknown change: {what}"),
+                }
+                if what == "expire" {
+                    a.extend(["--on".into(), text(args, "on").into()]);
+                }
+                a.extend(["--expect".into(), text(args, "code").into(), "--yes".into()]);
+                // The item and permission last, after `--`: never read as options.
+                a.extend(["--".into(), text(args, "item").into(), text(args, "permission").into()]);
+                Ok(Value::from(oneup(a).await?.trim().to_string()))
             }
             "pair_add_shared" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
