@@ -50,6 +50,10 @@ pub enum Stop {
     Share,
     /// Downloading more needs the person's go-ahead.
     Approval,
+    /// This month's data budget on the network has less left than this
+    /// file: it waits, and smaller ones may still go (not an end of the
+    /// pass).
+    Budget,
 }
 
 /// What a pass of downloads did.
@@ -102,6 +106,9 @@ pub async fn fetch_pinned(
     let mut out = Fetched { more: rows.len() >= BATCH, ..Fetched::default() };
     for (rel, id, size) in rows {
         if let Err(why) = may(id, size) {
+            if why == Stop::Budget {
+                continue;
+            }
             out.stopped = Some(why);
             out.more = true;
             break;

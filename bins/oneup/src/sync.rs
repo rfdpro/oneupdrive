@@ -105,6 +105,32 @@ pub struct Controls {
     pub net: crate::network::Policy,
 }
 
+/// Before a kept file of `size` bytes downloads (`pinrules::fetch_pass`):
+/// unless `paused` (a pause, or a network that holds contents, which stops
+/// the pass), a file larger than the data budget has left
+/// (`net.budget_left`, less what this pass already let through, `allowed`)
+/// waits, not started, while smaller ones may go; otherwise `rest`
+/// decides (the pause, then the disk and the pass's share), and what it
+/// lets through counts.
+pub(crate) fn pin_may(
+    net: &crate::network::Policy,
+    paused: bool,
+    allowed: &std::sync::atomic::AtomicU64,
+    size: u64,
+    rest: impl FnOnce() -> std::result::Result<(), oneup_exec::placement::Stop>,
+) -> std::result::Result<(), oneup_exec::placement::Stop> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !paused
+        && let Some(left) = net.budget_left
+        && left.saturating_sub(allowed.load(Relaxed)) < size
+    {
+        return Err(oneup_exec::placement::Stop::Budget);
+    }
+    rest()?;
+    allowed.fetch_add(size, Relaxed);
+    Ok(())
+}
+
 /// What the network lets the executor download besides a round's planned
 /// operations (an edit an upload went over, `Executor::set_may_fetch`):
 /// the agent's policy as it changes mid-round, or the round's.
@@ -1238,6 +1264,8 @@ impl Engine {
         let total = oneup_sys::disk::total_bytes(Path::new(&root.path)).ok();
         let reserve = crate::pinrules::reserve(total, space.low_disk_percent);
         let limit = std::sync::Mutex::new(crate::pinrules::FetchLimit::new(reserve, std::time::Instant::now()));
+        // What this pass let through, against the data budget's remainder.
+        let allowed = std::sync::atomic::AtomicU64::new(0);
         let root_path = PathBuf::from(&root.path);
         // Whether a file is on this PC by now, from its attributes alone
         // (never its content): a reservation a crash left is settled by it.
@@ -1272,9 +1300,11 @@ impl Engine {
                     let c = controls();
                     let paused =
                         c.pause_local || c.net.transfer != crate::network::Transfer::Everything || c.net.offline;
-                    let free = crate::pinrules::free_space(&root_path);
-                    let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
-                    l.may(size, paused, free, std::time::Instant::now())
+                    pin_may(&c.net, paused, &allowed, size, || {
+                        let free = crate::pinrules::free_space(&root_path);
+                        let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
+                        l.may(size, paused, free, std::time::Instant::now())
+                    })
                 },
                 &mut |rel| oneup_exec::placement::fetch_one_blocking(&root_path, rel),
             )

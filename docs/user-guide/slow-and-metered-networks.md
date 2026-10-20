@@ -65,7 +65,7 @@ A network's settings (or the metered ones) can have a **monthly data budget** in
 
 * A sync only starts transfers that fit in what's left; the rest waits.
 * When the budget is used up, OneUpDrive pauses on that network and tells you (a notification from the OneUpDrive icon). **Allow 500 MB more** (in the icon's menu, on the Network page, or `oneup network allow-more`) adds to this month's budget and syncing goes on.
-* Opening an online-only file always downloads it, and counts toward the budget. Files set to **Always keep on this device** download only while the budget lasts.
+* Opening an online-only file always downloads it, and counts toward the budget. Files set to **Always keep on this device** (by you or a pin rule) download only while the budget has room for each: a large one waits while smaller ones go.
 * Everything OneUpDrive sends and receives on that network counts, also a download that fails halfway and is tried again. OneUpDrive doesn't download its own updates by itself on a metered network, one with a data budget, or while working offline; **Check now** still does.
 
 ```
