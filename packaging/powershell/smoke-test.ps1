@@ -17,7 +17,7 @@ Set-Content -LiteralPath (Join-Path $dir 'agent.pipe') -Value "\\.\pipe\$name" -
 $server = [PowerShell]::Create()
 [void]$server.AddScript({
     param($name)
-    $state = @{ rev = 1; activity = 'idle'; local = $false; remote = $false; until = $null; checked = $null; pending = $false }
+    $state = @{ rev = 1; activity = 'idle'; local = $false; remote = $false; until = $null; checked = $null; pending = $false; auto = $null }
     $status = {
         $s = [ordered]@{
             version = 'fake'; rev = $state.rev; local = 'C:\Sync'; remote = '/'; activity = $state.activity
@@ -25,6 +25,7 @@ $server = [PowerShell]::Create()
         }
         if ($state.until) { $s.paused.until_ms = $state.until }
         if ($state.checked) { $s.checked_ms = $state.checked }
+        if ($state.auto) { $s.auto_pause = $state.auto }
         $s
     }
     $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -52,6 +53,8 @@ $server = [PowerShell]::Create()
                 $state.rev++
             }
             'sync_now' { $state.activity = 'syncing'; $state.pending = $true; $state.rev++ }
+            # Test hooks: the agent pauses itself / undoes it.
+            'autopause' { $state.auto = $req.params.why; $state.activity = 'idle'; $state.rev++ }
             # The test is over.
             'quit' { $done = $true }
             'watch' {
@@ -112,6 +115,14 @@ try {
         Check "Wait-OneUpSync reports a $dir2-only pause" $threw
         [void](Resume-OneUp -DataDir $dir)
     }
+
+    # Paused by itself (metered, battery, quiet hours): activity is 'idle',
+    # but Wait-OneUpSync must still report it.
+    & (Get-Module OneUpDrive) { param($d) Invoke-OneUpCall -Method autopause -Params @{ why = 'on a metered connection' } -DataDir $d } $dir | Out-Null
+    $threw = $false
+    try { Wait-OneUpSync -TimeoutSeconds 5 -DataDir $dir | Out-Null } catch { $threw = $_.Exception.Message -like '*by itself*metered*' }
+    Check 'Wait-OneUpSync reports an automatic pause' $threw
+    & (Get-Module OneUpDrive) { param($d) Invoke-OneUpCall -Method autopause -Params @{ why = $null } -DataDir $d } $dir | Out-Null
 
     $none = Join-Path ([IO.Path]::GetTempPath()) ("oneup-ps-none-" + [Guid]::NewGuid().ToString('N'))
     $threw = $false
