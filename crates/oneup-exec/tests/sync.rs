@@ -6545,6 +6545,39 @@ async fn a_copy_moved_here_after_the_approval_isnt_set_aside() {
 }
 
 #[tokio::test]
+async fn a_restore_into_a_name_taken_meanwhile_replaces_nothing() {
+    // b.txt is asked back from the recycle bin under its name, free then.
+    // Before the step runs, a new b.txt is made in OneDrive: the restore is
+    // refused (as OneDrive refuses a taken name), and the new one stays.
+    let cloud = Fake::new();
+    let mut s = Sync::new("restore-name-taken", cloud.clone());
+    write(&s.p("docs/b.txt"), b"bee");
+    s.settle().await;
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    s.settle().await;
+    let gone = s.obs.store().read(|o| o.history_removed(10, None)).unwrap();
+    let b = gone.iter().find(|r| r.was.name == "b.txt").expect("recorded");
+    let parent = s.obs.store().read(|o| o.synced_get(b.was.parent.unwrap())).unwrap().unwrap().remote.unwrap();
+    let id = b.was.remote.clone().unwrap();
+    let op = s
+        .obs
+        .store()
+        .read(|o| oneup_exec::recover::deleted_op(o, b.sid, &id, &parent, "b.txt", oneup_sync::NodeKind::File))
+        .unwrap();
+    assert!(matches!(op.rewind_step(), Some(oneup_sync::rewind::Step::Restore { name, .. }) if name == "b.txt"));
+    let c = cloud.clone();
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        c.add("docs/b.txt", Some(b"another bee"));
+    }));
+    s.extra = vec![op.clone()];
+    let r = s.attempt().await;
+    assert!(r.failed.iter().any(|(o, _)| *o == op) || r.skipped.iter().any(|(o, _)| *o == op), "{r:?}");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/docs/b.txt"], Some(b"another bee".to_vec()), "nothing replaced");
+    assert!(cloud.0.lock().unwrap().bin.contains_key(&id.0), "still in the recycle bin");
+}
+
+#[tokio::test]
 async fn an_item_someone_else_restored_and_edited_isnt_put_back_over() {
     // a.txt was "first" then, "second" when it was deleted. The rewind
     // restores it and puts "first" back. After the approval, someone else
