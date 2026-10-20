@@ -161,10 +161,12 @@ pub fn may_stop(
         n = n.saturating_add(weight(o));
         always |= always_stops(o);
     }
+    let recent = recent.local.max(recent.remote);
     any_approved
         || any_suspicious
         || always
-        || n.saturating_add(recent.local.max(recent.remote)) > policy.min_count.min(policy.max_count)
+        || recent >= FULL
+        || n.saturating_add(recent) > policy.min_count.min(policy.max_count)
 }
 
 /// How many items `op` counts as for the circuit breakers: a pruned folder
@@ -566,8 +568,11 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         // included, rather than a level at a time.
         let weighed = weigh(&batch).saturating_add(later.len());
         let n = weighed.saturating_add(cx.recent.on(side));
-        // A folder of unknown size may hold any number: always asked.
+        // A folder of unknown size may hold any number: always asked, and
+        // so is anything after one in the window (or after a window that
+        // couldn't be read), whatever the limits are set to.
         let too_many = batch.iter().any(|(_, o, _)| always_stops(o))
+            || cx.recent.on(side) >= FULL
             || n > policy.max_count
             || (n > policy.min_count
                 && (n as u128) * 100 > u128::from(policy.max_percent) * u128::from(cx.synced_items));
@@ -1417,6 +1422,25 @@ mod tests {
         // The same folder, counted in full and small: no stop.
         let exact = Op::PruneRemote { remote: rpre(9), forget: vec![9], items: 10, exact: true, keep: Vec::new() };
         assert!(review(&p, 10_000_000, &[], vec![exact]).breakers.is_empty());
+    }
+
+    /// A full window (after a removal of unknown size, or one that couldn't
+    /// be read) stops the next deletion even with limits set above
+    /// [`FULL`], and [`may_stop`] agrees.
+    #[test]
+    fn a_full_window_stops_whatever_the_limits() {
+        let p = Policy { max_count: FULL + 1, min_count: FULL + 1, max_percent: 100, ..Policy::default() };
+        let synced = u64::try_from(FULL).unwrap_or(u64::MAX) * 4;
+        let full = Recent { remote: FULL, ..Recent::default() };
+        let cx = Context { synced_items: synced, recent: full, ..Context::default() };
+        let r = review_in(&p, &cx, vec![delete_remote(1)]);
+        assert_eq!(r.breakers.len(), 1, "one deletion after a full window is asked about");
+        assert!(may_stop(&p, &[delete_remote(1)], &[], full, false, false));
+        // Below it, the raised limits apply as usual.
+        let some = Recent { remote: 10, ..Recent::default() };
+        let cx = Context { synced_items: synced, recent: some, ..Context::default() };
+        assert!(review_in(&p, &cx, vec![delete_remote(1)]).breakers.is_empty());
+        assert!(!may_stop(&p, &[delete_remote(1)], &[], some, false, false));
     }
 
     /// The round's operations on approved lists are reported with the keys
