@@ -101,6 +101,19 @@ macro_rules! t_key {
     };
 }
 
+/// [`t!`] in a given language: `t_in!(locale, "{n} items", n = 4)`. For
+/// text that is shown or stays machine-stable (English for `--json`)
+/// depending on who reads it.
+#[macro_export]
+macro_rules! t_in {
+    ($loc:expr, $msg:literal) => {
+        $loc.message($msg, &[])
+    };
+    ($loc:expr, $msg:literal, $($name:ident = $value:expr),+ $(,)?) => {
+        $loc.message($msg, &[$((stringify!($name), $crate::l10n::Arg::from($value))),+])
+    };
+}
+
 // ---- numbers
 
 /// How numbers are written: decimal separator, group separator, and group
@@ -212,10 +225,12 @@ pub fn plural(lang: &str, n: &Arg) -> &'static str {
     match base.as_str() {
         // No plural forms.
         "ja" | "zh" | "ko" | "vi" | "th" | "id" | "ms" | "lo" | "my" => "other",
-        // 0 and 1 are singular (French; Portuguese as spoken in Brazil).
+        // Portugal: 1 is singular; 0 and 1 are in Brazil and France (below).
         "pt" if lang.eq_ignore_ascii_case("pt-pt") => {
             if i == 1 && v == 0 {
                 "one"
+            } else if v == 0 && i != 0 && i % 1_000_000 == 0 {
+                "many"
             } else {
                 "other"
             }
@@ -305,11 +320,9 @@ pub fn plural(lang: &str, n: &Arg) -> &'static str {
             }
         }
         "is" | "mk" => {
-            if (v == 0 && i10 == 1 && i100 != 11) || (v != 0 && f % 10 == 1) {
-                "one"
-            } else {
-                "other"
-            }
+            // Icelandic says t (the fraction without trailing zeros) and
+            // Macedonian f; `f` here has no trailing zeros, so they agree.
+            if (v == 0 && i10 == 1 && i100 != 11) || (v != 0 && f % 10 == 1 && f % 100 != 11) { "one" } else { "other" }
         }
         // Everything else: English's rule.
         _ => {
@@ -478,6 +491,10 @@ impl Parser<'_> {
                             let key = self.word();
                             if key.is_empty() {
                                 return Err(self.bad("a plural case without a name"));
+                            }
+                            // Which of two would win is undefined: refused.
+                            if cases.iter().any(|(k, _)| *k == key) {
+                                return Err(self.bad("a plural case given twice"));
                             }
                             self.expect('{', "a { after a plural case")?;
                             let parts = self.parts(true)?;
@@ -796,6 +813,16 @@ mod tests {
         assert_eq!(l.message(files, &[("n", 11u64.into())]), "11 файлов");
         assert_eq!(l.message(files, &[("n", 21_000u64.into())]), "21\u{a0}000 файлов");
         assert!(l.page_json().contains("\"lang\":\"ru\""));
+        // A malformed translation (a case twice, a brace left open) is
+        // passed over for the English.
+        let bad = r#"{
+            "{n, plural, one {# file} other {# files}}": "{n, plural, one {# Datei} one {# Dateien} other {# Dateien}}",
+            "Nothing found.": "Nichts {gefunden"
+        }"#;
+        let l = Locale::with_catalogue("de", bad, "de-DE", Numbers::new(",", ".", "3;0")).expect("catalogue");
+        assert_eq!(l.message(files, &[("n", 2u64.into())]), "2 files");
+        assert_eq!(l.message("Nothing found.", &[]), "Nothing found.");
+        assert_eq!(t_in!(Locale::english(), "{n} more", n = 1830u64), "1,830 more");
     }
 
     #[test]
@@ -804,7 +831,12 @@ mod tests {
         assert_eq!((cat("en", 1), cat("en", 0), cat("en", 2)), ("one", "other", "other"));
         assert_eq!(plural("en", &Arg::Float(1.5)), "other");
         assert_eq!((cat("fr", 0), cat("fr", 1), cat("fr", 2), cat("fr", 1_000_000)), ("one", "one", "other", "many"));
-        assert_eq!(cat("pt-PT", 0), "other");
+        assert_eq!((cat("pt-PT", 0), cat("pt-PT", 1), cat("pt-PT", 1_000_000)), ("other", "one", "many"));
+        for (lang, x, want) in
+            [("is", 1.11, "other"), ("is", 1.1, "one"), ("is", 21.0, "one"), ("mk", 1.11, "other"), ("mk", 0.21, "one")]
+        {
+            assert_eq!(plural(lang, &Arg::Float(x)), want, "{lang} {x}");
+        }
         assert_eq!(
             (cat("ru", 1), cat("ru", 2), cat("ru", 5), cat("ru", 11), cat("ru", 22)),
             ("one", "few", "many", "many", "few")
@@ -862,6 +894,8 @@ mod tests {
         assert!(check("{n, plural, one {# Datei}}", files).is_err(), "no other case");
         assert!(check("{n", files).is_err());
         assert!(check("}", "x").is_err());
+        assert!(check("{n, plural, one {a} one {b} other {c}}", files).is_err(), "a case given twice");
+        assert!(check("{n, plural, other {a} other {b}}", files).is_err(), "other given twice");
     }
 
     #[test]
