@@ -100,7 +100,13 @@ struct State {
     /// Runs at the start of the next request: something a user does while
     /// a round is under way.
     meanwhile: Option<Box<dyn FnOnce() + Send>>,
+    /// Told the ID of each item about to be removed (deleted or pruned),
+    /// once its precondition held: what the store says at that moment.
+    on_remove: Option<OnRemove>,
 }
+
+/// See [`State::on_remove`].
+type OnRemove = Arc<dyn Fn(&str) + Send + std::marker::Sync>;
 
 /// What one pull delivers: every live item (parents first), then the
 /// deletions since the pull before.
@@ -711,6 +717,9 @@ impl Cloud for Fake {
         self.exchange(|| -> Result<(), CloudError> {
             let mut s = self.0.lock().unwrap();
             s.check(pre)?;
+            if let Some(f) = &s.on_remove {
+                f(&pre.id.0);
+            }
             let mut gone = vec![pre.id.0.clone()];
             let mut i = 0;
             while i < gone.len() {
@@ -782,6 +791,9 @@ impl Cloud for Fake {
             s.check(pre)?;
             if s.items.values().any(|it| it.parent.as_deref() == Some(&pre.id.0)) {
                 return Err(CloudError::NotEmpty);
+            }
+            if let Some(f) = &s.on_remove {
+                f(&pre.id.0);
             }
             let it = s.items.remove(&pre.id.0).unwrap();
             s.kept.push(it.content);
@@ -2486,6 +2498,64 @@ async fn pruning_removes_only_the_cloud_copy_and_re_including_uploads_it_again()
         assert_eq!(cloud.tree()["/renders/a.mp4"].as_deref(), Some(&b"render a"[..]), "sent again");
         assert!(s.versions().is_empty(), "nothing here was replaced or recycled");
     }
+}
+
+/// What the store on disk says while the cloud removes `id`: its durable
+/// commits so far, and whether a Synced row still points at `id`. Read
+/// through a connection of its own, as after a restart.
+type AtRemoval = Arc<Mutex<Option<(u64, bool)>>>;
+
+fn watch_removal(s: &Sync, id: String) -> AtRemoval {
+    let db = s.db.as_ref().expect("a database on disk").0.clone();
+    let seen: AtRemoval = Arc::default();
+    let out = seen.clone();
+    s.cloud.0.lock().unwrap().on_remove = Some(Arc::new(move |removed: &str| {
+        if removed == id {
+            let store = Store::open(&db, 1024).unwrap();
+            let state = store.read(|o| Ok((o.durable_commits()?, o.synced_by_remote(&id)?.is_some()))).unwrap();
+            *out.lock().unwrap() = Some(state);
+        }
+    }));
+    seen
+}
+
+/// Pruning forgets the Synced rows durably before OneDrive removes the
+/// item: rolled back by a power cut after the prune, they would read the
+/// cloud's deletion as one to bring to this PC.
+#[tokio::test]
+async fn pruning_forgets_its_records_durably_before_the_cloud_removes_them() {
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("prune-durable", cloud.clone());
+    write(&s.p("renders/a.mp4"), b"render a");
+    s.settle().await;
+    s.rules = user_rules(&["renders/"]);
+    s.settle().await;
+    let id = resolve(&cloud.0.lock().unwrap(), "/renders");
+    let before = s.obs.store().read(|o| o.durable_commits()).unwrap();
+    let seen = watch_removal(&s, id);
+    let r = s.prune("renders").await;
+    assert_eq!(r.done.len(), 1, "{r:?}");
+    let (durable, linked) = seen.lock().unwrap().expect("the cloud pruned it");
+    assert!(!linked, "the Synced rows were gone before the prune");
+    assert_eq!(durable, before + 1, "and they went in a durable commit");
+}
+
+/// A move in parts flushes what it recorded before it removes the emptied
+/// original from OneDrive.
+#[tokio::test]
+async fn a_move_in_parts_is_recorded_durably_before_the_original_is_removed() {
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("large-durable", cloud.clone());
+    large_folder(&s);
+    s.settle().await;
+    cloud.0.lock().unwrap().threshold = Some(5);
+    let id = resolve(&cloud.0.lock().unwrap(), "/Projects/Bookmarks");
+    let before = s.obs.store().read(|o| o.durable_commits()).unwrap();
+    let seen = watch_removal(&s, id);
+    move_large_folder_in_parts(&mut s).await;
+    let (durable, linked) = seen.lock().unwrap().expect("the original was removed");
+    assert!(!linked, "the Synced row had followed the new folder");
+    assert!(durable > before, "in a durable commit before the removal");
 }
 
 /// `pull`: excluded items come from OneDrive and are never sent. A change

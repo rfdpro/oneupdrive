@@ -65,9 +65,10 @@ pub enum Error {
     TooNew { found: i64, supported: i64 },
     #[error("corrupt row: {0}")]
     Corrupt(String),
-    /// A write-ahead record ([`Ops::meta_set_ahead`]) outside a durable
-    /// transaction ([`Store::durably`]): a bug, refused before it's written.
-    #[error("write-ahead record outside a durable transaction")]
+    /// A write that must outlive its effect ([`Ops::require_durable`])
+    /// outside a durable transaction ([`Store::write_durable`]): a bug,
+    /// refused before anything is committed.
+    #[error("a write ahead of an effect outside a durable transaction")]
     NotDurable,
 }
 
@@ -502,7 +503,7 @@ impl Store {
         // them in order, so it's always the newest that go). Enough for the
         // mirror and everything the next round finds again. Write-ahead
         // records must outlive their effect, so they commit at FULL
-        // (`Store::durably`).
+        // (`Store::write_durable`).
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -564,6 +565,20 @@ impl Store {
         E: From<Error>,
         F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
     {
+        self.try_write_now_as(false, f)
+    }
+
+    /// [`Store::try_write_now`]; `durable`: the transaction counts itself
+    /// first ([`Store::write_durable`]), the caller having set FULL.
+    fn try_write_now_as<T, E, F>(
+        &mut self,
+        durable: bool,
+        f: F,
+    ) -> std::result::Result<std::result::Result<T, E>, (F, Error)>
+    where
+        E: From<Error>,
+        F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
+    {
         let begun = self
             .conn
             .busy_timeout(std::time::Duration::ZERO)
@@ -578,6 +593,9 @@ impl Store {
             }
             (Ok(_), Err(e)) => return Ok(Err(Error::from(e).into())),
         };
+        if durable && let Err(e) = (Ops { c: &tx }).count_durable() {
+            return Ok(Err(e.into()));
+        }
         let out = match f(&Ops { c: &tx }) {
             Ok(out) => out,
             Err(e) => return Ok(Err(e)),
@@ -585,28 +603,44 @@ impl Store {
         Ok(commit(tx).map(|()| out).map_err(Into::into))
     }
 
-    /// Runs `f` with this connection's commits durable (`synchronous =
-    /// FULL`): each is on disk, the WAL flushed, before it returns, so it
-    /// survives a power cut or an OS crash, and so does every commit before
-    /// it. For transactions that write a record ahead of an effect
-    /// (`data-safety.md` invariant 7): the effect starts only after the
-    /// commit, so the record can't be lost while the effect stays done.
-    /// Everything else commits at NORMAL, which skips the flush.
+    /// [`Store::write`], committed durably (`synchronous = FULL`): on disk,
+    /// the WAL flushed, before it returns, so it survives a power cut or an
+    /// OS crash, and so does every commit before it. For a transaction that
+    /// must outlive the effect that follows it (`data-safety.md` invariant
+    /// 7): a record written ahead of the effect, or state whose rollback
+    /// would make the next round undo what the effect did. Everything else
+    /// commits at NORMAL, which skips the flush.
     ///
-    /// Back to NORMAL afterwards, whatever `f` returned. Should that fail,
+    /// Each also counts itself in `meta` ([`Ops::durable_commits`]). SQLite
+    /// flushes only a commit that changed a page (one that rewrites a row as
+    /// it was changes none), so without it a durable commit could leave the
+    /// commits before it unflushed.
+    pub fn write_durable<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
+        self.durably(|s| s.write(|o| o.count_durable().and_then(|()| f(o))))?
+    }
+
+    /// [`Store::try_write_now`], committed durably ([`Store::write_durable`]).
+    pub fn try_write_now_durable<T, E, F>(&mut self, f: F) -> std::result::Result<std::result::Result<T, E>, (F, Error)>
+    where
+        E: From<Error>,
+        F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
+    {
+        match self.durably(|s| s.try_write_now_as(true, f)) {
+            Ok(r) => r,
+            Err(e) => Ok(Err(e.into())),
+        }
+    }
+
+    /// Runs `f` with the connection at `synchronous = FULL`, and puts it
+    /// back to NORMAL afterwards, whatever `f` returned. Should that fail,
     /// the connection stays at FULL: slower, never less safe.
-    pub fn durably<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
+    fn durably<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
         // SQLite refuses this inside a transaction, and none is open here:
         // every one is begun and ended within a call.
         self.conn.pragma_update(None, "synchronous", "FULL")?;
         let out = f(self);
         let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
         Ok(out)
-    }
-
-    /// [`Store::write`], committed durably ([`Store::durably`]).
-    pub fn write_durable<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
-        self.durably(|s| s.write(f))?
     }
 
     /// Reads this connection's pages through a memory map of up to `bytes`
@@ -728,6 +762,9 @@ pub struct Ops<'a> {
     c: &'a Connection,
 }
 
+/// In `meta`: the number of durable commits ([`Store::write_durable`]).
+const DURABLE_COMMITS: &str = "store.durable_commits";
+
 pub(crate) const ITEM_COLS: &str = "id, parent_id, name, kind, size, etag, qxh, mtime";
 
 /// Cloud files at least this large are worth copying in OneDrive instead of
@@ -794,14 +831,37 @@ impl Ops<'_> {
     /// [`Ops::meta_set`] for a record written ahead of an effect, which
     /// must be on disk before the effect starts (`data-safety.md`
     /// invariant 7): refused ([`Error::NotDurable`]) unless the transaction
-    /// commits durably ([`Store::durably`]).
+    /// commits durably ([`Store::write_durable`]).
     pub fn meta_set_ahead(&self, key: &str, value: &str) -> Result<()> {
+        self.require_durable()?;
+        self.meta_set(key, value)
+    }
+
+    /// Refuses ([`Error::NotDurable`]) unless this transaction commits
+    /// durably ([`Store::write_durable`]). For a transaction that must
+    /// outlive the effect after it, so one written the fast way fails in
+    /// every test that runs it instead of only after a power cut.
+    pub fn require_durable(&self) -> Result<()> {
         // 2 is FULL, 3 EXTRA.
         let level: i64 = self.c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
         if level < 2 {
             return Err(Error::NotDurable);
         }
-        self.meta_set(key, value)
+        Ok(())
+    }
+
+    /// How many durable commits this database has had
+    /// ([`Store::write_durable`]).
+    pub fn durable_commits(&self) -> Result<u64> {
+        Ok(self.meta_get(DURABLE_COMMITS)?.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Counts a durable commit: a page it is sure to change, so SQLite
+    /// flushes it.
+    fn count_durable(&self) -> Result<()> {
+        self.require_durable()?;
+        let n = self.durable_commits()?.wrapping_add(1);
+        self.meta_set(DURABLE_COMMITS, &n.to_string())
     }
 
     pub fn meta_delete(&self, key: &str) -> Result<()> {
@@ -1469,16 +1529,19 @@ mod tests {
         // The executor's way in: without waiting, the closure handed back.
         let other = Store::open(&path, 1024).unwrap();
         other.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let busy = s.durably(|s| s.try_write_now(|o| o.meta_set_ahead("exec.pending.3", "x"))).unwrap();
+        let busy = s.try_write_now_durable(|o| o.meta_set_ahead("exec.pending.3", "x"));
         assert!(matches!(busy, Err((_, ref e)) if e.is_busy()));
         assert_eq!(synchronous(&s), 1, "back to NORMAL after a busy try");
         other.conn.execute_batch("ROLLBACK").unwrap();
-        s.durably(|s| s.try_write_now(|o| o.meta_set_ahead("exec.pending.3", "x")))
-            .unwrap()
-            .map_err(|(_, e)| e)
-            .unwrap()
-            .unwrap();
+        s.try_write_now_durable(|o| o.meta_set_ahead("exec.pending.3", "x")).map_err(|(_, e)| e).unwrap().unwrap();
         assert_eq!(synchronous(&s), 1);
+        assert_eq!(s.read(|o| o.durable_commits()).unwrap(), 2, "the failed and the busy ones don't count");
+
+        // A durable commit that changes nothing else still changes a page,
+        // so SQLite flushes it, and every commit before it.
+        s.write(|o| o.meta_set("plain", "1")).unwrap();
+        s.write_durable(|o| o.require_durable()).unwrap();
+        assert_eq!(s.read(|o| o.durable_commits()).unwrap(), 3);
         drop((s, other));
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
