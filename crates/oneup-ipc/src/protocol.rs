@@ -392,9 +392,16 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrying: Option<Retrying>,
     /// Database files held back, or warned about
-    /// (`docs/architecture/databases.md`).
+    /// (`docs/architecture/databases.md`): at most 100.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub databases: Vec<DatabaseNote>,
+    /// How many more were held back than `databases` lists.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub databases_more: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// A database file the agent holds back until it's in a state to sync, or
@@ -408,8 +415,8 @@ pub struct DatabaseNote {
     pub format: String,
     /// Why it waits: `wal` (SQLite changes not yet in the file), `journal`
     /// (a SQLite transaction under way), `open` (open in another program),
-    /// `behind` (a SQLite working file from OneDrive whose database here
-    /// isn't OneDrive's version yet).
+    /// `beside` (a database's working file, or a file going into such a
+    /// name: they never travel).
     /// `live`: a format that shouldn't sync while in use (Outlook data
     /// files, virtual disks), whether it waits or not.
     pub why: String,

@@ -496,17 +496,16 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
 async fn database(data_dir: &Path, store: &Store, row: &Option<LocalRow>, rel: &str, name: &str) -> Result<()> {
     use oneup_rules::database::{Companion, Consistent};
     let settings = config::load_databases(data_dir)?;
-    // A working file beside a SQLite database syncs with it (the file
-    // isn't read here, so whether that's a SQLite database isn't proved).
+    // A working file beside its namesake never syncs (`oneup_plan::park`).
     if let Some((_, main)) = Companion::of_name(name)
         && let Some(parent) = row.as_ref().and_then(|r| r.parent_id)
         && !store.read(|o| o.local_named(parent, main))?.is_empty()
         && !settings.databases()?.opted_out(&format!("{}{main}", rel.strip_suffix(name).unwrap_or_default()))
     {
         println!(
-            "  database: if {main} is a SQLite database, this is its working file: sent only when it holds nothing \
-             the database needs, changed here only while the database is closed"
+            "  not synced: a working file of {main}, beside it; it stays on this PC (`!{main}` in `oneup databases` opts it out)"
         );
+        return Ok(());
     }
     if let Some(r) = settings.databases()?.by_name(rel) {
         let when = match r.format.consistent() {

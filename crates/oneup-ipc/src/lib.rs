@@ -379,6 +379,7 @@ mod tests {
             unsynced: None,
             retrying: None,
             databases: Vec::new(),
+            databases_more: 0,
         }
     }
 

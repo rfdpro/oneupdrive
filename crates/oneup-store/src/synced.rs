@@ -704,6 +704,15 @@ impl Trees for Ops<'_> {
     fn has_base_children(&self, sid: Sid) -> Result<bool> {
         self.synced_has_children(sid)
     }
+
+    // Through the name index: one lookup, whatever the folder holds.
+    fn local_has_file(&self, id: LocalId, name: &str) -> Result<bool> {
+        Ok(self.local_named(id.0, name)?.iter().any(|r| r.kind == crate::LocalKind::File))
+    }
+
+    fn remote_has_file(&self, id: &RemoteId, name: &str) -> Result<bool> {
+        Ok(self.remote_named(&id.0, name)?.iter().any(|r| r.kind == crate::Kind::File))
+    }
 }
 
 #[cfg(test)]

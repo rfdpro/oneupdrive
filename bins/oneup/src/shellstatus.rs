@@ -141,6 +141,7 @@ mod tests {
             unsynced: None,
             retrying: None,
             databases: Vec::new(),
+            databases_more: 0,
         };
         let f = ShellStatus::from_status(&s, Path::new(r"C:\Data"), Some((5, 10)));
         assert_eq!((f.state, f.label.as_str(), f.kind, f.local.as_str()), ("insync", "Up to date", "main", r"C:\Sync"));

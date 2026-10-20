@@ -27,11 +27,13 @@
 //! crash, and one from another PC would be applied to a database it
 //! doesn't belong to. The database itself goes up only once everything is
 //! in it (`docs/architecture/databases.md`), so it needs none of them.
-//! The database is told by what planning can know without reading it: its
-//! name or the user's `[databases]` patterns (given with
-//! [`Parked::with_databases`]; a `!` pattern opts it out). A working file
-//! beside anything else, or with no database beside it, is ordinary, and
-//! the executor still protects it beside a database its content proves.
+//! The rule is the name alone: a file named `<X>-wal`, `<X>-shm` or
+//! `<X>-journal` whose sibling `<X>` exists, on its side or in the Synced
+//! tree, whatever `<X>` holds; a `!` pattern in `[databases]` naming `<X>`
+//! (given with [`Parked::with_databases`]) opts it out. Siblings are found
+//! with the trees' exact-name lookups (`Trees::local_has_file`, indexed in
+//! the store); the Synced tree, which has no name index, is read one folder
+//! at a time, and only that folder's names are kept.
 //!
 //! **The user's rules** (`docs/architecture/rules.md`), when given with
 //! [`Parked::with_rules`], hide what they exclude, judged by each item's
@@ -56,7 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use oneup_rules::RuleSet;
-use oneup_rules::database::{Companion, Databases, Format};
+use oneup_rules::database::{Companion, Databases};
 use oneup_sync::{Base, LocalId, LocalNode, NodeKind, Op, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold};
 
 use crate::names;
@@ -89,19 +91,14 @@ pub struct Parked<'a, T: ?Sized> {
     local_dirs: RefCell<BTreeMap<LocalId, Dir>>,
     remote_dirs: RefCell<BTreeMap<RemoteId, Option<Dir>>>,
     base_dirs: RefCell<BTreeMap<Sid, Dir>>,
-    /// What counts as a database by name and pattern (the default set when
-    /// not given), for SQLite's working files.
+    /// The `[databases]` patterns, for their `!` opt-outs.
     databases: Option<&'a Databases>,
-    default_databases: Databases,
     /// No rules: what folders' paths are worked out with when there are
     /// none.
     no_rules: RuleSet,
-    /// Per folder a round visits, the (folded) names of the files there
-    /// that a working file there is named after: two passes over the
-    /// folder once, whatever how many working files it holds.
-    local_mains: RefCell<BTreeMap<LocalId, Rc<BTreeSet<String>>>>,
-    remote_mains: RefCell<BTreeMap<RemoteId, Rc<BTreeSet<String>>>>,
-    base_mains: RefCell<BTreeMap<Sid, Rc<BTreeSet<String>>>>,
+    /// The (folded) names of the files in the last Synced folder whose
+    /// names were needed: one folder's at a time, read once for it.
+    base_files: RefCell<Option<(Sid, Rc<BTreeSet<String>>)>>,
 }
 
 /// A folder as the rules see it.
@@ -123,11 +120,8 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
             remote_dirs: RefCell::default(),
             base_dirs: RefCell::default(),
             databases: None,
-            default_databases: Databases::default(),
             no_rules: RuleSet::default(),
-            local_mains: RefCell::default(),
-            remote_mains: RefCell::default(),
-            base_mains: RefCell::default(),
+            base_files: RefCell::default(),
         }
     }
 
@@ -137,13 +131,33 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         Self { databases: Some(databases), ..self }
     }
 
-    /// Whether the file `main` in the folder at `dir` (relative to the
-    /// synced folder) is a database that may have SQLite working files, by
-    /// its name or a pattern; a `!` pattern says it isn't.
-    fn is_database(&self, dir: &str, main: &str) -> bool {
-        let dbs = self.databases.unwrap_or(&self.default_databases);
+    /// Whether a `!` pattern in `[databases]` opts the file `main` in the
+    /// folder at `dir` (relative to the synced folder) out.
+    fn opted_out(&self, dir: &str, main: &str) -> bool {
+        let Some(dbs) = self.databases else { return false };
         let path = if dir.is_empty() { main.to_string() } else { format!("{dir}/{main}") };
-        dbs.recognise(&path, None, false).is_some_and(|r| matches!(r.format, Format::Sqlite | Format::Other))
+        dbs.opted_out(&path)
+    }
+
+    /// Whether Synced folder `sid` has a file record named `name`.
+    fn base_has_file(&self, sid: Sid, name: &str) -> Result<bool, T::Error> {
+        let cached = self.base_files.borrow().as_ref().filter(|(s, _)| *s == sid).map(|(_, f)| Rc::clone(f));
+        let files = match cached {
+            Some(f) => f,
+            None => {
+                let mut f = BTreeSet::new();
+                self.inner.any_base_child(sid, &mut |c| {
+                    if c.kind == NodeKind::File {
+                        f.insert(fold(&c.name));
+                    }
+                    Ok(false)
+                })?;
+                let f = Rc::new(f);
+                *self.base_files.borrow_mut() = Some((sid, Rc::clone(&f)));
+                f
+            }
+        };
+        Ok(files.contains(&fold(name)))
     }
 
     /// Also hides what the user's `rules` exclude (see the module docs).
@@ -223,66 +237,68 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
     }
 
     /// Whether the local file `n` is a SQLite database's working file
-    /// beside its database (see the module docs). Only names that could be
-    /// one look at the folder.
+    /// beside its database (see the module docs): only names that could be
+    /// one look further.
     fn local_companion(&self, n: &LocalNode) -> Result<bool, T::Error> {
         let (Some((_, main)), Some(p), NodeKind::File) = (Companion::of_name(&n.name), n.parent, n.kind) else {
             return Ok(false);
         };
-        let dir = self.local_dir(self.rules.unwrap_or(&self.no_rules), p)?;
-        if !self.is_database(&dir.path, main) {
+        if self.databases.is_some()
+            && self.opted_out(&self.local_dir(self.rules.unwrap_or(&self.no_rules), p)?.path, main)
+        {
             return Ok(false);
         }
-        let cached = self.local_mains.borrow().get(&p).cloned();
-        let mains = match cached {
-            Some(m) => m,
-            None => {
-                let m = Rc::new(mains_of(|f| self.inner.any_local_child(p, &mut |c| Ok(f(c.kind, &c.name))))?);
-                self.local_mains.borrow_mut().insert(p, Rc::clone(&m));
-                m
-            }
-        };
-        Ok(mains.contains(&fold(main)))
+        if self.inner.local_has_file(p, main)? {
+            return Ok(true);
+        }
+        match self.inner.base_by_local(p)? {
+            Some(b) => self.base_has_file(b.sid, main),
+            None => Ok(false),
+        }
     }
 
     fn remote_companion(&self, n: &RemoteNode) -> Result<bool, T::Error> {
         let (Some((_, main)), Some(p), NodeKind::File) = (Companion::of_name(&n.name), &n.parent, n.kind) else {
             return Ok(false);
         };
-        let Some(dir) = self.remote_dir(self.rules.unwrap_or(&self.no_rules), p)? else { return Ok(false) };
-        if !self.is_database(&dir.path, main) {
-            return Ok(false);
-        }
-        let cached = self.remote_mains.borrow().get(p).cloned();
-        let mains = match cached {
-            Some(m) => m,
-            None => {
-                let m = Rc::new(mains_of(|f| self.inner.any_remote_child(p, &mut |c| Ok(f(c.kind, &c.name))))?);
-                self.remote_mains.borrow_mut().insert(p.clone(), Rc::clone(&m));
-                m
+        if self.databases.is_some() {
+            let Some(dir) = self.remote_dir(self.rules.unwrap_or(&self.no_rules), p)? else { return Ok(false) };
+            if self.opted_out(&dir.path, main) {
+                return Ok(false);
             }
-        };
-        Ok(mains.contains(&fold(main)))
+        }
+        if self.inner.remote_has_file(p, main)? {
+            return Ok(true);
+        }
+        match self.inner.base_by_remote(p)? {
+            Some(b) => self.base_has_file(b.sid, main),
+            None => Ok(false),
+        }
     }
 
     fn base_companion(&self, b: &Base) -> Result<bool, T::Error> {
         let (Some((_, main)), Some(p), NodeKind::File) = (Companion::of_name(&b.name), b.parent, b.kind) else {
             return Ok(false);
         };
-        let dir = self.base_dir(self.rules.unwrap_or(&self.no_rules), p)?;
-        if !self.is_database(&dir.path, main) {
+        if self.databases.is_some()
+            && self.opted_out(&self.base_dir(self.rules.unwrap_or(&self.no_rules), p)?.path, main)
+        {
             return Ok(false);
         }
-        let cached = self.base_mains.borrow().get(&p).cloned();
-        let mains = match cached {
-            Some(m) => m,
-            None => {
-                let m = Rc::new(mains_of(|f| self.inner.any_base_child(p, &mut |c| Ok(f(c.kind, &c.name))))?);
-                self.base_mains.borrow_mut().insert(p, Rc::clone(&m));
-                m
-            }
-        };
-        Ok(mains.contains(&fold(main)))
+        if self.base_has_file(p, main)? {
+            return Ok(true);
+        }
+        // A database here or in OneDrive that isn't synced (yet).
+        let Some(folder) = self.inner.base(p)? else { return Ok(false) };
+        if let Some(l) = folder.local
+            && self.inner.local_has_file(l, main)?
+        {
+            return Ok(true);
+        }
+        match &folder.remote {
+            Some(r) => self.inner.remote_has_file(r, main),
+            None => Ok(false),
+        }
     }
 
     /// Whether the Synced record `b` is hidden (see the module docs).
@@ -403,37 +419,6 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         }
         is_local_by_nature(&n.name)
     }
-}
-
-/// The folded names of the files in a folder that working files in it are
-/// named after, those present (`walk` calls its argument with each child's
-/// kind and name; returning `false` goes on): one pass for the working
-/// files' names, and only if there are any, one for those files.
-fn mains_of<E>(
-    walk: impl Fn(&mut dyn FnMut(NodeKind, &str) -> bool) -> Result<bool, E>,
-) -> Result<BTreeSet<String>, E> {
-    let mut wanted = BTreeSet::new();
-    walk(&mut |kind, name| {
-        if kind == NodeKind::File
-            && let Some((_, main)) = Companion::of_name(name)
-        {
-            wanted.insert(fold(main));
-        }
-        false
-    })?;
-    let mut present = BTreeSet::new();
-    if !wanted.is_empty() {
-        walk(&mut |kind, name| {
-            if kind == NodeKind::File {
-                let f = fold(name);
-                if wanted.contains(&f) {
-                    present.insert(f);
-                }
-            }
-            false
-        })?;
-    }
-    Ok(present)
 }
 
 /// Files the official client never syncs, on either side.
@@ -649,6 +634,13 @@ mod tests {
             self.listings.set(self.listings.get() + 1);
             Ok(self.local.iter().filter(|n| n.parent == Some(id)).cloned().collect())
         }
+        // An exact-name lookup, as the store's index gives: no listing.
+        fn local_has_file(&self, id: LocalId, name: &str) -> Result<bool, Self::Error> {
+            Ok(self
+                .local
+                .iter()
+                .any(|n| n.parent == Some(id) && n.kind == NodeKind::File && oneup_sync::same_name(&n.name, name)))
+        }
         fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>, Self::Error> {
             Ok(self.remote.iter().filter(|n| n.parent.as_ref() == Some(id)).cloned().collect())
         }
@@ -766,7 +758,8 @@ mod tests {
     }
 
     /// A folder of many databases and their working files is listed a
-    /// fixed number of times, not once per working file.
+    /// fixed number of times, not once per working file: each one's
+    /// database is found by an exact-name lookup.
     #[test]
     fn a_folder_of_databases_is_listed_a_fixed_number_of_times() {
         let mut w = world();
@@ -779,11 +772,11 @@ mod tests {
         assert!(w.listings.get() <= 10, "listed {} times", w.listings.get());
     }
 
-    /// Only a database told by its name or the user's patterns has its
-    /// working files parked: beside any other file they're ordinary, and a
-    /// `!` pattern opts a database out.
+    /// Working files are parked beside their namesake by the name alone,
+    /// whatever it is (a text file here); a `!` pattern opts the namesake
+    /// out.
     #[test]
-    fn working_files_are_parked_only_beside_a_database_told_by_name_or_pattern() {
+    fn working_files_are_parked_beside_their_namesake_unless_opted_out() {
         let mut w = world();
         for (i, name) in ["notes.txt", "notes.txt-wal", "books.ledger", "books.ledger-wal", "app.db", "app.db-wal"]
             .iter()
@@ -796,11 +789,11 @@ mod tests {
             up.sort();
             up
         };
-        assert_eq!(ups(&Parked::new(&w)), ["app.db", "books.ledger", "books.ledger-wal", "notes.txt", "notes.txt-wal"]);
+        assert_eq!(ups(&Parked::new(&w)), ["app.db", "books.ledger", "notes.txt"], "by the name alone");
         let patterns = Databases::new(true, &[], &["*.ledger", "!app.db"]).unwrap();
         assert_eq!(
             ups(&Parked::new(&w).with_databases(&patterns)),
-            ["app.db", "app.db-wal", "books.ledger", "notes.txt", "notes.txt-wal"]
+            ["app.db", "app.db-wal", "books.ledger", "notes.txt"]
         );
     }
 

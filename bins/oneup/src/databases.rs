@@ -16,6 +16,25 @@ use oneup_sync::Op;
 
 /// Files warned about, at most (each costs a line in the status).
 pub const MAX_LIVE: usize = 100;
+/// Databases held back listed in the status, at most; the rest are
+/// counted (`Status::databases_more`).
+pub const MAX_WAITS: usize = 100;
+
+/// What a round's report says about databases, looked up by operation
+/// once: a large round has many.
+pub struct Found<'a> {
+    held: std::collections::HashMap<&'a Op, &'a DbState>,
+    recognised: std::collections::HashMap<&'a Op, Format>,
+}
+
+impl<'a> Found<'a> {
+    pub fn of(r: &'a Report) -> Self {
+        Self {
+            held: r.databases.iter().map(|(op, d)| (op, d)).collect(),
+            recognised: r.recognised.iter().map(|(op, f)| (op, *f)).collect(),
+        }
+    }
+}
 
 /// The formats by their settings name.
 const FORMATS: [Format; 7] = [
@@ -37,7 +56,7 @@ fn why_name(w: &Wait) -> &'static str {
         Wait::Wal => "wal",
         Wait::Journal => "journal",
         Wait::Open => "open",
-        Wait::Behind => "behind",
+        Wait::Beside => "beside",
     }
 }
 
@@ -65,6 +84,16 @@ pub fn note(path: String, op: &Op, db: &DbState) -> Option<DatabaseNote> {
     Some(n)
 }
 
+/// The notes for the databases a round held back, at most
+/// [`MAX_WAITS`], and how many more there were. `paths`: each planned
+/// operation's path (indexed once for the round).
+pub fn held_notes(r: &Report, paths: &std::collections::HashMap<&Op, &str>) -> (Vec<DatabaseNote>, u64) {
+    let notes: Vec<DatabaseNote> =
+        r.databases.iter().filter_map(|(op, db)| note((*paths.get(op)?).to_string(), op, db)).take(MAX_WAITS).collect();
+    let more = r.databases.len().saturating_sub(notes.len());
+    (notes, u64::try_from(more).unwrap_or(u64::MAX))
+}
+
 /// The programs, by their friendlier names: "KeePass, Word".
 pub fn programs(p: &[String]) -> String {
     let mut names: Vec<String> = p.iter().map(|e| crate::apps::display_name(e)).collect();
@@ -88,11 +117,9 @@ pub fn detail(n: &DatabaseNote) -> String {
                 format!("{label} open in {who}; sent once it's closed")
             }
         }
-        "behind" => {
-            format!(
-                "{label}'s working file from OneDrive; placed once the database here is synced at OneDrive's version"
-            )
-        }
+        "beside" => "a database's working file, or a file going into such a name: they stay with the database \
+                     and never sync"
+            .to_string(),
         "wal" | "journal" => {
             let what = if n.why == "wal" {
                 "changes not yet written into it (its -wal file)"
@@ -114,17 +141,17 @@ pub fn detail(n: &DatabaseNote) -> String {
 
 /// The text of a skip the executor reported for `op` with a database
 /// note, if it did (the activity log and the round's output).
-pub fn skip_detail(r: &Report, op: &Op) -> Option<String> {
-    let (_, db) = r.databases.iter().find(|(o, _)| o == op)?;
+pub fn skip_detail(found: &Found<'_>, op: &Op) -> Option<String> {
+    let db = found.held.get(op)?;
     note(String::new(), op, db).map(|n| detail(&n))
 }
 
 /// Whether `op` sends or fetches a file that shouldn't sync while in use
 /// (by its name, or by what the executor found), and which format.
-pub fn live_format(r: &Report, op: &Op) -> Option<Format> {
+pub fn live_format(found: &Found<'_>, op: &Op) -> Option<Format> {
     let (Op::Upload { name, .. } | Op::Download { name, .. }) = op else { return None };
-    let held = r.databases.iter().find(|(o, _)| o == op).map(|(_, d)| d.recognised.format);
-    let sent = || r.recognised.iter().find(|(o, _)| o == op).map(|(_, f)| *f);
+    let held = found.held.get(op).map(|d| d.recognised.format);
+    let sent = || found.recognised.get(op).copied();
     held.or_else(sent).or_else(|| Format::of_name(name)).filter(|f| f.never_live())
 }
 
@@ -200,11 +227,39 @@ mod tests {
             link: oneup_sync::Link::New,
         };
         let mut r = Report { done: vec![op.clone()], ..Report::default() };
-        assert_eq!(live_format(&r, &op), None, "nothing in its name says so");
+        assert_eq!(live_format(&Found::of(&r), &op), None, "nothing in its name says so");
         r.recognised.push((op.clone(), Format::Outlook));
-        assert_eq!(live_format(&r, &op), Some(Format::Outlook));
+        assert_eq!(live_format(&Found::of(&r), &op), Some(Format::Outlook));
         r.recognised = vec![(op.clone(), Format::Sqlite)];
-        assert_eq!(live_format(&r, &op), None, "a database, but one that may sync live");
+        assert_eq!(live_format(&Found::of(&r), &op), None, "a database, but one that may sync live");
+    }
+
+    /// A round that held back many databases lists a bounded number, and
+    /// counts the rest.
+    #[test]
+    fn many_databases_held_back_are_listed_up_to_a_limit_and_counted() {
+        let op = |i: u128| Op::Upload {
+            local: oneup_sync::LocalPre { id: oneup_sync::LocalId(i), stamp: Some((10, 1)) },
+            to: oneup_sync::RemoteId("root".into()),
+            parent: 0,
+            name: format!("db{i}.db"),
+            replace: None,
+            link: oneup_sync::Link::New,
+        };
+        let db = DbState {
+            recognised: oneup_rules::database::Recognised {
+                format: Format::Sqlite,
+                by: oneup_rules::database::By::Header,
+            },
+            wait: Some(Wait::Wal),
+            programs: Vec::new(),
+        };
+        let r = Report { databases: (0..250).map(|i| (op(i), db.clone())).collect(), ..Report::default() };
+        let names: Vec<String> = (0..250).map(|i| format!("/db{i}.db")).collect();
+        let paths = r.databases.iter().zip(&names).map(|((o, _), n)| (o, n.as_str())).collect();
+        let (notes, more) = held_notes(&r, &paths);
+        assert_eq!((notes.len(), more), (MAX_WAITS, 150));
+        assert_eq!(notes[0].path, "/db0.db");
     }
 
     #[test]

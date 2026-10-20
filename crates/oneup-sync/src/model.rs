@@ -22,14 +22,14 @@ pub struct LocalId(pub u128);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RemoteId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     File,
     Folder,
 }
 
 /// One Synced row: what both sides last agreed on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Base {
     pub sid: Sid,
     /// Agreed parent; `None` only for [`ROOT`].
@@ -170,6 +170,17 @@ pub trait Trees {
             }
         }
         Ok(false)
+    }
+
+    /// Whether local folder `id` has a file named `name` (as Windows
+    /// compares names). The default reads the folder; a backend with an
+    /// index on names overrides it, so one lookup costs one lookup.
+    fn local_has_file(&self, id: LocalId, name: &str) -> Result<bool, Self::Error> {
+        self.any_local_child(id, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, name)))
+    }
+    /// [`Self::local_has_file`] for a cloud folder.
+    fn remote_has_file(&self, id: &RemoteId, name: &str) -> Result<bool, Self::Error> {
+        self.any_remote_child(id, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, name)))
     }
 
     /// Whether Synced folder `sid` has any child rows.

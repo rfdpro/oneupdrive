@@ -1,37 +1,32 @@
 //! Database files (`oneup_rules::database`, `docs/architecture/databases.md`):
-//! what's checked before one is sent or replaced, and before one of SQLite's
-//! working files, or a database beside them, changes here.
+//! what's checked before one is sent, replaced, moved or recycled.
 //!
 //! * **Sent only in a consistent state**, whatever `[databases] wait`
-//!   says. SQLite: every change is in the file itself (its `-wal` absent or
-//!   empty, its `-journal` not in a transaction); the program may keep it
-//!   open. The `-wal` and `-journal` are watched while it's read, and every
-//!   read checks again that nothing waits outside it, so a change to any
-//!   part of the group cancels the upload before it commits. A working file
-//!   is sent only when it holds nothing the database needs. Every other
-//!   format: no other program has it open (unless `wait` is off).
+//!   says. A database that may be SQLite (by its content, name or a
+//!   pattern) goes only with nothing outside the file (its `-wal` absent or
+//!   empty, its `-journal` not in a transaction); its `-wal` and `-journal`
+//!   are watched while it's read, and every read checks again that nothing
+//!   waits outside it, so a change beside it cancels the upload before it
+//!   commits. Every other database: no other program has it open (unless
+//!   `wait` is off).
 //! * **Replaced, moved or recycled only away from nothing it needs.** A
 //!   newer version from OneDrive waits while a program has the database
 //!   open, and no database is replaced, moved, renamed or recycled while
-//!   changes wait beside it (`-wal`, `-journal`), nor moved beside such
-//!   changes: SQLite would apply them to the wrong file. Checked last under
-//!   the exclusive handle the change goes through, with the configured
-//!   recognition (content, patterns, name; an encrypted database has no
-//!   readable signature).
-//! * **Working files stay with their database.** Before a SQLite working
-//!   file changes here (a download into its name, a move or rename from or
-//!   into such a name, a conflict copy or recycling), its database is
-//!   classified from its attributes, compared with what was expected, and
-//!   held with writers kept out ([`LocalFs::hold_for_companion`]) for
-//!   exactly that step.
+//!   changes wait beside it, nor moved or placed beside such changes:
+//!   SQLite would apply them to the wrong file. Checked last under the
+//!   exclusive handle the change goes through.
+//! * **Working files never travel.** A file named `<X>-wal`, `<X>-shm` or
+//!   `<X>-journal` beside `<X>` is parked by planning (`oneup_plan::park`),
+//!   whatever `<X>` is; the effects refuse, by the same name rule, to move,
+//!   recycle or place one beside its `<X>`, or anything into such a name,
+//!   in case the folder changed after planning.
 //!
 //! Every state that can't be told is "wait" or "try again", never "go
 //! ahead": a file's attributes that can't be read (only "not found" means
-//! absent), a database whose content isn't all here, a link or another
-//! provider's placeholder where a database should be, a Restart Manager
-//! that can't answer. Content is read only from ordinary files and
-//! OneUpDrive's own placeholders whose content is all here, never from
-//! another provider's placeholder. Which programs have a file open is
+//! absent), content that can't be read, a Restart Manager that can't
+//! answer. Content is read only from ordinary files and OneUpDrive's own
+//! placeholders whose content is all here (`LocalFs::readable_here`), never
+//! from another provider's placeholder. Which programs have a file open is
 //! asked of Windows only for a file whose data is all here (asking about
 //! an online-only file downloads it).
 
@@ -41,12 +36,12 @@ use std::path::{Path, PathBuf};
 
 use oneup_gate::Approved;
 use oneup_ntfs::FileId;
-use oneup_ntfs::dirent::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, NOT_PLAIN};
+use oneup_ntfs::dirent::NOT_PLAIN;
 use oneup_ntfs::win;
 use oneup_rules::database::{By, Companion, Consistent, Databases, Format, HEAD, Recognised, access_lock_name};
 use oneup_sync::{LocalId, Op};
 
-use crate::local::{ChangedMeanwhile, Error, LocalFs, Result, Staged, UploadSource, is_cloud_tag, long};
+use crate::local::{ChangedMeanwhile, Error, LocalFs, Result, Staged, UploadSource, long};
 
 /// `CreateFile` flag: open a reparse point itself, never what it leads to.
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -72,11 +67,9 @@ pub enum Wait {
     /// Open in another program ([`DbState::programs`] says which, if
     /// Windows would; an Access lock file beside it says it's open).
     Open,
-    /// A SQLite working file whose database here isn't the one it belongs
-    /// to (not the version OneDrive has, not one OneUpDrive knows, or a
-    /// file put in its place): placed or moved now, SQLite would apply it
-    /// to the wrong database.
-    Behind,
+    /// A database's working file beside it (or a file going into such a
+    /// name): they stay with the database and never travel.
+    Beside,
 }
 
 /// A database found by a check, and why it waits, if it does.
@@ -87,18 +80,6 @@ pub struct DbState {
     /// When it waits: the programs that have it open (their executables,
     /// `KeePass.exe`), as far as Windows says.
     pub programs: Vec<String>,
-}
-
-/// What a check before changing a possible SQLite working file found
-/// ([`LocalFs::check_companion_change`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompanionCheck {
-    /// Not a database's working file: an ordinary file.
-    Ordinary,
-    /// One, and nothing here holds it back. `main`: its database's name.
-    Go { main: String },
-    /// One, and it waits.
-    Waits(DbState),
 }
 
 /// What an upload's check found ([`LocalFs::check_database_upload`]).
@@ -115,30 +96,10 @@ pub enum UploadCheck {
     /// programs have it open ([`LocalFs::database_open_by`]) with the
     /// file closed, then open it again. Asking Windows (Restart Manager)
     /// breaks the file's watch, which would fail every read after it.
-    IfClosed { recognised: Recognised, path: PathBuf },
-}
-
-/// The database a SQLite working file from OneDrive may be placed beside
-/// ([`LocalFs::hold_for_companion`]): the one the state database has
-/// there, at the stamp it was synced at. `None` where it has none.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MainExpect {
-    pub id: LocalId,
-    pub size: i64,
-    pub mtime: i64,
-}
-
-/// A SQLite database held with writers kept out while one of its working
-/// files changes ([`LocalFs::hold_for_companion`]). Dropping it lets them
-/// in again.
-#[derive(Debug)]
-pub struct CompanionHold(Option<win::Handle>);
-
-impl CompanionHold {
-    /// Whether a database is held (a working file beside a SQLite one).
-    pub fn holds(&self) -> bool {
-        self.0.is_some()
-    }
+    /// `watch`: once opened again, its `-wal` and `-journal` are to be
+    /// watched with it ([`LocalFs::watch_database`]): one that may be
+    /// SQLite (a pattern names it).
+    IfClosed { recognised: Recognised, path: PathBuf, watch: bool },
 }
 
 /// What's at a path, from its attributes alone (nothing is opened for data).
@@ -327,32 +288,6 @@ fn programs_using(path: &Path) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// What a database's place beside a working file holds
-/// ([`LocalFs::classify_main`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Main {
-    Absent,
-    /// A file that isn't a database (or a folder, or opted out).
-    Ordinary,
-    /// A database, or a file that may be one (its content can't be read:
-    /// not all here, empty).
-    Database,
-}
-
-/// A file's identity and stamp, from its attributes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Ident {
-    id: FileId,
-    size: i64,
-    mtime: i64,
-}
-
-impl Ident {
-    fn is(&self, e: &MainExpect) -> bool {
-        self.id.0 == e.id.0 && self.size == e.size && self.mtime == e.mtime
-    }
-}
-
 impl LocalFs {
     pub(crate) fn look(&self) -> Look {
         #[cfg(feature = "crash-test")]
@@ -445,99 +380,16 @@ impl LocalFs {
         self.sqlite_like_on(h, size, &[path])
     }
 
-    /// What's in a database's place at `main`, beside a working file, from
-    /// its attributes first: absent; a folder, a file a `!` pattern opts
-    /// out, or one whose content says it isn't a database (ordinary); or a
-    /// database (by the configured recognition, or because its content
-    /// can't be told). A link or another provider's placeholder there is
-    /// [`Error::DatabaseWaits`]: nothing is read from it. Content is read
-    /// only through a handle on the same file (checked by ID), from an
-    /// ordinary file or OneUpDrive's own placeholder all here.
-    fn classify_main(&self, main: &Path, dbs: &Databases) -> Result<(Main, Option<Ident>)> {
-        if dbs.opted_out(&self.relative(main)) {
-            return Ok((Main::Ordinary, None));
-        }
-        if self.look().side(main)? == Seen::Absent {
-            return Ok((Main::Absent, None));
-        }
-        let attrs = match win::open_path_for_attributes(main) {
-            Ok(h) => h,
-            Err(e) if e.is_not_found() => return Ok((Main::Absent, None)),
-            Err(_) => return Err(Error::Busy),
-        };
-        let (attributes, tag) = win::attribute_tag(&attrs).map_err(|_| Error::Busy)?;
-        if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            return Ok((Main::Ordinary, None));
-        }
-        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !(self.on_demand() && is_cloud_tag(tag)) {
-            return Err(Error::DatabaseWaits);
-        }
-        let (_, id) = win::file_id(&attrs)?;
-        let entry = win::stat_handle(&attrs, id)?.ok_or(Error::Changed)?;
-        let size = i64::try_from(entry.size).unwrap_or(i64::MAX);
-        let ident = Ident { id, size, mtime: entry.modified };
-        if dbs.recognise(&self.relative(main), None, false).is_some_and(|r| may_be_sqlite(&r)) {
-            return Ok((Main::Database, Some(ident)));
-        }
-        if size == 0 {
-            return Ok((Main::Database, Some(ident)));
-        }
-        drop(attrs);
-        let mut w = self.volume().open_watched_path(main).map_err(|_| Error::Busy)?;
-        if w.with_handle(|h| win::file_id(h).map(|(_, i)| i)).and_then(Result::ok) != Some(id) {
-            return Err(Error::Changed);
-        }
-        // On the handle it's read through: an ordinary file, or our own
-        // placeholder all here; anything else isn't read, and may be one.
-        if !w.with_handle(|h| self.readable_here(h, size)).unwrap_or(false) {
-            return Ok((Main::Database, Some(ident)));
-        }
-        let mut head = [0u8; 16];
-        let mut n = 0;
-        while n < head.len() {
-            match w.read(&mut head[n..]) {
-                Ok(0) => break,
-                Ok(k) => n += k,
-                Err(_) => return Err(Error::Changed),
-            }
-        }
-        if w.broken() {
-            return Err(Error::Changed);
-        }
-        let sqlite = Format::of_header(&head[..n]) == Some(Format::Sqlite);
-        Ok((if sqlite { Main::Database } else { Main::Ordinary }, Some(ident)))
-    }
-
-    /// Holds the database at `main` with writers kept out, and checks it's
-    /// still the file `ident` names. A program that has it open to write
-    /// refuses the hold: [`Error::DatabaseWaits`].
-    fn hold_main(&self, main: &Path, ident: Option<Ident>) -> Result<CompanionHold> {
-        let h = match win::open_path_keeping_writers_out(main) {
-            Ok(h) => h,
-            Err(e) if e.is_busy() => return Err(Error::DatabaseWaits),
-            Err(e) if e.is_not_found() => return Err(Error::Changed),
-            Err(_) => return Err(Error::Busy),
-        };
-        let (_, id) = win::file_id(&h)?;
-        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
-        let now = Ident { id, size: i64::try_from(entry.size).unwrap_or(i64::MAX), mtime: entry.modified };
-        if ident.is_some_and(|i| i != now) {
-            return Err(Error::Changed);
-        }
-        Ok(CompanionHold(Some(h)))
-    }
-
     /// Before an upload: whether the file `src` is reading is a database,
-    /// or a database's working file, and if so whether it waits. SQLite's
-    /// consistency is checked whatever `dbs.wait` says; that setting only
-    /// decides whether other databases wait for their programs to close
-    /// them. If a SQLite one doesn't wait, the rest of its group (the
-    /// database, its `-wal` and `-journal`) is watched with it from now on,
-    /// so a write to any of them fails the upload's reads like a write to
-    /// the file itself, and each read checks again that nothing waits
-    /// outside the database (a `-wal` or `-journal` created meanwhile).
-    /// Reads the file's first bytes through `src`, which starts from the
-    /// beginning again after.
+    /// and if so whether it waits. Consistency is checked whatever
+    /// `dbs.wait` says; that setting only decides whether databases wait for
+    /// their programs to close them. One that may be SQLite (its content,
+    /// name or a pattern says so) waits while anything waits outside it, and
+    /// otherwise has its `-wal` and `-journal` watched with it from now on,
+    /// so a write to either fails the upload's reads like a write to the
+    /// file itself, and each read checks again that nothing waits outside it
+    /// (one created meanwhile). Reads the file's first bytes through `src`,
+    /// which starts from the beginning again after.
     pub fn check_database_upload(&self, src: &mut UploadSource, dbs: &Databases) -> Result<UploadCheck> {
         let path = src.path().to_path_buf();
         let mut head = vec![0u8; HEAD];
@@ -552,41 +404,31 @@ impl LocalFs {
         }
         head.truncate(n);
         src.rewind()?;
-        let look = self.look();
-        if let Some((c, main)) = Companion::of_name(&file_name(&path)) {
-            let main = path.with_file_name(main);
-            if self.classify_main(&main, dbs)?.0 == Main::Database {
-                // Sent only when it carries nothing the database needs.
-                let wait = match c {
-                    Companion::Wal if src.size > 0 => Some(Wait::Wal),
-                    Companion::Journal if oneup_rules::database::journal_active(&head) => Some(Wait::Journal),
-                    _ => look.sqlite_wait(&main)?,
-                };
-                let recognised = Recognised { format: Format::Sqlite, by: By::Companions };
-                if let Some(w) = wait {
-                    return Ok(UploadCheck::Waits(self.waiting(recognised, w, &main)));
-                }
-                self.watch_group(src, &main, Some(c))?;
-                return Ok(UploadCheck::Consistent(recognised));
-            }
-        }
         let Some(recognised) = self.recognise(dbs, &path, Some(&head))? else {
             return Ok(UploadCheck::Send);
         };
-        let sqlite = recognised.format.consistent() == Consistent::Sqlite || may_be_sqlite(&recognised);
+        let sqlite = may_be_sqlite(&recognised);
         if sqlite {
-            if let Some(w) = look.sqlite_wait(&path)? {
+            if let Some(w) = self.look().sqlite_wait(&path)? {
                 return Ok(UploadCheck::Waits(self.waiting(recognised, w, &path)));
             }
-            if recognised.format.consistent() == Consistent::Sqlite {
-                self.watch_group(src, &path, None)?;
-                return Ok(UploadCheck::Consistent(recognised));
-            }
+            self.watch_group(src, &path)?;
         }
-        if !dbs.wait {
+        if recognised.format.consistent() == Consistent::Sqlite || !dbs.wait {
             return Ok(UploadCheck::Consistent(recognised));
         }
-        Ok(UploadCheck::IfClosed { recognised, path })
+        Ok(UploadCheck::IfClosed { recognised, path, watch: sqlite })
+    }
+
+    /// After [`UploadCheck::IfClosed`] opened the file again: watches its
+    /// `-wal` and `-journal` with it, as [`LocalFs::check_database_upload`]
+    /// did with the handle it closed.
+    pub fn watch_database(&self, src: &mut UploadSource) -> Result<()> {
+        let path = src.path().to_path_buf();
+        if self.look().sqlite_wait(&path)?.is_some() {
+            return Err(Error::DatabaseWaits);
+        }
+        self.watch_group(src, &path)
     }
 
     /// For [`UploadCheck::IfClosed`]: why the database at `path` waits, if
@@ -597,25 +439,15 @@ impl LocalFs {
         Ok(wait.map(|w| DbState { recognised, wait: Some(w), programs }))
     }
 
-    /// Watches the rest of the SQLite database `main`'s group with `src`:
-    /// the database itself unless `src` is it (`of` is `None`), and its
-    /// `-wal` and `-journal` other than `src`. Ordinary files only, and only
-    /// those there now; one created later is caught by the state check on
-    /// every read (`UploadSource::watch_sqlite`). Not the `-shm`: SQLite
-    /// keeps it mapped for writing while the database is open, and it only
-    /// indexes the `-wal`.
-    fn watch_group(&self, src: &mut UploadSource, main: &Path, of: Option<Companion>) -> Result<()> {
+    /// Watches the database `main`'s `-wal` and `-journal` with `src`:
+    /// ordinary files only, and only those there now; one created later is
+    /// caught by the state check on every read (`UploadSource::watch_sqlite`).
+    /// Not the `-shm`: SQLite keeps it mapped for writing while the database
+    /// is open, and it only indexes the `-wal`.
+    fn watch_group(&self, src: &mut UploadSource, main: &Path) -> Result<()> {
         let look = self.look();
-        let mut paths = Vec::new();
-        if of.is_some() {
-            paths.push(main.to_path_buf());
-        }
         for c in [Companion::Wal, Companion::Journal] {
-            if of != Some(c) {
-                paths.push(beside(main, c.suffix()));
-            }
-        }
-        for p in paths {
+            let p = beside(main, c.suffix());
             match look.side(&p)? {
                 Seen::Absent => continue,
                 Seen::File { plain: true, .. } => {}
@@ -675,114 +507,47 @@ impl LocalFs {
         Ok(wait.map(|w| DbState { recognised, wait: Some(w), programs }))
     }
 
-    /// Where a download into a SQLite working file's name goes: `None`
-    /// for anything else.
-    fn download_target(&self, a: &Approved) -> Result<Option<PathBuf>> {
-        let Op::Download { to, name, .. } = a.op() else { return Ok(None) };
-        if Companion::of_name(name).is_none() {
-            return Ok(None);
+    /// Whether the file at `path` is a working file beside its database:
+    /// named `<X>-wal`, `<X>-shm` or `<X>-journal`, with `<X>` beside it,
+    /// and no `!` pattern opting `<X>` out. The rule planning parks by
+    /// (`oneup_plan::park`), checked again on the folder as it is now.
+    fn beside_its_database(&self, path: &Path) -> Result<bool> {
+        let name = file_name(path);
+        let Some((_, main)) = Companion::of_name(&name) else { return Ok(false) };
+        let main = path.with_file_name(main);
+        if self.databases().opted_out(&self.relative(&main)) {
+            return Ok(false);
         }
-        let (_pin, dir) = self.pin_folder_pub(*to)?;
-        Ok(Some(dir.join(name)))
-    }
-
-    /// Before a download into a SQLite working file's name (`a`): whether
-    /// it waits while another program has the database beside it open. The
-    /// database here must also be the one OneDrive's version is: the caller
-    /// checks that from the state database ([`CompanionCheck::Go`]), and
-    /// [`LocalFs::hold_for_companion`] makes the final check, under a hold.
-    pub fn check_companion_change(&self, a: &Approved, dbs: &Databases) -> Result<CompanionCheck> {
-        let Some(path) = self.download_target(a)? else { return Ok(CompanionCheck::Ordinary) };
-        let name = file_name(&path);
-        let Some((_, main_name)) = Companion::of_name(&name) else { return Ok(CompanionCheck::Ordinary) };
-        let main = path.with_file_name(main_name);
-        if self.classify_main(&main, dbs)?.0 != Main::Database {
-            return Ok(CompanionCheck::Ordinary);
-        }
-        let recognised = Recognised { format: Format::Sqlite, by: By::Companions };
-        let programs = self.programs(&main)?;
-        if !programs.is_empty() {
-            return Ok(CompanionCheck::Waits(DbState { recognised, wait: Some(Wait::Open), programs }));
-        }
-        Ok(CompanionCheck::Go { main: main_name.to_string() })
-    }
-
-    /// The final check before a download into a SQLite working file's name
-    /// (`a`), made under a hold the caller keeps for exactly the placement,
-    /// never during a transfer. The database's place is looked at from its
-    /// attributes first: with `expect` (the database the state database
-    /// knows there), it must be that file at that stamp, whatever it holds;
-    /// without, there must be no database there (an ordinary file is fine).
-    /// Then the database is held, writers kept out (a program that has it
-    /// open to write refuses the hold), and checked to be the same file.
-    /// Refused: [`Error::DatabaseWaits`].
-    pub fn hold_for_companion(&self, a: &Approved, expect: Option<&MainExpect>) -> Result<CompanionHold> {
-        let none = CompanionHold(None);
-        let Some(path) = self.download_target(a)? else { return Ok(none) };
-        let name = file_name(&path);
-        let Some((_, main_name)) = Companion::of_name(&name) else { return Ok(none) };
-        let main = path.with_file_name(main_name);
-        let (kind, ident) = self.classify_main(&main, &self.databases())?;
-        match (expect, kind, ident) {
-            (Some(e), Main::Database | Main::Ordinary, Some(i)) if i.is(e) => {}
-            (Some(_), _, _) => return Err(Error::DatabaseWaits),
-            (None, Main::Absent | Main::Ordinary, _) => return Ok(none),
-            (None, Main::Database, _) => return Err(Error::DatabaseWaits),
-        }
-        self.hold_main(&main, ident)
+        Ok(matches!(self.look().side(&main)?, Seen::File { .. }))
     }
 
     /// The final checks before the file open as `h` (exclusively) at
     /// `from`, `size` bytes, is moved to `to` (`to` is `None` for
     /// recycling), made by the move itself, right before it, on the actual
     /// names. Refused ([`Error::DatabaseWaits`]):
-    /// * a database ([`LocalFs::sqlite_like_on`]) with changes beside it
-    ///   (they'd stay behind), or moved beside changes at `to` (they'd be
-    ///   applied to it);
-    /// * a SQLite working file whose database is open, or that holds
-    ///   changes the database needs;
-    /// * anything moved into a database's working-file name.
-    ///
-    /// The database beside a working file moved away is returned held,
-    /// writers kept out: the caller keeps it until the move is done.
-    pub(crate) fn check_move(
-        &self,
-        h: &win::Handle,
-        from: &Path,
-        size: u64,
-        to: Option<&Path>,
-    ) -> Result<CompanionHold> {
+    /// * a database ([`LocalFs::sqlite_like_on`], each name on its own) with
+    ///   changes beside it (they'd stay behind), or moved beside changes at
+    ///   `to` (they'd be applied to it);
+    /// * a working file beside its database, or anything moved into a
+    ///   working file's name beside a database: working files never travel.
+    pub(crate) fn check_move(&self, h: &win::Handle, from: &Path, size: u64, to: Option<&Path>) -> Result<()> {
         let look = self.look();
-        let dbs = self.databases();
         let same =
             to.is_some_and(|t| oneup_sync::fold(&t.to_string_lossy()) == oneup_sync::fold(&from.to_string_lossy()));
+        let to = to.filter(|_| !same);
+        if self.beside_its_database(from)? || to.map(|t| self.beside_its_database(t)).transpose()?.unwrap_or(false) {
+            return Err(Error::DatabaseWaits);
+        }
         let pending_here = look.sqlite_wait(from)?.is_some();
         let pending_there = match to {
-            Some(t) if !same => look.sqlite_wait(t)?.is_some(),
-            _ => false,
+            Some(t) => look.sqlite_wait(t)?.is_some(),
+            None => false,
         };
-        let names: Vec<&Path> = std::iter::once(from).chain(to.filter(|_| !same)).collect();
+        let names: Vec<&Path> = std::iter::once(from).chain(to).collect();
         if (pending_here || pending_there) && self.sqlite_like_on(h, size, &names)? {
             return Err(Error::DatabaseWaits);
         }
-        if let Some(t) = to.filter(|_| !same)
-            && let Some((_, main)) = Companion::of_name(&file_name(t))
-            && self.classify_main(&t.with_file_name(main), &dbs)?.0 == Main::Database
-        {
-            return Err(Error::DatabaseWaits);
-        }
-        let from_name = file_name(from);
-        let Some((c, main)) = Companion::of_name(&from_name) else { return Ok(CompanionHold(None)) };
-        let main = from.with_file_name(main);
-        let (kind, ident) = self.classify_main(&main, &dbs)?;
-        if kind != Main::Database {
-            return Ok(CompanionHold(None));
-        }
-        let hold = self.hold_main(&main, ident)?;
-        if look.holds_changes(c, from)?.is_some() {
-            return Err(Error::DatabaseWaits);
-        }
-        Ok(hold)
+        Ok(())
     }
 
     /// Why an operation on a file here was refused for a database
@@ -795,16 +560,10 @@ impl LocalFs {
             Op::Download { to, name, replace, .. } => {
                 let (_pin, dir) = self.pin_folder_pub(*to).ok()?;
                 let target = dir.join(name);
-                if replace.is_none() || Companion::of_name(name).is_some() {
-                    if let Some((_, main)) = Companion::of_name(name) {
-                        let main = target.with_file_name(main);
-                        let programs = self.programs(&main).unwrap_or_default();
-                        let wait = if programs.is_empty() { Wait::Behind } else { Wait::Open };
-                        return Some(DbState { recognised, wait: Some(wait), programs });
-                    }
-                    return look.sqlite_wait(&target).ok().flatten().map(|w| self.waiting(recognised, w, &target));
+                match replace {
+                    None => (target, None),
+                    Some(pre) => (self.path_of(pre.id)?, None),
                 }
-                (target, None)
             }
             Op::MoveLocal { local, to, name, .. } => {
                 let (_pin, dir) = self.pin_folder_pub(*to).ok()?;
@@ -817,24 +576,18 @@ impl LocalFs {
             Op::RecycleLocal { local, .. } => (self.path_of(local.id)?, None),
             _ => return None,
         };
-        if let Ok(Some(w)) = look.sqlite_wait(&from) {
-            return Some(self.waiting(recognised, w, &from));
-        }
-        if let Some((c, main)) = Companion::of_name(&file_name(&from)) {
-            let main = from.with_file_name(main);
-            let programs = self.programs(&main).unwrap_or_default();
-            if !programs.is_empty() {
-                return Some(DbState { recognised, wait: Some(Wait::Open), programs });
+        for p in std::iter::once(&from).chain(to.as_ref()) {
+            if let Ok(Some(w)) = look.sqlite_wait(p) {
+                return Some(self.waiting(recognised, w, p));
             }
-            if let Ok(Some(w)) = look.holds_changes(c, &from) {
-                return Some(DbState { recognised, wait: Some(w), programs });
+            if let Some((_, main)) = Companion::of_name(&file_name(p)) {
+                let main = p.with_file_name(main);
+                let programs = self.programs(&main).unwrap_or_default();
+                let wait = if programs.is_empty() { Wait::Beside } else { Wait::Open };
+                return Some(DbState { recognised, wait: Some(wait), programs });
             }
         }
-        let to = to?;
-        if let Ok(Some(w)) = look.sqlite_wait(&to) {
-            return Some(self.waiting(recognised, w, &to));
-        }
-        Some(DbState { recognised, wait: Some(Wait::Behind), programs: Vec::new() })
+        None
     }
 
     /// Where item `id` is now, if it can be found (read-only).
@@ -846,20 +599,21 @@ impl LocalFs {
 
     /// Right before a new file from OneDrive is placed (`a`, a download
     /// into a free name, its content in `staged`; `None` for an online-only
-    /// placeholder, whose content isn't here to say what it is): if it may
-    /// be a SQLite database (its content or name says so, or can't tell)
-    /// and a `-wal` or `-journal` with changes is already beside its name,
-    /// SQLite would apply them to it. That's allowed only for working files
-    /// that came from OneDrive with it: `known` (synced, at OneDrive's
-    /// version, as the state database has them), checked by file ID and
-    /// stamp. Otherwise [`Error::DatabaseWaits`].
-    pub fn check_new_beside(&self, a: &Approved, staged: Option<&mut Staged>, known: &[MainExpect]) -> Result<()> {
+    /// placeholder, whose content isn't here to say what it is), by the
+    /// rules planning follows, checked on the folder as it is now: nothing
+    /// is placed into a working file's name beside its database, and a file
+    /// that may be a SQLite database (its content or name says so, or can't
+    /// tell) isn't placed beside a `-wal` or `-journal` with changes, which
+    /// SQLite would apply to it. Refused: [`Error::DatabaseWaits`].
+    pub fn check_new_beside(&self, a: &Approved, staged: Option<&mut Staged>) -> Result<()> {
         use std::io::{Seek as _, SeekFrom};
         let Op::Download { to, name, replace: None, .. } = a.op() else { return Ok(()) };
         let (_pin, dir) = self.pin_folder_pub(*to)?;
         let target = dir.join(name);
-        let look = self.look();
-        if look.sqlite_wait(&target)?.is_none() {
+        if self.beside_its_database(&target)? {
+            return Err(Error::DatabaseWaits);
+        }
+        if self.look().sqlite_wait(&target)?.is_none() {
             return Ok(());
         }
         let head = match staged.and_then(Staged::file) {
@@ -877,25 +631,10 @@ impl LocalFs {
         if dbs.opted_out(&rel) {
             return Ok(());
         }
-        if let Some(h) = head.as_deref().filter(|h| !h.is_empty())
-            && !dbs.recognise(&rel, Some(h), false).is_some_and(|r| may_be_sqlite(&r))
-        {
-            return Ok(());
+        match head.as_deref().filter(|h| !h.is_empty()) {
+            Some(h) if !dbs.recognise(&rel, Some(h), false).is_some_and(|r| may_be_sqlite(&r)) => Ok(()),
+            _ => Err(Error::DatabaseWaits),
         }
-        for c in [Companion::Wal, Companion::Journal] {
-            let p = beside(&target, c.suffix());
-            if look.holds_changes(c, &p)?.is_none() {
-                continue;
-            }
-            let h = win::open_path_for_attributes(&p).map_err(|_| Error::DatabaseWaits)?;
-            let (_, id) = win::file_id(&h)?;
-            let e = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
-            let size = i64::try_from(e.size).unwrap_or(i64::MAX);
-            if !known.iter().any(|k| k.id.0 == id.0 && k.size == size && k.mtime == e.modified) {
-                return Err(Error::DatabaseWaits);
-            }
-        }
-        Ok(())
     }
 }
 
