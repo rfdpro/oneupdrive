@@ -33,6 +33,8 @@ pub mod in_use;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
+pub mod locale;
+#[cfg(windows)]
 pub mod mutex;
 #[cfg(windows)]
 pub mod processes;
