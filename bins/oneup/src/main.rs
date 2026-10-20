@@ -3252,5 +3252,8 @@ mod rules_args_tests {
         assert!(!parses(&["rules", "--include-path", "x", "--exclude-path", "y"]));
         assert!(!parses(&["rules", "--yes"]), "--yes needs --exclude-path");
         assert!(!parses(&["rules", "--include-path", "x", "--yes"]));
+        assert!(parses(&["rules", "--pin", "*.psd", "--yes"]) && parses(&["rules", "--unpin", "!x", "--yes"]));
+        assert!(!parses(&["rules", "--pin", "*.psd", "--exclude-path", "x"]));
+        assert!(!parses(&["rules", "--allow-downloads", "--suggest"]));
     }
 }

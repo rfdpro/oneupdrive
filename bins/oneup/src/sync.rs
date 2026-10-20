@@ -1162,56 +1162,55 @@ impl Engine {
         let total = oneup_sys::disk::total_bytes(Path::new(&root.path)).ok();
         let reserve = crate::pinrules::reserve(total, space.low_disk_percent);
         let limit = std::sync::Mutex::new(crate::pinrules::FetchLimit::new(reserve, std::time::Instant::now()));
-        let budget = std::sync::Mutex::new(crate::pinrules::budget(&store)?);
-        let asked = std::sync::Mutex::new(None::<u64>);
         let root_path = PathBuf::from(&root.path);
-        // The rules' own among the files this pass may fetch (the store
-        // can't be shared with the download tasks).
-        let owned: std::collections::HashSet<u128> = store.read(|o| {
+        // Whether a file is on this PC by now, from its attributes alone
+        // (never its content): a reservation a crash left is settled by it.
+        let on_pc = |store: &Store| -> Result<std::collections::HashSet<u128>> {
             let mut v = std::collections::HashSet::new();
-            for r in o.local_to_fetch(oneup_exec::placement::BATCH)? {
-                if o.pin_owned_has(r.file_id)? {
-                    v.insert(r.file_id);
+            let Some(list) = store.read(|o| o.meta_get(crate::pinrules::KEY_RESERVED))? else { return Ok(v) };
+            for id in list.split(',').filter_map(|i| i.split_once(':')).filter_map(|(id, _)| id.parse::<u128>().ok()) {
+                if let Some(p) = store.read(|o| o.local_path_of(id))? {
+                    let full = p.split('/').filter(|x| !x.is_empty()).fold(root_path.clone(), |f, x| f.join(x));
+                    let here = std::fs::symlink_metadata(&full)
+                        .is_ok_and(|m| std::os::windows::fs::MetadataExt::file_attributes(&m) & 0x0040_0000 == 0);
+                    if here {
+                        v.insert(id);
+                    }
                 }
             }
             Ok(v)
+        };
+        let here = on_pc(&store)?;
+        crate::pinrules::settle(&mut store, &[], &|id| here.contains(&id))?;
+        // The rules' own among the files this pass may fetch get their
+        // budget reserved before any download (the store can't be shared
+        // with the download tasks, so this is decided up front).
+        let candidates: Vec<(u128, u64, bool)> = store.read(|o| {
+            let mut v = Vec::new();
+            for r in o.local_to_fetch(oneup_exec::placement::BATCH)? {
+                v.push((r.file_id, u64::try_from(r.size).unwrap_or(0), o.pin_owned_has(r.file_id)?));
+            }
+            Ok(v)
         })?;
+        let owned: std::collections::HashSet<u128> = candidates.iter().filter(|c| c.2).map(|c| c.0).collect();
+        let (reserved, blocked) = crate::pinrules::reserve_budget(&mut store, &candidates)?;
         let may = |id: u128, size: u64| -> std::result::Result<(), oneup_exec::placement::Stop> {
-            let owned = owned.contains(&id);
-            if owned {
-                let b = budget.lock().unwrap_or_else(|p| p.into_inner());
-                if !crate::pinrules::within_budget(*b, size) {
-                    *asked.lock().unwrap_or_else(|p| p.into_inner()) = Some(size);
-                    return Err(oneup_exec::placement::Stop::Approval);
-                }
+            if owned.contains(&id) && !reserved.contains(&id) {
+                return Err(oneup_exec::placement::Stop::Approval);
             }
             let paused = controls().pause_local;
             let free = crate::pinrules::free_space(&root_path);
             let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
-            l.may(size, paused, free, std::time::Instant::now())?;
-            if owned {
-                let mut b = budget.lock().unwrap_or_else(|p| p.into_inner());
-                *b = b.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
-            }
-            Ok(())
+            l.may(size, paused, free, std::time::Instant::now())
         };
         let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path), &may).await?;
-        // What the rules' items downloaded comes off what was approved.
-        let spent: u64 = store.read(|o| {
-            let mut n = 0u64;
-            for (_, id, size) in &fetched.done {
-                if o.pin_owned_has(*id)? {
-                    n += size;
-                }
-            }
-            Ok(n)
-        })?;
-        if spent > 0 {
-            crate::pinrules::spend(&mut store, spent)?;
-        }
+        // What wasn't downloaded goes back to the budget.
+        let done: Vec<u128> = fetched.done.iter().map(|d| d.1).collect();
+        crate::pinrules::settle(&mut store, &done, &|_| false)?;
+        let asked = blocked.map(|(_, size)| size);
         use oneup_exec::placement::Stop;
         if fetched.stopped == Some(Stop::Approval)
-            && let Some(size) = asked.into_inner().unwrap_or_else(|p| p.into_inner())
+            && let Some(size) = asked
         {
             crate::pinrules::wait_for_go_ahead(&mut store, size)?;
             let e = notice(

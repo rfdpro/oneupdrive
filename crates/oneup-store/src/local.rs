@@ -263,6 +263,12 @@ impl Ops<'_> {
     /// stores the root folder's row and queues it for listing.
     pub fn local_begin(&self, root: &LocalRoot, root_row: &LocalRow) -> Result<()> {
         debug_assert_eq!(root_row.kind, LocalKind::Root);
+        // The pin rules' own notes go with the rows; for the same folder
+        // they're set aside to be put back (`crate::pins`).
+        let same = self
+            .local_root()?
+            .is_some_and(|r| r.volume_serial == root.volume_serial && r.root_file_id == root.root_file_id);
+        self.pins_hold_for_rescan(same)?;
         self.c.execute_batch("DELETE FROM local_scan_queue; DELETE FROM local_item; DELETE FROM local_root;")?;
         self.c.execute(
             "INSERT INTO local_root (id, path, volume_serial, root_file_id, rules, journal_id, start_usn,
