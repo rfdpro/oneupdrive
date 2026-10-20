@@ -34,7 +34,7 @@ Semantics are git's:
 3. **`.oneupignore` files** in the synced folder, each anchored at its own folder. They sync like any file, so the rules travel with the folder. Only the **local** copy is read: one source of truth, and a `.oneupignore` that exists only in the cloud takes effect once it has been downloaded. Read only if it's an ordinary file (never a placeholder), at most 64 KiB; a larger or unreadable one is reported and ignored.
 4. **Last layers no `!` rule can undo**: paused folders (`[pause] folders`), folders synced on their own (vaults and extra pairs inside this pair's OneDrive folder, [pairs.md](pairs.md)), and folders left to the OneDrive app ([office.md](office.md#folders-left-to-the-onedrive-app)).
 
-Separate from user rules, and not changeable by them: **not synced by nature** (Office lock files, `*.tmp`, `desktop.ini`, the OneDrive app's marker; `oneup_plan::names`), names OneDrive refuses, files over 250 GB, and the engine's own `.oneup` folder. `explain` reports these too.
+Separate from user rules, and not changeable by them: **not synced by nature** (Office lock files, `*.tmp`, `desktop.ini`, the OneDrive app's marker; `oneup_plan::names`; SQLite's working files beside their database, [databases.md](databases.md)), names OneDrive refuses, files over 250 GB, and the engine's own `.oneup` folder. `explain` reports these too.
 
 ## Where rules apply
 **1. Planning (the authority).** The `Parked` view (`oneup-plan/src/park.rs`) hides items OneDrive would refuse, and the user's rules, evaluated on paths relative to the synced folder, in each tree with that tree's own path:

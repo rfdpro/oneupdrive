@@ -8,6 +8,8 @@
 
 **Conflict copy**: when a file changed on both sides, you get both. One keeps its name; the other becomes `name (conflict 1).ext`.
 
+**Database** (file): a file a program keeps open and changes bit by bit, such as a password vault, a mailbox or an app's SQLite data. OneUpDrive sends one only when it's whole and replaces it only while it's closed. See [Databases](databases.md).
+
 **Data folder**: where OneUpDrive keeps its settings, records and log (`%LOCALAPPDATA%\OneUpDrive`). Each account has its own. It is not your synced folder.
 
 **Duplicates**: files with the same content, in OneDrive or on this PC. OneUpDrive lists them and removes the copies you choose once you approve, never the last copy. See [Duplicates](files-on-demand.md#duplicates).
@@ -43,5 +45,7 @@
 **Synced folder**: the folder on this PC that OneUpDrive keeps the same as a OneDrive folder.
 
 **Vault**: a folder whose files are encrypted before they reach OneDrive. See [Encrypted vaults](vaults.md).
+
+**Working files** (SQLite's): the `-wal`, `-shm` and `-journal` files beside a SQLite database, holding changes on their way into it. They never sync. See [Databases](databases.md).
 
 **Version history**: the earlier versions of a file that OneDrive itself keeps. See [Earlier versions and sharing](versions-and-sharing.md).
