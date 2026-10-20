@@ -5672,7 +5672,9 @@
         // Database files ([databases]): what counts as one, and what waits
         // now or is warned about (the agent's status, `st`).
         function databaseRows(rs, st) {
+            // An older program's snapshot has no `databases`: nothing to show.
             const d = rs.databases;
+            if (!d) return [];
             const save = (value, ok) => run(call("save", {
                 root: F.root.id,
                 section: "databases",
