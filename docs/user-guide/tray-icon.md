@@ -12,7 +12,9 @@ While OneUpDrive runs, its icon (a blue cloud lifted one step above its base) si
 | Blue icon, red **!** | A problem: OneUpDrive retries by itself, or stopped (see [When something goes wrong](troubleshooting.md)) |
 | Faded grey icon | OneUpDrive isn't running |
 
-Point at the icon to see the same in words, for example "OneUpDrive: Paused: battery saver is on".
+Point at the icon to see the same in words, for example "OneUpDrive: Paused: battery saver is on". Screen readers read the same words.
+
+From the keyboard: Win+B goes to the taskbar corner, the arrow keys to the icon, and Enter, Space or the menu key opens its menu.
 
 "Up to date · 12 items failed" (in the tooltip; the menu shows **Sync failure: 12 items**) means everything else is synced, and 12 items need you to change something before they can be (see [What can't sync](syncing.md#what-cant-sync)). The icon stays blue: trying again wouldn't help, so OneUpDrive isn't stuck on them.
 
