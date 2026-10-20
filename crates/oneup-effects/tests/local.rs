@@ -71,6 +71,25 @@ fn approve_with(policy: &Policy, op: Op) -> Approved {
     r.approved.into_iter().next().unwrap()
 }
 
+/// A recovery step the user asked for: its key approved, as the agent
+/// approves a queued restore (`oneup_app::restores`).
+fn approve_asked(op: Op) -> Approved {
+    let keys = oneup_gate::rewind_keys(std::slice::from_ref(&op), &[String::new()]);
+    let cx = Context { synced_items: 1_000_000, approved: &keys, ..Context::default() };
+    let r = review_in(&Policy::default(), &cx, vec![op]);
+    assert!(r.withheld.is_empty() && r.breakers.is_empty(), "{:?}", r.breakers);
+    r.approved.into_iter().next().unwrap()
+}
+
+/// Puts kept item `slot` back at `to` (or where it came from), as a
+/// restore asked for and approved: bound to the item and the folder as
+/// found now.
+fn restore(fs: &LocalFs, slot: &str, to: Option<&str>) -> Result<String, Error> {
+    let t = fs.kept_target(slot, to)?;
+    let step = oneup_sync::rewind::Step::RestoreKept { slot: slot.into(), item: t.item, dir: t.dir, name: t.name };
+    fs.restore_approved(&approve_asked(Op::rewind(0, step)))
+}
+
 /// A recycle the user chose to discard (an overflow batch of one).
 fn approve_discard(op: Op) -> Approved {
     let p = Policy::default();
@@ -424,23 +443,56 @@ fn kept_items_are_listed_restored_without_replacing_and_pruned() {
     assert_eq!(slots[0].bytes, 5);
 
     // Back where it came from; the slot is gone.
-    assert_eq!(fs.restore(&slots[0].id, None).unwrap(), "docs\\a.txt");
+    assert_eq!(restore(&fs, &slots[0].id, None).unwrap(), "docs\\a.txt");
     assert_eq!(std::fs::read(r.p("docs/a.txt")).unwrap(), b"first");
     assert_eq!(fs.versions().unwrap().len(), 1);
 
     // The name is taken meanwhile: restored beside it, nothing replaced.
     std::fs::write(r.p("b.txt"), b"new bee").unwrap();
-    assert_eq!(fs.restore(&slots[1].id, None).unwrap(), "b (restored 1).txt");
+    assert_eq!(restore(&fs, &slots[1].id, None).unwrap(), "b (restored 1).txt");
     assert_eq!(std::fs::read(r.p("b.txt")).unwrap(), b"new bee");
     assert_eq!(std::fs::read(r.p("b (restored 1).txt")).unwrap(), b"bee");
 
     // Never into OneUpDrive's own folder, never outside, never a bad slot.
     fs.apply(&approve(Op::RecycleLocal { sid: 1, local: pre(&r.p("b.txt")) })).unwrap();
     let id = fs.versions().unwrap()[0].id.clone();
-    assert!(matches!(fs.restore(&id, Some(".oneup\\x.txt")), Err(Error::BadName)));
-    assert!(matches!(fs.restore(&id, Some("..\\x.txt")), Err(Error::BadName)));
-    assert!(matches!(fs.restore("..", None), Err(Error::BadName)));
-    assert!(matches!(fs.restore(&id, Some("missing\\x.txt")), Err(Error::Changed)));
+    assert!(matches!(restore(&fs, &id, Some(".oneup\\x.txt")), Err(Error::BadName)));
+    assert!(matches!(restore(&fs, &id, Some("..\\x.txt")), Err(Error::BadName)));
+    assert!(matches!(restore(&fs, "..", None), Err(Error::BadName)));
+    assert!(matches!(restore(&fs, &id, Some("missing\\x.txt")), Err(Error::Changed)));
+
+    // Bound to what was chosen: the kept item by its ID and stamp, the
+    // folder by its ID. A kept file changed since, or a folder swapped for
+    // another of the same name, isn't acted on.
+    std::fs::create_dir(r.p("dest")).unwrap();
+    let step = |t: &oneup_effects::KeptTarget| {
+        Op::rewind(
+            0,
+            oneup_sync::rewind::Step::RestoreKept {
+                slot: id.clone(),
+                item: t.item.clone(),
+                dir: t.dir,
+                name: t.name.clone(),
+            },
+        )
+    };
+    let t = fs.kept_target(&id, Some("dest\\x.txt")).unwrap();
+    let kept = r.p(&format!(".oneup/versions/{id}/b.txt"));
+    std::fs::write(&kept, b"changed in the store").unwrap();
+    assert!(matches!(fs.restore_approved(&approve_asked(step(&t))), Err(Error::Changed)), "item changed");
+    let t = fs.kept_target(&id, Some("dest\\x.txt")).unwrap();
+    std::fs::rename(r.p("dest"), r.p("dest-was")).unwrap();
+    std::fs::create_dir(r.p("dest")).unwrap();
+    // The folder chosen, wherever it is now; never another of its name.
+    assert_eq!(fs.restore_approved(&approve_asked(step(&t))).unwrap(), "dest-was\\x.txt");
+    assert!(!r.p("dest/x.txt").exists());
+    assert_eq!(std::fs::read(r.p("dest-was/x.txt")).unwrap(), b"changed in the store");
+    // Once done, the same step finds nothing to act on.
+    assert!(fs.restore_approved(&approve_asked(step(&t))).is_err());
+    // Kept again, as it was, for what follows.
+    std::fs::write(r.p("dest-was/x.txt"), b"bee").unwrap();
+    std::fs::rename(r.p("dest-was/x.txt"), r.p("b.txt")).unwrap();
+    fs.apply(&approve(Op::RecycleLocal { sid: 1, local: pre(&r.p("b.txt")) })).unwrap();
 
     // Pruning: a preview removes nothing; by size, oldest first.
     std::fs::write(r.p("c.txt"), b"0123456789").unwrap();
@@ -505,7 +557,7 @@ fn the_version_store_is_measured_once_per_slot() {
     keep("b.txt", b"0123456789");
     assert_eq!(bytes(), [("a.txt".to_string(), 5), ("b.txt".to_string(), 10)]);
     let a = fs.versions().unwrap()[0].id.clone();
-    fs.restore(&a, None).unwrap();
+    restore(&fs, &a, None).unwrap();
     assert_eq!(bytes(), [("b.txt".to_string(), 10)]);
     assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
     fs.prune_versions(Some(i64::MAX), None, false).unwrap();

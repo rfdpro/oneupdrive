@@ -65,4 +65,4 @@ pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadS
 #[cfg(windows)]
 pub use ondemand::{EXCLUDED_MARK, Version};
 pub use oneup_ntfs::dirent::DirEntry;
-pub use versions::{Slot, Trim};
+pub use versions::{KeptTarget, Slot, Trim};

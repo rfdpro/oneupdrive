@@ -24,9 +24,19 @@ use oneup_sync::rewind::Step;
 use oneup_sync::{LocalId, LocalPre, NodeKind, Op, RemoteId, RemotePre, Sid};
 
 /// The step that puts kept copy `slot` (its version store slot) back into
-/// the synced folder, at `to` (a path in it) or where it came from.
-pub fn kept_op(slot: &str, to: Option<&str>) -> Op {
-    Op::rewind(0, Step::RestoreKept { slot: slot.to_string(), to: to.map(str::to_string) })
+/// the synced folder, bound to the kept item and the destination folder by
+/// their file IDs, and the item's stamp, as `target` found them
+/// (`oneup_effects::LocalFs::kept_target`).
+pub fn kept_op(slot: &str, target: &oneup_effects::KeptTarget) -> Op {
+    Op::rewind(
+        0,
+        Step::RestoreKept {
+            slot: slot.to_string(),
+            item: target.item.clone(),
+            dir: target.dir,
+            name: target.name.clone(),
+        },
+    )
 }
 
 /// The step that makes version `version` of OneDrive file `id` its current

@@ -5985,7 +5985,7 @@ async fn everyday_restoring_a_kept_copy_brings_it_back_on_both_sides() {
     assert!(!s.p("docs/a.txt").exists());
     let slot = s.exec.local().versions().unwrap().into_iter().find(|v| v.name == "a.txt").expect("kept");
     // A planned step, approved by the user's answer: unanswered, it stops.
-    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, None)];
+    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, &s.exec.local().kept_target(&slot.id, None).unwrap())];
     s.unanswered = true;
     s.stops.allowed = true;
     let r = s.attempt().await;
@@ -5993,7 +5993,7 @@ async fn everyday_restoring_a_kept_copy_brings_it_back_on_both_sides() {
     assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Rewind), "a stop asks");
     s.stops.raised.clear();
     s.stops.allowed = false;
-    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, None)];
+    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, &s.exec.local().kept_target(&slot.id, None).unwrap())];
     s.settle().await;
     assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"keep me");
     assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"keep me".to_vec()), "uploaded again");
@@ -6081,7 +6081,7 @@ async fn everyday_a_restore_asked_for_leaves_a_file_changed_since_alone() {
     s.settle().await;
     let slot = s.exec.local().versions().unwrap().into_iter().find(|v| v.name == "k.txt").expect("kept");
     write(&s.p("docs/k.txt"), b"a new k");
-    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, None)];
+    s.extra = vec![oneup_exec::recover::kept_op(&slot.id, &s.exec.local().kept_target(&slot.id, None).unwrap())];
     s.settle().await;
     assert_eq!(std::fs::read(s.p("docs/k.txt")).unwrap(), b"a new k");
     assert_eq!(std::fs::read(s.p("docs/k (restored 1).txt")).unwrap(), b"kept");

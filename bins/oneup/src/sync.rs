@@ -3216,11 +3216,9 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
                 Step::Restore { to, name, .. } => {
                     Line::new("restore", join(&rp(to), name), "from OneDrive's recycle bin")
                 }
-                Step::RestoreKept { slot, to } => Line::new(
-                    "restore",
-                    to.clone().unwrap_or_else(|| slot.clone()),
-                    r"from .oneup\versions, never over anything",
-                ),
+                Step::RestoreKept { dir, name, .. } => {
+                    Line::new("restore", join(&lp(dir.0), name), r"from .oneup\versions, never over anything")
+                }
                 Step::RevertTo { remote, .. } => {
                     Line::new("revert", rp(&remote.id), "an old version from OneDrive's history becomes current")
                 }
