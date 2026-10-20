@@ -26,7 +26,7 @@ Holding is the same mechanism as for files that keep changing or OneDrive being 
 
 What waits is kept in `meta` (`net.waiting`, the 500 largest, with the count and bytes) for `oneup status`, `oneup explain` and `oneup network waiting`, and logged once per reason.
 
-**Mid-round:** `control::LivePause` also holds the policy. `round_check` compares it with the policy the round was planned under; once it differs, a content transfer it doesn't allow stops that side for the rest of the round, as a pause does (downloads, whose size isn't known there, stop under a size limit too). The next round plans what waits under the new policy.
+**Mid-round:** `control::LivePause` also holds the policy. `round_check` compares it with the policy the round was planned under; once it differs, a content transfer it doesn't allow stops that side for the rest of the round, as a pause does (downloads, whose size isn't known there, stop under a size limit too). The next round plans what waits under the new policy. Keeping an edit a large upload went over (its version downloaded and uploaded again as a new file, [sync-engine.md](sync-engine.md#executor-cratesoneup-exec)) isn't a planned operation: the executor asks the live policy before each download of one (`Executor::set_may_fetch`, `LivePause::allows`), and its record waits in the store while the network doesn't let it through, so working offline, `metadata`, `small` over its limit and `opened` move none of it.
 
 ## Data budget
 

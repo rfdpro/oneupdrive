@@ -80,6 +80,18 @@ pub struct VersionMark {
     pub size: Option<i64>,
 }
 
+/// What a replacement went over ([`Cloud::replaced_other`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// The version it was meant to replace: nothing else to keep.
+    Planned,
+    /// Another one: an edit that reached OneDrive while it committed.
+    Other(VersionMark),
+    /// The history can't tell: it doesn't list the planned version, or
+    /// nothing after it (not yet, or the replacement never committed).
+    Unknown,
+}
+
 pub trait Cloud: Send + Sync {
     /// Streams the content of file `pre.id` into `out`, provided its eTag
     /// is still `pre.etag`. `Some(hash)`: the content was transformed on
@@ -122,15 +134,13 @@ pub trait Cloud: Send + Sync {
         size: i64,
     ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
 
-    /// After replacing file `id`, which held `mark`'s version: the version
-    /// the replacement went over, if it was another one (an edit that
-    /// reached OneDrive while the upload committed). `None`: it went over
-    /// `mark`'s, as planned, or the history can't tell. Read-only.
+    /// After replacing file `id`, which held `mark`'s version: what the
+    /// replacement went over. Read-only.
     fn replaced_other(
         &self,
         id: &RemoteId,
         mark: &VersionMark,
-    ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
+    ) -> impl Future<Output = Result<Replaced, CloudError>> + Send;
 
     /// Streams the content of version `version` of file `id` into `out`;
     /// returns its size. Read-only.

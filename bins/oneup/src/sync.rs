@@ -105,6 +105,18 @@ pub struct Controls {
     pub net: crate::network::Policy,
 }
 
+/// What the network lets the executor download besides a round's planned
+/// operations (an edit an upload went over, `Executor::set_may_fetch`):
+/// the agent's policy as it changes mid-round, or the round's.
+fn may_fetch(c: &Controls) -> oneup_exec::FetchCheck {
+    use crate::network::Way;
+    let (fixed, live) = (c.net.clone(), c.live.clone());
+    Arc::new(move |bytes| match &live {
+        Some(l) => l.allows(Way::Down, bytes),
+        None => fixed.allows(Way::Down, bytes),
+    })
+}
+
 /// Who the messages are for: `oneup sync` takes answers on its next run,
 /// the agent through `oneup approve/keep/discard` while it keeps running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1974,6 +1986,7 @@ impl Engine {
                 items: std::sync::atomic::AtomicU64::new(0),
                 bytes: std::sync::atomic::AtomicU64::new(0),
             };
+            self.exec.set_may_fetch(Some(may_fetch(controls)));
             let report = self
                 .run_reported(&mut store, approved, n, bytes_total, progress, controls.live.as_deref(), &follower)
                 .await;
@@ -2000,6 +2013,14 @@ impl Engine {
                 let detail = format!("an edit made in OneDrive that an earlier upload went over, kept as {name}");
                 println!("  {detail}");
                 log.push(notice(ActivityOutcome::Done, "keep", detail));
+            }
+            for name in &report.rescues_given_up {
+                let detail = format!(
+                    "{name}: an upload may have gone over an edit made in OneDrive, which its version history \
+                     doesn't show; look there"
+                );
+                println!("  {detail}");
+                log.push(notice(ActivityOutcome::Failed, "keep", detail));
             }
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
@@ -3660,6 +3681,27 @@ impl Totals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the executor may download besides the round's operations
+    /// follows the network as it changes mid-round: nothing while working
+    /// offline or on a network that moves only the files the user opens.
+    #[test]
+    fn keeping_an_edit_downloads_only_what_the_network_lets_through() {
+        use crate::network::{Policy, Transfer};
+        let c = crate::control::Control::new(None, "L".into(), "/R".into(), Answers::default());
+        let check = may_fetch(&c.controls());
+        assert!(check(Some(10)), "everything goes");
+        c.set_policy(Policy { transfer: Transfer::Opened, ..Policy::default() });
+        assert!(!check(Some(10)), "only files the user opens");
+        c.set_policy(Policy::default());
+        assert!(check(Some(10)));
+        oneup_ipc::Handler::handle(&c, oneup_ipc::Call::Offline { on: true }).unwrap();
+        assert!(!check(Some(10)), "working offline");
+        // A one-shot run: the policy it started with.
+        let fixed = Controls { net: Policy { offline: true, ..Policy::default() }, ..Controls::default() };
+        assert!(!may_fetch(&fixed)(None));
+        assert!(may_fetch(&Controls::default())(None));
+    }
 
     /// The problems list reads conflict copies' names back from the log.
     #[test]

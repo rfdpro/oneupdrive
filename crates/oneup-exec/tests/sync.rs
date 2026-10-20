@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use oneup_effects::LocalFs;
-use oneup_exec::{CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Report, Source, VersionMark, link_roots};
+use oneup_exec::{
+    CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Replaced, Report, Source, VersionMark, link_roots,
+};
 use oneup_gate::{
     Breaker, Choice, Context, Decision, ItemKey, Overflow, OverflowOutcome, Policy, Recent, Side, is_mass_sensitive,
     review_in,
@@ -69,6 +71,11 @@ struct State {
     replaced: BTreeMap<String, u64>,
     /// Versions in the history can't be downloaded (a service error).
     versions_fail: bool,
+    /// The history doesn't list the latest replacement for this many more
+    /// looks (Graph's history can lag behind a commit).
+    history_lag: u32,
+    /// Versions downloaded from the history.
+    version_downloads: u32,
     /// No room left: uploads and new folders are refused (as with HTTP
     /// 507), and the requests refused counted (a batch counts once).
     full: bool,
@@ -687,11 +694,25 @@ impl Cloud for Fake {
         .await
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
-        self.exchange(|| -> Result<Option<VersionMark>, CloudError> {
-            let s = self.0.lock().unwrap();
-            let over = s.replaced.get(&id.0).filter(|e| e.to_string() != mark.id);
-            Ok(over.map(|e| VersionMark { id: e.to_string(), modified_ms: None, size: Some(s.old[e].len() as i64) }))
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Replaced, CloudError> {
+        self.exchange(|| -> Result<Replaced, CloudError> {
+            let mut s = self.0.lock().unwrap();
+            // Nothing replaced the planned version (yet), or the history
+            // doesn't show it.
+            let current = s.items.get(&id.0).map(|it| it.etag.to_string());
+            if s.history_lag > 0 || current.as_deref() == Some(mark.id.as_str()) {
+                s.history_lag = s.history_lag.saturating_sub(1);
+                return Ok(Replaced::Unknown);
+            }
+            Ok(match s.replaced.get(&id.0) {
+                Some(e) if e.to_string() != mark.id => Replaced::Other(VersionMark {
+                    id: e.to_string(),
+                    modified_ms: None,
+                    size: Some(s.old[e].len() as i64),
+                }),
+                Some(_) => Replaced::Planned,
+                None => Replaced::Unknown,
+            })
         })
         .await
     }
@@ -703,10 +724,11 @@ impl Cloud for Fake {
         out: &mut (dyn Write + Send),
     ) -> Result<u64, CloudError> {
         self.exchange(|| -> Result<u64, CloudError> {
-            let s = self.0.lock().unwrap();
+            let mut s = self.0.lock().unwrap();
             if s.versions_fail {
                 return Err(CloudError::Other("HTTP 500".into()));
             }
+            s.version_downloads += 1;
             let content = s.old.get(&version.parse().unwrap()).cloned();
             drop(s);
             let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
@@ -1585,6 +1607,162 @@ async fn an_upload_over_an_edit_that_cant_be_kept_is_still_done() {
         assert_eq!(t.len(), 2, "{:?}", names(&t));
     }
     assert!(s.round().await.kept_later.is_empty(), "kept once");
+}
+
+/// The process killed at any point of an upload that goes over an edit
+/// in OneDrive (between the record written ahead of it and the upload,
+/// between the upload and its records, between those and keeping the
+/// edit, or while keeping it): after a restart, the edit is kept as a new
+/// file all the same, once. The record is written durably before the
+/// upload (`meta_set_ahead` refuses otherwise), so a power cut doesn't
+/// roll it back either.
+#[tokio::test]
+async fn a_crash_around_an_upload_over_an_edit_still_keeps_the_edit() {
+    for n in 0.. {
+        let cloud = Fake::new();
+        let mut s = Sync::on_disk(&format!("raced-crash{n}"), cloud.clone());
+        write(&s.p("notes.txt"), b"v1");
+        s.settle().await;
+        write(&s.p("notes.txt"), b"mine");
+        cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+
+        s.exec.crash_after(Some(n));
+        let mut crashed = false;
+        for _ in 0..10 {
+            let r = s.attempt().await;
+            if r.halted.as_deref() == Some(CRASHED) {
+                crashed = true;
+                break;
+            }
+            assert!(r.halted.is_none() && r.failed.is_empty(), "crash point {n}: {r:?}");
+            if r.is_idle() && r.skipped.is_empty() {
+                break;
+            }
+        }
+        if !crashed {
+            assert!(n > 2, "only {n} crash points");
+            return;
+        }
+        let mut s = s.restart();
+        s.settle().await;
+        for t in [local_tree(&s.dir.0), cloud.tree()] {
+            assert_eq!(t["/notes.txt"].as_deref(), Some(&b"mine"[..]), "crash point {n}");
+            assert_eq!(
+                t["/notes (conflict 1).txt"].as_deref(),
+                Some(&b"theirs"[..]),
+                "crash point {n}: {:?}",
+                names(&t)
+            );
+            assert_eq!(t.len(), 2, "crash point {n}: {:?}", names(&t));
+        }
+        let left = s.obs.store().read(|o| o.meta_under("exec.rescue")).unwrap();
+        assert!(left.is_empty(), "crash point {n}: {left:?}");
+    }
+}
+
+/// OneDrive's version history can lag behind a commit: while it doesn't
+/// show what an upload went over, keeping the edit waits and is tried
+/// again at the next rounds, not given up as "nothing to keep".
+#[tokio::test]
+async fn an_edit_the_version_history_doesnt_show_yet_is_looked_for_again() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-lag", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        st.race = Some(b"theirs".to_vec());
+        st.history_lag = 3;
+    }
+    let mut kept = Vec::new();
+    let mut waited = Vec::new();
+    for _ in 0..8 {
+        let r = s.round().await;
+        waited.extend(r.theirs_not_kept.into_iter().map(|(_, why)| why));
+        kept.extend(r.kept_theirs.into_iter().map(|(_, name)| name));
+        kept.extend(r.kept_later);
+        if !kept.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(kept, ["notes (conflict 1).txt"]);
+    assert!(waited.iter().any(|w| w.contains("doesn't show it yet")), "{waited:?}");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/notes (conflict 1).txt"].as_deref(), Some(&b"theirs"[..]));
+}
+
+/// A history that never shows it: given up after `RESCUE_TRIES` rounds,
+/// listed for the user, and no longer asked for.
+#[tokio::test]
+async fn an_edit_the_version_history_never_shows_is_given_up_and_listed() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-never", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    write(&s.p("notes.txt"), b"mine");
+    {
+        let mut st = cloud.0.lock().unwrap();
+        st.race = Some(b"theirs".to_vec());
+        st.history_lag = u32::MAX;
+    }
+    let mut given_up = Vec::new();
+    let mut rounds = 0;
+    while given_up.is_empty() && rounds < 3 * oneup_exec::RESCUE_TRIES {
+        given_up.extend(s.round().await.rescues_given_up);
+        rounds += 1;
+    }
+    assert_eq!(given_up, ["notes.txt"]);
+    assert!(rounds <= oneup_exec::RESCUE_TRIES + 1, "{rounds} rounds");
+    let listed = s.obs.store().read(oneup_exec::rescues_given_up).unwrap();
+    assert_eq!(listed.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["notes.txt"]);
+    let asked = cloud.0.lock().unwrap().history_lag;
+    for _ in 0..3 {
+        assert!(s.round().await.rescues_given_up.is_empty(), "reported once");
+    }
+    assert_eq!(cloud.0.lock().unwrap().history_lag, asked, "no longer asked for");
+}
+
+/// Working offline, or on a network that moves only names or only the
+/// files the user opens: the edit an upload went over isn't downloaded
+/// (nor uploaded again) until the network lets it through; then it's kept.
+#[tokio::test]
+async fn keeping_an_edit_waits_for_a_network_that_lets_it_download() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-offline", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    let asked = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let a = Arc::clone(&asked);
+    s.exec.set_may_fetch(Some(Arc::new(move |_| {
+        a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    })));
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    let mut waits = Vec::new();
+    for _ in 0..5 {
+        let r = s.round().await;
+        assert!(r.kept_later.is_empty() && r.kept_theirs.is_empty(), "{r:?}");
+        waits.extend(r.theirs_not_kept.into_iter().map(|(_, why)| why));
+    }
+    assert!(waits.iter().any(|w| w.contains("waits for a network")), "{waits:?}");
+    assert!(asked.load(std::sync::atomic::Ordering::Relaxed) >= 2, "asked at every round");
+    let uploaded = {
+        let st = cloud.0.lock().unwrap();
+        assert_eq!(st.version_downloads, 0, "nothing downloaded");
+        st.uploaded
+    };
+    assert_eq!(uploaded, b"v1".len() as u64 + b"mine".len() as u64, "nothing uploaded but the file");
+    assert_eq!(cloud.tree().len(), 1);
+
+    s.exec.set_may_fetch(None);
+    let r = s.round().await;
+    assert_eq!(r.kept_later, ["notes (conflict 1).txt"]);
+    assert_eq!(cloud.0.lock().unwrap().version_downloads, 1);
 }
 
 /// Server-side copy: a new local file whose content OneDrive

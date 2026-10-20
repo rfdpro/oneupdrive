@@ -27,6 +27,7 @@ OneUpDrive tells you about a problem in plain words, says whether it deals with 
 * items that can't sync, and items that failed and wait to be tried again;
 * excluded items still in OneDrive;
 * files changed on both sides in the last 7 days whose second copy is still there (OneDrive's version kept the name; compare the two and delete the one you don't need). The newest 100 are listed; a line says when there are more, or when older ones weren't checked.
+* a file whose upload may have gone over an edit someone made in OneDrive at the same moment, when OneUpDrive couldn't find that edit to keep it as a copy (look for it in the file's version history on the OneDrive website). Listed for 14 days.
 
 Each line says what to do. `oneup problems --json` gives the same for scripts: each item's `kind`, `title`, `detail`, `action`, the `code` an answer takes, the `pair` (none for the main folder) and its `data_dir`, and `more_conflicts` when not all files changed on both sides are listed (`conflicts_not_checked` when older ones weren't looked at). It works whether or not OneUpDrive is running. The settings window shows the same list at the top of its **Activity** page.
 
