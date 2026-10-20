@@ -48,7 +48,7 @@ oneup --data-dir … rules --on dev        # turn a preset on
 oneup --data-dir … rules --off dev       # and off
 ```
 
-Some files are never synced, whatever the rules say, as with the OneDrive app: Office lock files (`~$…`), `*.tmp`, `desktop.ini`, names OneDrive doesn't accept, and files over 250 GB. Databases sync with extra care: see [Databases](databases.md).
+Some files are never synced, whatever the rules say, as with the OneDrive app: Office lock files (`~$…`), `*.tmp`, `desktop.ini`, names OneDrive doesn't accept, and files over 250 GB. Neither are the `-wal`, `-shm` and `-journal` files beside a SQLite database: see [Databases](databases.md).
 
 ## Your own rules
 Rules are written like a `.gitignore` file, one per line:
