@@ -533,10 +533,10 @@ pub type Keep = dyn Fn(&mut Store, Recent) -> Result<()> + Send + Sync;
 
 /// `executed` plus what `approved` may carry out that the safety window
 /// counts: recorded before a round runs.
-fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId]) -> Recent {
+fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId], policy: &oneup_gate::Policy) -> Recent {
     let mut r = executed;
     for op in approved.iter().map(Approved::op) {
-        r.add_op(op, suspicious);
+        r.add_op(op, suspicious, policy);
     }
     r
 }
@@ -1011,7 +1011,7 @@ impl Engine {
             .await?;
         }
         let ready: Vec<_> = found.into_iter().filter(crate::prune::Candidate::ready).collect();
-        Ok(crate::prune::counted(&self.graph, ready).await?.iter().map(crate::prune::Candidate::op).collect())
+        Ok(crate::prune::counted(self.graph.as_ref(), ready).await?.iter().map(crate::prune::Candidate::op).collect())
     }
 
     /// Files On-Demand placement after a round (`oneup_exec::placement`):
@@ -1567,7 +1567,7 @@ impl Engine {
             if let Some(keep) = keep {
                 // Counted before anything runs: a crash mid-round must not
                 // forget what it may have done.
-                keep(&mut store, reserved(*executed, &approved, &suspicious))
+                keep(&mut store, reserved(*executed, &approved, &suspicious, &policy))
                     .context("can't record the safety window, so nothing was changed")?;
             }
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
@@ -1605,7 +1605,7 @@ impl Engine {
             // Counted before anything below can fail: what ran must reach
             // the caller's safety window even if this call ends in an error.
             for op in &report.done {
-                executed.add_op(op, &suspicious);
+                executed.add_op(op, &suspicious, &policy);
             }
             // Approved changes that ran are done with; those that wait stay.
             self.stops_lock().round_ended(listed_ops, &report.done);
@@ -2506,8 +2506,12 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
         Op::ConflictCopy { local, name, .. } => moved(CONFLICT_ACTION, lp(local.id.0), name.clone(), CONFLICT_NOTE),
         Op::DeleteRemote { remote, .. } => Line::new("delete", rp(&remote.id), "to OneDrive's recycle bin"),
         Op::Dehydrate { local, .. } => Line::new("free up", lp(local.id.0), ""),
-        Op::PruneRemote { remote, .. } => {
-            Line::new("prune", rp(&remote.id), "excluded; to OneDrive's recycle bin, kept here")
+        Op::PruneRemote { remote, items, exact, .. } => {
+            let n = if *exact { format!("{items} items") } else { format!("at least {items} items") };
+            Line {
+                folder: *items > 1 || !*exact,
+                ..Line::new("prune", rp(&remote.id), &format!("excluded, {n}; to OneDrive's recycle bin, kept here"))
+            }
         }
         Op::RecycleLocal { local, .. } if dropped => {
             Line::new("remove", lp(local.id.0), "no copy kept, as you chose; in OneDrive's recycle bin")
@@ -2952,7 +2956,11 @@ pub fn breaker_what(b: &Breaker) -> String {
         Side::Remote => "in OneDrive",
     };
     match b.kind {
-        BreakerKind::Mass => format!("{} items {side} would be deleted, overwritten or moved", b.count),
+        BreakerKind::Mass => format!(
+            "{}{} items {side} would be deleted, overwritten or moved",
+            if b.at_least { "at least " } else { "" },
+            b.count
+        ),
         BreakerKind::Suspicious => format!(
             "{} files would replace their OneDrive copy with content that doesn't look like their type \
              (as when files are encrypted by ransomware)",
@@ -3394,6 +3402,7 @@ mod tests {
             remote: oneup_sync::RemotePre { id: RemoteId("big".into()), etag: "e".into() },
             forget: vec![7],
             items: 1000,
+            exact: true,
             keep: Vec::new(),
         };
         assert!(may_trip(&p, std::slice::from_ref(&prune), &[], Recent::default(), false, false));
@@ -3404,14 +3413,14 @@ mod tests {
         let cx = GateContext { approved: &b.items, ..cx };
         let r = review_in(&p, &cx, vec![prune.clone()]);
         assert!(r.breakers.is_empty(), "approved where it was shown");
-        let reserve = reserved(Recent::default(), &r.approved, &[]);
+        let reserve = reserved(Recent::default(), &r.approved, &[], &p);
         assert_eq!(reserve.remote, 1000);
         let mut store = Store::open_in_memory().unwrap();
         crate::safetywindow::SafetyWindow::default().save_with(&mut store, reserve, 0).unwrap();
         let (mut w, _) = crate::safetywindow::SafetyWindow::load(&store, 1).unwrap();
         assert_eq!(w.recent(1).remote, 1000);
         let mut done = Recent::default();
-        done.add_op(&prune, &[]);
+        done.add_op(&prune, &[], &p);
         assert_eq!(done.remote, 1000);
     }
 
@@ -3427,7 +3436,10 @@ mod tests {
             .collect();
         let approved = oneup_gate::review(&oneup_gate::Policy::default(), 1_000_000, &[], ops).approved;
         let before = Recent { local: 5, remote: 1, suspicious: 0 };
-        assert_eq!(reserved(before, &approved, &[]), Recent { local: 35, remote: 1, suspicious: 0 });
+        assert_eq!(
+            reserved(before, &approved, &[], &oneup_gate::Policy::default()),
+            Recent { local: 35, remote: 1, suspicious: 0 }
+        );
     }
 
     #[test]

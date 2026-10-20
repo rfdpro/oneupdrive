@@ -209,11 +209,22 @@ pub struct SafetyStop {
     /// `local` (this PC) or `remote` (OneDrive).
     pub side: String,
     pub count: usize,
+    /// `count` is only a lower bound (a folder of unknown size is on the
+    /// list).
+    #[serde(default)]
+    pub at_least: bool,
     /// Of the limit, how much the last 15 minutes had used.
     pub recent: usize,
     pub synced_items: u64,
     /// The approval code.
     pub code: String,
+}
+
+impl SafetyStop {
+    /// How many items, as the user is told: `12`, or `at least 12`.
+    pub fn items(&self) -> String {
+        if self.at_least { format!("at least {}", self.count) } else { self.count.to_string() }
+    }
 }
 
 /// A version-store overflow batch.

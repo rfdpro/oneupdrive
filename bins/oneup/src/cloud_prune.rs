@@ -37,7 +37,7 @@ pub async fn run(
         let kept = all.len();
         let found = prune::without_kept(&store, all)?;
         let kept = kept - found.len();
-        let found = prune::counted(&graph, found).await?;
+        let found = prune::counted(&*graph, found).await?;
         print_list(&found);
         if kept > 0 {
             println!("({kept} more you chose to keep in OneDrive aren't listed.)");
@@ -66,7 +66,7 @@ pub async fn run(
         return Ok(());
     }
     let (ready, waiting): (Vec<Candidate>, Vec<Candidate>) = found.into_iter().partition(Candidate::ready);
-    let ready = prune::counted(&graph, ready).await?;
+    let ready = prune::counted(&*graph, ready).await?;
     print_list(&ready);
     let (_, report) = engine.prune(store, &ready).await?;
     println!(
@@ -166,7 +166,7 @@ fn print_list(found: &[Candidate]) {
     let (mut items, mut bytes) = (0u64, 0i64);
     for c in found {
         let what = if c.folder {
-            let n = if c.unlisted { format!("at least {} items", c.items) } else { format!("{} items", c.items) };
+            let n = if c.exact { format!("{} items", c.items) } else { format!("at least {} items", c.items) };
             format!("folder, {n}")
         } else {
             "file".into()

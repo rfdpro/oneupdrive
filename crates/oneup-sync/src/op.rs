@@ -188,14 +188,18 @@ pub enum Op {
     /// rows at and below it, deepest first, dropped *before* the deletion so
     /// that re-including the item later uploads the local copy instead of
     /// reading the cloud deletion as one to bring to this PC. `items`: how
-    /// many items it holds, at least 1 (what the circuit breakers count).
-    /// `keep`: the local copy, deepest first, every item of which must still
-    /// be here with all its content, or nothing is done: a cloud copy is
-    /// only removed once it's here.
+    /// many items it holds, at least 1 (what the circuit breakers count);
+    /// `exact`: whether that's all of them. A folder never listed in full
+    /// (skipped by name, or holding one that was) has only a lower bound,
+    /// and deleting it deletes everything in it, so the safety gate always
+    /// stops for it. `keep`: the local copy, deepest first, every item of
+    /// which must still be here with all its content, or nothing is done: a
+    /// cloud copy is only removed once it's here.
     PruneRemote {
         remote: RemotePre,
         forget: Vec<Sid>,
         items: u64,
+        exact: bool,
         keep: Vec<LocalPre>,
     },
 

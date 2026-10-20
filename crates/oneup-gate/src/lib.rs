@@ -121,8 +121,16 @@ pub fn may_follow(ops: &[Op]) -> bool {
     !ops.iter().any(is_mass_sensitive)
 }
 
+/// Whether `op` removes an unknown number of items: a pruned folder never
+/// listed in full, whose count is only a lower bound. It always trips its
+/// side's breaker, and counts in the safety window as over the limit.
+pub fn unknown_size(op: &Op) -> bool {
+    matches!(op, Op::PruneRemote { exact: false, .. })
+}
+
 /// How many items `op` counts as for the circuit breakers: a pruned folder
-/// counts as everything in it.
+/// counts as everything in it (for one of [`unknown_size`], as many as
+/// are known).
 pub fn weight(op: &Op) -> usize {
     match op {
         Op::PruneRemote { items, .. } => usize::try_from(*items).unwrap_or(usize::MAX).max(1),
@@ -315,12 +323,14 @@ impl Recent {
     /// Adds `op` as carried out: its weight ([`weight`]) on the side it
     /// changes if it's mass-sensitive, and one suspicious upload if it's in
     /// `suspicious`. Every count the safety window keeps goes through this,
-    /// so a pruned folder counts as everything in it.
-    pub fn add_op(&mut self, op: &Op, suspicious: &[LocalId]) {
+    /// so a pruned folder counts as everything in it, and one of unknown
+    /// size ([`unknown_size`]) as over `policy`'s limit by itself.
+    pub fn add_op(&mut self, op: &Op, suspicious: &[LocalId], policy: &Policy) {
         if is_mass_sensitive(op) {
+            let n = if unknown_size(op) { weight(op).max(policy.max_count.saturating_add(1)) } else { weight(op) };
             match Side::changed_by(op) {
-                Some(Side::Local) => self.local = self.local.saturating_add(weight(op)),
-                Some(Side::Remote) => self.remote = self.remote.saturating_add(weight(op)),
+                Some(Side::Local) => self.local = self.local.saturating_add(n),
+                Some(Side::Remote) => self.remote = self.remote.saturating_add(n),
                 None => {}
             }
         }
@@ -355,6 +365,9 @@ pub struct Breaker {
     pub recent: usize,
     pub synced_items: u64,
     pub fingerprint: Fingerprint,
+    /// `count` is only a lower bound: the list removes a folder never
+    /// listed in full ([`unknown_size`]).
+    pub at_least: bool,
     /// Every item on the list, sorted: what approving it approves.
     pub items: Vec<ItemKey>,
     /// Folders on the list that are deleted in later rounds, once the
@@ -514,7 +527,9 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         // included, rather than a level at a time.
         let weighed = weigh(&batch).saturating_add(later.len());
         let n = weighed.saturating_add(cx.recent.on(side));
-        let too_many = n > policy.max_count
+        // A folder of unknown size may hold any number: always asked.
+        let too_many = batch.iter().any(|(_, o, _)| unknown_size(o))
+            || n > policy.max_count
             || (n > policy.min_count
                 && (n as u128) * 100 > u128::from(policy.max_percent) * u128::from(cx.synced_items));
         let (on_list, rest): (Vec<Item<'_>>, Vec<Item<'_>>) =
@@ -717,6 +732,7 @@ fn breaker(
         .saturating_add(approved),
         synced_items: cx.synced_items,
         fingerprint: fingerprint(tag, &items),
+        at_least: rest.iter().any(|(_, o, _)| unknown_size(o)),
         items,
         later: later.into_iter().map(|(_, o, _)| o.clone()).collect(),
         sids,
@@ -1322,16 +1338,46 @@ mod tests {
         assert_eq!(recent.plus(recent), recent);
         let cx = Context { synced_items: 10, recent, ..Context::default() };
         assert_eq!(review_in(&p, &cx, vec![delete_remote(1)]).breakers.len(), 1);
-        let huge = Op::PruneRemote { remote: rpre(9), forget: vec![9], items: u64::MAX, keep: Vec::new() };
+        let huge = Op::PruneRemote { remote: rpre(9), forget: vec![9], items: u64::MAX, exact: true, keep: Vec::new() };
         let r = review_in(&p, &cx, vec![huge.clone(), delete_remote(1)]);
         assert_eq!(r.breakers[0].count, usize::MAX);
         let mut done = Recent::default();
-        done.add_op(&huge, &[]);
-        done.add_op(&huge, &[]);
+        done.add_op(&huge, &[], &p);
+        done.add_op(&huge, &[], &p);
         assert_eq!(done.remote, usize::MAX);
         let mut few = Recent::default();
-        few.add_op(&Op::PruneRemote { remote: rpre(9), forget: vec![9], items: 1000, keep: Vec::new() }, &[]);
+        let prune = |items, exact| Op::PruneRemote { remote: rpre(9), forget: vec![9], items, exact, keep: Vec::new() };
+        few.add_op(&prune(1000, true), &[], &p);
         assert_eq!(few, Recent { remote: 1000, ..Recent::default() }, "a pruned folder counts as all it holds");
+    }
+
+    /// A pruned folder never listed in full (its count only a lower bound)
+    /// always trips its side's breaker, however few items are known, is
+    /// shown as "at least", and counts in the window as over the limit.
+    #[test]
+    fn a_folder_of_unknown_size_always_needs_approval() {
+        let p = Policy::default();
+        let some = Op::PruneRemote { remote: rpre(9), forget: vec![9], items: 10, exact: false, keep: Vec::new() };
+        let r = review(&p, 10_000_000, &[], vec![some.clone()]);
+        assert_eq!(r.breakers.len(), 1);
+        let b = &r.breakers[0];
+        assert_eq!((b.side, b.count, b.at_least), (Side::Remote, 10, true));
+        assert_eq!(r.withheld.len(), 1);
+        // Approved, it runs; and the window counts it as over the limit.
+        let cx = Context { synced_items: 10_000_000, approved: &b.items, ..Context::default() };
+        assert!(review_in(&p, &cx, vec![some.clone()]).breakers.is_empty());
+        let mut done = Recent::default();
+        done.add_op(&some, &[], &p);
+        assert_eq!(done.remote, p.max_count + 1);
+        let r = review_in(
+            &p,
+            &Context { synced_items: 10_000_000, recent: done, ..Context::default() },
+            vec![delete_remote(1)],
+        );
+        assert_eq!(r.breakers.len(), 1, "a deletion right after it is asked about");
+        // The same folder, counted in full and small: no stop.
+        let exact = Op::PruneRemote { remote: rpre(9), forget: vec![9], items: 10, exact: true, keep: Vec::new() };
+        assert!(review(&p, 10_000_000, &[], vec![exact]).breakers.is_empty());
     }
 
     /// The round's operations on approved lists are reported with the keys

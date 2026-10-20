@@ -306,7 +306,9 @@ fn print_status(s: &Status) {
         println!(
             "  SAFETY STOP       {} items {side} would be deleted, overwritten or moved{earlier} ({} are synced).\n                    \
              If that's what you meant: `oneup approve {}`",
-            st.count, st.synced_items, st.code
+            st.items(),
+            st.synced_items,
+            st.code
         );
     }
     if let Some(o) = &s.overflow

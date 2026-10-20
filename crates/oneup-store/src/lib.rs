@@ -815,6 +815,20 @@ impl Ops<'_> {
         Ok(u64::try_from(n - 1).unwrap_or(0))
     }
 
+    /// [`Ops::remote_subtree_count`], and whether that's all of it: no
+    /// folder below `id` was skipped by name when listing (`is_excluded`),
+    /// whose contents the store never saw. Otherwise it's a lower bound.
+    pub fn remote_subtree_known(&self, id: &str) -> Result<(u64, bool)> {
+        self.load_subtree(id)?;
+        let (n, skipped): (i64, i64) = self.c.query_row(
+            "SELECT count(*), coalesce(sum(is_excluded != 0 AND id != ?1), 0)
+             FROM remote_item WHERE id IN (SELECT id FROM t_sub)",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((u64::try_from(n - 1).unwrap_or(0), skipped == 0))
+    }
+
     fn load_subtree(&self, id: &str) -> Result<()> {
         // Everything that reads `t_sub` back must look rows up from it (`IN`),
         // not join it: with no table statistics SQLite drives such a join

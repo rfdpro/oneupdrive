@@ -348,6 +348,7 @@ impl Control {
                     Side::Remote => "remote".into(),
                 },
                 count: b.count,
+                at_least: b.at_least,
                 recent: b.recent,
                 synced_items: b.synced_items,
                 code: code(b.fingerprint.0),
@@ -705,6 +706,7 @@ mod tests {
             items: Vec::new(),
             later: Vec::new(),
             sids: Vec::new(),
+            at_least: false,
         };
         let overflow = Overflow {
             count: 2,

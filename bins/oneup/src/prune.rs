@@ -45,6 +45,11 @@ pub struct Candidate {
     pub unlisted: bool,
     /// Items inside, as far as known (an unlisted folder: see [`counted`]).
     pub items: u64,
+    /// `items` is all of them. Not for a folder never listed in full (one
+    /// skipped by name, or holding one): its count is a lower bound, and
+    /// removing it removes everything in it, so the safety gate always asks
+    /// first (`oneup_gate::unknown_size`).
+    pub exact: bool,
     /// Synced rows at and below it, deepest first.
     pub forget: Vec<Sid>,
     /// The copy here, deepest first, as far as it's here.
@@ -67,6 +72,7 @@ impl Candidate {
             remote: RemotePre { id: RemoteId(self.id.clone()), etag: self.etag.clone() },
             forget: self.forget.clone(),
             items: self.items.max(1),
+            exact: self.exact,
             keep: self.keep.clone(),
         }
     }
@@ -195,7 +201,11 @@ pub fn candidates(store: &Store, rules: &RuleSet, scope: Scope<'_>, brings: bool
                         if here.never || (!brings && here.arriving > 0) {
                             continue;
                         }
-                        let items = if folder && !unlisted { o.remote_subtree_count(&row.id)? } else { 0 };
+                        let (items, exact) = match (folder, unlisted) {
+                            (false, _) => (1, true),
+                            (true, true) => (0, false),
+                            (true, false) => o.remote_subtree_known(&row.id)?,
+                        };
                         out.push(Candidate {
                             forget: forget_below(o, &row.id)?,
                             id: row.id,
@@ -204,7 +214,8 @@ pub fn candidates(store: &Store, rules: &RuleSet, scope: Scope<'_>, brings: bool
                             folder,
                             size: row.size,
                             unlisted,
-                            items: if folder { items } else { 1 },
+                            items,
+                            exact,
                             keep: here.keep,
                             fetch: here.fetch,
                             waiting: here.downloading + here.arriving,
@@ -292,15 +303,40 @@ pub fn fingerprint(found: &[Candidate]) -> u64 {
     h
 }
 
-/// Fills in the item count of unlisted folders from OneDrive (one
-/// read-only request each; Graph reports the direct children only, so this
-/// is a lower bound, shown with the folder's size).
-pub async fn counted(graph: &oneup_graph::Graph, mut c: Vec<Candidate>) -> Result<Vec<Candidate>> {
+/// What OneDrive says about a folder: how many items it holds directly
+/// (not in its subfolders), and its size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderFacts {
+    pub children: Option<u64>,
+    pub size: Option<i64>,
+}
+
+/// Where [`counted`] asks: OneDrive (one read-only request per folder).
+pub trait FolderInfo {
+    fn folder_facts(&self, id: &str) -> impl std::future::Future<Output = Result<Option<FolderFacts>>> + Send;
+}
+
+impl FolderInfo for oneup_graph::Graph {
+    async fn folder_facts(&self, id: &str) -> Result<Option<FolderFacts>> {
+        Ok(self.item(id).await?.map(|item| FolderFacts {
+            children: item.folder.and_then(|f| f.child_count).map(|n| n.max(0) as u64),
+            size: item.size,
+        }))
+    }
+}
+
+/// Fills in what's known of unlisted folders from OneDrive: their size, and
+/// as their item count its direct children. That's only a lower bound (a
+/// folder of 10 subfolders reports 10, however much they hold), so they stay
+/// of unknown size ([`Candidate::exact`] false): shown as "at least", and
+/// always asked about before removal.
+pub async fn counted<G: FolderInfo>(graph: &G, mut c: Vec<Candidate>) -> Result<Vec<Candidate>> {
     for x in c.iter_mut().filter(|x| x.unlisted) {
-        if let Some(item) = graph.item(&x.id).await? {
-            x.items = item.folder.and_then(|f| f.child_count).map_or(1, |n| n.max(1) as u64);
-            x.size = item.size.unwrap_or(x.size);
+        if let Some(f) = graph.folder_facts(&x.id).await? {
+            x.items = f.children.map_or(1, |n| n.max(1));
+            x.size = f.size.unwrap_or(x.size);
         }
+        x.exact = false;
     }
     Ok(c)
 }
@@ -371,6 +407,76 @@ mod tests {
         assert_eq!(paths, ["/a.env"], "not the paused folder, nor a skipped folder with nothing here");
         assert!(!found[0].ready() && found[0].waiting == 1 && found[0].keep.is_empty());
         assert!(candidates(&s, &rules, Scope::All, false).unwrap().is_empty(), "`keep`: nothing brings it here");
+    }
+
+    /// OneDrive as the prune flow reads it, reporting a folder's direct
+    /// children only (as Graph's `childCount` does).
+    struct DirectChildren(u64);
+
+    impl FolderInfo for DirectChildren {
+        async fn folder_facts(&self, _: &str) -> Result<Option<FolderFacts>> {
+            Ok(Some(FolderFacts { children: Some(self.0), size: Some(5_000_000) }))
+        }
+    }
+
+    /// A folder whose contents were never listed (skipped by name) is
+    /// counted from OneDrive's direct children: 10 subfolders, however much
+    /// they hold. That's a lower bound, so it's removed only after the user
+    /// approves it, whatever the limits, and once removed the safety window
+    /// counts it as over the limit. A listed folder holding one is the same.
+    #[tokio::test]
+    async fn a_folder_never_listed_in_full_is_always_asked_about() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.upsert_item(&RemoteRow { parent_id: None, kind: Kind::Root, ..row("root", "", "", Kind::Root) }, false)?;
+            o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+            // Skipped by name when listing: nothing inside was ever seen.
+            o.upsert_item(&row("nm", "top", "node_modules", Kind::Folder), true)?;
+            // Listed, but holding a folder that was skipped.
+            o.upsert_item(&row("rd", "top", "renders", Kind::Folder), false)?;
+            o.upsert_item(&row("x", "rd", "x.png", Kind::File), false)?;
+            o.upsert_item(&row("deep", "rd", "node_modules", Kind::Folder), true)?;
+            oneup_exec::link_roots(o, 1, "top")?;
+            let here = oneup_store::LocalRow {
+                file_id: 2,
+                parent_id: Some(1),
+                name: "node_modules".into(),
+                name_lossy: false,
+                kind: LocalKind::Folder,
+                size: 0,
+                mtime: 1,
+                attributes: 0x10,
+                reparse_tag: 0,
+                skip: oneup_store::Skip::Excluded,
+            };
+            o.local_put(&here).map(|_| ())
+        })
+        .unwrap();
+        let rules = RuleSet::new(&["dev"], &["renders/"]).unwrap();
+        let found = candidates(&s, &rules, Scope::All, true).unwrap();
+        let by = |p: &str| found.iter().find(|c| c.path == p).unwrap().clone();
+        let renders = by("/renders");
+        assert_eq!((renders.items, renders.exact), (2, false), "holds a folder never listed");
+        assert!(!by("/node_modules").exact);
+
+        let ready: Vec<Candidate> = found.into_iter().filter(Candidate::ready).collect();
+        let counted = counted(&DirectChildren(10), ready).await.unwrap();
+        assert_eq!(counted.len(), 1);
+        let c = &counted[0];
+        assert_eq!((c.path.as_str(), c.items, c.exact, c.size), ("/node_modules", 10, false, 5_000_000));
+
+        let p = oneup_gate::Policy::default();
+        let r = oneup_gate::review(&p, 10_000_000, &[], vec![c.op()]);
+        assert_eq!(r.breakers.len(), 1, "10 known items are far under the limits, but it may hold any number");
+        let b = &r.breakers[0];
+        assert_eq!((b.count, b.at_least), (10, true));
+        assert!(r.approved.is_empty());
+        let cx = oneup_gate::Context { synced_items: 10_000_000, approved: &b.items, ..Default::default() };
+        let r = oneup_gate::review_in(&p, &cx, vec![c.op()]);
+        assert_eq!(r.approved.len(), 1, "approved, it goes");
+        let mut window = oneup_gate::Recent::default();
+        window.add_op(r.approved[0].op(), &[], &p);
+        assert!(window.remote > p.max_count, "counted as over the limit, not as 10");
     }
 
     /// Items the user chose to keep in OneDrive aren't offered again, also
