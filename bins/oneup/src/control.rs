@@ -132,6 +132,8 @@ struct Shared {
     cloud_full: Option<oneup_ipc::Problem>,
     /// The network and what it lets sync do (`crate::network`).
     net: oneup_ipc::NetStatus,
+    /// What the network's profile lets rounds do.
+    policy: crate::network::Policy,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
     /// The sides paused when that was last told as an event, and why.
@@ -208,6 +210,7 @@ impl Control {
                 databases_more: 0,
                 cloud_full: None,
                 net: oneup_ipc::NetStatus::default(),
+                policy: crate::network::Policy::default(),
                 shown: None,
                 paused_told: (pause.local, pause.remote, None),
             }),
@@ -313,6 +316,7 @@ impl Control {
             pause_remote,
             first: s.first.clone(),
             live: Some(Arc::clone(&self.live)),
+            net: s.policy.clone(),
         }
     }
 
@@ -382,6 +386,11 @@ impl Control {
         let mut s = self.lock();
         s.net = n;
         self.publish(&mut s);
+    }
+
+    /// What the network's profile lets the next rounds do.
+    pub fn set_policy(&self, p: crate::network::Policy) {
+        self.lock().policy = p;
     }
 
     /// Why the agent paused by itself, or `None` when it didn't.

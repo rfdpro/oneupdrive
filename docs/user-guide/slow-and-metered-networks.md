@@ -19,3 +19,21 @@ oneup settings --sync-interval off       # back to within seconds
 ```
 
 `oneup status` shows the interval and when the next sync runs.
+
+## Settings for each network
+
+OneUpDrive tells networks apart the way Windows does (by the ID Windows gives each network, not by its name, so two Wi-Fi networks called "Home" are still two networks). Each can have its own settings:
+
+* **What syncs** (see below), the **upload and download limits**, the **sync interval**, and a **monthly data budget**.
+* A network you haven't set up uses your **default** settings (the limits under **Speed limits**, everything syncs), or the **metered** ones if Windows says the network is metered (a phone hotspot, a data plan you marked as metered in Windows' settings).
+* Settings you leave empty for a network come from the default or metered settings.
+
+In the settings window: **Network → This network** changes the network you're on now, and **Metered connections** changes every metered network without settings of its own.
+
+```
+oneup network                                              # this network and what syncs on it
+oneup network set --this --transfer small --small-mb 20    # on this network, only files under 20 MB
+oneup network set --this --sync-interval 30 --upload-kib 200
+oneup network set --metered --transfer metadata            # on metered networks, names and folders only
+oneup network forget --this                                # this network back to the default or metered settings
+```

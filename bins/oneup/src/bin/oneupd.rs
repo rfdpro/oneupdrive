@@ -610,7 +610,11 @@ async fn agent(
             Ok(s) => settings = s,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "config.toml: keeping the previous settings"),
         }
-        pacer.set(oneup_app::config::kept(dir, oneup_app::pace::load(dir)).unwrap_or_default());
+        // The network and its profile (`oneup_app::network`): caps, the
+        // interval, what transfers.
+        let (net, profile) = oneup_app::network::situation(dir, &settings);
+        pacer.set(profile.interval);
+        control.set_policy(oneup_app::network::Policy::of(&profile));
         // A folder in someone else's drive has no push channel for us: the
         // timer covers it.
         let want_push = !args.no_push && !graph.is_other_drive() && pacer.wants_push();
@@ -626,7 +630,7 @@ async fn agent(
         // The hooks, if config.toml changed (`oneup hooks` nudges the agent).
         hooks.refresh();
         let minute = autopause::local_minute_of_day();
-        let auto = auto_pause(&settings, minute);
+        let auto = auto_pause(&settings, minute, &profile);
         if auto != auto_was {
             match &auto {
                 Some(why) => println!("oneupd: pausing by itself: {}", why.english()),
@@ -685,6 +689,7 @@ async fn agent(
                     &|p| control.set_progress(p),
                     Some(&keep),
                 ),
+                dir,
                 &settings,
                 control,
             )
@@ -806,7 +811,7 @@ async fn agent(
             }
             _ => next,
         };
-        control.set_network(net_status(&pacer));
+        control.set_network(net_status(&pacer, &net, &profile));
 
         // ---- wait for something to do
         let (s, w) = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer).await?;
@@ -819,18 +824,39 @@ async fn agent(
 }
 
 /// What `oneup status` shows of the network and the sync interval.
-fn net_status(pacer: &Pacer) -> oneup_ipc::NetStatus {
+fn net_status(
+    pacer: &Pacer,
+    net: &oneup_sys::network::Network,
+    profile: &oneup_app::network::Profile,
+) -> oneup_ipc::NetStatus {
     let next_ms = pacer.due().map(|d| {
         let left = d.saturating_duration_since(Instant::now());
         now_ms() + i64::try_from(left.as_millis()).unwrap_or(i64::MAX / 2)
     });
-    oneup_ipc::NetStatus { interval_min: pacer.interval().minutes, next_ms }
+    oneup_ipc::NetStatus {
+        name: net.name.clone(),
+        metered: net.metered,
+        profile: match profile.key {
+            oneup_app::network::Key::Default => "default",
+            oneup_app::network::Key::Metered => "metered",
+            oneup_app::network::Key::Network(_) => "own",
+        }
+        .into(),
+        transfer: profile.transfer.label(profile.small_mb),
+        connectivity: net.connectivity.name().into(),
+        interval_min: pacer.interval().minutes,
+        next_ms,
+    }
 }
 
-/// Why the agent pauses by itself now (config.toml [agent]), if it does.
-fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<autopause::Reason> {
+/// Why the agent pauses by itself now (config.toml), if it does.
+fn auto_pause(
+    settings: &oneup_app::config::Agent,
+    minute: u32,
+    profile: &oneup_app::network::Profile,
+) -> Option<autopause::Reason> {
     let conditions = autopause::Conditions {
-        metered: oneup_sys::conditions::metered(),
+        network: oneup_app::network::pause_reason(profile),
         battery_saver: oneup_sys::conditions::battery_saver(),
         full_screen: oneup_sys::conditions::full_screen(),
         minute_of_day: minute,
@@ -843,6 +869,7 @@ fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<autopa
 /// `control`). Ending one waits for the rounds to end.
 async fn watching_auto_pause<T>(
     rounds: impl Future<Output = T>,
+    dir: &Path,
     settings: &oneup_app::config::Agent,
     control: &Control,
 ) -> T {
@@ -853,7 +880,8 @@ async fn watching_auto_pause<T>(
         tokio::select! {
             r = &mut rounds => return r,
             _ = tick.tick() => {
-                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day()) {
+                let (_, profile) = oneup_app::network::situation(dir, settings);
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day(), &profile) {
                     control.set_auto_pause(Some(why));
                 }
             }

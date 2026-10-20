@@ -149,6 +149,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "search": { "onedrive": search.onedrive, "hotkey": search.hotkey },
         "databases": databases_json(dir)?,
         "sync": { "interval_minutes": interval.minutes, "keep_push": interval.keep_push },
+        "network": network_json(dir, &a)?,
         "kept_folder": local.as_deref().map(|l| shown(&Path::new(l).join(oneup_rules::ENGINE_DIR).join("versions").to_string_lossy())),
     }))
 }
@@ -411,6 +412,105 @@ pub fn agent_with(mut a: Agent, v: &Value) -> Result<Agent> {
         a.cap_hours = q;
     }
     Ok(a)
+}
+
+fn layer_json(l: &crate::network::Layer) -> Value {
+    json!({
+        "transfer": l.transfer.map(crate::network::Transfer::name),
+        "small_mb": l.small_mb,
+        "upload_kib": l.upload_kib,
+        "download_kib": l.download_kib,
+        "interval_minutes": l.interval_minutes,
+        "budget_mb": l.budget_mb,
+    })
+}
+
+/// The network page's profiles: this network (and its own settings, if
+/// any) and the metered profile, with "paused" as `[agent]` says.
+fn network_json(dir: &Path, a: &Agent) -> Result<Value> {
+    let nets = crate::network::load(dir)?;
+    let n = oneup_sys::network::current();
+    let own = n.id.as_deref().and_then(|id| nets.get(id)).map(layer_json);
+    let mut metered = layer_json(&nets.metered);
+    let transfer = match nets.metered.transfer {
+        _ if a.pause_on_metered => "paused",
+        Some(t) if t != crate::network::Transfer::Paused => t.name(),
+        _ => "everything",
+    };
+    metered["transfer"] = json!(transfer);
+    Ok(json!({
+        "this": { "id": n.id, "name": n.name, "metered": n.metered, "connectivity": n.connectivity.name() },
+        "own": own,
+        "metered": metered,
+        "small_mb_default": crate::network::SMALL_MB,
+    }))
+}
+
+/// A profile's settings changed by the fields present in `v`: a number
+/// sets one, `null` or `""` goes back to the layer below.
+pub fn layer_with(mut l: crate::network::Layer, v: &Value) -> Result<crate::network::Layer> {
+    let num = |k: &str| -> Result<Option<Option<u64>>> {
+        match v.get(k) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(Value::String(s)) if s.trim().is_empty() => Ok(Some(None)),
+            Some(x) => Ok(Some(Some(x.as_u64().with_context(|| format!("{k}: expected a whole number"))?))),
+        }
+    };
+    if let Some(t) = v.get("transfer") {
+        l.transfer = match t.as_str().unwrap_or_default() {
+            "" => None,
+            name => Some(crate::network::Transfer::from_name(name).context("transfer: unknown choice")?),
+        };
+    }
+    if let Some(n) = num("small_mb")? {
+        l.small_mb = n;
+    }
+    if let Some(n) = num("upload_kib")? {
+        l.upload_kib = n;
+    }
+    if let Some(n) = num("download_kib")? {
+        l.download_kib = n;
+    }
+    if let Some(n) = num("interval_minutes")? {
+        l.interval_minutes = n.map(crate::pace::check_minutes).transpose()?;
+    }
+    if let Some(n) = num("budget_mb")? {
+        l.budget_mb = n;
+    }
+    crate::network::check(&l)?;
+    Ok(l)
+}
+
+/// Saves the network page's change: to `"target": "this"` network (or
+/// forgets its settings) or the `"metered"` profile.
+fn save_network(dir: &Path, v: &Value) -> Result<()> {
+    let mut nets = crate::network::load(dir)?;
+    match v.get("target").and_then(Value::as_str) {
+        Some("metered") => {
+            nets.metered = layer_with(nets.metered.clone(), v)?;
+            if let Some(t) = v.get("transfer").and_then(Value::as_str) {
+                let mut a = config::load_agent(dir)?;
+                a.pause_on_metered = t == "paused";
+                config::save_agent(dir, &a)?;
+                if a.pause_on_metered {
+                    nets.metered.transfer = None;
+                }
+            }
+        }
+        Some("this") => {
+            let (id, name) = crate::network::this_network()?;
+            if v.get("forget").and_then(Value::as_bool) == Some(true) {
+                nets.forget(&id);
+            } else {
+                let l = layer_with(nets.get(&id).cloned().unwrap_or_default(), v)?;
+                let l = crate::network::Layer { name: l.name.clone().or(Some(name)), ..l };
+                *nets.get_mut(&id) = l;
+            }
+        }
+        _ => bail!("network: target is this or metered"),
+    }
+    crate::network::save(dir, &nets)
 }
 
 /// The sync interval (`[sync]`) changed by the fields present in `v`.
@@ -992,6 +1092,7 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
             let i = sync_with(crate::pace::load(dir)?, v)?;
             crate::pace::save(dir, &i)
         }
+        "network" => save_network(dir, v),
         "autostart" => {
             let on = v.as_bool().context("autostart: expected on or off")?;
             let launcher = if on { Some(crate::launch::sibling("oneupd-start.exe")?) } else { None };
@@ -1107,6 +1208,18 @@ mod tests {
         ] {
             assert!(agent_with(Agent::default(), &bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn network_profile_changes_are_checked_and_can_be_undone() {
+        use crate::network::{Layer, Transfer};
+        let l = layer_with(Layer::default(), &json!({ "transfer": "small", "small_mb": 5, "budget_mb": "" })).unwrap();
+        assert_eq!((l.transfer, l.small_mb, l.budget_mb), (Some(Transfer::Small), Some(5), None));
+        let l = layer_with(l, &json!({ "transfer": "", "small_mb": null })).unwrap();
+        assert_eq!(l, Layer::default(), "back to the layer below");
+        assert!(layer_with(Layer::default(), &json!({ "transfer": "most" })).is_err());
+        assert!(layer_with(Layer::default(), &json!({ "small_mb": 0 })).is_err());
+        assert!(layer_with(Layer::default(), &json!({ "interval_minutes": 99999 })).is_err());
     }
 
     #[test]
