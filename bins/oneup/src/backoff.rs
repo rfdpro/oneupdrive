@@ -39,10 +39,10 @@ pub fn item(op: &Op) -> Option<RetryItem<'_>> {
                 RetryItem::Local(local.id)
             }
             oneup_sync::rewind::Step::Restore { id, .. } => RetryItem::Remote(id),
-            oneup_sync::rewind::Step::Reset { remote, .. } | oneup_sync::rewind::Step::Remove { remote, .. } => {
-                RetryItem::Remote(&remote.id)
-            }
-            oneup_sync::rewind::Step::Forget => return None,
+            oneup_sync::rewind::Step::Reset { remote, .. }
+            | oneup_sync::rewind::Step::Remove { remote, .. }
+            | oneup_sync::rewind::Step::RevertTo { remote, .. } => RetryItem::Remote(&remote.id),
+            oneup_sync::rewind::Step::Forget | oneup_sync::rewind::Step::RestoreKept { .. } => return None,
         },
         Op::Pair { .. } | Op::Record(_) | Op::Forget(_) | Op::Hold { .. } => return None,
     })

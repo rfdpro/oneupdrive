@@ -999,12 +999,23 @@ pub fn kept(dir: &Path) -> Result<Value> {
         .collect())
 }
 
-/// Puts a kept item back where it was (never over anything: a taken name
-/// gets " (restored N)"); returns where. Run with the agent stopped.
+/// Asks the agent to put a kept item back where it was (never over
+/// anything: a taken name gets " (restored N)"); returns where it came
+/// from (`crate::restores`).
 pub fn kept_restore(dir: &Path, id: &str) -> Result<String> {
-    let _lock = crate::setup::DirLock::acquire(dir).context("OneUpDrive is still syncing this folder")?;
-    let store = crate::setup::open_store(dir, 1024)?;
-    Ok(crate::sync::open_paired(&store)?.restore(id, None)?)
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    crate::restores::kept(&mut store, id, None)
+}
+
+/// Asks the agent to bring back deleted item `seq` from OneDrive's recycle
+/// bin; returns where it goes (`crate::restores`).
+pub fn cloud_bin_restore(dir: &Path, seq: i64) -> Result<String> {
+    crate::setup::require_test_account(dir)?;
+    if crate::vaultpair::is_vault_dir(dir) {
+        anyhow::bail!("this is an encrypted vault: OneDrive only has its encrypted files");
+    }
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    crate::restores::deleted(&mut store, seq)
 }
 
 /// The Recovery page's rewind: the one under way, if any, and how far

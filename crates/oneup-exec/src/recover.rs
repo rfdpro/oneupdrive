@@ -1,59 +1,46 @@
-//! Recovery outside the rounds: putting back a OneDrive version, bringing
-//! back an item from OneDrive's recycle bin, and answering a conflict
-//! (the settings window's **Recovery** page, `oneup history`, `oneup
+//! Recovery: putting back a kept copy, a OneDrive version or an item
+//! from OneDrive's recycle bin, and answering a conflict (the settings
+//! window's **Recovery** page, `oneup restore`, `oneup history`, `oneup
 //! recycle-bin`, `oneup conflicts`).
 //!
-//! The first two only add to OneDrive, under its own preconditions, so
-//! they don't go through the rounds: a restored version is uploaded as a
-//! new version conditional on the file's eTag now (`If-Match`; Graph's
-//! `restoreVersion` ignores it on OneDrive Personal), so the version it
-//! replaces stays in the history; a restored item takes a free name and
-//! replaces nothing. This PC then gets either by syncing, through the
-//! safety gate, as any change made in OneDrive. Answering a conflict
-//! removes or renames a copy on this PC, so it's planned operations
-//! ([`conflict_ops`]) that the caller adds to a round, for the gate and
-//! the effects layer like the rest.
+//! Each is planned operations the caller queues for the agent's next
+//! round, approved by the user's answer (its keys, `oneup_gate::rewind_keys`),
+//! and run through the safety gate, the executor and the effects layer like
+//! the rest, each under its own precondition:
+//! * a kept copy ([`kept_op`], [`Step::RestoreKept`]) goes back into the
+//!   synced folder, never over anything; the next round sends it;
+//! * a OneDrive version ([`version_op`], [`Step::RevertTo`]) is uploaded as
+//!   a new version under `If-Match` with the eTag the answer saw (Graph's
+//!   `restoreVersion` ignores it on OneDrive Personal), so the version it
+//!   replaces stays in the history and a file changed since is left alone;
+//! * a deleted item ([`deleted_op`], [`Step::Restore`]) comes back from the
+//!   recycle bin under a free name, replacing nothing;
+//! * a conflict's answer ([`conflict_ops`]) removes or renames a copy here.
+//!
+//! This PC then gets what changed in OneDrive by syncing, as any change.
 
-use std::io::Seek as _;
-
-use oneup_store::{Kind, LocalKind, Ops, RemoteRow};
+use oneup_store::{Kind, LocalKind, Ops};
 use oneup_sync::rewind::Step;
 use oneup_sync::{LocalId, LocalPre, NodeKind, Op, RemoteId, RemotePre, Sid};
 
-use crate::cloud::{Cloud, CloudError, Hashing};
-
-/// Makes version `version` of file `id` its current one in OneDrive. It's
-/// downloaded into `staging` (a file OneUpDrive owns, outside the synced
-/// folder), then uploaded as a new version under `If-Match` with the
-/// file's eTag now, and OneDrive's copy checked by its hash. Returns the
-/// file as OneDrive now has it.
-pub async fn restore_version<C: Cloud>(
-    cloud: &C,
-    id: &RemoteId,
-    version: &str,
-    staging: &mut std::fs::File,
-) -> Result<RemoteRow, CloudError> {
-    let now = cloud.item(id).await?.ok_or(CloudError::Changed)?;
-    if now.kind != Kind::File {
-        return Err(CloudError::Other("folders have no versions".into()));
-    }
-    let parent = RemoteId(now.parent_id.clone().ok_or(CloudError::Changed)?);
-    let pre = RemotePre { id: id.clone(), etag: now.etag.clone().ok_or(CloudError::Changed)? };
-    staging.set_len(0)?;
-    staging.rewind()?;
-    let mut hashing = Hashing::new(&mut *staging);
-    let len = cloud.download_version(id, version, &mut hashing).await?;
-    let hash = hashing.hash.finalize();
-    staging.rewind()?;
-    let size = i64::try_from(len).map_err(|e| CloudError::Other(e.to_string()))?;
-    let (row, sent) = cloud.upload(&parent, &now.name, Some(&pre), size, staging).await?;
-    if row.qxh != Some(sent.unwrap_or(hash)) || row.size != size {
-        return Err(CloudError::Other("OneDrive's copy doesn't match the version sent".into()));
-    }
-    Ok(row)
+/// The step that puts kept copy `slot` (its version store slot) back into
+/// the synced folder, at `to` (a path in it) or where it came from.
+pub fn kept_op(slot: &str, to: Option<&str>) -> Op {
+    Op::rewind(0, Step::RestoreKept { slot: slot.to_string(), to: to.map(str::to_string) })
 }
 
-/// The `n`th name [`restore_deleted`] tries after `name` itself:
+/// The step that makes version `version` of OneDrive file `id` its current
+/// one, bound to the file as the store has it now (its eTag). `None`: it
+/// isn't a file OneDrive is known to have.
+pub fn version_op(o: &Ops<'_>, id: &RemoteId, version: &str) -> oneup_store::Result<Option<Op>> {
+    let Some(row) = o.get_item(&id.0)? else { return Ok(None) };
+    let Some(etag) = row.etag.filter(|_| row.kind == Kind::File) else { return Ok(None) };
+    let sid = o.synced_by_remote(&id.0)?.map_or(0, |b| b.sid);
+    let remote = RemotePre { id: id.clone(), etag };
+    Ok(Some(Op::rewind(sid, Step::RevertTo { remote, version: version.to_string() })))
+}
+
+/// The `n`th name [`deleted_op`] tries after `name` itself:
 /// `name (restored N).ext`, as the version store's restore names them.
 pub fn restored_name(name: &str, n: u32, kind: NodeKind) -> String {
     match name.rfind('.').filter(|&i| i > 0 && kind == NodeKind::File) {
@@ -62,25 +49,30 @@ pub fn restored_name(name: &str, n: u32, kind: NodeKind) -> String {
     }
 }
 
-/// Brings deleted item `id` back from OneDrive's recycle bin into folder
-/// `parent` as `name`, or, if that's taken, as `name (restored N)`.
-/// Nothing is replaced. [`CloudError::Changed`]: it's no longer in the
-/// recycle bin (emptied, or kept past its time), or the folder is gone.
-pub async fn restore_deleted<C: Cloud>(
-    cloud: &C,
+/// The step that brings deleted item `id` (record `sid`) back from
+/// OneDrive's recycle bin into folder `parent`, as `name` or, if the store
+/// lists that as taken, `name (restored N)`. Nothing is replaced: a name
+/// taken meanwhile fails it (OneDrive refuses), and it can be asked again.
+pub fn deleted_op(
+    o: &Ops<'_>,
+    sid: Sid,
     id: &RemoteId,
     parent: &RemoteId,
     name: &str,
     kind: NodeKind,
-) -> Result<RemoteRow, CloudError> {
-    for n in 0..20 {
-        let candidate = if n == 0 { name.to_string() } else { restored_name(name, n, kind) };
-        match cloud.restore(id, parent, &candidate).await {
-            Err(CloudError::NameTaken) => continue,
-            r => return r,
-        }
+) -> oneup_store::Result<Op> {
+    let taken: std::collections::HashSet<String> =
+        o.remote_children(&parent.0)?.into_iter().map(|(r, _)| oneup_sync::fold(&r.name)).collect();
+    let mut chosen = name.to_string();
+    let mut n = 0;
+    while taken.contains(&oneup_sync::fold(&chosen)) {
+        n += 1;
+        chosen = restored_name(name, n, kind);
     }
-    Err(CloudError::NameTaken)
+    Ok(Op::rewind(
+        sid,
+        Step::Restore { id: id.clone(), to: parent.clone(), name: chosen, kind, content: None, gone: None },
+    ))
 }
 
 /// Two copies of a file that changed on both sides: the one under the

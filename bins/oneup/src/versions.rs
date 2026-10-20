@@ -236,13 +236,6 @@ pub fn versions(store: &Store, older_than_days: Option<u64>, max_gib: Option<f64
     Ok(())
 }
 
-pub fn restore(store: &Store, id: &str, to: Option<&str>) -> Result<()> {
-    let fs = crate::sync::open_paired(store)?;
-    let at = fs.restore(id, to)?;
-    println!("Restored to {at}. The next `oneup sync` sends it to OneDrive too.");
-    Ok(())
-}
-
 /// After a sync: applies the automatic rule and says what it removed.
 pub fn auto_trim(fs: &oneup_effects::LocalFs, store: &Store) -> Result<Vec<Slot>> {
     let removed = fs.trim_versions(&trim_settings(store)?)?;

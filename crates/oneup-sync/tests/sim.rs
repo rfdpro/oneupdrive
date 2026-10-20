@@ -868,7 +868,9 @@ impl World {
                 self.remove_bases(sid);
                 true
             }
-            Step::Discard { .. } => panic!("a rewind discarded a copy"),
+            Step::Discard { .. } | Step::RestoreKept { .. } | Step::RevertTo { .. } => {
+                panic!("a rewind planned a recovery step")
+            }
             Step::Forget => {
                 let Some(b) = self.bases.get(&sid) else { return false };
                 if b.local.is_some_and(|l| self.local.contains_key(&l.0)) {

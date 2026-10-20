@@ -3,13 +3,14 @@
 //! OneDrive item, its versions (list, open a copy, restore one), and
 //! sharing links.
 //!
-//! Restoring a version changes the file in OneDrive: the old version is
-//! downloaded and sent as a new version, conditional on the file's current
-//! eTag (`If-Match`), and checked by its hash. The version it replaces
-//! stays in the history. (Graph's own `restoreVersion` ignores `If-Match`
-//! on OneDrive Personal, measured with `oneup dev-remote restore-check`,
-//! so it isn't used.) This PC gets the restored content by
-//! syncing, through the safety gate as any change from OneDrive. Opening a version writes a copy outside the synced
+//! Restoring a version is asked of the agent (`crate::restores`): its
+//! next round downloads the old version and sends it as a new version,
+//! conditional on the eTag the file had when asked (`If-Match`), and checks
+//! it by its hash. The version it replaces stays in the history. (Graph's
+//! own `restoreVersion` ignores `If-Match` on OneDrive Personal, measured
+//! with `oneup dev-remote restore-check`, so it isn't used.) This PC gets
+//! the restored content by syncing, through the safety gate as any change
+//! from OneDrive. Opening a version writes a copy outside the synced
 //! folder. Nothing here works inside an encrypted vault (OneDrive's
 //! versions and links there are of encrypted files).
 
@@ -149,26 +150,19 @@ pub async fn open_version(path: &Path, version: &str, label: &str) -> Result<Pat
     Ok(to)
 }
 
-/// Makes version `version` the file's current one in OneDrive (see the
-/// module docs).
-pub async fn restore_version(path: &Path, version: &str) -> Result<()> {
+/// Asks the agent to make version `version` the file's current one in
+/// OneDrive (see the module docs). Returns the data folder, whose agent
+/// the caller nudges.
+pub fn restore_version(path: &Path, version: &str) -> Result<PathBuf> {
     let it = Item::at(path)?;
     crate::setup::require_test_account(&it.dir)?;
     if it.folder {
         bail!("folders have no versions");
     }
-    let cloud = oneup_exec::GraphCloud::new(it.graph()?);
-    // Downloaded into the data folder (OneUpDrive's own), never the synced one.
-    let staged = it.dir.join(format!("restore-{}.tmp", std::process::id()));
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&staged)?;
+    let mut store = crate::setup::open_store(&it.dir, 1024)?;
     let id = oneup_sync::RemoteId(it.remote.clone());
-    let result = oneup_exec::recover::restore_version(&cloud, &id, version, &mut f).await;
-    drop(f);
-    let _ = std::fs::remove_file(&staged);
-    result.map(|_| ()).map_err(|e| match e {
-        oneup_exec::CloudError::Changed => anyhow::anyhow!("it changed in OneDrive meanwhile; look again"),
-        e => anyhow::anyhow!("{e}"),
-    })
+    crate::restores::version(&mut store, &id, version, &format!("/{}", it.rel))?;
+    Ok(it.dir)
 }
 
 /// The Office program for a file name (Microsoft's Office URI schemes),

@@ -782,20 +782,17 @@ mod win {
             }
             "cloud_bin_restore" => {
                 let seq = i64::try_from(count(args, "seq", 0)).unwrap_or(0);
-                let at = oneup_app::cloudbin::restore(dir, seq).await?;
+                let d = dir.to_path_buf();
+                let at = tokio::task::spawn_blocking(move || settingsapi::cloud_bin_restore(&d, seq)).await??;
                 let _ = agent(dir, Call::SyncNow).await;
                 Ok(Value::from(at))
             }
             "kept_restore" => {
-                // The agent is stopped around it: restoring writes into the folder.
+                // Asked of the agent, whose next round puts it back.
                 let (d, id) = (dir.to_path_buf(), text(args, "id"));
-                let was = stop_and_wait(&d).await;
-                let d2 = d.clone();
-                let at = tokio::task::spawn_blocking(move || settingsapi::kept_restore(&d2, &id)).await;
-                if was {
-                    oneup_app::launch::start_agent(&d)?;
-                }
-                Ok(Value::from(at??))
+                let at = tokio::task::spawn_blocking(move || settingsapi::kept_restore(&d, &id)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::from(at))
             }
             "shortcuts" => {
                 let d = dir.to_path_buf();
@@ -1038,7 +1035,8 @@ mod win {
             }
             "item_restore" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-                oneup_app::item::restore_version(Path::new(&s("path")), &s("id")).await?;
+                let d = oneup_app::item::restore_version(Path::new(&s("path")), &s("id"))?;
+                let _ = agent(&d, Call::SyncNow).await;
                 Ok(Value::Null)
             }
             "item_share" => {

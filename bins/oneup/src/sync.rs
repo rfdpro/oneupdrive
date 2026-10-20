@@ -1790,6 +1790,9 @@ impl Engine {
             let conflicts = crate::conflicts::queued(&mut store)?;
             log_activity(&mut store, conflicts.log.clone())?;
             extra.extend(conflicts.ops.iter().cloned());
+            // Restores the user asked for (`crate::restores`): the same.
+            let restores = crate::restores::queued(&store)?;
+            extra.extend(restores.ops.iter().cloned());
             // A rewind under way (`crate::rewind`): its steps for this round.
             let mut rewinding = store.read(crate::rewind::load)?;
             let mut steps = match &rewinding {
@@ -1853,7 +1856,7 @@ impl Engine {
                 pull: mode != crate::config::CloudCopies::Keep,
                 extra,
                 rewind: steps.clone(),
-                answered: conflicts.ops.clone(),
+                answered: conflicts.ops.iter().chain(&restores.ops).cloned().collect(),
                 rewound,
                 removal: removal_ops,
             };
@@ -2142,6 +2145,7 @@ impl Engine {
             }
 
             crate::conflicts::ran(&mut store, &conflicts, &report)?;
+            crate::restores::ran(&mut store, &restores, &report)?;
             // However busy the folder, the history keeps to its limits.
             crate::rewind::keep_history(&mut store, now_ms(), false)?;
             if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref()) {
@@ -2774,8 +2778,8 @@ struct Modes {
     /// A rewind's steps (`crate::rewind::steps`): added to the plan, and
     /// what the planner would do to the same items waits for them.
     rewind: Option<crate::rewind::Steps>,
-    /// Of `extra`, the steps of conflicts the user answered: the answer
-    /// approves them (`oneup_exec::recover::conflict_ops`).
+    /// Of `extra`, the steps of conflicts the user answered and of restores
+    /// they asked for: the answer approves them (`oneup_exec::recover`).
     answered: Vec<Op>,
     /// What this PC is to do to follow a finished rewind (see
     /// [`Engine::rewound`]).
@@ -3208,8 +3212,17 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
             use oneup_sync::rewind::Step;
             let synced = || o.synced_get(*sid).ok().flatten().and_then(|b| b.remote).map(|r| rp(&r));
             match &**step {
+                // A rewind's, or one the user asked for (`crate::restores`).
                 Step::Restore { to, name, .. } => {
-                    Line::new("restore", join(&rp(to), name), "rewind; from OneDrive's recycle bin")
+                    Line::new("restore", join(&rp(to), name), "from OneDrive's recycle bin")
+                }
+                Step::RestoreKept { slot, to } => Line::new(
+                    "restore",
+                    to.clone().unwrap_or_else(|| slot.clone()),
+                    r"from .oneup\versions, never over anything",
+                ),
+                Step::RevertTo { remote, .. } => {
+                    Line::new("revert", rp(&remote.id), "an old version from OneDrive's history becomes current")
                 }
                 Step::Reset { remote, place: Some((to, name)), content, .. } => moved(
                     "move back",
@@ -3510,7 +3523,7 @@ fn waits_for_a_change(s: Skip) -> bool {
     matches!(s, Skip::Refused | Skip::NameTaken | Skip::NotEmpty)
 }
 
-fn skip_label(s: Skip) -> &'static str {
+pub(crate) fn skip_label(s: Skip) -> &'static str {
     match s {
         Skip::Changed => "changed meanwhile; retrying",
         Skip::Busy => "open in another program; retrying",
@@ -4296,6 +4309,67 @@ mod tests {
         let mut done = Recent::default();
         done.add_op(&prune, &[]);
         assert_eq!(done.remote, 1000);
+    }
+
+    /// A removal of unknown size (a folder never listed in full, of which
+    /// 10 items are known) goes through a round as the engine plans it:
+    /// it raises a stop whose list is keyed with the path it shows, so
+    /// approving it works the first time (from the agent's list, or by its
+    /// code as `oneup sync --approve` does), and a move of a folder above it
+    /// between `status` and `approve` makes it a stop of its own again.
+    /// A restore the user asked for joins the round as a planned step that
+    /// the answer approves; without the answer the gate stops it. Done, it
+    /// leaves the queue and the log says so.
+    #[test]
+    fn a_restore_asked_for_runs_as_an_approved_step_of_the_round() {
+        use oneup_store::RemoteRow;
+        let row = |id: &str, parent: &str, name: &str, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                o.upsert_item(
+                    &RemoteRow { parent_id: None, kind: Kind::Root, ..row("root", "", "", Kind::Root) },
+                    false,
+                )?;
+                o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+                o.upsert_item(&row("f", "top", "a.txt", Kind::File), false)?;
+                oneup_exec::link_roots(o, 1, "top").map(|_| ())
+            })
+            .unwrap();
+        crate::restores::version(&mut store, &RemoteId("f".into()), "v1", "/a.txt").unwrap();
+        assert!(crate::restores::version(&mut store, &RemoteId("f".into()), "v1", "/a.txt").is_err(), "once");
+        let q = crate::restores::queued(&store).unwrap();
+        assert_eq!(q.ops.len(), 1);
+        let rules = RuleSet::new(&[] as &[&str], &[] as &[&str]).unwrap();
+        let round = |answered: Vec<Op>| {
+            let modes = Modes { pull: true, extra: q.ops.clone(), answered, ..Modes::default() };
+            let controls = Controls::default();
+            plan_round(&store, None, Scope::All, &controls, Recent::default(), &rules, modes, &[]).unwrap().review
+        };
+        let r = round(Vec::new());
+        assert!(r.breakers.iter().any(|b| b.kind == BreakerKind::Rewind), "unanswered: a stop");
+        assert!(!r.approved.iter().any(|a| a.op() == &q.ops[0]));
+        let r = round(q.ops.clone());
+        assert!(r.breakers.is_empty(), "{:?}", r.breakers);
+        assert!(r.approved.iter().any(|a| a.op() == &q.ops[0]), "approved by the answer");
+
+        // Not run (a pause): it waits. Run: done with, and logged.
+        crate::restores::ran(&mut store, &q, &oneup_exec::Report::default()).unwrap();
+        assert_eq!(store.read(crate::restores::waiting).unwrap().len(), 1);
+        let report = oneup_exec::Report { done: q.ops.clone(), ..Default::default() };
+        crate::restores::ran(&mut store, &q, &report).unwrap();
+        assert!(store.read(crate::restores::waiting).unwrap().is_empty());
+        let log = store.read(|o| o.activity_recent(None, 10)).unwrap();
+        assert!(log.iter().any(|e| e.action == "restore" && e.path == "/a.txt"));
     }
 
     /// A removal of unknown size (a folder never listed in full, of which

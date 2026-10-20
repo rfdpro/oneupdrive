@@ -96,7 +96,9 @@ impl Side {
             // Setting this PC's copy aside, or forgetting a record so
             // OneDrive's copy comes back, changes what this PC has.
             Op::Rewind { step, .. } => match &**step {
-                Step::SetAside { .. } | Step::Forget | Step::Discard { .. } => Some(Side::Local),
+                Step::SetAside { .. } | Step::Forget | Step::Discard { .. } | Step::RestoreKept { .. } => {
+                    Some(Side::Local)
+                }
                 _ => Some(Side::Remote),
             },
             Op::Download { .. }

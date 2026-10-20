@@ -414,6 +414,8 @@ impl Op {
                 Step::Reset { remote, .. } | Step::Remove { remote, .. } => (Some(*sid), None, r(remote)),
                 Step::SetAside { local } | Step::Discard { local } => (Some(*sid), l(local), None),
                 Step::Forget => (Some(*sid), None, None),
+                Step::RestoreKept { .. } => (None, None, None),
+                Step::RevertTo { remote, .. } => (None, None, r(remote)),
             },
             Op::Hold { sid, local, remote, .. } => (*sid, *local, remote.clone()),
         }
@@ -423,7 +425,12 @@ impl Op {
     /// places (bookkeeping and hashing don't).
     pub fn changes_local(&self) -> bool {
         match self {
-            Op::Rewind { step, .. } => matches!(&**step, Step::SetAside { .. } | Step::Forget | Step::Discard { .. }),
+            Op::Rewind { step, .. } => {
+                matches!(
+                    &**step,
+                    Step::SetAside { .. } | Step::Forget | Step::Discard { .. } | Step::RestoreKept { .. }
+                )
+            }
             _ => matches!(
                 self,
                 Op::Download { .. }

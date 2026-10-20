@@ -51,7 +51,7 @@ oneupd
 * It prints what it does (to `oneupd.log` when started with `oneup start`), in the same form as `oneup sync`.
 * `oneup stop`, or Ctrl+C in its window, stops it after the current step; pressing Ctrl+C again stops it at once.
 
-While `oneupd` runs, `oneup sync`, `oneup versions` and `oneup restore` refuse to touch the same data folder ("another OneUpDrive process is using this data folder"). Stop `oneupd` first.
+While `oneupd` runs, `oneup sync` and `oneup versions` refuse to touch the same data folder ("another OneUpDrive process is using this data folder"). Stop `oneupd` first.
 
 ### Checking on it and pausing it
 While `oneupd` runs, these commands talk to it directly. Use the same `--data-dir`. Nothing needs restarting.
@@ -249,7 +249,7 @@ oneup --data-dir … restore 1791337982375-3        # put it back where it was
 oneup --data-dir … restore 1791337982375-3 --to "docs\old notes.txt"
 ```
 
-Restoring never replaces anything. If the name is taken, you get `name (restored 1).ext` beside it. The next `oneup sync` sends the restored file to OneDrive too.
+Restoring never replaces anything. If the name is taken, you get `name (restored 1).ext` beside it. OneUpDrive restores it with its next sync (right away if `oneupd` runs), then sends it to OneDrive too; `oneup activity` says when it's done.
 
 Files deleted from OneDrive are in OneDrive's own recycle bin (on the website); those OneUpDrive saw deleted can be brought back from the settings window or `oneup recycle-bin`. Older versions of a file are in its version history there. To put a whole folder back the way it was at some moment, [rewind it](recovery.md#rewind-a-folder).
 
