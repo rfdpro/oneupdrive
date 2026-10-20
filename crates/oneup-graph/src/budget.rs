@@ -42,6 +42,11 @@ pub struct Budget {
     /// Where more comes from when what's held runs low (`None`: nowhere,
     /// what's set is all).
     refill: Mutex<Option<Refill>>,
+    /// The last refill got nothing: none is asked for again until the
+    /// budget is next [`Budget::set`]. Every chunk of a large download
+    /// the user opened would otherwise ask the shared store again (a
+    /// write each time) for what isn't there.
+    dry: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for Budget {
@@ -54,6 +59,7 @@ impl Budget {
     /// What's left (`None`: no budget, everything goes).
     pub fn set(&self, left: Option<u64>) {
         *self.lock() = left;
+        self.dry.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn left(&self) -> Option<u64> {
@@ -68,6 +74,10 @@ impl Budget {
     /// Takes at least `need` more from where the budget is shared, if
     /// anywhere ([`RESERVE`] at a time).
     fn top_up(&self, need: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.dry.load(Relaxed) {
+            return;
+        }
         let more = {
             let r = self.refill.lock().unwrap_or_else(|p| p.into_inner());
             match r.as_ref() {
@@ -75,6 +85,9 @@ impl Budget {
                 None => return,
             }
         };
+        if more == 0 {
+            self.dry.store(true, Relaxed);
+        }
         if more > 0
             && let Some(left) = &mut *self.lock()
         {
@@ -199,6 +212,31 @@ mod tests {
         assert_eq!(b.left(), Some(RESERVE - 100));
         assert!(b.send(RESERVE - 100) && b.send(10), "the last of it");
         assert!(!b.send(1), "nothing more anywhere");
+    }
+
+    /// Once the shared budget had nothing more, a download that goes on
+    /// past it (one the user opened) doesn't ask it again for every
+    /// chunk; the next look at the budget does.
+    #[test]
+    fn a_refill_that_got_nothing_isnt_asked_again_until_the_budget_is_set() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let asked = Arc::new(AtomicU64::new(0));
+        let b = Budget::default();
+        let a = Arc::clone(&asked);
+        b.set(Some(0));
+        b.set_refill(Some(Box::new(move |_| {
+            a.fetch_add(1, Relaxed);
+            0
+        })));
+        for _ in 0..1000 {
+            b.received(READ_MAX);
+        }
+        assert!(!b.send(1));
+        assert_eq!(asked.load(Relaxed), 1, "asked once");
+        b.set(Some(0));
+        assert!(!b.send(1));
+        assert_eq!(asked.load(Relaxed), 2, "asked again after the next look");
     }
 
     #[tokio::test]
