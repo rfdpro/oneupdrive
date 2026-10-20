@@ -152,8 +152,12 @@ fn freeable(
         return Ok(None);
     }
     let Some(path) = path else { return Ok(None) };
-    // A pin rule's file, unless it was freed by name since.
+    // A pin rule's file, unless it was freed by name since; and a file a
+    // folder above keeps (pinned, or pinned by the user).
     if kept(&path) && !store.read(|o| o.pin_released_has(r.file_id))? {
+        return Ok(None);
+    }
+    if crate::pinrules::kept_by_folder_above(store, r)? {
         return Ok(None);
     }
     if accessed(&path).is_some_and(|a| a >= cutoff) {
@@ -284,5 +288,18 @@ mod tests {
         s.write(|o| o.meta_delete(KEY_CURSOR)).unwrap();
         let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &kept).unwrap();
         assert_eq!(freed(&sel), vec![10, 11]);
+    }
+
+    /// A file in a folder that's pinned (by the user) is never chosen,
+    /// though nothing on the file itself says so.
+    #[test]
+    fn a_pinned_folder_above_keeps_its_files() {
+        let folder = LocalRow { kind: LocalKind::Folder, attributes: 0x10 | 0x0008_0000, ..file(20, 400) };
+        let inside = LocalRow { parent_id: Some(20), ..file(21, 400) };
+        let mut s = store(&[file(10, 400), inside]);
+        s.write(|o| o.local_put(&folder).map(|_| ())).unwrap();
+        let space = Space { free_unused_days: 1, ..Space::default() };
+        let sel = select(&mut s, &space, None, NOW, &|_| None, &|_| false).unwrap();
+        assert_eq!(freed(&sel), vec![10]);
     }
 }
