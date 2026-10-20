@@ -108,6 +108,9 @@ pub struct Control {
     offline_file: Option<PathBuf>,
     /// Pinged when a call changed something the loop must act on.
     pub wake: Notify,
+    /// Pinged when the user turns working offline on or off, for a round
+    /// under way (its push channel closes at once).
+    pub offline_changed: Notify,
     /// Whether the push channel is live (set by the push task).
     pub push_up: Arc<AtomicBool>,
     /// Pinged once when a `stop` call arrives.
@@ -263,6 +266,7 @@ impl Control {
             pause_file,
             offline_file,
             wake: Notify::new(),
+            offline_changed: Notify::new(),
             push_up: Arc::new(AtomicBool::new(false)),
             stop: Notify::new(),
             poor_link: AtomicBool::new(false),
@@ -662,6 +666,8 @@ impl Control {
             Call::Status | Call::Watch { .. } | Call::Events { .. } => wake = false,
             Call::SyncNow => {}
             Call::Offline { on } => {
+                // A stored permit: a round under way sees it at its next look.
+                self.offline_changed.notify_one();
                 if s.offline != on {
                     s.offline = on;
                     if let Some(f) = &self.offline_file {
