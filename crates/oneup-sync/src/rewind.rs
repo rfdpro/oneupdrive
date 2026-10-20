@@ -95,6 +95,23 @@ pub trait History {
     fn written_ms(&self, local_mtime: i64) -> i64 {
         local_mtime / 10_000 - 11_644_473_600_000
     }
+
+    /// Every record with a change after moment `at`, anywhere, at most
+    /// `limit` of them (`None`: more). What a rewind reads first: its cost
+    /// follows the changes since the moment, not the size of the folder.
+    fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>, Self::Error>;
+
+    /// The Synced folders that may hold changes not synced yet (the
+    /// planner's marks): what's in them may differ from its record without
+    /// a change in the history.
+    fn unsettled(&self) -> Result<Vec<Sid>, Self::Error>;
+}
+
+/// How many records a rewind reads at most (changed since its moment,
+/// anywhere, and in folders with changes not synced yet), for a limit of
+/// `max` changes.
+pub fn read_limit(max: usize) -> usize {
+    max.saturating_mul(4)
 }
 
 /// One step of a rewind, for [`Op::Rewind`].
@@ -270,6 +287,9 @@ pub enum Error<E> {
     Read(E),
     /// More than the limit given would change.
     TooMany,
+    /// More records changed since the moment (anywhere), or wait to sync,
+    /// than a rewind reads ([`read_limit`]).
+    TooManySince,
 }
 
 impl<E> From<E> for Error<E> {
@@ -290,29 +310,6 @@ where
     }
 }
 
-/// The items in folder `parent` at moment `at`, as they were then, by name.
-pub fn children_at<T, H>(t: &T, h: &H, parent: Sid, at: i64) -> Result<Vec<(Sid, Was)>, T::Error>
-where
-    T: Trees + ?Sized,
-    H: History<Error = T::Error> + ?Sized,
-{
-    let mut candidates: BTreeSet<Sid> = h.children_after(parent, at)?.into_iter().collect();
-    candidates.extend(t.base_children(parent)?.into_iter().map(|b| b.sid));
-    let mut out = Vec::new();
-    for c in candidates {
-        if c == parent {
-            continue;
-        }
-        if let Some(w) = state_at(t, h, c, at)?
-            && w.parent == Some(parent)
-        {
-            out.push((c, w));
-        }
-    }
-    out.sort_by(|a, b| a.1.name.cmp(&b.1.name).then(a.0.cmp(&b.0)));
-    Ok(out)
-}
-
 /// The folder at `path` (names below the root, compared as Windows does)
 /// at moment `at`, if there was one.
 pub fn folder_at<T, H>(t: &T, h: &H, path: &[&str], at: i64) -> Result<Option<Sid>, T::Error>
@@ -322,11 +319,23 @@ where
 {
     let mut cur = ROOT;
     for part in path {
-        let next = children_at(t, h, cur, at)?
-            .into_iter()
-            .find(|(_, w)| w.kind == NodeKind::Folder && same_name(&w.name, part));
+        // What had the name then: a child with it now and no change since,
+        // or one the history has changing since. Only those are read again.
+        let mut candidates: BTreeSet<Sid> = h.children_after(cur, at)?.into_iter().collect();
+        candidates.extend(t.base_children(cur)?.into_iter().filter(|b| same_name(&b.name, part)).map(|b| b.sid));
+        let mut next = None;
+        for c in candidates {
+            if let Some(w) = state_at(t, h, c, at)?
+                && w.parent == Some(cur)
+                && w.kind == NodeKind::Folder
+                && same_name(&w.name, part)
+            {
+                next = Some(c);
+                break;
+            }
+        }
         match next {
-            Some((sid, _)) => cur = sid,
+            Some(sid) => cur = sid,
             None => return Ok(None),
         }
     }
@@ -346,68 +355,49 @@ where
     T: Trees + ?Sized,
     H: History<Error = T::Error> + ?Sized,
 {
-    let walk_max = max.saturating_mul(16).max(1 << 20);
-    // What the folder held then.
-    let mut then: BTreeMap<Sid, Then> = BTreeMap::new();
-    let mut todo: Vec<(Sid, String, usize)> = Vec::new();
-    if folder == ROOT {
-        todo.push((ROOT, String::new(), 0));
-    } else if let Some(w) = state_at(t, h, folder, at)? {
-        let path = path_then(t, h, folder, at)?;
-        if w.kind == NodeKind::Folder {
-            todo.push((folder, path.clone(), 0));
+    // Only what changed since the moment can differ from then, and what
+    // waits to sync: an item with neither is as it was, wherever it is. So
+    // the records read are those the history has after the moment and
+    // those in folders with changes not synced yet, each placed by walking
+    // up from it (shared parts remembered): the cost follows the changes,
+    // not the size of the folder.
+    let limit = read_limit(max);
+    let Some(changed) = h.changed_after(at, limit)? else { return Err(Error::TooManySince) };
+    let mut candidates: BTreeSet<Sid> = changed.into_iter().collect();
+    for f in h.unsettled()? {
+        candidates.insert(f);
+        for c in t.base_children(f)? {
+            candidates.insert(c.sid);
         }
-        then.insert(folder, (w, path, 0));
-    }
-    while let Some((p, path, depth)) = todo.pop() {
-        for (c, w) in children_at(t, h, p, at)? {
-            let cpath = format!("{path}/{}", w.name);
-            if w.kind == NodeKind::Folder {
-                todo.push((c, cpath.clone(), depth + 1));
-            }
-            then.insert(c, (w, cpath, depth + 1));
-        }
-        if then.len() > walk_max {
-            return Err(Error::TooMany);
+        if candidates.len() > limit {
+            return Err(Error::TooManySince);
         }
     }
+    if folder != ROOT {
+        candidates.insert(folder);
+    }
+    let mut place = Place::new(folder, at);
 
-    // What it holds now, and where what it held then is now.
+    // What the folder held then, of those; and what it holds now: what's in
+    // it, and what was in it then (it comes back, with what's in it now).
+    let mut then: BTreeMap<Sid, Then> = BTreeMap::new();
     let mut now: BTreeMap<Sid, (Base, String)> = BTreeMap::new();
-    let mut todo: Vec<(Sid, String)> = Vec::new();
-    if let Some(b) = t.base(folder)? {
-        let path = path_now(t, &b)?;
-        if b.kind == NodeKind::Folder {
-            todo.push((folder, path.clone()));
+    for &sid in &candidates {
+        if sid == ROOT {
+            continue;
         }
-        if folder != ROOT {
-            now.insert(folder, (b, path));
+        if place.in_then(t, h, sid)?
+            && let Some(w) = state_at(t, h, sid, at)?
+        {
+            let path = place.path_then(t, h, sid)?;
+            let depth = depth_of(&path);
+            then.insert(sid, (w, path, depth));
         }
-    }
-    // Items moved out since come back, and with them what's in them now.
-    let moved_out: Vec<Sid> = then.keys().filter(|s| !now.contains_key(s)).copied().collect();
-    for sid in moved_out {
-        if now.contains_key(&sid) {
-            continue; // inside another one moved out
-        }
-        if let Some(b) = t.base(sid)? {
-            let path = path_now(t, &b)?;
-            if b.kind == NodeKind::Folder {
-                todo.push((sid, path.clone()));
-            }
+        if place.in_now(t, h, sid)?
+            && let Some(b) = t.base(sid)?
+        {
+            let path = place.path_now(t, sid)?;
             now.insert(sid, (b, path));
-        }
-    }
-    while let Some((p, path)) = todo.pop() {
-        for b in t.base_children(p)? {
-            let cpath = format!("{path}/{}", b.name);
-            if b.kind == NodeKind::Folder {
-                todo.push((b.sid, cpath.clone()));
-            }
-            now.insert(b.sid, (b, cpath));
-        }
-        if now.len() > walk_max {
-            return Err(Error::TooMany);
         }
     }
 
@@ -437,7 +427,7 @@ where
     let moved_in: Vec<Sid> = now.keys().filter(|s| !then.contains_key(s) && !alias.contains_key(s)).copied().collect();
     for sid in moved_in {
         if let Some(w) = state_at(t, h, sid, at)? {
-            let path = path_then(t, h, sid, at)?;
+            let path = place.path_then(t, h, sid)?;
             let depth = depth_of(&path);
             then.insert(sid, (w, path, depth));
         }
@@ -528,6 +518,154 @@ where
     }
     b.remove_folders = folders;
     Ok(b.finish())
+}
+
+/// Where records were then and are now, relative to the folder rewound,
+/// and their paths, remembered as they're found: records share their
+/// folders, so each folder above them is read once.
+struct Place {
+    folder: Sid,
+    at: i64,
+    then: HashMap<Sid, bool>,
+    now: HashMap<Sid, bool>,
+    paths_then: HashMap<Sid, String>,
+    paths_now: HashMap<Sid, String>,
+}
+
+impl Place {
+    fn new(folder: Sid, at: i64) -> Self {
+        Place {
+            folder,
+            at,
+            then: HashMap::new(),
+            now: HashMap::new(),
+            paths_then: HashMap::new(),
+            paths_now: HashMap::new(),
+        }
+    }
+
+    /// Whether `sid` was in the folder (or is it) at the moment.
+    fn in_then<T, H>(&mut self, t: &T, h: &H, sid: Sid) -> Result<bool, T::Error>
+    where
+        T: Trees + ?Sized,
+        H: History<Error = T::Error> + ?Sized,
+    {
+        let mut chain = Vec::new();
+        let mut cur = sid;
+        let mut found = false;
+        for _ in 0..4096 {
+            if cur == self.folder {
+                found = true;
+                break;
+            }
+            if let Some(&known) = self.then.get(&cur) {
+                found = known;
+                break;
+            }
+            chain.push(cur);
+            match state_at(t, h, cur, self.at)?.and_then(|w| w.parent) {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        for c in chain {
+            self.then.insert(c, found);
+        }
+        Ok(found)
+    }
+
+    /// Whether `sid` is in the folder now, or in something that was in it
+    /// then (which goes back, with what it holds now).
+    fn in_now<T, H>(&mut self, t: &T, h: &H, sid: Sid) -> Result<bool, T::Error>
+    where
+        T: Trees + ?Sized,
+        H: History<Error = T::Error> + ?Sized,
+    {
+        let mut chain = Vec::new();
+        let mut cur = sid;
+        let mut found = false;
+        for _ in 0..4096 {
+            if cur == self.folder {
+                found = true;
+                break;
+            }
+            if let Some(&known) = self.now.get(&cur) {
+                found = known;
+                break;
+            }
+            if self.in_then(t, h, cur)? {
+                found = true;
+                break;
+            }
+            chain.push(cur);
+            match t.base(cur)?.and_then(|b| b.parent) {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        for c in chain {
+            self.now.insert(c, found);
+        }
+        Ok(found)
+    }
+
+    /// `sid`'s path at the moment ([`path_then`]).
+    fn path_then<T, H>(&mut self, t: &T, h: &H, sid: Sid) -> Result<String, T::Error>
+    where
+        T: Trees + ?Sized,
+        H: History<Error = T::Error> + ?Sized,
+    {
+        let mut chain: Vec<(Sid, String)> = Vec::new();
+        let mut cur = sid;
+        let mut base = String::new();
+        for _ in 0..4096 {
+            if cur == ROOT {
+                break;
+            }
+            if let Some(p) = self.paths_then.get(&cur) {
+                base = p.clone();
+                break;
+            }
+            let Some(w) = state_at(t, h, cur, self.at)? else { break };
+            chain.push((cur, w.name));
+            match w.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        for (c, name) in chain.into_iter().rev() {
+            base = format!("{base}/{name}");
+            self.paths_then.insert(c, base.clone());
+        }
+        Ok(base)
+    }
+
+    /// `sid`'s path now (`/a/b`), from the Synced tree.
+    fn path_now<T: Trees + ?Sized>(&mut self, t: &T, sid: Sid) -> Result<String, T::Error> {
+        let mut chain: Vec<(Sid, String)> = Vec::new();
+        let mut cur = sid;
+        let mut base = String::new();
+        for _ in 0..4096 {
+            if cur == ROOT {
+                break;
+            }
+            if let Some(p) = self.paths_now.get(&cur) {
+                base = p.clone();
+                break;
+            }
+            let Some(b) = t.base(cur)? else { break };
+            chain.push((cur, b.name));
+            match b.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        for (c, name) in chain.into_iter().rev() {
+            base = format!("{base}/{name}");
+            self.paths_now.insert(c, base.clone());
+        }
+        Ok(base)
+    }
 }
 
 fn sid_of(op: &Op) -> Option<Sid> {
@@ -979,25 +1117,6 @@ where
             Some(p) => cur = p,
             None => break,
         }
-    }
-    parts.reverse();
-    Ok(parts.iter().map(|p| format!("/{p}")).collect())
-}
-
-/// `b`'s path now (`/a/b`), from the Synced tree.
-fn path_now<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<String, T::Error> {
-    let mut parts = Vec::new();
-    let mut cur = Some(b.clone());
-    for _ in 0..4096 {
-        let Some(c) = cur else { break };
-        if c.sid == ROOT {
-            break;
-        }
-        parts.push(c.name.clone());
-        cur = match c.parent {
-            Some(p) => t.base(p)?,
-            None => None,
-        };
     }
     parts.reverse();
     Ok(parts.iter().map(|p| format!("/{p}")).collect())

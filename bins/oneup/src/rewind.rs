@@ -309,6 +309,10 @@ pub fn plan(o: &Ops<'_>, rules: &RuleSet, sid: Sid, at_ms: i64) -> Result<core::
     let view = oneup_plan::Parked::with_rules(o, rules);
     core::plan(&view, o, sid, at_ms, MAX).map_err(|e| match e {
         core::Error::TooMany => anyhow::anyhow!("that would change more than {MAX} items; pick a smaller folder"),
+        core::Error::TooManySince => anyhow::anyhow!(
+            "more than {} changes were synced since then (or wait to sync), more than a rewind reads;              pick a later moment",
+            core::read_limit(MAX)
+        ),
         core::Error::Read(e) => e.into(),
     })
 }

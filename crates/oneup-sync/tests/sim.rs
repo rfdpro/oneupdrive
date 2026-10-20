@@ -944,6 +944,45 @@ impl History for World {
             .map(|(_, s, _)| *s)
             .collect())
     }
+
+    fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>, Infallible> {
+        let sids: BTreeSet<Sid> = self.history.iter().filter(|(t, _, _)| *t > at).map(|(_, s, _)| *s).collect();
+        Ok((sids.len() <= limit).then(|| sids.into_iter().collect()))
+    }
+
+    /// As the planner's marks have them: the folders of records whose item
+    /// differs from the record on either side (and such folders themselves).
+    fn unsettled(&self) -> Result<Vec<Sid>, Infallible> {
+        Ok(self.unsettled_folders())
+    }
+}
+
+impl World {
+    fn unsettled_folders(&self) -> Vec<Sid> {
+        let mut out = BTreeSet::new();
+        for b in self.bases.values() {
+            let parent_local = b.parent.and_then(|p| self.bases.get(&p)).and_then(|p| p.local);
+            let local_ok = match b.local.map(|id| Trees::local(self, id)) {
+                Some(Ok(Seen::Present(n))) => {
+                    n.name == b.name
+                        && n.parent == parent_local
+                        && (b.kind == NodeKind::Folder || (n.size == b.size && n.mtime == b.local_mtime))
+                }
+                _ => b.sid == ROOT,
+            };
+            let remote_ok = match b.remote.as_ref().map(|r| Trees::remote(self, r)) {
+                Some(Ok(Seen::Present(n))) => n.etag == b.remote_etag || b.kind == NodeKind::Folder,
+                _ => false,
+            };
+            if !(local_ok && remote_ok) {
+                out.insert(b.parent.unwrap_or(ROOT));
+                if b.kind == NodeKind::Folder {
+                    out.insert(b.sid);
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
 }
 
 fn file_base(parent: Sid, name: &str, c: Content, local: LocalId, mtime: i64, remote: String, etag: String) -> Base {
@@ -1603,9 +1642,10 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
         if check_store() {
             let mut s = store_of(&snap);
             s.write(|o| o.history_replace(&snap.history)).expect("writing the history");
+            let marks = snap.unsettled_folders();
             let from_store = s
                 .read(|o| {
-                    oneup_sync::rewind::plan(o, &OwnClock(o), folder, at, 1 << 20)
+                    oneup_sync::rewind::plan(o, &OwnClock(o, &marks), folder, at, 1 << 20)
                         .map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
                 })
                 .expect("planning the rewind from the store");
@@ -1668,8 +1708,9 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
     panic!("the rewind didn't finish");
 }
 
-/// The store's history, with the world's last-write times (its own clock).
-struct OwnClock<'a, 'b>(&'a oneup_store::Ops<'b>);
+/// The store's history, with the world's last-write times (its own clock)
+/// and the world's marks.
+struct OwnClock<'a, 'b>(&'a oneup_store::Ops<'b>, &'a [Sid]);
 
 impl History for OwnClock<'_, '_> {
     type Error = oneup_store::Error;
@@ -1688,6 +1729,14 @@ impl History for OwnClock<'_, '_> {
 
     fn written_ms(&self, local_mtime: i64) -> i64 {
         local_mtime
+    }
+
+    fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>, oneup_store::Error> {
+        self.0.changed_after(at, limit)
+    }
+
+    fn unsettled(&self) -> Result<Vec<Sid>, oneup_store::Error> {
+        Ok(self.1.to_vec())
     }
 }
 
