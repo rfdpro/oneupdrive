@@ -169,6 +169,10 @@ struct Req<'a> {
     /// Don't follow a redirect: a 3xx answer is the result (its
     /// `Location` in the measure), for a caller that fetches it itself.
     no_redirect: bool,
+    /// For a file the user opens: doesn't wait for a permit (background
+    /// transfers may hold them all), only for a pause the service asked
+    /// for.
+    priority: bool,
 }
 
 impl<'a> Req<'a> {
@@ -187,6 +191,7 @@ impl<'a> Req<'a> {
             retry: true,
             content: false,
             no_redirect: false,
+            priority: false,
         }
     }
 
@@ -298,11 +303,20 @@ impl Graph {
     /// An item's eTag, kind and pre-authenticated download URL. `None` if
     /// it no longer exists.
     pub async fn download_info(&self, id: &str) -> Result<Option<crate::model::DownloadInfo>> {
+        self.download_info_for(id, false).await
+    }
+
+    /// [`Graph::download_info`]; `opened`: for a file the user opens, which
+    /// doesn't wait behind background transfers for a request permit (only
+    /// for a pause the service asked for).
+    pub async fn download_info_for(&self, id: &str, opened: bool) -> Result<Option<crate::model::DownloadInfo>> {
         // The full item: OneDrive Personal leaves the link out of a
         // `$select`ed answer (measured: every time), which then cost a
         // second request per download.
         let url = format!("{}/items/{}", self.drive_url(), encode_id(id));
-        match self.get::<crate::model::DownloadInfo>(&url).await {
+        let req = Req { priority: opened, ..Req::new(reqwest::Method::GET, &url) };
+        let got = self.send(&req).await.and_then(|(_, body)| Ok(serde_json::from_slice(&body)?));
+        match got {
             Ok(it) => Ok(Some(it)),
             Err(e) if e.status() == Some(404) => Ok(None),
             Err(e) => Err(e),
@@ -822,6 +836,24 @@ impl Graph {
         format!("{}{}", self.base, self.drive)
     }
 
+    /// Talks to `base` instead of Graph (tests: a loopback server).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_base_for_tests(mut self, base: &str) -> Self {
+        self.base = base.to_string();
+        self
+    }
+
+    /// A client for tests against a loopback server at `base`, signed in
+    /// with a made-up token, `at_once` requests at a time.
+    #[doc(hidden)]
+    pub async fn for_tests(base: &str, at_once: usize) -> Graph {
+        let store = crate::DpapiFileStore::new(std::env::temp_dir().join("oneup-graph-test-none.dpapi"));
+        let auth = Arc::new(Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
+        auth.set_access_for_tests("t").await;
+        Graph::new(reqwest::Client::new(), auth, Aimd::new(at_once, at_once)).with_base_for_tests(base)
+    }
+
     /// Makes the scope's root folder look like a drive root.
     fn rooted(&self, mut item: DriveItem) -> DriveItem {
         if self.scope.as_deref() == Some(item.id.as_str()) && !item.is_deleted() {
@@ -920,7 +952,12 @@ impl Graph {
                 measure.capped += self.upload.take(body_len).await;
             }
             let waiting = std::time::Instant::now();
-            let permit = self.limiter.acquire().await;
+            let permit = if req.priority {
+                self.limiter.unpaused().await;
+                None
+            } else {
+                Some(self.limiter.acquire().await)
+            };
             measure.paused += waiting.elapsed();
             // ...and must fit in the data budget as it is right before it
             // goes, which a change of network may have set meanwhile.

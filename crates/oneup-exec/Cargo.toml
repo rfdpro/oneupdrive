@@ -53,7 +53,7 @@ oneup-cfapi = { path = "../oneup-cfapi" }
 oneup-hooks = { path = "../oneup-hooks" }
 oneup-ipc = { path = "../oneup-ipc" }
 oneup-plan = { path = "../oneup-plan" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "net", "io-util"] }
 
 [lints]
 workspace = true

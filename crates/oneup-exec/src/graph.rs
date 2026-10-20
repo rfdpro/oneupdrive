@@ -277,6 +277,12 @@ impl GraphCloud {
     /// the coming downloads' ([`Links`]); `None` if it's gone. Whether it
     /// was read ahead.
     async fn link(&self, id: &str) -> Result<(Option<DownloadInfo>, bool), CloudError> {
+        // A file the user opens: its own link, read without waiting
+        // behind background transfers for a request permit.
+        if !self.budgeted {
+            let info = self.graph.download_info_for(id, true).await.map_err(map)?;
+            return Ok((info, false));
+        }
         let ids = loop {
             let read = self.links_read.notified();
             tokio::pin!(read);
@@ -895,7 +901,12 @@ impl Cloud for GraphCloud {
             // than expected), before any byte arrived: read it again.
             Err(e) if read_ahead && e.status().is_some_and(|s| matches!(s, 401 | 403 | 404 | 410)) => {
                 tracing::debug!(error = %e, "a download link read ahead didn't work; reading it again");
-                let info = self.graph.download_info(&pre.id.0).await.map_err(map)?.ok_or(CloudError::Changed)?;
+                let info = self
+                    .graph
+                    .download_info_for(&pre.id.0, !self.budgeted)
+                    .await
+                    .map_err(map)?
+                    .ok_or(CloudError::Changed)?;
                 if info.e_tag.as_deref() != Some(pre.etag.as_str()) {
                     return Err(CloudError::Changed);
                 }
@@ -1713,6 +1724,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A file the user opens, through the hydration service's cloud: its
+    /// link and its content come while background transfers hold every
+    /// request permit; a background download waits. Over loopback, through
+    /// the real client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_the_user_opens_gets_its_link_and_content_past_background_transfers() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let content_url = format!("{base}/content");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let content_url = content_url.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = if head.starts_with("GET /content") {
+                        "hello".to_string()
+                    } else {
+                        format!(r#"{{"id":"X","eTag":"e","@microsoft.graph.downloadUrl":"{content_url}"}}"#)
+                    };
+                    let answer =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = s.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        let graph = Arc::new(Graph::for_tests(&base, 1).await);
+        let _held = graph.limiter().acquire().await;
+        let pre = RemotePre { id: RemoteId("X".into()), etag: "e".into() };
+        let opened = GraphCloud::new(Arc::clone(&graph)).unbudgeted();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), opened.download(&pre, &mut out))
+            .await
+            .expect("not held up behind the permits")
+            .unwrap();
+        assert_eq!(out, b"hello");
+        let background = GraphCloud::new(Arc::clone(&graph));
+        let waited = tokio::time::timeout(Duration::from_millis(300), background.download(&pre, &mut Vec::new())).await;
+        assert!(waited.is_err(), "a background download waits for a permit");
     }
 
     fn version(id: &str, modified_ms: i64, size: i64) -> FileVersion {
