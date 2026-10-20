@@ -128,10 +128,11 @@ pub(crate) fn migrate_v22() -> String {
              WHEN NEW.kind = 1 AND (OLD.attributes & {PINNED}) = 0 AND (NEW.attributes & {PINNED}) != 0
               AND NOT EXISTS (SELECT 1 FROM pin_owned WHERE file_id = NEW.file_id)
          BEGIN
-             DELETE FROM pin_user WHERE file_id = NEW.file_id;
-             INSERT INTO pin_user(file_id) VALUES (NEW.file_id);
-             DELETE FROM pin_changed WHERE file_id = NEW.file_id;
-             INSERT INTO pin_changed(file_id) VALUES (NEW.file_id);
+             INSERT INTO pin_user(file_id)
+                 SELECT NEW.file_id WHERE NOT EXISTS (SELECT 1 FROM pin_user WHERE file_id = NEW.file_id);
+             INSERT INTO pin_changed(file_id)
+                 SELECT NEW.file_id WHERE (SELECT created FROM pin_user WHERE file_id = NEW.file_id) IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM pin_changed WHERE file_id = NEW.file_id);
          END;
          CREATE TRIGGER pin_user_folder_lost AFTER UPDATE OF attributes ON local_item
              WHEN NEW.kind = 1 AND (OLD.attributes & {PINNED}) != 0 AND (NEW.attributes & {PINNED}) = 0
