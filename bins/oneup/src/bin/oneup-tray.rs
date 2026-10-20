@@ -186,6 +186,32 @@ mod win {
         });
     }
 
+    /// The automatic update download, in a process of its own (`oneup
+    /// updates --fetch`), ended at once if Windows reports a change to a
+    /// network where background transfers don't go. Whether it finished.
+    fn download_by_itself(dir: &Path) -> bool {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(exe) = oneup_app::launch::sibling("oneup.exe") else { return false };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--data-dir").arg(dir).args(["updates", "--fetch"]).creation_flags(CREATE_NO_WINDOW);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let changes = tx.clone();
+        let _watch = oneup_sys::network::watch(move || drop(changes.send(oneup_app::updates::Heard::Changed))).ok();
+        let stop = || !oneup_app::updates::may_download_by_itself_now(dir);
+        match oneup_app::updates::run_stoppable(cmd, tx, rx, stop) {
+            Ok(oneup_app::updates::Ran::Finished(ok)) => ok,
+            Ok(oneup_app::updates::Ran::Stopped) => {
+                tracing::info!("the update download stopped: the network changed to one it doesn't go on");
+                false
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "the update download couldn't run");
+                false
+            }
+        }
+    }
+
     /// A few minutes after starting, then daily, or at once when the
     /// settings window's "Check now" asks: download and check an update
     /// (`oneup_app::updates`), and tell the icon's thread. The daily check
@@ -202,11 +228,15 @@ mod win {
         let mut asked = wait(Duration::from_secs(150));
         loop {
             // By itself only where background transfers may go (not on a
-            // metered network, with a data budget, or offline); asked, always.
+            // metered network, with a data budget, or offline), and stopped
+            // if the network changes to one of those meanwhile; asked,
+            // always, and never stopped.
             let auto = oneup_app::config::load_updates(dir).is_ok_and(|u| u.auto)
                 && oneup_app::updates::may_download_by_itself_now(dir);
+            let fetched = !asked && auto && download_by_itself(dir);
             let found = match oneup_app::updates::manager(dir) {
-                Ok(Some(um)) if auto || asked => oneup_app::updates::check(um),
+                // What the download left is used; nothing is fetched again.
+                Ok(Some(um)) if asked || fetched => oneup_app::updates::check(um),
                 _ => Ok(None),
             };
             match found {

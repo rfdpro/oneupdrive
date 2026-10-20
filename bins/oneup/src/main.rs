@@ -610,6 +610,10 @@ enum Cmd {
         channel: Option<String>,
         #[arg(long)]
         check: bool,
+        /// The tray's automatic download, in a process of its own so a
+        /// change of network can stop it: look and download, nothing else
+        #[arg(long, hide = true)]
+        fetch: bool,
     },
     /// List broken shortcuts to OneDrive files (Desktop, Start menu,
     /// taskbar); `--fix` updates them to the synced folder, `--undo`
@@ -2342,7 +2346,11 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Updates { auto, channel, check } => {
+        Cmd::Updates { fetch: true, .. } => {
+            let Some(um) = oneup_app::updates::manager(&data_dir(&cli)?)? else { return Ok(()) };
+            oneup_app::updates::check(um).map(drop)
+        }
+        Cmd::Updates { auto, channel, check, fetch: false } => {
             updates_cmd(&data_dir(&cli)?, auto.map(Toggle::on), channel.as_deref(), *check)
         }
         Cmd::Shortcuts { fix, undo, from, json } => {
