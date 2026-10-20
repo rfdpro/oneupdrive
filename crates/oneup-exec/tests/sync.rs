@@ -2394,7 +2394,8 @@ async fn excluded_new_items_stay_on_their_side() {
 }
 
 impl Sync {
-    /// What `oneup cloud prune --yes` does for the cloud item at `path`:
+    /// What `oneup cloud prune --yes` does for the cloud item at `path`, and
+    /// what the agent does with a ready candidate in `prune` mode:
     /// one PruneRemote through the gate and the executor.
     async fn prune(&mut self, path: &str) -> Report {
         let (id, etag) = {
@@ -2921,6 +2922,47 @@ fn bin(tag: &str) -> Tmp {
     let _ = std::fs::remove_dir_all(&b.0);
     std::fs::create_dir_all(&b.0).unwrap();
     b
+}
+
+/// Unticking a synced folder in the settings window writes the rule naming
+/// exactly it (`/projects/`, `oneup_app::filetree::set_sync`). Nothing is
+/// lost on either side. With OneDrive's copies kept (`keep`), both copies
+/// stay as they are, an edit here waits, and the rest of the folder keeps
+/// syncing; with `prune`, OneDrive's copies go to its recycle bin, through
+/// the gate, once everything is here, and the copies here stay.
+#[tokio::test]
+async fn everyday_unticking_a_synced_folder_loses_nothing_and_does_what_was_chosen() {
+    for prune in [false, true] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(if prune { "untick-prune" } else { "untick-keep" }, cloud.clone());
+        write(&s.p("projects/app/main.rs"), b"fn main() {}");
+        write(&s.p("projects/notes.md"), b"notes");
+        write(&s.p("letters/a.txt"), b"letter");
+        s.settle().await;
+        assert!(cloud.tree().contains_key("/projects/app/main.rs"));
+
+        s.rules = user_rules(&["/projects/"]);
+        s.settle().await;
+        let t = cloud.tree();
+        assert_eq!(t["/projects/app/main.rs"].as_deref(), Some(&b"fn main() {}"[..]), "nothing removed by the rule");
+        assert_eq!(std::fs::read(s.p("projects/notes.md")).unwrap(), b"notes");
+        if prune {
+            let r = s.prune("projects").await;
+            assert_eq!(r.done.len(), 1, "{r:?}");
+            s.settle().await;
+            assert!(!cloud.tree().contains_key("/projects"), "OneDrive's copies removed");
+            assert!(cloud.holds(b"fn main() {}") && cloud.holds(b"notes"), "into OneDrive's recycle bin");
+        } else {
+            write(&s.p("projects/notes.md"), b"notes, edited while excluded");
+            s.settle().await;
+            assert_eq!(cloud.tree()["/projects/notes.md"].as_deref(), Some(&b"notes"[..]), "not sent");
+        }
+        assert_eq!(std::fs::read(s.p("projects/app/main.rs")).unwrap(), b"fn main() {}", "the copy here stays");
+        assert!(s.versions().is_empty(), "nothing here replaced or recycled");
+        write(&s.p("letters/a.txt"), b"letter, edited");
+        s.settle().await;
+        assert_eq!(cloud.tree()["/letters/a.txt"].as_deref(), Some(&b"letter, edited"[..]), "the rest syncs");
+    }
 }
 
 /// Renaming and moving files and folders here moves them in OneDrive:
