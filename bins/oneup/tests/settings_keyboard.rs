@@ -49,6 +49,15 @@ const HOST_ANSWERS = {
   apps: {series: [{name: "Word", counts: [1, 2, 0]}], apps: [{name: "Word", exe: "winword.exe", changed: 3, opened: 1, bytes: 1830}],
     start_ms: 0, hourly: false},
   app_files: [], rule_suggestions: {largest: [], busiest: []}, rule_files: [],
+  // Recovery: a rewind of 600 changes (two pages), one deleted item.
+  rewind_state: {since_ms: 1, job: null, code: null},
+  rewind_preview: a => ({folder: "/Docs", at_ms: 5000, code: "0123456789abcdef", started: false, skipped: [],
+    changes: Array.from({length: 600}, (_, i) => ({kind: "Revert", folder: false, then: "/Docs/f" + i, now: "/Docs/f" + i,
+      size: 10, source: "Versions"}))}),
+  rewind_start: a => ({...HOST_ANSWERS.rewind_preview(a), started: true}),
+  rewind_cancel: "", conflicts: [],
+  cloud_bin: [{seq: 7, at_ms: 5000, path: "/Docs/gone.txt", folder: false, size: 3, restorable: true}],
+  cloud_bin_restore: "/Docs/gone.txt",
 };
 window.chrome = {webview: {
   postMessage(text) {
@@ -182,6 +191,25 @@ const DRIVER: &str = r##"<script>
       check(sel + " takes focus", document.activeElement === e, at());
     }
     check("Work offline waits for the agent to run", document.querySelector("#net-offline").disabled, "");
+    // Recovery: focus follows the rewind's list and answers.
+    window.confirm = () => true;
+    document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);
+    document.querySelector("#rw-at").value = "2026-01-01T10:00:00";
+    document.querySelector("#rw-preview").focus();
+    document.querySelector("#rw-preview").click(); await sleep(300);
+    const more = document.querySelector("#rw-actions button");
+    check("a long list shows Show more, not Rewind", more && more.textContent === "Show more", more && more.textContent);
+    more.focus(); more.click(); await sleep(100);
+    check("Show more gives focus to what replaces it", document.activeElement.textContent === "Rewind", at());
+    document.activeElement.click(); await sleep(300);
+    check("asking for the rewind gives focus to Approve", document.activeElement.textContent === "Approve", at());
+    const cancel = [...document.querySelectorAll("#rw-actions button")].find(b => b.textContent === "Cancel");
+    cancel.focus(); cancel.click(); await sleep(300);
+    check("cancelling gives focus back to Preview", document.activeElement.id === "rw-preview", at());
+    const restore = document.querySelector("#rc-bin button");
+    check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore && restore.outerHTML);
+    restore.focus(); restore.click(); await sleep(300);
+    check("restoring keeps focus in the list as it reloads", document.querySelector("#rc-bin").contains(document.activeElement), at());
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }
