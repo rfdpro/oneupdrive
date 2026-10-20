@@ -264,6 +264,7 @@ pub fn keep_history(store: &mut Store, now_ms: i64, settled: bool) -> Result<()>
                 }
                 let needed = load(o)?.map(|j| j.at_ms);
                 o.history_prune_some(keep, now_ms, needed, PRUNE_BUDGET)?;
+                o.history_settle_marks(PRUNE_BUDGET)?;
             }
             None => o.history_stop()?,
         }

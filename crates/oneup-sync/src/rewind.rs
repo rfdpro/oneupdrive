@@ -101,10 +101,11 @@ pub trait History {
     /// follows the changes since the moment, not the size of the folder.
     fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>, Self::Error>;
 
-    /// The Synced folders that may hold changes not synced yet (the
-    /// planner's marks): what's in them may differ from its record without
-    /// a change in the history.
-    fn unsettled(&self) -> Result<Vec<Sid>, Self::Error>;
+    /// Records whose item may differ from them on either side, changes not
+    /// synced yet (found from the planner's marks), at most `limit`
+    /// (`None`: more): an item can differ from its record without a change
+    /// in the history.
+    fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>, Self::Error>;
 }
 
 /// How many records a rewind reads at most (changed since its moment,
@@ -320,9 +321,9 @@ where
     let mut cur = ROOT;
     for part in path {
         // What had the name then: a child with it now and no change since,
-        // or one the history has changing since. Only those are read again.
+        // or one the history has changing since. Only those are read.
         let mut candidates: BTreeSet<Sid> = h.children_after(cur, at)?.into_iter().collect();
-        candidates.extend(t.base_children(cur)?.into_iter().filter(|b| same_name(&b.name, part)).map(|b| b.sid));
+        candidates.extend(t.base_named(cur, part)?.into_iter().map(|b| b.sid));
         let mut next = None;
         for c in candidates {
             if let Some(w) = state_at(t, h, c, at)?
@@ -364,14 +365,10 @@ where
     let limit = read_limit(max);
     let Some(changed) = h.changed_after(at, limit)? else { return Err(Error::TooManySince) };
     let mut candidates: BTreeSet<Sid> = changed.into_iter().collect();
-    for f in h.unsettled()? {
-        candidates.insert(f);
-        for c in t.base_children(f)? {
-            candidates.insert(c.sid);
-        }
-        if candidates.len() > limit {
-            return Err(Error::TooManySince);
-        }
+    let Some(unsettled) = h.unsettled(limit)? else { return Err(Error::TooManySince) };
+    candidates.extend(unsettled);
+    if candidates.len() > limit {
+        return Err(Error::TooManySince);
     }
     if folder != ROOT {
         candidates.insert(folder);
