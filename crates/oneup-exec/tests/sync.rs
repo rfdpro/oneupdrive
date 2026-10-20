@@ -1993,22 +1993,53 @@ async fn a_crash_at_any_point_of_a_round_loses_nothing() {
     }
 }
 
-/// What a crash inside a replacing download left: whether the file was in
-/// its place, and with what.
+/// What a crash inside a replacing download left: what's at the file's
+/// name, whether the old version is in the version store, and the slots
+/// left without an item.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LeftAt {
-    /// Nothing at the name: the old version kept, the new one not placed.
-    Free,
-    Placed(Vec<u8>),
+struct LeftAt {
+    here: Option<Vec<u8>>,
+    old_kept: bool,
+    /// Slots left empty (killed after making one, before moving in).
+    empty: usize,
+    /// Slots left with only their `origin.txt` (killed after deleting a
+    /// dropped old copy, before removing its slot).
+    origin_only: usize,
+}
+
+impl Sync {
+    fn left_at(&self) -> LeftAt {
+        let (mut empty, mut origin_only) = (0, 0);
+        for slot in std::fs::read_dir(self.p(".oneup/versions")).unwrap().flatten() {
+            if !slot.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let names: Vec<_> = std::fs::read_dir(slot.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+            match names.as_slice() {
+                [] => empty += 1,
+                [only] if only == "origin.txt" => origin_only += 1,
+                _ => {}
+            }
+        }
+        LeftAt {
+            here: std::fs::read(self.p("a.txt")).ok(),
+            old_kept: self.versions().contains(&b"v1".to_vec()),
+            empty,
+            origin_only,
+        }
+    }
 }
 
 /// A crash inside a download that replaces a file, at each of its steps:
-/// the old version moved into the version store, the new one renamed into
-/// place, the old copy discarded (when OneDrive's history has it). Between
-/// the two renames the name is free and the old version is only in the
-/// version store. After a restart the new version arrives, the old one is
-/// still in the version store or OneDrive's history, nothing is left in
-/// staging, and the store's invariants hold. With and without keeping
+/// the old version moved into the version store (a slot made, the file
+/// moved in), the new one renamed into place, the old copy dropped (when
+/// OneDrive's history has it: deleted, then its slot removed). Between the
+/// two renames the name is free and the old version is only in the version
+/// store; between dropping the old copy and removing its slot, the slot
+/// holds only its `origin.txt`. After a restart the new version arrives,
+/// the old one is still in the version store or OneDrive's history,
+/// nothing is left in staging, the store's listing shows no slot without
+/// an item, and the store's invariants hold. With and without keeping
 /// replaced files.
 #[tokio::test]
 async fn a_crash_inside_a_replacing_download_loses_nothing() {
@@ -2027,11 +2058,11 @@ async fn a_crash_inside_a_replacing_download_loses_nothing() {
                 assert!(r.done.iter().any(|op| matches!(op, Op::Download { replace: Some(_), .. })), "{r:?}");
                 break;
             }
-            let here = std::fs::read(s.p("a.txt")).ok();
-            left.push(here.clone().map_or(LeftAt::Free, LeftAt::Placed));
-            if here.is_none() {
-                assert!(s.versions().contains(&b"v1".to_vec()), "keep {keep}, crash point {n}: v1 isn't kept");
+            let at = s.left_at();
+            if at.here.is_none() {
+                assert!(at.old_kept, "keep {keep}, crash point {n}: v1 isn't kept");
             }
+            left.push(at);
 
             let mut s = s.restart();
             let staging = std::fs::read_dir(s.p(".oneup/staging")).unwrap().count();
@@ -2047,14 +2078,22 @@ async fn a_crash_inside_a_replacing_download_loses_nothing() {
             if keep {
                 assert!(s.versions().contains(&b"v1".to_vec()), "keep {keep}, crash point {n}: v1 isn't kept");
             }
+            // A slot left empty or with only its origin is no kept item.
+            let listed = s.exec.local().versions().unwrap();
+            assert_eq!(listed.len(), s.versions().len(), "keep {keep}, crash point {n}: {listed:?}");
             let t = local_tree(&s.dir.0);
             assert_eq!(names(&t), BTreeSet::from(["/a.txt"]), "keep {keep}, crash point {n}");
         }
-        // The crashes did land inside the effect: between its renames, and
-        // after the new version was placed but before the old was dropped.
-        assert!(left.contains(&LeftAt::Free), "keep {keep}: {left:?}");
-        assert!(left.contains(&LeftAt::Placed(b"v2".to_vec())), "keep {keep}: {left:?}");
-        assert!(left.len() >= 5, "keep {keep}: only {} crash points", left.len());
+        // The crashes landed at each step inside the effect.
+        let v2 = Some(b"v2".to_vec());
+        let saw = |f: &dyn Fn(&LeftAt) -> bool| left.iter().any(f);
+        assert!(saw(&|a| a.empty == 1 && a.here.as_deref() == Some(b"v1")), "keep {keep}, a slot made: {left:?}");
+        assert!(saw(&|a| a.here.is_none() && a.old_kept), "keep {keep}, between the renames: {left:?}");
+        assert!(saw(&|a| a.here == v2 && a.old_kept), "keep {keep}, both kept: {left:?}");
+        let dropped = |a: &LeftAt| a.here == v2 && !a.old_kept && a.origin_only == 1;
+        // Only a dropped old copy (`keep` off) has the step between deleting
+        // it and removing its slot.
+        assert_eq!(saw(&dropped), !keep, "keep {keep}, old copy deleted, slot left: {left:?}");
     }
 }
 
