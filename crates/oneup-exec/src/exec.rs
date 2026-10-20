@@ -22,7 +22,7 @@ use oneup_sync::{
 };
 
 use crate::blocking::{Jobs, OffTask, Settle};
-use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Replaced, VersionMark};
+use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Ours, Replaced, VersionMark};
 use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
@@ -220,6 +220,10 @@ struct Rescue {
     /// The eTag the upload was to replace: still OneDrive's, the upload
     /// never committed.
     etag: String,
+    /// The eTag the upload left, once recorded, and its time and size as
+    /// the version history lists them, once read ([`Ours`]).
+    ours_etag: Option<String>,
+    ours: Option<VersionMark>,
     /// Rounds the version history couldn't tell what the upload went over.
     tries: u32,
     /// When it was given up (Unix ms), after [`RESCUE_TRIES`] such rounds.
@@ -250,6 +254,7 @@ impl Rescue {
             "id": self.id, "mark": mark_json(&self.mark), "theirs": self.theirs.as_ref().map(mark_json),
             "parent": self.parent, "to": self.to, "name": self.name, "etag": self.etag,
             "tries": self.tries, "given_up_ms": self.given_up_ms,
+            "ours_etag": self.ours_etag, "ours": self.ours.as_ref().map(mark_json),
         })
         .to_string()
     }
@@ -266,6 +271,8 @@ impl Rescue {
             etag: v["etag"].as_str().unwrap_or_default().to_string(),
             tries: v["tries"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
             given_up_ms: v["given_up_ms"].as_i64(),
+            ours_etag: v["ours_etag"].as_str().map(str::to_string),
+            ours: mark_of(&v["ours"]),
         })
     }
 }
@@ -960,9 +967,19 @@ impl<C: Cloud> Executor<C> {
             return Rescued::Later(Box::new(r), format!("{THEIRS_NOT_KEPT}; it {RESCUE_WAITS}"));
         }
         let id = RemoteId(r.id.clone());
-        let theirs = match &r.theirs {
-            Some(t) => t.clone(),
-            None => match self.cloud.replaced_other(&id, &r.mark).await {
+        let found = match &r.theirs {
+            Some(_) => None,
+            None => {
+                let mut ours = Ours { etag: r.ours_etag.clone(), mark: r.ours.clone() };
+                let got = self.cloud.replaced_other(&id, &r.mark, &mut ours).await;
+                r.ours = ours.mark;
+                Some(got)
+            }
+        };
+        let theirs = match (&r.theirs, found) {
+            (Some(t), _) => t.clone(),
+            (None, None) => return Rescued::Nothing,
+            (None, Some(got)) => match got {
                 Ok(Replaced::Other(v)) => v,
                 Ok(Replaced::Planned) => return Rescued::Nothing,
                 // The history doesn't show it (yet): unless the upload never
@@ -1077,7 +1094,16 @@ impl<C: Cloud> Executor<C> {
         let lost = |e: String| Fail::Failed(format!("{THEIRS_NOT_KEPT}: {e}"));
         let mut staged = self.fs.stage()?;
         let Some(file) = staged.file() else { return Err(odd()) };
-        let len = self.cloud.download_version(id, &theirs.id, &mut *file).await.map_err(|e| lost(e.to_string()))?;
+        // Asked again before each write: a network that stops letting it
+        // through (working offline, another network) stops it there.
+        let bytes = theirs.size.and_then(|s| u64::try_from(s).ok());
+        let go = || self.may_fetch(bytes);
+        let mut out = Stoppable { inner: &mut *file, go: &go, stopped: false };
+        let got = self.cloud.download_version(id, &theirs.id, &mut out).await;
+        if out.stopped {
+            return Err(lost(RESCUE_WAITS.into()));
+        }
+        let len = got.map_err(|e| lost(e.to_string()))?;
         if theirs.size.is_some_and(|s| u64::try_from(s).ok() != Some(len)) {
             return Err(lost("its content didn't match its size".into()));
         }
@@ -1099,6 +1125,9 @@ impl<C: Cloud> Executor<C> {
         let mut tries = 0;
         // A name OneDrive has that the Remote tree doesn't yet: another.
         while tries < NAME_TRIES {
+            if !self.may_fetch(Some(len)) {
+                return Err(lost(RESCUE_WAITS.into()));
+            }
             n += 1;
             let copy = conflict_candidate(name, NodeKind::File, n);
             if !store.read(|o| free(o, &copy))? {
@@ -1910,6 +1939,8 @@ impl<C: Cloud> Executor<C> {
                                 to: to.0.clone(),
                                 name: name.clone(),
                                 etag: pre.etag.clone(),
+                                ours_etag: None,
+                                ours: None,
                                 tries: 0,
                                 given_up_ms: None,
                             };
@@ -1937,7 +1968,24 @@ impl<C: Cloud> Executor<C> {
                 let written = !src.get().is_some_and(oneup_effects::UploadSource::unchanged);
                 drop(src);
                 let local_mtime = if written { STAMP_UNKNOWN } else { mtime };
-                store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
+                // The rescue record learns the eTag the upload left, which
+                // tells it apart from a later save.
+                let rescue_key = match (replace, &mark) {
+                    (Some(pre), Some(m)) => Some(format!("{}.{}.{}", Rescue::KEY, pre.id.0, m.id)),
+                    _ => None,
+                };
+                store
+                    .write(|o| {
+                        o.upsert_item(&row, false)?;
+                        if let Some(key) = &rescue_key
+                            && let Some(mut r) = o.meta_get(key)?.as_deref().and_then(Rescue::parse)
+                        {
+                            r.ours_etag.clone_from(&row.etag);
+                            o.meta_set(key, &r.to_json())?;
+                        }
+                        Ok::<_, Fail>(())
+                    })
+                    .await?;
                 if row.qxh != Some(sent) || i64::try_from(sent_len).ok() != Some(size) || row.size != size {
                     return Err(Fail::Skip(Skip::ContentMismatch));
                 }

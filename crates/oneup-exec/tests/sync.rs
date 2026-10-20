@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use oneup_effects::LocalFs;
 use oneup_exec::{
-    CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Replaced, Report, Source, VersionMark, link_roots,
+    CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Ours, Replaced, Report, Source, VersionMark, link_roots,
 };
 use oneup_gate::{
     Breaker, Choice, Context, Decision, ItemKey, Overflow, OverflowOutcome, Policy, Recent, Side, is_mass_sensitive,
@@ -71,10 +71,13 @@ struct State {
     replaced: BTreeMap<String, u64>,
     /// Versions in the history can't be downloaded (a service error).
     versions_fail: bool,
-    /// The history doesn't list the latest replacement for this many more
+    /// Each file's version history, newest first: its versions' times
+    /// (the eTag each content got) and sizes.
+    history: BTreeMap<String, Vec<(u64, i64)>>,
+    /// The history doesn't list the newest version for this many more
     /// looks (Graph's history can lag behind a commit).
     history_lag: u32,
-    /// Versions downloaded from the history.
+    /// Versions downloaded whole from the history.
     version_downloads: u32,
     /// No room left: uploads and new folders are refused (as with HTTP
     /// 507), and the requests refused counted (a batch counts once).
@@ -193,6 +196,9 @@ impl State {
     fn create(&mut self, parent: &str, name: &str, folder: bool, content: Vec<u8>) -> String {
         let id = format!("r{}", self.bump());
         let etag = self.bump();
+        if !folder {
+            self.history.entry(id.clone()).or_default().insert(0, (etag, content.len() as i64));
+        }
         self.items.insert(id.clone(), Item { parent: Some(parent.into()), name: name.into(), folder, content, etag });
         id
     }
@@ -285,6 +291,7 @@ impl Fake {
         let old = std::mem::replace(&mut it.content, content.to_vec());
         it.etag = etag;
         s.kept.push(old);
+        s.history.entry(id.to_string()).or_default().insert(0, (etag, content.len() as i64));
     }
     fn rename(&self, path: &str, name: &str) {
         let mut s = self.0.lock().unwrap();
@@ -542,13 +549,16 @@ impl Fake {
                     s = self.0.lock().unwrap();
                 }
                 let etag = s.bump();
+                // The version gone over, as its history names it.
+                let over = s.history.get(&pre.id.0).and_then(|h| h.first()).map_or(0, |v| v.0);
+                let len = content.len() as i64;
                 let it = s.items.get_mut(&pre.id.0).unwrap();
-                let over = it.etag;
                 let old = std::mem::replace(&mut it.content, content);
                 it.etag = etag;
                 s.kept.push(old.clone());
                 s.old.insert(over, old);
                 s.replaced.insert(pre.id.0.clone(), over);
+                s.history.entry(pre.id.0.clone()).or_default().insert(0, (etag, len));
                 pre.id.0.clone()
             }
             None => {
@@ -688,31 +698,42 @@ impl Cloud for Fake {
     async fn version_mark(&self, pre: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
         self.exchange(|| -> Result<Option<VersionMark>, CloudError> {
             let s = self.0.lock().unwrap();
-            let it = s.check(pre)?;
-            Ok(Some(VersionMark { id: it.etag.to_string(), modified_ms: None, size: Some(it.content.len() as i64) }))
+            s.check(pre)?;
+            let newest = s.history.get(&pre.id.0).and_then(|h| h.first()).copied();
+            Ok(newest.map(|(t, size)| VersionMark { id: t.to_string(), modified_ms: Some(t as i64), size: Some(size) }))
         })
         .await
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Replaced, CloudError> {
+    /// As Graph's: the file's current version read while it still holds
+    /// the replacement, then its history (without its newest entry while
+    /// the history lags).
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark, ours: &mut Ours) -> Result<Replaced, CloudError> {
         self.exchange(|| -> Result<Replaced, CloudError> {
             let mut s = self.0.lock().unwrap();
-            // Nothing replaced the planned version (yet), or the history
-            // doesn't show it.
-            let current = s.items.get(&id.0).map(|it| it.etag.to_string());
-            if s.history_lag > 0 || current.as_deref() == Some(mark.id.as_str()) {
-                s.history_lag = s.history_lag.saturating_sub(1);
-                return Ok(Replaced::Unknown);
+            let Some(etag) = s.items.get(&id.0).map(|it| it.etag.to_string()) else { return Ok(Replaced::Unknown) };
+            let history = s.history.get(&id.0).cloned().unwrap_or_default();
+            if ours.mark.is_none() {
+                if ours.etag.as_ref().is_some_and(|e| *e != etag) {
+                    return Ok(Replaced::Unknown);
+                }
+                let Some(&(t, size)) = history.first() else { return Ok(Replaced::Unknown) };
+                ours.mark = Some(VersionMark { id: t.to_string(), modified_ms: Some(t as i64), size: Some(size) });
             }
-            Ok(match s.replaced.get(&id.0) {
-                Some(e) if e.to_string() != mark.id => Replaced::Other(VersionMark {
-                    id: e.to_string(),
-                    modified_ms: None,
-                    size: Some(s.old[e].len() as i64),
-                }),
-                Some(_) => Replaced::Planned,
-                None => Replaced::Unknown,
-            })
+            let mut listed: Vec<oneup_graph::FileVersion> = history
+                .iter()
+                .map(|&(t, size)| oneup_graph::FileVersion {
+                    id: t.to_string(),
+                    modified_ms: Some(t as i64),
+                    size: Some(size),
+                    by: None,
+                })
+                .collect();
+            if s.history_lag > 0 {
+                s.history_lag -= 1;
+                listed.remove(0);
+            }
+            Ok(oneup_exec::graph::replaced_version(&listed, mark, ours.mark.as_ref().unwrap()))
         })
         .await
     }
@@ -724,15 +745,15 @@ impl Cloud for Fake {
         out: &mut (dyn Write + Send),
     ) -> Result<u64, CloudError> {
         self.exchange(|| -> Result<u64, CloudError> {
-            let mut s = self.0.lock().unwrap();
+            let s = self.0.lock().unwrap();
             if s.versions_fail {
                 return Err(CloudError::Other("HTTP 500".into()));
             }
-            s.version_downloads += 1;
             let content = s.old.get(&version.parse().unwrap()).cloned();
             drop(s);
             let content = content.ok_or_else(|| CloudError::Other("no such version".into()))?;
             out.write_all(&content)?;
+            self.0.lock().unwrap().version_downloads += 1;
             Ok(content.len() as u64)
         })
         .await
@@ -1763,6 +1784,43 @@ async fn keeping_an_edit_waits_for_a_network_that_lets_it_download() {
     let r = s.round().await;
     assert_eq!(r.kept_later, ["notes (conflict 1).txt"]);
     assert_eq!(cloud.0.lock().unwrap().version_downloads, 1);
+}
+
+/// A rescue download under way when the network stops letting it
+/// through (working offline, another network) stops at its next write;
+/// the record stays, and the edit is kept once it's allowed again.
+#[tokio::test]
+async fn a_rescue_download_stops_when_the_network_stops_letting_it_through() {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let cloud = Fake::new();
+    let mut s = Sync::new("raced-stopped", cloud.clone());
+    write(&s.p("notes.txt"), b"v1");
+    s.settle().await;
+
+    // Allowed when the rescue starts and when its download starts; not
+    // from then on.
+    let asked = Arc::new(AtomicU32::new(0));
+    let a = Arc::clone(&asked);
+    s.exec.set_may_fetch(Some(Arc::new(move |_| a.fetch_add(1, Relaxed) < 2)));
+    write(&s.p("notes.txt"), b"mine");
+    cloud.0.lock().unwrap().race = Some(b"theirs".to_vec());
+    let mut waits = Vec::new();
+    for _ in 0..5 {
+        let r = s.round().await;
+        assert!(r.kept_theirs.is_empty() && r.kept_later.is_empty(), "{r:?}");
+        waits.extend(r.theirs_not_kept.into_iter().map(|(_, why)| why));
+        if !waits.is_empty() {
+            break;
+        }
+    }
+    assert!(waits.iter().any(|w| w.contains("waits for a network")), "{waits:?}");
+    assert_eq!(cloud.0.lock().unwrap().version_downloads, 0, "stopped before its data was written");
+    assert_eq!(cloud.tree().len(), 1);
+    let left = s.obs.store().read(|o| o.meta_under("exec.rescue")).unwrap();
+    assert_eq!(left.len(), 1, "the record stays");
+
+    s.exec.set_may_fetch(None);
+    assert_eq!(s.round().await.kept_later, ["notes (conflict 1).txt"]);
 }
 
 /// Server-side copy: a new local file whose content OneDrive

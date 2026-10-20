@@ -77,7 +77,7 @@ pub mod resolve;
 mod schedule;
 pub mod timing;
 
-pub use cloud::{Cloud, CloudError, Meta, MetaDone, Replaced, Source, VersionMark};
+pub use cloud::{Cloud, CloudError, Meta, MetaDone, Ours, Replaced, Source, VersionMark};
 #[cfg(all(windows, feature = "crash-test"))]
 pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]

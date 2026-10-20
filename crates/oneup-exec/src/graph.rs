@@ -17,7 +17,7 @@ use oneup_graph::{DriveItem, FileVersion, Graph};
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
 
-use crate::cloud::{Cloud, CloudError, Meta, MetaDone, Replaced, Source, VersionMark};
+use crate::cloud::{Cloud, CloudError, Meta, MetaDone, Ours, Replaced, Source, VersionMark};
 use crate::timing::Timings;
 
 /// The executor's view of a signed-in drive.
@@ -829,29 +829,39 @@ where
     }
 }
 
-/// What a replacement went over, from a history listed newest first (the
-/// replacement itself first): the entry right after the newest when
-/// `base` is further down; `base`'s version when it's right after.
-/// [`Replaced::Unknown`] if `base` is the newest (the history doesn't list
-/// the replacement yet, or it never committed) or isn't listed at all: a
-/// guess could copy the wrong version. A version is `base`'s by its ID
-/// and, where the history gives them, its time and size; or, failing the
-/// ID (it may change once a version is no longer the current one), by time
-/// and size.
-fn replaced_version(versions: &[FileVersion], base: &VersionMark) -> Replaced {
-    let same = |v: &FileVersion| v.modified_ms.is_some() && v.modified_ms == base.modified_ms && v.size == base.size;
-    let at = versions
+/// What a replacement went over, from a history listed newest first:
+/// the entry right below the replacement (`ours`, found by its time and
+/// size) is `base`'s version, as planned, or another one, an edit gone
+/// over, when `base` is further down. [`Replaced::Unknown`] if `ours`
+/// isn't listed (the history lags behind a commit: what's newest may be
+/// the edit itself) or `base` isn't below it: a guess could copy the wrong
+/// version, or none. A version is `base`'s by its ID and, where the history
+/// gives them, its time and size; or, failing the ID (it may change once a
+/// version is no longer the current one), by time and size.
+#[doc(hidden)]
+pub fn replaced_version(versions: &[FileVersion], base: &VersionMark, ours: &VersionMark) -> Replaced {
+    let stamp = |v: &FileVersion, m: &VersionMark| {
+        m.modified_ms.is_some() && v.modified_ms == m.modified_ms && v.size == m.size
+    };
+    // By its ID where it's known: a rename while it's the current version
+    // moves its time (measured).
+    let is_ours = |v: &FileVersion| if ours.id.is_empty() { stamp(v, ours) } else { v.id == ours.id };
+    let Some(o) = versions.iter().position(is_ours) else {
+        tracing::debug!("a large upload isn't in its file's history yet");
+        return Replaced::Unknown;
+    };
+    let below = &versions[o + 1..];
+    let at = below
         .iter()
-        .position(|v| v.id == base.id && (base.modified_ms.is_none() || same(v)))
-        .or_else(|| versions.iter().skip(1).position(same).map(|i| i + 1));
-    match at {
-        Some(i) if i >= 2 => versions.get(1).map_or(Replaced::Unknown, |v| {
+        .position(|v| v.id == base.id && (base.modified_ms.is_none() || stamp(v, base)))
+        .or_else(|| below.iter().position(|v| stamp(v, base)));
+    match (at, below.first()) {
+        (Some(0), _) => Replaced::Planned,
+        (Some(_), Some(v)) => {
             Replaced::Other(VersionMark { id: v.id.clone(), modified_ms: v.modified_ms, size: v.size })
-        }),
-        Some(1) => Replaced::Planned,
-        Some(_) => Replaced::Unknown,
-        None => {
-            tracing::debug!("the version a large upload replaced isn't in the file's history yet");
+        }
+        _ => {
+            tracing::debug!("the version a large upload replaced isn't in the file's history");
             Replaced::Unknown
         }
     }
@@ -987,9 +997,22 @@ impl Cloud for GraphCloud {
         }))
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Replaced, CloudError> {
+    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark, ours: &mut Ours) -> Result<Replaced, CloudError> {
+        if ours.mark.is_none() {
+            // Read from the file while it still holds the replacement: its
+            // eTag is the upload's. Saved again since, ours can't be told
+            // from what's in the history.
+            let Some((etag, now)) = self.graph.current_version(&id.0).await.map_err(map)? else {
+                return Ok(Replaced::Unknown);
+            };
+            if ours.etag.is_some() && ours.etag != etag || now.id.is_empty() && now.modified_ms.is_none() {
+                return Ok(Replaced::Unknown);
+            }
+            ours.mark = Some(VersionMark { id: now.id, modified_ms: now.modified_ms, size: now.size });
+        }
+        let Some(o) = &ours.mark else { return Ok(Replaced::Unknown) };
         let versions = self.graph.versions(&id.0).await.map_err(map)?;
-        Ok(replaced_version(&versions, mark))
+        Ok(replaced_version(&versions, mark, o))
     }
 
     async fn download_version(
@@ -1781,10 +1804,12 @@ mod tests {
         let ours = version("3.0", 300, 30);
         let theirs = version("2.5", 250, 25);
         let planned = version("2.0", 200, 20);
+        let us = VersionMark { id: String::new(), modified_ms: Some(300), size: Some(30) };
+        let rv = |list: &[FileVersion]| replaced_version(list, &base, &us);
         // Ours went over the planned version.
-        assert_eq!(replaced_version(&[ours.clone(), planned.clone()], &base), Replaced::Planned);
+        assert_eq!(rv(&[ours.clone(), planned.clone()]), Replaced::Planned);
         // An edit landed in between: that's the one gone over.
-        let got = |list: &[FileVersion]| match replaced_version(list, &base) {
+        let got = |list: &[FileVersion]| match rv(list) {
             Replaced::Other(v) => Some(v.id),
             _ => None,
         };
@@ -1792,11 +1817,23 @@ mod tests {
         // The planned version under another ID once it's no longer current.
         let renamed = version("x", 200, 20);
         assert_eq!(got(&[ours.clone(), theirs.clone(), renamed.clone()]).as_deref(), Some("2.5"));
-        assert_eq!(replaced_version(&[ours.clone(), renamed], &base), Replaced::Planned);
-        // A history that doesn't show the planned version, or not yet ours:
-        // no guess, and nothing said done either.
-        assert_eq!(replaced_version(&[ours, theirs], &base), Replaced::Unknown);
-        assert_eq!(replaced_version(&[planned], &base), Replaced::Unknown);
+        assert_eq!(rv(&[ours.clone(), renamed]), Replaced::Planned);
+        // Saved again after ours: still what ours went over.
+        let later = version("4.0", 400, 40);
+        assert_eq!(got(&[later, ours.clone(), theirs.clone(), planned.clone()]).as_deref(), Some("2.5"));
+        // The history lags behind our commit: the edit is newest, the
+        // planned version right below it. Not "as planned": can't tell.
+        assert_eq!(rv(&[theirs.clone(), planned.clone()]), Replaced::Unknown);
+        // Ours known by its ID: found even after a rename moved its time.
+        let us_id = VersionMark { id: "3.0".into(), modified_ms: Some(999), size: Some(30) };
+        assert_eq!(
+            replaced_version(&[ours.clone(), theirs.clone(), planned.clone()], &base, &us_id),
+            Replaced::Other(VersionMark { id: "2.5".into(), modified_ms: Some(250), size: Some(25) })
+        );
+        assert_eq!(replaced_version(&[theirs.clone(), planned.clone()], &base, &us_id), Replaced::Unknown);
+        // Nor without the planned version, or without ours.
+        assert_eq!(rv(&[ours, theirs]), Replaced::Unknown);
+        assert_eq!(rv(&[planned]), Replaced::Unknown);
     }
 
     /// A full OneDrive reads as such whichever way OneDrive says it, and
