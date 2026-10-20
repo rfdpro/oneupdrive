@@ -1,4 +1,4 @@
-//! The Synced tree's history (schema v22): for each change to a Synced row,
+//! The Synced tree's history (schema v23): for each change to a Synced row,
 //! what the row agreed on until then, and when. It's what a rewind
 //! reconstructs a folder's past from, and what lists items deleted from
 //! OneDrive by ID (the OneDrive Personal recycle bin can't be listed
@@ -37,12 +37,15 @@ const CREATED: i64 = 0;
 const CHANGED: i64 = 1;
 const REMOVED: i64 = 2;
 
-/// v21 -> v22: the history table, its indexes and its triggers. A folder
-/// already synced is covered from now on; a new one from the end of its
+/// v23: the history table, its indexes and its triggers, the index on
+/// Synced names and the item marks. It touches only `synced_item`,
+/// `local_item`, `remote_item` and `meta`, all there since v9, so it runs
+/// on v19 as on any version after it. A folder already synced is covered
+/// from now on; a new one from the end of its
 /// first sync ([`Ops::history_start`]): the records a first sync makes
 /// are of items that were there before it, not created then, and a large
 /// folder's would fill the history at once.
-pub(crate) fn migrate_v22() -> String {
+pub(crate) fn migrate_v23() -> String {
     let on = format!("EXISTS (SELECT 1 FROM meta WHERE key = '{ON}')");
     let unsettled = unsettled_triggers(&on);
     format!(
@@ -152,9 +155,9 @@ fn unsettled_triggers(on: &str) -> String {
     .concat()
 }
 
-/// Undoes [`migrate_v22`], for tests that make an older store.
+/// Undoes [`migrate_v23`], for tests that make an older store.
 #[cfg(test)]
-pub(crate) const UNDO_V22: &str = "DROP TRIGGER synced_history_ins; DROP TRIGGER synced_history_upd;
+pub(crate) const UNDO_V23: &str = "DROP TRIGGER synced_history_ins; DROP TRIGGER synced_history_upd;
     DROP TRIGGER synced_history_del; DROP TABLE synced_history; DROP INDEX synced_item_name;
     DROP TRIGGER unsettled_local_ins; DROP TRIGGER unsettled_local_upd; DROP TRIGGER unsettled_local_del;
     DROP TRIGGER unsettled_remote_ins; DROP TRIGGER unsettled_remote_upd; DROP TRIGGER unsettled_remote_del;
@@ -521,6 +524,66 @@ mod tests {
             remote: Some(RemoteId("root".into())),
             remote_etag: String::new(),
         }
+    }
+
+    /// A store at v19 (the last version before this one's neighbours) with
+    /// a synced folder comes up to v23: the history is kept from then on,
+    /// a change is recorded, an item that changes is marked, and a child
+    /// is found by name through the new index.
+    #[test]
+    fn a_store_at_v19_is_upgraded() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-history-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            s.write(|o| {
+                o.synced_put(&root())?;
+                o.synced_put(&base(1, ROOT, "a.txt", 3))
+            })
+            .unwrap();
+            s.read(|o| Ok(o.c.execute_batch(&format!("{UNDO_V23} DELETE FROM meta; PRAGMA user_version = 19;"))?))
+                .unwrap();
+            let v: i64 = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
+            assert_eq!(v, 19);
+        }
+        let mut s = Store::open(&path, 1024).unwrap();
+        let v: i64 = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(v, 23);
+        assert!(s.read(|o| o.history_since()).unwrap() < i64::MAX, "already synced: kept from the upgrade");
+        s.write(|o| o.synced_put(&base(1, ROOT, "a.txt", 4))).unwrap();
+        assert_eq!(s.read(|o| o.history_rows()).unwrap(), 1, "a change is recorded");
+        let named = s.read(|o| oneup_sync::Trees::base_named(o, ROOT, "A.TXT")).unwrap();
+        assert_eq!(named.iter().map(|b| b.sid).collect::<Vec<_>>(), [1], "found by name");
+        s.write(|o| {
+            o.upsert_item(
+                &crate::RemoteRow {
+                    id: "r1".into(),
+                    parent_id: Some("root".into()),
+                    name: "a.txt".into(),
+                    kind: crate::Kind::File,
+                    size: 9,
+                    etag: Some("e2".into()),
+                    qxh: None,
+                    mtime_ms: None,
+                },
+                false,
+            )
+            .map(drop)
+        })
+        .unwrap();
+        let marked: Vec<i64> = s
+            .read(|o| {
+                Ok(o.c
+                    .prepare("SELECT sid FROM synced_unsettled")?
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?)
+            })
+            .unwrap();
+        assert_eq!(marked, [1], "an item that changes is marked");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Moves every row's time to `at`, so tests can tell moments apart.

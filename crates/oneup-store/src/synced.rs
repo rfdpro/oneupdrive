@@ -890,7 +890,7 @@ pub(crate) mod tests {
                 o.c.execute_batch(crate::dupes::UNDO_V20)?;
                 o.c.execute_batch(crate::choose::UNDO_V19)?;
                 o.c.execute_batch(crate::search::UNDO_V18)?;
-                o.c.execute_batch(crate::history::UNDO_V22)?;
+                o.c.execute_batch(crate::history::UNDO_V23)?;
                 o.c.execute_batch(
                     "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
                      DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;
