@@ -1,7 +1,7 @@
 //! Where a hook's program is, how it's launched, and whether a cloud value
 //! can ever reach it as code.
 //!
-//! The rule ([`docs/architecture/data-safety.md`] invariant 17): **cloud
+//! The rule ([`docs/architecture/data-safety.md`] invariant 18): **cloud
 //! data never reaches a code position.** Two parts:
 //!
 //! * The program (and any script) must live outside every folder a cloud
