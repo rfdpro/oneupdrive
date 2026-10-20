@@ -164,6 +164,21 @@ pub trait Cloud: Send + Sync {
         out: &mut (dyn Write + Send),
     ) -> impl Future<Output = Result<u64, CloudError>> + Send;
 
+    /// The file's versions in OneDrive's history, newest first (its current
+    /// one included). Read-only. No default, like [`Cloud::children`].
+    fn versions(&self, id: &RemoteId) -> impl Future<Output = Result<Vec<VersionMark>, CloudError>> + Send;
+
+    /// Brings deleted item `id` back from OneDrive's recycle bin into folder
+    /// `parent` as `name`, only if the name is free there; returns it as the
+    /// cloud now has it. [`CloudError::Changed`]: it's no longer in the
+    /// recycle bin. No default, like [`Cloud::children`].
+    fn restore(
+        &self,
+        id: &RemoteId,
+        parent: &RemoteId,
+        name: &str,
+    ) -> impl Future<Output = Result<RemoteRow, CloudError>> + Send;
+
     /// Whether operations may run several at a time. `false`: the executor
     /// runs one at a time. No default, like [`Cloud::children`]: a wrapper
     /// that didn't pass a `false` on would run its cloud concurrently.

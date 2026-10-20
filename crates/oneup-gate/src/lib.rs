@@ -40,6 +40,12 @@
 //!   list, but never counted in, nor released by, a mass breaker's list, and
 //!   they don't hold the rest of the round back. What they remove here
 //!   always goes to the version store.
+//! * **Rewind** (F2): every step of rewinding a folder ([`Op::Rewind`]) is
+//!   on a stop of its own, whatever the limits, until the user approves its
+//!   list. Its follow-ups on this PC (a reverted file downloaded, a moved
+//!   one moved, a removed one recycled) aren't counted by the breakers
+//!   while the caller names their items ([`Context::rewound`]): the user
+//!   approved them with the rewind.
 //! * **Malformed** operations, as a defence in depth: a file operation
 //!   without a size/time stamp could not be re-checked, so it never runs.
 //! * The planner's own **holds** pass through, so they can be reported.
@@ -66,7 +72,8 @@
 //! [`sharing::review_permission`], for removing a sharing link or setting
 //! its expiry (it changes who can open an item, never its content).
 
-use oneup_sync::{LocalId, Op, Sid};
+use oneup_sync::rewind::Step;
+use oneup_sync::{Link, LocalId, Op, Sid};
 
 pub mod content;
 pub mod release;
@@ -86,6 +93,12 @@ impl Side {
     pub fn changed_by(op: &Op) -> Option<Side> {
         match op {
             Op::Pair { .. } | Op::Record(_) | Op::Forget(_) | Op::Hash(_) | Op::Hold { .. } => None,
+            // Setting this PC's copy aside, or forgetting a record so
+            // OneDrive's copy comes back, changes what this PC has.
+            Op::Rewind { step, .. } => match &**step {
+                Step::SetAside { .. } | Step::Forget | Step::Discard { .. } => Some(Side::Local),
+                _ => Some(Side::Remote),
+            },
             Op::Download { .. }
             | Op::MkdirLocal { .. }
             | Op::MoveLocal { .. }
@@ -420,6 +433,8 @@ pub enum BreakerKind {
     /// Duplicate copies the user chose to remove (see the module docs):
     /// always a stop, whatever the limits.
     Removal,
+    /// A rewind (F2): always a stop, whatever its size.
+    Rewind,
 }
 
 /// A tripped circuit breaker, for the user to review.
@@ -541,6 +556,25 @@ pub struct Context<'a> {
     /// type ([`content::looks_wrong`]), **sorted**. Uploads of these count
     /// for the content guard.
     pub suspicious: &'a [LocalId],
+    /// Synced items an approved rewind changed in OneDrive, **sorted**: this
+    /// PC following those changes ([`follows_rewind`]) isn't counted by the
+    /// circuit breakers.
+    pub rewound: &'a [Sid],
+}
+
+/// Whether `op` brings this PC along with a change a rewind made in
+/// OneDrive to an item in `rewound` (sorted): a reverted file downloaded
+/// over the copy here, a file or folder moved back, one removed recycled.
+/// Each still runs under its own preconditions and keeps what it replaces
+/// as any download or recycling does.
+pub fn follows_rewind(op: &Op, rewound: &[Sid]) -> bool {
+    let sid = match op {
+        Op::Download { replace: Some(_), link: Link::Existing(sid), .. }
+        | Op::MoveLocal { sid, .. }
+        | Op::RecycleLocal { sid, .. } => *sid,
+        _ => return false,
+    };
+    rewound.binary_search(&sid).is_ok()
 }
 
 /// Whether `op` removes a duplicate copy the user chose to remove: an
@@ -593,11 +627,12 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     let listed = |kind, (_, op, path): Item<'_>| is_listed(kind, op, path, cx.approved);
     let removal = is_removal;
     for (i, op, p) in items.iter().copied() {
-        for kind in [BreakerKind::Mass, BreakerKind::Suspicious, BreakerKind::Removal] {
+        for kind in [BreakerKind::Mass, BreakerKind::Suspicious, BreakerKind::Removal, BreakerKind::Rewind] {
             let relevant = match kind {
                 BreakerKind::Mass => is_mass_sensitive(op) && !removal(op),
                 BreakerKind::Suspicious => is_suspicious(op, cx.suspicious),
                 BreakerKind::Removal => removal(op),
+                BreakerKind::Rewind => matches!(op, Op::Rewind { .. }),
             };
             if relevant && let Some(k) = listed_key(kind, op, p, cx.approved) {
                 on_lists[i].push(k);
@@ -607,7 +642,9 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     for side in [Side::Local, Side::Remote] {
         // A removal the user chose has a list of its own: a mass list's
         // approval never covers it.
-        let on_side = |(_, o, _): &Item<'_>| Side::changed_by(o) == Some(side) && is_mass_sensitive(o) && !removal(o);
+        let on_side = |(_, o, _): &Item<'_>| {
+            Side::changed_by(o) == Some(side) && is_mass_sensitive(o) && !removal(o) && !follows_rewind(o, cx.rewound)
+        };
         let batch: Vec<Item<'_>> = items.iter().copied().filter(on_side).collect();
         if batch.is_empty() {
             continue;
@@ -677,6 +714,31 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
         if cx.approvals.contains(&Approval { side, fingerprint: b.fingerprint }) {
             for (i, o, p) in &rest {
                 on_lists[*i].push(item_key(BreakerKind::Removal, o, p));
+            }
+            out.answered.push(b);
+        } else {
+            lists.push(rest.iter().map(|(i, _, _)| *i).collect());
+            breakers.push(b);
+        }
+    }
+
+    // A rewind: every step waits for the user's approval of its list,
+    // however few.
+    let batch: Vec<Item<'_>> = items.iter().copied().filter(|(_, o, _)| matches!(o, Op::Rewind { .. })).collect();
+    let (on_list, rest): (Vec<Item<'_>>, Vec<Item<'_>>) =
+        batch.into_iter().partition(|i| listed(BreakerKind::Rewind, *i));
+    if !rest.is_empty() {
+        // Its folders to remove once emptied, in a later round, are on the
+        // list too ([`Context::pending`]).
+        let later: Vec<Item<'_>> = pending
+            .iter()
+            .copied()
+            .filter(|i| matches!(i.1, Op::Rewind { .. }) && !listed(BreakerKind::Rewind, *i))
+            .collect();
+        let b = breaker(BreakerKind::Rewind, Side::Remote, cx, &rest, later, on_list.len());
+        if cx.approvals.contains(&Approval { side: Side::Remote, fingerprint: b.fingerprint }) {
+            for (i, o, p) in &rest {
+                on_lists[*i].push(item_key(BreakerKind::Rewind, o, p));
             }
             out.answered.push(b);
         } else {
@@ -783,6 +845,10 @@ pub fn store_size(policy: &Policy, op: &Op) -> Option<u64> {
         Op::RecycleLocal { local, .. } | Op::RemoveCopy { local: Some(local), .. } => {
             local.stamp.map(|(size, _)| size.max(0) as u64)
         }
+        Op::Rewind { step, .. } => match &**step {
+            Step::SetAside { local } | Step::Discard { local } => local.stamp.map(|(size, _)| size.max(0) as u64),
+            _ => None,
+        },
         Op::Download { replace: Some(local), .. } if policy.keep_replaced => {
             local.stamp.map(|(size, _)| size.max(0) as u64)
         }
@@ -807,6 +873,10 @@ fn malformed(op: &Op) -> bool {
         Op::Upload { local, .. } | Op::Hash(local) | Op::RemoveCopy { local: Some(local), .. } => local.stamp.is_none(),
         // Nothing to remove.
         Op::RemoveCopy { local: None, remote: None, .. } => true,
+        // Only files are set aside.
+        Op::Rewind { step, .. } => {
+            matches!(&**step, Step::SetAside { local } | Step::Discard { local } if local.stamp.is_none())
+        }
         Op::Download { replace: Some(local), .. } => local.stamp.is_none(),
         // Folders are created or empty when they move; anything goes.
         _ => false,
@@ -847,6 +917,7 @@ fn breaker(
         BreakerKind::Mass => b"breaker",
         BreakerKind::Suspicious => b"suspicious",
         BreakerKind::Removal => b"removal",
+        BreakerKind::Rewind => b"rewind",
     };
     Breaker {
         kind,
@@ -857,6 +928,7 @@ fn breaker(
             BreakerKind::Suspicious => cx.recent.suspicious,
             // No limit to have used up: only what approved lists ran.
             BreakerKind::Removal => 0,
+            BreakerKind::Rewind => 0,
         }
         .saturating_add(approved),
         synced_items: cx.synced_items,
@@ -891,8 +963,49 @@ pub fn item_key(kind: BreakerKind, op: &Op, path: &str) -> ItemKey {
             };
             key_of(kind, &unstamped, path)
         }
+        // A rewind's step is keyed by what it does and the state it saw
+        // (its `from`), not the eTag: a folder's changes as the rewind's
+        // other steps empty or fill it, and an item the user changed after
+        // the preview has another `from` anyway.
+        Op::Rewind { sid, step } => {
+            let unstamped = match &**step {
+                Step::Reset { remote, from, place, content } => Step::Reset {
+                    remote: oneup_sync::RemotePre { id: remote.id.clone(), etag: String::new() },
+                    from: from.clone(),
+                    place: place.clone(),
+                    content: *content,
+                },
+                Step::Remove { remote, from } => Step::Remove {
+                    remote: oneup_sync::RemotePre { id: remote.id.clone(), etag: String::new() },
+                    from: from.clone(),
+                },
+                s => s.clone(),
+            };
+            key_of(kind, &Op::rewind(*sid, unstamped), path)
+        }
         _ => key_of(kind, op, path),
     }
+}
+
+/// The code a rewind's stop shows for `ops` (each shown at the path of the
+/// same place in `paths`), as [`review_in`] works it out, so a preview can
+/// name the code its stop will have.
+pub fn rewind_fingerprint(ops: &[Op], paths: &[String]) -> Fingerprint {
+    let mut items = rewind_keys(ops, paths);
+    items.sort_unstable();
+    items.dedup();
+    fingerprint(b"rewind", &items)
+}
+
+/// The keys of a rewind's steps `ops` (each shown at the path of the same
+/// place in `paths`): what approving them approves, for the caller to keep
+/// in [`Context::approved`] while the rewind runs.
+pub fn rewind_keys(ops: &[Op], paths: &[String]) -> Vec<ItemKey> {
+    ops.iter()
+        .enumerate()
+        .filter(|(_, o)| matches!(o, Op::Rewind { .. }))
+        .map(|(i, o)| item_key(BreakerKind::Rewind, o, paths.get(i).map_or("", String::as_str)))
+        .collect()
 }
 
 /// The key of a folder deletion still to come: without the cloud folder's
@@ -943,6 +1056,7 @@ fn key_of(kind: BreakerKind, op: &Op, path: &str) -> ItemKey {
         BreakerKind::Mass => b"mass",
         BreakerKind::Suspicious => b"suspicious",
         BreakerKind::Removal => b"removal",
+        BreakerKind::Rewind => b"rewind",
     };
     let mut h = sha2::Sha256::new();
     h.update(tag);
@@ -989,6 +1103,7 @@ pub fn sid_of(op: &Op) -> Option<Sid> {
         | Op::DeleteRemote { sid, .. }
         | Op::RecycleLocal { sid, .. } => Some(*sid),
         Op::Hold { sid, .. } => *sid,
+        Op::Rewind { sid, .. } => Some(*sid),
         _ => None,
     }
 }
@@ -1023,6 +1138,81 @@ mod tests {
             replace: Some(rpre(i)),
             link: Link::Existing(i as Sid),
         }
+    }
+
+    fn revert(i: u128, etag: &str, hash: u8) -> Op {
+        use oneup_sync::rewind::Spot;
+        Op::rewind(
+            i as Sid,
+            Step::Reset {
+                remote: RemotePre { id: RemoteId(format!("r{i}")), etag: etag.into() },
+                from: Spot { parent: RemoteId("root".into()), name: format!("f{i}"), size: 1, hash: Some([hash; 20]) },
+                place: None,
+                content: Some((1, [0; 20])),
+            },
+        )
+    }
+
+    #[test]
+    fn a_rewind_always_waits_for_its_approval_and_runs_only_what_it_approved() {
+        // Whatever the limits: even one step, with the breakers off.
+        let lax = Policy { max_count: usize::MAX, min_count: usize::MAX, max_percent: 100, ..Policy::default() };
+        let paths = vec!["/f1".to_string()];
+        let cx = Context { synced_items: 1_000_000, paths: &paths, ..Context::default() };
+        let r = review_in(&lax, &cx, vec![revert(1, "e1", 1), upload_over(2)]);
+        assert_eq!(r.breakers.len(), 1);
+        let b = &r.breakers[0];
+        assert_eq!((b.kind, b.count), (BreakerKind::Rewind, 1));
+        assert!(matches!(r.withheld[..], [(Op::Rewind { .. }, Withheld::Breaker(Side::Remote))]));
+        assert_eq!(r.approved.len(), 1, "the upload stands on its own (the caller runs nothing while a stop stands)");
+        assert_eq!(
+            b.fingerprint,
+            rewind_fingerprint(&[revert(1, "e1", 1)], &paths),
+            "the preview's code is the stop's"
+        );
+
+        // Approved by its code, it runs.
+        let ok = [Approval { side: Side::Remote, fingerprint: b.fingerprint }];
+        let r = review_in(&lax, &Context { approvals: &ok, ..cx }, vec![revert(1, "e1", 1)]);
+        assert!(r.breakers.is_empty() && r.approved.len() == 1 && r.answered.len() == 1);
+
+        // Approved item by item: its key covers it whatever its eTag (the
+        // rewind's own steps change it), not if the item itself changed.
+        let keys = {
+            let mut k = rewind_keys(&[revert(1, "e1", 1)], &paths);
+            k.sort_unstable();
+            k
+        };
+        let cx = Context { approved: &keys, ..cx };
+        assert_eq!(review_in(&lax, &cx, vec![revert(1, "e2", 1)]).approved.len(), 1);
+        let r = review_in(&lax, &cx, vec![revert(1, "e1", 2)]);
+        assert_eq!((r.approved.len(), r.breakers.len()), (0, 1), "a changed item needs a new approval");
+        // Shown at another path, it's another item too.
+        let elsewhere = vec!["/moved/f1".to_string()];
+        assert_eq!(review_in(&lax, &Context { paths: &elsewhere, ..cx }, vec![revert(1, "e1", 1)]).breakers.len(), 1);
+    }
+
+    #[test]
+    fn following_an_approved_rewind_isnt_counted_by_the_breakers() {
+        let follow = |i: u128| Op::Download {
+            remote: rpre(i),
+            to: LocalId(1),
+            parent: 0,
+            name: format!("f{i}"),
+            replace: Some(lpre(i)),
+            link: Link::Existing(i as Sid),
+        };
+        let ops: Vec<Op> = (1..=30).map(follow).collect();
+        let cx = Context { synced_items: 100, ..Context::default() };
+        assert_eq!(review_in(&Policy::default(), &cx, ops.clone()).breakers.len(), 1);
+        let rewound: Vec<Sid> = (1..=30).collect();
+        let r = review_in(&Policy::default(), &Context { rewound: &rewound, ..cx }, ops.clone());
+        assert!(r.breakers.is_empty() && r.approved.len() == 30);
+        // Only those items, and only what follows a change made in OneDrive.
+        let some: Vec<Sid> = (1..=5).collect();
+        assert_eq!(review_in(&Policy::default(), &Context { rewound: &some, ..cx }, ops).breakers.len(), 1);
+        let deletes: Vec<Op> = (1..=30).map(delete_remote).collect();
+        assert_eq!(review_in(&Policy::default(), &Context { rewound: &rewound, ..cx }, deletes).breakers.len(), 1);
     }
 
     #[test]

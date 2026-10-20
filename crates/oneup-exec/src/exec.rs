@@ -26,6 +26,9 @@ use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Replaced, Version
 use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
+mod rewind;
+pub use rewind::rewind_mark;
+
 /// The store, shared by the operations under way. Each use locks it for
 /// one synchronous read or transaction, never across an `.await`.
 ///
@@ -527,6 +530,7 @@ fn stage(op: &Op) -> &'static str {
         | Op::Dehydrate { .. } => "op: local change",
         Op::RemoveCopy { .. } => "op: duplicate removal",
         Op::Hash(_) => "op: hash",
+        Op::Rewind { .. } => "op: rewind",
         Op::Pair { .. } | Op::Record(_) | Op::Forget(_) | Op::Hold { .. } => "op: bookkeeping",
     }
 }
@@ -2546,6 +2550,7 @@ impl<C: Cloud> Executor<C> {
                     })
                     .await
             }
+            Op::Rewind { sid, step } => self.rewind(store, a, *sid, step).await,
             Op::Hold { .. } => Err(Fail::Failed("a held item can't be executed".into())),
         }
     }
@@ -2571,6 +2576,9 @@ impl<C: Cloud> Executor<C> {
             // A conflict copy renames it in place.
             Some(Pending::Detached { local, name, .. }) => self.fs.name_of(*local).is_some_and(|n| n != *name),
             Some(Pending::Removing { local, .. }) => self.fs.is_present(*local),
+            // Setting a copy aside takes it out of the folder; still there,
+            // nothing happened and the record stays.
+            Some(Pending::Aside { local, .. }) => self.fs.is_present(*local),
             None => false,
         };
         tracing::debug!(undo, "settling an unfinished write-ahead record");
@@ -2592,6 +2600,8 @@ impl<C: Cloud> Executor<C> {
                             o.synced_put(&Base { local: Some(local), ..b })?;
                         }
                     }
+                    // Moved aside: its record goes, as the step would have.
+                    Some(Pending::Aside { sid, local }) if !undo => rewind::forget_aside(o, sid, local)?,
                     _ => {}
                 }
                 Ok(o.meta_delete(key)?)
@@ -2628,7 +2638,7 @@ fn pending_key(op: &Op) -> Option<String> {
         Op::RecycleLocal { local, .. } | Op::ConflictCopy { local, .. } => Some(pending_of(local.id)),
         Op::Download { replace: Some(old), .. } => Some(pending_of(old.id)),
         Op::RemoveCopy { sid: Some(_), local: Some(l), .. } => Some(pending_of(l.id)),
-        _ => None,
+        op => rewind::aside_of(op).map(|l| pending_of(l.id)),
     }
 }
 
@@ -2642,6 +2652,9 @@ enum Pending {
     /// of Synced item `sid` goes, then `local`. Left over with `local` still
     /// here, the removal is undone: the record goes, so it's uploaded again.
     Removing { sid: Sid, local: LocalId },
+    /// A rewind about to set `local` (Synced item `sid`) aside into the
+    /// version store, then forget its record.
+    Aside { sid: Sid, local: LocalId },
 }
 
 impl Pending {
@@ -2650,6 +2663,7 @@ impl Pending {
             Pending::Evidence(id) => format!("evidence {:x}", id.0),
             Pending::Detached { sid, local, name } => format!("detached {sid} {:x} {name}", local.0),
             Pending::Removing { sid, local } => format!("removing {sid} {:x}", local.0),
+            Pending::Aside { sid, local } => format!("aside {sid} {:x}", local.0),
         }
     }
 
@@ -2665,6 +2679,11 @@ impl Pending {
             "removing" => {
                 let sid = it.next()?.parse().ok()?;
                 Some(Pending::Removing { sid, local: LocalId(u128::from_str_radix(it.next()?, 16).ok()?) })
+            }
+
+            "aside" => {
+                let sid = it.next()?.parse().ok()?;
+                Some(Pending::Aside { sid, local: LocalId(u128::from_str_radix(it.next()?, 16).ok()?) })
             }
             _ => None,
         }

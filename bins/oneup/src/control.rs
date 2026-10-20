@@ -553,6 +553,7 @@ impl Control {
                     oneup_gate::BreakerKind::Mass => "mass".into(),
                     oneup_gate::BreakerKind::Suspicious => "content".into(),
                     oneup_gate::BreakerKind::Removal => "removal".into(),
+                    oneup_gate::BreakerKind::Rewind => "rewind".into(),
                 },
                 side: match b.side {
                     Side::Local => "local".into(),

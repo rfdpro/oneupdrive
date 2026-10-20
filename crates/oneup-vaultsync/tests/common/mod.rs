@@ -177,6 +177,12 @@ impl Cloud for Fake {
         let s = self.0.lock().unwrap();
         Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
     }
+    async fn versions(&self, _: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        Err(CloudError::Other("no version history here".into()))
+    }
+    async fn restore(&self, _: &RemoteId, _: &RemoteId, _: &str) -> Result<RemoteRow, CloudError> {
+        Err(CloudError::Other("no recycle bin here".into()))
+    }
     async fn prune(&self, pre: &RemotePre) -> Result<(), CloudError> {
         let mut s = self.0.lock().unwrap();
         s.check(pre)?;

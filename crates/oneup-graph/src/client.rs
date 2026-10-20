@@ -727,6 +727,17 @@ impl Graph {
         self.json(&req).await
     }
 
+    /// Brings deleted item `id` back from the OneDrive recycle bin into
+    /// folder `parent` as `name` (`POST /items/{id}/restore`, documented for
+    /// OneDrive Personal only). 404: it's no longer in the recycle bin; 409:
+    /// the name is taken.
+    pub async fn restore_deleted(&self, id: &str, parent: &str, name: &str) -> Result<DriveItem> {
+        let url = format!("{}/items/{}/restore", self.drive_url(), encode_id(id));
+        let body = serde_json::json!({ "parentReference": { "id": parent }, "name": name });
+        let req = Req { json: Some(&body), ..Req::new(reqwest::Method::POST, &url) };
+        self.json(&req).await
+    }
+
     /// Deletes an item into the OneDrive recycle bin, if its eTag is still
     /// `etag`. **Graph deletes a folder with everything in it**: callers
     /// must check that a folder is empty first.

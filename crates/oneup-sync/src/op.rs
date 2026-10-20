@@ -7,6 +7,7 @@
 //! again, from fresh state, in the next round.
 
 use crate::model::{Base, Hash, LocalId, NodeKind, RemoteId, Sid};
+use crate::rewind::Step;
 
 /// A local item must still be exactly this when the operation runs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -278,6 +279,17 @@ pub enum Op {
         keep: Vec<LocalPre>,
     },
 
+    /// One step of rewinding a folder to an earlier moment (F2; never
+    /// planned by the reconciler, see [`crate::rewind`]). It changes
+    /// OneDrive (or sets this PC's copy aside) and leaves the Synced tree
+    /// alone, so the next round brings this PC along. `sid`: the Synced
+    /// item it concerns (for a restore, the record the item had).
+    Rewind {
+        sid: Sid,
+        /// Boxed: the largest step would make every operation larger.
+        step: Box<Step>,
+    },
+
     /// Leave alone and report.
     Hold {
         sid: Option<Sid>,
@@ -302,6 +314,12 @@ impl Op {
             }
             Op::MoveLocal { to, name, .. } => Some((Dir::Local(*to), name)),
             Op::RenameLocal { dir, name, .. } | Op::ConflictCopy { dir, name, .. } => Some((Dir::Local(*dir), name)),
+            Op::Rewind { step, .. } => match &**step {
+                Step::Restore { to, name, .. } | Step::Reset { place: Some((to, name)), .. } => {
+                    Some((Dir::Remote(to.clone()), name))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -337,6 +355,13 @@ impl Op {
             | Op::RenameRemote { remote, .. }
             | Op::DeleteRemote { remote, .. }
             | Op::PruneRemote { remote, .. } => Some(Vacates::Remote(remote.id.clone())),
+            Op::Rewind { step, .. } => match &**step {
+                Step::SetAside { local } | Step::Discard { local } => Some(Vacates::Local(local.id)),
+                Step::Reset { remote, place: Some(_), .. } | Step::Remove { remote, .. } => {
+                    Some(Vacates::Remote(remote.id.clone()))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -351,6 +376,7 @@ impl Op {
             | Op::ConflictCopy { .. }
             | Op::MoveRemote { .. }
             | Op::RenameRemote { .. } => self.vacates(),
+            Op::Rewind { step, .. } if matches!(&**step, Step::Reset { place: Some(_), .. }) => self.vacates(),
             _ => None,
         }
     }
@@ -383,6 +409,12 @@ impl Op {
             Op::RemoveCopy { sid, remote, local, .. } => {
                 (*sid, local.as_ref().and_then(l), remote.as_ref().and_then(r))
             }
+            Op::Rewind { sid, step } => match &**step {
+                Step::Restore { id, .. } => (Some(*sid), None, Some(id.clone())),
+                Step::Reset { remote, .. } | Step::Remove { remote, .. } => (Some(*sid), None, r(remote)),
+                Step::SetAside { local } | Step::Discard { local } => (Some(*sid), l(local), None),
+                Step::Forget => (Some(*sid), None, None),
+            },
             Op::Hold { sid, local, remote, .. } => (*sid, *local, remote.clone()),
         }
     }
@@ -390,17 +422,33 @@ impl Op {
     /// Whether the operation changes anything on this PC: content, names or
     /// places (bookkeeping and hashing don't).
     pub fn changes_local(&self) -> bool {
-        matches!(
-            self,
-            Op::Download { .. }
-                | Op::MkdirLocal { .. }
-                | Op::MoveLocal { .. }
-                | Op::RenameLocal { .. }
-                | Op::ConflictCopy { .. }
-                | Op::RecycleLocal { .. }
-                | Op::RemoveCopy { local: Some(_), .. }
-                | Op::Dehydrate { .. }
-        )
+        match self {
+            Op::Rewind { step, .. } => matches!(&**step, Step::SetAside { .. } | Step::Forget | Step::Discard { .. }),
+            _ => matches!(
+                self,
+                Op::Download { .. }
+                    | Op::MkdirLocal { .. }
+                    | Op::MoveLocal { .. }
+                    | Op::RenameLocal { .. }
+                    | Op::ConflictCopy { .. }
+                    | Op::RecycleLocal { .. }
+                    | Op::RemoveCopy { local: Some(_), .. }
+                    | Op::Dehydrate { .. }
+            ),
+        }
+    }
+
+    /// A rewind step for Synced item `sid`.
+    pub fn rewind(sid: Sid, step: Step) -> Op {
+        Op::Rewind { sid, step: Box::new(step) }
+    }
+
+    /// The rewind step this operation is, if it is one.
+    pub fn rewind_step(&self) -> Option<&Step> {
+        match self {
+            Op::Rewind { step, .. } => Some(step),
+            _ => None,
+        }
     }
 
     /// Whether the operation changes anything (bookkeeping included); holds

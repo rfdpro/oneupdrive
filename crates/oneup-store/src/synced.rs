@@ -142,7 +142,7 @@ const BASE_COLS: &str = "sid, parent_sid, name, kind, size, qxh, local_id, local
 
 /// The stored kind codes, shared with `local_item` and `remote_item`
 /// (0 = file, 1 = folder, 2 = root).
-fn node_kind(code: i64) -> Result<NodeKind> {
+pub(crate) fn node_kind(code: i64) -> Result<NodeKind> {
     match code {
         0 => Ok(NodeKind::File),
         1 => Ok(NodeKind::Folder),
@@ -150,7 +150,7 @@ fn node_kind(code: i64) -> Result<NodeKind> {
     }
 }
 
-fn kind_code(k: NodeKind) -> i64 {
+pub(crate) fn kind_code(k: NodeKind) -> i64 {
     match k {
         NodeKind::File => 0,
         NodeKind::Folder => 1,
@@ -160,17 +160,17 @@ fn kind_code(k: NodeKind) -> i64 {
 /// A BLOB that should hold a QuickXorHash. Anything but 20 bytes (never
 /// written by us) reads as "no hash", which only ever makes the reconciler
 /// ask for one; it never makes two different contents look equal.
-fn hash_of(b: Option<Vec<u8>>) -> Option<Hash> {
+pub(crate) fn hash_of(b: Option<Vec<u8>>) -> Option<Hash> {
     b.and_then(|v| <[u8; 20]>::try_from(v.as_slice()).ok())
 }
 
 /// Sids are `u64` in the reconciler and `INTEGER` (i64) in SQLite. They
 /// are allocated by SQLite from 1 upwards, so the cast never wraps.
-fn sid_out(v: i64) -> Sid {
+pub(crate) fn sid_out(v: i64) -> Sid {
     v as Sid
 }
 
-fn sid_in(s: Sid) -> i64 {
+pub(crate) fn sid_in(s: Sid) -> i64 {
     s as i64
 }
 
@@ -870,6 +870,8 @@ pub(crate) mod tests {
                 o.c.execute_batch(
                     "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
                      DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;
+                     DROP TRIGGER synced_history_ins; DROP TRIGGER synced_history_upd;
+                     DROP TRIGGER synced_history_del; DROP TABLE synced_history;
                      INSERT INTO remote_gone(id) VALUES ('f'), ('gone');
                      INSERT INTO synced_item(sid, parent_sid, name, kind, remote_id) VALUES (9, 0, 'gone', 0, 'gone');
                      PRAGMA user_version = 15;",

@@ -1056,6 +1056,16 @@ impl Cloud for GraphCloud {
         })
     }
 
+    async fn versions(&self, id: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        let versions = self.graph.versions(&id.0).await.map_err(map)?;
+        Ok(versions.into_iter().map(|v| VersionMark { id: v.id, modified_ms: v.modified_ms, size: v.size }).collect())
+    }
+
+    async fn restore(&self, id: &RemoteId, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        let item = self.graph.restore_deleted(&id.0, &parent.0, name).await.map_err(map)?;
+        self.row_of(item).await
+    }
+
     async fn copy(
         &self,
         source: &RemotePre,

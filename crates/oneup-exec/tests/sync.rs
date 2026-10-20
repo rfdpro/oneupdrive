@@ -15,14 +15,15 @@ use oneup_exec::{
     CRASHED, Cloud, CloudError, Executor, Meta, MetaDone, Replaced, Report, Source, VersionMark, link_roots,
 };
 use oneup_gate::{
-    Breaker, Choice, Context, Decision, ItemKey, Overflow, OverflowOutcome, Policy, Recent, Side, is_mass_sensitive,
-    review_in,
+    Breaker, BreakerKind, Choice, Context, Decision, ItemKey, Overflow, OverflowOutcome, Policy, Recent, Side,
+    is_mass_sensitive, review_in,
 };
 use oneup_local::observe::Observer;
 use oneup_local::{Config, Scan};
 use oneup_plan::{Parked, names};
 use oneup_rules::{ExcludeSet, RuleSet};
 use oneup_store::{Kind, RemoteRow, Store};
+use oneup_sync::rewind::Job;
 use oneup_sync::{LocalPre, Op, RemoteId, RemotePre, all_folders, fold, plan};
 
 // ---------------------------------------------------------------- fake cloud
@@ -126,6 +127,8 @@ struct State {
     /// Runs once the next upload has read its first bytes: another
     /// program writing something else meanwhile.
     during_upload: Option<Box<dyn FnOnce() + Send>>,
+    /// OneDrive's recycle bin, by ID: what `restore` brings back.
+    bin: BTreeMap<String, Item>,
 }
 
 /// See [`State::on_remove`].
@@ -291,9 +294,11 @@ impl Fake {
         let mut s = self.0.lock().unwrap();
         let etag = s.bump();
         let it = s.items.get_mut(id).unwrap();
+        let over = it.etag;
         let old = std::mem::replace(&mut it.content, content.to_vec());
         it.etag = etag;
-        s.kept.push(old);
+        s.kept.push(old.clone());
+        s.old.insert(over, old);
         s.history.entry(id.to_string()).or_default().insert(0, (etag, etag as i64, content.len() as i64));
     }
     fn rename(&self, path: &str, name: &str) {
@@ -321,8 +326,14 @@ impl Fake {
         let mut s = self.0.lock().unwrap();
         let id = resolve(&s, path);
         let it = s.items.remove(&id).unwrap();
-        s.kept.push(it.content);
+        s.kept.push(it.content.clone());
+        s.bin.insert(id.clone(), it);
         s.deleted.push(id);
+    }
+
+    /// Empties OneDrive's recycle bin (what's in it can't come back).
+    fn empty_bin(&self) {
+        self.0.lock().unwrap().bin.clear();
     }
 
     /// What delta would deliver: every live item (parents first), then the
@@ -820,10 +831,48 @@ impl Cloud for Fake {
             }
             for id in gone {
                 let it = s.items.remove(&id).unwrap();
-                s.kept.push(it.content);
+                s.kept.push(it.content.clone());
+                s.bin.insert(id.clone(), it);
                 s.deleted.push(id);
             }
             Ok(())
+        })
+        .await
+    }
+
+    /// Newest first, the current version included (its eTag is its ID).
+    async fn versions(&self, id: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        self.exchange(|| -> Result<Vec<VersionMark>, CloudError> {
+            let s = self.0.lock().unwrap();
+            if !s.items.contains_key(&id.0) {
+                return Err(CloudError::Changed);
+            }
+            Ok(s.history
+                .get(&id.0)
+                .into_iter()
+                .flatten()
+                .map(|&(t, at, size)| VersionMark { id: t.to_string(), modified_ms: Some(at), size: Some(size) })
+                .collect())
+        })
+        .await
+    }
+
+    async fn restore(&self, id: &RemoteId, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        self.exchange(|| -> Result<RemoteRow, CloudError> {
+            let mut s = self.0.lock().unwrap();
+            if !s.bin.contains_key(&id.0) || !s.items.get(&parent.0).is_some_and(|p| p.folder) {
+                return Err(CloudError::Changed);
+            }
+            if s.child(&parent.0, name).is_some() {
+                return Err(CloudError::NameTaken);
+            }
+            let etag = s.bump();
+            let mut it = s.bin.remove(&id.0).unwrap();
+            it.parent = Some(parent.0.clone());
+            it.name = name.into();
+            it.etag = etag;
+            s.items.insert(id.0.clone(), it);
+            Ok(s.row(&id.0))
         })
         .await
     }
@@ -885,7 +934,8 @@ impl Cloud for Fake {
                 f(&pre.id.0);
             }
             let it = s.items.remove(&pre.id.0).unwrap();
-            s.kept.push(it.content);
+            s.kept.push(it.content.clone());
+            s.bin.insert(pre.id.0.clone(), it);
             s.deleted.push(pre.id.0.clone());
             Ok(())
         })
@@ -986,12 +1036,42 @@ struct Stops {
     approved: Vec<ItemKey>,
     /// The last round's stops.
     raised: Vec<Breaker>,
+    /// A rewind under way, as the agent runs one (`oneup_app::rewind`).
+    rewind: Option<Rewinding>,
 }
 
+/// A rewind: of `folder` to moment `at`. Until the user approves, each
+/// round adds every step (and its stop shows them); once approved, only the
+/// steps its approval still covers ([`Job::accepts`]).
+#[derive(Default)]
+struct Rewinding {
+    folder: oneup_sync::Sid,
+    at: i64,
+    job: Option<Job>,
+    /// The steps of the stop last shown.
+    preview: Vec<Op>,
+    /// Steps planned after the approval that it doesn't cover (their item
+    /// changed after the preview), by round.
+    left_alone: usize,
+    /// Rounds in a row whose steps all failed or were skipped: after
+    /// [`STALLS`], the rewind ends with what it could do, as the agent's.
+    stalls: usize,
+    /// Every step it approved has run, was left alone, or can't be done.
+    done: bool,
+}
+
+/// See [`Rewinding::stalls`].
+const STALLS: usize = 3;
+
 impl Stops {
-    /// The user approves the stops standing.
+    /// The user approves the stops standing (a rewind's with them).
     fn approve(&mut self) {
         for b in std::mem::take(&mut self.raised) {
+            if b.kind == BreakerKind::Rewind
+                && let Some(r) = &mut self.rewind
+            {
+                r.job = Some(Job::approve(&r.preview));
+            }
             self.approved.extend(b.items);
         }
         self.approved.sort_unstable();
@@ -1216,7 +1296,8 @@ impl Sync {
         let rules = &self.rules;
         let dbs = self.exec.local().databases();
         let pull = self.pull;
-        let (scope, ops, pending, paths, pending_paths) = store
+        let rewinding = self.stops.rewind.as_ref().filter(|r| !r.done).map(|r| (r.folder, r.at));
+        let (scope, mut ops, mut pending, mut paths, mut pending_paths, planned_rewind) = store
             .read(|o| {
                 let scope = o.dirty_scope()?;
                 let folders = if all { all_folders(&Parked::with_rules(o, rules))? } else { scope.folders.clone() };
@@ -1232,17 +1313,78 @@ impl Sync {
                     ops.extend(removal);
                 }
                 let (paths, pending_paths) = (shown_paths(o, &ops)?, shown_paths(o, &pending)?);
-                Ok((scope, ops, pending, paths, pending_paths))
+                let rewind = match rewinding {
+                    Some((folder, at)) => Some(
+                        oneup_sync::rewind::plan(&Parked::with_rules(o, rules), o, folder, at, 100_000)
+                            .map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))?,
+                    ),
+                    None => None,
+                };
+                Ok((scope, ops, pending, paths, pending_paths, rewind))
             })
             .unwrap();
+        // A rewind's steps join the round, as the agent adds them; what the
+        // planner would do to the same items waits for the rewind.
+        let mut approved = self.stops.approved.clone();
+        let mut rewound: Vec<oneup_sync::Sid> = Vec::new();
+        if let (Some(rw), Some(r)) = (planned_rewind, self.stops.rewind.as_mut()) {
+            let (steps, step_paths, later): (Vec<Op>, Vec<String>, Vec<(Op, String)>) = match &r.job {
+                None => {
+                    r.preview = rw.ops.iter().cloned().chain(rw.later.iter().map(|(o, _)| o.clone())).collect();
+                    (rw.ops, rw.paths, rw.later)
+                }
+                Some(job) => {
+                    let (take, leave) = job.take(rw.ops, rw.paths);
+                    r.left_alone += leave.len();
+                    let later: Vec<(Op, String)> = rw.later.into_iter().filter(|(op, _)| job.accepts(op)).collect();
+                    if take.is_empty() && later.is_empty() {
+                        r.done = true;
+                    }
+                    let (steps, step_paths): (Vec<Op>, Vec<String>) = take.into_iter().unzip();
+                    approved.extend(oneup_gate::rewind_keys(&steps, &step_paths));
+                    rewound = job.rewound.iter().copied().collect();
+                    (steps, step_paths, later)
+                }
+            };
+            let subjects = |op: &Op| {
+                let (s, l, rm) = op.subjects();
+                steps.iter().any(|st| {
+                    let (ss, sl, srm) = st.subjects();
+                    (s.is_some() && s == ss) || (l.is_some() && l == sl) || (rm.is_some() && rm == srm)
+                })
+            };
+            let kept: Vec<(Op, String)> =
+                ops.into_iter().zip(paths).filter(|(op, _)| !op.is_action() || !subjects(op)).collect();
+            (ops, paths) = kept.into_iter().unzip();
+            ops.extend(steps);
+            paths.extend(step_paths);
+            for (op, p) in later {
+                pending.push(op);
+                pending_paths.push(p);
+            }
+        }
+        // A conflict answered: the answer approves its steps.
+        let answered: Vec<(Op, String)> = ops
+            .iter()
+            .zip(&paths)
+            .filter(|(o, _)| o.rewind_step().is_some())
+            .map(|(o, p)| (o.clone(), p.clone()))
+            .collect();
+        if self.stops.rewind.as_ref().is_none_or(|r| r.done) {
+            let (o, p): (Vec<Op>, Vec<String>) = answered.into_iter().unzip();
+            approved.extend(oneup_gate::rewind_keys(&o, &p));
+        }
+        approved.sort_unstable();
+        approved.dedup();
         let cx = Context {
             room: self.room,
             decisions: &self.decisions,
             recent: self.stops.window.unwrap_or_default(),
-            approved: &self.stops.approved,
+            approved: &approved,
             pending: &pending,
             paths: &paths,
             pending_paths: &pending_paths,
+            rewound: &rewound,
             ..Context::default()
         };
         let r = review_in(&self.policy, &cx, ops);
@@ -1289,6 +1431,21 @@ impl Sync {
         if let Some(w) = &mut self.stops.window {
             for op in &report.done {
                 w.add_op(op, &[]);
+            }
+        }
+        // A rewind's steps that ran: what they left their items in.
+        if let Some(r) = self.stops.rewind.as_mut()
+            && let Some(job) = r.job.as_mut()
+        {
+            let ran: Vec<&Op> = report.done.iter().filter(|o| matches!(o, Op::Rewind { .. })).collect();
+            for op in &ran {
+                let mark = store.read(|o| oneup_exec::rewind_mark(o, op)).unwrap();
+                job.ran(op, mark);
+            }
+            let tried = order.iter().any(|o| matches!(o, Op::Rewind { .. }));
+            r.stalls = if tried && ran.is_empty() { r.stalls + 1 } else { 0 };
+            if r.stalls >= STALLS {
+                r.done = true;
             }
         }
         let followed = followed.into_inner().unwrap();
@@ -1359,6 +1516,8 @@ impl Sync {
                     let problems = self.obs.store().read(|o| o.check_invariants()).unwrap();
                     assert!(problems.is_empty(), "{problems:?}");
                     assert!(!self.full_plan_has_actions(), "dirty-folder planning missed work a full pass finds");
+                    // As the agent does once a first sync has settled.
+                    self.obs.store_mut().write(|o| o.history_start(now_ms())).unwrap();
                     return n;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -5579,6 +5738,380 @@ async fn bench_hooks_under_a_10000_file_burst() {
     assert!(slower <= 0.05, "hooks slowed sync by {:.1}%", slower * 100.0);
 }
 
+// ---------------------------------------------------------------- recovery
+
+/// Now, as the Synced history's clock tells it (Unix ms).
+fn now_ms() -> i64 {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    i64::try_from(d.as_millis()).unwrap()
+}
+
+/// A moment between what came before and what comes after: the history
+/// times changes to the millisecond.
+fn moment() -> i64 {
+    std::thread::sleep(Duration::from_millis(20));
+    let t = now_ms();
+    std::thread::sleep(Duration::from_millis(20));
+    t
+}
+
+/// What's below `folder` in a tree, named from there.
+fn inside(t: &Tree, folder: &str) -> Tree {
+    let at = format!("{folder}/");
+    t.iter().filter_map(|(p, c)| p.strip_prefix(&at).map(|rest| (rest.to_string(), c.clone()))).collect()
+}
+
+impl Sync {
+    /// Starts rewinding `folder` (`/docs`; `""` for everything) to moment
+    /// `at`, as `oneup rewind --start` does.
+    fn start_rewind(&mut self, folder: &str, at: i64) {
+        let parts: Vec<&str> = folder.split('/').filter(|p| !p.is_empty()).collect();
+        let sid = self
+            .obs
+            .store()
+            .read(|o| oneup_sync::rewind::folder_at(o, o, &parts, at))
+            .unwrap()
+            .expect("the folder was there then");
+        self.stops.allowed = true;
+        self.stops.rewind = Some(Rewinding { folder: sid, at, ..Rewinding::default() });
+    }
+
+    /// Rewinds `folder` to `at` the way the agent does: the first rounds
+    /// only show its stop and change nothing; once approved, the rounds
+    /// carry it out and bring this PC along. `meanwhile` runs between the
+    /// preview and the answer. Returns how many steps were left alone
+    /// because their items changed after the preview.
+    async fn rewind_to(&mut self, folder: &str, at: i64, meanwhile: impl FnOnce(&Sync)) -> usize {
+        self.start_rewind(folder, at);
+        let before = (local_tree(&self.dir.0), self.cloud.tree());
+        for _ in 0..2 {
+            let r = self.round().await;
+            assert!(r.done.is_empty() && r.skipped.is_empty(), "nothing runs before the approval: {r:?}");
+            assert!(self.stops.raised.iter().any(|b| b.kind == BreakerKind::Rewind), "a rewind is a safety stop");
+            assert_eq!((local_tree(&self.dir.0), self.cloud.tree()), before, "nothing changed before the approval");
+        }
+        meanwhile(self);
+        self.stops.approve();
+        self.settle().await;
+        let r = self.stops.rewind.take().expect("a rewind");
+        assert!(r.done, "the rewind finished");
+        r.left_alone
+    }
+}
+
+#[tokio::test]
+async fn everyday_rewinding_a_folder_puts_back_what_it_held_and_a_rewind_can_be_rewound() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a, first");
+    write(&s.p("docs/b.txt"), b"b");
+    write(&s.p("docs/sub/c.txt"), b"c");
+    write(&s.p("other.txt"), b"other");
+    s.settle().await;
+    let then = inside(&local_tree(&s.dir.0), "/docs");
+    let at = moment();
+
+    // Since then: an edit, a deletion and a rename here, a new file in
+    // OneDrive, and an edit outside the folder.
+    write(&s.p("docs/a.txt"), b"a, second");
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    std::fs::rename(s.p("docs/sub"), s.p("docs/moved")).unwrap();
+    s.settle().await;
+    cloud.add("docs/new.txt", Some(b"new in OneDrive"));
+    cloud.edit("other.txt", b"other, second");
+    s.settle().await;
+    let before = local_tree(&s.dir.0);
+    let before_at = moment();
+
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    let now = local_tree(&s.dir.0);
+    assert_eq!(inside(&now, "/docs"), then, "the folder is as it was");
+    assert_eq!(now["/other.txt"], Some(b"other, second".to_vec()), "outside the folder, nothing changed");
+    assert_eq!(s.synced_part(now.clone()), s.synced_part(cloud.tree()));
+    // Nothing is destroyed: the newer content is in OneDrive's version
+    // history, the file created since in its recycle bin and here in the
+    // version store.
+    assert!(cloud.holds(b"a, second") && cloud.holds(b"new in OneDrive"));
+    assert!(s.versions().contains(&b"new in OneDrive".to_vec()));
+
+    // So a rewind can itself be rewound.
+    assert_eq!(s.rewind_to("/docs", before_at, |_| {}).await, 0);
+    assert_eq!(local_tree(&s.dir.0), before, "rewinding the rewind puts back what was there");
+    assert_eq!(s.synced_part(local_tree(&s.dir.0)), s.synced_part(cloud.tree()));
+}
+
+#[tokio::test]
+async fn everyday_a_file_changed_after_the_rewind_preview_is_left_alone() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-changed", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a, first");
+    write(&s.p("docs/b.txt"), b"b, first");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/a.txt"), b"a, second");
+    write(&s.p("docs/b.txt"), b"b, second");
+    s.settle().await;
+
+    // Between the preview and the answer, a.txt is saved again here.
+    let left = s
+        .rewind_to("/docs", at, |s| {
+            std::thread::sleep(Duration::from_millis(20));
+            write(&s.p("docs/a.txt"), b"a, third");
+        })
+        .await;
+    assert!(left > 0, "a step was left alone");
+    let now = local_tree(&s.dir.0);
+    assert_eq!(now["/docs/a.txt"], Some(b"a, third".to_vec()), "the newer edit stays, and is synced");
+    assert_eq!(now["/docs/b.txt"], Some(b"b, first".to_vec()), "the rest of the rewind ran");
+    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"a, third".to_vec()));
+    assert!(!now.keys().any(|p| p.contains("conflict")), "nothing ran on the changed file: {:?}", names(&now));
+}
+
+#[tokio::test]
+async fn everyday_a_rewind_sets_aside_edits_not_synced_yet() {
+    // As when ransomware encrypts files where they are: the edits haven't
+    // reached OneDrive (the content guard holds them); the rewind moves
+    // them into the version store and OneDrive's copies come back.
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-aside", cloud.clone());
+    for f in ["x", "y", "z"] {
+        write(&s.p(&format!("docs/{f}.txt")), format!("{f}, as written").as_bytes());
+    }
+    s.settle().await;
+    let then = local_tree(&s.dir.0);
+    let at = moment();
+    for f in ["x", "y", "z"] {
+        write(&s.p(&format!("docs/{f}.txt")), format!("{f} \u{1}\u{2}scrambled").as_bytes());
+    }
+    // Not synced: the preview's round plans these uploads too, and the stop
+    // holds them with everything else.
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    assert_eq!(local_tree(&s.dir.0), then, "OneDrive's copies came back");
+    for f in ["x", "y", "z"] {
+        let scrambled = format!("{f} \u{1}\u{2}scrambled").into_bytes();
+        assert!(!cloud.holds(&scrambled), "the scrambled {f} never reached OneDrive");
+        assert!(s.versions().contains(&scrambled), "the scrambled {f} is kept in the version store");
+    }
+}
+
+#[tokio::test]
+async fn everyday_a_rewind_ends_with_what_onedrive_no_longer_has() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-emptied", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a, first");
+    write(&s.p("docs/b.txt"), b"b");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/a.txt"), b"a, second");
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    s.settle().await;
+    // OneDrive's recycle bin was emptied since: b.txt can't come back.
+    cloud.empty_bin();
+    s.start_rewind("/docs", at);
+    let r = s.round().await;
+    assert!(r.done.is_empty());
+    s.stops.approve();
+    let mut failed = 0;
+    for _ in 0..12 {
+        let r = s.attempt().await;
+        assert!(r.halted.is_none(), "{r:?}");
+        failed += r.failed.len();
+        if s.stops.rewind.as_ref().is_some_and(|r| r.done) && r.is_idle() && r.skipped.is_empty() {
+            break;
+        }
+    }
+    assert!(s.stops.rewind.as_ref().is_some_and(|r| r.done), "the rewind ends");
+    assert!(failed > 0, "and says what it couldn't do");
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"a, first", "the rest of it ran");
+    assert!(!s.p("docs/b.txt").exists());
+}
+
+#[tokio::test]
+async fn everyday_restoring_a_kept_copy_brings_it_back_on_both_sides() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-restore-kept", cloud.clone());
+    write(&s.p("docs/a.txt"), b"keep me");
+    s.settle().await;
+    // Deleted in OneDrive: this PC's copy goes into the version store.
+    cloud.delete("docs/a.txt");
+    s.settle().await;
+    assert!(!s.p("docs/a.txt").exists());
+    let slot = s.exec.local().versions().unwrap().into_iter().find(|v| v.name == "a.txt").expect("kept");
+    let back = s.exec.local().restore(&slot.id, None).unwrap();
+    assert_eq!(back.replace('\\', "/"), "docs/a.txt");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/docs/a.txt"], Some(b"keep me".to_vec()), "uploaded again");
+    assert!(s.versions().is_empty());
+}
+
+#[tokio::test]
+async fn everyday_restoring_a_onedrive_version_and_a_deleted_item() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-restore-cloud", cloud.clone());
+    write(&s.p("docs/a.txt"), b"version one");
+    write(&s.p("docs/b.txt"), b"bee");
+    s.settle().await;
+    write(&s.p("docs/a.txt"), b"version two");
+    s.settle().await;
+
+    // A version from the file's history: downloaded and sent as a new one.
+    let id = RemoteId(resolve(&cloud.0.lock().unwrap(), "docs/a.txt"));
+    let versions = cloud.versions(&id).await.unwrap();
+    let old = versions.iter().skip(1).find(|v| v.size == Some(11)).unwrap();
+    let staging = s.dir.0.with_extension("restore.tmp");
+    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&staging).unwrap();
+    oneup_exec::recover::restore_version(&cloud, &id, &old.id, &mut f).await.unwrap();
+    drop(f);
+    let _ = std::fs::remove_file(&staging);
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"version one");
+    assert!(cloud.holds(b"version two"), "the version it replaced stays in the history");
+
+    // An item deleted here comes back from OneDrive's recycle bin by the ID
+    // the history recorded, beside a new file that took its name meanwhile.
+    std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+    s.settle().await;
+    write(&s.p("docs/b.txt"), b"another bee");
+    s.settle().await;
+    let gone = s.obs.store().read(|o| o.history_removed(10, None)).unwrap();
+    let b = gone.iter().find(|r| r.was.name == "b.txt").expect("recorded");
+    let parent = s.obs.store().read(|o| o.synced_get(b.was.parent.unwrap())).unwrap().unwrap().remote.unwrap();
+    let id = b.was.remote.clone().unwrap();
+    let row =
+        oneup_exec::recover::restore_deleted(&cloud, &id, &parent, "b.txt", oneup_sync::NodeKind::File).await.unwrap();
+    assert_eq!(row.name, "b (restored 1).txt");
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("docs/b (restored 1).txt")).unwrap(), b"bee");
+    assert_eq!(std::fs::read(s.p("docs/b.txt")).unwrap(), b"another bee");
+    let listed = s.obs.store().read(|o| o.history_removed(10, None)).unwrap();
+    assert!(listed.iter().all(|r| r.was.remote.as_ref() != Some(&id)), "back in OneDrive: not listed as deleted");
+}
+
+#[tokio::test]
+async fn everyday_answering_a_conflict_keeps_one_copy_and_the_other_recoverably() {
+    use oneup_exec::recover::{Keep, conflict_ops, conflicts_in};
+    for keep in [Keep::Original, Keep::Copy] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(&format!("everyday-conflict-{keep:?}"), cloud.clone());
+        write(&s.p("docs/r.txt"), b"start");
+        s.settle().await;
+        write(&s.p("docs/r.txt"), b"mine, here");
+        cloud.edit("docs/r.txt", b"theirs, in OneDrive");
+        s.settle().await;
+        let docs_id = resolve(&cloud.0.lock().unwrap(), "docs");
+        let docs = s.obs.store().read(|o| Ok(o.synced_by_remote(&docs_id)?.unwrap().sid)).unwrap();
+        let found = s.obs.store().read(|o| conflicts_in(o, docs)).unwrap();
+        assert_eq!(found.len(), 1, "one conflict");
+        let c = &found[0];
+        assert_eq!((c.original.name.as_str(), c.copy.name.as_str()), ("r.txt", "r (conflict 1).txt"));
+        s.extra = s.obs.store().read(|o| conflict_ops(o, c, keep)).unwrap().unwrap();
+        s.settle().await;
+        let now = local_tree(&s.dir.0);
+        let (kept, other): (&[u8], &[u8]) = match keep {
+            Keep::Original => (b"theirs, in OneDrive", b"mine, here"),
+            Keep::Copy => (b"mine, here", b"theirs, in OneDrive"),
+        };
+        assert_eq!(now.get("/docs/r.txt"), Some(&Some(kept.to_vec())), "{keep:?}: {now:?}");
+        assert!(!now.contains_key("/docs/r (conflict 1).txt"));
+        assert_eq!(s.synced_part(now), s.synced_part(cloud.tree()));
+        assert!(s.versions().contains(&other.to_vec()), "the other copy is in the version store");
+        assert!(cloud.holds(other), "and in OneDrive's recycle bin");
+        assert!(s.obs.store().read(|o| conflicts_in(o, docs)).unwrap().is_empty(), "answered");
+    }
+}
+
+#[tokio::test]
+async fn everyday_a_large_rewind_takes_one_approval() {
+    // More than the breakers allow: approving the rewind approves this PC
+    // following it, so no second stop asks again.
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-large", cloud.clone());
+    for i in 0..8 {
+        write(&s.p(&format!("docs/f{i}.txt")), format!("{i}, first").as_bytes());
+    }
+    s.settle().await;
+    let then = local_tree(&s.dir.0);
+    let at = moment();
+    for i in 0..8 {
+        cloud.edit(&format!("docs/f{i}.txt"), format!("{i}, second").as_bytes());
+    }
+    s.stops.window = Some(Recent::default());
+    s.settle().await;
+    s.policy = strict();
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    assert_eq!(local_tree(&s.dir.0), then);
+    // Afterwards, changes the rewind didn't make are judged as ever.
+    s.stops.allowed = true;
+    for i in 0..8 {
+        cloud.delete(&format!("docs/f{i}.txt"));
+    }
+    s.round().await;
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Mass), "a mass deletion still stops");
+}
+
+/// A rewind killed at any point of its rounds loses nothing: after a
+/// restart it goes on (its approval is kept, as the agent keeps it in the
+/// database), every content is still somewhere, and the folder ends as it
+/// was at the moment chosen.
+#[tokio::test]
+async fn a_crash_at_any_point_of_a_rewind_loses_nothing() {
+    const CONTENTS: [&[u8]; 6] = [b"a, first", b"a, second", b"b", b"new", b"x, first", b"x \x01scrambled"];
+    for n in 0.. {
+        let cloud = Fake::new();
+        let mut s = Sync::on_disk(&format!("crash-rewind{n}"), cloud.clone());
+        write(&s.p("docs/a.txt"), b"a, first");
+        write(&s.p("docs/b.txt"), b"b");
+        write(&s.p("docs/x.txt"), b"x, first");
+        s.settle().await;
+        let then = local_tree(&s.dir.0);
+        let at = moment();
+        write(&s.p("docs/a.txt"), b"a, second");
+        std::fs::remove_file(s.p("docs/b.txt")).unwrap();
+        cloud.add("docs/new.txt", Some(b"new"));
+        s.settle().await;
+        // Not synced: set aside by the rewind.
+        write(&s.p("docs/x.txt"), b"x \x01scrambled");
+        s.start_rewind("/docs", at);
+        assert!(s.round().await.done.is_empty());
+        s.stops.approve();
+
+        s.exec.crash_after(Some(n));
+        let mut crashed = false;
+        for _ in 0..40 {
+            let r = s.attempt().await;
+            if r.halted.as_deref() == Some(CRASHED) {
+                crashed = true;
+                break;
+            }
+            assert!(r.halted.is_none() && r.failed.is_empty(), "crash point {n}: {r:?}");
+            if r.is_idle() && r.skipped.is_empty() && s.stops.rewind.as_ref().is_some_and(|r| r.done) {
+                break;
+            }
+        }
+        if !crashed {
+            assert!(n > 5, "only {n} crash points");
+            return;
+        }
+        let mut s = s.restart();
+        s.obs.catch_up().unwrap();
+        let store = s.obs.store_mut();
+        let r = s.exec.run(store, Vec::new()).await;
+        assert!(r.halted.is_none(), "crash point {n}: {r:?}");
+        assert_eq!(store.read(|o| o.meta_under("exec.pending")).unwrap(), vec![], "crash point {n}");
+        let problems = store.read(|o| o.check_invariants()).unwrap();
+        assert!(problems.is_empty(), "crash point {n}: {problems:?}");
+        s.settle().await;
+
+        let t = local_tree(&s.dir.0);
+        let here: Vec<&[u8]> = t.values().filter_map(|c| c.as_deref()).collect();
+        let versions = s.versions();
+        for c in CONTENTS {
+            let kept = here.contains(&c) || versions.iter().any(|v| v == c) || s.cloud.holds(c);
+            assert!(kept, "crash point {n}: {:?} was lost", String::from_utf8_lossy(c));
+        }
+        assert_eq!(t, then, "crash point {n}: the rewind went on after the restart");
+    }
+}
 // ---------------------------------------------------------------- duplicates
 // Copies the user chose to remove (`oneup_exec::dupes`): the gate holds them
 // until the user approves exactly that batch, whatever the circuit breakers'
