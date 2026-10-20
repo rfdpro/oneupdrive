@@ -1007,6 +1007,51 @@ pub fn kept_restore(dir: &Path, id: &str) -> Result<String> {
     Ok(crate::sync::open_paired(&store)?.restore(id, None)?)
 }
 
+/// The Recovery page's rewind: the one under way, if any, and how far
+/// back the history reaches (`crate::rewind`).
+pub fn rewind_state(dir: &Path) -> Result<Value> {
+    let store = crate::setup::open_store(dir, 1024)?;
+    let (job, since) = store.read(|o| Ok((crate::rewind::load(o)?, o.history_since()?)))?;
+    let since = (since != i64::MAX).then_some(since);
+    let job = job.map(|j| {
+        json!({
+            "folder": j.folder, "at_ms": j.at_ms, "started_ms": j.started_ms,
+            "approved": j.approval.is_some(), "ran": j.ran, "left_alone": j.left_alone, "failed": j.failed,
+        })
+    });
+    // The code of its stop, while it waits for the approval.
+    let code = std::fs::read_dir(dir.join(crate::stoplist::DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".txt").map(str::to_string))
+        .find(|c| crate::stoplist::read(dir, c, "", 0).is_some_and(|l| l.header.contains("a rewind would make")));
+    Ok(json!({ "since_ms": since, "job": job, "code": code }))
+}
+
+/// The Recovery page's conflicts (`crate::conflicts`).
+pub fn conflicts(dir: &Path) -> Result<Value> {
+    let store = crate::setup::open_store(dir, 1024)?;
+    let listed = store.read(crate::conflicts::list)?;
+    Ok(listed.iter().map(crate::conflicts::to_json).collect())
+}
+
+/// Queues keeping one copy of a conflict, as the page listed it (`keep`:
+/// `original` or `copy`).
+pub fn conflict_keep(dir: &Path, listed: &Value, keep: &str) -> Result<()> {
+    let c = crate::conflicts::from_json(listed).context("not a conflict")?;
+    let Some(k) = crate::conflicts::parse_keep(keep)? else { return Ok(()) };
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    crate::conflicts::answer(&mut store, &c, k)
+}
+
+/// The Recovery page's items deleted from OneDrive (`crate::cloudbin`).
+pub fn cloud_bin(dir: &Path) -> Result<Value> {
+    let store = crate::setup::open_store(dir, 1024)?;
+    let listed = store.read(|o| crate::cloudbin::list(o, crate::cloudbin::MAX))?;
+    Ok(listed.iter().map(crate::cloudbin::to_json).collect())
+}
+
 /// Saves one section the window changed.
 pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
     match section {

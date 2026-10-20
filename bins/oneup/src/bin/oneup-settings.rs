@@ -727,6 +727,65 @@ mod win {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::kept(&d)).await?
             }
+            // The Recovery page: rewinding a folder (`oneup rewind`, with the
+            // same checks), conflicts and items deleted from OneDrive.
+            "rewind_state" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || settingsapi::rewind_state(&d)).await?
+            }
+            "rewind_preview" | "rewind_start" => {
+                let mut a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "rewind".into()];
+                match args.get("before_stop").and_then(Value::as_str) {
+                    Some(code) => a.extend(["--before-stop".into(), code.into()]),
+                    None => {
+                        a.push(text(args, "folder").into());
+                        a.extend(["--to".into(), count(args, "at_ms", 0).to_string().into()]);
+                    }
+                }
+                if op == "rewind_start" {
+                    a.push("--start".into());
+                }
+                a.push("--json".into());
+                let out = oneup(a).await?;
+                let line = out.lines().rev().find(|l| l.starts_with('{')).context("no answer from oneup")?;
+                Ok(serde_json::from_str(line)?)
+            }
+            "rewind_cancel" => {
+                let a: Vec<std::ffi::OsString> =
+                    vec!["--data-dir".into(), dir.into(), "rewind".into(), "--cancel".into()];
+                Ok(Value::from(oneup(a).await?))
+            }
+            // The page showed the rewind's list and its code; the person
+            // approves exactly that (`oneup approve CODE`).
+            "rewind_approve" => {
+                let code = text(args, "code");
+                if code.len() != 16 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("not a code");
+                }
+                let a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "approve".into(), code.into()];
+                Ok(Value::from(oneup(a).await?))
+            }
+            "conflicts" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || settingsapi::conflicts(&d)).await?
+            }
+            "conflict_keep" => {
+                let (d, keep) = (dir.to_path_buf(), text(args, "keep"));
+                let listed = args.get("conflict").cloned().unwrap_or(Value::Null);
+                tokio::task::spawn_blocking(move || settingsapi::conflict_keep(&d, &listed, &keep)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
+            "cloud_bin" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || settingsapi::cloud_bin(&d)).await?
+            }
+            "cloud_bin_restore" => {
+                let seq = i64::try_from(count(args, "seq", 0)).unwrap_or(0);
+                let at = oneup_app::cloudbin::restore(dir, seq).await?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::from(at))
+            }
             "kept_restore" => {
                 // The agent is stopped around it: restoring writes into the folder.
                 let (d, id) = (dir.to_path_buf(), text(args, "id"));
