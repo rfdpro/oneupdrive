@@ -3056,9 +3056,21 @@
             try {
                 const r = await call("hooks");
                 $("#hk-run").checked = !r.paused;
-                $("#hk-state").textContent = r.hooks.length ? plural(r.hooks.length, "hook") + " · output in " + r.log : "None set. Add a [[hook]] section to config.toml.";
+                $("#hk-state").textContent = r.hooks.length ? tr("{n, plural, one {# hook} other {# hooks}} · output in {log}", {
+                    n: r.hooks.length,
+                    log: r.log
+                }) : tr("None set. Add a [[hook]] section to config.toml.");
                 $("#hk-list").replaceChildren(...r.hooks.map(h => {
-                    const detail = h.refused ? "Refused: " + h.refused : h.on.join(", ") + (h.paths.length ? " · " + h.paths.join(", ") : "") + " → " + h.program;
+                    const detail = h.refused ? tr("Refused: {why}", {
+                        why: h.refused
+                    }) : h.paths.length ? tr("{on} · {paths} → {program}", {
+                        on: h.on.join(", "),
+                        paths: h.paths.join(", "),
+                        program: h.program
+                    }) : tr("{on} → {program}", {
+                        on: h.on.join(", "),
+                        program: h.program
+                    });
                     const sw = h.refused ? null : el("label", {
                         className: "toggle"
                     }, el("input", {
@@ -3068,7 +3080,11 @@
                         onchange: e => run(call("hook_enable", {
                             name: h.name,
                             on: e.target.checked
-                        }), () => e.target.checked ? h.name + " on" : h.name + " off").catch(() => null).then(loadHooks)
+                        }), () => e.target.checked ? tr("{name} on", {
+                            name: h.name
+                        }) : tr("{name} off", {
+                            name: h.name
+                        })).catch(() => null).then(loadHooks)
                     }), el("span"));
                     return el("div", {
                         className: "row"
@@ -3080,12 +3096,14 @@
                     }, detail)), sw);
                 }));
             } catch (e) {
-                $("#hk-state").textContent = "Can't read the hooks: " + e.message;
+                $("#hk-state").textContent = tr("Can't read the hooks: {error}", {
+                    error: e.message
+                });
             }
         }
         $("#hk-run").onchange = e => run(call("hooks_pause", {
             on: !e.target.checked
-        }), () => e.target.checked ? "Hooks on" : "Hooks paused").catch(() => null).then(loadHooks);
+        }), () => e.target.checked ? tr("Hooks on") : tr("Hooks paused")).catch(() => null).then(loadHooks);
         $("#sc-fix").onclick = () => scChange("shortcuts_fix", {
             links: scFound.map(f => f.link)
         }, n => tr("Updated {n, plural, one {# shortcut} other {# shortcuts}}", {

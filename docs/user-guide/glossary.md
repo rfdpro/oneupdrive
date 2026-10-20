@@ -18,6 +18,8 @@
 
 **Folder pair** (`pair` in commands): a folder on this PC and the OneDrive folder it is kept the same as. Your main folder is one; each folder you add is another. See [More folders](folders.md).
 
+**Hook**: a program of yours that OneUpDrive starts when something happens (a file synced, a conflict, a safety stop). It gets the event as data, never as a command. See [Scripts and hooks](hooks.md).
+
 **Kept copies** (also *version store*, `.oneup\versions`): copies that OneUpDrive keeps on this PC of files it removed or replaced, so you can get them back. Not the same as *version history*.
 
 **Online-only**: the file is in OneDrive and shows on this PC, but takes no space until you open it.
