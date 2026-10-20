@@ -22,7 +22,7 @@ use oneup_sync::{
 };
 
 use crate::blocking::{Jobs, OffTask, Settle};
-use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, VersionMark};
+use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Replaced, VersionMark};
 use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
@@ -186,6 +186,11 @@ pub struct Report {
     /// Edits gone over by an earlier upload, kept this round as new files
     /// in OneDrive (their names).
     pub kept_later: Vec<String>,
+    /// Files whose upload may have gone over an edit that the file's
+    /// version history still didn't show after [`RESCUE_TRIES`] rounds
+    /// (their names): no longer looked for, and listed for the user
+    /// ([`rescues_given_up`]).
+    pub rescues_given_up: Vec<String>,
 }
 
 impl Report {
@@ -196,9 +201,11 @@ impl Report {
 }
 
 /// An edit an upload may have gone over, to keep as a new file
-/// (`Executor::rescue`): kept in `meta` (`exec.rescue.<item>.<version>`)
-/// until it's done, so a failure (the data budget used up, the network
-/// gone) never drops it.
+/// (`Executor::rescue`): kept in `meta` (`exec.rescue.<item>.<version>`),
+/// written durably before the upload starts and removed in the same
+/// transaction that records the kept copy, so neither a failure (the data
+/// budget used up, the network gone) nor the process killed or a power cut
+/// drops it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Rescue {
     /// The file uploaded over.
@@ -210,6 +217,13 @@ struct Rescue {
     parent: Sid,
     to: String,
     name: String,
+    /// The eTag the upload was to replace: still OneDrive's, the upload
+    /// never committed.
+    etag: String,
+    /// Rounds the version history couldn't tell what the upload went over.
+    tries: u32,
+    /// When it was given up (Unix ms), after [`RESCUE_TRIES`] such rounds.
+    given_up_ms: Option<i64>,
 }
 
 fn mark_json(m: &VersionMark) -> serde_json::Value {
@@ -234,7 +248,8 @@ impl Rescue {
     fn to_json(&self) -> String {
         serde_json::json!({
             "id": self.id, "mark": mark_json(&self.mark), "theirs": self.theirs.as_ref().map(mark_json),
-            "parent": self.parent, "to": self.to, "name": self.name,
+            "parent": self.parent, "to": self.to, "name": self.name, "etag": self.etag,
+            "tries": self.tries, "given_up_ms": self.given_up_ms,
         })
         .to_string()
     }
@@ -248,12 +263,60 @@ impl Rescue {
             parent: v["parent"].as_u64()?,
             to: v["to"].as_str()?.to_string(),
             name: v["name"].as_str()?.to_string(),
+            etag: v["etag"].as_str().unwrap_or_default().to_string(),
+            tries: v["tries"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
+            given_up_ms: v["given_up_ms"].as_i64(),
         })
     }
+}
 
-    fn save(&self, o: &Ops<'_>) -> oneup_store::Result<()> {
-        o.meta_set(&self.key(), &self.to_json())
-    }
+/// Rounds a rescue waits for the version history to show what an upload
+/// went over before it's given up (and listed for the user).
+pub const RESCUE_TRIES: u32 = 20;
+
+/// How long a given-up rescue stays listed for the user.
+const GIVEN_UP_KEPT_MS: i64 = 14 * 24 * 3600 * 1000;
+
+/// What a rescue waiting for another network reports.
+const RESCUE_WAITS: &str = "waits for a network that lets it download";
+
+/// The files whose upload may have gone over an edit in OneDrive that
+/// couldn't be found ([`Report::rescues_given_up`]): their names and when
+/// they were given up, oldest first.
+pub fn rescues_given_up(o: &Ops<'_>) -> oneup_store::Result<Vec<(String, i64)>> {
+    let mut out: Vec<(String, i64)> = o
+        .meta_under(Rescue::KEY)?
+        .into_iter()
+        .filter_map(|(_, text)| Rescue::parse(&text))
+        .filter_map(|r| Some((r.name, r.given_up_ms?)))
+        .collect();
+    out.sort_by_key(|(_, at)| *at);
+    Ok(out)
+}
+
+/// Whether a download of `bytes` (unknown: `None`) may go over the network
+/// now ([`Executor::set_may_fetch`]).
+pub type FetchCheck = Arc<dyn Fn(Option<u64>) -> bool + Send + Sync>;
+
+/// Where a rescue got to (`Executor::rescue`).
+enum Rescued {
+    /// Kept as a new file (its name); its record went with the copy's.
+    Kept(String),
+    /// Nothing to keep: it went over the version planned, or never
+    /// committed.
+    Nothing,
+    /// Not now: the record as far as it got, and why.
+    Later(Box<Rescue>, String),
+    Halt(String),
+}
+
+/// What a rescue came to, once its record is updated.
+enum RescueEnd {
+    Kept(String),
+    Nothing,
+    Waits(String),
+    GaveUp(String),
+    Halt(String),
 }
 
 fn fail_text(f: &Fail) -> String {
@@ -337,6 +400,8 @@ struct Notes {
     theirs: Option<String>,
     /// [`Report::theirs_not_kept`].
     theirs_not_kept: Option<String>,
+    /// [`Report::rescues_given_up`].
+    given_up: Option<String>,
     /// Done, but the round stops after it (the store failed, or the sync
     /// folder its identity check, while keeping such a version).
     halt: Option<String>,
@@ -370,6 +435,9 @@ fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
             if let Some(why) = notes.theirs_not_kept {
                 tracing::warn!(error = %why, "an edit an upload went over wasn't kept as a new file");
                 report.theirs_not_kept.push((op.clone(), why));
+            }
+            if let Some(name) = notes.given_up {
+                report.rescues_given_up.push(name);
             }
             report.done.push(op);
             if let Some(m) = notes.halt
@@ -702,6 +770,8 @@ pub struct Executor<C> {
     timings: std::sync::Arc<Timings>,
     /// Work under way on blocking threads ([`crate::blocking`]).
     jobs: Arc<Jobs>,
+    /// See [`Executor::set_may_fetch`].
+    may_fetch: std::sync::RwLock<Option<FetchCheck>>,
     /// See [`Executor::on_blocking`].
     #[cfg(feature = "crash-test")]
     on_blocking: std::sync::Mutex<Option<BlockingHook>>,
@@ -723,9 +793,23 @@ impl<C: Cloud> Executor<C> {
             parallel: std::sync::Mutex::new(Parallel::for_profile("balanced")),
             timings: std::sync::Arc::default(),
             jobs: Arc::default(),
+            may_fetch: std::sync::RwLock::default(),
             #[cfg(feature = "crash-test")]
             on_blocking: std::sync::Mutex::default(),
         }
+    }
+
+    /// What the network lets through now, for downloads that aren't a
+    /// round's planned operations (keeping an edit an upload went over):
+    /// asked before each, so working offline, or a network that moves only
+    /// names or only the files the user opens, holds them until it lets
+    /// them go. `None`: everything goes.
+    pub fn set_may_fetch(&self, f: Option<FetchCheck>) {
+        *self.may_fetch.write().unwrap_or_else(|p| p.into_inner()) = f;
+    }
+
+    fn may_fetch(&self, bytes: Option<u64>) -> bool {
+        self.may_fetch.read().unwrap_or_else(|p| p.into_inner()).as_ref().is_none_or(|f| f(bytes))
     }
 
     /// The rules changed: rows written from now on follow these.
@@ -864,39 +948,92 @@ impl<C: Cloud> Executor<C> {
         &self.fs
     }
 
-    /// After an upload replaced file `id` in OneDrive folder `to` (Synced
-    /// folder `parent`): if it went over a version other than `mark`'s (an
-    /// edit that reached OneDrive while the upload committed), keeps that
-    /// version as a new file next to it, named as conflict copies are, and
-    /// returns its name. Only a free name is taken; nothing is replaced. The
-    /// next round brings it here like any new file in OneDrive.
-    /// Keeps the edit an upload may have gone over (`r`): finds it (unless
-    /// `r` already names it) and uploads it as a new file. `Ok(None)`: it
-    /// went over nothing else. On failure, the rescue as far as it got, for
-    /// the caller to keep and try again.
-    async fn rescue(&self, store: &Db<'_>, mut r: Rescue) -> Result<Option<String>, Box<(Fail, Rescue)>> {
+    /// Keeps the edit an upload may have gone over (`r`, recorded under
+    /// `key`): finds it, unless `r` already names it, and uploads it as a
+    /// new file next to the file, named as conflict copies are (only a free
+    /// name is taken; nothing is replaced). The next round brings it here
+    /// like any new file in OneDrive. Nothing goes over a network that
+    /// doesn't let the download through.
+    async fn rescue(&self, store: &Db<'_>, key: &str, mut r: Rescue) -> Rescued {
+        let size = |m: &VersionMark| m.size.and_then(|s| u64::try_from(s).ok());
+        if !self.may_fetch(size(r.theirs.as_ref().unwrap_or(&r.mark))) {
+            return Rescued::Later(Box::new(r), format!("{THEIRS_NOT_KEPT}; it {RESCUE_WAITS}"));
+        }
         let id = RemoteId(r.id.clone());
         let theirs = match &r.theirs {
             Some(t) => t.clone(),
             None => match self.cloud.replaced_other(&id, &r.mark).await {
-                Ok(Some(v)) => v,
-                Ok(None) => return Ok(None),
+                Ok(Replaced::Other(v)) => v,
+                Ok(Replaced::Planned) => return Rescued::Nothing,
+                // The history doesn't show it (yet): unless the upload never
+                // committed, or the file is gone with its history, looked
+                // for again next round.
+                Ok(Replaced::Unknown) => match self.cloud.item(&id).await {
+                    Ok(None) => return Rescued::Nothing,
+                    Ok(Some(now)) if now.etag.as_deref() == Some(r.etag.as_str()) => return Rescued::Nothing,
+                    Ok(Some(_)) => {
+                        r.tries += 1;
+                        let why = format!("{THEIRS_NOT_KEPT}; its version history doesn't show it yet");
+                        return Rescued::Later(Box::new(r), why);
+                    }
+                    Err(e) => return Rescued::Later(Box::new(r), format!("{THEIRS_NOT_KEPT}: {e}")),
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "an upload's replaced version couldn't be checked");
-                    return Err(Box::new((Fail::Failed(format!("{THEIRS_NOT_KEPT}: {e}")), r)));
+                    return Rescued::Later(Box::new(r), format!("{THEIRS_NOT_KEPT}: {e}"));
                 }
             },
         };
         r.theirs = Some(theirs.clone());
+        if !self.may_fetch(size(&theirs)) {
+            return Rescued::Later(Box::new(r), format!("{THEIRS_NOT_KEPT}; it {RESCUE_WAITS}"));
+        }
         let (parent, to, name) = (r.parent, RemoteId(r.to.clone()), r.name.clone());
-        match self.keep_version(store, &id, parent, &to, &name, &theirs).await {
-            Ok(copy) => Ok(Some(copy)),
-            Err(f) => Err(Box::new((f, r))),
+        match self.keep_version(store, key, &id, parent, &to, &name, &theirs).await {
+            Ok(copy) => Rescued::Kept(copy),
+            Err(Fail::Halt(m)) => Rescued::Halt(m),
+            Err(f) => Rescued::Later(Box::new(r), fail_text(&f)),
+        }
+    }
+
+    /// [`Executor::rescue`] for the record `before` under `key`, and the
+    /// record brought up to date with where it got: removed once nothing is
+    /// left to keep, given up after [`RESCUE_TRIES`] rounds the version
+    /// history couldn't tell. A record that can't be updated stays as it
+    /// was (written durably before the upload), and is tried again.
+    async fn rescue_recorded(&self, store: &Db<'_>, key: &str, before: Rescue) -> RescueEnd {
+        match self.rescue(store, key, before.clone()).await {
+            Rescued::Kept(copy) => RescueEnd::Kept(copy),
+            Rescued::Halt(m) => RescueEnd::Halt(m),
+            Rescued::Nothing => {
+                if let Err(e) = store.write(|o| Ok::<_, Fail>(o.meta_delete(key)?)).await {
+                    tracing::warn!(error = %fail_text(&e), "a finished rescue's record stays; checked again next round");
+                }
+                RescueEnd::Nothing
+            }
+            Rescued::Later(r, why) => {
+                let mut r = *r;
+                let gave_up = r.tries >= RESCUE_TRIES;
+                if gave_up {
+                    r.given_up_ms = Some(now_ms());
+                }
+                if r != before
+                    && let Err(e) = store.write(|o| Ok::<_, Fail>(o.meta_set(key, &r.to_json())?)).await
+                {
+                    tracing::warn!(error = %fail_text(&e), "a rescue's progress wasn't saved; it starts over next round");
+                }
+                if gave_up {
+                    tracing::warn!("an edit an upload may have gone over isn't in the version history; given up");
+                    RescueEnd::GaveUp(r.name)
+                } else {
+                    RescueEnd::Waits(why)
+                }
+            }
         }
     }
 
     /// The rescues earlier rounds couldn't finish, tried again (oldest
-    /// first); one that works, or finds nothing to keep, is done with.
+    /// first). Given-up ones are only listed, until they're old.
     async fn retry_rescues(&self, store: &Db<'_>, report: &mut Report) -> Result<(), String> {
         let waiting = store.read(|o| o.meta_under(Rescue::KEY)).map_err(|e| e.to_string())?;
         for (key, text) in waiting {
@@ -904,31 +1041,33 @@ impl<C: Cloud> Executor<C> {
                 let _ = store.write(|o| Ok::<_, Fail>(o.meta_delete(&key)?)).await;
                 continue;
             };
-            match self.rescue(store, r).await {
-                Ok(kept) => {
-                    store.write(|o| Ok::<_, Fail>(o.meta_delete(&key)?)).await.map_err(|e| fail_text(&e))?;
-                    if let Some(copy) = kept {
-                        tracing::info!("an edit an earlier upload went over was kept as a new file");
-                        report.kept_later.push(copy);
-                    }
+            if let Some(at) = r.given_up_ms {
+                if now_ms() - at > GIVEN_UP_KEPT_MS {
+                    let _ = store.write(|o| Ok::<_, Fail>(o.meta_delete(&key)?)).await;
                 }
-                Err(failed) => {
-                    let (fail, r) = *failed;
-                    if let Fail::Halt(m) = fail {
-                        return Err(m);
-                    }
-                    // Where it got to (the version found) is kept.
-                    store.write(|o| Ok::<_, Fail>(o.meta_set(&key, &r.to_json())?)).await.map_err(|e| fail_text(&e))?;
+                continue;
+            }
+            match self.rescue_recorded(store, &key, r).await {
+                RescueEnd::Kept(copy) => {
+                    tracing::info!("an edit an earlier upload went over was kept as a new file");
+                    report.kept_later.push(copy);
                 }
+                RescueEnd::GaveUp(name) => report.rescues_given_up.push(name),
+                RescueEnd::Nothing | RescueEnd::Waits(_) => {}
+                RescueEnd::Halt(m) => return Err(m),
             }
         }
         Ok(())
     }
 
     /// Uploads version `theirs` of file `id` as a new file next to it.
+    /// Its record (`key`) goes in the same transaction that records the
+    /// copy.
+    #[allow(clippy::too_many_arguments)]
     async fn keep_version(
         &self,
         store: &Db<'_>,
+        key: &str,
         id: &RemoteId,
         parent: Sid,
         to: &RemoteId,
@@ -974,8 +1113,17 @@ impl<C: Cloud> Executor<C> {
                 Ok((row, sent)) => {
                     let sent = sent.unwrap_or_else(|| reader.hash.finalize());
                     let read = reader.hash.len();
-                    store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
-                    if row.qxh != Some(sent) || read != len || row.size != size {
+                    let same = row.qxh == Some(sent) && read == len && row.size == size;
+                    store
+                        .write(|o| {
+                            o.upsert_item(&row, false)?;
+                            if same {
+                                o.meta_delete(key)?;
+                            }
+                            Ok::<_, Fail>(())
+                        })
+                        .await?;
+                    if !same {
                         return Err(lost("OneDrive's copy didn't match what was sent".into()));
                     }
                     tracing::info!("a file changed in OneDrive while its upload committed; that version was kept");
@@ -1749,6 +1897,25 @@ impl<C: Cloud> Executor<C> {
                             },
                             None => None,
                         };
+                        // Written ahead, durably: whatever happens from here
+                        // (a failure, the process killed, a power cut), the
+                        // edit the upload may go over is looked for until
+                        // it's kept or shown not to be there.
+                        if let (Some(pre), Some(mark)) = (replace, &mark) {
+                            let r = Rescue {
+                                id: pre.id.0.clone(),
+                                mark: mark.clone(),
+                                theirs: None,
+                                parent: *parent,
+                                to: to.0.clone(),
+                                name: name.clone(),
+                                etag: pre.etag.clone(),
+                                tries: 0,
+                                given_up_ms: None,
+                            };
+                            store.write_ahead(|o| Ok::<_, Fail>(o.meta_set_ahead(&r.key(), &r.to_json())?)).await?;
+                            self.crash_point()?;
+                        }
                         let uploaded = self.cloud.upload(to, name, replace.as_ref(), size, &mut src).await;
                         let (row, sent) = match uploaded {
                             Err(CloudError::Io(e)) if oneup_effects::ChangedMeanwhile::is(&e) => {
@@ -1802,36 +1969,23 @@ impl<C: Cloud> Executor<C> {
                 // file's version history), not as the upload failing, which
                 // would leave it out of what the round did.
                 if let (Some(pre), Some(mark)) = (replace, mark) {
-                    let r = Rescue {
-                        id: pre.id.0.clone(),
-                        mark,
-                        theirs: None,
-                        parent: *parent,
-                        to: to.0.clone(),
-                        name: name.clone(),
-                    };
-                    match self.rescue(store, r).await {
-                        Ok(kept) => notes.theirs = kept,
-                        Err(failed) => {
-                            let (fail, pending) = *failed;
-                            // Never dropped: kept in the store and tried
-                            // again at every later round (the data budget
-                            // used up, the network gone, OneDrive busy).
-                            let saved = store.write(|o| Ok::<_, Fail>(pending.save(o)?)).await;
-                            let why = match &fail {
-                                Fail::Failed(why) => why.clone(),
-                                Fail::Skip(s) => format!("{THEIRS_NOT_KEPT}: {s:?}"),
-                                Fail::NotNow => THEIRS_NOT_KEPT.into(),
-                                Fail::Halt(m) => format!("{THEIRS_NOT_KEPT}: {m}"),
-                            };
-                            notes.theirs_not_kept = Some(match saved {
-                                Ok(()) => format!("{why}; kept as a new file once it can be, tried again next round"),
-                                Err(_) => why,
-                            });
-                            if let Fail::Halt(m) = fail {
-                                notes.halt = Some(m);
+                    self.crash_point()?;
+                    let key = format!("{}.{}.{}", Rescue::KEY, pre.id.0, mark.id);
+                    // Unreadable now: the record stays, and the next round
+                    // tries it (the upload itself is done).
+                    let r = store.read(|o| o.meta_get(&key)).ok().flatten();
+                    match r.as_deref().and_then(Rescue::parse) {
+                        None => tracing::warn!("an upload's rescue record couldn't be read; tried next round"),
+                        Some(r) => match self.rescue_recorded(store, &key, r).await {
+                            RescueEnd::Kept(copy) => notes.theirs = Some(copy),
+                            RescueEnd::Nothing => {}
+                            RescueEnd::Waits(why) => {
+                                notes.theirs_not_kept =
+                                    Some(format!("{why}; kept as a new file once it can be, tried again next round"));
                             }
-                        }
+                            RescueEnd::GaveUp(name) => notes.given_up = Some(name),
+                            RescueEnd::Halt(m) => notes.halt = Some(m),
+                        },
                     }
                 }
                 Ok(())
@@ -2501,13 +2655,15 @@ fn folder_version(r: &RemoteRow) -> Version {
     }
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+}
+
 /// Unix milliseconds as a Windows FILETIME (now if unknown).
 fn filetime(ms: Option<i64>) -> i64 {
-    let ms = ms.unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
-    });
+    let ms = ms.unwrap_or_else(now_ms);
     ms.saturating_mul(10_000).saturating_add(116_444_736_000_000_000)
 }
 

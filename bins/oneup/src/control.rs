@@ -61,6 +61,12 @@ impl LivePause {
     /// Whether the network lets `op` through now. A download's size isn't
     /// known here: under a size limit, a download after a change of
     /// network waits for the next round, which knows it.
+    /// Whether the network's policy now lets a transfer of `bytes`
+    /// (unknown: `None`) go `way` (working offline: nothing does).
+    pub fn allows(&self, way: crate::network::Way, bytes: Option<u64>) -> bool {
+        self.net.lock().unwrap_or_else(|e| e.into_inner()).allows(way, bytes)
+    }
+
     fn net_allows(&self, op: &Op) -> bool {
         match crate::network::content(op, self.on_demand.load(Relaxed), |_| None) {
             Some((way, bytes)) => self.net.lock().unwrap_or_else(|e| e.into_inner()).allows(way, bytes),

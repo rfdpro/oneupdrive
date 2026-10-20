@@ -49,6 +49,9 @@ pub struct Facts {
     pub conflicts: Vec<Conflict>,
     /// Whether there are conflict copies besides [`Facts::conflicts`].
     pub conflicts_more: More,
+    /// Files whose upload may have gone over an edit in OneDrive that its
+    /// version history never showed (`oneup_exec::rescues_given_up`).
+    pub edits_not_found: Vec<String>,
     /// An extra pair or vault that should be running: the main agent runs
     /// (it starts them), it wasn't asked to stop, and for a vault its keys
     /// are remembered (`launch::start_others`).
@@ -94,7 +97,8 @@ pub struct Item {
     /// (`offline`, `signin`, `cloud-full`, `disk-full`, `folder`, `records`,
     /// `onedrive`, `other`), `paused`, `auto_paused`, `data_budget`,
     /// `working_offline`, `waiting_network`, `unsynced`,
-    /// `retrying`, `live_database`, `excluded_in_onedrive`, `paused_folder`, `conflict`.
+    /// `retrying`, `live_database`, `excluded_in_onedrive`, `paused_folder`, `conflict`,
+    /// `edit_not_found`.
     pub kind: String,
     pub title: String,
     pub detail: String,
@@ -245,6 +249,18 @@ pub fn collect_in(f: &Facts, now_ms: i64, loc: &Locale) -> Vec<Item> {
             t_in!(loc, "Changed on both sides"),
             t_in!(loc, "{path}: both versions kept. This PC's is now {copy}.", path = &c.path, copy = &c.copy),
             t_in!(loc, "Compare the two and delete the one you don't need."),
+        ));
+    }
+    for name in &f.edits_not_found {
+        out.push(Item::new(
+            "edit_not_found",
+            t_in!(loc, "Edit in OneDrive not found"),
+            t_in!(
+                loc,
+                "{name}: an upload may have gone over an edit made in OneDrive, which the file's version history doesn't show.",
+                name = name.as_str()
+            ),
+            t_in!(loc, "Look for it in the file's version history in OneDrive."),
         ));
     }
     if f.stale_note {
@@ -520,7 +536,8 @@ async fn facts(dir: &Path, pair: Option<String>) -> Facts {
         Err(e) => View::Unreachable(e.to_string()),
     };
     let set_up = !crate::settingsapi::needs_setup(dir);
-    let (unsynced, (conflicts, conflicts_more)) = if set_up { from_store(dir) } else { (None, (Vec::new(), More::No)) };
+    let (unsynced, (conflicts, conflicts_more), edits_not_found) =
+        if set_up { from_store(dir) } else { (None, (Vec::new(), More::No), Vec::new()) };
     Facts {
         signed_in: dir.join("token.dpapi").exists(),
         paused_folders: crate::config::paused_folders(dir),
@@ -531,6 +548,7 @@ async fn facts(dir: &Path, pair: Option<String>) -> Facts {
         unsynced,
         conflicts,
         conflicts_more,
+        edits_not_found,
         expected: false,
         stale_note: crate::problem::stale_stop_note(dir),
         children_unreadable: None,
@@ -544,13 +562,14 @@ async fn status(dir: &Path) -> Result<Status, ClientError> {
 /// What the store records: what can't sync, and the conflict copies of the
 /// last [`CONFLICT_DAYS`] still in the synced folder. Unreadable: nothing
 /// (the rest of the list still helps).
-fn from_store(dir: &Path) -> (Option<Unsynced>, (Vec<Conflict>, More)) {
-    let Ok(store) = crate::setup::open_store(dir, 1024) else { return (None, (Vec::new(), More::No)) };
+fn from_store(dir: &Path) -> (Option<Unsynced>, (Vec<Conflict>, More), Vec<String>) {
+    let Ok(store) = crate::setup::open_store(dir, 1024) else { return (None, (Vec::new(), More::No), Vec::new()) };
     let unsynced = crate::unsynced::load(&store).ok().and_then(|r| crate::unsynced::count(&r));
     let since = crate::control::now_ms() - CONFLICT_DAYS * 24 * 3600 * 1000;
     let root = crate::sync::pairing(&store).ok().map(|p| p.local);
     let conflicts = conflicts(&store, since, CONFLICTS_MAX, |c| root.as_deref().is_none_or(|r| copy_exists(r, c)));
-    (unsynced, conflicts)
+    let edits = store.read(oneup_exec::rescues_given_up).unwrap_or_default();
+    (unsynced, conflicts, edits.into_iter().map(|(name, _)| name).collect())
 }
 
 /// The newest `max` conflict copies logged since `since_ms` that are
@@ -688,6 +707,7 @@ mod tests {
             unsynced: None,
             conflicts: Vec::new(),
             conflicts_more: More::No,
+            edits_not_found: Vec::new(),
             expected: false,
             stale_note: false,
             children_unreadable: None,
@@ -696,6 +716,16 @@ mod tests {
 
     fn kinds(items: &[Item]) -> Vec<&str> {
         items.iter().map(|i| i.kind.as_str()).collect()
+    }
+
+    /// An edit an upload may have gone over that was looked for until
+    /// given up is listed, by name.
+    #[test]
+    fn an_edit_not_found_in_the_version_history_is_listed() {
+        let f = Facts { edits_not_found: vec!["notes.txt".into()], ..facts(View::NotRunning) };
+        let items = collect(&f, 0);
+        let item = items.iter().find(|i| i.kind == "edit_not_found").expect("listed");
+        assert!(item.detail.starts_with("notes.txt: "), "{}", item.detail);
     }
 
     #[test]
