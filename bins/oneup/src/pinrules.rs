@@ -1061,15 +1061,17 @@ pub fn fetch_pass(
             continue;
         }
         if let Err(why) = may(size) {
+            // The waiting file too big for the disk or the pass's share
+            // now: the rest of the batch may still go, and the next pass
+            // tries it first again. Only a pause stops the pass there.
+            if before.is_none() && why != Stop::Paused {
+                continue;
+            }
             out.stopped = Some(why);
             out.more = true;
-            // The next scan starts at this file (the waiting file is
-            // tried first anyway).
-            if let Some(before) = before {
-                resume = before;
-            } else {
-                resume = start;
-            }
+            // The next scan starts at this file (none read yet if it's the
+            // waiting file).
+            resume = before.unwrap_or(start);
             break;
         }
         let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
@@ -2356,6 +2358,53 @@ mod tests {
         let (_, g) = pass(&mut s, &mut fake);
         assert_eq!(g, [rel], "exactly the remembered file");
         assert!(s.read(|o| o.meta_get(KEY_FETCH_WAITING)).unwrap().is_none());
+    }
+
+    /// The waiting file, approved but too big for the free space now,
+    /// doesn't hold up the rest: a small file the user pinned downloads,
+    /// the scan moves on, and no pass comes soon for it.
+    #[test]
+    fn a_waiting_file_too_big_for_the_disk_doesnt_hold_up_the_rest() {
+        let (mut s, mut fake, _) = many_kept(1, 8 << 30);
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |_| false).unwrap();
+        let (waiting, size) = f.blocked.unwrap();
+        assert_eq!(waiting, 10);
+        settle(&mut s, &f.attempted, &|_| false).unwrap();
+        wait_for_go_ahead(&mut s, size).unwrap();
+        allow(&mut s, 0).unwrap();
+        let mut got = Vec::new();
+        let mut free = 4u64 << 30;
+        let mut limit = FetchLimit::new(1 << 30, Instant::now());
+        let f = fetch_pass(
+            &mut s,
+            &mut fake,
+            &mut |size| {
+                let r = limit.may(size, false, Some(free), Instant::now());
+                if r.is_ok() {
+                    free -= size;
+                }
+                r
+            },
+            &mut |rel| {
+                got.push(rel.to_string());
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(got, ["/u.txt"], "the user's file downloads");
+        assert_eq!((f.stopped, f.more), (None, false), "no stop, and no pass soon");
+        assert!(s.read(|o| o.meta_get(KEY_FETCH_AFTER)).unwrap().is_none(), "the scan went round");
+        assert_eq!(s.read(|o| o.meta_get(KEY_FETCH_WAITING)).unwrap(), Some("10".into()), "still waiting");
+        // Downloaded: nothing left but the waiting file. No pass soon.
+        journal(&mut s, &[(1000, PINNED)]);
+        let mut limit = FetchLimit::new(1 << 30, Instant::now());
+        let f =
+            fetch_pass(&mut s, &mut fake, &mut |size| limit.may(size, false, Some(free), Instant::now()), &mut |_| {
+                true
+            })
+            .unwrap();
+        assert!(f.done.is_empty());
+        assert_eq!((f.stopped, f.more), (None, false));
     }
 
     /// A rescan of the folder (the change journal lost) deletes every Local
