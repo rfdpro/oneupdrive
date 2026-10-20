@@ -279,6 +279,12 @@ pub fn apply_records(
     order.sort_unstable();
     let freed = freed_names(o, records)?;
     let mut small: HashMap<u128, bool> = HashMap::new();
+    // A write to a file's data: a hash of it made for finding duplicates no
+    // longer stands, even if the write kept its size and put its time back.
+    let data = reason::DATA_OVERWRITE | reason::DATA_EXTEND | reason::DATA_TRUNCATION;
+    for r in records.iter().filter(|r| r.reason & data != 0) {
+        o.local_only_hash_forget(r.file_id.0)?;
+    }
 
     for r in order.into_iter().map(|i| &records[i]) {
         let id = r.file_id.0;
@@ -1134,6 +1140,26 @@ mod tests {
 
     fn path(s: &Store, id: u128) -> Option<String> {
         s.read(|o| o.local_path_of(id)).unwrap()
+    }
+
+    /// A write to a file's data drops its duplicates hash, even when the
+    /// file keeps its size and time; a rename doesn't.
+    #[test]
+    fn a_data_write_drops_the_duplicates_hash() {
+        let mut s = tree();
+        s.write(|o| {
+            o.local_only_hash_put(3, 0, 5, &[1; 20])?;
+            o.local_only_hash_put(4, 0, 5, &[1; 20]).map(|_| ())
+        })
+        .unwrap();
+        let live = [entry(3, "a.txt", 0, 0), entry(4, "b.txt", 0, 0)];
+        apply(
+            &mut s,
+            &[rec(3, 2, reason::DATA_OVERWRITE | reason::CLOSE), rec(4, ROOT_ID, reason::BASIC_INFO_CHANGE)],
+            &live,
+        );
+        assert!(s.read(|o| o.local_only_hash_get(3, 0, 5)).unwrap().is_none(), "written");
+        assert!(s.read(|o| o.local_only_hash_get(4, 0, 5)).unwrap().is_some(), "only its attributes");
     }
 
     #[test]

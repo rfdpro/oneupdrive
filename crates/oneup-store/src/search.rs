@@ -774,7 +774,11 @@ mod tests {
             let mut s = Store::open(&path, 1024).unwrap();
             drive(&mut s);
             s.read(|o| {
-                let undo = format!("{} {UNDO_V18} PRAGMA user_version = 17;", crate::choose::UNDO_V19);
+                let undo = format!(
+                    "{} {} {UNDO_V18} PRAGMA user_version = 17;",
+                    crate::dupes::UNDO_V20,
+                    crate::choose::UNDO_V19
+                );
                 Ok(o.c.execute_batch(&undo)?)
             })
             .unwrap();
