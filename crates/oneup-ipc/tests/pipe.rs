@@ -85,6 +85,66 @@ async fn the_agent_is_reachable_through_its_data_folder_only_while_it_runs() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// An agent that refuses the given process id (as the real agent refuses
+/// its own hook processes).
+struct Picky(u32);
+
+impl Handler for Picky {
+    fn handle(&self, _: Call) -> Result<Status, RpcError> {
+        Ok(Status {
+            version: "test".into(),
+            rev: 0,
+            local: "L".into(),
+            remote: "/R".into(),
+            activity: Activity::Idle,
+            paused: PauseState::default(),
+            push: false,
+            checked_ms: None,
+            last: None,
+            safety_stops: Vec::new(),
+            overflow: None,
+            problem: None,
+            auto_pause: None,
+            auto_pause_hours: None,
+            prune_offer: None,
+            progress: None,
+            unsynced: None,
+            retrying: None,
+        })
+    }
+    fn permit(&self, pid: u32) -> bool {
+        pid != self.0
+    }
+}
+
+/// A client the agent won't serve (here, this test process, standing in for
+/// a hook process) is refused: the server identifies it by process id and
+/// drops the connection, so it can't read status or answer anything.
+#[tokio::test]
+async fn a_client_the_agent_refuses_cant_use_the_pipe() {
+    let dir = std::env::temp_dir().join(format!("oneup-ipc-permit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Refuse our own process id: every call from this test is turned away.
+    let server = Server::start(&dir, Arc::new(Picky(std::process::id()))).unwrap();
+    let mut c = connect(&dir).await.unwrap();
+    let e = c.call(&Call::Status).await.unwrap_err();
+    assert!(matches!(e, ClientError::Protocol(_) | ClientError::Io(_)), "refused client gets no reply: {e}");
+    drop(c);
+    // A permit that allows this process id is served as usual.
+    drop(server);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+    let dir2 = std::env::temp_dir().join(format!("oneup-ipc-permit2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir2);
+    std::fs::create_dir_all(&dir2).unwrap();
+    let server = Server::start(&dir2, Arc::new(Picky(0))).unwrap();
+    let mut c = connect(&dir2).await.unwrap();
+    assert_eq!(c.call(&Call::Status).await.unwrap().activity, Activity::Idle);
+    drop((c, server));
+    std::fs::remove_dir_all(&dir2).unwrap();
+}
+
 #[tokio::test]
 async fn a_watching_client_hears_of_another_clients_change() {
     let dir = std::env::temp_dir().join(format!("oneup-ipc-watch-{}", std::process::id()));

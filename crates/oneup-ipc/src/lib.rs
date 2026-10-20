@@ -70,6 +70,14 @@ pub trait Handler: Send + Sync + 'static {
     fn event_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         None
     }
+
+    /// Whether the client process `pid` may use the control pipe. The
+    /// agent refuses its own hook processes (`oneup_app::hooks`), so a hook
+    /// can't approve a safety stop or read the status over the pipe. By
+    /// default everyone may.
+    fn permit(&self, _pid: u32) -> bool {
+        true
+    }
 }
 
 /// Answers a [`Call::Events`]: once there is an event after `since`, or
@@ -290,8 +298,14 @@ mod win {
                 tracing::warn!(error = %e, "control pipe: a connection failed");
             } else {
                 let conn = next;
+                // Who's calling: the agent refuses its own hook processes,
+                // so a hook can't reach the control calls (approving a
+                // safety stop) by any path other programs don't have.
+                use std::os::windows::io::AsRawHandle as _;
+                let pid = oneup_sys::pipe::client_process_id(conn.as_raw_handle() as isize);
+                let permitted = pid.is_none_or(|p| handler.permit(p));
                 match Arc::clone(&slots).try_acquire_owned() {
-                    Ok(permit) => {
+                    Ok(permit) if permitted => {
                         let handler = Arc::clone(&handler);
                         tokio::spawn(async move {
                             if let Err(e) = serve(conn, handler.as_ref()).await {
@@ -300,7 +314,7 @@ mod win {
                             drop(permit);
                         });
                     }
-                    Err(_) => drop(conn),
+                    _ => drop(conn),
                 }
             }
             // The next instance, for the next client.
