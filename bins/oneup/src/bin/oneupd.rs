@@ -1402,7 +1402,7 @@ impl NetUse {
                 };
                 let month = oneup_app::netusage::month_of(now_ms());
                 let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
-                let alive = |w: &str| w.parse::<u32>().ok().and_then(oneup_sys::processes::image_of).is_some();
+                let alive = oneup_app::netusage::agent_alive;
                 oneup_app::netusage::reserve(&mut s, &profile, &month, &owner, want, budget, &alive).unwrap_or_else(
                     |e| {
                         tracing::warn!(error = %e, "couldn't take more of the data budget");
