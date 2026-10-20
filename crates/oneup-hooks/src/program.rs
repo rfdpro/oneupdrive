@@ -218,7 +218,14 @@ pub fn check(program: &str, args: &[String], cwd: &Path, places: &Places) -> Res
     let real = safe_file(&given, "the program", places)?;
     let ext = real.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     let stem = real.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let templates_ok = ext == "exe" && !is_interpreter(&stem);
+    // The name it has now, and the names its version resource gives (a
+    // renamed copy of an interpreter keeps its OriginalFilename).
+    let renamed_interpreter = oneup_sys::version_info::original_names(&real).iter().any(|n| {
+        let n = n.trim().to_ascii_lowercase();
+        let n = n.strip_suffix(".exe").or_else(|| n.strip_suffix(".mui")).unwrap_or(&n).to_string();
+        is_interpreter(&n)
+    });
+    let templates_ok = ext == "exe" && !is_interpreter(&stem) && !renamed_interpreter;
 
     if !templates_ok && let Some(a) = args.iter().find(|a| has_template(a)) {
         let kind = if ext == "exe" { "an interpreter" } else { "a script, not a plain .exe" };
@@ -229,8 +236,10 @@ pub fn check(program: &str, args: &[String], cwd: &Path, places: &Places) -> Res
         )));
     }
 
-    // Literal script/path arguments must be outside every synced folder.
-    let mut scripts = literal_scripts(args, cwd, places)?;
+    // For an interpreter or a script, every path its literal arguments name
+    // (a script, or one inside inline code) must be outside every synced
+    // folder. A plain .exe's arguments are data to it, so they're left alone.
+    let mut scripts = if templates_ok { Vec::new() } else { literal_scripts(args, cwd, places)? };
 
     // How it actually launches.
     let (launch, prefix) = match ext.as_str() {
@@ -240,9 +249,12 @@ pub fn check(program: &str, args: &[String], cwd: &Path, places: &Places) -> Res
             // script path on the line; the event is data (env + stdin). cmd
             // doesn't understand an extended `\\?\` path, so the argument is
             // the plain form; the guard still holds the canonical file.
+            // `/d`: no AutoRun commands from the registry; `call`: cmd keeps
+            // the quoted path as one argument, whatever parentheses or
+            // spaces it has.
             scripts.insert(0, real.clone());
             let plain = coexist::plain(&real).into_os_string();
-            (cmd_exe()?, vec![OsString::from("/c"), plain])
+            (cmd_exe()?, vec![OsString::from("/d"), OsString::from("/c"), OsString::from("call"), plain])
         }
         _ => {
             return Err(Refusal(format!(
@@ -275,17 +287,22 @@ fn has_template(arg: &str) -> bool {
     false
 }
 
-/// Literal arguments that name a file: each is verified to be outside every
-/// synced folder (its contents would otherwise be cloud-controlled), and
-/// collected to guard at launch. Drive-relative paths (`C:script.py`) are
-/// refused; a leading `/c`/`/k` on the token is stripped first.
+/// Literal arguments that name a file, for an interpreter or a script: each
+/// path in them (whole, after `=`, after a leading `/c`/`/k`, and every token
+/// of inline code split on quotes, white space and `; | & ( ) , < >`) must be
+/// outside every synced folder, whether or not the file exists yet (the path
+/// and its deepest existing folder are checked), across every hard link of a
+/// file that exists. Drive-relative paths (`C:script.py`) are refused. Script
+/// files found are returned to guard at launch.
 fn literal_scripts(args: &[String], cwd: &Path, places: &Places) -> Result<Vec<PathBuf>, Refusal> {
     let mut scripts = Vec::new();
     for a in args {
         if has_template(a) {
             continue;
         }
-        for cand in arg_paths(a) {
+        let mut cands = arg_paths(a);
+        cands.extend(inline_tokens(a));
+        for cand in cands {
             let p = Path::new(&cand);
             // A drive-relative path (`C:foo`, no separator after the colon)
             // resolves against that drive's current directory, which we
@@ -301,23 +318,57 @@ fn literal_scripts(args: &[String], cwd: &Path, places: &Places) -> Result<Vec<P
                 continue;
             }
             let full = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-            let Ok(real) = std::fs::canonicalize(&full) else { continue };
-            if !real.is_file() {
-                continue;
-            }
-            if let Some(place) = cloud_place(&real, &places.synced).or_else(|| cloud_place(&full, &places.synced)) {
+            if let Some(place) = place_of_path(&full, places) {
                 return Err(Refusal(format!(
                     "{} is in {place}: a change in the cloud could replace what the hook runs. Move it to a folder \
                      that isn't synced",
                     full.display()
                 )));
             }
-            if is_script_name(&real) {
+            let Ok(real) = std::fs::canonicalize(&full) else { continue };
+            if !real.is_file() {
+                continue;
+            }
+            // Every name the file has must be outside the synced folders too.
+            let real = safe_file(&full, "the script", places)?;
+            if is_script_name(&real) && !scripts.contains(&real) {
                 scripts.push(real);
             }
         }
     }
     Ok(scripts)
+}
+
+/// Where `path` lies in a cloud folder, if it does, even when it doesn't
+/// exist yet: the path as written, and its deepest existing folder resolved
+/// (links followed) with the rest of the path added back.
+fn place_of_path(path: &Path, places: &Places) -> Option<String> {
+    if let Some(place) = cloud_place(path, &places.synced) {
+        return Some(place);
+    }
+    let mut ancestor = path;
+    let mut rest: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(ancestor) {
+            let mut full = real;
+            for part in rest.iter().rev() {
+                full.push(part);
+            }
+            return cloud_place(&full, &places.synced);
+        }
+        rest.push(ancestor.file_name()?);
+        ancestor = ancestor.parent()?;
+    }
+}
+
+/// The tokens of inline code in a literal argument (`& 'C:\x.ps1'`,
+/// `call C:\x.bat`), split on quotes, white space and command separators.
+fn inline_tokens(arg: &str) -> Vec<String> {
+    arg.split(|c: char| c.is_whitespace() || "\"'`;|&(),<>".contains(c))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The path-like candidates in a literal argument: the whole thing, the part
@@ -521,7 +572,7 @@ mod tests {
         assert!(!c.templates_ok);
         assert!(c.program.to_string_lossy().to_lowercase().ends_with(r"\cmd.exe"));
         let plain_bat = coexist::plain(&std::fs::canonicalize(&bat).unwrap()).into_os_string();
-        assert_eq!(c.prefix, vec![OsString::from("/c"), plain_bat]);
+        assert_eq!(c.prefix, vec![OsString::from("/d"), OsString::from("/c"), OsString::from("call"), plain_bat]);
         assert_eq!(c.scripts, vec![std::fs::canonicalize(&bat).unwrap()]);
         // A .ps1 program (not .bat): refused, pointed at an interpreter.
         let ps = t.0.join("x.ps1");
@@ -577,6 +628,52 @@ mod tests {
         // A literal interpreter command with no template is fine (the user's
         // own code), e.g. cmd echoing a fixed string.
         assert!(check("cmd.exe", &args(&["/c", "echo done"]), &t.0, &pl).is_ok());
+    }
+
+    /// Paths inside inline code, paths that don't exist yet, and a script
+    /// with a second hard link into a synced folder are all caught.
+    #[test]
+    fn literal_paths_are_checked_in_inline_code_unborn_and_across_links() {
+        let t = tmp("inline");
+        let synced = t.0.join("Synced");
+        let tools = t.0.join("Tools");
+        std::fs::create_dir_all(&synced).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let pl = places(vec![(synced.clone(), "the main folder".into())]);
+        let evil = synced.join("evil.ps1");
+        let evil_s = evil.to_string_lossy().to_string();
+        // Inline code naming a script in the synced folder (it needn't exist).
+        let cmdline = format!("& '{evil_s}'");
+        assert!(check("powershell.exe", &args(&["-Command", &cmdline]), &tools, &pl).is_err(), "inline &");
+        let call = format!("call {}", synced.join("evil.bat").display());
+        assert!(check("cmd.exe", &args(&["/c", &call]), &tools, &pl).is_err(), "inline call");
+        // A path that doesn't exist yet, under a synced folder.
+        let unborn = synced.join("later").join("x.py").to_string_lossy().to_string();
+        assert!(check("python.exe", &args(&[&unborn]), &tools, &pl).is_err(), "unborn path");
+        // A script outside with a second hard link inside the synced folder.
+        let ok = tools.join("ok.ps1");
+        std::fs::write(&ok, b"x").unwrap();
+        assert!(check("powershell.exe", &args(&["-File", &ok.to_string_lossy()]), &tools, &pl).is_ok());
+        std::fs::hard_link(&ok, synced.join("ok.ps1")).unwrap();
+        let e = check("powershell.exe", &args(&["-File", &ok.to_string_lossy()]), &tools, &pl).unwrap_err();
+        assert!(e.0.contains("the main folder"), "{e}");
+        // A plain .exe's literal data path is its own business.
+        let exe = tools.join("tool.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        assert!(check(&exe.to_string_lossy(), &args(&[&evil_s]), &tools, &pl).is_ok());
+    }
+
+    /// A renamed copy of an interpreter is still an interpreter (its version
+    /// resource's original name), so templates are refused for it.
+    #[test]
+    fn a_renamed_interpreter_is_still_an_interpreter() {
+        let t = tmp("renamed");
+        std::fs::create_dir_all(&t.0).unwrap();
+        let cmd = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32").join("cmd.exe");
+        let copy = t.0.join("innocent.exe");
+        std::fs::copy(&cmd, &copy).unwrap();
+        let e = check(&copy.to_string_lossy(), &args(&["/c", "echo {path}"]), &t.0, &places(vec![])).unwrap_err();
+        assert!(e.0.contains("interpreter"), "{e}");
     }
 
     #[test]
