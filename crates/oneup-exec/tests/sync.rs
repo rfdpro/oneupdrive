@@ -108,6 +108,11 @@ struct State {
     /// Told the ID of each item about to be removed (deleted or pruned),
     /// once its precondition held: what the store says at that moment.
     on_remove: Option<OnRemove>,
+    /// Every upload that committed: the file's name and what it held.
+    sent: Vec<(String, Vec<u8>)>,
+    /// Runs once the next upload has read its first bytes: another
+    /// program writing something else meanwhile.
+    during_upload: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// See [`State::on_remove`].
@@ -493,6 +498,10 @@ impl Fake {
         if let Some(s) = now {
             s.save();
         }
+        let during = self.0.lock().unwrap().during_upload.take();
+        if let Some(f) = during {
+            f();
+        }
         // One more than is left: a file longer than its size shows.
         let (rest, read) = src.fill(vec![0; size - first + 1], size - first + 1).await;
         content.extend_from_slice(&rest[..read?]);
@@ -516,6 +525,7 @@ impl Fake {
             return Err(CloudError::Full);
         }
         s.uploaded += content.len() as u64;
+        s.sent.push((name.to_string(), content.clone()));
         let id = match replace {
             Some(pre) => {
                 s.check(pre)?;
@@ -5827,4 +5837,874 @@ async fn on_demand_a_dehydrated_duplicate_goes_without_downloading() {
     assert_eq!(slots, 0, "nothing of it kept here");
     assert_eq!(placeholder(&keep).on_disk, 0, "nothing downloaded");
     assert_eq!(cloud.tree()["/keep/x.bin"].as_deref(), Some(data.as_slice()));
+}
+
+// ---------------------------------------------------------------- databases
+
+/// `oneup-test-sqlite` (this crate's test helper): a program of its own
+/// that writes SQLite databases, as a user's program would.
+struct SqliteApp {
+    child: std::process::Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+}
+
+impl SqliteApp {
+    fn start(args: &[&str]) -> Self {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oneup-test-sqlite"))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = std::io::BufReader::new(child.stdout.take().unwrap());
+        Self { child, out }
+    }
+
+    /// The next line it prints.
+    fn line(&mut self) -> String {
+        let mut l = String::new();
+        std::io::BufRead::read_line(&mut self.out, &mut l).unwrap();
+        l.trim().to_string()
+    }
+
+    fn running(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Asks a `hold` to close its database, and waits until it has.
+    fn close(mut self) {
+        let mut stdin = self.child.stdin.take().unwrap();
+        stdin.write_all(b"close\n").unwrap();
+        drop(stdin);
+        while !matches!(self.line().as_str(), "closed" | "") {}
+        assert!(self.child.wait().unwrap().success());
+    }
+
+    /// Killed: whatever it had open stays as it was.
+    fn kill(mut self) {
+        self.child.kill().unwrap();
+        self.child.wait().unwrap();
+    }
+}
+
+/// The helper's executable name, as Windows reports the programs that
+/// have a file open (compared in lower case).
+const SQLITE_APP: &str = "oneup-test-sqlite.exe";
+
+/// Opens a copy of a database's bytes the way a program would, and checks
+/// it: SQLite's own `integrity_check` says `ok`, and it holds as many rows
+/// as the counter its transactions raise with each one (a copy that mixes
+/// two states of the file shows). Returns the rows. A database the program
+/// hasn't made its tables in yet (a state it was in) has none.
+fn check_sqlite(bytes: &[u8]) -> Result<i64, String> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-check-{}-{n}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("copy.db");
+    std::fs::write(&path, bytes).unwrap();
+    let c = rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+    let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if ok != "ok" {
+        return Err(ok);
+    }
+    let tables: i64 = c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if tables == 0 {
+        return Ok(0);
+    }
+    let rows: i64 = c.query_row("SELECT count(*) FROM item", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let counted: i64 = c.query_row("SELECT n FROM counter", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if rows != counted {
+        return Err(format!("{rows} rows, but the counter says {counted}"));
+    }
+    Ok(rows)
+}
+
+impl Fake {
+    /// What every upload of a file called `name` sent, in order.
+    fn sent(&self, name: &str) -> Vec<Vec<u8>> {
+        self.0.lock().unwrap().sent.iter().filter(|(n, _)| n == name).map(|(_, c)| c.clone()).collect()
+    }
+}
+
+/// The waits a round reported for `name`: why, and which programs (in
+/// lower case).
+fn db_waits(r: &Report, name: &str) -> Vec<(oneup_effects::Wait, Vec<String>)> {
+    r.databases
+        .iter()
+        .filter(|(op, _)| match op {
+            Op::Upload { name: n, .. } | Op::Download { name: n, .. } => n == name,
+            _ => false,
+        })
+        .filter_map(|(_, d)| Some((d.wait.clone()?, d.programs.iter().map(|p| p.to_lowercase()).collect())))
+        .collect()
+}
+
+/// A program writes a SQLite database without pause, in WAL mode and in
+/// rollback-journal mode, while rounds run: every version sent opens, and
+/// passes SQLite's integrity check with its rows matching its counter. Its
+/// `-wal` and `-journal` are sent only empty or with no transaction in
+/// them, and never renamed or removed under the program.
+#[tokio::test]
+async fn everyday_a_sqlite_database_written_without_pause_is_only_sent_whole() {
+    for mode in ["wal", "delete"] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(&format!("sqlite-{mode}"), cloud.clone());
+        s.settle().await;
+        let db = s.p("app.db");
+        let mut app = SqliteApp::start(&["write", db.to_str().unwrap(), "6", mode]);
+        let mut waited = 0;
+        while app.running() {
+            let r = s.round().await;
+            waited += db_waits(&r, "app.db").len();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let rows: i64 = app.line().strip_prefix("done ").unwrap().parse().unwrap();
+        let during = cloud.sent("app.db").len();
+        s.settle().await;
+        let sent = cloud.sent("app.db");
+        assert!(!sent.is_empty());
+        for (i, v) in sent.iter().enumerate() {
+            if let Err(e) = check_sqlite(v) {
+                panic!("{mode}: version {i} of {} sent is broken: {e}", sent.len());
+            }
+        }
+        assert_eq!(check_sqlite(sent.last().unwrap()), Ok(rows), "{mode}: the last version sent has every row");
+        assert_eq!(cloud.tree()["/app.db"].as_deref(), Some(std::fs::read(&db).unwrap().as_slice()));
+        // Its working files go only when they carry nothing it needs.
+        for v in cloud.sent("app.db-wal") {
+            assert!(v.is_empty(), "{mode}: a -wal holding changes was sent");
+        }
+        for v in cloud.sent("app.db-journal") {
+            assert!(!oneup_rules::database::journal_active(&v), "{mode}: a -journal in a transaction was sent");
+        }
+        eprintln!("{mode}: {rows} transactions, {} versions sent ({during} while writing), {waited} waits", sent.len());
+        if mode == "wal" {
+            assert!(during > 0, "sent while the program was still writing, when the -wal was empty");
+        }
+    }
+}
+
+/// A database open with changes in its `-wal` (not yet in the file) isn't
+/// sent, and the round says which program has it open; once the program
+/// closes it (SQLite moves the changes into the file), it is, with them.
+#[tokio::test]
+async fn everyday_a_database_with_changes_in_its_wal_waits_until_they_are_in_it() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-hold", cloud.clone());
+    let db = s.p("app.db");
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "30"]);
+    assert_eq!(app.line(), "held");
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let r = s.round().await;
+        waits.extend(db_waits(&r, "app.db"));
+    }
+    assert!(cloud.sent("app.db").is_empty(), "not sent while its changes are in the -wal");
+    assert!(cloud.sent("app.db-wal").is_empty());
+    assert!(
+        waits.iter().any(|(w, p)| *w == oneup_effects::Wait::Wal && p.iter().any(|p| p == SQLITE_APP)),
+        "{waits:?}"
+    );
+    app.close();
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(check_sqlite(t["/app.db"].as_deref().unwrap()), Ok(30));
+    assert!(!t.contains_key("/app.db-wal"), "{:?}", names(&t));
+}
+
+/// A newer version of a database from OneDrive waits while a program has
+/// the database open (the round names it), and replaces it once closed.
+#[tokio::test]
+async fn everyday_a_newer_version_from_onedrive_waits_while_the_database_is_open() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-download", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["hold", db.to_str().unwrap(), "5"]).close();
+    s.settle().await;
+    let ours = std::fs::read(&db).unwrap();
+    // Theirs: the same database with more rows, made elsewhere.
+    let other = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-theirs-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&other.0);
+    std::fs::create_dir_all(&other.0).unwrap();
+    let theirs_path = other.0.join("app.db");
+    std::fs::copy(&db, &theirs_path).unwrap();
+    SqliteApp::start(&["hold", theirs_path.to_str().unwrap(), "7"]).close();
+    let theirs = std::fs::read(&theirs_path).unwrap();
+    assert_eq!(check_sqlite(&theirs), Ok(12));
+
+    // Opened, with nothing written.
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "0"]);
+    assert_eq!(app.line(), "held");
+    cloud.edit("app.db", &theirs);
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let r = s.round().await;
+        waits.extend(db_waits(&r, "app.db"));
+    }
+    assert_eq!(std::fs::read(&db).unwrap(), ours, "not replaced while open");
+    assert!(
+        waits.iter().any(|(w, p)| *w == oneup_effects::Wait::Open && p.iter().any(|p| p == SQLITE_APP)),
+        "{waits:?}"
+    );
+    app.close();
+    s.settle().await;
+    assert_eq!(std::fs::read(&db).unwrap(), theirs);
+    assert_eq!(check_sqlite(&std::fs::read(&db).unwrap()), Ok(12));
+}
+
+/// A program that died with changes in a database's `-wal` leaves them
+/// there: replacing the database then would have SQLite apply them to the
+/// new file. A newer version from OneDrive waits, with `[databases] wait`
+/// off too, and the round says why.
+#[tokio::test]
+async fn a_database_left_with_changes_in_its_wal_is_never_replaced() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-left", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
+    s.settle().await;
+    let ours = std::fs::read(&db).unwrap();
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "10"]);
+    assert_eq!(app.line(), "held");
+    app.kill();
+    let wal = std::fs::read(s.p("app.db-wal")).unwrap();
+    assert!(!wal.is_empty());
+    cloud.edit("app.db", &ours[..ours.len() / 2]);
+
+    // With waiting off too, and the round says why.
+    s.exec.set_databases(oneup_rules::database::Databases::off());
+    let r = s.round().await;
+    assert!(db_waits(&r, "app.db").iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{r:?}");
+    assert_eq!(std::fs::read(&db).unwrap(), ours);
+
+    s.exec.set_databases(oneup_rules::database::Databases::default());
+    let r = s.round().await;
+    assert!(db_waits(&r, "app.db").iter().any(|(w, p)| *w == oneup_effects::Wait::Wal && p.is_empty()), "{r:?}");
+    assert_eq!(std::fs::read(&db).unwrap(), ours);
+    assert_eq!(std::fs::read(s.p("app.db-wal")).unwrap(), wal);
+}
+
+/// Another program keeping a file open (PowerShell, here), so the test
+/// isn't the one holding it.
+struct HeldOpen(std::process::Child);
+
+impl HeldOpen {
+    fn new(path: &Path) -> Self {
+        let script = format!(
+            "$f=[IO.File]::Open('{}','Open','Read','ReadWrite'); [Console]::Out.WriteLine('open'); \
+             [Console]::In.ReadLine() | Out-Null; $f.Close()",
+            path.display()
+        );
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        assert_eq!(line.trim(), "open");
+        Self(child)
+    }
+
+    fn close(mut self) {
+        drop(self.0.stdin.take());
+        self.0.wait().unwrap();
+    }
+}
+
+/// A password database (and a file a `[databases]` pattern names) open in
+/// another program waits, and the round names the program; once closed,
+/// it's sent.
+#[tokio::test]
+async fn everyday_a_database_open_in_another_program_is_sent_once_closed() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("db-open", cloud.clone());
+    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["*.ledger"]).unwrap());
+    let mut kdbx = vec![0x03, 0xD9, 0xA2, 0x9A, 0x67, 0xFB, 0x4B, 0xB5, 0x01, 0x00, 0x04, 0x00];
+    kdbx.extend(std::iter::repeat_n(0x5A, 500));
+    write(&s.p("vault.kdbx"), &kdbx);
+    write(&s.p("home.ledger"), b"2026-10-01 coffee 3.50\n");
+    let held = [HeldOpen::new(&s.p("vault.kdbx")), HeldOpen::new(&s.p("home.ledger"))];
+    let mut waits = Vec::new();
+    for _ in 0..2 {
+        let r = s.round().await;
+        waits.extend(db_waits(&r, "vault.kdbx"));
+        waits.extend(db_waits(&r, "home.ledger"));
+    }
+    let t = cloud.tree();
+    assert!(!t.contains_key("/vault.kdbx") && !t.contains_key("/home.ledger"), "{:?}", names(&t));
+    let by_powershell = waits.iter().filter(|(w, p)| *w == oneup_effects::Wait::Open && p == &["powershell.exe"]);
+    assert!(by_powershell.count() >= 2, "{waits:?}");
+    for h in held {
+        h.close();
+    }
+    s.settle().await;
+    let t = cloud.tree();
+    assert_eq!(t["/vault.kdbx"].as_deref(), Some(kdbx.as_slice()));
+    assert!(t.contains_key("/home.ledger"));
+}
+
+/// [`check_sqlite`] for a database and the `-wal` beside it, opened
+/// together as SQLite would find them on a PC.
+fn check_sqlite_with_wal(main: &[u8], wal: &[u8]) -> Result<i64, String> {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-pair-{}-{n}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("copy.db");
+    std::fs::write(&path, main).unwrap();
+    std::fs::write(dir.0.join("copy.db-wal"), wal).unwrap();
+    let c = rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+    let rows: i64 = c.query_row("SELECT count(*) FROM item", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let counted: i64 = c.query_row("SELECT n FROM counter", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let ok: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if ok != "ok" || rows != counted {
+        return Err(format!("{ok}: {rows} rows, counter {counted}"));
+    }
+    Ok(rows)
+}
+
+/// A database made elsewhere by `oneup-test-sqlite`, with `rows` rows
+/// committed into its `-wal` and none moved into the file (the program was
+/// killed): its file and its `-wal`. `from`: the file to start from.
+fn sqlite_with_wal(tag: &str, from: Option<&[u8]>, rows: u32) -> (Vec<u8>, Vec<u8>) {
+    let dir = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-elsewhere-{tag}-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("app.db");
+    match from {
+        Some(b) => std::fs::write(&path, b).unwrap(),
+        None => SqliteApp::start(&["hold", path.to_str().unwrap(), "0"]).close(),
+    }
+    let mut app = SqliteApp::start(&["hold", path.to_str().unwrap(), &rows.to_string()]);
+    assert_eq!(app.line(), "held");
+    app.kill();
+    let wal = std::fs::read(dir.0.join("app.db-wal")).unwrap();
+    assert!(!wal.is_empty());
+    (std::fs::read(&path).unwrap(), wal)
+}
+
+/// A first sync of a SQLite database whose changes are still in its
+/// `-wal` in OneDrive (another PC's program never moved them into the
+/// file) brings both here: opened, it has every row.
+#[tokio::test]
+async fn a_first_sync_brings_a_database_with_its_wal() {
+    let cloud = Fake::new();
+    let (main, wal) = sqlite_with_wal("first", None, 6);
+    cloud.add("app.db", Some(&main));
+    cloud.add("app.db-wal", Some(&wal));
+    let mut s = Sync::new("sqlite-first", cloud.clone());
+    s.settle().await;
+    let (here, here_wal) = (std::fs::read(s.p("app.db")).unwrap(), std::fs::read(s.p("app.db-wal")).unwrap());
+    assert_eq!((here.as_slice(), here_wal.as_slice()), (main.as_slice(), wal.as_slice()));
+    assert_eq!(check_sqlite_with_wal(&here, &here_wal), Ok(6));
+}
+
+/// A database and its `-wal` synced before as two files keep syncing as
+/// such: nothing reads as deleted, and a newer `-wal` from OneDrive
+/// (another PC committed into it) is placed beside the database, which is
+/// OneDrive's version, so opened here it has the new rows.
+#[tokio::test]
+async fn a_synced_wal_keeps_syncing_with_its_database() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-synced-wal", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
+    write(&s.p("app.db-wal"), b"");
+    s.settle().await;
+    assert!(cloud.tree().contains_key("/app.db-wal"));
+    let main = std::fs::read(&db).unwrap();
+    let (same, wal) = sqlite_with_wal("synced", Some(&main), 4);
+    assert_eq!(same, main, "nothing moved into the file elsewhere");
+    cloud.edit("app.db-wal", &wal);
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("app.db-wal")).unwrap(), wal);
+    assert_eq!(check_sqlite_with_wal(&std::fs::read(&db).unwrap(), &wal), Ok(7));
+    let t = cloud.tree();
+    assert!(t.contains_key("/app.db") && t.contains_key("/app.db-wal"), "{:?}", names(&t));
+}
+
+/// Files named like SQLite's working files beside a file that isn't a
+/// SQLite database are ordinary files: synced, and a conflict on one keeps
+/// both copies. A `!` pattern says a SQLite database isn't to be treated
+/// as one: its working files then sync like any file too.
+#[tokio::test]
+async fn files_named_like_working_files_sync_unless_beside_a_sqlite_database() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-names", cloud.clone());
+    write(&s.p("travel"), b"plans");
+    write(&s.p("travel-journal"), b"day one");
+    let notes = s.p("notes.db");
+    SqliteApp::start(&["hold", notes.to_str().unwrap(), "2"]).close();
+    // A rollback journal mid-transaction, left by a program that stopped.
+    let mut journal = vec![0xD9, 0xD5, 0x05, 0xF9, 0x20, 0xA1, 0x63, 0xD7];
+    journal.resize(512, 0);
+    write(&s.p("notes.db-journal"), &journal);
+    let mut waits = Vec::new();
+    for _ in 0..2 {
+        let r = s.round().await;
+        waits.extend(db_waits(&r, "notes.db-journal"));
+    }
+    let t = cloud.tree();
+    assert!(t.contains_key("/travel-journal"), "an ordinary file: {:?}", names(&t));
+    assert!(!t.contains_key("/notes.db-journal"), "a transaction the database needs");
+    assert!(waits.iter().any(|(w, _)| *w == oneup_effects::Wait::Journal), "{waits:?}");
+
+    s.exec.set_databases(oneup_rules::database::Databases::new(true, &[], &["!notes.db"]).unwrap());
+    s.settle().await;
+    assert_eq!(cloud.tree()["/notes.db-journal"].as_deref(), Some(journal.as_slice()));
+
+    write(&s.p("travel-journal"), b"day two, here");
+    cloud.edit("travel-journal", b"day two, there");
+    s.settle().await;
+    let t = cloud.tree();
+    assert!(t.keys().any(|k| k.starts_with("/travel-journal (conflict")), "both kept: {:?}", names(&t));
+}
+
+/// A database's upload is cancelled before it commits when, while it's
+/// read, another program writes its `-journal` (which stays as it was in
+/// meaning: zeroed, no transaction): the joint watch, not a state check,
+/// sees it.
+#[tokio::test]
+async fn a_write_to_a_databases_journal_during_its_upload_cancels_it() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-joint-watch", cloud.clone());
+    let journal = s.p("app.db-journal");
+    write(&journal, &[0u8; 512]);
+    s.settle().await;
+    let made = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-made-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&made.0);
+    std::fs::create_dir_all(&made.0).unwrap();
+    SqliteApp::start(&["hold", made.0.join("app.db").to_str().unwrap(), "3"]).close();
+    std::fs::copy(made.0.join("app.db"), s.p("app.db")).unwrap();
+    let script = format!("[IO.File]::WriteAllBytes('{}', (New-Object byte[] 512))", journal.display());
+    cloud.0.lock().unwrap().during_upload = Some(Box::new(move || {
+        let st = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }));
+    let r = s.round().await;
+    let changed = r
+        .skipped
+        .iter()
+        .any(|(op, k)| matches!(op, Op::Upload { name, .. } if name == "app.db") && *k == oneup_exec::Skip::Changed);
+    assert!(changed, "{r:?}");
+    assert!(cloud.sent("app.db").is_empty());
+    s.settle().await;
+    assert_eq!(check_sqlite(cloud.tree()["/app.db"].as_deref().unwrap()), Ok(3));
+}
+
+/// A `-wal` created with changes while a database is read cancels its
+/// upload before it commits: every read checks nothing waits outside it.
+#[tokio::test]
+async fn a_wal_created_during_a_databases_upload_cancels_it() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-wal-created", cloud.clone());
+    s.settle().await;
+    let made = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-made2-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&made.0);
+    std::fs::create_dir_all(&made.0).unwrap();
+    SqliteApp::start(&["hold", made.0.join("app.db").to_str().unwrap(), "3"]).close();
+    std::fs::copy(made.0.join("app.db"), s.p("app.db")).unwrap();
+    let wal = s.p("app.db-wal");
+    cloud.0.lock().unwrap().during_upload = Some(Box::new(move || {
+        let st = std::process::Command::new("cmd").raw_arg(format!("/C echo x>\"{}\"", wal.display())).status();
+        assert!(st.unwrap().success());
+    }));
+    let r = s.round().await;
+    let changed = r
+        .skipped
+        .iter()
+        .any(|(op, k)| matches!(op, Op::Upload { name, .. } if name == "app.db") && *k == oneup_exec::Skip::Changed);
+    assert!(changed, "{r:?}");
+    assert!(cloud.sent("app.db").is_empty());
+}
+
+/// A `-wal` that gets changes after a replacement's first check, while the
+/// newer version downloads, still stops it: the replacement checks again
+/// under its exclusive handle, and the round says why.
+#[tokio::test]
+async fn a_wal_written_during_a_download_stops_the_replacement() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-wal-download", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
+    s.settle().await;
+    let ours = std::fs::read(&db).unwrap();
+    cloud.edit("app.db", &ours[..ours.len() / 2]);
+    // The round's first request is its listing; the next, the download.
+    let (inner, wal) = (cloud.clone(), s.p("app.db-wal"));
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        inner.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+            let st = std::process::Command::new("cmd").raw_arg(format!("/C echo x>\"{}\"", wal.display())).status();
+            assert!(st.unwrap().success());
+        }));
+    }));
+    let r = s.round().await;
+    assert!(db_waits(&r, "app.db").iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{r:?}");
+    assert_eq!(std::fs::read(&db).unwrap(), ours);
+}
+
+/// A `-wal` holding changes the database here needs is never renamed for
+/// a conflict copy (nor moved or recycled): the database would lose them.
+/// It waits, both copies untouched, and the round says why.
+#[tokio::test]
+async fn a_wal_holding_changes_is_never_renamed_for_a_conflict() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-wal-conflict", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
+    write(&s.p("app.db-wal"), b"");
+    s.settle().await;
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "4"]);
+    assert_eq!(app.line(), "held");
+    app.kill();
+    let wal = std::fs::read(s.p("app.db-wal")).unwrap();
+    cloud.edit("app.db-wal", b"another PC's");
+    let mut waits = Vec::new();
+    // A round hashes it first (changed on both sides); the next would copy.
+    for _ in 0..4 {
+        let r = s.round().await;
+        assert!(!r.done.iter().any(|op| matches!(op, Op::ConflictCopy { .. })), "{r:?}");
+        let copies = r.databases.iter().filter(|(op, _)| matches!(op, Op::ConflictCopy { .. }));
+        waits.extend(copies.filter_map(|(_, d)| d.wait.clone()));
+    }
+    assert!(waits.contains(&oneup_effects::Wait::Wal), "{waits:?}");
+    assert_eq!(std::fs::read(s.p("app.db-wal")).unwrap(), wal);
+    assert_eq!(check_sqlite_with_wal(&std::fs::read(&db).unwrap(), &wal), Ok(7));
+}
+
+/// With `[databases] wait` off, a SQLite database is still sent only once
+/// every change is in the file: the setting only decides whether other
+/// databases wait for their programs.
+#[tokio::test]
+async fn a_database_with_changes_in_its_wal_waits_with_waiting_off_too() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-wait-off", cloud.clone());
+    s.exec.set_databases(oneup_rules::database::Databases::off());
+    let db = s.p("app.db");
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "20"]);
+    assert_eq!(app.line(), "held");
+    let mut waits = Vec::new();
+    for _ in 0..3 {
+        let r = s.round().await;
+        waits.extend(db_waits(&r, "app.db"));
+    }
+    assert!(cloud.sent("app.db").is_empty(), "not sent while its changes are in the -wal");
+    assert!(cloud.sent("app.db-wal").is_empty(), "nor the -wal holding them");
+    assert!(waits.iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{waits:?}");
+    app.close();
+    s.settle().await;
+    assert_eq!(check_sqlite(cloud.tree()["/app.db"].as_deref().unwrap()), Ok(20));
+}
+
+/// Holds a running `oneup-test-sqlite` until the test closes it.
+type HeldApp = Arc<Mutex<Option<SqliteApp>>>;
+
+/// A program that opens the database while a `-wal` for it is fetched,
+/// after the check before the download, still keeps it from being placed:
+/// the database is held, writers kept out, for the placement itself, and a
+/// program that has it open refuses the hold. Once it's closed, it's placed.
+#[tokio::test]
+async fn a_database_opened_during_a_wal_download_keeps_the_wal_out() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-opened-during", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["keep", db.to_str().unwrap(), "delete"]).close();
+    s.settle().await;
+    cloud.add("app.db-wal", Some(b"from another PC"));
+    let kept: HeldApp = Arc::default();
+    // The round's first request is its listing; the next, the download.
+    let (inner, keep, path) = (cloud.clone(), Arc::clone(&kept), db.clone());
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        inner.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+            let mut app = SqliteApp::start(&["keep", path.to_str().unwrap(), "delete"]);
+            assert_eq!(app.line(), "open");
+            *keep.lock().unwrap() = Some(app);
+        }));
+    }));
+    let r = s.round().await;
+    assert!(kept.lock().unwrap().is_some(), "the program opened it during the download");
+    assert!(!s.p("app.db-wal").exists(), "not placed beside a database a program has open");
+    let waits = db_waits(&r, "app.db-wal");
+    assert!(waits.iter().any(|(w, p)| *w == oneup_effects::Wait::Open && p.iter().any(|p| p == SQLITE_APP)), "{r:?}");
+    kept.lock().unwrap().take().unwrap().close();
+    s.settle().await;
+    assert_eq!(std::fs::read(s.p("app.db-wal")).unwrap(), b"from another PC");
+}
+
+/// A SQLite database that appears here after OneUpDrive last looked isn't
+/// one a `-wal` from OneDrive may go beside: nothing says the file belongs
+/// to it. The download waits until the database is synced.
+#[tokio::test]
+async fn a_wal_from_onedrive_waits_beside_a_database_not_known_yet() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-unknown-db", cloud.clone());
+    s.settle().await;
+    cloud.add("app.db-wal", Some(b"from another PC"));
+    let made = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-made3-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&made.0);
+    std::fs::create_dir_all(&made.0).unwrap();
+    let from = made.0.join("app.db");
+    SqliteApp::start(&["keep", from.to_str().unwrap(), "delete"]).close();
+    // Copied in by another program after the round looked at this PC.
+    let to = s.p("app.db");
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        let st = std::process::Command::new("cmd")
+            .raw_arg(format!("/C copy /y \"{}\" \"{}\" >nul", from.display(), to.display()))
+            .status();
+        assert!(st.unwrap().success());
+    }));
+    let r = s.round().await;
+    assert!(s.p("app.db").exists());
+    assert!(!s.p("app.db-wal").exists(), "not placed beside a database not known yet");
+    assert!(db_waits(&r, "app.db-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Behind), "{r:?}");
+}
+
+/// When Windows can't say which programs have a database open, it isn't
+/// taken for closed: the upload is tried again later.
+#[tokio::test]
+async fn a_database_whose_users_windows_cant_tell_isnt_taken_for_closed() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("db-rm-fails", cloud.clone());
+    let mut kdbx = vec![0x03, 0xD9, 0xA2, 0x9A, 0x67, 0xFB, 0x4B, 0xB5, 0x01, 0x00, 0x04, 0x00];
+    kdbx.extend(std::iter::repeat_n(0x5A, 500));
+    write(&s.p("vault.kdbx"), &kdbx);
+    s.exec.local().fail_restart_manager(true);
+    let r = s.round().await;
+    let busy = r
+        .skipped
+        .iter()
+        .any(|(op, k)| matches!(op, Op::Upload { name, .. } if name == "vault.kdbx") && *k == oneup_exec::Skip::Busy);
+    assert!(busy, "{r:?}");
+    assert!(cloud.sent("vault.kdbx").is_empty());
+    s.exec.local().fail_restart_manager(false);
+    s.settle().await;
+    assert_eq!(cloud.tree()["/vault.kdbx"].as_deref(), Some(kdbx.as_slice()));
+}
+
+/// An Outlook data file renamed to an ordinary name is known by its
+/// content when it's sent, so the agent can still warn about it.
+#[tokio::test]
+async fn a_renamed_outlook_file_is_known_by_its_content() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("db-renamed-pst", cloud.clone());
+    let mut pst = b"!BDN".to_vec();
+    pst.extend(std::iter::repeat_n(0x11, 600));
+    write(&s.p("mail backup.dat"), &pst);
+    let r = s.round().await;
+    let known = r.recognised.iter().any(|(op, f)| {
+        matches!(op, Op::Upload { name, .. } if name == "mail backup.dat")
+            && *f == oneup_rules::database::Format::Outlook
+    });
+    assert!(known, "{r:?}");
+}
+
+/// A SQLite database with changes in its `-wal` is never moved, renamed
+/// or recycled here away from them (a rename or deletion in OneDrive):
+/// they'd be left behind, to be applied to whatever takes its name. It
+/// waits, untouched, and the round says why.
+#[tokio::test]
+async fn a_database_is_never_moved_or_recycled_away_from_its_wal() {
+    for delete in [false, true] {
+        let cloud = Fake::new();
+        let mut s = Sync::new(&format!("sqlite-move-{delete}"), cloud.clone());
+        let db = s.p("app.db");
+        SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
+        s.settle().await;
+        let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "5"]);
+        assert_eq!(app.line(), "held");
+        app.kill();
+        let (main, wal) = (std::fs::read(&db).unwrap(), std::fs::read(s.p("app.db-wal")).unwrap());
+        if delete {
+            cloud.delete("app.db");
+        } else {
+            cloud.rename("app.db", "renamed.db");
+        }
+        let mut waits = Vec::new();
+        for _ in 0..2 {
+            let r = s.round().await;
+            let moved = r.done.iter().any(|op| matches!(op, Op::MoveLocal { .. } | Op::RecycleLocal { .. }));
+            assert!(!moved, "{r:?}");
+            waits.extend(r.databases.iter().filter_map(|(_, d)| d.wait.clone()));
+        }
+        assert!(waits.contains(&oneup_effects::Wait::Wal), "delete {delete}: {waits:?}");
+        assert_eq!(std::fs::read(&db).unwrap(), main);
+        assert_eq!(std::fs::read(s.p("app.db-wal")).unwrap(), wal);
+        assert_eq!(check_sqlite_with_wal(&main, &wal), Ok(8));
+    }
+}
+
+/// A new database from OneDrive isn't placed beside a `-wal` with changes
+/// that didn't come from OneDrive with it (another program's, new here):
+/// SQLite would apply them to it.
+#[tokio::test]
+async fn a_new_database_isnt_placed_beside_a_wal_of_unknown_origin() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-new-beside", cloud.clone());
+    s.settle().await;
+    let made = Tmp(std::env::temp_dir().join(format!("oneup-exec-sqlite-made4-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&made.0);
+    std::fs::create_dir_all(&made.0).unwrap();
+    let from = made.0.join("app.db");
+    SqliteApp::start(&["keep", from.to_str().unwrap(), "delete"]).close();
+    cloud.add("app.db", Some(&std::fs::read(&from).unwrap()));
+    // Written by another program after the round looked at this PC.
+    let wal = s.p("app.db-wal");
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        let st = std::process::Command::new("cmd").raw_arg(format!("/C echo x>\"{}\"", wal.display())).status();
+        assert!(st.unwrap().success());
+    }));
+    let r = s.round().await;
+    assert!(!s.p("app.db").exists(), "not placed beside a -wal it didn't come with");
+    assert!(db_waits(&r, "app.db").iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{r:?}");
+}
+
+/// Moves judge the names they actually use, right before they act: a
+/// database renamed in OneDrive isn't moved beside another database's
+/// `-wal` with changes (SQLite would apply them to it), and nothing is
+/// renamed into a database's working-file name.
+#[tokio::test]
+async fn a_move_never_lands_a_database_beside_changes_or_a_file_in_a_working_files_name() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-move-into", cloud.clone());
+    let old = s.p("old.sqlite");
+    SqliteApp::start(&["keep", old.to_str().unwrap(), "delete"]).close();
+    write(&s.p("app.sqlite-wal"), b"another database's changes");
+    let db = s.p("data.db");
+    SqliteApp::start(&["keep", db.to_str().unwrap(), "delete"]).close();
+    write(&s.p("notes.txt"), b"notes");
+    s.settle().await;
+
+    cloud.rename("old.sqlite", "app.sqlite");
+    cloud.rename("notes.txt", "data.db-wal");
+    let mut waits = 0;
+    for _ in 0..2 {
+        let r = s.round().await;
+        assert!(!r.done.iter().any(|op| matches!(op, Op::MoveLocal { .. })), "{r:?}");
+        waits += r.databases.iter().filter(|(op, _)| matches!(op, Op::MoveLocal { .. })).count();
+    }
+    assert!(old.exists() && !s.p("app.sqlite").exists(), "not moved beside another database's changes");
+    assert!(s.p("notes.txt").exists() && !s.p("data.db-wal").exists(), "not renamed into a working file's name");
+    assert!(waits >= 2, "both said why: {waits}");
+}
+
+/// A database's `-wal` whose attributes can't be read isn't taken for
+/// absent: the database is neither replaced nor sent; both are tried again.
+#[tokio::test]
+async fn a_wal_that_cant_be_looked_at_is_never_taken_for_absent() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-wal-unreadable", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["hold", db.to_str().unwrap(), "3"]).close();
+    s.settle().await;
+    let ours = std::fs::read(&db).unwrap();
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "5"]);
+    assert_eq!(app.line(), "held");
+    app.kill();
+    cloud.edit("app.db", &ours[..ours.len() / 2]);
+    s.exec.local().fail_metadata(Some("-wal"));
+    for _ in 0..2 {
+        let r = s.round().await;
+        assert!(!r.done.iter().any(|op| matches!(op, Op::Download { name, .. } if name == "app.db")), "{r:?}");
+    }
+    assert_eq!(std::fs::read(&db).unwrap(), ours);
+
+    // Sending: a database whose -wal can't be looked at isn't sent.
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-wal-unreadable-up", cloud.clone());
+    let db = s.p("app.db");
+    let mut app = SqliteApp::start(&["hold", db.to_str().unwrap(), "5"]);
+    assert_eq!(app.line(), "held");
+    s.exec.local().fail_metadata(Some("-wal"));
+    for _ in 0..2 {
+        s.round().await;
+    }
+    assert!(cloud.sent("app.db").is_empty());
+    app.close();
+}
+
+/// A database recognised by its name whose content has no SQLite
+/// signature (encrypted, as SQLCipher's) is still protected: with changes
+/// in its `-wal`, it's neither replaced (waiting off, too) nor recycled.
+#[tokio::test]
+async fn an_encrypted_database_known_by_its_name_keeps_its_wal() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-encrypted", cloud.clone());
+    let db = s.p("app.sqlite");
+    let cipher: Vec<u8> = (0..4096u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    write(&db, &cipher);
+    s.settle().await;
+    let wal = s.p("app.sqlite-wal");
+    let st = std::process::Command::new("cmd").raw_arg(format!("/C echo changes>\"{}\"", wal.display())).status();
+    assert!(st.unwrap().success());
+
+    s.exec.set_databases(oneup_rules::database::Databases::off());
+    cloud.edit("app.sqlite", b"a newer version");
+    let r = s.round().await;
+    assert!(db_waits(&r, "app.sqlite").iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{r:?}");
+    assert_eq!(std::fs::read(&db).unwrap(), cipher);
+
+    s.exec.set_databases(oneup_rules::database::Databases::default());
+    cloud.delete("app.sqlite");
+    for _ in 0..2 {
+        let r = s.round().await;
+        assert!(!r.done.iter().any(|op| matches!(op, Op::RecycleLocal { .. })), "{r:?}");
+    }
+    assert_eq!(std::fs::read(&db).unwrap(), cipher);
+}
+
+/// The final check before a `-wal` from OneDrive is placed compares the
+/// database beside it with the one expected, by file ID and stamp, before
+/// anything else: a file put in its place since (here an ordinary text
+/// file, another program's) means the `-wal` isn't placed.
+#[tokio::test]
+async fn a_wal_isnt_placed_beside_a_file_put_in_its_databases_place() {
+    use std::os::windows::process::CommandExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("sqlite-swapped", cloud.clone());
+    let db = s.p("app.db");
+    SqliteApp::start(&["keep", db.to_str().unwrap(), "delete"]).close();
+    write(&s.p("app.db-wal"), b"");
+    s.settle().await;
+    cloud.edit("app.db-wal", b"another PC's changes");
+    // The round's first request is its listing; the next, the download.
+    let (inner, path) = (cloud.clone(), db.clone());
+    cloud.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+        inner.0.lock().unwrap().meanwhile = Some(Box::new(move || {
+            let p = path.display();
+            let st = std::process::Command::new("cmd").raw_arg(format!("/C del \"{p}\" && echo text>\"{p}\"")).status();
+            assert!(st.unwrap().success());
+        }));
+    }));
+    let r = s.round().await;
+    assert_eq!(std::fs::read(s.p("app.db-wal")).unwrap(), b"", "not placed: {r:?}");
+    assert!(db_waits(&r, "app.db-wal").iter().any(|(w, _)| *w == oneup_effects::Wait::Behind), "{r:?}");
+}
+
+/// A downloaded Outlook data file under an ordinary name is known by its
+/// content, so the agent can warn about it.
+#[tokio::test]
+async fn a_downloaded_outlook_file_is_known_by_its_content() {
+    let cloud = Fake::new();
+    let mut pst = b"!BDN".to_vec();
+    pst.extend(std::iter::repeat_n(0x22, 600));
+    cloud.add("mail.dat", Some(&pst));
+    let mut s = Sync::new("db-downloaded-pst", cloud.clone());
+    let r = s.round().await;
+    let known = r.recognised.iter().any(|(op, f)| {
+        matches!(op, Op::Download { name, .. } if name == "mail.dat") && *f == oneup_rules::database::Format::Outlook
+    });
+    assert!(known, "{r:?}");
 }

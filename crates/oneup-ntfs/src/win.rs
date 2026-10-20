@@ -178,6 +178,17 @@ pub fn open_path_for_change(path: &Path, folder: bool) -> Result<Handle> {
     open_shared(path, access, share, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
 }
 
+/// Opens the file at `path` to read it, sharing reading only: while it's
+/// held, no other program can open it to write it, rename it or delete it,
+/// and a program that has it open to write refuses this open
+/// ([`Error::is_busy`]). For a short step only: a SQLite database held
+/// while one of its working files changes beside it. Follows what the
+/// path leads to, as a program opening it would (OneUpDrive's own
+/// placeholders go through the Cloud Files filter).
+pub fn open_path_keeping_writers_out(path: &Path) -> Result<Handle> {
+    open_shared(path, FILE_READ_DATA.0 | FILE_READ_ATTRIBUTES.0, FILE_SHARE_READ, FILE_FLAG_BACKUP_SEMANTICS)
+}
+
 /// Like [`open_path_for_change`], for one of OneUpDrive's own cloud
 /// placeholders: also with attribute-write access (what the Cloud Files
 /// calls need), and without `FILE_FLAG_OPEN_REPARSE_POINT` (the placeholder
@@ -610,6 +621,15 @@ impl Volume {
             return Err(busy);
         }
         self.watched_at(id, &path)?.ok_or(Error::Win32 { op: "open_watched", source: ERROR_FILE_NOT_FOUND.into() })
+    }
+
+    /// Opens whatever file is at `path` as a [`WatchedFile`], to learn
+    /// whether anything writes, replaces or deletes it while something else
+    /// is read: a database's companion files while the database is
+    /// (`-wal`, `-journal`). The same cautions as [`Volume::open_watched`]
+    /// apply: check [`attribute_tag`] on its handle before reading it.
+    pub fn open_watched_path(&self, path: &Path) -> Result<WatchedFile> {
+        WatchedFile::open(path)
     }
 
     /// [`Volume::open_watched`] at `path`; `None` if it's another item.

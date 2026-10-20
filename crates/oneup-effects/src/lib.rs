@@ -48,12 +48,16 @@ pub mod sharing;
 pub mod versions;
 
 #[cfg(windows)]
+mod database;
+#[cfg(windows)]
 mod local;
 #[cfg(windows)]
 mod ondemand;
 #[cfg(windows)]
 pub mod release;
 
+#[cfg(windows)]
+pub use database::{CompanionCheck, CompanionHold, DbState, MainExpect, UploadCheck, Wait, staged_format};
 #[cfg(all(windows, feature = "crash-test"))]
 pub use local::Crashed;
 #[cfg(windows)]

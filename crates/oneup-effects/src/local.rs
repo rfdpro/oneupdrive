@@ -76,6 +76,11 @@ pub enum Error {
     NotEmpty,
     #[error("the name can't be used on Windows")]
     BadName,
+    /// A file to replace has changes beside it that aren't in it yet (a
+    /// SQLite database's `-wal` or `-journal`): replacing it would let
+    /// SQLite apply them to the new file. Nothing was done; try later.
+    #[error("a database with changes beside it that aren't in it yet")]
+    DatabaseWaits,
     #[error("outside the sync folder")]
     Outside,
     /// The token is for an operation this layer doesn't run (a remote or
@@ -170,13 +175,38 @@ pub struct UploadSource {
     file: WatchedFile,
     pub size: i64,
     pub mtime: i64,
+    /// Where it was opened (`\\?\` form).
+    path: PathBuf,
+    /// Other files watched with it: the rest of a SQLite database's group
+    /// ([`LocalFs::check_database_upload`]). A change to any of them counts
+    /// as a change to this one.
+    also: Vec<WatchedFile>,
+    /// The SQLite database this file belongs to (or is): every read checks
+    /// that nothing waits outside it (`-wal`, `-journal`), so one created
+    /// during the read counts as a change too.
+    sqlite: Option<(PathBuf, crate::database::Look)>,
 }
 
 impl UploadSource {
     /// Whether nobody has written the file (or needed it closed) since it
-    /// was opened: what was read so far is the checked version.
+    /// was opened, nor any file watched with it: what was read so far is
+    /// the checked version.
     pub fn unchanged(&self) -> bool {
         !self.file.broken()
+            && self.also.iter().all(|w| !w.broken())
+            && self.sqlite.as_ref().is_none_or(|(main, look)| matches!(look.sqlite_wait(main), Ok(None)))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn watch_also(&mut self, w: WatchedFile) {
+        self.also.push(w);
+    }
+
+    pub(crate) fn watch_sqlite(&mut self, main: PathBuf, look: crate::database::Look) {
+        self.sqlite = Some((main, look));
     }
 
     pub fn rewind(&mut self) -> std::io::Result<()> {
@@ -217,11 +247,19 @@ struct OpenedToRead {
     file: WatchedFile,
     size: i64,
     mtime: i64,
+    path: PathBuf,
 }
 
 impl OpenedToRead {
     fn into_source(self) -> UploadSource {
-        UploadSource { file: self.file, size: self.size, mtime: self.mtime }
+        UploadSource {
+            file: self.file,
+            size: self.size,
+            mtime: self.mtime,
+            path: self.path,
+            also: Vec::new(),
+            sqlite: None,
+        }
     }
 }
 
@@ -267,9 +305,19 @@ pub struct LocalFs {
     /// cloud content arrives as placeholders (`ondemand.rs`).
     on_demand: bool,
     locator: Locate,
+    /// What counts as a database, for the checks made under a hold
+    /// ([`LocalFs::set_databases`]).
+    databases: std::sync::RwLock<oneup_rules::database::Databases>,
     /// Crash points left to pass before the injected crash; negative: off.
     #[cfg(feature = "crash-test")]
     crash: std::sync::atomic::AtomicI64,
+    /// Test-only: asking Windows which programs have a file open fails.
+    #[cfg(feature = "crash-test")]
+    restart_manager_fails: std::sync::atomic::AtomicBool,
+    /// Test-only: reading the attributes of files with this name ending
+    /// fails.
+    #[cfg(feature = "crash-test")]
+    metadata_fails: std::sync::RwLock<Option<String>>,
     /// See [`LocalFs::on_removing`].
     #[cfg(feature = "crash-test")]
     removing: Removing,
@@ -352,8 +400,13 @@ impl LocalFs {
             seq: AtomicU64::new(0),
             on_demand,
             locator: Locate::default(),
+            databases: std::sync::RwLock::default(),
             #[cfg(feature = "crash-test")]
             crash: std::sync::atomic::AtomicI64::new(-1),
+            #[cfg(feature = "crash-test")]
+            restart_manager_fails: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "crash-test")]
+            metadata_fails: std::sync::RwLock::default(),
             #[cfg(feature = "crash-test")]
             removing: Removing::default(),
         };
@@ -451,6 +504,41 @@ impl LocalFs {
         Some(path)
     }
 
+    /// What counts as a database from now on (`[databases]`), for the
+    /// checks the effects make themselves.
+    pub fn set_databases(&self, d: oneup_rules::database::Databases) {
+        *self.databases.write().unwrap_or_else(std::sync::PoisonError::into_inner) = d;
+    }
+
+    pub(crate) fn databases(&self) -> oneup_rules::database::Databases {
+        self.databases.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Test-only: asking Windows which programs have a file open fails
+    /// (`true`) or works again.
+    #[cfg(feature = "crash-test")]
+    pub fn fail_restart_manager(&self, on: bool) {
+        self.restart_manager_fails.store(on, Relaxed);
+    }
+
+    #[cfg(feature = "crash-test")]
+    pub(crate) fn restart_manager_fails(&self) -> bool {
+        self.restart_manager_fails.load(Relaxed)
+    }
+
+    /// Test-only: reading the attributes of a file whose name ends with
+    /// `suffix` (what's beside a database) fails, as when access is denied;
+    /// `None` makes it work again.
+    #[cfg(feature = "crash-test")]
+    pub fn fail_metadata(&self, suffix: Option<&str>) {
+        *self.metadata_fails.write().unwrap_or_else(std::sync::PoisonError::into_inner) = suffix.map(str::to_string);
+    }
+
+    #[cfg(feature = "crash-test")]
+    pub(crate) fn metadata_fails(&self) -> Option<String> {
+        self.metadata_fails.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
     /// Whether the sync folder is in Files On-Demand mode (see `ondemand.rs`).
     pub fn on_demand(&self) -> bool {
         self.on_demand
@@ -499,6 +587,10 @@ impl LocalFs {
 
     pub(crate) fn volume(&self) -> &Volume {
         &self.volume
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn is_inside_pub(&self, path: &Path) -> bool {
@@ -798,6 +890,12 @@ impl LocalFs {
                 {
                     return Err(Error::Changed);
                 }
+                // Checked under the exclusive handle, which keeps SQLite
+                // from opening the database (and so from writing beside
+                // it) until the replacement is done.
+                if self.pending_beside(&old, &old_path, old_entry.size)? {
+                    return Err(Error::DatabaseWaits);
+                }
                 // Decided before anything moves, under the exclusive handle,
                 // so the content checked is the content dropped.
                 let drop_old = a.old_copy() == OldCopy::DropIfSynced && self.is_synced(&old, pre, synced)?;
@@ -835,10 +933,18 @@ impl LocalFs {
     /// Opens the local file of an approved [`Op::Upload`] for reading, after
     /// checking it is still the planned stamp.
     pub fn open_upload(&self, a: &Approved) -> Result<UploadSource> {
-        let Op::Upload { local, .. } = a.op() else {
+        let Op::Upload { local, name, .. } = a.op() else {
             return Err(Error::WrongOp);
         };
-        let opened = self.open_for_read(local)?;
+        let opened = match self.open_for_read(local) {
+            // SQLite deletes a rollback journal at the end of every
+            // transaction, and a file being deleted refuses to be opened
+            // (access denied): it changed.
+            Err(Error::Win(_)) if oneup_rules::database::Companion::of_name(name).is_some() => {
+                return Err(Error::Changed);
+            }
+            r => r?,
+        };
         // Reading a placeholder whose content isn't all here would ask the
         // cloud (ourselves) for it.
         if self.on_demand && !self.on_disk(&opened) {
@@ -912,10 +1018,14 @@ impl LocalFs {
     fn move_item(&self, pre: &LocalPre, to: LocalId, name: &str, in_place: bool) -> Result<Done> {
         let (_pin, dir) = self.pin_folder(to)?;
         let target = dir.join(self.checked_name(to, name)?);
-        let (h, _, path) = self.open_item(pre)?;
+        let (h, entry, path) = self.open_item(pre)?;
         if in_place && path.parent() != Some(dir.as_path()) {
             return Err(Error::Changed);
         }
+        // Databases and their working files, judged on the actual names
+        // right before the move (`database::check_move`); the database
+        // beside a working file moved away stays held until it's done.
+        let _hold = if entry.is_dir() { None } else { Some(self.check_move(&h, &path, entry.size, Some(&target))?) };
         let was_in_sync = self.on_demand && self.is_in_sync(&h);
         win::rename_handle(&h, &target)?;
         if was_in_sync {
@@ -927,6 +1037,8 @@ impl LocalFs {
 
     fn recycle_item(&self, pre: &LocalPre, old: OldCopy, synced: Option<&Hash>) -> Result<Done> {
         let (h, entry, path) = self.open_item(pre)?;
+        // As for a move (`database::check_move`).
+        let _hold = if entry.is_dir() { None } else { Some(self.check_move(&h, &path, entry.size, None)?) };
         if entry.is_dir() {
             // Children can still be added after this check (the folder is
             // shared for writing); they would then move along into the
@@ -1242,7 +1354,7 @@ impl LocalFs {
         if !self.is_inside(&path) {
             return Err(Error::Outside);
         }
-        Ok(OpenedToRead { file, size: stamp.0, mtime: stamp.1 })
+        Ok(OpenedToRead { file, size: stamp.0, mtime: stamp.1, path })
     }
 
     /// Opens destination folder `id`, pinned in place for as long as the
@@ -1362,7 +1474,7 @@ pub(crate) fn check_placeholder(entry: &DirEntry, stamp: Option<(i64, i64)>, our
 }
 
 /// A Cloud Files reparse tag (`IO_REPARSE_TAG_CLOUD` and its variants).
-fn is_cloud_tag(tag: u32) -> bool {
+pub(crate) fn is_cloud_tag(tag: u32) -> bool {
     tag & 0xFFFF_0FFF == 0x9000_001A
 }
 
