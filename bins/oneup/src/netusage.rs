@@ -105,13 +105,104 @@ impl Meter {
         Self { up, down }
     }
 
-    /// The bytes sent and received since the last call, given the
-    /// counters now.
-    pub fn take(&mut self, up: u64, down: u64) -> (u64, u64) {
-        let d = (up.saturating_sub(self.up), down.saturating_sub(self.down));
+    /// The bytes sent and received since the last [`Meter::commit`],
+    /// given the counters now.
+    pub fn peek(&self, up: u64, down: u64) -> (u64, u64) {
+        (up.saturating_sub(self.up), down.saturating_sub(self.down))
+    }
+
+    /// What [`Meter::peek`] said is accounted for.
+    pub fn commit(&mut self, up: u64, down: u64) {
         self.up = self.up.max(up);
         self.down = self.down.max(down);
-        d
+    }
+}
+
+/// Charges what went over the network to the profile in effect while it
+/// went: what went before a change of network is the old profile's, and a
+/// failed write charges it again the next time instead of losing it.
+#[derive(Debug, Clone, Default)]
+pub struct Account {
+    meter: Meter,
+    /// The profile in effect since the last charge (`crate::network::Key::id`).
+    profile: Option<String>,
+}
+
+impl Account {
+    pub fn new(up: u64, down: u64) -> Self {
+        Self { meter: Meter::new(up, down), profile: None }
+    }
+
+    /// Adds what went since the last charge (the counters now: `up`,
+    /// `down`) to the profile in effect then, through `write(profile, up,
+    /// down)`; the meter moves on only once that succeeded.
+    pub fn charge<E>(
+        &mut self,
+        up: u64,
+        down: u64,
+        write: impl FnOnce(&str, u64, u64) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let (du, dd) = self.meter.peek(up, down);
+        if let Some(p) = &self.profile
+            && (du > 0 || dd > 0)
+        {
+            write(p, du, dd)?;
+        }
+        self.meter.commit(up, down);
+        Ok(())
+    }
+
+    /// Charge to `profile` from now on (after charging what went before).
+    pub fn switch(&mut self, profile: &str) {
+        self.profile = Some(profile.to_string());
+    }
+
+    pub fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
+    }
+}
+
+/// The agent's record of data used: an [`Account`] written to its own
+/// database connection, reading the transport's counters (`counters`:
+/// bytes sent, bytes received so far). Charged whenever the agent asks,
+/// and once more when dropped, so what went just before a stop, an error
+/// or a restart is kept.
+pub struct Ledger {
+    db: Store,
+    account: Account,
+    counters: Box<dyn Fn() -> (u64, u64) + Send>,
+}
+
+impl Ledger {
+    pub fn new(db: Store, counters: Box<dyn Fn() -> (u64, u64) + Send>) -> Self {
+        let (up, down) = counters();
+        Self { db, account: Account::new(up, down), counters }
+    }
+
+    /// Adds what went since the last charge to the profile in effect
+    /// meanwhile.
+    pub fn charge(&mut self) -> oneup_store::Result<()> {
+        let (up, down) = (self.counters)();
+        let month = month_of(crate::control::now_ms());
+        let db = &mut self.db;
+        self.account.charge(up, down, |p, u, d| add(db, p, &month, u, d, 0).map(drop))
+    }
+
+    /// Charge to `profile` from now on (charge first what went before).
+    pub fn switch(&mut self, profile: &str) {
+        self.account.switch(profile);
+    }
+
+    pub fn db(&mut self) -> &mut Store {
+        &mut self.db
+    }
+}
+
+impl Drop for Ledger {
+    fn drop(&mut self) {
+        if let Err(e) = self.charge() {
+            tracing::warn!(error = %e, "the data used last couldn't be recorded");
+        }
     }
 }
 
@@ -156,9 +247,58 @@ mod tests {
     #[test]
     fn the_meter_counts_only_whats_new() {
         let mut m = Meter::new(100, 1000);
-        assert_eq!(m.take(150, 1000), (50, 0));
-        assert_eq!(m.take(150, 1500), (0, 500));
-        assert_eq!(m.take(10, 10), (0, 0), "counters never go back");
+        assert_eq!(m.peek(150, 1000), (50, 0));
+        m.commit(150, 1000);
+        assert_eq!(m.peek(150, 1500), (0, 500));
+        m.commit(150, 1500);
+        assert_eq!(m.peek(10, 10), (0, 0), "counters never go back");
+    }
+
+    /// Traffic before a change of network is the old profile's; a write
+    /// that fails is charged again next time, not lost.
+    #[test]
+    fn each_profile_is_charged_its_own_traffic_and_nothing_is_lost() {
+        let mut s = Store::open_in_memory().unwrap();
+        let month = "2026-10";
+        let mut a = Account::new(0, 0);
+        let write = |s: &mut Store, p: &str, up, down| add(s, p, month, up, down, 0).map(drop);
+        a.charge(5, 5, |p, u, d| write(&mut s, p, u, d)).unwrap();
+        a.switch("default");
+        a.charge(100, 200, |p, u, d| write(&mut s, p, u, d)).unwrap();
+        // Windows reports a metered network: what went until now is still
+        // the default profile's.
+        a.charge(150, 300, |p, u, d| write(&mut s, p, u, d)).unwrap();
+        a.switch("metered");
+        a.charge(160, 300, |p, u, d| write(&mut s, p, u, d)).unwrap();
+        assert_eq!(load(&s, "default", month).unwrap().total(), 145 + 295);
+        assert_eq!(load(&s, "metered", month).unwrap().up, 10);
+        // The database refused: charged at the next try.
+        assert!(a.charge(200, 300, |_, _, _| Err("busy")).is_err());
+        a.charge(210, 300, |p, u, d| write(&mut s, p, u, d)).unwrap();
+        assert_eq!(load(&s, "metered", month).unwrap().up, 60);
+    }
+
+    /// What went just before the agent stopped (a stop, an error that
+    /// ends the attempt, a restart) is kept: the ledger charges once more
+    /// as it goes.
+    #[test]
+    fn what_went_before_a_stop_is_kept() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let path = std::env::temp_dir().join(format!("oneup-ledger-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (sent, got) = (Arc::new(AtomicU64::new(10)), Arc::new(AtomicU64::new(10)));
+        let (s, g) = (Arc::clone(&sent), Arc::clone(&got));
+        let mut l =
+            Ledger::new(Store::open(&path, 1024).unwrap(), Box::new(move || (s.load(Relaxed), g.load(Relaxed))));
+        l.switch("metered");
+        sent.fetch_add(3 * MB, Relaxed);
+        got.fetch_add(4 * MB, Relaxed);
+        drop(l);
+        let month = month_of(crate::control::now_ms());
+        let u = load(&Store::open(&path, 1024).unwrap(), "metered", &month).unwrap();
+        assert_eq!((u.up, u.down), (3 * MB, 4 * MB));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

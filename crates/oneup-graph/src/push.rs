@@ -152,8 +152,17 @@ fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> Error {
 /// subscription is live and `changed` for every notification. Returns
 /// `Ok` when the server closes the channel normally (the caller asks for a
 /// new endpoint and reconnects), `Err` on a failure, including a server
-/// that goes silent for longer than its own ping deadline.
-pub async fn listen(ep: &Endpoint, mut joined: impl FnMut(), mut changed: impl FnMut()) -> Result<()> {
+/// that goes silent for longer than its own ping deadline. Every message
+/// each way counts in `traffic` (`sent`, `bytes`), as the data budget
+/// counts the client's requests.
+pub async fn listen(
+    ep: &Endpoint,
+    traffic: &crate::NetStats,
+    mut joined: impl FnMut(),
+    mut changed: impl FnMut(),
+) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let sent = |n: usize| traffic.sent.fetch_add(n as u64, Relaxed);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
     let (mut ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ep.ws_url.as_str()))
         .await
@@ -167,6 +176,7 @@ pub async fn listen(ep: &Endpoint, mut joined: impl FnMut(), mut changed: impl F
             Ok(None) => return Ok(()),
             Ok(Some(m)) => m.map_err(ws_error)?,
         };
+        traffic.bytes.fetch_add(msg.len() as u64, Relaxed);
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => return Ok(()),
@@ -176,9 +186,14 @@ pub async fn listen(ep: &Endpoint, mut joined: impl FnMut(), mut changed: impl F
         match classify(text.as_str()) {
             Frame::Open { ping, timeout } => {
                 silence = ping + timeout;
-                ws.send(Message::text(ep.join_frame())).await.map_err(ws_error)?;
+                let join = ep.join_frame();
+                sent(join.len());
+                ws.send(Message::text(join)).await.map_err(ws_error)?;
             }
-            Frame::Ping => ws.send(Message::text("3")).await.map_err(ws_error)?,
+            Frame::Ping => {
+                sent(1);
+                ws.send(Message::text("3")).await.map_err(ws_error)?;
+            }
             Frame::Joined => joined(),
             Frame::Event => changed(),
             Frame::Refused => return Err(Error::Push("the push channel refused the subscription".into())),

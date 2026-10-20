@@ -982,6 +982,8 @@
   "the version store (.oneup\\versions)": "",
   "the {preset} setting": "",
   "this month's data budget on this network is used up": "",
+  "waiting for a network connection": "",
+  "waiting for the internet: sign in to this network first": "",
   "your rule {rule}": "",
   "{access}, password": "",
   "{action} `oneup start` starts it again.": "",
