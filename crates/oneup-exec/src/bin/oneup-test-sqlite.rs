@@ -66,7 +66,9 @@ fn main() -> rusqlite::Result<()> {
             };
             let mut c = open(path)?;
             let mut i = 0u64;
-            while Instant::now() < end {
+            // The stops come first however slow the machine: under load the
+            // time can run out before the 50th transaction.
+            while stops > 0 || Instant::now() < end {
                 add(&mut c, i)?;
                 i += 1;
                 if i.is_multiple_of(50) {
