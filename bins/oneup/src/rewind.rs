@@ -8,11 +8,15 @@
 //! and the effects layer. Starting one saves it in `meta` ([`KEY`]); each
 //! round then plans its steps again. Until the user approves, they're a
 //! safety stop of their own, whatever the limits, with its list and code
-//! like any other stop, and nothing at all runs. The approval binds the
+//! like any other stop; only they wait, and the rest syncs, the folder
+//! included. A change in the folder changes the list and its code, so an
+//! approval is taken only for the list planned when it comes (`oneup
+//! rewind --approve`, and the round that takes it). The approval binds the
 //! steps the stop showed, item by item ([`oneup_sync::rewind::Job`], saved
-//! with the rewind): a later round runs an item's steps only while it's
-//! as the preview showed it, or as the rewind's own last step left it, so
-//! what changed after the preview is left alone. It ends once nothing it
+//! with the rewind): what each does, and the state it starts from; a later
+//! round runs an item's steps only while it's as the preview showed it, or
+//! as the rewind's own last step left it, so what changed after the
+//! approval is left alone. It ends once nothing it
 //! approved is left to do, or after [`STALLS`] rounds in a row in which its
 //! steps all failed or were skipped.
 

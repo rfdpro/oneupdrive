@@ -4031,8 +4031,8 @@
                     folder: p.folder,
                     when: when(p.at_ms)
                 };
-                const ask = p.folder === "/" ? tr("Rewind everything to {when}? It waits for your approval next, and nothing changes until then.", a) :
-                    tr("Rewind {folder} to {when}? It waits for your approval next, and nothing changes until then.", a);
+                const ask = p.folder === "/" ? tr("Rewind everything to {when}? It waits for your approval next; meanwhile the rest keeps syncing, and a change in the folder gives a new list to approve.", a) :
+                    tr("Rewind {folder} to {when}? It waits for your approval next; meanwhile the rest keeps syncing, and a change in the folder gives a new list to approve.", a);
                 if (!confirm(ask)) return;
                 const s = await run(call("rewind_start", {
                     ...args,
