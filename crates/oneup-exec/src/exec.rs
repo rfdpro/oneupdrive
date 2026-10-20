@@ -1406,10 +1406,8 @@ impl<C: Cloud> Executor<C> {
             // ------------------------------------------------ transfers
             Op::Upload { local, to, parent, name, replace, link } => {
                 store.write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())).await?;
-                // Opened here, on the task's thread: the write watch it
-                // starts is a request Windows would cancel if the thread
-                // that made it ended, as a blocking thread does when idle.
-                // Only its reads run on blocking threads.
+                // Opened here (an open and an oplock request: short); its
+                // reads run on blocking threads.
                 let opened = self.fs.open_upload(a)?;
                 let (size, mtime) = (opened.size, opened.mtime);
                 let mut src = OffTask::new(opened, &self.jobs);

@@ -649,19 +649,85 @@ fn a_save_in_place_during_an_upload_read_goes_through_and_fails_the_read() {
     assert!(!src.unchanged());
 }
 
+/// A save by renaming a new file over the one being read goes through,
+/// however the program renames: with POSIX semantics (Rust's), or
+/// `MoveFileEx` from another program (`cmd`'s `move /y`), which fails while
+/// any other handle on the file is open. The read then fails, so the
+/// upload is cancelled before it commits.
 #[test]
-fn a_save_by_rename_during_an_upload_read_goes_through_and_the_read_keeps_its_version() {
+fn a_save_by_rename_during_an_upload_read_goes_through_and_fails_the_read() {
     let r = Root::new("read-renamed");
     let fs = r.fs();
+    for classic in [false, true] {
+        std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+        let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
+        let mut head = [0u8; 4];
+        src.read_exact(&mut head).unwrap();
+        std::fs::write(r.p("f.tmp"), b"new").unwrap();
+        if classic {
+            let out = std::process::Command::new("cmd.exe")
+                .current_dir(&r.dir)
+                .args(["/c", "move", "/y", "f.tmp", "f.bin"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "the save must not fail: {out:?}");
+        } else {
+            std::fs::rename(r.p("f.tmp"), r.p("f.bin")).unwrap();
+        }
+        assert_eq!(std::fs::read(r.p("f.bin")).unwrap(), b"new");
+        let err = src.read_to_string(&mut String::new()).unwrap_err();
+        assert!(oneup_effects::ChangedMeanwhile::is(&err), "{err}");
+        assert!(!src.unchanged());
+    }
+}
+
+/// In a Files On-Demand folder the placeholder checks (is all of it
+/// here, does its identity vouch for it) go through the read's own handle,
+/// so no other handle is ever open, and they queue nothing on its
+/// completion port. A save by `MoveFileEx` during the read goes through.
+#[test]
+fn on_demand_reads_hold_one_handle_and_saves_go_through() {
+    let r = Root::new("read-on-demand");
+    drop(r.fs());
+    oneup_cfapi::provider::register(&r.dir, b"token-1").unwrap();
+    let fs = r.fs();
+    assert!(fs.on_demand());
+    let ignored = win::ignored_completions();
     std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let Done::Hashed { size, .. } = fs.apply(&approve(Op::Hash(pre(&r.p("f.bin"))))).unwrap() else { panic!() };
+    assert_eq!(size, 18);
     let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
+    let mut head = [0u8; 4];
+    src.read_exact(&mut head).unwrap();
     std::fs::write(r.p("f.tmp"), b"new").unwrap();
-    std::fs::rename(r.p("f.tmp"), r.p("f.bin")).unwrap();
-    let mut s = String::new();
-    src.read_to_string(&mut s).unwrap();
-    assert_eq!(s, "some bytes to hash");
-    drop(src);
-    assert_eq!(std::fs::read(r.p("f.bin")).unwrap(), b"new");
+    let out = std::process::Command::new("cmd.exe")
+        .current_dir(&r.dir)
+        .args(["/c", "move", "/y", "f.tmp", "f.bin"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the save must not fail: {out:?}");
+    let err = src.read_to_string(&mut String::new()).unwrap_err();
+    assert!(oneup_effects::ChangedMeanwhile::is(&err), "{err}");
+    drop((src, fs));
+    assert_eq!(win::ignored_completions(), ignored, "nothing but our own requests on the port");
+    oneup_cfapi::provider::unregister(&r.dir).unwrap();
+}
+
+/// A file planned as an ordinary one that has become placeholder-like
+/// since (marked offline, as an archiver does; same size and time) is
+/// refused on the handle opened to read it, before any byte is read.
+#[test]
+fn a_file_that_became_offline_since_planning_is_refused_before_reading() {
+    let r = Root::new("read-offline");
+    let fs = r.fs();
+    std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let (hash, upload) = (approve(Op::Hash(pre(&r.p("f.bin")))), upload_of(&r.p("f.bin")));
+    let st = std::process::Command::new("attrib").arg("+O").arg(r.p("f.bin")).status().unwrap();
+    assert!(st.success());
+    assert!(matches!(fs.apply(&hash), Err(Error::NotOrdinary)));
+    assert!(matches!(fs.open_upload(&upload), Err(Error::NotOrdinary)));
+    let Op::Upload { local, .. } = upload.op() else { panic!() };
+    assert_eq!(fs.sample(local, 64), None);
 }
 
 #[test]

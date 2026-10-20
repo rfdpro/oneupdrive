@@ -16,12 +16,14 @@
 //!   re-checked on the open handle, not just trusted from the scan.
 //!
 //! Every file is also checked to be the one the scan saw: same file ID, same
-//! size and same last-write time when opened. It is read under a write watch
-//! (a read oplock, `win::WriteWatch`): a file written, truncated or mapped
-//! for writing while it is read is reported as [`Checked::Changed`] rather
-//! than hashed into a misleading answer, and the program writing it is
-//! never kept waiting or locked out. It is opened by path, found in its
-//! folder under its recorded name, and by ID only if it moved since.
+//! size and same last-write time when opened. It is read as a
+//! `win::WatchedFile` (under a Read-Handle oplock): a file written,
+//! truncated or mapped for writing while it is read, or that another
+//! program needed closed (to save over it, delete it, or open it
+//! exclusively), is reported as [`Checked::Changed`] rather than hashed
+//! into a misleading answer, and that program is never locked out. It is
+//! opened by path, found in its folder under its recorded name, and by ID
+//! only if it moved since.
 
 use std::os::windows::fs::MetadataExt as _;
 use std::path::PathBuf;
@@ -116,17 +118,18 @@ impl Verifier {
     /// and an ordinary one. Never fails as a whole: every problem becomes a
     /// [`Checked`] outcome the report can count.
     pub fn hash(&mut self, row: &LocalRow) -> Checked {
-        let (file, watch) = match self.open_row(row) {
+        let mut file = match self.open_row(row) {
             Ok(opened) => opened,
             Err(c) => return c,
         };
-        let hash = match oneup_hash::hash_reader(&file, &mut self.buf) {
+        let hash = match oneup_hash::hash_reader(&mut file, &mut self.buf) {
             Ok(h) => h,
+            Err(_) if file.broken() => return Checked::Changed,
             // A byte-range lock held by another program, or an I/O error.
             Err(_) => return Checked::Unreadable,
         };
         // Written to while we read it: the hash describes no real version.
-        if watch.broken() || i64::try_from(hash.len()).ok() != Some(row.size) {
+        if file.broken() || i64::try_from(hash.len()).ok() != Some(row.size) {
             return Checked::Changed;
         }
         Checked::Hash(hash.finalize())
@@ -142,15 +145,15 @@ impl Verifier {
         if u64::try_from(row.size).map_or(true, |s| s > max) {
             return Small::TooLarge;
         }
-        let (mut file, watch) = match self.open_row(row) {
+        let mut file = match self.open_row(row) {
             Ok(opened) => opened,
             Err(c) => return Small::Checked(c),
         };
         let mut out = Vec::new();
         if std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, max + 1), &mut out).is_err() {
-            return Small::Checked(Checked::Unreadable);
+            return Small::Checked(if file.broken() { Checked::Changed } else { Checked::Unreadable });
         }
-        if watch.broken() || i64::try_from(out.len()).ok() != Some(row.size) {
+        if file.broken() || i64::try_from(out.len()).ok() != Some(row.size) {
             return Small::Checked(Checked::Changed);
         }
         Small::Read(out)
@@ -170,18 +173,18 @@ impl Verifier {
 
     /// Opens the file the scan recorded as `row` for reading, if it is
     /// still an ordinary file with the scan's size and last-write time,
-    /// watched for writes from the open on ([`win::WriteWatch`]).
+    /// watched from the open on ([`win::WatchedFile`]).
     ///
     /// Found by path, in its folder under its recorded name, when it's
     /// still there: opening a file by ID would make a program saving it by
     /// renaming another file over it fail meanwhile (`win::Volume`'s docs).
-    fn open_row(&self, row: &LocalRow) -> Result<(std::fs::File, win::WriteWatch), Checked> {
+    fn open_row(&self, row: &LocalRow) -> Result<win::WatchedFile, Checked> {
         if !Self::ordinary(row) {
             return Err(Checked::NotOrdinary);
         }
         let id = FileId(row.file_id);
         let hint = row.parent_id.and_then(|p| self.volume.child_path(FileId(p), &row.name));
-        let (handle, watch, _) = match self.volume.open_watched(id, hint.as_deref()) {
+        let (file, _) = match self.volume.open_watched(id, hint.as_deref()) {
             Ok(opened) => opened,
             // Access denied, or mapped for writing by another program
             // (whose writes no watch would see).
@@ -191,23 +194,23 @@ impl Verifier {
             Err(_) => return Err(Checked::Changed),
         };
         // Re-check on the handle: the file may have become a placeholder (or
-        // been replaced by one under the same ID) since the scan.
-        match win::attribute_tag(&handle) {
-            Ok((attributes, tag)) if attributes & NOT_ORDINARY == 0 && !is_cloud_tag(tag) => {}
-            Ok(_) => return Err(Checked::NotOrdinary),
-            Err(_) => return Err(Checked::Unreadable),
-        }
-        let file = handle.into_file();
-        // Still the version the scan saw; any write after this breaks the watch.
-        let same = file.metadata().is_ok_and(|m| {
-            m.file_attributes() & NOT_ORDINARY == 0
-                && i64::try_from(m.len()).is_ok_and(|len| len == row.size)
-                && i64::try_from(m.last_write_time()).is_ok_and(|t| t == row.mtime)
+        // been replaced by one under the same ID) since the scan, and it
+        // must still be the version the scan saw; any write after this
+        // breaks the oplock.
+        let checked = file.with_handle(|h| {
+            match win::attribute_tag(h) {
+                Ok((attributes, tag)) if attributes & NOT_ORDINARY == 0 && !is_cloud_tag(tag) => {}
+                Ok(_) => return Err(Checked::NotOrdinary),
+                Err(_) => return Err(Checked::Unreadable),
+            }
+            let same = h.as_file().metadata().is_ok_and(|m| {
+                i64::try_from(m.len()).is_ok_and(|len| len == row.size)
+                    && i64::try_from(m.last_write_time()).is_ok_and(|t| t == row.mtime)
+            });
+            if same { Ok(()) } else { Err(Checked::Changed) }
         });
-        if !same {
-            return Err(Checked::Changed);
-        }
-        Ok((file, watch))
+        checked.unwrap_or(Err(Checked::Changed))?;
+        Ok(file)
     }
 }
 

@@ -34,18 +34,29 @@ pub struct Version {
 
 impl LocalFs {
     /// Where item `id` is, if it's one of our **dehydrated** placeholders
-    /// (judged by attributes, read through an attribute-only handle, which
-    /// never downloads anything).
+    /// (judged by attributes, which never downloads anything). Read from
+    /// its folder's listing where the state database last saw it, so the
+    /// file itself isn't opened: any handle on it would make a program's
+    /// `MoveFileEx` save over it fail meanwhile. Only if it isn't there is
+    /// it opened, attribute-only.
     pub(crate) fn dehydrated_path(&self, id: FileId) -> Result<Option<PathBuf>> {
         if !self.on_demand() {
             return Ok(None);
         }
-        let probe = self.volume().open_attributes(id, self.hint(id).as_deref()).map_err(|_| Error::Changed)?;
+        let dehydrated = |entry: &DirEntry| {
+            entry.attributes & oneup_ntfs::dirent::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
+                && entry.attributes & oneup_ntfs::dirent::FILE_ATTRIBUTE_REPARSE_POINT != 0
+                && !entry.is_dir()
+        };
+        let hint = self.hint(id);
+        if let Some(path) = &hint
+            && let Ok(Some(entry)) = self.volume().listed_at(path, id)
+        {
+            return Ok(dehydrated(&entry).then(|| path.clone()));
+        }
+        let probe = self.volume().open_attributes(id, hint.as_deref()).map_err(|_| Error::Changed)?;
         let entry = win::stat_handle(&probe, id)?.ok_or(Error::Changed)?;
-        let dehydrated = entry.attributes & oneup_ntfs::dirent::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
-            && entry.attributes & oneup_ntfs::dirent::FILE_ATTRIBUTE_REPARSE_POINT != 0
-            && !entry.is_dir();
-        Ok(if dehydrated { Some(long(&win::final_path(&probe)?)) } else { None })
+        Ok(if dehydrated(&entry) { Some(long(&win::final_path(&probe)?)) } else { None })
     }
 
     /// Opens `pre` if it's one of our dehydrated placeholders: with
