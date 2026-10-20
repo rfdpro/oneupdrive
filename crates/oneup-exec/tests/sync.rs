@@ -191,14 +191,31 @@ struct SaveDuringUpload {
     after_last_byte: bool,
     /// Saved by another program (`cmd.exe`), as Files On-Demand needs.
     by_app: bool,
+    /// Saved by another program writing a new file and renaming it over
+    /// the old one with `MoveFileEx` (`cmd`'s `move /y`), which fails
+    /// while any other handle on the file is open.
+    by_move: bool,
 }
 
 impl SaveDuringUpload {
     fn in_place(path: PathBuf, content: &[u8]) -> Self {
-        Self { path, content: content.to_vec(), after_last_byte: false, by_app: false }
+        Self { path, content: content.to_vec(), after_last_byte: false, by_app: false, by_move: false }
     }
 
     fn save(self) {
+        if self.by_move {
+            let tmp = self.path.with_extension("saving");
+            std::fs::write(&tmp, &self.content).unwrap();
+            let out = std::process::Command::new("cmd.exe")
+                .current_dir(self.path.parent().unwrap())
+                .args(["/c", "move", "/y"])
+                .arg(tmp.file_name().unwrap())
+                .arg(self.path.file_name().unwrap())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "the save must not fail: {out:?}");
+            return;
+        }
         if self.by_app {
             use std::os::windows::process::CommandExt;
             let text = String::from_utf8(self.content).unwrap();
@@ -1690,6 +1707,28 @@ async fn a_save_during_an_upload_goes_through_and_the_saved_version_is_sent() {
     assert!(!cloud.holds(b"first version") && !cloud.holds(b"fisaved meanwhile"));
 }
 
+/// A program that saves by renaming a new file over the old one with
+/// `MoveFileEx` (as `cmd`'s `move /y`, Node, Python, Go and .NET do) while
+/// the file is being uploaded: the save goes through, the upload is
+/// cancelled before it commits, and the saved version is sent next.
+#[tokio::test]
+async fn everyday_a_save_by_rename_during_an_upload_goes_through_and_the_saved_version_is_sent() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("moved-meanwhile", cloud.clone());
+    write(&s.p("doc.txt"), b"first version");
+    cloud.0.lock().unwrap().saved_meanwhile =
+        Some(SaveDuringUpload { by_move: true, ..SaveDuringUpload::in_place(s.p("doc.txt"), b"saved by rename") });
+    let r = s.round().await;
+    assert!(r.skipped.iter().any(|(_, k)| *k == oneup_exec::Skip::Changed), "{r:?}");
+    assert!(cloud.0.lock().unwrap().saved_meanwhile.is_none(), "the upload began");
+    assert!(!cloud.tree().contains_key("/doc.txt"), "nothing committed");
+    assert_eq!(std::fs::read(s.p("doc.txt")).unwrap(), b"saved by rename");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/doc.txt"].as_deref(), Some(&b"saved by rename"[..]));
+    assert!(!cloud.holds(b"first version"));
+    assert_eq!(local_tree(&s.dir.0), cloud.tree());
+}
+
 #[tokio::test]
 async fn a_save_after_an_uploads_last_read_that_keeps_the_stamp_is_still_sent() {
     let cloud = Fake::new();
@@ -2643,6 +2682,17 @@ async fn on_demand_placeholders_follow_both_sides() {
     let sent = cloud.tree()["/b.txt"].clone().unwrap();
     assert!(String::from_utf8_lossy(&sent).contains("saved during the upload"), "{:?}", String::from_utf8_lossy(&sent));
     assert!(placeholder(&pb).in_sync);
+
+    // Saved by renaming a new file over it (`MoveFileEx`, which fails while
+    // any other handle on the file is open) while it's being sent: the save
+    // goes through, and the saved version is sent next.
+    app_append(&pb, "edited once more");
+    cloud.0.lock().unwrap().saved_meanwhile =
+        Some(SaveDuringUpload { by_move: true, ..SaveDuringUpload::in_place(pb.clone(), b"saved by rename") });
+    s.quiesce().await;
+    assert!(cloud.0.lock().unwrap().saved_meanwhile.is_none(), "the upload began");
+    assert_eq!(cloud.tree()["/b.txt"].as_deref(), Some(&b"saved by rename"[..]));
+    assert_eq!(app_read(&pb).as_deref(), Some(&b"saved by rename"[..]));
     assert_eq!(cloud.tree()["/docs/new.txt"].as_deref(), Some(&b"made here"[..]));
     let n = placeholder(&s.p("docs").join("new.txt"));
     assert!(n.in_sync && n.on_disk == 9, "converted, content kept: {n:?}");
