@@ -115,13 +115,14 @@ impl<C: Cloud> Executor<C> {
             Step::SetAside { local } => {
                 // Written ahead: a crash after the move into the version
                 // store, before the record goes, finishes the job when the
-                // record is settled (`Executor::recover`).
+                // record is settled (`Executor::recover`). Durable: a power
+                // cut mustn't roll it back once the move may have happened.
                 store
-                    .write(|o| {
+                    .write_ahead(|o| {
                         let Some(b) = o.synced_get(sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                         need(b.local == Some(local.id))?;
                         let p = Pending::Aside { sid, local: local.id };
-                        Ok(o.meta_set(&pending_of(local.id), &p.encode())?)
+                        Ok(o.meta_set_ahead(&pending_of(local.id), &p.encode())?)
                     })
                     .await?;
                 self.crash_point()?;
@@ -137,13 +138,13 @@ impl<C: Cloud> Executor<C> {
             Step::Discard { local } => {
                 // As a deletion made here: noted ahead (the change journal
                 // sees only a move out of the folder), settled like a
-                // recycling's if the move doesn't happen.
+                // recycling's if the move doesn't happen. Durable, as above.
                 store
-                    .write(|o| {
+                    .write_ahead(|o| {
                         let Some(b) = o.synced_get(sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                         need(b.local == Some(local.id))?;
                         o.note_local_deleted(local.id.0)?;
-                        Ok(o.meta_set(&pending_of(local.id), &Pending::Evidence(local.id).encode())?)
+                        Ok(o.meta_set_ahead(&pending_of(local.id), &Pending::Evidence(local.id).encode())?)
                     })
                     .await?;
                 self.crash_point()?;
