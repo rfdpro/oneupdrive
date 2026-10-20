@@ -47,6 +47,7 @@ impl ShellStatus {
         } else if let Some(p) = &s.problem {
             ("error", "Problem", format!("{} Select for details.", p.title))
         } else if let Some(why) = &s.auto_pause {
+            let why = crate::autopause::said(why, s.auto_pause_hours.as_deref(), &crate::l10n::Locale::english());
             ("paused", "Paused", format!("Paused: {why}."))
         } else {
             match s.activity {
@@ -134,6 +135,7 @@ mod tests {
             overflow: None,
             problem: None,
             auto_pause: None,
+            auto_pause_hours: None,
             prune_offer: None,
             progress: None,
             unsynced: None,

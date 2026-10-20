@@ -31,6 +31,12 @@ fn literal(s: &str, i: usize) -> Option<(String, usize)> {
         match c {
             '"' => return Some((out, i + 1 + j + 1)),
             '\\' => match chars.next()?.1 {
+                // Rust: a backslash at the end of a line joins it to the next.
+                '\n' => {
+                    while chars.clone().next().is_some_and(|(_, c)| c.is_whitespace()) {
+                        chars.next();
+                    }
+                }
                 'n' => out.push('\n'),
                 't' => out.push('\t'),
                 'u' => {
@@ -55,9 +61,28 @@ fn literal(s: &str, i: usize) -> Option<(String, usize)> {
     None
 }
 
-/// The first argument of each call to `name(` whose argument is a string
-/// literal, skipping comment lines.
-fn calls(src: &str, name: &str) -> Vec<String> {
+/// A message argument as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Msg {
+    /// A whole string literal: the message.
+    Literal(String),
+    /// A name (`p.title`): a message whose English is said elsewhere.
+    Named,
+    /// Anything else (`"a " + b`, a ternary, a template): pieces, which a
+    /// translation can't reorder.
+    Composed(String),
+}
+
+fn skip_space(src: &str, mut i: usize) -> usize {
+    while src.as_bytes().get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
+/// The message argument of each call to `name(` (the first argument; with
+/// `skip_first`, the second, as in `t_in!(loc, "…")`), outside comment lines.
+fn messages(src: &str, name: &str, skip_first: bool) -> Vec<Msg> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(at) = src[from..].find(name) {
@@ -72,14 +97,36 @@ fn calls(src: &str, name: &str) -> Vec<String> {
             continue;
         }
         let mut i = from;
-        while src.as_bytes().get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
+        if skip_first {
+            match src[i..].find(',') {
+                Some(c) => i += c + 1,
+                None => continue,
+            }
         }
-        if let Some((text, _)) = literal(src, i) {
-            out.push(text);
+        i = skip_space(src, i);
+        let ends = |j: usize| matches!(src.as_bytes().get(skip_space(src, j)), Some(b',' | b')'));
+        let snippet = || src[i..src.len().min(i + 80)].lines().next().unwrap_or("").to_string();
+        if let Some((text, end)) = literal(src, i) {
+            out.push(if ends(end) { Msg::Literal(text) } else { Msg::Composed(snippet()) });
+        } else {
+            let name_len = src[i..].find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).unwrap_or(0);
+            // A function's own parameter (`tr(english, …)`) isn't a call.
+            if src[i + name_len..].starts_with(" =") {
+                continue;
+            }
+            out.push(if name_len > 0 && ends(i + name_len) { Msg::Named } else { Msg::Composed(snippet()) });
         }
     }
     out
+}
+
+fn literals(msgs: Vec<Msg>) -> Vec<String> {
+    msgs.into_iter()
+        .filter_map(|m| match m {
+            Msg::Literal(s) => Some(s),
+            _ => None,
+        })
+        .collect()
 }
 
 fn entities(s: &str) -> String {
@@ -122,9 +169,12 @@ fn page_markup() -> BTreeSet<String> {
     out
 }
 
+fn script() -> &'static str {
+    PAGE.split("<script>").nth(1).and_then(|r| r.split("</script>").next()).unwrap_or("")
+}
+
 fn page_script() -> Vec<String> {
-    let script = PAGE.split("<script>").nth(1).and_then(|r| r.split("</script>").next()).unwrap_or("");
-    calls(script, "tr(")
+    literals(messages(script(), "tr(", false))
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -138,16 +188,22 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn rust_strings() -> Vec<String> {
+/// Every `t!`, `t_in!` and `t_key!` message in the programs' code.
+fn rust_messages() -> Vec<Msg> {
     let mut files = Vec::new();
     rust_sources(&crate_dir().join("src"), &mut files);
     let mut out = Vec::new();
     for f in files {
         let src = std::fs::read_to_string(&f).expect("a source file");
-        out.extend(calls(&src, "t!("));
-        out.extend(calls(&src, "t_key!("));
+        out.extend(messages(&src, "t!(", false));
+        out.extend(messages(&src, "t_in!(", true));
+        out.extend(messages(&src, "t_key!(", false));
     }
     out
+}
+
+fn rust_strings() -> Vec<String> {
+    literals(rust_messages())
 }
 
 fn all_strings() -> BTreeSet<String> {
@@ -188,6 +244,62 @@ fn the_string_list_has_the_page_and_the_programs() {
     assert!(all.len() > 500, "only {} strings found", all.len());
 }
 
+/// Messages are whole: no `tr("a " + b)` or `tr(x ? "a" : "b")`, which
+/// the string list can't see and a translation can't reorder; and none is a
+/// piece of a sentence (starting with a space or a comma, ending in a space).
+#[test]
+fn messages_are_whole_sentences_given_as_literals() {
+    let mut bad = Vec::new();
+    for (whose, msgs) in [("page", messages(script(), "tr(", false)), ("code", rust_messages())] {
+        for m in msgs {
+            match m {
+                Msg::Composed(s) => bad.push(format!("{whose}: built from pieces: {s}")),
+                Msg::Literal(s) if s.starts_with([' ', ',', '.', ';', '·']) || s.ends_with(' ') => {
+                    bad.push(format!("{whose}: a piece of a sentence: {s:?}"))
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// The template lists every message code gives (`tr`, `t!`, `t_in!`,
+/// `t_key!`). The page's own markup isn't required (another branch's new
+/// label still shows, in English); regenerate to include it.
+#[test]
+fn the_template_has_every_message_in_code() {
+    if std::env::var_os("ONEUP_WRITE_STRINGS").is_some() {
+        return; // being written meanwhile (`write_the_string_template`)
+    }
+    let text = std::fs::read_to_string(crate_dir().join("locales").join("template.json")).expect("template");
+    let template: BTreeMap<String, String> = serde_json::from_str(&text).expect("a JSON object");
+    let missing: BTreeSet<String> =
+        page_script().into_iter().chain(rust_strings()).filter(|s| !template.contains_key(s)).collect();
+    assert!(
+        missing.is_empty(),
+        "not in locales/template.json (ONEUP_WRITE_STRINGS=1 cargo test -p oneup --test l10n_strings writes it):\n{}",
+        missing.into_iter().collect::<Vec<_>>().join("\n")
+    );
+}
+
+#[test]
+fn the_checks_tell_whole_messages_from_pieces() {
+    let src = r#"tr("Whole {n}", { n }); tr("a " + b); tr(x ? "a" : "b"); tr(p.title); tr(`t ${x}`);
+        // tr("in a comment")
+        t_in!(loc, "In {lang}"); t_key!("Joined \
+                 line");"#;
+    let page = messages(src, "tr(", false);
+    assert_eq!(page[0], Msg::Literal("Whole {n}".into()));
+    assert!(matches!(page[1], Msg::Composed(_)));
+    assert!(matches!(page[2], Msg::Composed(_)));
+    assert_eq!(page[3], Msg::Named);
+    assert!(matches!(page[4], Msg::Composed(_)));
+    assert_eq!(page.len(), 5, "comments are skipped");
+    assert_eq!(messages(src, "t_in!(", true), [Msg::Literal("In {lang}".into())]);
+    assert_eq!(messages(src, "t_key!(", false), [Msg::Literal("Joined line".into())]);
+}
+
 #[test]
 fn write_the_string_template() {
     let path = crate_dir().join("locales").join("template.json");
@@ -219,10 +331,13 @@ struct Case {
 #[derive(Clone, Copy)]
 enum Value {
     N(i64),
+    F(f64),
     S(&'static str),
 }
 
 const FILES: &str = "{n, plural, one {# file} other {# files}}";
+const CATS: &str = "{n, plural, other {x}}";
+const CATS_SHOWN: &str = "{n, plural, zero {zero} one {one} two {two} few {few} many {many} other {other}}";
 const RU_FILES: &str = "{n, plural, one {# файл} few {# файла} many {# файлов} other {# файла}}";
 const PL_FILES: &str = "{n, plural, one {# plik} few {# pliki} many {# plików} other {# pliku}}";
 const AR_FILES: &str = "{n, plural, zero {لا ملفات} one {ملف} two {ملفان} few {# ملفات} many {# ملفًا} other {# ملف}}";
@@ -313,6 +428,37 @@ fn cases() -> Vec<Case> {
             args: [("n", Value::N(n))].to_vec().leak(),
         });
     }
+    // The categories alone (`#` would bring in number formats).
+    for (lang, n) in [
+        ("pt-PT", 1_000_000.0_f64),
+        ("pt-PT", 1.0),
+        ("pt-PT", 0.0),
+        ("pt", 0.0),
+        ("is", 1.11),
+        ("is", 1.1),
+        ("is", 21.0),
+        ("mk", 1.11),
+        ("mk", 0.21),
+        ("fr", 2_000_000.0),
+    ] {
+        out.push(Case {
+            lang,
+            locale: "en-US",
+            numbers: en,
+            strings: &[(CATS, CATS_SHOWN)],
+            english: CATS,
+            args: [("n", if n.fract() == 0.0 { Value::N(n as i64) } else { Value::F(n) })].to_vec().leak(),
+        });
+    }
+    // A translation with a case given twice is passed over, in both.
+    out.push(Case {
+        lang: "de",
+        locale: "de-DE",
+        numbers: de,
+        strings: &[(FILES, "{n, plural, one {# Datei} one {# Dateien} other {# Dateien}}")],
+        english: FILES,
+        args: &[("n", Value::N(1))],
+    });
     for n in [0, 1, 2] {
         out.push(Case {
             lang: "fr",
@@ -351,6 +497,7 @@ fn the_page_formats_messages_as_the_programs_do() {
             .map(|(k, v)| {
                 let v = match v {
                     Value::N(n) => serde_json::Value::from(*n),
+                    Value::F(x) => serde_json::Value::from(*x),
                     Value::S(s) => serde_json::Value::from(*s),
                 };
                 ((*k).to_string(), v)
@@ -381,6 +528,7 @@ fn the_page_formats_messages_as_the_programs_do() {
             .map(|(k, v)| {
                 let a = match v {
                     Value::N(n) => Arg::from(*n),
+                    Value::F(x) => Arg::from(*x),
                     Value::S(s) => Arg::from(*s),
                 };
                 (*k, a)

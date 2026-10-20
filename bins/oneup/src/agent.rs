@@ -272,6 +272,7 @@ fn print_status(s: &Status) {
         println!("  paused            {what}{until}  (`oneup resume`)");
     }
     if let Some(why) = &s.auto_pause {
+        let why = oneup_app::autopause::said(why, s.auto_pause_hours.as_deref(), oneup_app::l10n::current());
         println!("  paused by itself  {why}; resumes when that ends (`oneup settings` to change this)");
     }
     println!("  OneDrive changes  {}", if s.push { "notified as they happen" } else { "checked on a timer" });

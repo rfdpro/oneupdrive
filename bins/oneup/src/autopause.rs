@@ -5,6 +5,41 @@
 use anyhow::{Result, bail};
 
 use crate::config::Agent;
+use crate::l10n::{Arg, Locale};
+use crate::t_key;
+
+/// Why the agent pauses by itself: a fixed English message (the key a
+/// catalogue translates it by, and what the status carries) and, for
+/// quiet hours, the hours it fills in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reason {
+    pub key: &'static str,
+    pub hours: Option<String>,
+}
+
+impl Reason {
+    fn fixed(key: &'static str) -> Reason {
+        Reason { key, hours: None }
+    }
+
+    /// In `loc`'s language.
+    pub fn said(&self, loc: &Locale) -> String {
+        said(self.key, self.hours.as_deref(), loc)
+    }
+
+    /// In English, for the agent's own log.
+    pub fn english(&self) -> String {
+        self.said(&Locale::english())
+    }
+}
+
+/// A status's `auto_pause` and `auto_pause_hours` in `loc`'s language.
+pub fn said(key: &str, hours: Option<&str>, loc: &Locale) -> String {
+    match hours {
+        Some(h) => loc.message(key, &[("hours", Arg::from(h))]),
+        None => loc.message(key, &[]),
+    }
+}
 
 /// What the PC is doing now.
 #[derive(Debug, Clone, Copy)]
@@ -18,23 +53,23 @@ pub struct Conditions {
 }
 
 /// Why the agent pauses by itself now, if it does.
-pub fn reason(a: &Agent, c: &Conditions) -> Option<String> {
+pub fn reason(a: &Agent, c: &Conditions) -> Option<Reason> {
     if a.pause_on_metered && c.metered {
-        return Some("on a metered connection".into());
+        return Some(Reason::fixed(t_key!("on a metered connection")));
     }
     if a.pause_on_battery_saver && c.battery_saver {
-        return Some("battery saver is on".into());
+        return Some(Reason::fixed(t_key!("battery saver is on")));
     }
     use oneup_sys::conditions::FullScreen;
     if a.pause_on_full_screen && c.full_screen == FullScreen::Program {
-        return Some("a game, presentation or other full-screen program is running".into());
+        return Some(Reason::fixed(t_key!("a game, presentation or other full-screen program is running")));
     }
     if a.pause_on_full_screen_video && c.full_screen == FullScreen::Video {
-        return Some("a video is playing full screen".into());
+        return Some(Reason::fixed(t_key!("a video is playing full screen")));
     }
     match &a.quiet_hours {
         Some(q) if parse_quiet_hours(q).is_ok_and(|(from, to)| within(from, to, c.minute_of_day)) => {
-            Some(format!("quiet hours ({q})"))
+            Some(Reason { key: t_key!("quiet hours ({hours})"), hours: Some(q.clone()) })
         }
         _ => None,
     }
@@ -107,10 +142,10 @@ mod tests {
         };
         let none = FullScreen::None;
         assert_eq!(reason(&on, &c(false, false, none)), None);
-        assert!(reason(&on, &c(true, false, none)).unwrap().contains("metered"));
-        assert!(reason(&on, &c(false, true, none)).unwrap().contains("battery"));
-        assert!(reason(&on, &c(false, false, Program)).unwrap().contains("game"));
-        assert!(reason(&on, &c(false, false, Video)).unwrap().contains("video"));
+        assert!(reason(&on, &c(true, false, none)).unwrap().english().contains("metered"));
+        assert!(reason(&on, &c(false, true, none)).unwrap().english().contains("battery"));
+        assert!(reason(&on, &c(false, false, Program)).unwrap().english().contains("game"));
+        assert!(reason(&on, &c(false, false, Video)).unwrap().english().contains("video"));
         // Games but not videos.
         let games = Agent { pause_on_full_screen_video: false, ..Agent::default() };
         assert!(reason(&games, &c(false, false, Program)).is_some());
@@ -124,6 +159,26 @@ mod tests {
         };
         assert_eq!(reason(&off, &c(true, true, Program)), None);
         assert_eq!(reason(&off, &c(false, false, Video)), None);
+    }
+
+    #[test]
+    fn quiet_hours_are_a_fixed_message_with_the_hours_put_in() {
+        let quiet = Agent { quiet_hours: Some("22:00-07:00".into()), ..Agent::default() };
+        let night = Conditions {
+            metered: false,
+            battery_saver: false,
+            full_screen: oneup_sys::conditions::FullScreen::None,
+            minute_of_day: 23 * 60,
+        };
+        let r = reason(&quiet, &night).unwrap();
+        assert_eq!(r, Reason { key: "quiet hours ({hours})", hours: Some("22:00-07:00".into()) });
+        assert_eq!(r.english(), "quiet hours (22:00-07:00)");
+        let de = r#"{"quiet hours ({hours})": "Ruhezeit ({hours})", "battery saver is on": "Energiesparmodus ist an"}"#;
+        let de = Locale::with_catalogue("de", de, "de-DE", crate::l10n::Numbers::new(",", ".", "3;0")).unwrap();
+        assert_eq!(r.said(&de), "Ruhezeit (22:00-07:00)");
+        // As a status carries it.
+        assert_eq!(said(r.key, r.hours.as_deref(), &de), "Ruhezeit (22:00-07:00)");
+        assert_eq!(said("battery saver is on", None, &de), "Energiesparmodus ist an");
     }
 
     #[test]

@@ -31,6 +31,7 @@ impl Handler for Agent {
             overflow: None,
             problem: None,
             auto_pause: None,
+            auto_pause_hours: None,
             prune_offer: None,
             progress: None,
             unsynced: None,

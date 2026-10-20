@@ -355,9 +355,13 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<Problem>,
     /// Why the agent paused by itself (a metered connection, battery
-    /// saver, quiet hours), if it did.
+    /// saver, quiet hours), if it did: a fixed English message, the key
+    /// readers translate it by (`oneup_app::autopause::Reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_pause: Option<String>,
+    /// The quiet hours `auto_pause` names, as its `{hours}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pause_hours: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prune_offer: Option<PruneOffer>,
     /// The round being carried out, while one is.

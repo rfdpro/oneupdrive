@@ -775,8 +775,11 @@ mod win {
             "stopped" => Ok(json!(oneup_app::problem::load_stopped(dir))),
             // Everything that needs the user, as `oneup problems` lists it.
             "problems" => {
-                let all: Vec<Value> =
-                    oneup_app::problems::list(dir).await.iter().map(oneup_app::problems::Item::to_json).collect();
+                let all: Vec<Value> = oneup_app::problems::list(dir, oneup_app::l10n::current())
+                    .await
+                    .iter()
+                    .map(oneup_app::problems::Item::to_json)
+                    .collect();
                 Ok(json!({ "problems": all }))
             }
             "save" => {

@@ -2501,6 +2501,8 @@
                         break;
                     }
                     const key = word();
+                    // Which of two would win is undefined: refused, as in Rust.
+                    if (Object.hasOwn(cases, key)) throw new Error("a plural case given twice");
                     expect("{");
                     cases[key] = parts(true);
                     expect("}");
@@ -2664,6 +2666,13 @@
             timeStyle: "short"
         }) : "–";
 
+        // A message with an element in it: `{link}` in the (translated) text
+        // is where `node` goes, so a translation can put it anywhere.
+        function linked(text, node) {
+            const [before, after = ""] = text.split("{link}");
+            return [before, node, after];
+        }
+
         // ---- navigation
         function show(page) {
             if (LIST_PAGES[page]) {
@@ -2730,7 +2739,9 @@
             if (!s) {
                 dot.className = stopped ? "dot bad" : "dot";
                 title.textContent = stopped ? tr("Stopped") : tr("Not running");
-                detail.textContent = stopped ? stopped.title + "." : tr("Nothing syncs until it starts.");
+                detail.textContent = stopped ? tr("{what}.", {
+                    what: tr(stopped.title)
+                }) : tr("Nothing syncs until it starts.");
                 btn(tr("Start"), () => run(call("start"), tr("Starting…")), "btn primary small");
                 return;
             }
@@ -2742,9 +2753,13 @@
             dot.className = "dot " + (attention || s.problem ? "bad" : paused || s.auto_pause ? "wait" : a === "syncing" || a === "starting" ? "busy" : "ok");
             const bits = [];
             if (s.auto_pause) bits.push(tr("Paused: {why}.", {
-                why: s.auto_pause
+                why: tr(s.auto_pause, {
+                    hours: s.auto_pause_hours
+                })
             }));
-            if (s.problem) bits.push(s.problem.title + ".");
+            if (s.problem) bits.push(tr("{what}.", {
+                what: tr(s.problem.title)
+            }));
             if (stops.some(x => x.kind === "content")) bits.push(tr("Some edited files look encrypted. Review them from the icon's menu."));
             else if (attention) bits.push(tr("Review from the icon's menu."));
             if (s.last && s.last.done) bits.push(tr("Last sync {when}: {n, plural, one {# change} other {# changes}}.", {
@@ -2779,24 +2794,28 @@
             // Nothing set up yet: the Set up page is the answer, not a card.
             card.hidden = !p || p.kind === "setup";
             if (card.hidden) return;
+            // The agent records them in English (`problem::Kind::words`).
             $("#pb-title").textContent = stopped ? tr("Stopped: {what}", {
-                what: p.title
-            }) : p.title;
-            $("#pb-detail").textContent = p.detail;
-            $("#pb-action").textContent = p.action;
+                what: tr(p.title)
+            }) : tr(p.title);
+            $("#pb-detail").textContent = tr(p.detail);
+            $("#pb-action").textContent = tr(p.action);
             const at = t => new Date(t).toLocaleTimeString(FMT, {
                 hour: "numeric",
                 minute: "2-digit"
             });
-            $("#pb-when").textContent = stopped ? tr("OneUpDrive stopped. Start it to try again.") :
-                (p.retry_ms ? tr("Next try at {time}", {
+            // Separate facts, each a message of its own, set side by side.
+            $("#pb-when").textContent = stopped ? tr("OneUpDrive stopped. Start it to try again.") : [
+                p.retry_ms ? tr("Next try at {time}", {
                     time: at(p.retry_ms)
-                }) : tr("Trying again soon")) +
-                tr(" · since {when}", {
+                }) : tr("Trying again soon"),
+                tr("since {when}", {
                     when: when(p.since_ms)
-                }) + (p.attempts > 1 ? tr(" · {n} tries", {
+                }),
+                p.attempts > 1 ? tr("{n, plural, one {# try} other {# tries}}", {
                     n: p.attempts
-                }) : "");
+                }) : ""
+            ].filter(Boolean).join(" · ");
             $("#pb-retry").textContent = stopped ? tr("Start") : tr("Retry now");
             $("#pb-tech").textContent = p.technical;
         }
@@ -3001,7 +3020,10 @@
                 }, el("b", {}, f.name), el("small", {
                     className: "path",
                     title: f.target
-                }, f.place + (f.broken ? tr(" · broken") : "") + " → " + f.new_target)))));
+                }, f.broken ? tr("{place} · broken → {target}", {
+                    place: f.place,
+                    target: f.new_target
+                }) : f.place + " → " + f.new_target)))));
                 return n;
             } catch (e) {
                 $("#sc-state").textContent = tr("Search failed: {why}", {
@@ -3011,9 +3033,10 @@
             }
         }
         async function scChange(op, args, done) {
-            await run(call(op, args), r => done(r.changed) + (r.skipped ? tr("; {n} skipped", {
+            await run(call(op, args), r => r.skipped ? tr("{done}; {n} skipped", {
+                done: done(r.changed),
                 n: r.skipped
-            }) : "")).catch(() => null);
+            }) : done(r.changed)).catch(() => null);
             loadShortcuts();
         }
         $("#sc-find").onclick = loadShortcuts;
@@ -3251,13 +3274,14 @@
                             n: c.missing
                         }) : tr("Not yet")
                     }))));
-                const kept = r.kept ? tr(" {n} more kept in OneDrive by choice aren't listed.", {
-                    n: r.kept
-                }) : "";
-                sum.textContent = (!r.items.length ? tr("No excluded items in OneDrive.") : tr("{n}+ items, {size}.", {
+                const head = !r.items.length ? tr("No excluded items in OneDrive.") : tr("{n}+ items, {size}.", {
                     n: items,
                     size: size(bytes)
-                })) + kept;
+                });
+                sum.textContent = r.kept ? tr("{text} {n} more kept in OneDrive by choice aren't listed.", {
+                    text: head,
+                    n: r.kept
+                }) : head;
             } else {
                 const rows = [];
                 let shown = 0,
@@ -3283,16 +3307,22 @@
                 }
                 setTable([tr("Change"), tr("Item"), ""], rows);
                 const unwritten = r.reduce((a, st) => a + st.unwritten, 0);
-                sum.textContent = !r.length ? tr("No safety stops.") :
-                    (r.length === 1 ? r[0].header : tr("{n} safety stops. Nothing changed yet.", {
-                        n: r.length
-                    })) +
-                    (q ? tr(" {n} match.", {
-                        n: matching
-                    }) : "") + tr(" Decide from the icon's menu.") +
-                    (unwritten ? tr(" {n} more not listed (oneup sync --dry-run lists all).", {
-                        n: unwritten
-                    }) : "");
+                // Each sentence a message, the earlier ones its {text}.
+                let said = r.length === 1 ? r[0].header : tr("{n} safety stops. Nothing changed yet.", {
+                    n: r.length
+                });
+                if (q) said = tr("{text} {n} match.", {
+                    text: said,
+                    n: matching
+                });
+                said = tr("{text} Decide from the icon's menu.", {
+                    text: said
+                });
+                if (unwritten) said = tr("{text} {n} more not listed (oneup sync --dry-run lists all).", {
+                    text: said,
+                    n: unwritten
+                });
+                sum.textContent = !r.length ? tr("No safety stops.") : said;
                 if (matching > shown) moreBtn(tr("Show more ({shown} of {all})", {
                     shown,
                     all: matching
@@ -3689,7 +3719,7 @@
                     textContent: new Date(f.at_ms).toLocaleString(FMT)
                 }),
                 el("span", {
-                    textContent: f.kind === "opened" ? "opened" : "changed"
+                    textContent: f.kind === "opened" ? tr("opened") : tr("changed")
                 }),
                 el("span", {
                     className: "path",
@@ -3894,7 +3924,15 @@
                         }),
                         el("small", {
                             className: "path",
-                            textContent: (a.signed_in ? tr("Signed in") : tr("Not signed in")) + (a.test_account ? tr(", test account") : "") + ". " + a.dir
+                            textContent: a.signed_in ? (a.test_account ? tr("Signed in, test account. {folder}", {
+                                folder: a.dir
+                            }) : tr("Signed in. {folder}", {
+                                folder: a.dir
+                            })) : a.test_account ? tr("Not signed in, test account. {folder}", {
+                                folder: a.dir
+                            }) : tr("Not signed in. {folder}", {
+                                folder: a.dir
+                            })
                         })),
                     acts));
             }
@@ -4048,7 +4086,16 @@
             };
             const line = r.kind === "vault" ? tr("Encrypted vault with OneDrive {remote}", remote) :
                 r.backup ? tr("Backs up with OneDrive {remote}", remote) : tr("Syncs with OneDrive {remote}", remote);
-            return line + (r.on_demand ? tr(", Files On-Demand") : "") + (r.running === false ? tr(". Not running.") : ".");
+            const off = r.running === false;
+            return r.on_demand ? (off ? tr("{line}, Files On-Demand. Not running.", {
+                line
+            }) : tr("{line}, Files On-Demand.", {
+                line
+            })) : off ? tr("{line}. Not running.", {
+                line
+            }) : tr("{line}.", {
+                line
+            });
         }
 
         function relPath(rel) {
@@ -4071,11 +4118,11 @@
                     }, el("b", {
                         textContent: tr("Nothing syncs yet")
                     }),
-                    tr("Set up your main folder, or "), el("button", {
+                    ...linked(tr("Set up your main folder, or {link}."), el("button", {
                         className: "link",
                         textContent: tr("add a folder"),
                         onclick: () => $("#add-menu").showPopover()
-                    }), "."));
+                    }))));
                 $("#details").replaceChildren();
                 return;
             }
@@ -4111,7 +4158,7 @@
                         textContent: r.kind === "main" ? tr("Main folder") : r.name
                     }),
                     r.running === false ? el("small", {
-                        textContent: r.kind === "vault" ? "locked" : "stopped"
+                        textContent: r.kind === "vault" ? tr("locked") : tr("stopped")
                     }) : null);
                 b.setAttribute("aria-selected", String(!!F.root && F.root.id === r.id));
                 b.tabIndex = F.root && F.root.id === r.id ? 0 : -1;
@@ -5133,7 +5180,9 @@
                     const p = await run(call("pick_folder"));
                     if (!p) return;
                     const base = F.root.local.replace(/[\\/]+$/, "");
-                    if (!p.toLowerCase().startsWith(base.toLowerCase() + "\\")) return toast(tr("Choose a folder inside ") + base, true);
+                    if (!p.toLowerCase().startsWith(base.toLowerCase() + "\\")) return toast(tr("Choose a folder inside {folder}", {
+                        folder: base
+                    }), true);
                     const rel = p.slice(base.length + 1).replace(/\\/g, "/");
                     run(call("tree_pause", {
                         root: F.root.id,
@@ -5355,9 +5404,10 @@
                 w.kind === "file" ? tr("the .oneupignore file in {folder}", {
                     folder: w.folder
                 }) : tr("a rule");
-            const inside = w.inside ? tr(" Inside excluded {folder}.", {
+            const inside = text => w.inside ? tr("{text} Inside excluded {folder}.", {
+                text,
                 folder: w.inside
-            }) : "";
+            }) : text;
             switch (n.state) {
                 case "synced":
                     return n.placement === "online" ? tr("Synced. Downloads when you open it.") :
@@ -5369,13 +5419,13 @@
                 case "pending":
                     return tr("Syncing.");
                 case "left_out":
-                    return (F.rs && F.rs.rules.cloud === "keep" ? tr("Excluded by {by}. Stays {where}.", {
+                    return inside(F.rs && F.rs.rules.cloud === "keep" ? tr("Excluded by {by}. Stays {where}.", {
                         by,
                         where
                     }) : tr("Excluded by {by}. Stays {where}; never uploaded.", {
                         by,
                         where
-                    })) + inside;
+                    }));
                 case "paused":
                     return w.inside ? tr("In the paused folder {folder}.", {
                         folder: w.inside
@@ -5456,9 +5506,10 @@
                     style: "margin-top:10px"
                 }, el("span", {
                     className: "dot " + cls
-                }), word + (n.size != null ? ", " + size(n.size) : "") + (n.modified_ms ? tr(", changed {when}", {
+                }), n.modified_ms ? tr("{state}, changed {when}", {
+                    state: word + (n.size != null ? ", " + size(n.size) : ""),
                     when: when(n.modified_ms)
-                }) : "")),
+                }) : word + (n.size != null ? ", " + size(n.size) : "")),
                 el("p", {
                     className: "say",
                     textContent: sentence(n)
@@ -5691,11 +5742,15 @@
         }
         // What sync did with an item (or, for "", the whole folder), newest first.
         const DID = {
-            done: "",
-            skipped: tr("Skipped: "),
-            failed: tr("Failed: "),
-            waiting: tr("Waiting: "),
-            note: ""
+            skipped: what => tr("Skipped: {what}", {
+                what
+            }),
+            failed: what => tr("Failed: {what}", {
+                what
+            }),
+            waiting: what => tr("Waiting: {what}", {
+                what
+            })
         };
         async function activityInto(b, rel) {
             try {
@@ -5715,7 +5770,7 @@
                         style: "white-space:nowrap;vertical-align:top"
                     }),
                     el("td", {
-                        textContent: DID[e.outcome] + e.action + (rel ? (e.path.replace(/^\//, "") !== rel ? " " + e.path : "") : " " + e.path) + (e.detail ? " (" + e.detail + ")" : ""),
+                        textContent: (DID[e.outcome] || (what => what))(e.action + (rel ? (e.path.replace(/^\//, "") !== rel ? " " + e.path : "") : " " + e.path) + (e.detail ? " (" + e.detail + ")" : "")),
                         style: e.outcome === "failed" ? "color:var(--bad)" : ""
                     })))));
                 b.replaceChildren(t, el("p", {
@@ -5761,7 +5816,9 @@
                                 root: r.id,
                                 id: x.id
                             }));
-                            toast(tr("Restored to ") + at.replace(/^\\\\\?\\/, ""));
+                            toast(tr("Restored to {path}", {
+                                path: at.replace(/^\\\\\?\\/, "")
+                            }));
                             keptInto(b, r);
                         }
                     }))));
@@ -6503,10 +6560,14 @@
                 });
             } else if (linked && app.stalled) {
                 const hours = app.unlinked_at_ms ? Math.max(1, Math.round((Date.now() - app.unlinked_at_ms) / 3600000)) : 0;
-                const started = hours ? tr("The OneDrive app started unlinking {n, plural, one {# hour} other {# hours}} ago but is stuck", {
+                const n = {
                     n: hours
-                }) : tr("The OneDrive app started unlinking but is stuck");
-                $("#mv-stuck-say").textContent = started + (app.app_running ? tr(" and still running") : "") + tr(". OneUpDrive can finish it.");
+                };
+                $("#mv-stuck-say").textContent = hours ? (app.app_running ?
+                        tr("The OneDrive app started unlinking {n, plural, one {# hour} other {# hours}} ago but is stuck and still running. OneUpDrive can finish it.", n) :
+                        tr("The OneDrive app started unlinking {n, plural, one {# hour} other {# hours}} ago but is stuck. OneUpDrive can finish it.", n)) :
+                    app.app_running ? tr("The OneDrive app started unlinking but is stuck and still running. OneUpDrive can finish it.") :
+                    tr("The OneDrive app started unlinking but is stuck. OneUpDrive can finish it.");
             }
             // Watching for the unlink while it's the next step.
             if (linked && cloudOk && !MV.timer) MV.timer = setInterval(async() => {
@@ -6861,7 +6922,7 @@
             for (const f of r.items) box.append(findRow(f));
             if (r.too_many) box.append(el("div", {
                 className: "msg",
-                textContent: r.too_many
+                textContent: tr(r.too_many)
             }));
             else if (r.more) box.append(el("div", {
                 className: "msg",
@@ -6907,9 +6968,9 @@
                     else findList(box, cloud);
                 }
                 const found = names.items.length + (cloud && cloud.items ? cloud.items.length : 0);
-                $("#fd-sum").textContent = found ? "" : names.too_many || tr("Nothing found.");
+                $("#fd-sum").textContent = found ? "" : (names.too_many ? tr(names.too_many) : tr("Nothing found."));
                 $("#fd-card").hidden = !found && !cloud;
-                $("#fd-note").textContent = names.note;
+                $("#fd-note").textContent = tr(names.note);
                 $("#fd-note").hidden = false;
             } catch (e) {
                 if (n === FD.seq) $("#fd-sum").textContent = e.message;

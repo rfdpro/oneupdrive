@@ -20,7 +20,7 @@ pub use oneup_store::search::MIN_CHARS;
 pub const DEFAULT_LIMIT: usize = 50;
 
 /// What every result list says, because the index can't do better.
-pub const LIMIT_NOTE: &str = "Items inside excluded folders aren't searched.";
+pub const LIMIT_NOTE: &str = crate::t_key!("Items inside excluded folders aren't searched.");
 
 /// Recall on data access (Cloud Files): an online-only file.
 const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
@@ -90,7 +90,7 @@ pub struct Found {
 }
 
 /// What a search says when it gave up ([`Found::too_many`]).
-pub const TOO_MANY: &str = "Too many matches. Type more.";
+pub const TOO_MANY: &str = crate::t_key!("Too many matches. Type more.");
 
 /// The synced folder pair and the rules, to tell each result's placement.
 struct Pair {

@@ -104,7 +104,7 @@ struct Shared {
     /// [`Control::take_resolved`] collects it for the activity log).
     problem: Option<oneup_ipc::Problem>,
     resolved: Option<oneup_ipc::Problem>,
-    auto_pause: Option<String>,
+    auto_pause: Option<crate::autopause::Reason>,
     /// Paths to transfer first (`oneup sync-now PATH`), until a round settles.
     first: Vec<String>,
     /// The round being carried out, while one is.
@@ -296,7 +296,7 @@ impl Control {
     }
 
     /// Why the agent paused by itself, or `None` when it didn't.
-    pub fn set_auto_pause(&self, why: Option<String>) {
+    pub fn set_auto_pause(&self, why: Option<crate::autopause::Reason>) {
         let mut s = self.lock();
         s.auto_pause = why;
         self.publish(&mut s);
@@ -434,7 +434,8 @@ impl Control {
                 o
             }),
             problem: s.problem.clone().or_else(|| s.cloud_full.clone()),
-            auto_pause: s.auto_pause.clone(),
+            auto_pause: s.auto_pause.as_ref().map(|r| r.key.to_string()),
+            auto_pause_hours: s.auto_pause.as_ref().and_then(|r| r.hours.clone()),
             prune_offer: s.prune_offer.clone().filter(|o| !s.answered.contains(&o.code)),
             progress: s.progress.clone(),
             unsynced: s.unsynced.clone(),
@@ -662,7 +663,7 @@ mod tests {
         assert!(live.round_check()(&there));
 
         // Pausing by itself pauses both sides, for the next rounds too.
-        c.set_auto_pause(Some("on a metered connection".into()));
+        c.set_auto_pause(Some(crate::autopause::Reason { key: "on a metered connection", hours: None }));
         let check = live.round_check();
         assert!(!check(&here) && !check(&there));
         assert!(c.controls().pause_local && c.controls().pause_remote);

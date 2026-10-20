@@ -585,7 +585,7 @@ async fn agent(
     let mut scope = sync::start_scope(&store)?;
     let mut retry = RETRY_FIRST;
     let mut settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
-    let mut auto_was: Option<String> = None;
+    let mut auto_was: Option<autopause::Reason> = None;
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
         // wake-up; a broken config.toml keeps the last good settings
@@ -598,8 +598,11 @@ async fn agent(
         let auto = auto_pause(&settings, minute);
         if auto != auto_was {
             match &auto {
-                Some(why) => println!("oneupd: pausing by itself: {why}"),
-                None => println!("oneupd: resuming ({} no longer applies)", auto_was.as_deref().unwrap_or("")),
+                Some(why) => println!("oneupd: pausing by itself: {}", why.english()),
+                None => println!(
+                    "oneupd: resuming ({} no longer applies)",
+                    auto_was.as_ref().map(autopause::Reason::english).unwrap_or_default()
+                ),
             }
             auto_was.clone_from(&auto);
         }
@@ -761,7 +764,7 @@ async fn agent(
 }
 
 /// Why the agent pauses by itself now (config.toml [agent]), if it does.
-fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<String> {
+fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<autopause::Reason> {
     let conditions = autopause::Conditions {
         metered: oneup_sys::conditions::metered(),
         battery_saver: oneup_sys::conditions::battery_saver(),
