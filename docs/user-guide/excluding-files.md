@@ -92,7 +92,7 @@ oneup --data-dir … cloud prune --keep                   # keep them in OneDriv
 
 With the agent running, `--yes` asks it to do exactly what it found. Without it, only what's completely here is removed (downloading needs the agent); the rest is listed as not on this PC yet.
 
-Folders OneUpDrive never looks inside (like `node_modules`, below) are removed whole when this PC has a folder of the same name in the same place, and not offered otherwise; the list shows how many items OneDrive says they hold.
+Folders OneUpDrive never looks inside (like `node_modules`, below) are removed whole when this PC has a folder of the same name in the same place, and not offered otherwise. OneDrive only says how many items such a folder holds directly, not what's in its subfolders, so the list says "at least N items", and removing one always asks first (a safety stop), however small it looks.
 
 ## Folders that aren't even looked inside
 Folders that a preset or one of your `config.toml` rules skips by name alone (such as `node_modules/`) aren't even looked inside, on your PC or in OneDrive. That's what makes them cheap: millions of files there cost nothing. It also means OneDrive's copies of them don't appear here, whatever the setting above. `oneup rules` lists these names. Turn a preset off, or remove such a rule, and OneUpDrive looks through just those folders again on its own, on both sides; nothing else is rescanned. A name that a `!` rule might bring back is always looked inside, so the rules are followed exactly.
