@@ -1,5 +1,5 @@
 //! The Synced tree's history (schema v22): for each change to a Synced row,
-//! what the row agreed on until then, and when. It's what a rewind (F2)
+//! what the row agreed on until then, and when. It's what a rewind
 //! reconstructs a folder's past from, and what lists items deleted from
 //! OneDrive by ID (the OneDrive Personal recycle bin can't be listed
 //! through documented Graph; `POST /items/{id}/restore` takes an ID).

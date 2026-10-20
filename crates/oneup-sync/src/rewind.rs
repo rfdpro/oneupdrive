@@ -1,4 +1,4 @@
-//! Rewinding a folder to how it was at an earlier moment (F2).
+//! Rewinding a folder to how it was at an earlier moment.
 //!
 //! The Synced tree's history ([`History`]: what each Synced row agreed on
 //! until each change, written as it changes) says, for any moment it

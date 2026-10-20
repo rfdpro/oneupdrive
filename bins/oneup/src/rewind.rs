@@ -1,4 +1,4 @@
-//! Rewinding a folder to an earlier moment (F2): `oneup rewind`, the
+//! Rewinding a folder to an earlier moment: `oneup rewind`, the
 //! settings window's **Recovery** page, and the content guard's stop
 //! ("rewind to just before this batch").
 //!
