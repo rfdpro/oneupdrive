@@ -5919,6 +5919,27 @@
                     textContent: "Always on this PC"
                 }));
                 const pins = rs.rules.pin || [];
+                // Any change that would download files says so and asks;
+                // so does one whose count couldn't finish.
+                const savePins = async(next, ok) => {
+                    const pv = await run(call("pin_preview", {
+                        root: F.root.id,
+                        pin: next
+                    }));
+                    if (pv.ask && !confirm(`Download ${pv.all ? "" : "at least "}${pv.files.toLocaleString()} online-only files (${size(pv.bytes)})${pv.free != null ? ", with " + size(pv.free) + " free" : ""}?`)) return;
+                    run(call("pin_save", {
+                        root: F.root.id,
+                        pin: next,
+                        bytes: pv.bytes
+                    }), ok).then(() => afterChange(""));
+                };
+                if (rs.rules.pin_waiting != null) box.append(flatRow("Waiting to download", `Pin rules want more than you approved (${size(rs.rules.pin_waiting)} next).`, el("button", {
+                    className: "btn small",
+                    textContent: "Download",
+                    onclick: () => run(call("pin_allow", {
+                        root: F.root.id
+                    }), "Downloading").then(() => afterChange(""))
+                })));
                 const add = el("input", {
                     type: "text",
                     spellcheck: false,
@@ -5928,27 +5949,14 @@
                 const addBtn = el("button", {
                     className: "btn small",
                     textContent: "Add",
-                    onclick: async() => {
-                        const next = [...pins, add.value.trim()];
-                        if (!add.value.trim()) return;
-                        // A rule that downloads a lot asks first.
-                        const pv = await run(call("pin_preview", {
-                            root: F.root.id,
-                            pin: next
-                        }));
-                        if (pv.ask && !confirm(`Download ${pv.all ? "" : "at least "}${pv.files.toLocaleString()} online-only files (${size(pv.bytes)})${pv.free != null ? ", with " + size(pv.free) + " free" : ""}?`)) return;
-                        save({
-                            pin: next
-                        }, "Kept on this PC");
-                    }
+                    onclick: () => add.value.trim() && savePins([...pins, add.value.trim()], "Kept on this PC")
                 });
                 box.append(flatRow(pins.length ? "Add a pin rule" : "No pin rules", "Matching files stay downloaded. Space policies never free them.", add, addBtn));
                 for (const r of pins) box.append(flatRow(r, "Pin rule", el("button", {
                     className: "btn small",
                     textContent: "Remove",
-                    onclick: () => save({
-                        pin: pins.filter(x => x !== r)
-                    }, "Pin rule removed")
+                    // Removing a `!` rule can pin more: the same question.
+                    onclick: () => savePins(pins.filter(x => x !== r), "Pin rule removed")
                 })));
             }
             box.append(el("div", {

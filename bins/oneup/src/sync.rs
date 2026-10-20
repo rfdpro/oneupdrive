@@ -1150,35 +1150,88 @@ impl Engine {
             let detail = format!("{} item(s) no longer kept on this PC: their pin rule was removed", pass.unpinned);
             notes.push(notice(ActivityOutcome::Note, "keep", detail));
         }
+        if pass.repinned > 0 {
+            let detail = format!("{} item(s) kept on this PC by pin rules, though set to free up space", pass.repinned);
+            notes.push(notice(ActivityOutcome::Note, "keep", detail));
+        }
         log_activity(&mut store, notes)?;
         // Downloads keep to a pause that comes meanwhile, leave free space
-        // alone, and take a share per pass; the rest follows soon after.
+        // alone (nothing when it can't be read), take a share per pass, and
+        // keep the rules' items to what was approved.
         let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
         let total = oneup_sys::disk::total_bytes(Path::new(&root.path)).ok();
         let reserve = crate::pinrules::reserve(total, space.low_disk_percent);
         let limit = std::sync::Mutex::new(crate::pinrules::FetchLimit::new(reserve, std::time::Instant::now()));
-        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let budget = std::sync::Mutex::new(crate::pinrules::budget(&store)?);
+        let asked = std::sync::Mutex::new(None::<u64>);
         let root_path = PathBuf::from(&root.path);
-        let may = |size: u64| {
+        // The rules' own among the files this pass may fetch (the store
+        // can't be shared with the download tasks).
+        let owned: std::collections::HashSet<u128> = store.read(|o| {
+            let mut v = std::collections::HashSet::new();
+            for r in o.local_to_fetch(oneup_exec::placement::BATCH)? {
+                if o.pin_owned_has(r.file_id)? {
+                    v.insert(r.file_id);
+                }
+            }
+            Ok(v)
+        })?;
+        let may = |id: u128, size: u64| -> std::result::Result<(), oneup_exec::placement::Stop> {
+            let owned = owned.contains(&id);
+            if owned {
+                let b = budget.lock().unwrap_or_else(|p| p.into_inner());
+                if !crate::pinrules::within_budget(*b, size) {
+                    *asked.lock().unwrap_or_else(|p| p.into_inner()) = Some(size);
+                    return Err(oneup_exec::placement::Stop::Approval);
+                }
+            }
             let paused = controls().pause_local;
             let free = crate::pinrules::free_space(&root_path);
             let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
-            let ok = l.may(size, paused, free, std::time::Instant::now());
-            if !ok {
-                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            l.may(size, paused, free, std::time::Instant::now())?;
+            if owned {
+                let mut b = budget.lock().unwrap_or_else(|p| p.into_inner());
+                *b = b.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
             }
-            ok
+            Ok(())
         };
         let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path), &may).await?;
-        // More to download (stopped by its share, not by a pause or space,
-        // which a later wake-up finds anyway).
-        let more_fetch = stopped.load(std::sync::atomic::Ordering::Relaxed) && !controls().pause_local;
+        // What the rules' items downloaded comes off what was approved.
+        let spent: u64 = store.read(|o| {
+            let mut n = 0u64;
+            for (_, id, size) in &fetched.done {
+                if o.pin_owned_has(*id)? {
+                    n += size;
+                }
+            }
+            Ok(n)
+        })?;
+        if spent > 0 {
+            crate::pinrules::spend(&mut store, spent)?;
+        }
+        use oneup_exec::placement::Stop;
+        if fetched.stopped == Some(Stop::Approval)
+            && let Some(size) = asked.into_inner().unwrap_or_else(|p| p.into_inner())
+        {
+            crate::pinrules::wait_for_go_ahead(&mut store, size)?;
+            let e = notice(
+                ActivityOutcome::Waiting,
+                "keep",
+                "pin rules wait for your go-ahead to download more (oneup rules --allow-downloads)".into(),
+            );
+            self.log_once(&mut store, "pins waiting".into(), e)?;
+        }
+        // Soon again when only the pass's share stopped it (or the batch was
+        // full); a pause, the disk or a question waits for an event instead
+        // (resuming, settings, the agent's own checks), never a short timer.
+        let more_fetch = fetched.more && matches!(fetched.stopped, None | Some(Stop::Share));
         self.pin_more.store(pass.more || more_fetch, std::sync::atomic::Ordering::Relaxed);
-        if !fetched.is_empty() {
+        if !fetched.done.is_empty() {
             let at_ms = now_ms();
             let log: Vec<ActivityEntry> = fetched
+                .done
                 .into_iter()
-                .map(|path| ActivityEntry {
+                .map(|(path, _, _)| ActivityEntry {
                     seq: 0,
                     at_ms,
                     outcome: ActivityOutcome::Done,

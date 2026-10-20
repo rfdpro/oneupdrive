@@ -44,7 +44,7 @@ use oneup_app::{setup, sync, test_account, versions};
 /// `oneup rules` options that change the rules: each of --exclude-path,
 /// --include-path and --suggest does one thing, so combining them with
 /// these is refused rather than one of them silently ignored.
-const RULE_CHANGES: [&str; 7] = ["cloud", "on", "off", "add", "remove", "pin", "unpin"];
+const RULE_CHANGES: [&str; 8] = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "allow_downloads"];
 
 #[derive(Parser)]
 #[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (beta)")]
@@ -175,19 +175,23 @@ enum Cmd {
         /// Remove a pin rule
         #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
         unpin: Vec<String>,
+        /// Let pin rules download what they're waiting for (past what you
+        /// approved when you added them)
+        #[arg(long)]
+        allow_downloads: bool,
         /// Exclude this file or folder (a full path, or one inside the synced
         /// folder): shows what stops syncing; --yes to do it
         #[arg(long, value_name = "PATH", conflicts_with_all = RULE_CHANGES)]
         exclude_path: Option<String>,
         /// Sync this excluded file or folder again
-        #[arg(long, value_name = "PATH", conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "exclude_path", "yes"])]
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "allow_downloads", "exclude_path", "yes"])]
         include_path: Option<String>,
         /// With --exclude-path: exclude it. With --pin/--unpin: save pin rules
         /// that download files (shown first)
         #[arg(long, requires = "yes_for")]
         yes: bool,
         /// Suggest folders to exclude: the largest, and the busiest lately
-        #[arg(long, conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "exclude_path", "include_path", "yes"])]
+        #[arg(long, conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "allow_downloads", "exclude_path", "include_path", "yes"])]
         suggest: bool,
         #[command(flatten)]
         profile: ProfileArg,
@@ -1685,7 +1689,21 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Autostart { state } => agent::autostart(&data_dir(&cli)?, state.map(Toggle::on)),
-        Cmd::Rules { cloud, on, off, add, remove, pin, unpin, exclude_path, include_path, yes, suggest, profile } => {
+        Cmd::Rules {
+            cloud,
+            on,
+            off,
+            add,
+            remove,
+            pin,
+            unpin,
+            allow_downloads,
+            exclude_path,
+            include_path,
+            yes,
+            suggest,
+            profile,
+        } => {
             let dir = data_dir(&cli)?;
             if *suggest {
                 return rules::suggest(&dir, &open_store(&cli, profile.memory_profile)?);
@@ -1705,6 +1723,7 @@ async fn run() -> Result<()> {
                 pin: pin.clone(),
                 unpin: unpin.clone(),
                 yes: *yes,
+                allow_downloads: *allow_downloads,
             };
             rules::run(&dir, &open_store(&cli, profile.memory_profile)?, &changes).await
         }

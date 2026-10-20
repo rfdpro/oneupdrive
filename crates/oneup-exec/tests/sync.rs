@@ -2960,11 +2960,20 @@ async fn on_demand_pinned_files_download_and_freed_files_free_up() {
 
     provider::set_pin(&provider::open(&pk).unwrap(), provider::Pin::Pinned).unwrap();
     s.quiesce().await;
-    // Asked before each file: a "no" (a pause, say) stops the pass there.
-    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_| false).await.unwrap();
-    assert!(fetched.is_empty() && placeholder(&pk).on_disk == 0, "nothing downloaded");
-    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|size| size == 11).await.unwrap();
-    assert_eq!(fetched, ["/keep.txt"]);
+    // Asked before each file: a "no" (a pause, say) stops the pass there,
+    // says why, and says more is waiting.
+    use oneup_exec::placement::Stop;
+    let fetched =
+        oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_, _| Err(Stop::Paused)).await.unwrap();
+    assert!(fetched.done.is_empty() && placeholder(&pk).on_disk == 0, "nothing downloaded");
+    assert_eq!((fetched.stopped, fetched.more), (Some(Stop::Paused), true));
+    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_, size| {
+        if size == 11 { Ok(()) } else { Err(Stop::Share) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fetched.done.iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), ["/keep.txt"]);
+    assert_eq!((fetched.stopped, fetched.more), (None, false), "a batch not full: nothing more");
     assert_eq!(placeholder(&pk).on_disk, 11, "downloaded");
 
     assert_eq!(app_read(&pf).as_deref(), Some(&b"free me up"[..]));
@@ -3018,6 +3027,27 @@ async fn on_demand_a_pinned_file_is_never_freed() {
     let report = s.exec.run(s.obs.store_mut(), r.approved).await;
     assert_eq!(report.done.len(), 1, "{report:?}");
     assert_eq!(placeholder(&p).on_disk, 0);
+    drop(s);
+    drop(od);
+}
+
+/// A full batch of pinned files downloaded says more may wait, so the
+/// agent comes back for the rest at once instead of at its next timed check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_full_batch_of_pinned_files_says_more_may_wait() {
+    let cloud = Fake::new();
+    let n = oneup_exec::placement::BATCH;
+    for i in 0..n {
+        cloud.add(&format!("p{i}.txt"), Some(b"kept"));
+    }
+    let (od, mut s) = on_demand_sync("ondemand-pin-batch", &cloud);
+    s.quiesce().await;
+    for i in 0..n {
+        provider::set_pin(&provider::open(&s.p(&format!("p{i}.txt"))).unwrap(), provider::Pin::Pinned).unwrap();
+    }
+    s.quiesce().await;
+    let fetched = oneup_exec::placement::fetch_pinned(s.obs.store(), &s.dir.0, &|_, _| Ok(())).await.unwrap();
+    assert_eq!((fetched.done.len(), fetched.stopped, fetched.more), (n, None, true));
     drop(s);
     drop(od);
 }
