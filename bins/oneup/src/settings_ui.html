@@ -369,6 +369,16 @@
             user-select: text;
         }
         
+        /* For screen readers only (a column of buttons' heading). */
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            overflow: hidden;
+            clip-path: inset(50%);
+            white-space: nowrap;
+        }
+
         .note {
             color: var(--muted);
             font-size: 12px;
@@ -2126,20 +2136,20 @@
             <div class="card">
                 <div class="row block">
                     <div class="label"><small id="rw-since">Puts a folder back the way it was at a moment you choose. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.</small></div>
-                    <div class="field"><input type="text" id="rw-folder" placeholder="Folder, like /Documents (/ for everything)" spellcheck="false" aria-label="Folder"><input type="datetime-local" id="rw-at" step="1" aria-label="Moment"><button class="btn" id="rw-preview">Preview</button></div>
+                    <div class="field"><input type="text" id="rw-folder" placeholder="Folder, like /Documents (/ for everything)" spellcheck="false" aria-label="Folder to rewind" aria-describedby="rw-since"><input type="datetime-local" id="rw-at" step="1" aria-label="Moment to rewind to"><button class="btn" id="rw-preview">Preview</button></div>
                 </div>
                 <div class="row block" id="rw-result" hidden>
                     <ul class="facts" id="rw-groups"></ul>
-                    <table class="list" id="rw-table"><tbody></tbody></table>
-                    <p class="note" id="rw-note"></p>
+                    <table class="list" id="rw-table" aria-label="What the rewind changes"><thead><tr><th>Change</th><th>Item</th><th class="num">Size</th></tr></thead><tbody></tbody></table>
+                    <p class="note" id="rw-note" role="status"></p>
                     <div class="actions" id="rw-actions"></div>
                 </div>
             </div>
             <h3>Conflicts</h3>
             <div class="card" id="cf-card">
-                <p class="say" id="cf-sum">Looking…</p>
-                <table class="list" id="cf-table" hidden>
-                    <thead><tr><th>File</th><th>Original</th><th>Conflict copy</th><th></th></tr></thead>
+                <p class="say" id="cf-sum" role="status">Looking…</p>
+                <table class="list" id="cf-table" aria-label="Conflicts" hidden>
+                    <thead><tr><th>File</th><th>Original</th><th>Conflict copy</th><th><span class="sr-only">Action</span></th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
@@ -2148,7 +2158,7 @@
             <h3>OneDrive versions</h3>
             <div class="card">
                 <div class="row block">
-                    <div class="field"><input type="text" id="rv-path" placeholder="A file in a synced folder, like C:\Users\you\OneUpDrive\report.docx" spellcheck="false" aria-label="File"><button class="btn" id="rv-show">Show</button></div>
+                    <div class="field"><input type="text" id="rv-path" placeholder="A file in a synced folder, like C:\Users\you\OneUpDrive\report.docx" spellcheck="false" aria-label="File to show the versions of"><button class="btn" id="rv-show">Show</button></div>
                     <div id="rv-list"></div>
                 </div>
             </div>
@@ -3860,8 +3870,8 @@
                 // The content guard's: rewind the folder to just before it.
                 for (const st of r.filter(s => s.header.includes("look like their type"))) $("#ls-more").append(el("button", {
                     className: "btn",
-                    textContent: "Rewind",
-                    title: "Rewind the folder these files are in to just before them",
+                    textContent: tr("Rewind"),
+                    title: tr("Rewind the folder these files are in to just before them"),
                     onclick: () => rewindBeforeStop(st.code)
                 }));
             }
@@ -3870,35 +3880,48 @@
         // ---- Recovery: rewinding a folder (`oneup rewind`), conflicts,
         // kept copies, OneDrive versions and items deleted from OneDrive.
         const RW_KIND = {
-            Restore: "Restore",
-            Revert: "Revert",
-            MoveBack: "Move back",
-            Remove: "Remove",
-            SetAside: "Set aside"
-        };
-        const RW_GROUP = {
-            Restore: "deleted, restored",
-            Revert: "edited, reverted",
-            MoveBack: "moved, moved back",
-            Remove: "created since, removed",
-            SetAside: "changed here and not synced, set aside"
+            Restore: tr("Restore"),
+            Revert: tr("Revert"),
+            MoveBack: tr("Move back"),
+            Remove: tr("Remove"),
+            SetAside: tr("Set aside")
         };
         const RW_FROM = {
-            RecycleBin: "OneDrive's recycle bin",
-            Versions: "OneDrive's version history",
+            RecycleBin: tr("OneDrive's recycle bin"),
+            Versions: tr("OneDrive's version history"),
             InPlace: ""
         };
         const RW_SKIP = {
-            ChangedInCloud: "Changed in OneDrive, not synced yet",
-            ChangedHere: "Moved on this PC, not synced yet",
-            Missing: "Missing, held",
-            FolderGone: "Its folder then is gone",
-            NoCloudItem: "Never in OneDrive",
-            NotSyncedYet: "In OneDrive, not synced yet",
-            UnknownContent: "Its content then wasn't recorded",
-            ExistedBefore: "Was there then, not synced",
-            Keeps: "Holds what's left alone"
+            ChangedInCloud: tr("Changed in OneDrive, not synced yet"),
+            ChangedHere: tr("Moved on this PC, not synced yet"),
+            Missing: tr("Missing, held"),
+            FolderGone: tr("Its folder then is gone"),
+            NoCloudItem: tr("Never in OneDrive"),
+            NotSyncedYet: tr("In OneDrive, not synced yet"),
+            UnknownContent: tr("Its content then wasn't recorded"),
+            ExistedBefore: tr("Was there then, not synced"),
+            Keeps: tr("Holds what's left alone")
         };
+        // Each group's line, a whole message per kind.
+        function rewindGroup(kind, n, bytes) {
+            const a = {
+                n,
+                size: size(bytes)
+            };
+            switch (kind) {
+                case "Restore":
+                    return tr("{n, plural, one {# deleted item restored} other {# deleted items restored}} ({size})", a);
+                case "Revert":
+                    return tr("{n, plural, one {# edited file reverted} other {# edited files reverted}} ({size})", a);
+                case "MoveBack":
+                    return tr("{n, plural, one {# moved item moved back} other {# moved items moved back}} ({size})", a);
+                case "Remove":
+                    return tr("{n, plural, one {# item created since removed} other {# items created since removed}} ({size})", a);
+                default:
+                    return tr("{n, plural, one {# change here not synced set aside} other {# changes here not synced set aside}} ({size})", a);
+            }
+        }
+        const RW_ORDER = ["Restore", "Revert", "MoveBack", "Remove", "SetAside"];
         let RW = {
             preview: null
         };
@@ -3911,9 +3934,9 @@
         async function loadRecovery() {
             const st = await call("rewind_state").catch(() => null);
             if (st) {
-                $("#rw-since").textContent = st.since_ms ?
-                    `Puts a folder back the way it was at a moment you choose, back to ${when(st.since_ms)}. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.` :
-                    "Rewinding starts once the first sync has finished.";
+                $("#rw-since").textContent = st.since_ms ? tr("Puts a folder back the way it was at a moment you choose, back to {when}. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.", {
+                    when: when(st.since_ms)
+                }) : tr("Rewinding starts once the first sync has finished.");
                 if (!$("#rw-at").value) $("#rw-at").value = localInput(Date.now() - 3600000);
                 if (st.job) rewindUnderWay(st);
             }
@@ -3931,7 +3954,11 @@
         function rewindRows(p, from, to) {
             const rows = [];
             for (const c of p.changes.slice(from, to)) {
-                const where = c.kind === "MoveBack" || (c.kind === "Revert" && c.then !== c.now) ? `${c.now}  →  ${c.then}` : (c.then || c.now);
+                const moved = c.kind === "MoveBack" || (c.kind === "Revert" && c.then !== c.now);
+                const where = moved ? tr("{from} → {to}", {
+                    from: c.now,
+                    to: c.then
+                }) : (c.then || c.now);
                 rows.push(el("tr", {}, el("td", {
                     textContent: RW_KIND[c.kind]
                 }), cell(where + (c.folder ? "/" : ""), RW_FROM[c.source] || null, "wrap path"), el("td", {
@@ -3945,11 +3972,13 @@
         function skippedRows(p) {
             return p.skipped.map(s => el("tr", {}, el("td", {
                 className: "muted",
-                textContent: "Skipped"
+                textContent: tr("Skipped")
             }), cell(s.path, RW_SKIP[s.why] || s.why, "wrap path"), el("td")));
         }
 
-        function showRewind(p, actions) {
+        // `focus`: where focus goes once the list is shown (the actions'
+        // first button), as the button that was pressed goes away.
+        function showRewind(p, actions, focus = false) {
             const groups = {};
             for (const c of p.changes) {
                 const g = groups[c.kind] || (groups[c.kind] = {
@@ -3959,27 +3988,31 @@
                 g.n++;
                 g.bytes += c.folder ? 0 : c.size;
             }
-            $("#rw-groups").replaceChildren(...Object.keys(RW_GROUP).filter(k => groups[k]).map(k => el("li", {
-                textContent: `${groups[k].n.toLocaleString()} ${RW_GROUP[k]} (${size(groups[k].bytes)})`
+            $("#rw-groups").replaceChildren(...RW_ORDER.filter(k => groups[k]).map(k => el("li", {
+                textContent: rewindGroup(k, groups[k].n, groups[k].bytes)
             })));
             const body = $("#rw-table tbody");
             const total = p.changes.length;
             let shown = 0;
-            const page = () => {
+            const page = (moveFocus) => {
                 body.append(...rewindRows(p, shown, shown + RW_PAGE));
                 shown = Math.min(shown + RW_PAGE, total);
                 if (shown < total) {
-                    $("#rw-note").textContent = `${shown.toLocaleString()} of ${total.toLocaleString()} listed. See them all to rewind.`;
-                    $("#rw-actions").replaceChildren(smallBtn("Show more", page));
+                    $("#rw-note").textContent = tr("{shown} of {all} listed. See them all to rewind.", {
+                        shown,
+                        all: total
+                    });
+                    $("#rw-actions").replaceChildren(smallBtn(tr("Show more"), () => page(true)));
                 } else {
                     body.append(...skippedRows(p));
-                    $("#rw-note").textContent = total ? "" : "Nothing to change: the folder is as it was then.";
+                    $("#rw-note").textContent = total ? "" : tr("Nothing to change: the folder is as it was then.");
                     $("#rw-actions").replaceChildren(...actions);
                 }
+                if (moveFocus) $("#rw-actions button")?.focus();
             };
             body.replaceChildren();
-            page();
             $("#rw-result").hidden = false;
+            page(focus);
         }
 
         async function rewindPreview(args) {
@@ -3988,57 +4021,75 @@
 
         // Starts only the list shown (its code); a list that changed
         // meanwhile comes back and is shown instead, to be looked at again.
-        function rewindShown(args, p) {
+        function rewindShown(args, p, focus = false) {
             RW.preview = {
                 args,
                 p
             };
-            const go = smallBtn("Rewind", async() => {
-                if (!confirm(`Rewind ${p.folder === "/" ? "everything" : p.folder} to ${when(p.at_ms)}? It waits for your approval next, and nothing changes until then.`)) return;
+            const go = smallBtn(tr("Rewind"), async() => {
+                const a = {
+                    folder: p.folder,
+                    when: when(p.at_ms)
+                };
+                const ask = p.folder === "/" ? tr("Rewind everything to {when}? It waits for your approval next, and nothing changes until then.", a) :
+                    tr("Rewind {folder} to {when}? It waits for your approval next, and nothing changes until then.", a);
+                if (!confirm(ask)) return;
                 const s = await run(call("rewind_start", {
                     ...args,
                     expect: p.code
                 }));
                 if (!s.started) {
-                    toast("The list changed. Here it is again.");
-                    rewindShown(args, s);
+                    toast(tr("The list changed. Here it is again."));
+                    rewindShown(args, s, true);
                     return;
                 }
                 RW.preview.p = s;
-                rewindWaiting(s.code);
+                rewindWaiting(s.code, true);
             }, "primary");
-            showRewind(p, p.changes.length ? [go] : []);
+            showRewind(p, p.changes.length ? [go] : [], focus);
         }
 
-        function rewindWaiting(code) {
+        function rewindWaiting(code, focus = false) {
+            const approve = smallBtn(tr("Approve"), async() => {
+                await run(call("rewind_approve", {
+                    code
+                }), tr("Approved"));
+                setTimeout(loadRecovery, 2000);
+            }, "primary");
             $("#rw-actions").replaceChildren(el("span", {
                     className: "muted",
-                    textContent: `Waiting for your approval (code ${code}). Sync waits too.`
-                }),
-                smallBtn("Approve", async() => {
-                    await run(call("rewind_approve", {
+                    textContent: tr("Waiting for your approval (code {code}). Sync waits too.", {
                         code
-                    }), "Approved");
-                    setTimeout(loadRecovery, 2000);
-                }, "primary"),
-                smallBtn("Cancel", async() => {
-                    await run(call("rewind_cancel"), "Cancelled");
+                    })
+                }),
+                approve,
+                smallBtn(tr("Cancel"), async() => {
+                    await run(call("rewind_cancel"), tr("Cancelled"));
                     $("#rw-result").hidden = true;
+                    $("#rw-preview").focus();
                 }));
+            if (focus) approve.focus();
         }
 
         function rewindUnderWay(st) {
             const j = st.job;
             $("#rw-folder").value = j.folder;
             $("#rw-at").value = localInput(j.at_ms);
-            const say = j.approved ? `Rewinding ${j.folder || "/"} to ${when(j.at_ms)}: ${j.ran.toLocaleString()} changes made` +
-                (j.left_alone ? `, ${j.left_alone.toLocaleString()} changed since the preview left alone` : "") + "." : null;
+            const a = {
+                folder: j.folder || "/",
+                when: when(j.at_ms),
+                n: j.ran,
+                m: j.left_alone
+            };
+            const say = !j.approved ? null : j.left_alone ?
+                tr("Rewinding {folder} to {when}: {n, plural, one {# change made} other {# changes made}}; {m, plural, one {# item changed since the preview left alone} other {# items changed since the preview left alone}}.", a) :
+                tr("Rewinding {folder} to {when}: {n, plural, one {# change made} other {# changes made}}.", a);
             if (!j.approved && st.code) {
                 if (RW.preview && RW.preview.p.code === st.code) showRewind(RW.preview.p, []);
                 else {
                     $("#rw-groups").replaceChildren();
                     $("#rw-table tbody").replaceChildren();
-                    $("#rw-note").textContent = `A rewind of ${j.folder || "/"} to ${when(j.at_ms)} waits for your approval. Its list is on the Activity page (Safety stops).`;
+                    $("#rw-note").textContent = tr("A rewind of {folder} to {when} waits for your approval. Its list is on the Activity page (Safety stops).", a);
                     $("#rw-result").hidden = false;
                 }
                 rewindWaiting(st.code);
@@ -4046,9 +4097,10 @@
                 $("#rw-groups").replaceChildren();
                 $("#rw-table tbody").replaceChildren();
                 $("#rw-note").textContent = say;
-                $("#rw-actions").replaceChildren(smallBtn("Cancel", async() => {
-                    await run(call("rewind_cancel"), "Cancelled");
+                $("#rw-actions").replaceChildren(smallBtn(tr("Cancel"), async() => {
+                    await run(call("rewind_cancel"), tr("Cancelled"));
                     $("#rw-result").hidden = true;
+                    $("#rw-preview").focus();
                 }));
                 $("#rw-result").hidden = false;
             }
@@ -4056,7 +4108,11 @@
 
         $("#rw-preview").onclick = () => {
             const at = new Date($("#rw-at").value).getTime();
-            if (!at) return toast("Choose a moment", true);
+            if (!at) {
+                toast(tr("Choose a moment"), true);
+                $("#rw-at").focus();
+                return;
+            }
             rewindPreview({
                 folder: $("#rw-folder").value.trim() || "/",
                 at_ms: at
@@ -4066,6 +4122,7 @@
         // A content guard stop: rewind its folder to just before its batch.
         function rewindBeforeStop(code) {
             show("recovery");
+            $("#rw-preview").focus();
             rewindPreview({
                 before_stop: code
             });
@@ -4076,10 +4133,18 @@
                 t = $("#cf-table");
             try {
                 const list = await call("conflicts");
-                sum.textContent = list.length ? "" : "No conflicts.";
-                sum.hidden = !list.length ? false : true;
+                sum.textContent = list.length ? "" : tr("No conflicts.");
+                sum.hidden = !!list.length;
                 t.hidden = !list.length;
-                const side = (x, ms, newer) => cell(`${size(x.size)}, saved ${when(ms)}`, newer ? "Newer" : null);
+                const side = (x, ms, newer) => cell(tr("{size}, saved {when}", {
+                    size: size(x.size),
+                    when: when(ms)
+                }), newer ? tr("Newer") : null);
+                const button = (text, label, onclick) => {
+                    const b = smallBtn(text, onclick);
+                    b.setAttribute("aria-label", label);
+                    return b;
+                };
                 $("#cf-table tbody").replaceChildren(...list.map(c => el("tr", {},
                     cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
                     side(c.original, c.original_ms, c.newer === "original"),
@@ -4087,24 +4152,36 @@
                     el("td", {}, el("div", {
                             className: "actions"
                         },
-                        smallBtn("Keep original", () => keep(c, "original")),
-                        smallBtn("Keep copy", () => keep(c, "copy")),
-                        smallBtn("Keep both", () => keep(c, "both")))))));
+                        button(tr("Keep original"), tr("Keep the original of {path}", {
+                            path: c.path
+                        }), () => keep(c, "original")),
+                        button(tr("Keep copy"), tr("Keep the conflict copy of {path}", {
+                            path: c.path
+                        }), () => keep(c, "copy")),
+                        button(tr("Keep both"), tr("Keep both copies of {path}", {
+                            path: c.path
+                        }), () => keep(c, "both")))))));
             } catch (e) {
                 sum.textContent = e.message;
+                sum.hidden = false;
                 t.hidden = true;
             }
             async function keep(c, which) {
                 if (which === "both") {
-                    toast("Both copies stay.");
+                    toast(tr("Both copies stay."));
                     return;
                 }
-                const other = which === "original" ? c.copy_path : c.path;
-                if (!confirm(`Keep the ${which === "original" ? "original" : "conflict copy"} of ${c.path}? ${other} goes to kept copies on this PC and to OneDrive's recycle bin.`)) return;
+                const a = {
+                    path: c.path,
+                    other: which === "original" ? c.copy_path : c.path
+                };
+                const ask = which === "original" ? tr("Keep the original of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", a) :
+                    tr("Keep the conflict copy of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", a);
+                if (!confirm(ask)) return;
                 await run(call("conflict_keep", {
                     conflict: c,
                     keep: which
-                }), "Done with the next sync");
+                }), tr("Done with the next sync"));
                 setTimeout(loadConflicts, 2000);
             }
         }
@@ -4122,12 +4199,28 @@
                 const list = await call("cloud_bin");
                 const note = el("p", {
                     className: "note",
-                    textContent: "Only items OneUpDrive saw deleted are listed: OneDrive's recycle bin can't be read in full. OneDrive's website shows all of it."
+                    textContent: tr("Only items OneUpDrive saw deleted are listed: OneDrive's recycle bin can't be read in full. OneDrive's website shows all of it.")
                 });
                 if (!list.length) return b.replaceChildren(el("p", {
                     className: "say",
-                    textContent: "Nothing deleted."
+                    textContent: tr("Nothing deleted.")
                 }), note);
+                const restore = x => {
+                    const btn = smallBtn(tr("Restore"), async() => {
+                        const at = await run(call("cloud_bin_restore", {
+                            seq: x.seq
+                        }));
+                        toast(tr("Queued: {path}", {
+                            path: at
+                        }));
+                        await loadBin();
+                        $("#rc-bin button")?.focus();
+                    });
+                    btn.setAttribute("aria-label", tr("Restore {path}", {
+                        path: x.path
+                    }));
+                    return btn;
+                };
                 const body = el("tbody", {}, ...list.map(x => el("tr", {},
                     cell(x.path + (x.folder ? "/" : ""), null, "wrap path"),
                     el("td", {
@@ -4138,26 +4231,24 @@
                         textContent: when(x.at_ms),
                         style: "white-space:nowrap"
                     }),
-                    el("td", {}, x.restorable ? smallBtn("Restore", async() => {
-                        const at = await run(call("cloud_bin_restore", {
-                            seq: x.seq
-                        }));
-                        toast("Queued: " + at);
-                        loadBin();
-                    }) : el("small", {
+                    el("td", {}, x.restorable ? restore(x) : el("small", {
                         className: "muted",
-                        textContent: "Its folder is gone too"
+                        textContent: tr("Its folder is gone too")
                     })))));
                 b.replaceChildren(el("table", {
-                    className: "list"
+                    className: "list",
+                    "aria-label": tr("Deleted from OneDrive")
                 }, el("thead", {}, el("tr", {}, el("th", {
-                    textContent: "Item"
+                    textContent: tr("Item")
                 }), el("th", {
                     className: "num",
-                    textContent: "Size"
+                    textContent: tr("Size")
                 }), el("th", {
-                    textContent: "Deleted"
-                }), el("th"))), body), note);
+                    textContent: tr("Deleted")
+                }), el("th", {}, el("span", {
+                    className: "sr-only",
+                    textContent: tr("Action")
+                })))), body), note);
             } catch (e) {
                 b.replaceChildren(el("div", {
                     className: "muted",
