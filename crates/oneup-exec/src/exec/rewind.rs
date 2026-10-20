@@ -20,8 +20,10 @@ use crate::blocking::OffTask;
 use crate::cloud::{Cloud, CloudError, Hashing};
 
 /// Versions of the right size tried before giving up: each is downloaded
-/// to be checked by its hash.
-const VERSION_TRIES: usize = 10;
+/// to be checked by its hash (OneDrive's version list carries no hash).
+/// Every version OneDrive lists is a candidate, newest first; this only
+/// bounds a history far longer than OneDrive keeps.
+const VERSION_TRIES: usize = 1_000;
 
 impl<C: Cloud> Executor<C> {
     /// Runs one approved rewind step.
@@ -164,7 +166,8 @@ impl<C: Cloud> Executor<C> {
         let pre = pre_of(row);
         let parent = RemoteId(row.parent_id.clone().ok_or(Fail::Skip(Skip::Changed))?);
         let versions = self.cloud.versions(&pre.id).await?;
-        let candidates = versions.iter().filter(|v| v.size.is_none_or(|s| s == size)).take(VERSION_TRIES);
+        // The first is the current version, which isn't the one sought.
+        let candidates = versions.iter().skip(1).filter(|v| v.size.is_none_or(|s| s == size)).take(VERSION_TRIES);
         for v in candidates {
             let mut staged = self.fs.stage()?;
             let Some(file) = staged.file() else { return Err(odd()) };

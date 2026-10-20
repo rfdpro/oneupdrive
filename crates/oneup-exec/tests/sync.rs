@@ -6112,6 +6112,24 @@ async fn a_crash_at_any_point_of_a_rewind_loses_nothing() {
         assert_eq!(t, then, "crash point {n}: the rewind went on after the restart");
     }
 }
+
+#[tokio::test]
+async fn everyday_a_rewind_finds_its_version_among_many_of_the_same_size() {
+    // OneDrive's version list has no hashes: versions of the right size are
+    // downloaded and checked one by one, newest first, all of them.
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-versions", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a, version 00");
+    s.settle().await;
+    let at = moment();
+    for i in 1..=12 {
+        cloud.edit("docs/a.txt", format!("a, version {i:02}").as_bytes());
+        s.settle().await;
+    }
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"a, version 00");
+}
+
 // ---------------------------------------------------------------- duplicates
 // Copies the user chose to remove (`oneup_exec::dupes`): the gate holds them
 // until the user approves exactly that batch, whatever the circuit breakers'
