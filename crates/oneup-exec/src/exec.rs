@@ -56,11 +56,14 @@ impl<'a> Db<'a> {
         self.write_as(false, f).await
     }
 
-    /// [`Db::write`] for a transaction that writes a record ahead of an
-    /// effect ([`PENDING`]): committed durably, so it's on disk before the
-    /// effect starts and outlives a power cut (`data-safety.md` invariant
-    /// 7). The record itself is written with `Ops::meta_set_ahead`, which
-    /// refuses anywhere else.
+    /// [`Db::write`] for a transaction that must outlive the effect after
+    /// it: a record written ahead of the effect ([`PENDING`]), or state
+    /// whose rollback would make the next round undo the effect. Committed
+    /// durably (`Store::try_write_now_durable`), so it's on disk, with
+    /// every commit before it, before the effect starts and outlives a
+    /// power cut (`data-safety.md` invariant 7). Such a transaction says so
+    /// (`Ops::meta_set_ahead`, `Ops::require_durable`), which refuses
+    /// anywhere else.
     async fn write_ahead<T, E: From<oneup_store::Error>>(
         &self,
         f: impl FnOnce(&Ops<'_>) -> Result<T, E>,
@@ -79,7 +82,7 @@ impl<'a> Db<'a> {
         loop {
             let tried = {
                 let mut store = self.lock();
-                if durable { store.durably(|s| s.try_write_now(f)).map_err(E::from)? } else { store.try_write_now(f) }
+                if durable { store.try_write_now_durable(f) } else { store.try_write_now(f) }
             };
             match tried {
                 Ok(done) => return done,
@@ -1329,6 +1332,11 @@ impl<C: Cloud> Executor<C> {
         }
         // Its eTag moved on with every item taken out.
         let emptied = self.cloud.item(&pre.id).await?.ok_or(Fail::Skip(Skip::Changed))?;
+        // The moves recorded above must outlive the original's removal: a
+        // power cut rolling them back would leave the Synced row on the
+        // original, whose deletion the next listing then reports as one to
+        // bring to this PC. A durable commit flushes every commit before it.
+        store.write_ahead(|o| Ok::<_, Fail>(o.require_durable()?)).await?;
         self.cloud.delete(&pre_of(&emptied)).await?;
         self.crash_point()?;
         // Nothing points at it any more: the Synced row follows the new
@@ -1758,9 +1766,11 @@ impl<C: Cloud> Executor<C> {
                 }
                 // The Synced rows go first (see the operation's docs): after
                 // a crash here, nothing is left that could later read as a
-                // cloud deletion to bring to this PC.
+                // cloud deletion to bring to this PC. Durably: rolled back
+                // by a power cut after the prune, they would.
                 store
-                    .write(|o| {
+                    .write_ahead(|o| {
+                        o.require_durable()?;
                         for sid in forget {
                             o.synced_remove(*sid)?;
                         }
