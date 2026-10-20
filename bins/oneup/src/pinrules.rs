@@ -638,10 +638,13 @@ fn repin(store: &mut Store, pinner: &mut dyn Pinner, pins: &PinSet, now_ms: i64,
             // handle, so its pin is only ever put back on this folder.
             if row.kind == LocalKind::Folder
                 && store.read(|o| Ok(o.pin_user_has(id)? && o.pin_user_created(id)?.is_none()))?
-                && let Ok((got, created)) = pinner.identify(&rel, id)
-                && got == id
             {
-                store.write(|o| o.pin_user_set_created(id, created))?;
+                match pinner.identify(&rel, id) {
+                    Ok((got, created)) if got == id => store.write(|o| o.pin_user_set_created(id, created))?,
+                    Ok(_) => {}
+                    // Can't be read now: it stays queued for the next pass.
+                    Err(_) => continue,
+                }
             }
             store.write(|o| o.pin_changed_done(id))?;
             continue;
@@ -918,8 +921,13 @@ pub fn fetch_pass(
     let batch = oneup_exec::placement::BATCH;
     let mut budget = budget(store)?;
     let mut out = Fetch::default();
-    // Each candidate with the position before it, to resume at.
-    let mut candidates: Vec<(u128, u64, bool, Option<u128>)> = Vec::with_capacity(batch);
+    // Each candidate with the position before it, to resume at, and its
+    // place in this pass's reading order.
+    let mut candidates: Vec<(u128, u64, bool, Option<u128>, usize)> = Vec::with_capacity(batch);
+    // The first of the rules' files that waits for a go-ahead: the next
+    // pass starts at it (place in the reading order, position before it),
+    // so the go-ahead downloads the file it was given for.
+    let mut held: Option<(usize, Option<u128>)> = None;
     let start: Option<u128> = store.read(|o| o.meta_get(KEY_FETCH_AFTER))?.and_then(|v| v.parse().ok());
     let (mut after, mut upto, mut wrapped) = (start, None, start.is_none());
     let mut read = 0;
@@ -951,11 +959,12 @@ pub fn fetch_pass(
             if owned {
                 if !within_budget(budget, size) {
                     out.blocked = Some((r.file_id, size));
+                    held = Some((read, before));
                     continue;
                 }
                 budget = budget.saturating_sub(i64::try_from(size).unwrap_or(i64::MAX));
             }
-            candidates.push((r.file_id, size, owned, before));
+            candidates.push((r.file_id, size, owned, before, read));
             if candidates.len() >= batch {
                 out.more = true;
                 resume = after;
@@ -977,8 +986,15 @@ pub fn fetch_pass(
     }
     let list: Vec<(u128, u64, bool)> = candidates.iter().map(|c| (c.0, c.1, c.2)).collect();
     let (reserved, blocked) = reserve_budget(store, &list)?;
+    if out.blocked.is_none()
+        && let Some((id, _)) = blocked
+        && let Some(c) = candidates.iter().find(|c| c.0 == id)
+    {
+        held = Some((c.4, c.3));
+    }
     out.blocked = out.blocked.or(blocked);
-    for &(id, size, owned, before) in &candidates {
+    let mut stop_at: Option<(usize, Option<u128>)> = None;
+    for &(id, size, owned, before, n) in &candidates {
         // Not reserved after all (the budget changed meanwhile): it waits.
         if owned && !reserved.contains(&id) {
             continue;
@@ -987,7 +1003,7 @@ pub fn fetch_pass(
             out.stopped = Some(why);
             out.more = true;
             // The next pass starts at this file.
-            resume = before;
+            stop_at = Some((n, before));
             break;
         }
         let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
@@ -1004,6 +1020,11 @@ pub fn fetch_pass(
         out.more = false;
     }
     out.read = read;
+    // Never past a file left for later: the earliest of them in this
+    // pass's order.
+    if let Some((_, before)) = [held, stop_at].into_iter().flatten().min_by_key(|h| h.0) {
+        resume = before;
+    }
     store.write(|o| match resume {
         Some(id) => o.meta_set(KEY_FETCH_AFTER, &id.to_string()),
         None => o.meta_delete(KEY_FETCH_AFTER),
@@ -2152,6 +2173,62 @@ mod tests {
         .unwrap();
         assert_eq!(got, ["/u.txt"], "resumed where the last pass stopped");
         assert!(f.read <= FETCH_READ_MAX && p.1 <= FETCH_READ_MAX);
+    }
+
+    /// The file a go-ahead was given for is the one downloaded, however
+    /// many files the pass read: the next pass starts at it. The user's
+    /// files in the window still download meanwhile.
+    #[test]
+    fn a_go_ahead_downloads_the_file_it_was_given_for() {
+        let n = FETCH_READ_MAX as u128 + 76;
+        let (mut s, mut fake, _) = many_kept(n, 2 << 30);
+        let mut got = Vec::new();
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        let (first, size) = f.blocked.unwrap();
+        assert_eq!(f.read, FETCH_READ_MAX);
+        settle(&mut s, &[], &|_| false).unwrap();
+        wait_for_go_ahead(&mut s, size).unwrap();
+        allow(&mut s, 0).unwrap();
+        got.clear();
+        let f = fetch_pass(&mut s, &mut fake, &mut |_| Ok(()), &mut |rel| {
+            got.push(rel.to_string());
+            true
+        })
+        .unwrap();
+        let rel = s.read(|o| o.local_path_of(first)).unwrap().unwrap();
+        assert_eq!(got.first(), Some(&rel), "the waiting file first");
+        assert!(f.done.iter().any(|d| d.1 == first));
+    }
+
+    /// A user's folder's creation time is read once it can be (queued
+    /// until then) and kept when its pin comes back after a restore, so a
+    /// rescan keeps the note.
+    #[test]
+    fn a_users_folders_creation_time_is_read_and_kept() {
+        let mut s = store(&[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
+        journal(&mut s, &[(3, 0x10 | PINNED)]);
+        let mut fake = Fake { failing: vec!["Docs/Kept".into()], ..Fake::default() };
+        apply(&mut s, &mut fake, &PinSet::new::<&str>(&[]), Duration::from_secs(60), 0).unwrap();
+        assert_eq!(s.read(|o| o.pin_user_created(3)).unwrap(), None);
+        assert_eq!(s.read(|o| o.pin_changed_page(10)).unwrap(), [3], "unread: still queued");
+        fake.failing.clear();
+        fake.others.insert("Docs/Kept".into(), (3, 7));
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(s.read(|o| o.pin_user_created(3)).unwrap(), Some(7));
+        // "Free up space" on Docs; the pass pins Kept again, and the
+        // observer sees the pin come back.
+        explorer_free(&mut s, &[2, 3]);
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert_eq!(fake.set, [("Docs/Kept".to_string(), Change::Pin)]);
+        journal(&mut s, &[(3, 0x10 | PINNED)]);
+        assert_eq!(s.read(|o| o.pin_user_created(3)).unwrap(), Some(7), "kept");
+        rescan(&mut s, &[row(2, 1, "Docs", LocalKind::Folder, 0x10), row(3, 2, "Kept", LocalKind::Folder, 0x10)]);
+        run(&mut s, &mut fake, &PinSet::new::<&str>(&[]), 0);
+        assert!(s.read(|o| o.pin_user_has(3)).unwrap(), "the note survives the rescan");
     }
 
     /// A rescan of the folder (the change journal lost) deletes every Local
