@@ -113,25 +113,44 @@ pub enum Keep {
     Copy,
 }
 
+/// The file name a conflict copy's name was made from
+/// ([`oneup_sync::conflict_candidate`]: `stem (conflict N).ext` from
+/// `stem.ext`); `None` if `name` isn't one.
+pub fn conflict_original(name: &str) -> Option<String> {
+    let at = name.rfind(" (conflict ")?;
+    let rest = &name[at + " (conflict ".len()..];
+    let close = rest.find(')')?;
+    let (n, ext) = (&rest[..close], &rest[close + 1..]);
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) || n.starts_with('0') {
+        return None;
+    }
+    // What follows is the extension, or nothing.
+    if !(ext.is_empty() || (ext.starts_with('.') && !ext.contains(['(', ')']))) {
+        return None;
+    }
+    let stem = &name[..at];
+    (!stem.is_empty()).then(|| format!("{stem}{ext}"))
+}
+
 /// Whether `name` is a conflict copy's name of `of`: `stem (conflict N).ext`.
 pub fn is_conflict_copy(name: &str, of: &str) -> bool {
-    (1..=99).any(|n| oneup_sync::same_name(name, &oneup_sync::conflict_candidate(of, NodeKind::File, n)))
+    conflict_original(name).is_some_and(|o| oneup_sync::same_name(&o, of))
 }
 
 /// The conflicts in Synced folder `folder`: each synced file with a synced
 /// conflict copy beside it, both on this PC as recorded. One indexed read
-/// of the folder's records and of each pair's two local rows.
+/// of the folder's records, one pass over them (each name parsed once,
+/// matched through the folded names), and each pair's two local rows.
 pub fn conflicts_in(o: &Ops<'_>, folder: Sid) -> oneup_store::Result<Vec<Conflict>> {
     let kids = o.synced_children(folder)?;
+    let files: std::collections::HashMap<String, &oneup_sync::Base> =
+        kids.iter().filter(|b| b.kind == NodeKind::File).map(|b| (oneup_sync::fold(&b.name), b)).collect();
     let mut out = Vec::new();
-    for original in kids.iter().filter(|b| b.kind == NodeKind::File) {
-        for copy in kids.iter().filter(|b| b.kind == NodeKind::File && b.sid != original.sid) {
-            if !is_conflict_copy(&copy.name, &original.name) {
-                continue;
-            }
-            let (Some(a), Some(b)) = (local_copy(o, original)?, local_copy(o, copy)?) else { continue };
-            out.push(Conflict { folder, original: a, copy: b });
-        }
+    for copy in kids.iter().filter(|b| b.kind == NodeKind::File) {
+        let Some(name) = conflict_original(&copy.name) else { continue };
+        let Some(original) = files.get(&oneup_sync::fold(&name)).filter(|b| b.sid != copy.sid) else { continue };
+        let (Some(a), Some(b)) = (local_copy(o, original)?, local_copy(o, copy)?) else { continue };
+        out.push(Conflict { folder, original: a, copy: b });
     }
     out.sort_by(|a, b| a.original.name.cmp(&b.original.name).then(a.copy.name.cmp(&b.copy.name)));
     Ok(out)
@@ -185,6 +204,13 @@ mod tests {
         assert!(is_conflict_copy("REPORT (conflict 12).DOCX", "report.docx"));
         assert!(!is_conflict_copy("report (conflict).docx", "report.docx"));
         assert!(!is_conflict_copy("other (conflict 1).docx", "report.docx"));
+        // Any number: names aren't guessed one by one.
+        assert!(is_conflict_copy("report (conflict 150).docx", "report.docx"));
+        assert_eq!(conflict_original("a.b (conflict 2).txt").as_deref(), Some("a.b.txt"));
+        assert_eq!(conflict_original(".gitignore (conflict 1)").as_deref(), Some(".gitignore"));
+        assert_eq!(conflict_original("notes (conflict 3)").as_deref(), Some("notes"));
+        assert_eq!(conflict_original("x (conflict 1) y.txt"), None);
+        assert_eq!(conflict_original(" (conflict 1).txt"), None);
         assert_eq!(restored_name("a.txt", 2, NodeKind::File), "a (restored 2).txt");
         assert_eq!(restored_name("dir.d", 1, NodeKind::Folder), "dir.d (restored 1)");
     }
