@@ -224,6 +224,40 @@ pub fn rewind_mark(o: &oneup_store::Ops<'_>, op: &Op) -> oneup_store::Result<Mar
     })
 }
 
+/// What this PC is to do to follow rewind step `op`, which just ran, bound
+/// to the state it left the item in, as the store has it now.
+pub fn rewind_follows(o: &oneup_store::Ops<'_>, op: &Op) -> oneup_store::Result<Vec<oneup_gate::Follow>> {
+    use oneup_gate::Follow;
+    let Op::Rewind { sid, step } = op else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    match &**step {
+        Step::Reset { remote, place, content, .. } => {
+            let Some(row) = o.get_item(&remote.id.0)? else { return Ok(out) };
+            if content.is_some() {
+                let pre = oneup_sync::RemotePre { id: remote.id.clone(), etag: row.etag.clone().unwrap_or_default() };
+                out.push(Follow::Download { sid: *sid, remote: pre });
+            }
+            if place.is_some()
+                && let Some(parent) = row.parent_id.as_deref()
+                && let Some(p) = o.synced_by_remote(parent)?
+            {
+                out.push(Follow::Move { sid: *sid, parent: p.sid, name: row.name.clone() });
+            }
+        }
+        Step::Remove { .. } => {
+            if let Some(b) = o.synced_get(*sid)?
+                && let Some(l) = b.local
+                && let Some(row) = o.local_get(l.0)?
+            {
+                let stamp = (row.kind == oneup_store::LocalKind::File).then_some((row.size, row.mtime));
+                out.push(Follow::Recycle { sid: *sid, local: LocalPre { id: l, stamp } });
+            }
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
 /// Whether `op` is a rewind step that sets a local copy aside (it writes a
 /// record ahead).
 pub(super) fn aside_of(op: &Op) -> Option<&LocalPre> {

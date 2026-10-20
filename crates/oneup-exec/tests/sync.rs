@@ -1326,7 +1326,7 @@ impl Sync {
         // A rewind's steps join the round, as the agent adds them; what the
         // planner would do to the same items waits for the rewind.
         let mut approved = self.stops.approved.clone();
-        let mut rewound: Vec<oneup_sync::Sid> = Vec::new();
+        let mut rewound: Vec<ItemKey> = Vec::new();
         if let (Some(rw), Some(r)) = (planned_rewind, self.stops.rewind.as_mut()) {
             let (steps, step_paths, later): (Vec<Op>, Vec<String>, Vec<(Op, String)>) = match &r.job {
                 None => {
@@ -1342,7 +1342,6 @@ impl Sync {
                     }
                     let (steps, step_paths): (Vec<Op>, Vec<String>) = take.into_iter().unzip();
                     approved.extend(oneup_gate::rewind_keys(&steps, &step_paths));
-                    rewound = job.rewound.iter().copied().collect();
                     (steps, step_paths, later)
                 }
             };
@@ -1373,6 +1372,10 @@ impl Sync {
         if self.stops.rewind.as_ref().is_none_or(|r| r.done) {
             let (o, p): (Vec<Op>, Vec<String>) = answered.into_iter().unzip();
             approved.extend(oneup_gate::rewind_keys(&o, &p));
+        }
+        // This PC following what it did: approved with it, until done.
+        if let Some(job) = self.stops.rewind.as_ref().and_then(|r| r.job.as_ref()) {
+            rewound = job.follows.iter().map(|k| ItemKey(*k)).collect();
         }
         approved.sort_unstable();
         approved.dedup();
@@ -1441,6 +1444,14 @@ impl Sync {
             for op in &ran {
                 let mark = store.read(|o| oneup_exec::rewind_mark(o, op)).unwrap();
                 job.ran(op, mark);
+                let follows = store.read(|o| oneup_exec::rewind_follows(o, op)).unwrap();
+                job.follows.extend(follows.iter().map(|f| oneup_gate::follow_key(f).0));
+            }
+            // Each follow-up goes once it ran.
+            for op in &report.done {
+                if let Some(f) = oneup_gate::Follow::of(op) {
+                    job.follows.remove(&oneup_gate::follow_key(&f).0);
+                }
             }
             let tried = order.iter().any(|o| matches!(o, Op::Rewind { .. }));
             r.stalls = if tried && ran.is_empty() { r.stalls + 1 } else { 0 };
@@ -6128,6 +6139,37 @@ async fn everyday_a_rewind_finds_its_version_among_many_of_the_same_size() {
     }
     assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
     assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"a, version 00");
+}
+
+#[tokio::test]
+async fn everyday_an_edit_after_a_rewind_ran_is_judged_on_its_own() {
+    // The rewind put 8 files back in OneDrive; before this PC follows,
+    // someone edits them all again there. Bringing that edit here isn't what
+    // the rewind's approval covered: the breakers count it as ever.
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rewind-race", cloud.clone());
+    for i in 0..8 {
+        write(&s.p(&format!("docs/f{i}.txt")), format!("{i}, first").as_bytes());
+    }
+    s.settle().await;
+    let at = moment();
+    for i in 0..8 {
+        cloud.edit(&format!("docs/f{i}.txt"), format!("{i}, second").as_bytes());
+    }
+    s.settle().await;
+    s.policy = strict();
+    s.start_rewind("/docs", at);
+    assert!(s.round().await.done.is_empty());
+    s.stops.approve();
+    // The rewind's steps run in OneDrive.
+    let r = s.round().await;
+    assert_eq!(r.done.iter().filter(|o| matches!(o, Op::Rewind { .. })).count(), 8, "{r:?}");
+    for i in 0..8 {
+        cloud.edit(&format!("docs/f{i}.txt"), format!("{i}, third").as_bytes());
+    }
+    let r = s.round().await;
+    assert!(r.done.is_empty(), "nothing runs: {r:?}");
+    assert!(s.stops.raised.iter().any(|b| b.kind == BreakerKind::Mass), "a stop of its own");
 }
 
 // ---------------------------------------------------------------- duplicates

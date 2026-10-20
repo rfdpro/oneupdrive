@@ -577,7 +577,7 @@ pub struct Engine {
     rewind_lines: std::sync::Mutex<Vec<(Op, String)>>,
     /// Items a finished rewind changed in OneDrive: this PC following them
     /// was approved with it, until a sequence of rounds settles.
-    rewound: std::sync::Mutex<Vec<oneup_sync::Sid>>,
+    rewound: std::sync::Mutex<Vec<ItemKey>>,
 }
 
 /// What stop `i` of `review` lists this round: exactly the operations its
@@ -2147,9 +2147,22 @@ impl Engine {
             if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref()) {
                 let finished = store.write(|o| Ok(crate::rewind::ran(o, j, s, &report, now_ms())))??;
                 if finished {
-                    // Its follow-ups here stay approved until the rounds settle.
+                    // Its follow-ups here stay approved until they ran, or
+                    // the rounds settle.
                     let mut rw = self.rewound.lock().unwrap_or_else(|p| p.into_inner());
-                    rw.extend(j.approval.iter().flat_map(|a| a.rewound.iter().copied()));
+                    rw.extend(j.approval.iter().flat_map(|a| a.follows.iter().map(|k| ItemKey(*k))));
+                }
+            }
+            {
+                let mut rw = self.rewound.lock().unwrap_or_else(|p| p.into_inner());
+                if !rw.is_empty() {
+                    let ran: Vec<ItemKey> = report
+                        .done
+                        .iter()
+                        .filter_map(oneup_gate::Follow::of)
+                        .map(|f| oneup_gate::follow_key(&f))
+                        .collect();
+                    rw.retain(|k| !ran.contains(k));
                 }
             }
             let mut log = print_round(n, &planned, &report);
@@ -2764,8 +2777,9 @@ struct Modes {
     /// Of `extra`, the steps of conflicts the user answered: the answer
     /// approves them (`oneup_exec::recover::conflict_ops`).
     answered: Vec<Op>,
-    /// Items a finished rewind changed (see [`Engine::rewound`]).
-    rewound: Vec<oneup_sync::Sid>,
+    /// What this PC is to do to follow a finished rewind (see
+    /// [`Engine::rewound`]).
+    rewound: Vec<ItemKey>,
 }
 
 /// One round's reviewed plan.
