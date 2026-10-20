@@ -72,9 +72,9 @@ pub struct Spec<'a> {
     /// removed).
     pub env_overrides: &'a [(OsString, OsString)],
     /// Files, besides the program, to open denying other writers/deleters
-    /// and check (final path and a single hard link) before the launch: a
-    /// script handed to an interpreter. The caller has checked these are
-    /// outside every synced folder.
+    /// and check for a swap (final path) before the launch: a script handed
+    /// to an interpreter. The caller has checked these, and every hard link
+    /// they have, are outside every synced folder.
     pub guard: &'a [PathBuf],
     /// Written to the program's standard input, then closed (the event as
     /// one JSON line). The program's input is otherwise empty.
@@ -243,8 +243,9 @@ fn job() -> std::io::Result<Owned> {
 }
 
 /// A pipe: the end the program gets (it reads it if `child_reads`) is
-/// inheritable, ours isn't. Returns (the program's end, ours).
-fn pipe(child_reads: bool) -> std::io::Result<(Owned, Owned)> {
+/// inheritable, ours isn't. `size`: the buffer asked for (0: the default).
+/// Returns (the program's end, ours).
+fn pipe(child_reads: bool, size: u32) -> std::io::Result<(Owned, Owned)> {
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         bInheritHandle: true.into(),
@@ -252,7 +253,7 @@ fn pipe(child_reads: bool) -> std::io::Result<(Owned, Owned)> {
     };
     let (mut r, mut w) = (HANDLE::default(), HANDLE::default());
     // SAFETY: valid out locations and attributes, alive for the call.
-    unsafe { CreatePipe(&mut r, &mut w, Some(&sa), 0) }.map_err(|e| io("CreatePipe", e))?;
+    unsafe { CreatePipe(&mut r, &mut w, Some(&sa), size) }.map_err(|e| io("CreatePipe", e))?;
     let (r, w) = (Owned(r), Owned(w));
     let (child, ours) = if child_reads { (r, w) } else { (w, r) };
     // SAFETY: a valid handle we own.
@@ -262,10 +263,10 @@ fn pipe(child_reads: bool) -> std::io::Result<(Owned, Owned)> {
 }
 
 /// Opens `path` denying other writers and deleters, and checks it is the
-/// one file the caller checked: a single hard link (so no second name in a
-/// synced folder points at the same bytes) and the expected final path (so
-/// it wasn't replaced since). The handle stays open (returned) until the
-/// process has run, so it can't be swapped meanwhile.
+/// one file the caller checked: the expected final path (so it wasn't
+/// replaced since). Hard links are checked by the caller, with the synced
+/// folders. The handle stays open (returned) until the process has run, so
+/// it can't be swapped meanwhile.
 fn guard_file(path: &Path) -> std::io::Result<Owned> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     // SAFETY: `wide` is NUL-terminated and outlives the call; no security
@@ -337,7 +338,15 @@ fn push_arg(cmd: &mut Vec<u16>, arg: &OsStr) {
     let chars: Vec<u16> = arg.encode_wide().collect();
     // Quote if empty, or if any character is a control character, a space
     // or a quote (so a stray CR, FF or tab can't split the argument).
-    let plain = !chars.is_empty() && !chars.iter().any(|&c| c <= 0x20 || c == 0x22);
+    // Also quote cmd's metacharacters, so an argument handed through
+    // `cmd /c call` (a .bat hook's literal args) stays one argument.
+    let meta = |c: u16| {
+        matches!(
+            char::from_u32(u32::from(c)),
+            Some('&' | '|' | '<' | '>' | '^' | '(' | ')' | ';' | ',' | '=' | '%' | '!')
+        )
+    };
+    let plain = !chars.is_empty() && !chars.iter().any(|&c| c <= 0x20 || c == 0x22 || meta(c));
     if !cmd.is_empty() {
         cmd.push(u16::from(b' '));
     }
@@ -379,7 +388,18 @@ fn command_line(program: &Path, args: &[OsString]) -> Vec<u16> {
 /// Windows keeps it).
 fn environment(drop: &dyn Fn(&OsStr) -> bool, overrides: &[(OsString, OsString)]) -> Vec<u16> {
     let mut vars: Vec<(OsString, OsString)> = std::env::vars_os().filter(|(k, _)| !drop(k)).collect();
-    for (k, v) in overrides {
+    // An override can carry a cloud-set value: a NUL would end the variable
+    // early (and could forge the next one), an `=` or NUL in a name would
+    // split it. Names with either are dropped; NULs in values become spaces.
+    let overrides: Vec<(OsString, OsString)> = overrides
+        .iter()
+        .filter(|(k, _)| {
+            let k = k.to_string_lossy();
+            !k.is_empty() && !k.contains(['=', '\0'])
+        })
+        .map(|(k, v)| (k.clone(), OsString::from(v.to_string_lossy().replace('\0', " "))))
+        .collect();
+    for (k, v) in &overrides {
         let fold = |s: &OsStr| s.to_string_lossy().to_uppercase();
         vars.retain(|(ek, _)| fold(ek) != fold(k));
         vars.push((k.clone(), v.clone()));
@@ -555,20 +575,28 @@ pub fn run(spec: &Spec<'_>, jobs: Option<&HookJobs>) -> std::io::Result<Finished
     for p in std::iter::once(spec.program).chain(spec.guard.iter().map(PathBuf::as_path)) {
         guards.push(guard_file(p)?);
     }
-    let (child_in, ours_in) = pipe(true)?;
-    let (child_out, ours_out) = pipe(false)?;
+    // Room for the whole event, so writing it never waits on a program
+    // that doesn't read its input.
+    let in_size = u32::try_from(spec.stdin.len()).unwrap_or(u32::MAX - 4096).saturating_add(4096);
+    let (child_in, ours_in) = pipe(true, in_size)?;
+    let (child_out, ours_out) = pipe(false, 0)?;
     let pi = create(spec, &job, &child_in, &child_out)?;
     let (process, thread) = (Owned(pi.hProcess), Owned(pi.hThread));
     // Only the program holds its ends now, so its output ends when it (and
     // all it started) has.
     drop((child_in, child_out));
-    // The event, as one JSON line, then end-of-input.
-    {
+    // The event, as one JSON line, then end-of-input. Written on its own
+    // thread too: if it ever outgrew the pipe, the run's timeout (which ends
+    // the job and closes the program's end) still ends the write.
+    let writer = {
         use std::io::Write as _;
         // SAFETY: our write end, owned by the file, closed when it drops.
         let mut w = unsafe { std::fs::File::from_raw_handle(ours_in.take().0) };
-        let _ = w.write_all(spec.stdin);
-    }
+        let data = spec.stdin.to_vec();
+        std::thread::Builder::new().name("hook-input".into()).spawn(move || {
+            let _ = w.write_all(&data);
+        })
+    };
     eco_qos(process.0);
     // SAFETY: the first thread of the process we created, suspended.
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
@@ -599,6 +627,9 @@ pub fn run(spec: &Spec<'_>, jobs: Option<&HookJobs>) -> std::io::Result<Finished
     };
     if let Ok(r) = reader {
         let _ = r.join();
+    }
+    if let Ok(w) = writer {
+        let _ = w.join();
     }
     // Wait until the job holds no process (a child may outlive the one we
     // waited on for a moment), so its registry entry can't be mistaken for a
@@ -673,11 +704,54 @@ mod tests {
             push_arg(&mut line, OsStr::new(c));
         }
         let line = String::from_utf16(&line).unwrap();
-        assert_eq!(line, r#"plain "two words" "" "C:\a b\\" "say \"hi\"" back\\slash a&b|c"#);
+        assert_eq!(line, r#"plain "two words" "" "C:\a b\\" "say \"hi\"" back\\slash "a&b|c""#);
         // As a program reads them back.
         let a = args(&["/c", "echo", "two words"]);
         let f = run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), None).unwrap();
         assert_eq!(String::from_utf8_lossy(&f.output).trim(), "\"two words\"");
+    }
+
+    /// cmd metacharacters force quoting, so `a,b` or `x(1)` stay one argument.
+    #[test]
+    fn cmd_metacharacters_are_quoted() {
+        for raw in ["a,b.bat", r"C:\Program Files (x86)\t.bat", "a&b", "50%", "x=y", "a;b", "a!b", "a^b"] {
+            let mut line: Vec<u16> = Vec::new();
+            push_arg(&mut line, OsStr::new(raw));
+            let out = String::from_utf16(&line).unwrap();
+            assert!(out.starts_with('"') && out.ends_with('"'), "{raw} -> {out}");
+        }
+    }
+
+    /// An override's name with `=` or NUL is dropped; a NUL in its value
+    /// can't end the variable early or forge another.
+    #[test]
+    fn environment_overrides_cant_forge_variables() {
+        let ov = [
+            (OsString::from("ONEUPHOOK_X"), OsString::from("a\0FORGED=1")),
+            (OsString::from("BAD=NAME"), OsString::from("v")),
+            (OsString::from("NUL\0NAME"), OsString::from("v")),
+        ];
+        let block = environment(&|_| false, &ov);
+        let text = String::from_utf16_lossy(&block);
+        let vars: Vec<&str> = text.split('\0').collect();
+        assert!(vars.contains(&"ONEUPHOOK_X=a FORGED=1"), "{vars:?}");
+        assert!(!vars.iter().any(|v| v.starts_with("FORGED=")), "{vars:?}");
+        assert!(!vars.iter().any(|v| v.starts_with("BAD=NAME") || v.starts_with("NUL")), "{vars:?}");
+    }
+
+    /// A big event (more than a pipe's default buffer) reaches a program that
+    /// never reads its input without hanging the run.
+    #[test]
+    fn a_big_stdin_to_a_program_that_doesnt_read_doesnt_hang() {
+        let a = args(&["/c", "exit 0"]);
+        let exe = cmd();
+        let big = vec![b'x'; 64 * 1024];
+        let mut sp = spec(&exe, &a, Duration::from_secs(20), &|_| false);
+        sp.stdin = &big;
+        let t = std::time::Instant::now();
+        let f = run(&sp, None).unwrap();
+        assert_eq!(f.exit_code, Some(0));
+        assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
     }
 
     /// A control character (carriage return, form feed, tab) forces quoting,
@@ -758,7 +832,7 @@ mod tests {
     fn the_program_inherits_only_its_input_and_output() {
         // An inheritable handle of ours: a pipe's write end. Had the program
         // inherited it, reading the pipe would only end with the program.
-        let (inheritable, ours) = pipe(false).unwrap();
+        let (inheritable, ours) = pipe(false, 0).unwrap();
         let a = args(&["/c", "ping -n 4 127.0.0.1 >nul"]);
         let runner =
             std::thread::spawn(move || run(&spec(&cmd(), &a, Duration::from_secs(30), &|_| false), None).unwrap());
