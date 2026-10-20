@@ -125,6 +125,7 @@ struct Shared {
     unsynced: Option<oneup_ipc::Unsynced>,
     /// Failed items waiting before they're tried again (`crate::backoff`).
     retrying: Option<oneup_ipc::Retrying>,
+    databases: Vec<oneup_ipc::DatabaseNote>,
     /// OneDrive is full: uploads wait, everything else goes on. Shown as
     /// the problem while no other one is.
     cloud_full: Option<oneup_ipc::Problem>,
@@ -200,6 +201,7 @@ impl Control {
                 progress: None,
                 unsynced: None,
                 retrying: None,
+                databases: Vec::new(),
                 cloud_full: None,
                 shown: None,
                 paused_told: (pause.local, pause.remote, None),
@@ -350,6 +352,16 @@ impl Control {
         let mut s = self.lock();
         s.retrying = r;
         self.publish(&mut s);
+    }
+
+    /// The database files held back or warned about after the last rounds
+    /// (`crate::databases`).
+    pub fn set_databases(&self, d: Vec<oneup_ipc::DatabaseNote>) {
+        let mut s = self.lock();
+        if s.databases != d {
+            s.databases = d;
+            self.publish(&mut s);
+        }
     }
 
     /// OneDrive is full (`crate::problem::cloud_full`), or no longer.
@@ -518,6 +530,7 @@ impl Control {
             progress: s.progress.clone(),
             unsynced: s.unsynced.clone(),
             retrying: s.retrying.clone(),
+            databases: s.databases.clone(),
         }
     }
 

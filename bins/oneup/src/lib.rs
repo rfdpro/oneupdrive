@@ -16,6 +16,8 @@ pub mod carryover;
 pub mod config;
 pub mod control;
 #[cfg(windows)]
+pub mod databases;
+#[cfg(windows)]
 pub mod datafolders;
 pub mod duplicates;
 pub mod events;

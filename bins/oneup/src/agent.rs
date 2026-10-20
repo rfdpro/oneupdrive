@@ -300,6 +300,10 @@ fn print_status(s: &Status) {
             remaining(r.next_ms)
         );
     }
+    for d in &s.databases {
+        let label = if d.why == "live" { "database" } else { "waiting" };
+        println!("  {label:<17} {}: {}", d.path, oneup_app::databases::detail(d));
+    }
     for st in &s.safety_stops {
         let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
         let earlier =

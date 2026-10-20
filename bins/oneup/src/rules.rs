@@ -442,6 +442,9 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
             println!("  {state}");
         }
     }
+    if !is_dir && !parts.is_empty() {
+        database(data_dir, store, &row, rel, name).await?;
+    }
     // A failed operation waiting its turn (`oneup_app::backoff`), on this
     // PC's item or OneDrive's.
     let remote = match &row {
@@ -483,6 +486,46 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     match oneup_app::hooks::explain(data_dir, rel) {
         Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
         Err(e) => println!("  hooks: {e:#}"),
+    }
+    Ok(())
+}
+
+/// `oneup explain`'s lines about a database file (`oneup_app::databases`):
+/// what it is by its name and the `[databases]` patterns (the file isn't
+/// read), and, from a running agent, what it waits for.
+async fn database(data_dir: &Path, store: &Store, row: &Option<LocalRow>, rel: &str, name: &str) -> Result<()> {
+    use oneup_rules::database::{Companion, Consistent};
+    let settings = config::load_databases(data_dir)?;
+    // A working file beside a SQLite database syncs with it (the file
+    // isn't read here, so whether that's a SQLite database isn't proved).
+    if let Some((_, main)) = Companion::of_name(name)
+        && let Some(parent) = row.as_ref().and_then(|r| r.parent_id)
+        && !store.read(|o| o.local_named(parent, main))?.is_empty()
+        && !settings.databases()?.opted_out(&format!("{}{main}", rel.strip_suffix(name).unwrap_or_default()))
+    {
+        println!(
+            "  database: if {main} is a SQLite database, this is its working file: sent only when it holds nothing \
+             the database needs, changed here only while the database is closed"
+        );
+    }
+    if let Some(r) = settings.databases()?.by_name(rel) {
+        let when = match r.format.consistent() {
+            Consistent::Sqlite => "sent once every change is in the file",
+            Consistent::WhileClosed => "sent only while no other program has it open",
+        };
+        let off = if settings.wait { "" } else { "; waiting is off ([databases] wait), so it syncs like any file" };
+        println!("  database: {} ({}): {when}, replaced only while closed{off}", r.format.label(), r.by.describe());
+        if r.format.never_live() && !oneup_app::databases::kept_syncing(&settings.keep_syncing, &format!("/{rel}")) {
+            println!("  note: doesn't sync safely while in use (`oneup databases --exclude` excludes it)");
+        }
+    }
+    if let Ok(mut client) = oneup_ipc::connect(data_dir).await
+        && let Ok(s) = client.call(&oneup_ipc::Call::Status).await
+    {
+        let at = format!("/{rel}");
+        for n in s.databases.iter().filter(|n| n.why != "live" && oneup_sync::same_name(&n.path, &at)) {
+            println!("  waiting: {}", oneup_app::databases::detail(n));
+        }
     }
     Ok(())
 }

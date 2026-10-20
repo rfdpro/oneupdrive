@@ -109,6 +109,68 @@ pub fn save_onedrive_app(data_dir: &Path, a: &OneDriveApp) -> Result<()> {
     )
 }
 
+/// `[databases]`: database files that sync only in a consistent state
+/// (`docs/architecture/databases.md`, `crate::databases`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabaseSettings {
+    /// Databases other than SQLite wait for their programs to close them,
+    /// both ways (on by default). SQLite databases always wait until
+    /// they're consistent, and nothing is ever replaced or moved under a
+    /// program, whatever this says.
+    pub wait: bool,
+    /// Database presets turned on (`oneup_rules::database::DATABASE_PRESETS`).
+    pub presets: Vec<String>,
+    /// The user's own patterns, gitignore style: files to treat as
+    /// databases (`!` for one that isn't).
+    pub patterns: Vec<String>,
+    /// Outlook data files and virtual disks the user chose to keep
+    /// syncing: no warning for them (paths relative to the synced folder).
+    pub keep_syncing: Vec<String>,
+}
+
+impl Default for DatabaseSettings {
+    fn default() -> Self {
+        Self { wait: true, presets: Vec::new(), patterns: Vec::new(), keep_syncing: Vec::new() }
+    }
+}
+
+impl DatabaseSettings {
+    /// What the executor works with.
+    pub fn databases(&self) -> Result<oneup_rules::database::Databases> {
+        Ok(oneup_rules::database::Databases::new(self.wait, &self.presets, &self.patterns)?)
+    }
+}
+
+pub fn load_databases(data_dir: &Path) -> Result<DatabaseSettings> {
+    let mut d = DatabaseSettings::default();
+    let Some(doc) = read_doc(data_dir)? else { return Ok(d) };
+    let Some(t) = section(&doc, "databases")? else { return Ok(d) };
+    if let Some(v) = t.get("wait") {
+        d.wait = v.as_bool().with_context(|| format!("{FILE}: [databases] wait must be true or false"))?;
+    }
+    d.presets = strings(t, "presets")?.unwrap_or_default();
+    d.patterns = strings(t, "patterns")?.unwrap_or_default();
+    d.keep_syncing = strings(t, "keep_syncing")?.unwrap_or_default();
+    d.databases()?; // an unknown preset is reported here, not later
+    Ok(d)
+}
+
+pub fn save_databases(data_dir: &Path, d: &DatabaseSettings) -> Result<()> {
+    let list = |l: &[String]| value(l.iter().collect::<Array>());
+    save(
+        data_dir,
+        "databases",
+        "# Database files sync only in a consistent state (`oneup databases`). presets: finance,\n\
+         # firebird, filemaker, dbase, lotus-notes. patterns: your own, gitignore style.\n",
+        vec![
+            ("wait", value(d.wait)),
+            ("presets", list(&d.presets)),
+            ("patterns", list(&d.patterns)),
+            ("keep_syncing", list(&d.keep_syncing)),
+        ],
+    )
+}
+
 /// The `[agent]` section: how the background agent uses the PC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {

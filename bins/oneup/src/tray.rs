@@ -771,6 +771,7 @@ mod tests {
             progress: None,
             unsynced: None,
             retrying: None,
+            databases: Vec::new(),
         }
     }
 

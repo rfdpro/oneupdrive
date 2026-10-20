@@ -36,6 +36,7 @@ impl Handler for Agent {
             progress: None,
             unsynced: None,
             retrying: None,
+            databases: Vec::new(),
         })
     }
 
@@ -110,6 +111,7 @@ impl Handler for Picky {
             progress: None,
             unsynced: None,
             retrying: None,
+            databases: Vec::new(),
         })
     }
     fn permit(&self, pid: u32) -> bool {

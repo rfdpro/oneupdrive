@@ -5669,6 +5669,92 @@
             }));
             $("#tree").replaceChildren(box);
         }
+        // Database files ([databases]): what counts as one, and what waits
+        // now or is warned about (the agent's status, `st`).
+        function databaseRows(rs, st) {
+            const d = rs.databases;
+            const save = (value, ok) => run(call("save", {
+                root: F.root.id,
+                section: "databases",
+                value
+            }), ok).then(() => afterChange(""));
+            const toggle = (label, sub, checked, onchange) => {
+                const i = el("input", {
+                    type: "checkbox",
+                    checked,
+                    "aria-label": label
+                });
+                i.onchange = () => onchange(i.checked).catch(() => i.checked = !i.checked);
+                return el("div", {
+                        className: "fl"
+                    }, el("div", {
+                        className: "label"
+                    }, el("b", {
+                        textContent: label
+                    }), el("small", {
+                        textContent: sub
+                    })),
+                    el("label", {
+                        className: "toggle"
+                    }, i, el("span")));
+            };
+            const rows = [el("div", {
+                className: "group",
+                textContent: "Databases"
+            })];
+            rows.push(toggle("Wait for programs to close databases",
+                "KeePass, Access, Thunderbird mail, Outlook data files and virtual disks sync only while closed. SQLite databases always wait until every change is in the file.",
+                d.wait, on => save({
+                    wait: on
+                }, on ? "On" : "Off")));
+            for (const p of d.presets) rows.push(toggle(p.summary, p.lines.join(", "), p.on, on => save({
+                presets: d.presets.filter(x => x.name === p.name ? on : x.on).map(x => x.name)
+            }, on ? "Synced as databases" : "Synced as files")));
+            for (const r of d.patterns) rows.push(flatRow(r, "Your pattern", el("button", {
+                className: "btn small",
+                textContent: "Remove",
+                onclick: () => save({
+                    patterns: d.patterns.filter(x => x !== r)
+                }, "Removed")
+            })));
+            const add = el("input", {
+                type: "text",
+                placeholder: "*.ledger",
+                spellcheck: false,
+                "aria-label": "Database pattern"
+            });
+            rows.push(flatRow("Add a pattern", "Files it matches sync as databases.", add, el("button", {
+                className: "btn small",
+                textContent: "Add",
+                onclick: () => add.value.trim() && save({
+                    patterns: [...d.patterns, add.value.trim()]
+                }, "Added")
+            })));
+            for (const n of (st && st.databases) || []) {
+                const rel = n.path.replace(/^\//, "");
+                if (n.why !== "live") {
+                    rows.push(flatRow(n.path, n.detail, showBtn(rel)));
+                    continue;
+                }
+                rows.push(flatRow(n.path, n.detail, showBtn(rel),
+                    el("button", {
+                        className: "btn small",
+                        textContent: "Exclude",
+                        onclick: () => save({
+                            exclude: n.path
+                        }, "Excluded")
+                    }),
+                    el("button", {
+                        className: "btn small",
+                        textContent: "Keep syncing",
+                        onclick: () => save({
+                            keep_syncing: n.path
+                        }, "Kept syncing")
+                    })));
+            }
+            return rows;
+        }
+
         async function renderOut() {
             const rs = F.rs;
             const box = el("div", {
@@ -5967,6 +6053,7 @@
                     }, el("b", {
                         textContent: tr("OneDrive's copies of excluded items")
                     }), cloudHelp), cloud)));
+            box.append(...databaseRows(rs, st));
             box.append(adv);
             $("#tree").replaceChildren(box);
         }

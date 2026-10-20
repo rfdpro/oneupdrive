@@ -93,7 +93,8 @@ pub struct Item {
     /// `unreachable`, `safety_stop`, `version_store`, a problem's kind
     /// (`offline`, `signin`, `cloud-full`, `disk-full`, `folder`, `records`,
     /// `onedrive`, `other`), `paused`, `auto_paused`, `unsynced`,
-    /// `retrying`, `excluded_in_onedrive`, `paused_folder`, `conflict`.
+    /// `retrying`, `live_database`, `excluded_in_onedrive`, `paused_folder`,
+    /// `conflict`.
     pub kind: String,
     pub title: String,
     pub detail: String,
@@ -374,6 +375,19 @@ fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
             t_in!(loc, "`oneup activity` says why."),
         ));
     }
+    for d in s.databases.iter().filter(|d| d.why == "live") {
+        let label = crate::databases::format_named(&d.format).map_or("Database", |f| f.label());
+        out.push(Item::new(
+            "live_database",
+            format!("Syncs only while closed: {}", d.path),
+            format!("{}.", crate::databases::detail(d)),
+            format!(
+                "`oneup databases --exclude \"{0}\"` excludes it; `oneup databases --keep-syncing \"{0}\"` keeps it \
+                 syncing without this note ({label}).",
+                d.path
+            ),
+        ));
+    }
     if let Some(o) = &s.prune_offer {
         out.push(Item {
             code: Some(o.code.clone()),
@@ -615,6 +629,7 @@ mod tests {
             progress: None,
             unsynced: None,
             retrying: None,
+            databases: Vec::new(),
         }
     }
 
@@ -665,6 +680,16 @@ mod tests {
         s.auto_pause = Some("battery saver is on".into());
         s.unsynced = Some(Unsynced { count: 4, more: false });
         s.retrying = Some(Retrying { count: 2, next_ms: 60_000 });
+        // A warning is listed; a database waiting its turn isn't a problem.
+        let note = |why: &str| oneup_ipc::DatabaseNote {
+            path: "/Mail/archive.pst".into(),
+            format: "outlook".into(),
+            why: why.into(),
+            programs: vec!["OUTLOOK.EXE".into()],
+            direction: Some("up".into()),
+            detail: String::new(),
+        };
+        s.databases = vec![note("open"), note("live")];
         let mut f = facts(View::Running(Box::new(s)));
         f.paused_folders = vec!["Videos".into()];
         f.conflicts = vec![Conflict { path: "/docs/a.txt".into(), copy: "a (1).txt".into(), at_ms: 0 }];
@@ -682,17 +707,19 @@ mod tests {
                 "auto_paused",
                 "unsynced",
                 "retrying",
+                "live_database",
                 "paused_folder",
                 "conflict"
             ]
         );
+        assert!(items[7].action.contains("oneup databases --exclude \"/Mail/archive.pst\""), "{}", items[7].action);
         assert_eq!(items[1].code.as_deref(), Some("00000000000000ab"));
         assert!(items[1].action.contains("oneup approve 00000000000000ab"), "{}", items[1].action);
         assert!(items[2].action.contains("oneup keep 00000000000000cd"));
         assert!(items[3].detail.contains("this PC") && items[3].detail.contains("30 min"), "{}", items[3].detail);
         assert_eq!(items[5].title, "Sync failure: 4 items");
-        assert!(items[7].action.contains("oneup resume --folder \"Videos\""));
-        assert!(items[8].detail.contains("/docs/a.txt") && items[8].detail.contains("a (1).txt"));
+        assert!(items[8].action.contains("oneup resume --folder \"Videos\""));
+        assert!(items[9].detail.contains("/docs/a.txt") && items[9].detail.contains("a (1).txt"));
         assert!(items.iter().all(|i| i.pair.is_none()));
     }
 

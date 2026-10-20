@@ -521,6 +521,12 @@ pub struct Engine {
     /// Where what the rounds did goes as events (the agent's; none for
     /// `oneup sync`).
     events: std::sync::OnceLock<Arc<crate::events::Feed>>,
+    /// Databases the last round held back (`crate::databases`).
+    db_waits: std::sync::Mutex<Vec<oneup_ipc::DatabaseNote>>,
+    /// Files that shouldn't sync while in use, seen since the agent
+    /// started, until excluded or kept syncing (at most
+    /// [`crate::databases::MAX_LIVE`]).
+    db_live: std::sync::Mutex<Vec<oneup_ipc::DatabaseNote>>,
 }
 
 /// What stop `i` of `review` lists this round: exactly the operations its
@@ -776,7 +782,65 @@ impl Engine {
             verified: std::sync::atomic::AtomicBool::new(false),
             stops: std::sync::Mutex::default(),
             events: std::sync::OnceLock::new(),
+            db_waits: std::sync::Mutex::default(),
+            db_live: std::sync::Mutex::default(),
         }
+    }
+
+    /// The databases held back by the last round, and the files warned
+    /// about (`crate::databases`), for the status.
+    pub fn database_notes(&self) -> Vec<oneup_ipc::DatabaseNote> {
+        let waits = self.db_waits.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let live = self.db_live.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        [waits, live].concat()
+    }
+
+    /// After a round: notes the databases it held back, and warns (once)
+    /// about each file it sent or fetched that shouldn't sync while in use,
+    /// unless the user keeps it syncing. A warning goes once the rules
+    /// exclude the file or the user keeps it.
+    fn note_databases(
+        &self,
+        store: &mut Store,
+        planned: &[(Op, Line)],
+        report: &Report,
+        keep: &[String],
+        rules: &RuleSet,
+    ) -> Result<()> {
+        let path_of = |op: &Op| planned.iter().find(|(o, _)| o == op).map(|(_, l)| l.path.clone());
+        let waits: Vec<oneup_ipc::DatabaseNote> =
+            report.databases.iter().filter_map(|(op, db)| crate::databases::note(path_of(op)?, op, db)).collect();
+        *self.db_waits.lock().unwrap_or_else(|p| p.into_inner()) = waits;
+        let mut new = Vec::new();
+        {
+            let mut live = self.db_live.lock().unwrap_or_else(|p| p.into_inner());
+            live.retain(|n| {
+                !crate::databases::kept_syncing(keep, &n.path) && !rules.excludes(n.path.trim_start_matches('/'), false)
+            });
+            let ops = report.done.iter().chain(report.skipped.iter().map(|(op, _)| op));
+            for op in ops {
+                let (Some(format), Some(path)) = (crate::databases::live_format(report, op), path_of(op)) else {
+                    continue;
+                };
+                if crate::databases::kept_syncing(keep, &path)
+                    || live.iter().any(|n| oneup_sync::same_name(&n.path, &path))
+                    || live.len() >= crate::databases::MAX_LIVE
+                {
+                    continue;
+                }
+                let n = crate::databases::live_note(path, format);
+                new.push(n.clone());
+                live.push(n);
+            }
+        }
+        for n in new {
+            let e = ActivityEntry {
+                path: n.path.clone(),
+                ..notice(ActivityOutcome::Note, "database", crate::databases::detail(&n))
+            };
+            self.log_once(store, format!("live {}", n.path), e)?;
+        }
+        Ok(())
     }
 
     fn stops_lock(&self) -> std::sync::MutexGuard<'_, Stops> {
@@ -1358,6 +1422,10 @@ impl Engine {
                 tracing::info!(relinked, held, waiting, "settled moves an earlier round cut short");
             }
             let user_rules = self.load_rules(&mut store)?;
+            // Databases: what counts as one, and whether they wait
+            // (`[databases]`, read every round like the rest).
+            let db_settings = crate::config::kept(&self.data_dir, crate::config::load_databases(&self.data_dir))?;
+            self.exec.set_databases(db_settings.databases()?);
             // Changed rules: every folder is planned again, from the
             // database (rules.md § Changing rules without a rescan).
             let fingerprint = user_rules.fingerprint();
@@ -1631,6 +1699,7 @@ impl Engine {
                 log_activity(&mut store, log)?;
             }
             let mut log = print_round(n, &planned, &report);
+            self.note_databases(&mut store, &planned, &report, &db_settings.keep_syncing, &user_rules)?;
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
                 println!("  {detail}");
@@ -2894,8 +2963,17 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
                 }
             }
         } else if let Some((_, s)) = skipped.next_if(|(o, _)| o == op) {
-            println!("  skip  {line}  ({})", skip_label(*s));
-            entry(line, ActivityOutcome::Skipped, Some(skip_label(*s).into()));
+            match crate::databases::skip_detail(r, op).filter(|_| *s == Skip::Database) {
+                // Waiting, not failing: it goes once the database is ready.
+                Some(why) => {
+                    println!("  wait  {line}  ({why})");
+                    entry(line, ActivityOutcome::Waiting, Some(why));
+                }
+                None => {
+                    println!("  skip  {line}  ({})", skip_label(*s));
+                    entry(line, ActivityOutcome::Skipped, Some(skip_label(*s).into()));
+                }
+            }
         } else if let Some((_, m)) = failed.next_if(|(o, _)| o == op) {
             println!("  FAIL  {line}  ({m})");
             entry(line, ActivityOutcome::Failed, Some(m.clone()));
