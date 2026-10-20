@@ -1,9 +1,13 @@
 //! What applying pin rules keeps (schema v22, `oneup_app::pinrules`):
 //!
 //! * `pin_owned`: the files and folders a pin rule pinned, with the
-//!   activity-log entry at the time (`at_seq`), so removing the rule unpins
-//!   those and never one the user pinned, and a placeholder that takes its
-//!   pin from a rule's folder counts as the rule's only if it came later.
+//!   item's creation time read on the handle that pinned it (`created`)
+//!   and the activity-log entry at the time (`at_seq`). It's written before
+//!   the pin is set (an intent: a crash in between leaves it the rule's).
+//!   A rule only ever unpins an item whose file ID and creation time, read
+//!   again on the handle that unpins it, are the ones recorded; anything
+//!   else is the user's. A placeholder that takes its pin from a rule's
+//!   folder counts as the rule's only if it came later.
 //! * `pin_retry`: pins and unpins that couldn't be set yet (not a
 //!   placeholder yet, say), each with its operation, tried again after a
 //!   back-off. At most [`PIN_RETRY_MAX`].
@@ -28,10 +32,13 @@
 //!
 //! **A rescan keeps them.** A new scan of the same folder (after the change
 //! journal was lost, say) deletes every Local row, which takes these rows
-//! along; `local_begin` first sets the rules' own pins and retries aside
-//! ([`Ops::pins_hold_for_rescan`]) and forgets that the rules were applied,
-//! so the agent walks again and puts back those whose items the new scan
-//! found ([`Ops::pins_rebind`]).
+//! along; `local_begin` first sets the rules' own pins, retries and
+//! releases aside ([`Ops::pins_hold_for_rescan`]) and forgets that the
+//! rules were applied, so the agent walks again and puts back those whose
+//! IDs the new scan found ([`Ops::pins_rebind`]). An ID alone proves
+//! nothing (it can be reused): an ownership put back is used only through
+//! the creation-time check above, so a replacement that took the ID is
+//! the user's; a release put back only keeps a rule from pinning.
 //!
 //! Also read for the rules: a folder's children a page at a time in the
 //! parent index's own order (a walk never holds a whole folder), and the
@@ -75,7 +82,11 @@ pub(crate) fn migrate_v22() -> String {
         DELETE FROM pin_user WHERE file_id = OLD.file_id;
         DELETE FROM pin_released WHERE file_id = OLD.file_id;";
     format!(
-        "CREATE TABLE pin_owned (file_id BLOB PRIMARY KEY, at_seq INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+        "CREATE TABLE pin_owned (
+             file_id BLOB PRIMARY KEY,
+             created INTEGER NOT NULL DEFAULT 0,
+             at_seq  INTEGER NOT NULL DEFAULT 0
+         ) WITHOUT ROWID;
          CREATE TABLE pin_retry (
              file_id BLOB PRIMARY KEY,
              op      INTEGER NOT NULL DEFAULT 0,
@@ -87,7 +98,8 @@ pub(crate) fn migrate_v22() -> String {
          CREATE TABLE pin_subtree (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_user (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_released (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
-         CREATE TABLE pin_owned_hold (file_id BLOB PRIMARY KEY, at_seq INTEGER NOT NULL) WITHOUT ROWID;
+         CREATE TABLE pin_owned_hold (file_id BLOB PRIMARY KEY, created INTEGER NOT NULL, at_seq INTEGER NOT NULL) WITHOUT ROWID;
+         CREATE TABLE pin_released_hold (file_id BLOB PRIMARY KEY) WITHOUT ROWID;
          CREATE TABLE pin_retry_hold (file_id BLOB PRIMARY KEY, op INTEGER NOT NULL) WITHOUT ROWID;
          CREATE TRIGGER pin_item_gone AFTER DELETE ON local_item BEGIN {gone} END;
          CREATE TRIGGER pin_item_kind AFTER UPDATE OF kind ON local_item WHEN OLD.kind != NEW.kind
@@ -111,7 +123,8 @@ pub(crate) fn migrate_v22() -> String {
 #[cfg(test)]
 pub(crate) const UNDO_V22: &str = "DROP TRIGGER pin_item_gone; DROP TRIGGER pin_item_kind;
     DROP TRIGGER pin_owned_lost; DROP TRIGGER pin_released_pinned; DROP TABLE pin_released; DROP TABLE pin_owned; DROP TABLE pin_retry; DROP TABLE pin_changed;
-    DROP TABLE pin_subtree; DROP TABLE pin_user; DROP TABLE pin_owned_hold; DROP TABLE pin_retry_hold;";
+    DROP TABLE pin_subtree; DROP TABLE pin_user; DROP TABLE pin_owned_hold; DROP TABLE pin_retry_hold;
+    DROP TABLE pin_released_hold;";
 
 /// At most this many items wait for a pin to be retried.
 pub const PIN_RETRY_MAX: usize = 10_000;
@@ -155,16 +168,37 @@ impl Ops<'_> {
         Ok(self.c.query_row("SELECT COALESCE(max(seq), 0) FROM activity", [], |r| r.get(0))?)
     }
 
-    /// Notes that a pin rule pinned item `id` when the activity log's last
-    /// entry was `at_seq` (it must be in the Local tree: the note goes with
-    /// its row). An existing note keeps its time.
-    pub fn pin_owned_add(&self, id: u128, at_seq: i64) -> Result<()> {
+    /// Notes that a pin rule pins item `id`, created at `created` (read on
+    /// the handle that pins it), when the activity log's last entry was
+    /// `at_seq`; written before the pin is set. It must be in the Local tree
+    /// (the note goes with its row). An existing note is replaced.
+    pub fn pin_owned_add(&self, id: u128, created: i64, at_seq: i64) -> Result<()> {
         self.c
             .prepare_cached(
-                "INSERT OR IGNORE INTO pin_owned(file_id, at_seq) SELECT file_id, ?2 FROM local_item WHERE file_id = ?1",
+                "INSERT OR REPLACE INTO pin_owned(file_id, created, at_seq)
+                 SELECT file_id, ?2, ?3 FROM local_item WHERE file_id = ?1",
             )?
-            .execute(rusqlite::params![blob(id), at_seq])?;
+            .execute(rusqlite::params![blob(id), created, at_seq])?;
         Ok(())
+    }
+
+    /// The creation time recorded when a rule pinned item `id`, if one did.
+    pub fn pin_owned_created(&self, id: u128) -> Result<Option<i64>> {
+        use rusqlite::OptionalExtension as _;
+        Ok(self
+            .c
+            .prepare_cached("SELECT created FROM pin_owned WHERE file_id = ?1")?
+            .query_row([blob(id)], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The person chose to keep item `id` on this device themselves: it's
+    /// theirs from now on (no rule's note, retry or release on it).
+    pub fn pin_claim_for_user(&self, id: u128) -> Result<()> {
+        self.pin_owned_remove(id)?;
+        self.pin_retry_remove(id)?;
+        self.pin_released_remove(id)?;
+        self.pin_user_add(id)
     }
 
     pub fn pin_owned_remove(&self, id: u128) -> Result<()> {
@@ -327,11 +361,14 @@ impl Ops<'_> {
     pub(crate) fn pins_hold_for_rescan(&self, same: bool) -> Result<()> {
         if same {
             self.c.execute_batch(
-                "INSERT OR IGNORE INTO pin_owned_hold(file_id, at_seq) SELECT file_id, at_seq FROM pin_owned;
-                 INSERT OR IGNORE INTO pin_retry_hold(file_id, op) SELECT file_id, op FROM pin_retry;",
+                "INSERT OR IGNORE INTO pin_owned_hold(file_id, created, at_seq) SELECT file_id, created, at_seq FROM pin_owned;
+                 INSERT OR IGNORE INTO pin_retry_hold(file_id, op) SELECT file_id, op FROM pin_retry;
+                 INSERT OR IGNORE INTO pin_released_hold(file_id) SELECT file_id FROM pin_released;",
             )?;
         } else {
-            self.c.execute_batch("DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold;")?;
+            self.c.execute_batch(
+                "DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;",
+            )?;
         }
         self.meta_delete(KEY_APPLIED)
     }
@@ -340,8 +377,13 @@ impl Ops<'_> {
     /// the new scan found; drops the rest. Returns how many were put back.
     pub fn pins_rebind(&self) -> Result<usize> {
         let n = self.c.execute(
-            "INSERT OR IGNORE INTO pin_owned(file_id, at_seq)
-             SELECT h.file_id, h.at_seq FROM pin_owned_hold h JOIN local_item l ON l.file_id = h.file_id",
+            "INSERT OR IGNORE INTO pin_owned(file_id, created, at_seq)
+             SELECT h.file_id, h.created, h.at_seq FROM pin_owned_hold h JOIN local_item l ON l.file_id = h.file_id",
+            [],
+        )?;
+        self.c.execute(
+            "INSERT OR IGNORE INTO pin_released(file_id)
+             SELECT h.file_id FROM pin_released_hold h JOIN local_item l ON l.file_id = h.file_id",
             [],
         )?;
         self.c.execute(
@@ -349,7 +391,8 @@ impl Ops<'_> {
              SELECT h.file_id, h.op, 1, 0 FROM pin_retry_hold h JOIN local_item l ON l.file_id = h.file_id",
             [],
         )?;
-        self.c.execute_batch("DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold;")?;
+        self.c
+            .execute_batch("DELETE FROM pin_owned_hold; DELETE FROM pin_retry_hold; DELETE FROM pin_released_hold;")?;
         Ok(n)
     }
 }
@@ -421,9 +464,9 @@ mod tests {
         s.write(|o| {
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
             o.local_put(&row(8, 1, LocalKind::File, 0))?;
-            o.pin_owned_add(7, 0)?;
+            o.pin_owned_add(7, 0, 0)?;
             assert!(o.pin_retry_put(8, PinOp::Pin, 1, 0)?);
-            o.pin_owned_add(99, 0)?;
+            o.pin_owned_add(99, 0, 0)?;
             assert!(!o.pin_retry_put(98, PinOp::Pin, 1, 0)?, "not in the Local tree");
             assert!(o.pin_owned_has(7)? && !o.pin_owned_has(99)?);
             o.local_remove_subtree(7)?;
@@ -432,7 +475,7 @@ mod tests {
             // The ID comes back, for another file.
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
             assert!(!o.pin_owned_has(7)?, "a reused ID isn't the rule's");
-            o.pin_owned_add(7, 0)?;
+            o.pin_owned_add(7, 0, 0)?;
             o.local_update(&row(7, 1, LocalKind::Folder, PINNED as u32))?;
             assert!(!o.pin_owned_has(7)?, "a change of kind is another item");
             Ok(())
@@ -449,7 +492,7 @@ mod tests {
         s.write(|o| {
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
             o.local_put(&row(8, 1, LocalKind::File, PINNED as u32))?;
-            o.pin_owned_add(7, 0)?;
+            o.pin_owned_add(7, 0, 0)?;
             o.local_update(&row(7, 1, LocalKind::File, 0x0010_0000))?;
             o.local_update(&row(8, 1, LocalKind::File, 0x0010_0000))?;
             assert_eq!(o.pin_changed_page(10)?, [7]);
@@ -471,9 +514,10 @@ mod tests {
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
             o.local_put(&row(8, 1, LocalKind::File, 0))?;
             o.local_put(&row(9, 1, LocalKind::File, PINNED as u32))?;
-            o.pin_owned_add(7, 5)?;
-            o.pin_owned_add(9, 5)?;
+            o.pin_owned_add(7, 70, 5)?;
+            o.pin_owned_add(9, 90, 5)?;
             assert!(o.pin_retry_put(8, PinOp::Unpin, 3, 99)?);
+            o.pin_released_add(8)?;
             o.meta_set(KEY_APPLIED, "p2:x")
         })
         .unwrap();
@@ -496,9 +540,10 @@ mod tests {
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
             o.local_put(&row(8, 1, LocalKind::File, 0))?;
             assert_eq!(o.pins_rebind()?, 1);
-            assert_eq!(o.pin_owned_at(7)?, Some(5));
+            assert_eq!((o.pin_owned_at(7)?, o.pin_owned_created(7)?), (Some(5), Some(70)));
             assert!(!o.pin_owned_has(9)?, "not found again: dropped");
             assert_eq!(o.pin_retry_due(0, 10)?, [(8, PinOp::Unpin, 1)]);
+            assert!(o.pin_released_has(8)?, "a file freed by name stays released");
             assert_eq!(o.pins_rebind()?, 0, "set aside once");
             Ok(())
         })
@@ -520,6 +565,22 @@ mod tests {
         .unwrap();
     }
 
+    /// Keeping an item on this device oneself makes it the user's: no rule's
+    /// note, retry or release stays on it.
+    #[test]
+    fn keeping_it_oneself_makes_it_the_users() {
+        let mut s = store();
+        s.write(|o| {
+            o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
+            o.pin_owned_add(7, 70, 1)?;
+            assert!(o.pin_retry_put(7, PinOp::Unpin, 1, 0)?);
+            o.pin_claim_for_user(7)?;
+            assert!(!o.pin_owned_has(7)? && o.pin_retry_count()? == 0 && o.pin_user_has(7)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// A file freed by name stays released from the rules until it's pinned
     /// again (the trigger), and the release goes with its row.
     #[test]
@@ -527,7 +588,7 @@ mod tests {
         let mut s = store();
         s.write(|o| {
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
-            o.pin_owned_add(7, 1)?;
+            o.pin_owned_add(7, 70, 1)?;
             o.pin_released_add(7)?;
             assert!(o.pin_released_has(7)? && !o.pin_owned_has(7)?, "no longer the rule's");
             o.local_update(&row(7, 1, LocalKind::File, 0x0010_0000))?;
@@ -566,7 +627,7 @@ mod tests {
         assert_eq!(v, crate::SCHEMA_VERSION);
         s.write(|o| {
             o.local_put(&row(7, 1, LocalKind::File, PINNED as u32))?;
-            o.pin_owned_add(7, 1)?;
+            o.pin_owned_add(7, 70, 1)?;
             assert!(o.pin_owned_has(7)?);
             o.local_remove_subtree(7)?;
             assert!(!o.pin_owned_has(7)?, "the triggers are there");

@@ -365,13 +365,10 @@ pub async fn pin(data_dir: &Path, store: &Store, path: &str, keep: bool) -> Resu
             provider::set_pin(&f, provider::Pin::Pinned)
         }
         .with_context(|| format!("{rel} isn't an online-only-capable item"))?;
-        // Kept again: a pin rule keeps it again too.
-        let root = store.read(|o| o.local_root())?;
-        if let Some(r) = root
-            && let Some(row) = store.read(|o| oneup_app::filetree::row_at(o, r.root_file_id, &rel))?
-        {
-            oneup_app::setup::open_store(data_dir, 1024)?.write(|o| o.pin_released_remove(row.file_id))?;
-        }
+        // Kept by the person: theirs, the folder's contents too, so no rule
+        // undoes it later (and a file freed by name is kept again).
+        let mut w = oneup_app::setup::open_store(data_dir, 1024)?;
+        oneup_app::pinrules::claim_for_user(&mut w, &rel)?;
         println!("{rel}: always kept on this device; the background agent downloads what isn't here yet.");
     } else {
         // A file named itself is freed even if kept on this device (a pin
