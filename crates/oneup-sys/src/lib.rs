@@ -49,6 +49,8 @@ pub mod signal;
 #[cfg(windows)]
 pub mod tray;
 #[cfg(windows)]
+pub mod version_info;
+#[cfg(windows)]
 pub mod webview;
 
 /// Windows DPAPI: encrypts data so that only the current Windows user
