@@ -69,6 +69,28 @@ impl Ops<'_> {
         self.rows_where("kind = 0 AND (attributes & 524288) != 0 AND (attributes & 4194304) != 0", limit)
     }
 
+    /// [`Self::local_to_fetch`] a page at a time: up to `limit` of them
+    /// after file ID `after` (none: from the first), in file ID order, so
+    /// a caller can pass over files it won't fetch now and reach the rest.
+    pub fn local_to_fetch_after(&self, after: Option<u128>, limit: usize) -> Result<Vec<LocalRow>> {
+        let ids: Vec<Vec<u8>> = self
+            .c
+            .prepare_cached(
+                "SELECT file_id FROM local_item INDEXED BY local_to_fetch                  WHERE kind = 0 AND (attributes & 524288) != 0 AND (attributes & 4194304) != 0 AND file_id > ?1                  ORDER BY file_id LIMIT ?2",
+            )?
+            .query_map(rusqlite::params![after.map_or(Vec::new(), |a| blob(a).to_vec()), limit as i64], |r| {
+                r.get(0)
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(row) = self.local_get(id_from_blob(&id))? {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     /// Up to `limit` placeholders set to "free up space" whose content is
     /// still here. Not empty files: freeing one is always refused (it looks
     /// freed already), so they'd fill every batch for good.
@@ -197,7 +219,29 @@ mod placement_tests {
         let ids = |v: Vec<LocalRow>| v.into_iter().map(|r| r.file_id).collect::<Vec<_>>();
         assert_eq!(ids(s.read(|o| o.local_to_fetch(10)).unwrap()), [2]);
         assert_eq!(ids(s.read(|o| o.local_to_free(10)).unwrap()), [4]);
-        assert_eq!(s.read(|o| o.local_online_only_sample(10)).unwrap(), [2, 5], "not here, pinned or not");
+        // Paged by file ID: every one reached, a page at a time.
+        s.write(|o| {
+            for id in 12..17 {
+                o.local_put(&with(id, 0x0008_0000 | 0x0040_0000 | 0x400))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let (mut after, mut all) = (None, Vec::new());
+        loop {
+            let page = ids(s.read(|o| o.local_to_fetch_after(after, 2)).unwrap());
+            assert!(page.len() <= 2);
+            let Some(&last) = page.last() else { break };
+            after = Some(last);
+            all.extend(page);
+        }
+        all.sort_unstable();
+        assert_eq!(all, [2, 12, 13, 14, 15, 16]);
+        assert_eq!(
+            s.read(|o| o.local_online_only_sample(10)).unwrap(),
+            [2, 5, 12, 13, 14, 15, 16],
+            "not here, pinned or not"
+        );
         // Excluded folders to mark, and marks to undo once a folder syncs.
         s.write(|o| {
             let folder = |id, skip| LocalRow { skip, ..lrow(id, Some(1), &format!("d{id}"), LocalKind::Folder) };

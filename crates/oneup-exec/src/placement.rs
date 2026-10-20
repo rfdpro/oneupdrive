@@ -75,12 +75,14 @@ pub struct Fetched {
 /// Downloads one pinned file, `rel` relative to the synced folder (as
 /// [`fetch_pinned`] does each). Whether it's here now.
 pub async fn fetch_one(root: &Path, rel: &str) -> bool {
+    let (root, rel) = (root.to_path_buf(), rel.to_string());
+    tokio::task::spawn_blocking(move || fetch_one_blocking(&root, &rel)).await.unwrap_or(false)
+}
+
+/// [`fetch_one`] on the calling thread (it blocks until the download ends).
+pub fn fetch_one_blocking(root: &Path, rel: &str) -> bool {
     let path: PathBuf = rel.trim_start_matches('/').split('/').fold(root.to_path_buf(), |p, part| p.join(part));
-    tokio::task::spawn_blocking(move || -> bool {
-        oneup_cfapi::provider::open(&path).is_ok_and(|f| oneup_cfapi::provider::hydrate(&f).is_ok())
-    })
-    .await
-    .unwrap_or(false)
+    oneup_cfapi::provider::open(&path).is_ok_and(|f| oneup_cfapi::provider::hydrate(&f).is_ok())
 }
 
 pub async fn fetch_pinned(

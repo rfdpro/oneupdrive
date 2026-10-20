@@ -1229,76 +1229,31 @@ impl Engine {
         };
         let here = on_pc(&store)?;
         crate::pinrules::settle(&mut store, &[], &|id| here.contains(&id))?;
-        // The rules' own among the files this pass may fetch get their
-        // budget reserved before any download (the store can't be shared
-        // with the download tasks, so this is decided up front).
-        // The rules' own only while their note still names the item (its
-        // identity read on a handle): a reused ID isn't charged to them.
-        let rows: Vec<(u128, u64, bool)> = store.read(|o| {
-            let mut v = Vec::new();
-            for r in o.local_to_fetch(oneup_exec::placement::BATCH)? {
-                v.push((r.file_id, u64::try_from(r.size).unwrap_or(0), o.pin_owned_has(r.file_id)?));
-            }
-            Ok(v)
+        // A file this pass won't download (past the rules' budget, or its
+        // identity unreadable now) is passed over; a pause, the disk or the
+        // pass's share stops the pass.
+        let fetched = tokio::task::block_in_place(|| {
+            crate::pinrules::fetch_pass(
+                &mut store,
+                &mut pinner,
+                &mut |size| {
+                    let paused = controls().pause_local;
+                    let free = crate::pinrules::free_space(&root_path);
+                    let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
+                    l.may(size, paused, free, std::time::Instant::now())
+                },
+                &mut |rel| oneup_exec::placement::fetch_one_blocking(&root_path, rel),
+            )
         })?;
-        let mut candidates = Vec::with_capacity(rows.len());
-        for (id, size, noted) in rows {
-            let owned = if noted {
-                let rel = store.read(|o| o.local_path_of(id))?.map(|p| crate::filetree::clean(&p));
-                match rel {
-                    Some(rel) => crate::pinrules::owned_verified(&mut store, &mut pinner, id, &rel)?,
-                    None => Some(false),
-                }
-            } else {
-                Some(false)
-            };
-            // Unproven this pass (its identity couldn't be read): neither
-            // charged nor fetched.
-            if let Some(owned) = owned {
-                candidates.push((id, size, owned));
-            }
-        }
-        let owned: std::collections::HashSet<u128> = candidates.iter().filter(|c| c.2).map(|c| c.0).collect();
-        let (reserved, blocked) = crate::pinrules::reserve_budget(&mut store, &candidates)?;
-        // One file at a time: each of the rules' own is marked started,
-        // durably, before its download, so a crash never refunds it.
-        let mut fetched = oneup_exec::placement::Fetched {
-            more: candidates.len() >= oneup_exec::placement::BATCH,
-            ..Default::default()
-        };
-        for &(id, size, _) in &candidates {
-            let stop = if owned.contains(&id) && !reserved.contains(&id) {
-                Err(oneup_exec::placement::Stop::Approval)
-            } else {
-                let paused = controls().pause_local;
-                let free = crate::pinrules::free_space(&root_path);
-                let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
-                l.may(size, paused, free, std::time::Instant::now())
-            };
-            if let Err(why) = stop {
-                fetched.stopped = Some(why);
-                fetched.more = true;
-                break;
-            }
-            let Some(rel) = store.read(|o| o.local_path_of(id))? else { continue };
-            if owned.contains(&id) {
-                crate::pinrules::mark_started(&mut store, id)?;
-            }
-            if oneup_exec::placement::fetch_one(Path::new(&root.path), &rel).await {
-                fetched.done.push((rel, id, size));
-            } else {
-                fetched.attempted.push(id);
-            }
-        }
         // What wasn't tried goes back to the budget; a download that was
         // tried counts, finished or not (bytes may have come), so failures
         // can't go past the approval again and again.
         let done: Vec<u128> = fetched.done.iter().map(|d| d.1).chain(fetched.attempted.iter().copied()).collect();
         crate::pinrules::settle(&mut store, &done, &|_| false)?;
-        let asked = blocked.map(|(_, size)| size);
         use oneup_exec::placement::Stop;
-        if fetched.stopped == Some(Stop::Approval)
-            && let Some(size) = asked
+        // Past the budget: asked once the pass got that far.
+        if matches!(fetched.stopped, None | Some(Stop::Share))
+            && let Some((_, size)) = fetched.blocked
         {
             crate::pinrules::wait_for_go_ahead(&mut store, size)?;
             let e = notice(
