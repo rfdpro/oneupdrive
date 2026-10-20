@@ -16,8 +16,9 @@
 //! Since schema v3 it also holds the **Local tree**, a read-only scan of a
 //! local folder (see [`local`]), and since v4 the **Synced tree** with the
 //! deletion evidence the reconciler relies on (see [`synced`]), and since v5
-//! the marks of folders that need planning again (see [`dirty`]), and since
-//! v17 when failed operations are tried again (see [`retry`]).
+//! the marks of folders that need planning again (see [`dirty`]), since
+//! v17 when failed operations are tried again (see [`retry`]), and since
+//! v18 an index of the Remote tree's names for search (see [`search`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -45,9 +46,11 @@ pub use dirty::DirtyScope;
 pub mod activity;
 pub mod retry;
 mod rulefile;
+pub mod search;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
 pub use retry::{Item as RetryItem, Retry};
+pub use search::{Found, Hit, IndexState};
 pub use usage::{AppFile, AppUse, UseKind};
 
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +100,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -370,8 +373,20 @@ static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::ne
 
 /// Tables small enough to read whole at every round: what a round may
 /// scan ([`Store::tree_scans`]). Everything else grows with the tree.
+/// (`remote_name_config` holds the name index's few settings, which FTS5
+/// reads once per connection.)
 #[cfg(feature = "statement-log")]
-const SMALL_TABLES: &[&str] = &["meta", "cursor", "enum_unit", "local_root", "remote_orphan", "dirty", "t_sub"];
+const SMALL_TABLES: &[&str] = &[
+    "meta",
+    "cursor",
+    "enum_unit",
+    "local_root",
+    "remote_orphan",
+    "dirty",
+    "t_sub",
+    "search_queue",
+    "remote_name_config",
+];
 
 #[cfg(feature = "statement-log")]
 impl Store {
@@ -412,7 +427,9 @@ impl Store {
                 st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?;
             for step in steps {
                 let Some(name) = step.strip_prefix("SCAN ").and_then(|t| t.split(' ').next()) else { continue };
-                if !SMALL_TABLES.contains(&table_of(sql, name)) && !step.contains("CONSTANT ROW") {
+                let table = table_of(sql, name);
+                let table = table.strip_prefix("main.").unwrap_or(table);
+                if !SMALL_TABLES.contains(&table) && !step.contains("CONSTANT ROW") {
                     out.push(format!("{step}  <-  {sql}"));
                 }
             }
@@ -503,10 +520,13 @@ impl Store {
     /// WAL mode SQLite fails that at once ("database is locked", without
     /// waiting) when another connection committed in between, which has
     /// stopped the agent.
+    ///
+    /// Changes to the Remote tree reach the name index ([`search`]) just
+    /// before the commit.
     pub fn write<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let out = f(&Ops { c: &tx })?;
-        tx.commit()?;
+        commit(tx)?;
         Ok(out)
     }
 
@@ -518,7 +538,7 @@ impl Store {
     ) -> std::result::Result<T, E> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(Error::from)?;
         let out = f(&Ops { c: &tx })?;
-        tx.commit().map_err(Error::from)?;
+        commit(tx)?;
         Ok(out)
     }
 
@@ -550,7 +570,7 @@ impl Store {
             Ok(out) => out,
             Err(e) => return Ok(Err(e)),
         };
-        Ok(tx.commit().map(|()| out).map_err(|e| Error::from(e).into()))
+        Ok(commit(tx).map(|()| out).map_err(Into::into))
     }
 
     /// Reads this connection's pages through a memory map of up to `bytes`
@@ -610,6 +630,15 @@ impl Store {
     }
 }
 
+/// Commits a write transaction: every write path ends here, so changes to
+/// the Remote tree always reach the name index ([`search`]) before the
+/// commit, whichever way the transaction was opened.
+fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
+    Ops { c: &tx }.search_apply()?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn user_version(c: &Connection) -> Result<i64> {
     Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
@@ -623,7 +652,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 17] = [
+    let steps: [(i64, String); 18] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -641,6 +670,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (15, synced::MIGRATE_V15.into()),
         (16, format!("{} {MIGRATE_V16}", synced::MIGRATE_V16)),
         (17, retry::MIGRATE_V17.into()),
+        (18, search::MIGRATE_V18.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -661,7 +691,7 @@ pub struct Ops<'a> {
     c: &'a Connection,
 }
 
-const ITEM_COLS: &str = "id, parent_id, name, kind, size, etag, qxh, mtime";
+pub(crate) const ITEM_COLS: &str = "id, parent_id, name, kind, size, etag, qxh, mtime";
 
 /// Cloud files at least this large are worth copying in OneDrive instead of
 /// uploading when a new local file has the same content (server-side
@@ -1186,11 +1216,14 @@ impl Ops<'_> {
     /// cursor and the rules it was built with), so the next mirror run starts
     /// from scratch. The Local tree and user settings in `meta` are kept.
     pub fn clear_remote(&self) -> Result<()> {
-        self.c.execute_batch(
-            "DELETE FROM remote_item; DELETE FROM remote_pruned; DELETE FROM remote_orphan;
-             DELETE FROM enum_unit; DELETE FROM cursor; DELETE FROM meta WHERE key = 'rules';",
-        )?;
-        Ok(())
+        // The name index is emptied at once, not one queued removal per item.
+        self.search_clear_with(|| {
+            self.c.execute_batch(
+                "DELETE FROM remote_item; DELETE FROM remote_pruned; DELETE FROM remote_orphan;
+                 DELETE FROM enum_unit; DELETE FROM cursor; DELETE FROM meta WHERE key = 'rules';",
+            )?;
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------ cursor
@@ -1315,7 +1348,7 @@ impl Ops<'_> {
     }
 }
 
-fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
+pub(crate) fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
     row.kind = Kind::try_from(kind)?;
     Ok(row)
 }

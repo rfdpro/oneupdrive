@@ -841,8 +841,10 @@ pub(crate) mod tests {
         {
             let mut s = Store::open(&path, 1024).unwrap();
             synced(&mut s);
-            s.write(|o| {
+            // Outside `write`, which would look for v18's tables at its end.
+            s.read(|o| {
                 // What a v15 database looks like.
+                o.c.execute_batch(crate::search::UNDO_V18)?;
                 o.c.execute_batch(
                     "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
                      DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;

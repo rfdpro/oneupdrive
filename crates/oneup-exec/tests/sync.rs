@@ -3145,6 +3145,38 @@ async fn a_case_only_rename_of_a_large_folder_is_reported() {
     assert_eq!(cloud.tree(), before, "nothing changed in OneDrive");
 }
 
+/// Search finds anything in OneDrive by any part of its name, whichever
+/// side it came from, and follows renames, moves and deletions on either
+/// side as they sync (`oneup_store::search`).
+#[tokio::test]
+async fn everyday_search_finds_every_name_and_follows_changes() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-search", cloud.clone());
+    write(&s.p("Taxes/tax return 2024.pdf"), b"tax");
+    write(&s.p("Taxes/receipts/fuel.jpg"), b"fuel");
+    cloud.add("Photos", None);
+    cloud.add("Photos/Duty-free TAX receipt.jpg", Some(b"px"));
+    s.settle().await;
+    let found = |s: &Sync, q: &str| -> Vec<String> {
+        let mut v: Vec<String> =
+            s.obs.store().read(|o| o.search_names(q, 50)).unwrap().hits.into_iter().map(|h| h.row.name).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(found(&s, "tax"), ["Duty-free TAX receipt.jpg", "Taxes", "tax return 2024.pdf"]);
+    assert_eq!(found(&s, "receipt"), ["Duty-free TAX receipt.jpg", "receipts"]);
+
+    std::fs::rename(s.p("Taxes/tax return 2024.pdf"), s.p("Taxes/return 2024.pdf")).unwrap();
+    std::fs::rename(s.p("Taxes/receipts"), s.p("receipts 2024")).unwrap();
+    cloud.delete("Photos/Duty-free TAX receipt.jpg");
+    cloud.add("Photos/tax-free.jpg", Some(b"new"));
+    s.settle().await;
+    assert_eq!(found(&s, "tax"), ["Taxes", "tax-free.jpg"]);
+    assert_eq!(found(&s, "return 20"), ["return 2024.pdf"]);
+    assert_eq!(found(&s, "receipt"), ["receipts 2024"]);
+    assert_eq!(found(&s, "fuel"), ["fuel.jpg"], "moved along with its folder");
+}
+
 /// Changing only the case of a name, on either side, renames it on the
 /// other (Windows and OneDrive both ignore case when comparing names).
 #[tokio::test]
