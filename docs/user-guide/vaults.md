@@ -2,7 +2,7 @@
 
 A **vault** is a folder whose files are encrypted on your PC before they reach OneDrive, so that nobody but you, Microsoft included, can read them. OneUpDrive uses the same vault format as [Cryptomator](https://cryptomator.org/), a free and widely used app, so your vaults also open in Cryptomator on your phone, a Mac or Linux.
 
-**Vaults are experimental.** OneUpDrive's encryption code has had a review by its own developers ([the findings](../architecture/vault-crypto-review.md)), but not yet one by an outside security expert. Until then, don't make a vault the only copy of anything you can't afford to lose.
+**Vaults are experimental.** OneUpDrive's encryption code has had a review by its own developers ([the findings](../architecture/vault-crypto-review.md)), but not yet one by an outside security expert. Until then, don't make a vault the only copy of anything you can't afford to lose. For now, creating or adding a vault is meant for test accounts, as the `oneup vault` help says.
 
 ## What a vault protects, and what it doesn't
 * **Protected:** what's in your files, and their names and folder names.
