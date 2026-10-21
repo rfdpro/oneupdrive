@@ -108,6 +108,17 @@ END;
     )
 }
 
+/// v24: every Synced name's folded form again. `fold` is written by
+/// [`Ops::synced_put`], not by a trigger, so a build from before v23 that
+/// writes to a v23 store (one upgraded under a running agent) leaves new
+/// and renamed records without it, or with an old name's, and a lookup by
+/// name ([`oneup_sync::Trees::base_named`]) misses them. One pass over the
+/// Synced tree; it changes only the rows that differ.
+pub(crate) const MIGRATE_V24: &str = "
+UPDATE synced_item SET fold = CASE WHEN name GLOB '*[^ -~]*' THEN oneup_fold(name) END
+    WHERE fold IS NOT (CASE WHEN name GLOB '*[^ -~]*' THEN oneup_fold(name) END);
+";
+
 /// Whether record `s` (parent `p`) differs from its items `l` and `r`:
 /// gone or unlinked, another folder or name, a file's size or last-write
 /// time (here) or eTag (in OneDrive). More rather than fewer: one that
@@ -681,6 +692,41 @@ mod tests {
         }
     }
 
+    /// A build from before v23 writing to a v23 store leaves a new record
+    /// without its folded name and a renamed one with its old name's: v24
+    /// folds them again, so they're found by name.
+    #[test]
+    fn names_an_older_build_wrote_are_folded_again() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-refold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            s.write(|o| {
+                o.synced_put(&root())?;
+                o.synced_put(&base(1, ROOT, "Überblick.txt", 3))?;
+                o.synced_put(&base(2, ROOT, "Ärger.txt", 3))?;
+                o.synced_put(&base(3, ROOT, "plain.txt", 3))
+            })
+            .unwrap();
+            let older = "UPDATE synced_item SET fold = NULL WHERE sid = 1;
+                UPDATE synced_item SET name = 'Öl.txt' WHERE sid = 2;
+                PRAGMA user_version = 23;";
+            s.read(|o| Ok(o.c.execute_batch(older)?)).unwrap();
+        }
+        let s = Store::open(&path, 1024).unwrap();
+        let named = |name: &str| {
+            s.read(|o| oneup_sync::Trees::base_named(o, ROOT, name)).unwrap().iter().map(|b| b.sid).collect::<Vec<_>>()
+        };
+        assert_eq!(named("überblick.TXT"), [1], "a record written without its folded name");
+        assert_eq!(named("öl.txt"), [2], "a record renamed by the older build");
+        assert!(named("ärger.txt").is_empty(), "not by its old name");
+        assert_eq!(named("PLAIN.txt"), [3]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn upgraded_from(from: i64) {
         let dir = std::env::temp_dir().join(format!("oneup-store-history-up{from}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -706,7 +752,7 @@ mod tests {
         }
         let mut s = Store::open(&path, 1024).unwrap();
         let v: i64 = s.read(|o| Ok(o.c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
-        assert_eq!(v, 23, "from v{from}");
+        assert_eq!(v, crate::SCHEMA_VERSION, "from v{from}");
         assert_eq!(s.read(|o| o.history_since()).unwrap(), i64::MAX, "from v{from}: not started by the upgrade");
         // The first sync goes on: what it records isn't history.
         s.write(|o| o.synced_put(&base(2, ROOT, "found later.txt", 1))).unwrap();
