@@ -584,11 +584,26 @@ pub struct Engine {
 /// What stop `i` of `review` lists this round: exactly the operations its
 /// items key (with its folders still to come, `Breaker::later`), not every
 /// operation held for its side.
+#[cfg(test)]
 fn stop_ops(review: &oneup_gate::Review, i: usize) -> Vec<&Op> {
+    stop_ops_old(review, i).into_iter().map(|(op, _)| op).collect()
+}
+
+/// What stop `i` of `review` lists this round (exactly the operations its
+/// items key, not every operation held for its side), each with what
+/// approving it does to a file's old copy.
+fn stop_ops_old(review: &oneup_gate::Review, i: usize) -> Vec<(&Op, OldCopy)> {
     review
         .lists
         .get(i)
-        .map(|l| l.iter().filter_map(|&w| review.withheld.get(w)).map(|(op, _)| op).collect())
+        .map(|l| {
+            l.iter()
+                .filter_map(|&w| {
+                    let (op, _) = review.withheld.get(w)?;
+                    Some((op, review.withheld_old.get(w).copied().unwrap_or(OldCopy::Keep)))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1613,11 +1628,11 @@ impl Engine {
             if crate::stoplist::path(&self.data_dir, code).exists() {
                 continue;
             }
-            let held = stop_ops(review, i);
+            let held = stop_ops_old(review, i);
             // A rewind's steps are listed where its plan names them.
             let rewind = self.rewind_lines.lock().unwrap_or_else(|p| p.into_inner()).clone();
-            let shown = |o: &Ops<'_>, op: &Op| {
-                let mut l = describe(o, op);
+            let shown = |o: &Ops<'_>, op: &Op, old: OldCopy| {
+                let mut l = describe_as(o, op, old);
                 if let Some((_, p)) = rewind.iter().find(|(r, _)| r == op) {
                     l.path.clone_from(p);
                 }
@@ -1626,12 +1641,14 @@ impl Engine {
             let lines = store.read(|o| {
                 Ok(held
                     .iter()
-                    .map(|op| if b.kind == BreakerKind::Removal { removal_line(o, op) } else { shown(o, op) })
-                    .chain(
-                        b.later
-                            .iter()
-                            .map(|op| if op.rewind_step().is_some() { shown(o, op) } else { later_line(o, op) }),
+                    .map(
+                        |&(op, old)| {
+                            if b.kind == BreakerKind::Removal { removal_line(o, op) } else { shown(o, op, old) }
+                        },
                     )
+                    .chain(b.later.iter().map(|op| {
+                        if op.rewind_step().is_some() { shown(o, op, OldCopy::Keep) } else { later_line(o, op) }
+                    }))
                     .take(crate::stoplist::MAX_LINES)
                     .map(|l| l.to_string())
                     .collect::<Vec<_>>())
@@ -1960,6 +1977,9 @@ impl Engine {
                 let (outcome, what) = match o.outcome {
                     OverflowOutcome::Held => (ActivityOutcome::Waiting, "waiting for your decision".to_string()),
                     OverflowOutcome::KeptByPolicy => (ActivityOutcome::Note, "kept anyway (your setting)".into()),
+                    OverflowOutcome::DiscardedByPolicy => {
+                        (ActivityOutcome::Note, "removed without a local copy (your setting)".into())
+                    }
                     OverflowOutcome::Decided(Choice::Keep) => (ActivityOutcome::Note, "kept, as you chose".into()),
                     OverflowOutcome::Decided(Choice::Discard) => {
                         (ActivityOutcome::Note, "removed without a local copy, as you chose".into())
@@ -2129,6 +2149,8 @@ impl Engine {
                     room: None,
                     suspicious: &[],
                     rewound: &[],
+                    // What follows mid-round keeps every copy it removes.
+                    cloud_deleted: &[],
                 },
                 order: &order,
                 on_demand,
@@ -2577,6 +2599,7 @@ fn plan_round<'a>(
     approved.dedup();
     rewound.sort_unstable();
     rewound.dedup();
+    let cloud_deleted = store.read(|o| oneup_exec::resolve::cloud_deleted(o, ops.iter().chain(&pending)))?;
     let cx = GateContext {
         synced_items: synced,
         recent,
@@ -2589,6 +2612,7 @@ fn plan_round<'a>(
         room,
         suspicious: &suspicious,
         rewound: &rewound,
+        cloud_deleted: &cloud_deleted,
     };
     let review = review_in(&policy, &cx, ops);
     Ok(Planned { review, problems, upto, suspicious, policy, synced, planning })
@@ -2850,10 +2874,11 @@ async fn dry_run(
                 shown += 1;
             }
         }
-        for (op, why) in &review.withheld {
+        for (w, (op, why)) in review.withheld.iter().enumerate() {
             *totals.entry(withheld_label(*why)).or_default() += 1;
             if shown < limit {
-                println!("  [{}] {}", withheld_label(*why), describe(o, op));
+                let old = review.withheld_old.get(w).copied().unwrap_or(OldCopy::Keep);
+                println!("  [{}] {}", withheld_label(*why), describe_as(o, op, old));
                 shown += 1;
             }
         }
@@ -3895,13 +3920,18 @@ pub fn print_overflow(o: &Overflow, store: &Store, asker: Asker) -> Result<()> {
              {discard}  remove them from this PC without a local copy. OneDrive's recycle bin usually \
              still has them for up to 30 days, but empties sooner when it is full. (A file that differs from \
              the version OneDrive has is kept anyway.)\n  \
-             To decide this automatically from now on: `oneup versions --set-overflow keep`, or \
+             To decide this automatically from now on: `oneup versions --set-overflow keep` (or `discard`), or \
              `--set-rotate on` to make room by removing the oldest kept items."
         ),
         OverflowOutcome::KeptByPolicy => println!(
             "  Version store over its limit: {n} files ({bytes}) deleted or replaced in OneDrive were kept \
              although it had room for {room} (your setting: keep). It shrinks once they are {days} days old; \
              see `oneup versions` to free space sooner."
+        ),
+        OverflowOutcome::DiscardedByPolicy => println!(
+            "  Version store full: {n} files ({bytes}) deleted in OneDrive didn't fit (room for {room}) and were \
+             removed from this PC without a local copy (your setting: discard). Any that differed from the \
+             version OneDrive has were kept."
         ),
         OverflowOutcome::Decided(Choice::Keep) => println!(
             "  Kept as you chose: {n} files ({bytes}) in the version store, which had room for {room}. \

@@ -118,7 +118,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -769,7 +769,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 24] = [
+    let steps: [(i64, String); 25] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -794,6 +794,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (22, pins::migrate_v22()),
         (23, history::migrate_v23()),
         (24, history::MIGRATE_V24.into()),
+        (25, String::new()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -805,11 +806,31 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             if to == 24 {
                 settle_v23(&tx)?;
             }
+            if to == 25 && add_column(&tx, synced::V25_COLUMN)? {
+                // Evidence from before can't be told apart: an answer given
+                // under an older build, not carried out yet, may be among it.
+                // Counted as answered, those copies are kept.
+                tx.execute_batch("UPDATE remote_gone SET answered = 1;")?;
+            }
             tx.execute_batch(&format!("{sql} PRAGMA user_version = {to};"))?;
         }
         tx.commit()?;
     }
     Ok(())
+}
+
+/// Adds `(table, column, definition)` unless the table has it already, so
+/// the step can run again over a store that has it (an upgrade replayed).
+/// Whether it added it.
+fn add_column(tx: &Connection, (table, column, def): (&str, &str, &str)) -> Result<bool> {
+    let has: bool =
+        tx.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)", [table, column], |r| {
+            r.get(0)
+        })?;
+    if !has {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {def};"))?;
+    }
+    Ok(!has)
 }
 
 /// Before v24's refold: a store that a pre-release build marked v23 with

@@ -56,8 +56,12 @@
 //!   form one batch. By default ([`OverflowPolicy::Hold`]) the batch is
 //!   withheld until the user decides once for all of it ([`Decision`]): keep
 //!   them anyway, or discard them (see [`OldCopy::DropIfSynced`]). With
-//!   [`OverflowPolicy::Keep`] they are kept and the user is told. Either way
-//!   it isn't a stop: everything else in the round goes ahead.
+//!   [`OverflowPolicy::Keep`] they are kept and the user is told; with
+//!   [`OverflowPolicy::Discard`] they are discarded and the user is told.
+//!   Either way it isn't a stop: everything else in the round goes ahead.
+//!   With [`Policy::keep_removed`] off, files deleted in OneDrive aren't
+//!   kept at all (dropped where provably in OneDrive, like a discarded
+//!   batch), so they take no room and never overflow.
 //!
 //! The token also says what happens to a local file's old content when the
 //! operation removes or replaces it ([`OldCopy`]). A file replaced by a newer
@@ -229,6 +233,10 @@ pub enum OverflowPolicy {
     /// Move them into the store anyway (it stays over its limit until they
     /// are old enough to trim) and tell the user.
     Keep,
+    /// Remove them without a local copy where OneDrive provably has their
+    /// content ([`OldCopy::DropIfSynced`]), as if the user chose
+    /// [`Choice::Discard`] for the batch, and tell the user.
+    Discard,
 }
 
 /// The user's safety settings. Defaults are conservative.
@@ -251,6 +259,12 @@ pub struct Policy {
     /// Keep the old copy of a file replaced by a newer cloud version in the
     /// version store, even though OneDrive's version history has it.
     pub keep_replaced: bool,
+    /// Keep the old copy of a file deleted in OneDrive in the version
+    /// store. Off, it's removed without a copy where provably in OneDrive's
+    /// recycle bin ([`OldCopy::DropIfSynced`]), and replaced files aren't
+    /// kept either, whatever [`Policy::keep_replaced`] says. Duplicates the
+    /// user removes and a rewind's own steps are kept regardless.
+    pub keep_removed: bool,
     pub overflow: OverflowPolicy,
     /// The content guard trips when more than this many files would be
     /// sent with content that doesn't look like their type; 0 turns it off.
@@ -268,8 +282,16 @@ impl Default for Policy {
             pause_remote: false,
             panic: false,
             keep_replaced: false,
+            keep_removed: true,
             overflow: OverflowPolicy::Hold,
         }
+    }
+}
+
+impl Policy {
+    /// Whether a replaced file's old copy goes into the version store.
+    pub fn keeps_replaced(&self) -> bool {
+        self.keep_removed && self.keep_replaced
     }
 }
 
@@ -350,6 +372,8 @@ pub enum OverflowOutcome {
     Held,
     /// Kept, as the policy says ([`OverflowPolicy::Keep`]).
     KeptByPolicy,
+    /// Discarded, as the policy says ([`OverflowPolicy::Discard`]).
+    DiscardedByPolicy,
     /// Approved as the user decided.
     Decided(Choice),
 }
@@ -522,6 +546,10 @@ pub struct Review {
     /// keeps those keys approved while such an operation waits (a file that
     /// keeps changing, a pause), and lets them go once it ran.
     pub listed: Vec<(Op, Vec<ItemKey>)>,
+    /// For each of [`withheld`](Self::withheld), what would happen to the
+    /// old copy of a file it removes or replaces once approved (an overflow
+    /// batch's decision aside), so a stop's list says it truthfully.
+    pub withheld_old: Vec<OldCopy>,
     pub overflow: Option<Overflow>,
     /// Bytes the approved operations will move into the version store (the
     /// files whose old copy is kept), so the caller can make room first.
@@ -572,6 +600,14 @@ pub struct Context<'a> {
     /// in OneDrive ([`Follow`], by [`follow_key`]), **sorted**: exactly those
     /// operations aren't counted by the circuit breakers.
     pub rewound: &'a [ItemKey],
+    /// Synced items whose deletion OneDrive reported (its change feed's
+    /// `deleted` facet, or a deleted folder above), **sorted**: their content
+    /// is in OneDrive's recycle bin. Only recycling one of these may go
+    /// without a local copy ([`OldCopy::DropIfSynced`]): an item the user
+    /// answered "Delete here" for, gone from OneDrive without such evidence,
+    /// may be gone from the recycle bin too, so it's always kept. A caller
+    /// that leaves this empty keeps every copy.
+    pub cloud_deleted: &'a [Sid],
 }
 
 /// What this PC does to follow one change an approved rewind made in
@@ -858,10 +894,11 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
             let outcome = match (decided, policy.overflow) {
                 (Some(c), _) => OverflowOutcome::Decided(c),
                 (None, OverflowPolicy::Keep) => OverflowOutcome::KeptByPolicy,
+                (None, OverflowPolicy::Discard) => OverflowOutcome::DiscardedByPolicy,
                 (None, OverflowPolicy::Hold) => OverflowOutcome::Held,
             };
             held_overflow = outcome == OverflowOutcome::Held;
-            discard = outcome == OverflowOutcome::Decided(Choice::Discard);
+            discard = matches!(outcome, OverflowOutcome::Decided(Choice::Discard) | OverflowOutcome::DiscardedByPolicy);
             out.overflow = Some(Overflow { count: batch.len(), bytes, room, fingerprint, outcome });
         }
     }
@@ -896,17 +933,13 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
                 for l in lists_of {
                     held_lists[l].push(out.withheld.len());
                 }
+                out.withheld_old.push(old_copy(policy, cx, &op, false));
                 out.withheld.push((op, w));
             }
             None => {
-                let old = match &op {
-                    _ if chosen => OldCopy::Keep,
-                    Op::Download { replace: Some(_), .. } if !policy.keep_replaced => OldCopy::DropIfSynced,
-                    _ if discard && in_batch => OldCopy::DropIfSynced,
-                    _ => OldCopy::Keep,
-                };
+                let old = old_copy(policy, cx, &op, discard && in_batch);
                 if old == OldCopy::Keep {
-                    out.store_bytes += store_size(policy, &op).unwrap_or(0);
+                    out.store_bytes += kept_size(policy, &op).unwrap_or(0);
                 }
                 // A recycling that follows a rewind: only from where it was
                 // when the rewind removed it in OneDrive.
@@ -921,25 +954,54 @@ pub fn review_in(policy: &Policy, cx: &Context<'_>, ops: Vec<Op>) -> Review {
     out
 }
 
+/// What happens to the old copy of a file `op` removes or replaces, once
+/// approved; `discard`: it's in an overflow batch discarded by the user or
+/// the policy. Duplicates the user removes and a rewind's own steps keep
+/// theirs (a rewind's set-aside files may be all there is of them), and a
+/// recycling drops it only where OneDrive reported the deletion
+/// ([`Context::cloud_deleted`]).
+fn old_copy(policy: &Policy, cx: &Context<'_>, op: &Op, discard: bool) -> OldCopy {
+    match op {
+        _ if is_removal(op) => OldCopy::Keep,
+        Op::Rewind { .. } => OldCopy::Keep,
+        Op::Download { replace: Some(_), .. } if !policy.keeps_replaced() || discard => OldCopy::DropIfSynced,
+        Op::RecycleLocal { sid, .. } if cx.cloud_deleted.binary_search(sid).is_err() => OldCopy::Keep,
+        Op::RecycleLocal { .. } if !policy.keep_removed || discard => OldCopy::DropIfSynced,
+        _ => OldCopy::Keep,
+    }
+}
+
 /// The bytes `op` would move into the version store if its old copy is
 /// kept, or `None` if it moves none: files recycled locally (deleted in
-/// OneDrive) and, with [`Policy::keep_replaced`], replaced files. Folders
-/// are only recycled once empty, so they take no room and aren't counted.
+/// OneDrive) with [`Policy::keep_removed`], duplicates the user removes,
+/// a rewind's set-aside files and, with [`Policy::keeps_replaced`],
+/// replaced files. Folders are only recycled once empty, so they take no
+/// room and aren't counted.
 pub fn store_size(policy: &Policy, op: &Op) -> Option<u64> {
     match op {
-        Op::RecycleLocal { local, .. } | Op::RemoveCopy { local: Some(local), .. } => {
-            local.stamp.map(|(size, _)| size.max(0) as u64)
-        }
+        Op::RecycleLocal { local, .. } if policy.keep_removed => local.stamp.map(|(size, _)| size.max(0) as u64),
+        Op::RemoveCopy { local: Some(local), .. } => local.stamp.map(|(size, _)| size.max(0) as u64),
         Op::Rewind { step, .. } => match &**step {
             Step::SetAside { local, .. } | Step::Discard { local, .. } => {
                 local.stamp.map(|(size, _)| size.max(0) as u64)
             }
             _ => None,
         },
-        Op::Download { replace: Some(local), .. } if policy.keep_replaced => {
+        Op::Download { replace: Some(local), .. } if policy.keeps_replaced() => {
             local.stamp.map(|(size, _)| size.max(0) as u64)
         }
         _ => None,
+    }
+}
+
+/// The bytes `op` moves into the version store once its old copy is
+/// kept: [`store_size`], and a recycled file's size even with
+/// [`Policy::keep_removed`] off (a recycling OneDrive didn't report is kept
+/// all the same), so making room counts it.
+fn kept_size(policy: &Policy, op: &Op) -> Option<u64> {
+    match op {
+        Op::RecycleLocal { local, .. } => local.stamp.map(|(size, _)| size.max(0) as u64),
+        _ => store_size(policy, op),
     }
 }
 
@@ -1443,9 +1505,25 @@ mod tests {
         }
     }
 
+    /// Reviewed with `room` in the store; every recycling is backed by
+    /// OneDrive's report of the deletion.
     fn with_room(policy: &Policy, room: u64, decisions: &[Decision], ops: Vec<Op>) -> Review {
-        let cx = Context { synced_items: 1000, room: Some(room), decisions, ..Context::default() };
+        let deleted = reported(&ops);
+        let cx =
+            Context { synced_items: 1000, room: Some(room), decisions, cloud_deleted: &deleted, ..Context::default() };
         review_in(policy, &cx, ops)
+    }
+
+    fn reported(ops: &[Op]) -> Vec<Sid> {
+        let mut v: Vec<Sid> = ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::RecycleLocal { sid, .. } => Some(*sid),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     fn upload_new(i: u128) -> Op {
@@ -1606,6 +1684,95 @@ mod tests {
         let r = with_room(&p, 10, &[], vec![recycle_sized(1, 600)]);
         assert_eq!(r.overflow.unwrap().outcome, OverflowOutcome::KeptByPolicy);
         assert_eq!((r.approved.len(), r.store_bytes), (1, 600));
+    }
+
+    #[test]
+    fn the_discard_policy_drops_what_onedrive_has_and_reports() {
+        let p = Policy { overflow: OverflowPolicy::Discard, ..Policy::default() };
+        let ops = vec![recycle_sized(1, 600), recycle_sized(2, 500), upload_new(3)];
+        let r = with_room(&p, 1000, &[], ops.clone());
+        assert_eq!(r.overflow.unwrap().outcome, OverflowOutcome::DiscardedByPolicy);
+        assert!(r.withheld.is_empty());
+        assert_eq!(r.store_bytes, 0);
+        assert!(
+            r.approved
+                .iter()
+                .filter(|a| matches!(a.op(), Op::RecycleLocal { .. }))
+                .all(|a| a.old_copy() == OldCopy::DropIfSynced)
+        );
+        // A batch that fits is kept as usual.
+        let r = with_room(&p, 5000, &[], ops);
+        assert!(r.overflow.is_none());
+        assert_eq!(r.store_bytes, 1100);
+        assert!(
+            r.approved
+                .iter()
+                .filter(|a| matches!(a.op(), Op::RecycleLocal { .. }))
+                .all(|a| a.old_copy() == OldCopy::Keep)
+        );
+        // A user decision still wins over the policy.
+        let o = with_room(&Policy::default(), 1000, &[], vec![recycle_sized(1, 2000)]).overflow.unwrap();
+        let keep = [Decision { fingerprint: o.fingerprint, choice: Choice::Keep }];
+        let r = with_room(&p, 1000, &keep, vec![recycle_sized(1, 2000)]);
+        assert_eq!(r.overflow.unwrap().outcome, OverflowOutcome::Decided(Choice::Keep));
+        assert_eq!(r.approved[0].old_copy(), OldCopy::Keep);
+    }
+
+    #[test]
+    fn with_keeping_off_removed_and_replaced_files_are_not_kept() {
+        let p = Policy { keep_removed: false, keep_replaced: true, ..Policy::default() };
+        let ops = vec![recycle_sized(1, 600), replace_sized(2, 900)];
+        // Nothing goes into the store, so nothing overflows, even with no room.
+        assert_eq!(store_bytes(&p, &ops), 0);
+        let r = with_room(&p, 0, &[], ops);
+        assert!(r.overflow.is_none() && r.withheld.is_empty());
+        assert_eq!(r.store_bytes, 0);
+        assert!(r.approved.iter().all(|a| a.old_copy() == OldCopy::DropIfSynced));
+        assert!(!p.keeps_replaced());
+    }
+
+    #[test]
+    fn a_removal_onedrive_didnt_report_is_always_kept() {
+        // "Delete here" for an item gone from OneDrive without evidence: its
+        // content may be gone from the recycle bin too.
+        let off = Policy { keep_removed: false, ..Policy::default() };
+        let ops = vec![recycle_sized(1, 600), recycle_sized(2, 500)];
+        let only_2 = [2 as Sid];
+        let cx = Context { synced_items: 1000, cloud_deleted: &only_2, ..Context::default() };
+        let r = review_in(&off, &cx, ops.clone());
+        let old: Vec<_> = r.approved.iter().map(|a| a.old_copy()).collect();
+        assert_eq!(old, vec![OldCopy::Keep, OldCopy::DropIfSynced]);
+        // Nor does discarding an overflow batch, by the policy or by the user.
+        let discard = Policy { overflow: OverflowPolicy::Discard, ..Policy::default() };
+        let cx = Context { synced_items: 1000, room: Some(10), cloud_deleted: &only_2, ..Context::default() };
+        let r = review_in(&discard, &cx, ops.clone());
+        assert_eq!(r.overflow.as_ref().map(|o| o.outcome), Some(OverflowOutcome::DiscardedByPolicy));
+        let old: Vec<_> = r.approved.iter().map(|a| a.old_copy()).collect();
+        assert_eq!(old, vec![OldCopy::Keep, OldCopy::DropIfSynced]);
+        // A caller that names none keeps everything.
+        let r = review_in(&off, &Context { synced_items: 1000, ..Context::default() }, ops);
+        assert!(r.approved.iter().all(|a| a.old_copy() == OldCopy::Keep));
+    }
+
+    #[test]
+    fn a_rewinds_set_aside_files_and_chosen_duplicates_keep_their_copy() {
+        let off = Policy { keep_removed: false, overflow: OverflowPolicy::Discard, ..Policy::default() };
+        let all = [1 as Sid];
+        let cx = Context { cloud_deleted: &all, ..Context::default() };
+        let aside = Op::rewind(1, Step::SetAside { local: lpre(1), at: "/a".into() });
+        assert_eq!(old_copy(&off, &cx, &aside, true), OldCopy::Keep);
+        assert_eq!(old_copy(&off, &cx, &recycle_sized(1, 5), true), OldCopy::DropIfSynced);
+    }
+
+    #[test]
+    fn a_withheld_removal_says_what_approving_it_would_do() {
+        let off = Policy { keep_removed: false, panic: true, ..Policy::default() };
+        let ops = vec![recycle_sized(1, 600), recycle_sized(2, 500)];
+        let only_2 = [2 as Sid];
+        let cx = Context { synced_items: 1000, cloud_deleted: &only_2, ..Context::default() };
+        let r = review_in(&off, &cx, ops);
+        assert_eq!(r.withheld.len(), 2);
+        assert_eq!(r.withheld_old, vec![OldCopy::Keep, OldCopy::DropIfSynced]);
     }
 
     #[test]

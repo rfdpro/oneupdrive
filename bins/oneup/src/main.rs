@@ -493,10 +493,17 @@ enum Cmd {
         #[arg(long, value_enum, value_name = "ON|OFF")]
         set_rotate: Option<Toggle>,
         /// When removed files don't fit in the store: `hold` leaves them on
-        /// this PC until you decide, `keep` keeps them anyway and tells you
-        /// [default: hold]
-        #[arg(long, value_enum, value_name = "HOLD|KEEP")]
+        /// this PC until you decide, `keep` keeps them anyway and tells you,
+        /// `discard` removes them without a local copy (OneDrive's recycle
+        /// bin has them) and tells you [default: hold]
+        #[arg(long, value_enum, value_name = "HOLD|KEEP|DISCARD")]
         set_overflow: Option<OverflowChoice>,
+        /// Keep copies of files deleted or replaced in OneDrive; off, a file
+        /// that matches the version last synced is removed without a local
+        /// copy (OneDrive's recycle bin or version history has that version)
+        /// [default: on]
+        #[arg(long, value_enum, value_name = "ON|OFF")]
+        set_keep_removed: Option<Toggle>,
         /// Also keep files replaced by a newer version from OneDrive
         /// (OneDrive's version history has them anyway) [default: off]
         #[arg(long, value_enum, value_name = "ON|OFF")]
@@ -1445,6 +1452,7 @@ impl Toggle {
 enum OverflowChoice {
     Hold,
     Keep,
+    Discard,
 }
 
 fn shortcuts_cmd(dir: &Path, fix: bool, undo: bool, from: Option<&Path>, json: bool) -> Result<()> {
@@ -2620,6 +2628,7 @@ async fn run() -> Result<()> {
             set_rotate,
             set_overflow,
             set_keep_replaced,
+            set_keep_removed,
             profile,
         } => {
             let _lock = DirLock::acquire(&data_dir(&cli)?)?;
@@ -2632,8 +2641,10 @@ async fn run() -> Result<()> {
                 overflow: set_overflow.map(|c| match c {
                     OverflowChoice::Hold => oneup_gate::OverflowPolicy::Hold,
                     OverflowChoice::Keep => oneup_gate::OverflowPolicy::Keep,
+                    OverflowChoice::Discard => oneup_gate::OverflowPolicy::Discard,
                 }),
                 keep_replaced: set_keep_replaced.map(Toggle::on),
+                keep_removed: set_keep_removed.map(Toggle::on),
             };
             if !changes.is_empty() {
                 versions::set(&mut store, &changes)?;

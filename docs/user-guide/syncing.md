@@ -99,13 +99,13 @@ oneup --data-dir … settings --hash-files-at-once 4        # compare up to 4 fi
 * **Bandwidth caps** apply to file contents, at once, even while `oneupd` runs. With `--cap-hours 09:00-18:00` they apply only in those hours (`--cap-hours always` to undo).
 * **Background priority** is on by default: `oneupd` gives way to your programs for processor, disk and memory, and Windows may run it on power-efficient cores. Syncing a large batch can take a little longer.
 * **Memory profile** sets how much memory the database may use for caching (4, 16 or 64 MiB, plus, with background priority off, up to four times that of the database file read straight from Windows' disk cache by `oneupd`), how large the pieces are that big files are uploaded in (up to 10, 40 or 60 MiB), and how many files are sent or received at once (4, 8 or 16, of which big uploads 1, 2 or 4) with as many requests to OneDrive under way as that needs. `performance` syncs many small files fastest. Larger pieces upload faster on a good connection: OneUpDrive measures the connection as it goes and picks the size, within the profile's limit.
-* **Each of the memory profile's numbers can be set on its own**, the rest staying the profile's: `--database-cache-mib` (1 to 1024), `--operations-at-once` (1 to 32), `--large-uploads-at-once` (uploads over 4 MiB, 1 to 8) and `--upload-fragment-mib` (the largest piece, 2 to 59; rounded down to a multiple of 320 KiB, as OneDrive requires). `profile` goes back to the profile's. `oneup settings` shows what applies and which you set. In the settings window: **General → Memory and hashing** (empty is the default).
+* **Each of the memory profile's numbers can be set on its own**, the rest staying the profile's: `--database-cache-mib` (1 to 1024), `--operations-at-once` (1 to 32), `--large-uploads-at-once` (uploads over 4 MiB, 1 to 8) and `--upload-fragment-mib` (the largest piece, 2 to 59; rounded down to a multiple of 320 KiB, as OneDrive requires). `profile` goes back to the profile's. `oneup settings` shows what applies and which you set. In the settings window: **General → Advanced → Memory and hashing** (empty is the default).
 * **Files hashed at once** (`--hash-files-at-once`, 1 to 16, default 1): to tell whether a file here and one in OneDrive with the same name and size are the same (on a first sync over a copy, for example), OneUpDrive reads the file and computes its hash. More at once is faster on an SSD; on a spinning disk they compete for it. Hashing runs alongside transfers, never holding them up, and like everything else at background priority unless you turned that off.
 * **Copies of files already in OneDrive aren't uploaded again.** If you copy a large file (1 MiB or more) that's already in your OneDrive, for example a video into a second folder, OneUpDrive checks that the contents are identical and asks OneDrive to make the copy itself. That takes a couple of seconds whatever the size. `oneup activity` shows it as copied in OneDrive.
 * **An item that fails waits before it's tried again:** a minute, then twice as long after each failure in a row, up to an hour. Other files keep syncing, and a change to the item (here or in OneDrive) ends the wait. See [When something goes wrong](troubleshooting.md#a-file-that-fails-again-and-again).
 * **While OneDrive is full, uploads and new folders wait.** Downloads go on, and what waited is sent once OneDrive has more room. The icon and `oneup status` say "OneDrive is full" meanwhile ([details](troubleshooting.md#cloud-full)).
 * **Saving never fails because OneUpDrive is sending the file.** If you save while it's being sent, the send stops and the saved version goes instead.
-* **Timeout highly active files.** A file saved twice within 5 seconds (a database, an app that saves its settings every few seconds) isn't sent after every save: OneUpDrive waits until it has gone 15 seconds without a change, then sends it once. A file that never stops changing is still sent at least every 10 minutes. `oneup activity` shows such a file as waiting. In the settings window: **General → File changes**; `--busy-changes`, `--busy-window-s` and `--busy-max-s` set how many changes in how many seconds make a file busy and the longest it waits. Downloads never wait.
+* **Timeout highly active files.** A file saved twice within 5 seconds (a database, an app that saves its settings every few seconds) isn't sent after every save: OneUpDrive waits until it has gone 15 seconds without a change, then sends it once. A file that never stops changing is still sent at least every 10 minutes. `oneup activity` shows such a file as waiting. In the settings window: **General → Advanced → File changes**; `--busy-changes`, `--busy-window-s` and `--busy-max-s` set how many changes in how many seconds make a file busy and the longest it waits. Downloads never wait.
 * **The database is compacted** when `oneupd` starts, if deleted entries left most of it empty (it can otherwise stay at its largest size). It takes a few seconds and shows in `oneup activity`. `oneup settings --compact-database off` turns it off.
 * Priority, the memory profile and its numbers, and files hashed at once apply the next time `oneupd` starts (`oneup stop`, then `oneup start`).
 
@@ -298,6 +298,16 @@ The code covers exactly the files listed. If anything changes in the meantime, y
 To decide automatically from now on instead of being asked:
 
 ```powershell
-oneup --data-dir … versions --set-overflow keep    # always keep them, and tell me
-oneup --data-dir … versions --set-overflow hold    # ask me (the default)
+oneup --data-dir … versions --set-overflow keep     # always keep them, and tell me
+oneup --data-dir … versions --set-overflow discard  # delete them immediately, and tell me
+oneup --data-dir … versions --set-overflow hold     # ask me (the default)
+```
+
+`discard` is **When removed files don't fit → Delete immediately** in the settings window. As with `--discard CODE`, only files that match the version OneDrive has are removed; anything else is kept.
+
+### Not keeping copies
+**Safety → Kept copies → Keep copies of removed files** (on by default) can be turned off. Then files deleted or replaced in OneDrive are removed from your PC without a copy here, and you rely on OneDrive's recycle bin and version history to get them back. A file that differs from the version OneDrive has is still kept. Duplicates you remove, what a rewind sets aside, and files you chose **Delete here** for (gone from OneDrive without OneUpDrive seeing them deleted) are always kept.
+
+```powershell
+oneup --data-dir … versions --set-keep-removed off
 ```

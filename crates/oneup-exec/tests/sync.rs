@@ -1526,6 +1526,7 @@ impl Sync {
             })
             .collect();
         suspicious.sort_unstable();
+        let cloud_deleted = store.read(|o| oneup_exec::resolve::cloud_deleted(o, ops.iter().chain(&pending))).unwrap();
         let cx = Context {
             room: self.room,
             decisions: &self.decisions,
@@ -1536,6 +1537,7 @@ impl Sync {
             pending_paths: &pending_paths,
             rewound: &rewound,
             suspicious: &suspicious,
+            cloud_deleted: &cloud_deleted,
             ..Context::default()
         };
         let r = review_in(&self.policy, &cx, ops);
@@ -2389,6 +2391,58 @@ async fn deletions_that_dont_fit_the_version_store_wait_for_one_decision() {
     let mut kept = s.versions();
     kept.sort();
     assert_eq!(kept, vec![vec![b'c'; 100], vec![b'd'; 100]]);
+}
+
+#[tokio::test]
+async fn with_keeping_off_deletions_leave_no_copy_unless_the_content_differs() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("keep-removed-off", cloud.clone());
+    write(&s.p("a.bin"), &[b'a'; 100]);
+    write(&s.p("b.bin"), &[b'b'; 100]);
+    s.settle().await;
+    s.policy.keep_removed = false;
+
+    // Deleted in OneDrive: removed here without a copy, since OneDrive's
+    // recycle bin has exactly this content.
+    cloud.delete("a.bin");
+    s.settle().await;
+    assert!(!s.p("a.bin").exists());
+    assert!(s.versions().is_empty());
+    assert!(cloud.holds(&[b'a'; 100]));
+
+    // Rewritten here with its old size and time, then deleted in OneDrive:
+    // its content isn't what OneDrive has, so it's kept, never lost.
+    let path = s.p("b.bin");
+    let was = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, [b'B'; 100]).unwrap();
+    std::fs::File::options().write(true).open(&path).unwrap().set_modified(was).unwrap();
+    cloud.delete("b.bin");
+    s.settle().await;
+    assert!(!path.exists());
+    assert_eq!(s.versions(), vec![vec![b'B'; 100]]);
+}
+
+#[tokio::test]
+async fn the_discard_setting_removes_a_batch_that_doesnt_fit_without_asking() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("overflow-discard", cloud.clone());
+    write(&s.p("a.bin"), &[b'a'; 100]);
+    write(&s.p("b.bin"), &[b'b'; 100]);
+    s.settle().await;
+    s.policy.overflow = oneup_gate::OverflowPolicy::Discard;
+    s.room = Some(150);
+    cloud.delete("a.bin");
+    cloud.delete("b.bin");
+    let mut seen = None;
+    for _ in 0..3 {
+        s.round().await;
+        seen = seen.or(s.overflow.as_ref().map(|o| o.outcome));
+    }
+    assert_eq!(seen, Some(OverflowOutcome::DiscardedByPolicy));
+    s.settle().await;
+    assert!(!s.p("a.bin").exists() && !s.p("b.bin").exists());
+    assert!(s.versions().is_empty());
+    assert!(cloud.holds(&[b'a'; 100]) && cloud.holds(&[b'b'; 100]));
 }
 
 #[tokio::test]
@@ -5623,6 +5677,35 @@ async fn held_items_gone_from_onedrive_are_deleted_here_or_uploaded_when_chosen(
     assert!(!t.contains_key("/x.txt"));
     assert_eq!(t["/y.txt"].as_deref(), Some(&b"yankee"[..]));
     assert_eq!(t["/z.txt"].as_deref(), Some(&b"zulu, edited here"[..]));
+}
+
+/// "Delete here" with keeping copies turned off, and with a batch that
+/// doesn't fit set to be deleted: the item went from OneDrive without
+/// evidence, so nothing shows its recycle bin has it, and its copy is kept
+/// in the version store anyway.
+#[tokio::test]
+async fn delete_here_keeps_a_copy_whatever_the_version_store_settings() {
+    use oneup_exec::resolve::delete_here;
+    for (keep_removed, overflow, room) in
+        [(false, oneup_gate::OverflowPolicy::Hold, None), (true, oneup_gate::OverflowPolicy::Discard, Some(1))]
+    {
+        let cloud = Fake::new();
+        let mut s = Sync::new("resolve-gone-keep", cloud.clone());
+        write(&s.p("x.txt"), b"x-ray");
+        s.settle().await;
+        s.policy.keep_removed = keep_removed;
+        s.policy.overflow = overflow;
+        s.room = room;
+        cloud.lose("x.txt");
+        s.rebuild_mirror();
+        s.rounds(2).await;
+        assert!(s.p("x.txt").exists(), "held, not deleted on a guess");
+        let x = s.sid("x.txt");
+        assert_eq!(s.choose(|o, _| delete_here(o, x)), Ok(1));
+        s.settle().await;
+        assert!(!s.p("x.txt").exists());
+        assert_eq!(s.versions(), vec![b"x-ray".to_vec()], "kept ({keep_removed}, {overflow:?})");
+    }
 }
 
 /// "Rename" for an item OneDrive won't take as it's named: refused for a

@@ -63,6 +63,12 @@ CREATE TABLE local_hash (
 ) WITHOUT ROWID;
 ";
 
+/// v24 -> v25: a deletion noted from the user's "Delete here" answer, for
+/// an item gone from OneDrive without evidence, is marked `answered`: only
+/// a deletion OneDrive reported puts the content in its recycle bin, so
+/// only those may be recycled here without a local copy.
+pub(crate) const V25_COLUMN: (&str, &str, &str) = ("remote_gone", "answered", "INTEGER NOT NULL DEFAULT 0");
+
 /// v11 -> v12: an item written to the Local tree is there, so it can't be
 /// deleted: its deletion evidence goes (`data-safety.md` invariant 3). A file
 /// sent to the Recycle Bin counts as deleted (`oneup_app::recyclebin`);
@@ -507,6 +513,43 @@ impl Ops<'_> {
             )?
             .execute([id])?
             > 0)
+    }
+
+    /// Records the user's answer that Synced item with remote `id` is gone
+    /// from OneDrive ("Delete here"), for an item gone without evidence:
+    /// like [`Ops::note_remote_deleted`], marked `answered`, because nothing
+    /// shows its content is in OneDrive's recycle bin, so its copy here is
+    /// always kept ([`Ops::remote_gone_reported`]). Evidence already
+    /// recorded for it stays as it is.
+    pub fn note_remote_deleted_by_answer(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .c
+            .prepare_cached(
+                "INSERT OR IGNORE INTO remote_gone(id, answered)
+                 SELECT remote_id, 1 FROM synced_item WHERE remote_id = ?1",
+            )?
+            .execute([id])?
+            > 0)
+    }
+
+    /// Of Synced items `sids`, those whose deletion OneDrive reported (not
+    /// only the user's answer), sorted: the gate may recycle these without
+    /// a local copy (`oneup_gate::Context::cloud_deleted`). One lookup per
+    /// item, so callers pass a round's recyclings only.
+    pub fn remote_gone_reported(&self, sids: &[i64]) -> Result<Vec<i64>> {
+        let mut q = self.c.prepare_cached(
+            "SELECT 1 FROM synced_item s JOIN remote_gone g ON g.id = s.remote_id
+             WHERE s.sid = ?1 AND g.answered = 0",
+        )?;
+        let mut out = Vec::new();
+        for &sid in sids {
+            if q.exists([sid])? {
+                out.push(sid);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// Records evidence for every Synced item in the mirror's `t_sub`
@@ -1087,6 +1130,52 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn only_deletions_onedrive_reported_count_as_reported() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            // f: the user's answer first, then OneDrive's report; d: the
+            // other way round. An answer is never taken for a report.
+            assert!(o.note_remote_deleted_by_answer("f")?);
+            assert_eq!(o.remote_gone_reported(&[1, 2])?, Vec::<i64>::new());
+            o.delete_subtree("d")?;
+            o.delete_subtree("f")?;
+            assert!(!o.note_remote_deleted_by_answer("d")?);
+            assert_eq!(o.remote(&RemoteId("f".into()))?, Seen::Deleted);
+            assert_eq!(o.remote_gone_reported(&[2, 1, 2, 99])?, vec![2]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_upgrade_to_v25_counts_earlier_evidence_as_answered_and_can_run_again() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-v25-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            synced(&mut s);
+            s.write(|o| o.delete_subtree("f")).unwrap();
+            let v24 = "ALTER TABLE remote_gone DROP COLUMN answered; PRAGMA user_version = 24;";
+            s.read(|o| Ok(o.c.execute_batch(v24)?)).unwrap();
+        }
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            assert_eq!(s.read(|o| o.remote_gone_reported(&[1])).unwrap(), Vec::<i64>::new(), "kept, to be safe");
+            s.write(|o| o.delete_subtree("d")).unwrap();
+            assert_eq!(s.read(|o| o.remote_gone_reported(&[1, 2])).unwrap(), vec![2]);
+            s.read(|o| Ok(o.c.execute_batch("PRAGMA user_version = 24;")?)).unwrap();
+        }
+        // Replayed over a store that has the column: nothing changes.
+        let s = Store::open(&path, 1024).unwrap();
+        assert_eq!(s.read(|o| o.remote_gone_reported(&[1, 2])).unwrap(), vec![2]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

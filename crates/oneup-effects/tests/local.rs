@@ -126,10 +126,15 @@ fn restore(fs: &LocalFs, slot: &str, to: Option<&str>) -> Result<String, Error> 
     fs.restore_approved(&approve_asked(Op::rewind(0, step)))
 }
 
-/// A recycle the user chose to discard (an overflow batch of one).
+/// A recycle the user chose to discard (an overflow batch of one), of an
+/// item OneDrive reported deleted.
 fn approve_discard(op: Op) -> Approved {
     let p = Policy::default();
-    let cx = Context { synced_items: 1_000_000, room: Some(0), ..Context::default() };
+    let reported = match &op {
+        Op::RecycleLocal { sid, .. } => vec![*sid],
+        _ => Vec::new(),
+    };
+    let cx = Context { synced_items: 1_000_000, room: Some(0), cloud_deleted: &reported, ..Context::default() };
     let fingerprint = review_in(&p, &cx, vec![op.clone()]).overflow.unwrap().fingerprint;
     let decisions = [Decision { fingerprint, choice: Choice::Discard }];
     let r = review_in(&p, &Context { decisions: &decisions, ..cx }, vec![op]);
