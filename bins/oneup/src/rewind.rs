@@ -570,7 +570,16 @@ pub fn steps(o: &Ops<'_>, rules: &RuleSet, job: &Job) -> Result<Steps> {
 /// After a round: notes what the rewind's steps did, and ends the rewind
 /// once nothing approved is left (or it stalled). `steps`: what the round
 /// added. Returns the activity log's entry when it ended.
-pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Report, now_ms: i64) -> Result<bool> {
+/// `ats`: each recycling that ran under a rewind's approval, with the
+/// path its token carried (`oneup_gate::follow_keys_done`).
+pub fn ran(
+    o: &Ops<'_>,
+    job: &mut Job,
+    steps: &Steps,
+    report: &oneup_exec::Report,
+    ats: &[(Op, String)],
+    now_ms: i64,
+) -> Result<bool> {
     let Some(approval) = job.approval.as_mut() else {
         // Waiting for the approval, with nothing left to change (the folder
         // was put back by hand, say): it ends.
@@ -590,8 +599,8 @@ pub fn ran(o: &Ops<'_>, job: &mut Job, steps: &Steps, report: &oneup_exec::Repor
         approval.follows.extend(follows.iter().map(|f| oneup_gate::follow_key(f).0));
     }
     // Each follow-up is approved once: gone when it ran.
-    for f in report.done.iter().filter_map(oneup_gate::Follow::of) {
-        approval.follows.remove(&oneup_gate::follow_key(&f).0);
+    for k in oneup_gate::follow_keys_done(&report.done, ats) {
+        approval.follows.remove(&k.0);
     }
     job.ran += done.len() as u64;
     job.left_alone = job.left_alone.max(steps.left_alone as u64);
@@ -827,7 +836,7 @@ mod tests {
         assert_eq!((s2.ops.len(), s2.left_alone), (0, 1));
         // With nothing left to run, it ends, and says so.
         let report = oneup_exec::Report::default();
-        assert!(store.write(|o| Ok(ran(o, &mut job, &s2, &report, now()))).unwrap().unwrap());
+        assert!(store.write(|o| Ok(ran(o, &mut job, &s2, &report, &[], now()))).unwrap().unwrap());
         assert!(store.read(load).unwrap().is_none());
         let log = store.read(|o| o.activity_recent(None, 1)).unwrap();
         assert!(log[0].detail.contains("left alone"), "{:?}", log[0]);
@@ -851,10 +860,39 @@ mod tests {
         let report = oneup_exec::Report { failed: vec![(op, "no".into())], ..Default::default() };
         let mut store = Store::open_in_memory().unwrap();
         for round in 1..=STALLS {
-            let ended = store.write(|o| Ok(ran(o, &mut job, &s, &report, 0))).unwrap().unwrap();
+            let ended = store.write(|o| Ok(ran(o, &mut job, &s, &report, &[], 0))).unwrap().unwrap();
             assert_eq!(ended, round == STALLS, "round {round}");
         }
         assert_eq!(job.failed, u64::from(STALLS));
+    }
+
+    /// A recycling that followed the rewind is done with once it ran: its
+    /// key (with the path its token carried) goes, so it's no longer exempt
+    /// from the circuit breakers.
+    #[test]
+    fn a_follow_up_recycling_that_ran_is_done_with() {
+        let local = oneup_sync::LocalPre { id: LocalId(0xa), stamp: Some((3, 4)) };
+        let follow = oneup_gate::Follow::Recycle { sid: 7, local: local.clone(), at: "/docs/n.txt".into() };
+        let mut approval = oneup_sync::rewind::Job::default();
+        approval.follows.insert(oneup_gate::follow_key(&follow).0);
+        let mut job = Job {
+            folder: "/".into(),
+            sid: ROOT,
+            at_ms: 0,
+            started_ms: 0,
+            approval: Some(approval),
+            stalls: 0,
+            ran: 0,
+            left_alone: 0,
+            failed: 0,
+        };
+        let op = Op::RecycleLocal { sid: 7, local };
+        let report = oneup_exec::Report { done: vec![op.clone()], ..Default::default() };
+        let s = Steps { ops: vec![Op::rewind(1, oneup_sync::rewind::Step::Forget)], ..Steps::default() };
+        let mut store = Store::open_in_memory().unwrap();
+        let ats = [(op, "/docs/n.txt".to_string())];
+        store.write(|o| Ok(ran(o, &mut job, &s, &report, &ats, 0))).unwrap().unwrap();
+        assert!(job.approval.unwrap().follows.is_empty());
     }
 
     #[test]

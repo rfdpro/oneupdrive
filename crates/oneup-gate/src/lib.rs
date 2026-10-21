@@ -622,6 +622,20 @@ impl Follow {
     }
 }
 
+/// The keys of the follow-ups among `done` (operations that ran), a
+/// recycling's with the path its token carried (`ats`: each recycling
+/// that ran under a rewind's approval, with [`Approved::at`]): what to drop
+/// from [`Context::rewound`] once they ran.
+pub fn follow_keys_done(done: &[Op], ats: &[(Op, String)]) -> Vec<ItemKey> {
+    done.iter()
+        .filter_map(|op| match ats.iter().find(|(o, _)| o == op) {
+            Some((_, at)) => Follow::of_at(op, at),
+            None => Follow::of(op),
+        })
+        .map(|f| follow_key(&f))
+        .collect()
+}
+
 /// A [`Follow`]'s key, for [`Context::rewound`].
 pub fn follow_key(f: &Follow) -> ItemKey {
     use sha2::Digest as _;

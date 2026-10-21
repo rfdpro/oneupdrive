@@ -2093,6 +2093,10 @@ impl Engine {
                 }
             });
             log_activity(&mut store, wait.collect())?;
+            // A recycling that follows a rewind, with the path it's covered at:
+            // its follow-up goes once it ran.
+            let ats: Vec<(Op, String)> =
+                planned.iter().filter_map(|(a, _)| a.at().map(|at| (a.op().clone(), at.to_string()))).collect();
             let (approved, planned): (Vec<Approved>, Vec<(Op, Line)>) = planned
                 .into_iter()
                 .map(|(a, l)| {
@@ -2161,7 +2165,7 @@ impl Engine {
             // However busy the folder, the history keeps to its limits.
             crate::rewind::keep_history(&mut store, now_ms(), false)?;
             if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref()) {
-                let finished = store.write(|o| Ok(crate::rewind::ran(o, j, s, &report, now_ms())))??;
+                let finished = store.write(|o| Ok(crate::rewind::ran(o, j, s, &report, &ats, now_ms())))??;
                 if finished {
                     // Its follow-ups here stay approved until they ran, or
                     // the rounds settle.
@@ -2172,12 +2176,7 @@ impl Engine {
             {
                 let mut rw = self.rewound.lock().unwrap_or_else(|p| p.into_inner());
                 if !rw.is_empty() {
-                    let ran: Vec<ItemKey> = report
-                        .done
-                        .iter()
-                        .filter_map(oneup_gate::Follow::of)
-                        .map(|f| oneup_gate::follow_key(&f))
-                        .collect();
+                    let ran = oneup_gate::follow_keys_done(&report.done, &ats);
                     rw.retain(|k| !ran.contains(k));
                 }
             }
