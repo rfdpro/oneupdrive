@@ -800,8 +800,10 @@ impl World {
             Step::Restore { id, to, name, content, .. } => {
                 // As OneDrive does (measured): back into the folder it was
                 // deleted from, under the name it had, whatever was asked;
-                // the executor asks only when that's where the step puts it
-                // and nothing has the name there.
+                // the executor asks only when that's where the step puts it,
+                // into a live folder (OneDrive would bring a folder deleted
+                // with it back too, under its old name), and nothing has the
+                // name there.
                 let Some((Some(land), land_name)) =
                     self.remote_bin_items.get(&id.0).map(|it| (it.parent.clone(), it.name.clone()))
                 else {

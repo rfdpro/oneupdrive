@@ -208,6 +208,25 @@ impl State {
         let rows = order.iter().map(|id| self.row(id)).collect();
         (rows, std::mem::take(&mut self.deleted))
     }
+    /// Brings `id` back from the recycle bin where it was deleted from, as
+    /// Graph does: an item holding its name there is renamed `name(1)`.
+    fn bring_back(&mut self, id: &str) {
+        let Some(mut it) = self.bin.remove(id) else { return };
+        let parent = it.parent.clone().unwrap_or_default();
+        if let Some(holder) = self.child(&parent, &it.name) {
+            let renamed = match it.name.rsplit_once('.') {
+                Some((stem, ext)) if !stem.is_empty() => format!("{stem}(1).{ext}"),
+                _ => format!("{}(1)", it.name),
+            };
+            let etag = self.bump();
+            let h = self.items.get_mut(&holder).unwrap();
+            h.name = renamed;
+            h.etag = etag;
+        }
+        it.etag = self.bump();
+        self.items.insert(id.to_string(), it);
+    }
+
     fn create(&mut self, parent: &str, name: &str, folder: bool, content: Vec<u8>) -> String {
         let id = format!("r{}", self.bump());
         let etag = self.bump();
@@ -338,6 +357,23 @@ impl Fake {
         s.kept.push(it.content.clone());
         s.bin.insert(id.clone(), it);
         s.deleted.push(id);
+    }
+
+    /// Deletes folder `path` with everything in it, as one deletion: all of
+    /// it goes to the recycle bin together.
+    fn delete_tree(&self, path: &str) {
+        let mut s = self.0.lock().unwrap();
+        let top = resolve(&s, path);
+        let mut todo = vec![top.clone()];
+        while let Some(id) = todo.pop() {
+            todo.extend(
+                s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(id.as_str())).map(|(k, _)| k.clone()),
+            );
+            let it = s.items.remove(&id).unwrap();
+            s.kept.push(it.content.clone());
+            s.bin.insert(id, it);
+        }
+        s.deleted.push(top);
     }
 
     /// Empties OneDrive's recycle bin (what's in it can't come back).
@@ -890,23 +926,23 @@ impl Cloud for Fake {
             let Some(land) = s.bin.get(&id.0).and_then(|it| it.parent.clone()) else {
                 return Err(CloudError::Changed);
             };
-            if !s.items.get(&land).is_some_and(|p| p.folder) {
+            // Its folders deleted with it come back with it, top down
+            // (measured); one that isn't anywhere: 404.
+            let mut chain = Vec::new();
+            let mut cur = land;
+            while s.bin.contains_key(&cur) {
+                chain.push(cur.clone());
+                let Some(p) = s.bin[&cur].parent.clone() else { return Err(CloudError::Changed) };
+                cur = p;
+            }
+            if !s.items.get(&cur).is_some_and(|p| p.folder) {
                 return Err(CloudError::Changed);
             }
-            let own = s.bin[&id.0].name.clone();
-            if let Some(holder) = s.child(&land, &own) {
-                let renamed = match own.rsplit_once('.') {
-                    Some((stem, ext)) if !stem.is_empty() => format!("{stem}(1).{ext}"),
-                    _ => format!("{own}(1)"),
-                };
-                let etag = s.bump();
-                let h = s.items.get_mut(&holder).unwrap();
-                h.name = renamed;
-                h.etag = etag;
+            for f in chain.into_iter().rev() {
+                s.bring_back(&f);
             }
-            let etag = s.bump();
-            let mut it = s.bin.remove(&id.0).unwrap();
-            it.etag = etag;
+            s.bring_back(&id.0);
+            let mut it = s.items.remove(&id.0).unwrap();
             let mut at = id.0.clone();
             if let Some((other, new_id)) = s.restore_odd.take() {
                 it.name = other;
@@ -6632,6 +6668,98 @@ async fn a_rewinds_removal_followed_here_is_covered_only_where_it_was() {
     for i in 1..=3 {
         assert!(s.p(&format!("docs-keep/sub/n{i}.txt")).exists());
     }
+}
+
+#[tokio::test]
+async fn a_restore_into_a_folder_still_deleted_brings_nothing_back() {
+    // docs (holding a.txt) was deleted whole, and a new docs made. Asked to
+    // restore a.txt into the old docs, which isn't back: OneDrive would
+    // bring the old docs back too and rename the new one, so it waits. The
+    // old docs itself, asked back while the new one has its name: the same.
+    let cloud = Fake::new();
+    let mut s = Sync::new("restore-dead-folder", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a");
+    s.settle().await;
+    let (docs, a) = {
+        let st = cloud.0.lock().unwrap();
+        (resolve(&st, "docs"), resolve(&st, "docs/a.txt"))
+    };
+    cloud.delete_tree("docs");
+    s.settle().await;
+    cloud.add("docs", None);
+    cloud.add("docs/new.txt", Some(b"the new one"));
+    s.settle().await;
+    let before = cloud.tree();
+    let child = Op::rewind(
+        2,
+        oneup_sync::rewind::Step::Restore {
+            id: RemoteId(a),
+            to: RemoteId(docs.clone()),
+            name: "a.txt".into(),
+            kind: oneup_sync::NodeKind::File,
+            content: None,
+            gone: None,
+        },
+    );
+    let root = s.obs.store().read(|o| Ok(o.synced_get(oneup_sync::ROOT)?.unwrap().remote.unwrap())).unwrap();
+    let folder = Op::rewind(
+        1,
+        oneup_sync::rewind::Step::Restore {
+            id: RemoteId(docs),
+            to: root,
+            name: "docs".into(),
+            kind: oneup_sync::NodeKind::Folder,
+            content: None,
+            gone: None,
+        },
+    );
+    s.extra = vec![child.clone(), folder.clone()];
+    let r = s.attempt().await;
+    assert!(!r.done.contains(&child) && !r.done.contains(&folder), "{r:?}");
+    assert!(r.skipped.iter().any(|(o, why)| *o == folder && *why == oneup_exec::Skip::NameTaken), "{r:?}");
+    assert_eq!(cloud.tree(), before, "nothing came back, nothing renamed");
+}
+
+#[tokio::test]
+async fn an_item_back_under_another_case_still_gets_its_content_back() {
+    // a.txt was "first" then, "second" when it was deleted. After the
+    // approval someone brings it back as A.TXT, as it went (still "second"):
+    // the same name as Windows and OneDrive compare names, so the rewind
+    // puts "first" back over what went into the recycle bin.
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-restored-case", cloud.clone());
+    write(&s.p("docs/a.txt"), b"first");
+    s.settle().await;
+    let at = moment();
+    write(&s.p("docs/a.txt"), b"second");
+    s.settle().await;
+    let id = resolve(&cloud.0.lock().unwrap(), "docs/a.txt");
+    std::fs::remove_file(s.p("docs/a.txt")).unwrap();
+    s.settle().await;
+    let theirs = id.clone();
+    cloud.0.lock().unwrap().on_item = Some((
+        id,
+        Box::new(move |st: &mut State| {
+            let etag = st.bump();
+            let mut it = st.bin.remove(&theirs).unwrap();
+            it.name = "A.TXT".into();
+            it.etag = etag;
+            st.items.insert(theirs, it);
+        }),
+    ));
+    s.start_rewind("/docs", at);
+    s.round().await;
+    s.stops.approve();
+    // In the step itself: its content then, over what went into the bin.
+    s.attempt().await;
+    assert!(cloud.0.lock().unwrap().on_item.is_none(), "the step looked at it");
+    let t = cloud.tree();
+    assert_eq!(t.get("/docs/A.TXT"), Some(&Some(b"first".to_vec())), "put back at once: {t:?}");
+    s.settle().await;
+    let t = cloud.tree();
+    let back: Vec<_> = t.iter().filter(|(p, _)| p.eq_ignore_ascii_case("/docs/a.txt")).collect();
+    assert_eq!(back.len(), 1, "{t:?}");
+    assert_eq!(back[0].1.as_deref(), Some(b"first".as_slice()), "its content then is back: {t:?}");
 }
 
 #[tokio::test]

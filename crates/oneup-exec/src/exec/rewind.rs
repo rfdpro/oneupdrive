@@ -34,7 +34,9 @@ impl<C: Cloud> Executor<C> {
                 // user meanwhile): only if it's where it belongs.
                 let row = match self.cloud.item(id).await {
                     Ok(Some(row)) => {
-                        need(row.parent_id.as_deref() == Some(to.0.as_str()) && row.name == *name)?;
+                        need(
+                            row.parent_id.as_deref() == Some(to.0.as_str()) && oneup_sync::same_name(&row.name, name),
+                        )?;
                         row
                     }
                     Ok(None) => {
@@ -48,6 +50,14 @@ impl<C: Cloud> Executor<C> {
                             return Err(Fail::Failed(
                                 "OneDrive would bring it back where it was deleted, not where it goes".into(),
                             ));
+                        }
+                        // Into a live folder only: restoring an item whose
+                        // folder was deleted with it brings that folder back
+                        // too, under its old name (measured), which its own
+                        // step may have found taken. Not back yet: it waits.
+                        match self.cloud.item(to).await? {
+                            Some(f) if matches!(f.kind, Kind::Folder | Kind::Root) => {}
+                            _ => return Err(Fail::Skip(Skip::Changed)),
                         }
                         match self.cloud.name_taken(to, name).await? {
                             Some(false) => {}
@@ -75,7 +85,7 @@ impl<C: Cloud> Executor<C> {
                         "OneDrive brought it back as another item; it comes to this PC as a new one".into(),
                     ));
                 }
-                if row.parent_id.as_deref() != Some(to.0.as_str()) || row.name != *name {
+                if row.parent_id.as_deref() != Some(to.0.as_str()) || !oneup_sync::same_name(&row.name, name) {
                     // Back, but elsewhere (another folder or name): the
                     // rewind's next round moves it, from where it is.
                     tracing::warn!("OneDrive restored an item somewhere other than asked");
