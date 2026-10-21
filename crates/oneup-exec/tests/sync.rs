@@ -1532,6 +1532,8 @@ impl Sync {
             followed.lock().unwrap().extend(approved.iter().map(|a| a.op().clone()));
             approved
         };
+        let ats: Vec<(Op, String)> =
+            r.approved.iter().filter_map(|a| a.at().map(|at| (a.op().clone(), at.to_string()))).collect();
         let report = self.exec.run_following(store, r.approved, &count, may_run, &follow, self.follow_max).await;
         if let Some(w) = &mut self.stops.window {
             for op in &report.done {
@@ -1550,10 +1552,8 @@ impl Sync {
                 job.follows.extend(follows.iter().map(|f| oneup_gate::follow_key(f).0));
             }
             // Each follow-up goes once it ran.
-            for op in &report.done {
-                if let Some(f) = oneup_gate::Follow::of(op) {
-                    job.follows.remove(&oneup_gate::follow_key(&f).0);
-                }
+            for k in oneup_gate::follow_keys_done(&report.done, &ats) {
+                job.follows.remove(&k.0);
             }
             let tried = order.iter().any(|o| matches!(o, Op::Rewind { .. }));
             r.stalls = if tried && ran.is_empty() { r.stalls + 1 } else { 0 };
