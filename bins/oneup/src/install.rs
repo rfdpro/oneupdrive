@@ -114,10 +114,13 @@ pub async fn stop_agents(dirs: &[PathBuf], limit: Duration) {
     }
 }
 
-/// Releases `dir`'s Files On-Demand folder, if it has one.
+/// Releases `dir`'s Files On-Demand folder, if it has one. Its database is
+/// only read (`Store::peek_meta`): an agent that didn't stop in time may
+/// be another build, and opening the database as a store would upgrade it
+/// under that agent.
 fn release(dir: &Path) {
-    let Ok(store) = crate::setup::open_store(dir, 1024) else { return };
-    let get = |k| store.read(|o| o.meta_get(k)).ok().flatten();
+    let db = dir.join("state.db");
+    let get = |k| oneup_store::Store::peek_meta(&db, k).ok().flatten();
     if let (Some(local), Some(token)) = (get(crate::sync::KEY_LOCAL), get(crate::sync::KEY_TOKEN))
         && crate::ondemand::is_on(Path::new(&local), &token)
     {

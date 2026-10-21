@@ -78,6 +78,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 oneup-effects = { path = "../../crates/oneup-effects", features = ["fake"] }
 # Simulated time for the agent's waits (tests only).
 tokio = { version = "1", features = ["test-util"] }
+# Databases of older versions, to check other folders' are only read.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lints]
 workspace = true
