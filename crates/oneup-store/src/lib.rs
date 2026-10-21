@@ -802,9 +802,53 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             return Err(Error::TooNew { found: at, supported: SCHEMA_VERSION });
         }
         if at < to {
+            if to == 24 {
+                settle_v23(&tx)?;
+            }
             tx.execute_batch(&format!("{sql} PRAGMA user_version = {to};"))?;
         }
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Before v24's refold: a store that a pre-release build marked v23 with
+/// an earlier shape of v20 to v23 (tables, indexes, triggers or columns
+/// missing) gets what it lacks, from the same definitions. A v23 store that
+/// has them all is left as it is. The columns come first, so the indexes
+/// and triggers on them can be made.
+fn settle_v23(tx: &Connection) -> Result<()> {
+    for (table, column, def) in [
+        ("pin_changed", "seen", "INTEGER NOT NULL DEFAULT 0"),
+        ("pin_user", "created", "INTEGER"),
+        ("synced_item", "fold", "TEXT"),
+    ] {
+        let (exists, has): (bool, bool) = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1),
+                    EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            [table, column],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if exists && !has {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {def};"))?;
+        }
+    }
+    // The steps' own SQL, making only what isn't there; their column
+    // additions and fills are the loop above and v24.
+    let missing = |sql: &str| {
+        sql.lines()
+            .filter(|l| !l.starts_with("ALTER TABLE") && !l.starts_with("UPDATE "))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            )
+            .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+            .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
+            .replace("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ")
+    };
+    for sql in [dupes::MIGRATE_V20.to_string(), pins::migrate_v22(), history::migrate_v23()] {
+        tx.execute_batch(&missing(&sql))?;
     }
     Ok(())
 }
@@ -2199,6 +2243,88 @@ mod tests {
         assert_eq!(s.read(|o| o.local_stats()).unwrap(), LocalStats::default());
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A store a pre-release build marked v23 with an earlier shape of v20
+    /// to v23 (no duplicates table, older pin tables, no record of where
+    /// deleted items went, no folded names) ends up as a new store is.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_store_marked_v23_in_an_earlier_shape_is_settled() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fresh, earlier) = (dir.join("fresh.db"), dir.join("earlier.db"));
+        drop(Store::open(&fresh, 1024).unwrap());
+        drop(Store::open(&earlier, 1024).unwrap());
+        Connection::open(&earlier)
+            .unwrap()
+            .execute_batch(&format!(
+                "{} DROP TABLE pin_user_hold; DROP TRIGGER pin_user_folder; DROP TRIGGER pin_user_folder_lost;
+                 ALTER TABLE pin_changed DROP COLUMN seen; ALTER TABLE pin_user DROP COLUMN created;
+                 DROP INDEX remote_deleted_from_at; DROP TABLE remote_deleted_from;
+                 DROP INDEX synced_item_fold; ALTER TABLE synced_item DROP COLUMN fold;
+                 PRAGMA user_version = 23;",
+                dupes::UNDO_V20
+            ))
+            .unwrap();
+        assert_ne!(shape(&earlier), shape(&fresh));
+        drop(Store::open(&earlier, 1024).unwrap());
+        assert_eq!(shape(&earlier), shape(&fresh));
+        // A v23 store in the final shape: v24 changes nothing but the version.
+        let before = shape(&fresh);
+        Connection::open(&fresh).unwrap().execute_batch("PRAGMA user_version = 23;").unwrap();
+        drop(Store::open(&fresh, 1024).unwrap());
+        assert_eq!(shape(&fresh), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every table's columns, and every index's and trigger's definition,
+    /// spaced alike, with the schema version.
+    #[allow(clippy::unwrap_used)]
+    fn shape(path: &Path) -> (i64, Vec<(String, String, String)>) {
+        let c = Connection::open(path).unwrap();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let mut st = c
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> =
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect();
+        let out = rows
+            .into_iter()
+            .map(|(t, n, sql)| {
+                let what = if t == "table" {
+                    let mut cols = c
+                        .prepare(&format!(
+                            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('{n}')"
+                        ))
+                        .unwrap();
+                    let cols: Vec<String> = cols
+                        .query_map([], |r| {
+                            Ok(format!(
+                                "{} {} {} {:?} {}",
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                                r.get::<_, i64>(4)?
+                            ))
+                        })
+                        .unwrap()
+                        .map(|r| r.unwrap())
+                        .collect();
+                    cols.join(", ")
+                } else {
+                    sql.unwrap_or_default()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .replace(" IF NOT EXISTS", "")
+                };
+                (t, n, what)
+            })
+            .collect();
+        (v, out)
     }
 
     /// A look at another data folder's database reads its cloud root and
