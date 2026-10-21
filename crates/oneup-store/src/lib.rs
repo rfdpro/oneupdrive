@@ -477,6 +477,14 @@ fn table_of<'a>(sql: &'a str, name: &'a str) -> &'a str {
     name
 }
 
+/// A read-only connection to the database at `path`, which must exist:
+/// never upgraded, never written.
+fn peek(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_WAIT)?;
+    Ok(conn)
+}
+
 impl Store {
     /// Opens (creating if needed) the database. `cache_kib` bounds SQLite's
     /// page cache, which is how the memory profile reaches the store.
@@ -495,11 +503,15 @@ impl Store {
     /// would upgrade it under the agent using it, an older build that then
     /// writes to a schema it doesn't know.
     pub fn peek_remote_root_id(path: &Path) -> Result<Option<String>> {
-        let conn =
-            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
-        conn.busy_timeout(BUSY_WAIT)?;
         // `remote_item` and its root (kind 2) are there since v1.
-        Ok(conn.query_row("SELECT id FROM remote_item WHERE kind = 2 LIMIT 1", [], |r| r.get(0)).optional()?)
+        Ok(peek(path)?.query_row("SELECT id FROM remote_item WHERE kind = 2 LIMIT 1", [], |r| r.get(0)).optional()?)
+    }
+
+    /// `key` in the `meta` table (there since v1) of the database at
+    /// `path`, read as [`Store::peek_remote_root_id`] reads: for which
+    /// folder another data folder syncs.
+    pub fn peek_meta(path: &Path, key: &str) -> Result<Option<String>> {
+        Ok(peek(path)?.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
     }
 
     /// Another connection to the same database file, for a reader on
@@ -2205,11 +2217,14 @@ mod tests {
                 c.execute_batch(&format!(
                     "PRAGMA journal_mode = WAL; {SCHEMA_V1}
                      INSERT INTO remote_item(id, parent_id, name, kind) VALUES ('d1!101', NULL, 'root', 2);
+                     INSERT INTO meta(key, value) VALUES ('sync.local_path', 'C:/Sync');
                      PRAGMA user_version = {version};"
                 ))
                 .unwrap();
             }
             assert_eq!(Store::peek_remote_root_id(&path).unwrap().as_deref(), Some("d1!101"), "v{version}");
+            assert_eq!(Store::peek_meta(&path, "sync.local_path").unwrap().as_deref(), Some("C:/Sync"));
+            assert_eq!(Store::peek_meta(&path, "none").unwrap(), None);
             let c = Connection::open(&path).unwrap();
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
             assert_eq!(v, version, "left at its version");

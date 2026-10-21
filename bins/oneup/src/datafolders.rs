@@ -82,8 +82,12 @@ pub fn for_path_in(path: &Path, dirs: Vec<PathBuf>) -> Option<(PathBuf, String)>
     let path = std::fs::canonicalize(path).ok()?;
     let mut best: Option<(PathBuf, String, usize)> = None;
     for d in dirs {
-        let Ok(store) = crate::setup::open_store(&d, 1024) else { continue };
-        let Some(local) = store.read(|o| o.meta_get(crate::sync::KEY_LOCAL)).ok().flatten() else { continue };
+        // Read only: opening the database as a store would upgrade it
+        // under that folder's agent, maybe another build.
+        let Some(local) = oneup_store::Store::peek_meta(&d.join("state.db"), crate::sync::KEY_LOCAL).ok().flatten()
+        else {
+            continue;
+        };
         let local = std::fs::canonicalize(&local).unwrap_or_else(|_| PathBuf::from(&local));
         if let Ok(rel) = path.strip_prefix(&local) {
             // The innermost synced folder wins (a vault folder inside another).
