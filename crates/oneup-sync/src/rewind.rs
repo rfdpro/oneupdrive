@@ -90,6 +90,11 @@ pub trait History {
     /// OneDrive's recycle bin.
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, Self::Error>;
 
+    /// Where OneDrive brings deleted item `id` back to: the folder it was
+    /// deleted from, under the name it had then, whatever is asked
+    /// (measured). Only when that's known for certain; `None` otherwise.
+    fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>, Self::Error>;
+
     /// A record's local last-write time (`Base::local_mtime`) in Unix ms,
     /// to compare with a moment. By default from a Windows FILETIME.
     fn written_ms(&self, local_mtime: i64) -> i64 {
@@ -268,6 +273,10 @@ pub enum Skip {
     ExistedBefore,
     /// A folder created since that holds what's left alone: it stays.
     Keeps,
+    /// Deleted from another folder or under another name than it goes
+    /// back to, or from where isn't known for certain: OneDrive would bring
+    /// it back there, so only the user can, from its recycle bin.
+    DeletedElsewhere,
 }
 
 impl Skip {
@@ -504,10 +513,17 @@ where
     // round or before: an item moved out of it in OneDrive and not yet on
     // this PC would otherwise have this PC's copy of the folder made again
     // in OneDrive to hold it.
-    // A folder that holds what stays (left alone for good) stays too.
+    // A folder that holds what stays (left alone for good) stays too; an
+    // item left in the recycle bin isn't in it (its record may hold another
+    // item now, created since, which goes).
     let mut gone: BTreeSet<Sid> = b.remove_files.iter().filter_map(|(op, _)| sid_of(op)).collect();
-    let mut stays: BTreeSet<Sid> =
-        b.out.skipped.iter().filter(|(_, _, why)| !why.passes()).map(|(sid, _, _)| *sid).collect();
+    let mut stays: BTreeSet<Sid> = b
+        .out
+        .skipped
+        .iter()
+        .filter(|(_, _, why)| !why.passes() && *why != Skip::DeletedElsewhere)
+        .map(|(sid, _, _)| *sid)
+        .collect();
     b.remove_folders.sort_by_key(|(d, _, _)| std::cmp::Reverse(*d));
     let mut folders = Vec::new();
     for (d, op, p) in std::mem::take(&mut b.remove_folders) {
@@ -808,6 +824,14 @@ impl Builder {
             (NodeKind::File, Some(hash)) => Some((w.size, hash)),
             _ => None,
         };
+        // OneDrive puts it back where it was deleted from, not where it's
+        // asked to go: only when that's where it goes (an item moved on the
+        // web, then deleted with the folder it went into, would bring that
+        // folder back too).
+        if h.deleted_from(&id)?.is_none_or(|(p, n)| p != to || !crate::same_name(&n, &w.name)) {
+            self.skip(sid, path, Skip::DeletedElsewhere);
+            return Ok(());
+        }
         let gone = h.last_seen(&id)?.and_then(|g| g.hash.map(|hash| (g.size, hash)));
         self.change(sid, Kind::Restore, w.kind, Some(path), None, w.size);
         let step = Step::Restore { id, to, name: w.name.clone(), kind: w.kind, content, gone };

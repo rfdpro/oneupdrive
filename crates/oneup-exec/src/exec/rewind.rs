@@ -45,11 +45,11 @@ impl<C: Cloud> Executor<C> {
                         // renames what holds that name (measured): only when
                         // that's where this step puts it, and nothing has the
                         // name there now (`data-safety.md` invariant 2).
-                        let land = store.read(|o| landing(o, id))?;
+                        // As planned; a deletion seen since that says
+                        // otherwise is in the next plan.
+                        let land = store.read(|o| o.deleted_from(id))?;
                         if land.as_ref().is_none_or(|(p, n)| p != to || !oneup_sync::same_name(n, name)) {
-                            return Err(Fail::Failed(
-                                "OneDrive would bring it back where it was deleted, not where it goes".into(),
-                            ));
+                            return Err(Fail::Skip(Skip::Changed));
                         }
                         // Into a live folder only: restoring an item whose
                         // folder was deleted with it brings that folder back
@@ -310,20 +310,6 @@ pub fn rewind_mark(o: &oneup_store::Ops<'_>, op: &Op) -> oneup_store::Result<Mar
         }),
         None => Mark::Absent,
     })
-}
-
-/// Where OneDrive brings deleted item `id` back to (measured: where it was
-/// deleted from, under the name it had): its last record's folder, by its
-/// OneDrive ID, and name. `None`: not known.
-fn landing(o: &oneup_store::Ops<'_>, id: &RemoteId) -> oneup_store::Result<Option<(RemoteId, String)>> {
-    use oneup_sync::rewind::History as _;
-    let Some(was) = o.last_seen(id)? else { return Ok(None) };
-    let Some(parent) = was.parent else { return Ok(None) };
-    let folder = match o.synced_get(parent)?.and_then(|b| b.remote) {
-        Some(r) => Some(r),
-        None => o.history_remote_of(parent)?,
-    };
-    Ok(folder.map(|f| (f, was.name)))
 }
 
 /// What this PC is to do to follow rewind step `op`, which just ran, bound

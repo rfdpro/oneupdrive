@@ -145,7 +145,7 @@ type Meanwhile = Box<dyn FnOnce(&mut State) + Send>;
 
 /// What one pull delivers: every live item (parents first), then the
 /// deletions since the pull before.
-type Listing = (Vec<RemoteRow>, Vec<String>);
+type Listing = (Vec<RemoteRow>, Vec<(String, Option<String>)>);
 
 impl State {
     fn bump(&mut self) -> u64 {
@@ -206,7 +206,16 @@ impl State {
             i += 1;
         }
         let rows = order.iter().map(|id| self.row(id)).collect();
-        (rows, std::mem::take(&mut self.deleted))
+        // Each with the folder it was deleted from, as delta says it
+        // (measured: `parentReference`).
+        let deleted = std::mem::take(&mut self.deleted)
+            .into_iter()
+            .map(|id| {
+                let parent = self.bin.get(&id).and_then(|it| it.parent.clone());
+                (id, parent)
+            })
+            .collect();
+        (rows, deleted)
     }
     /// Brings `id` back from the recycle bin where it was deleted from, as
     /// Graph does: an item holding its name there is renamed `name(1)`.
@@ -364,16 +373,17 @@ impl Fake {
     fn delete_tree(&self, path: &str) {
         let mut s = self.0.lock().unwrap();
         let top = resolve(&s, path);
-        let mut todo = vec![top.clone()];
+        let mut todo = vec![top];
         while let Some(id) = todo.pop() {
             todo.extend(
                 s.items.iter().filter(|(_, it)| it.parent.as_deref() == Some(id.as_str())).map(|(k, _)| k.clone()),
             );
             let it = s.items.remove(&id).unwrap();
             s.kept.push(it.content.clone());
-            s.bin.insert(id, it);
+            s.bin.insert(id.clone(), it);
+            // Delta lists each item deleted (measured), the folder first.
+            s.deleted.push(id);
         }
-        s.deleted.push(top);
     }
 
     /// Empties OneDrive's recycle bin (what's in it can't come back).
@@ -402,8 +412,11 @@ impl Fake {
                     for r in &rows {
                         o.upsert_item(r, false)?;
                     }
-                    for id in &deleted {
+                    for (id, parent) in &deleted {
                         o.delete_subtree(id)?;
+                        if let Some(p) = parent {
+                            o.note_deleted_from(id, p)?;
+                        }
                     }
                     Ok(())
                 })
@@ -6828,6 +6841,70 @@ async fn everyday_a_rewind_keeps_what_was_there_then_but_synced_only_since() {
     let t = local_tree(&s.dir.0);
     assert_eq!(t.get("/docs/old.txt"), Some(&Some(b"left out by a rule".to_vec())), "it was there then");
     assert!(!t.contains_key("/docs/new.txt"), "removed: created since");
+}
+
+#[tokio::test]
+async fn an_item_moved_on_the_web_and_deleted_there_isnt_restored() {
+    // docs/a.txt synced. On the web, between two syncs: a.txt moved into a
+    // new folder trash, trash deleted, and another trash made. Delta says
+    // a.txt went from the old trash (measured), which OneDrive would bring
+    // back with it, renaming the new one: neither the rewind nor a restore
+    // asked for brings anything back or renames anything. The rewind says
+    // to restore it from the recycle bin on the web.
+    use oneup_sync::rewind::{Skip as Why, Step};
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-deleted-elsewhere", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a");
+    s.settle().await;
+    let at = moment();
+    let (docs, a) = {
+        let st = cloud.0.lock().unwrap();
+        (resolve(&st, "docs"), resolve(&st, "docs/a.txt"))
+    };
+    cloud.add("trash", None);
+    cloud.mv("docs/a.txt", "trash");
+    cloud.delete_tree("trash");
+    cloud.add("trash", None);
+    write(&s.p("docs/new.txt"), b"new since");
+    s.settle().await;
+    assert!(!s.p("docs/a.txt").exists());
+    let r = s
+        .obs
+        .store()
+        .read(|o| {
+            let sid = oneup_sync::rewind::folder_at(o, o, &["docs"], at)?.unwrap();
+            oneup_sync::rewind::plan(o, o, sid, at, 1000).map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
+        })
+        .unwrap();
+    assert!(r.skipped.iter().any(|(_, p, why)| p == "/docs/a.txt" && *why == Why::DeletedElsewhere), "{r:?}");
+    let restores = r.ops.iter().chain(r.later.iter().map(|(o, _)| o));
+    assert!(!restores.clone().any(|o| matches!(o.rewind_step(), Some(Step::Restore { .. }))), "{r:?}");
+    let before = cloud.tree();
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    let mut after = cloud.tree();
+    assert_eq!(after.remove("/docs/new.txt"), None, "the rest of it ran");
+    let mut expected = before;
+    expected.remove("/docs/new.txt");
+    assert_eq!(after, expected, "nothing restored, nothing renamed");
+    // Asked for by itself (as from the list of deleted items): the same.
+    let op = Op::rewind(
+        2,
+        Step::Restore {
+            id: RemoteId(a.clone()),
+            to: RemoteId(docs),
+            name: "a.txt".into(),
+            kind: oneup_sync::NodeKind::File,
+            content: None,
+            gone: None,
+        },
+    );
+    s.extra = vec![op.clone()];
+    let r = s.attempt().await;
+    assert!(r.skipped.iter().any(|(o, _)| *o == op) && !r.failed.iter().any(|(o, _)| *o == op), "{r:?}");
+    s.extra = Vec::new();
+    s.settle().await;
+    assert_eq!(cloud.tree(), expected, "nothing restored, nothing renamed");
+    assert!(cloud.0.lock().unwrap().bin.contains_key(&a), "still in the recycle bin");
 }
 
 // ---------------------------------------------------------------- duplicates

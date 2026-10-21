@@ -38,7 +38,8 @@ const CHANGED: i64 = 1;
 const REMOVED: i64 = 2;
 
 /// v23: the history table, its indexes and its triggers, the indexes on
-/// Synced names and the item marks. A name with letters SQLite's `NOCASE`
+/// Synced names, the item marks and where cloud items were deleted from
+/// (`remote_deleted_from`, see [`Ops::deleted_from`]). A name with letters SQLite's `NOCASE`
 /// doesn't fold (anything but ASCII) also keeps its folded form
 /// (`synced_item.fold`, written with the row by `Ops::synced_put`, filled
 /// here once with the store's own `oneup_fold`, a query, not part of the
@@ -78,6 +79,14 @@ ALTER TABLE synced_item ADD COLUMN fold TEXT;
 UPDATE synced_item SET fold = oneup_fold(name) WHERE name GLOB '*[^ -~]*';
 CREATE INDEX synced_item_fold ON synced_item(parent_sid, fold) WHERE fold IS NOT NULL;
 CREATE TABLE synced_unsettled (sid INTEGER PRIMARY KEY);
+CREATE TABLE remote_deleted_from (
+    id        TEXT PRIMARY KEY,
+    parent_id TEXT,
+    name      TEXT NOT NULL,
+    at_ms     INTEGER NOT NULL,
+    certain   INTEGER NOT NULL
+);
+CREATE INDEX remote_deleted_from_at ON remote_deleted_from(at_ms);
 {unsettled}
 CREATE TRIGGER synced_history_ins AFTER INSERT ON synced_item WHEN {on}
 BEGIN
@@ -170,7 +179,7 @@ pub(crate) const UNDO_V23: &str = "DROP TRIGGER synced_history_ins; DROP TRIGGER
     DROP INDEX synced_item_fold; ALTER TABLE synced_item DROP COLUMN fold;
     DROP TRIGGER unsettled_local_ins; DROP TRIGGER unsettled_local_upd; DROP TRIGGER unsettled_local_del;
     DROP TRIGGER unsettled_remote_ins; DROP TRIGGER unsettled_remote_upd; DROP TRIGGER unsettled_remote_del;
-    DROP TRIGGER unsettled_synced_upd; DROP TABLE synced_unsettled;";
+    DROP TRIGGER unsettled_synced_upd; DROP TABLE synced_unsettled; DROP TABLE remote_deleted_from;";
 
 /// An item whose record went, with its OneDrive ID: deleted (or set aside)
 /// at `at_ms`, as it was until then.
@@ -415,6 +424,13 @@ impl Ops<'_> {
             if since == i64::MAX || at > since {
                 self.meta_set(SINCE, &at.to_string())?;
             }
+            // Deleted before what's covered: no rewind restores it.
+            self.c
+                .prepare_cached(
+                    "DELETE FROM remote_deleted_from WHERE id IN (
+                         SELECT id FROM remote_deleted_from WHERE at_ms <= ?1 ORDER BY at_ms LIMIT ?2)",
+                )?
+                .execute(rusqlite::params![at, budget])?;
         }
         Ok(n)
     }
@@ -467,8 +483,74 @@ impl Ops<'_> {
         }
         self.c.execute("DELETE FROM synced_history", [])?;
         self.c.execute("DELETE FROM synced_unsettled", [])?;
+        self.c.execute("DELETE FROM remote_deleted_from", [])?;
         self.meta_delete(ON)?;
         self.meta_delete(SINCE)
+    }
+
+    /// Records where the cloud items in `t_sub` (a subtree
+    /// [`Ops::delete_subtree`] is removing) were, as the mirror last had
+    /// them: each one's folder and name, the folder not known for certain
+    /// ([`Ops::note_deleted_from`] makes it so). Only while the history is
+    /// kept: what a rewind or a restore of a deleted item reads.
+    pub(crate) fn note_gone_subtree(&self) -> Result<()> {
+        self.c
+            .prepare_cached(&format!(
+                "INSERT OR REPLACE INTO remote_deleted_from(id, parent_id, name, at_ms, certain)
+                 SELECT id, parent_id, name, {NOW_MS}, 0 FROM remote_item
+                 WHERE id IN (SELECT id FROM t_sub) AND EXISTS (SELECT 1 FROM meta WHERE key = '{ON}')"
+            ))?
+            .execute([])?;
+        Ok(())
+    }
+
+    /// Notes the folder OneDrive says cloud item `id` was deleted from (a
+    /// delta deletion's `parentReference`, measured: the folder it was in
+    /// when deleted, even one it was moved into that this PC never saw).
+    /// For an item [`Ops::delete_subtree`] just removed.
+    pub fn note_deleted_from(&self, id: &str, parent: &str) -> Result<()> {
+        self.c
+            .prepare_cached("UPDATE remote_deleted_from SET parent_id = ?2, certain = 1 WHERE id = ?1")?
+            .execute([id, parent])?;
+        Ok(())
+    }
+
+    /// Records deleted cloud item `id` as deleted from `parent` under
+    /// `name` at `at_ms`, for certain. For the simulation, which keeps
+    /// OneDrive's recycle bin of its own.
+    #[doc(hidden)]
+    pub fn deleted_from_put(&self, id: &str, parent: &str, name: &str, at_ms: i64) -> Result<()> {
+        self.c.execute(
+            "INSERT OR REPLACE INTO remote_deleted_from(id, parent_id, name, at_ms, certain) VALUES (?1, ?2, ?3, ?4, 1)",
+            rusqlite::params![id, parent, name, at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// See [`History::deleted_from`]. The folder is certain when OneDrive
+    /// said it; otherwise it's the mirror's last, taken only when the
+    /// item's last record agrees (that folder too): a move this PC never
+    /// synced may have come between.
+    pub fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>> {
+        let row: Option<(Option<String>, String, bool)> = self
+            .c
+            .prepare_cached("SELECT parent_id, name, certain FROM remote_deleted_from WHERE id = ?1")?
+            .query_row([id.0.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        let Some((Some(parent), name, certain)) = row else { return Ok(None) };
+        let parent = RemoteId(parent);
+        if !certain {
+            let Some(was) = History::last_seen(self, id)? else { return Ok(None) };
+            let Some(p) = was.parent else { return Ok(None) };
+            let folder = match self.synced_get(p)?.and_then(|b| b.remote) {
+                Some(r) => Some(r),
+                None => self.history_remote_of(p)?,
+            };
+            if folder.as_ref() != Some(&parent) {
+                return Ok(None);
+            }
+        }
+        Ok(Some((parent, name)))
     }
 
     /// How many rows the history holds.
@@ -494,6 +576,10 @@ impl History for Ops<'_> {
 
     fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>> {
         self.history_unsettled(limit)
+    }
+
+    fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>> {
+        Ops::deleted_from(self, id)
     }
 
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>> {
@@ -631,6 +717,63 @@ mod tests {
     /// Moves every row's time to `at`, so tests can tell moments apart.
     fn stamp(s: &mut Store, at: i64) {
         s.write(|o| Ok(o.c.execute("UPDATE synced_history SET at_ms = ?1 WHERE at_ms > 1000000000", [at])?)).unwrap();
+    }
+
+    /// Where OneDrive would restore a deleted cloud item: the folder delta
+    /// says it was deleted from, or else the mirror's folder, only while its
+    /// last record agrees (a move this PC never synced may have come
+    /// between). Not kept once the history isn't.
+    #[test]
+    fn where_an_item_was_deleted_from_is_taken_only_when_certain() {
+        use crate::synced::tests::rrow;
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.history_start(0)?;
+            o.synced_put(&root())?;
+            o.upsert_item(&rrow("root", None, "", crate::Kind::Root), false)?;
+            for (id, name) in [("docs", "docs"), ("trash", "trash")] {
+                o.upsert_item(&rrow(id, Some("root"), name, crate::Kind::Folder), false)?;
+            }
+            let docs = Base {
+                kind: NodeKind::Folder,
+                hash: None,
+                remote: Some(RemoteId("docs".into())),
+                ..base(1, ROOT, "docs", 0)
+            };
+            o.synced_put(&docs)?;
+            for (sid, name) in [(2, "a.txt"), (3, "b.txt"), (4, "c.txt")] {
+                o.upsert_item(&rrow(&format!("r{sid}"), Some("docs"), name, crate::Kind::File), false)?;
+                o.synced_put(&base(sid, 1, name, 3))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let gone = |s: &mut Store, sid: Sid, from: Option<&str>| {
+            s.write(|o| {
+                let id = format!("r{sid}");
+                o.delete_subtree(&id)?;
+                if let Some(p) = from {
+                    o.note_deleted_from(&id, p)?;
+                }
+                o.synced_remove(sid).map(drop)
+            })
+            .unwrap();
+        };
+        let from = |s: &Store, sid: Sid| s.read(|o| o.deleted_from(&RemoteId(format!("r{sid}")))).unwrap();
+        let at = |p: &str, n: &str| Some((RemoteId(p.into()), n.to_string()));
+        // a.txt: deleted where its record has it.
+        gone(&mut s, 2, None);
+        assert_eq!(from(&s, 2), at("docs", "a.txt"));
+        // b.txt: moved into trash in OneDrive (never synced), then deleted,
+        // delta not saying from where: not known.
+        s.write(|o| o.upsert_item(&rrow("r3", Some("trash"), "b.txt", crate::Kind::File), false).map(drop)).unwrap();
+        gone(&mut s, 3, None);
+        assert_eq!(from(&s, 3), None);
+        // c.txt: delta says it went from trash: that, whatever the record.
+        gone(&mut s, 4, Some("trash"));
+        assert_eq!(from(&s, 4), at("trash", "c.txt"));
+        s.write(|o| o.history_stop()).unwrap();
+        assert_eq!(from(&s, 4), None, "not kept without the history");
     }
 
     #[test]

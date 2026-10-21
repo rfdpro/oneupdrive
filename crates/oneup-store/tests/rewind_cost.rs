@@ -84,6 +84,10 @@ impl History for Counting<'_, '_> {
         self.n(1);
         History::last_seen(self.o, id)
     }
+    fn deleted_from(&self, id: &RemoteId) -> R<Option<(RemoteId, String)>> {
+        self.n(1);
+        History::deleted_from(self.o, id)
+    }
     fn changed_after(&self, at: i64, limit: usize) -> R<Option<Vec<Sid>>> {
         let v = History::changed_after(self.o, at, limit)?;
         self.n(v.as_ref().map_or(0, Vec::len));

@@ -1019,6 +1019,7 @@ impl Ops<'_> {
     pub fn delete_subtree(&self, id: &str) -> Result<usize> {
         self.load_subtree(id)?;
         self.note_remote_subtree_deleted()?;
+        self.note_gone_subtree()?;
         self.c.execute(
             "DELETE FROM remote_pruned WHERE id IN (
                  WITH RECURSIVE ps(id) AS (
