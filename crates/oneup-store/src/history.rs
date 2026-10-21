@@ -377,6 +377,7 @@ impl Ops<'_> {
         needed_after: Option<i64>,
         budget: usize,
     ) -> Result<usize> {
+        self.prune_deleted_from(keep, now_ms, budget)?;
         let mut upto: Option<i64> = None;
         if keep.days > 0 {
             let cutoff = now_ms.saturating_sub(i64::from(keep.days).saturating_mul(86_400_000));
@@ -493,15 +494,47 @@ impl Ops<'_> {
     /// them: each one's folder and name, the folder not known for certain
     /// ([`Ops::note_deleted_from`] makes it so). Only while the history is
     /// kept: what a rewind or a restore of a deleted item reads.
+    ///
+    /// Only items a record links: nothing else is restored (a rewind's
+    /// steps and the list of deleted items come from records), and a large
+    /// folder never synced adds nothing.
     pub(crate) fn note_gone_subtree(&self) -> Result<()> {
         self.c
             .prepare_cached(&format!(
                 "INSERT OR REPLACE INTO remote_deleted_from(id, parent_id, name, at_ms, certain)
-                 SELECT id, parent_id, name, {NOW_MS}, 0 FROM remote_item
-                 WHERE id IN (SELECT id FROM t_sub) AND EXISTS (SELECT 1 FROM meta WHERE key = '{ON}')"
+                 SELECT r.id, r.parent_id, r.name, {NOW_MS}, 0 FROM remote_item r
+                 WHERE r.id IN (SELECT id FROM t_sub)
+                   AND EXISTS (SELECT 1 FROM synced_item s WHERE s.remote_id = r.id)
+                   AND EXISTS (SELECT 1 FROM meta WHERE key = '{ON}')"
             ))?
             .execute([])?;
         Ok(())
+    }
+
+    /// Drops at most `budget` of where items were deleted from, the oldest,
+    /// from before what the history covers or older than `keep.days`: no
+    /// rewind goes back that far. Every round, whatever the history drops,
+    /// so they never outlast it.
+    fn prune_deleted_from(&self, keep: Keep, now_ms: i64, budget: usize) -> Result<()> {
+        let since = self.history_since()?;
+        let mut before = if since == i64::MAX { i64::MIN } else { since };
+        if keep.days > 0 {
+            before = before.max(now_ms.saturating_sub(i64::from(keep.days).saturating_mul(86_400_000)));
+        }
+        let budget = i64::try_from(budget).unwrap_or(i64::MAX).max(1);
+        self.c
+            .prepare_cached(
+                "DELETE FROM remote_deleted_from WHERE id IN (
+                     SELECT id FROM remote_deleted_from WHERE at_ms < ?1 ORDER BY at_ms LIMIT ?2)",
+            )?
+            .execute(rusqlite::params![before, budget])?;
+        Ok(())
+    }
+
+    /// How many deleted items' places are kept (see [`Ops::deleted_from`]).
+    #[doc(hidden)]
+    pub fn deleted_from_rows(&self) -> Result<i64> {
+        Ok(self.c.prepare_cached("SELECT count(*) FROM remote_deleted_from")?.query_row([], |r| r.get(0))?)
     }
 
     /// Notes the folder OneDrive says cloud item `id` was deleted from (a
@@ -774,6 +807,51 @@ mod tests {
         assert_eq!(from(&s, 4), at("trash", "c.txt"));
         s.write(|o| o.history_stop()).unwrap();
         assert_eq!(from(&s, 4), None, "not kept without the history");
+    }
+
+    /// Where deleted items went from is bounded: a large folder that was
+    /// never synced adds nothing when it's deleted, and what's from before
+    /// the history's coverage (or its days) goes a budget per round, even
+    /// while the history itself is within its limits.
+    #[test]
+    fn where_items_were_deleted_from_is_bounded() {
+        use crate::synced::tests::rrow;
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.history_start(1_000)?;
+            o.synced_put(&root())?;
+            o.upsert_item(&rrow("root", None, "", crate::Kind::Root), false)?;
+            o.upsert_item(&rrow("big", Some("root"), "big", crate::Kind::Folder), false)?;
+            for i in 0..2_000 {
+                o.upsert_item(&rrow(&format!("u{i}"), Some("big"), &format!("u{i}"), crate::Kind::File), false)?;
+            }
+            // One of them synced.
+            o.synced_put(&Base { remote: Some(RemoteId("u7".into())), ..base(1, ROOT, "u7", 3) })?;
+            o.delete_subtree("big").map(drop)
+        })
+        .unwrap();
+        assert_eq!(s.read(|o| o.deleted_from_rows()).unwrap(), 1, "only what a record links");
+        // From before the coverage (as after an upgrade, or once the
+        // history moved on): pruned over rounds, with nothing in the history.
+        s.write(|o| {
+            for i in 0..1_000 {
+                o.deleted_from_put(&format!("old{i}"), "root", "x", 500)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let keep = Keep { days: 30, rows: 1_000_000 };
+        let mut left = Vec::new();
+        for _ in 0..12 {
+            s.write(|o| o.history_prune_some(keep, 2_000, None, 100).map(drop)).unwrap();
+            left.push(s.read(|o| o.deleted_from_rows()).unwrap());
+        }
+        assert_eq!(left[0], 901, "a budget per round: {left:?}");
+        assert_eq!(*left.last().unwrap(), 1, "down to what's covered: {left:?}");
+        // Older than the days kept: the same.
+        let later = 4_000_000_000_000;
+        s.write(|o| o.history_prune_some(keep, later, None, 100).map(drop)).unwrap();
+        assert_eq!(s.read(|o| o.deleted_from_rows()).unwrap(), 0);
     }
 
     #[test]

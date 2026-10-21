@@ -319,6 +319,21 @@ mod tests {
             .write(|o| {
                 o.history_start(0)?;
                 let mut t = super::Tally::default();
+                // a.txt synced (only an item a record links is restored).
+                let base = |sid, parent, name: &str, kind, remote: &str| oneup_sync::Base {
+                    sid,
+                    parent,
+                    name: name.into(),
+                    kind,
+                    size: 0,
+                    hash: None,
+                    local: Some(oneup_sync::LocalId(u128::from(sid) + 100)),
+                    local_mtime: 1,
+                    remote: Some(oneup_sync::RemoteId(remote.into())),
+                    remote_etag: "e".into(),
+                };
+                o.synced_put(&base(oneup_sync::ROOT, None, "", oneup_sync::NodeKind::Folder, "R"))?;
+                o.synced_put(&base(2, Some(oneup_sync::ROOT), "a.txt", oneup_sync::NodeKind::File, "a"))?;
                 for json in [
                     r#"{"id":"R","name":"root","root":{},"folder":{"childCount":1}}"#,
                     r#"{"id":"d","name":"docs","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
