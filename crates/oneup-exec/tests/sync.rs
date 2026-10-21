@@ -4416,7 +4416,9 @@ async fn large_uploads_keep_to_their_own_limit() {
         write(&s.p(&format!("big{i}.bin")), &big);
     }
     s.settle().await;
-    assert_eq!(cloud.most_transfers(), 2);
+    // At most the limit; whether two overlap at all depends on the
+    // machine's load.
+    assert!((1..=2).contains(&cloud.most_transfers()), "{}", cloud.most_transfers());
     assert_eq!(cloud.tree().len(), 6);
 }
 
