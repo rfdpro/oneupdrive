@@ -40,7 +40,7 @@
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
 pub mod local;
 pub use local::{LOCAL_SCAN_FORMAT, LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip};
@@ -118,7 +118,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -488,6 +488,20 @@ impl Store {
         Self::init(Connection::open_in_memory()?, 2048)
     }
 
+    /// The ID of the cloud root the database at `path` mirrors, if it has
+    /// one, read without opening it as a store: read-only, never upgraded,
+    /// whatever its version. For a look at another data folder's database
+    /// (the test-account guard reads the default one's drive): opening it
+    /// would upgrade it under the agent using it, an older build that then
+    /// writes to a schema it doesn't know.
+    pub fn peek_remote_root_id(path: &Path) -> Result<Option<String>> {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        conn.busy_timeout(BUSY_WAIT)?;
+        // `remote_item` and its root (kind 2) are there since v1.
+        Ok(conn.query_row("SELECT id FROM remote_item WHERE kind = 2 LIMIT 1", [], |r| r.get(0)).optional()?)
+    }
+
     /// Another connection to the same database file, for a reader on
     /// another thread. `None` for an in-memory database, which no other
     /// connection can reach.
@@ -743,7 +757,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 23] = [
+    let steps: [(i64, String); 24] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -767,6 +781,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (21, shared::MIGRATE_V21.into()),
         (22, pins::migrate_v22()),
         (23, history::migrate_v23()),
+        (24, history::MIGRATE_V24.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2171,6 +2186,36 @@ mod tests {
         assert_eq!(s.read(|o| o.local_root()).unwrap(), None);
         assert_eq!(s.read(|o| o.local_stats()).unwrap(), LocalStats::default());
         drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A look at another data folder's database reads its cloud root and
+    /// leaves it at its version, older or newer than this build's: no
+    /// upgrade under an agent of another build, no refusal of a newer one.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_peek_reads_the_cloud_root_and_never_upgrades() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, version) in [(0, 1), (1, SCHEMA_VERSION - 1), (2, SCHEMA_VERSION + 1)] {
+            let path = dir.join(format!("state{n}.db"));
+            {
+                let c = Connection::open(&path).unwrap();
+                c.execute_batch(&format!(
+                    "PRAGMA journal_mode = WAL; {SCHEMA_V1}
+                     INSERT INTO remote_item(id, parent_id, name, kind) VALUES ('d1!101', NULL, 'root', 2);
+                     PRAGMA user_version = {version};"
+                ))
+                .unwrap();
+            }
+            assert_eq!(Store::peek_remote_root_id(&path).unwrap().as_deref(), Some("d1!101"), "v{version}");
+            let c = Connection::open(&path).unwrap();
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, version, "left at its version");
+        }
+        assert!(Store::peek_remote_root_id(&dir.join("none.db")).is_err(), "never made");
+        assert!(!dir.join("none.db").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -91,15 +91,15 @@ pub fn remove(dir: &Path) -> Result<()> {
 /// The drive mirrored in the default data folder, if any: in OneDrive
 /// Personal, item IDs start with the drive ID (`<drive>!<n>`). Used to refuse
 /// a test-account sign-in that is really the personal account. Only reads
-/// the local database; never contacts the personal account.
+/// the local database, read-only and never upgraded (the default folder's
+/// agent may be another build); never contacts the personal account.
 pub fn personal_drive(default: &Path) -> Option<String> {
     let db = default.join("state.db");
     if !db.exists() {
         return None;
     }
-    let store = oneup_store::Store::open(&db, 1024).ok()?;
-    let root = store.read(|ops| ops.remote_root()).ok()??;
-    root.id.split_once('!').map(|(drive, _)| drive.to_lowercase())
+    let root = oneup_store::Store::peek_remote_root_id(&db).ok()??;
+    root.split_once('!').map(|(drive, _)| drive.to_lowercase())
 }
 
 /// Whether drive ID `drive` is the same drive as `personal` (from
