@@ -298,10 +298,11 @@ pub struct Rewind {
     pub paths: Vec<String>,
     pub changes: Vec<Change>,
     pub skipped: Vec<(Sid, String, Skip)>,
-    /// Folders to remove that wait until this PC has caught up with what
-    /// moved out of them, or until what's in them goes: a later round
-    /// removes them. Part of the preview (and of what an approval covers),
-    /// not of this round's operations; with their paths.
+    /// Steps that wait for a later round: folders to remove until this PC
+    /// has caught up with what moved out of them, or until what's in them
+    /// goes; restores until their name is free. Part of the preview (and
+    /// of what an approval covers), not of this round's operations; with
+    /// their paths.
     pub later: Vec<(Op, String)>,
 }
 
@@ -916,16 +917,18 @@ impl Builder {
     /// files removed, restores from the top down, moves (a move into a
     /// name another move frees after it; names swapped through a temporary
     /// name), then folders removed from the bottom up. What can't go yet (a
-    /// restore into a name a move frees) waits for the next round.
+    /// restore into a name an item leaving frees) waits for a later round.
     fn finish(mut self) -> Rewind {
         self.restores.sort_by_key(|(d, _, _)| *d);
         self.resets.sort_by_key(|(d, _, _)| *d);
         self.remove_folders.sort_by_key(|(d, _, _)| std::cmp::Reverse(*d));
         // A name held by an item that leaves only later (a folder that goes
-        // once emptied, perhaps of the very item that needs the name; for a
-        // restore, an item that moves on, perhaps into what's restored):
-        // the item waits under a temporary name beside it, and the next
-        // round moves it on.
+        // once emptied, perhaps of the very item that needs the name): a
+        // move waits under a temporary name beside it, and the next round
+        // moves it on. A restore takes no name (OneDrive brings an item back
+        // under the name it had, measured): it waits, in a later round, for
+        // the name to be free, as does one whose name an item moving on
+        // holds.
         let held = |ops: &[(usize, Op, String)]| -> BTreeSet<Slot> {
             ops.iter()
                 .filter_map(|(_, op, _)| match op.rewind_step()? {
@@ -940,12 +943,45 @@ impl Builder {
         let mut emptied = held(&self.remove_folders);
         emptied.extend(held(&later));
         let moved = held(&self.resets);
-        for (_, op, _) in &mut self.restores {
+        let restored: BTreeSet<RemoteId> = self
+            .restores
+            .iter()
+            .filter_map(|(_, op, _)| match op.rewind_step()? {
+                Step::Restore { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut waits: BTreeSet<Slot> = BTreeSet::new();
+        let mut restores = Vec::with_capacity(self.restores.len());
+        for (d, op, p) in std::mem::take(&mut self.restores) {
+            let slot = match op.rewind_step() {
+                Some(Step::Restore { to, name, .. }) => Some((to.clone(), fold(name))),
+                _ => None,
+            };
+            match slot {
+                Some(slot) if emptied.contains(&slot) || moved.contains(&slot) => {
+                    waits.insert(slot);
+                    self.out.later.push((op, p));
+                }
+                _ => restores.push((d, op, p)),
+            }
+        }
+        self.restores = restores;
+        // An item holding a waiting restore's name that moves into what's
+        // restored can't go before it: it frees the name first, under a
+        // temporary name where it is, and the next round moves it on.
+        for (_, op, _) in &mut self.resets {
             if let Op::Rewind { sid, step } = op
-                && let Step::Restore { to, name, .. } = &mut **step
-                && (emptied.contains(&(to.clone(), fold(name))) || moved.contains(&(to.clone(), fold(name))))
+                && let Step::Reset { from, place, toward, .. } = &mut **step
+                && let Some((to, _)) = place.as_ref()
+                && restored.contains(to)
+                && waits.contains(&(from.parent.clone(), fold(&from.name)))
+                && !is_temporary(&from.name)
             {
-                *name = temporary(name, *sid);
+                if toward.is_none() {
+                    *toward = place.clone();
+                }
+                *place = Some((from.parent.clone(), temporary(&from.name, *sid)));
             }
         }
         for (_, op, _) in &mut self.resets {

@@ -518,7 +518,8 @@ pub struct Steps {
     /// To add to the round, each shown at the same place in `paths`.
     pub ops: Vec<Op>,
     pub paths: Vec<String>,
-    /// Folders it removes in a later round, for its stop's list.
+    /// Steps it takes in a later round (folders removed, restores whose
+    /// name isn't free yet), for its stop's list.
     pub later: Shown,
     /// Approved: the keys the gate takes them by.
     pub keys: Vec<oneup_gate::ItemKey>,
@@ -612,7 +613,8 @@ pub fn ran(
     if !tried && steps.waiting > 0 {
         job.stalls += 1;
     }
-    // Folders that wait to be emptied with nothing else to run: a stall too.
+    // Steps that wait (folders to empty, names to free) with nothing else
+    // to run: a stall too.
     if !tried && steps.waiting == 0 && !steps.later.is_empty() {
         job.stalls += 1;
     }

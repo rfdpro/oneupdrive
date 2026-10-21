@@ -6907,6 +6907,79 @@ async fn an_item_moved_on_the_web_and_deleted_there_isnt_restored() {
     assert!(cloud.0.lock().unwrap().bin.contains_key(&a), "still in the recycle bin");
 }
 
+#[tokio::test]
+async fn a_restore_whose_name_an_item_moving_on_holds_waits_for_it() {
+    // a.txt was deleted since, and b.txt renamed a.txt in its place. The
+    // rewind moves that one back to b.txt and restores a.txt: OneDrive
+    // takes no name for a restore (it brings it back under the name it
+    // had), so the restore waits a round for the name, not under another.
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-restore-waits", cloud.clone());
+    write(&s.p("docs/a.txt"), b"a");
+    write(&s.p("docs/b.txt"), b"b");
+    s.settle().await;
+    let then = inside(&local_tree(&s.dir.0), "/docs");
+    let at = moment();
+    std::fs::remove_file(s.p("docs/a.txt")).unwrap();
+    s.settle().await;
+    std::fs::rename(s.p("docs/b.txt"), s.p("docs/a.txt")).unwrap();
+    s.settle().await;
+    let r = s
+        .obs
+        .store()
+        .read(|o| {
+            let sid = oneup_sync::rewind::folder_at(o, o, &["docs"], at)?.unwrap();
+            oneup_sync::rewind::plan(o, o, sid, at, 1000).map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
+        })
+        .unwrap();
+    let restore = |o: &Op| matches!(o.rewind_step(), Some(oneup_sync::rewind::Step::Restore { .. }));
+    assert!(!r.ops.iter().any(restore), "not this round: {r:?}");
+    assert!(r.later.iter().any(|(o, _)| restore(o)), "a later one: {r:?}");
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    assert_eq!(inside(&local_tree(&s.dir.0), "/docs"), then, "the folder is as it was");
+    assert!(!cloud.tree().keys().any(|p| p.contains(".oneup-rewind-")), "{:?}", cloud.tree());
+    assert_eq!(s.synced_part(local_tree(&s.dir.0)), s.synced_part(cloud.tree()));
+}
+
+#[tokio::test]
+async fn a_folder_restored_into_the_name_of_what_moves_into_it_comes_back() {
+    // sub held x.txt; since, x.txt was moved out and renamed sub, and the
+    // folder deleted. Rewinding docs: sub comes back under its name, which
+    // x.txt holds until it moves into sub. x.txt frees the name first under
+    // a temporary one, the folder is restored, then x.txt goes into it.
+    let cloud = Fake::new();
+    let mut s = Sync::new("rewind-restore-cycle", cloud.clone());
+    write(&s.p("docs/sub/x.txt"), b"x");
+    s.settle().await;
+    let then = inside(&local_tree(&s.dir.0), "/docs");
+    let at = moment();
+    std::fs::rename(s.p("docs/sub/x.txt"), s.p("docs/x-out")).unwrap();
+    s.settle().await;
+    std::fs::remove_dir(s.p("docs/sub")).unwrap();
+    s.settle().await;
+    std::fs::rename(s.p("docs/x-out"), s.p("docs/sub")).unwrap();
+    s.settle().await;
+    let r = s
+        .obs
+        .store()
+        .read(|o| {
+            let sid = oneup_sync::rewind::folder_at(o, o, &["docs"], at)?.unwrap();
+            oneup_sync::rewind::plan(o, o, sid, at, 1000).map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
+        })
+        .unwrap();
+    use oneup_sync::rewind::Step;
+    assert!(r.later.iter().any(|(o, _)| matches!(o.rewind_step(), Some(Step::Restore { name, .. }) if name == "sub")));
+    assert!(
+        r.ops.iter().any(|o| matches!(o.rewind_step(),
+            Some(Step::Reset { from, place: Some((to, name)), .. }) if *to == from.parent && name.starts_with("sub.oneup-rewind-"))),
+        "x.txt frees the name where it is: {r:?}"
+    );
+    assert_eq!(s.rewind_to("/docs", at, |_| {}).await, 0);
+    assert_eq!(inside(&local_tree(&s.dir.0), "/docs"), then, "the folder is as it was");
+    assert!(!cloud.tree().keys().any(|p| p.contains(".oneup-rewind-")), "{:?}", cloud.tree());
+    assert_eq!(s.synced_part(local_tree(&s.dir.0)), s.synced_part(cloud.tree()));
+}
+
 // ---------------------------------------------------------------- duplicates
 // Copies the user chose to remove (`oneup_exec::dupes`): the gate holds them
 // until the user approves exactly that batch, whatever the circuit breakers'
