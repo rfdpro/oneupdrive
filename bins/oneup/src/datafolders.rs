@@ -52,6 +52,13 @@ pub fn all() -> Vec<PathBuf> {
     out
 }
 
+/// Whether data folder `d` has a database. Only one that isn't there (the
+/// folder gone too) is `false`; one that can't be looked at is an error,
+/// not a folder missed.
+fn has_database(d: &Path) -> std::io::Result<bool> {
+    d.join("state.db").try_exists()
+}
+
 /// Like [`all`], but strict: a registry read or a pair/vault listing that
 /// fails is an error, not an empty list, so a caller that must not miss a
 /// data folder (the hooks' safety checks) can refuse instead of guessing.
@@ -66,11 +73,9 @@ pub fn all_strict() -> std::io::Result<Vec<PathBuf>> {
         out.extend(crate::vaultpair::list_strict(&m).map_err(to_io)?.into_iter().map(|v| v.dir));
         out.extend(crate::pairs::list_strict(&m).map_err(to_io)?.into_iter().map(|p| p.dir));
     }
-    // Only a folder without a database is left out; one whose database
-    // can't be looked at is an error, not a folder missed.
     let mut kept = Vec::with_capacity(out.len());
     for d in out {
-        if d.join("state.db").try_exists()? {
+        if has_database(&d)? {
             kept.push(d);
         }
     }
@@ -131,6 +136,23 @@ pub(crate) mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap()
+    }
+
+    /// A database that isn't there leaves its folder out of the strict
+    /// listing; one that can't be looked at fails it.
+    #[test]
+    fn only_a_missing_database_leaves_a_folder_out() {
+        let root = std::env::temp_dir().join(format!("oneup-datafolders-has-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("with")).unwrap();
+        std::fs::write(root.join("with").join("state.db"), b"").unwrap();
+        std::fs::write(root.join("file"), b"").unwrap();
+        assert!(has_database(&root.join("with")).unwrap());
+        assert!(!has_database(&root.join("gone")).unwrap(), "the folder gone");
+        assert!(!has_database(&root.join("file")).unwrap(), "a file where the folder was");
+        // A path Windows can't look up at all.
+        assert!(has_database(&root.join("bad\u{0}name")).is_err(), "can't be looked at");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Finding which data folder a path is in reads the folders' databases
