@@ -2880,7 +2880,11 @@ async fn recycle_bin(dir: &std::path::Path, mut store: Store, restore: Option<us
         return Ok(());
     }
     for (i, d) in listed.iter().enumerate() {
-        let gone = if d.folder.is_some() { "" } else { "  (its folder is gone too)" };
+        let gone = match (&d.folder, d.elsewhere) {
+            (None, _) => "  (its folder is gone too)",
+            (Some(_), true) => "  (restore it from OneDrive's recycle bin on the web)",
+            (Some(_), false) => "",
+        };
         println!(
             "  {:>3}  {}  {:>10}  {}{gone}",
             i + 1,
