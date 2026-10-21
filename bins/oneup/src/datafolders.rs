@@ -66,9 +66,16 @@ pub fn all_strict() -> std::io::Result<Vec<PathBuf>> {
         out.extend(crate::vaultpair::list_strict(&m).map_err(to_io)?.into_iter().map(|v| v.dir));
         out.extend(crate::pairs::list_strict(&m).map_err(to_io)?.into_iter().map(|p| p.dir));
     }
-    out.retain(|d| d.join("state.db").exists());
-    out.dedup_by(|a, b| crate::test_account::same_dir(a, b));
-    Ok(out)
+    // Only a folder without a database is left out; one whose database
+    // can't be looked at is an error, not a folder missed.
+    let mut kept = Vec::with_capacity(out.len());
+    for d in out {
+        if d.join("state.db").try_exists()? {
+            kept.push(d);
+        }
+    }
+    kept.dedup_by(|a, b| crate::test_account::same_dir(a, b));
+    Ok(kept)
 }
 
 /// The data folder whose synced folder holds `path`, and `path` relative
