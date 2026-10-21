@@ -198,10 +198,7 @@ pub fn deleted(store: &mut Store, seq: i64) -> Result<String> {
         let Some(folder) = d.folder.clone() else {
             return Ok(Some(Err("the folder it was in is gone too: bring that back first")));
         };
-        // OneDrive brings it back where it was deleted from, whatever is
-        // asked (measured): only when that's the folder it was in here.
-        let land = o.deleted_from(&d.id)?;
-        if land.is_none_or(|(p, n)| p != folder || !oneup_sync::same_name(&n, &d.name)) {
+        if d.elsewhere {
             return Ok(Some(Err("restore it from OneDrive's recycle bin on the web")));
         }
         let op = oneup_exec::recover::deleted_op(d.sid, &d.id, &folder, &d.name, d.kind);

@@ -4254,7 +4254,7 @@
                     }),
                     el("td", {}, x.restorable ? restore(x) : el("small", {
                         className: "muted",
-                        textContent: tr("Its folder is gone too")
+                        textContent: x.elsewhere ? tr("Restore it from OneDrive's recycle bin on the web") : tr("Its folder is gone too")
                     })))));
                 b.replaceChildren(el("table", {
                     className: "list",
