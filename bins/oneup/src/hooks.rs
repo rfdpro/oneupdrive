@@ -102,10 +102,15 @@ fn synced_folders(main: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
     Ok(())
 }
 
-/// Another data folder's synced root (`None`: it syncs nothing yet).
+/// Another data folder's synced root (`None`: it syncs nothing yet). Read
+/// without opening its database as a store, which would upgrade it under
+/// that folder's agent, maybe another build (`Store::peek_meta`).
 fn other_folder(d: &Path) -> Result<Option<PathBuf>> {
-    let store = crate::setup::open_store(d, 1024)?;
-    Ok(store.read(|o| o.meta_get(crate::sync::KEY_LOCAL))?.map(PathBuf::from))
+    let db = d.join("state.db");
+    if !db.exists() {
+        return Ok(None);
+    }
+    Ok(oneup_store::Store::peek_meta(&db, crate::sync::KEY_LOCAL)?.map(PathBuf::from))
 }
 
 /// `PATH` with every directory inside a synced folder, or any cloud sync
