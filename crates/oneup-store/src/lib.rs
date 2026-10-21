@@ -817,7 +817,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 /// missing) gets what it lacks, from the same definitions. A v23 store that
 /// has them all is left as it is. The columns come first, so the indexes
 /// and triggers on them can be made.
+///
+/// Such a store's history is stopped (`Ops::history_stop`): the draft
+/// started it at the upgrade, maybe in the middle of a first sync, whose
+/// records would read to a rewind as items created since. The next
+/// settled round starts it again.
 fn settle_v23(tx: &Connection) -> Result<()> {
+    let objects =
+        |tx: &Connection| -> Result<i64> { Ok(tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?) };
+    let before = objects(tx)?;
+    let mut earlier = false;
     for (table, column, def) in [
         ("pin_changed", "seen", "INTEGER NOT NULL DEFAULT 0"),
         ("pin_user", "created", "INTEGER"),
@@ -831,6 +840,7 @@ fn settle_v23(tx: &Connection) -> Result<()> {
         )?;
         if exists && !has {
             tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {def};"))?;
+            earlier = true;
         }
     }
     // The steps' own SQL, making only what isn't there; their column
@@ -849,6 +859,9 @@ fn settle_v23(tx: &Connection) -> Result<()> {
     };
     for sql in [dupes::MIGRATE_V20.to_string(), pins::migrate_v22(), history::migrate_v23()] {
         tx.execute_batch(&missing(&sql))?;
+    }
+    if earlier || objects(tx)? != before {
+        Ops { c: tx }.history_stop()?;
     }
     Ok(())
 }
@@ -2268,15 +2281,35 @@ mod tests {
                 dupes::UNDO_V20
             ))
             .unwrap();
+        // The draft started the history at the upgrade.
+        let started = "INSERT INTO meta(key, value) VALUES ('history.on', '1'), ('history.since', '5');
+             INSERT INTO synced_history(at_ms, sid, change) VALUES (6, 1, 0);
+             INSERT INTO synced_unsettled(sid) VALUES (1);";
+        Connection::open(&earlier).unwrap().execute_batch(started).unwrap();
         assert_ne!(shape(&earlier), shape(&fresh));
         drop(Store::open(&earlier, 1024).unwrap());
         assert_eq!(shape(&earlier), shape(&fresh));
-        // A v23 store in the final shape: v24 changes nothing but the version.
+        assert_eq!(history_kept(&earlier), (0, 0, 0), "the draft's history is stopped");
+        // A v23 store in the final shape: v24 changes nothing but the
+        // version, and a history it keeps stays.
+        Connection::open(&fresh).unwrap().execute_batch(&format!("{started} PRAGMA user_version = 23;")).unwrap();
         let before = shape(&fresh);
-        Connection::open(&fresh).unwrap().execute_batch("PRAGMA user_version = 23;").unwrap();
         drop(Store::open(&fresh, 1024).unwrap());
-        assert_eq!(shape(&fresh), before);
+        assert_eq!(shape(&fresh).1, before.1);
+        assert_eq!(history_kept(&fresh), (2, 1, 1), "kept");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The history's keys in `meta`, its rows and its marks.
+    #[allow(clippy::unwrap_used)]
+    fn history_kept(path: &Path) -> (i64, i64, i64) {
+        let c = Connection::open(path).unwrap();
+        let n = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        (
+            n("SELECT count(*) FROM meta WHERE key IN ('history.on', 'history.since')"),
+            n("SELECT count(*) FROM synced_history"),
+            n("SELECT count(*) FROM synced_unsettled"),
+        )
     }
 
     /// Every table's columns, and every index's and trigger's definition,
