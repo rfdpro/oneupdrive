@@ -128,9 +128,10 @@ struct World {
     /// only when `track` is set.
     history: Vec<(i64, Sid, Option<Was>)>,
     track: bool,
-    /// Records whose item OneDrive can't bring back where it was deleted
-    /// from (that folder gone, or its name taken there now): a restore
-    /// lands only there, whatever is asked (measured), so it waits.
+    /// Records whose item OneDrive can't bring back where it goes: it was
+    /// deleted from another folder (the plan skips it), or that folder is
+    /// gone or its name taken there now. A restore lands only where it was
+    /// deleted from, whatever is asked (measured).
     unlanded: BTreeSet<Sid>,
 
     bases: BTreeMap<Sid, Base>,
@@ -953,6 +954,16 @@ impl History for World {
         Ok(self.history.iter().rev().find_map(|(_, _, w)| w.clone().filter(|w| w.remote.as_ref() == Some(id))))
     }
 
+    /// As delta says it (measured): the folder it was in when deleted.
+    fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>, Infallible> {
+        Ok(self
+            .remote_gone
+            .contains(&id.0)
+            .then(|| self.remote_bin_items.get(&id.0))
+            .flatten()
+            .and_then(|it| Some((RemoteId(it.parent.clone()?), it.name.clone()))))
+    }
+
     fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>, Infallible> {
         Ok(self
             .history
@@ -1255,6 +1266,11 @@ fn store_of(w: &World) -> Store {
         }
         for id in &w.remote_gone {
             o.note_remote_deleted(id)?;
+            if let Some(it) = w.remote_bin_items.get(id)
+                && let Some(parent) = &it.parent
+            {
+                o.deleted_from_put(id, parent, &it.name, 0)?;
+            }
         }
         let problems = o.check_invariants()?;
         assert!(problems.is_empty(), "store invariants: {problems:?}");
@@ -1668,6 +1684,12 @@ fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>
         }
         skipped.extend(r.skipped.iter().map(|(_, p, _)| p.trim_start_matches('/').to_string()));
         sids.extend(r.skipped.iter().map(|(s, _, _)| *s));
+        w.unlanded.extend(
+            r.skipped
+                .iter()
+                .filter(|(_, _, why)| *why == oneup_sync::rewind::Skip::DeletedElsewhere)
+                .map(|(s, _, _)| *s),
+        );
         let job = job.get_or_insert_with(|| {
             let mut all = r.ops.clone();
             all.extend(r.later.iter().map(|(o, _)| o.clone()));
@@ -1749,6 +1771,10 @@ impl History for OwnClock<'_, '_> {
 
     fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, oneup_store::Error> {
         self.0.last_seen(id)
+    }
+
+    fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>, oneup_store::Error> {
+        self.0.deleted_from(id)
     }
 
     fn written_ms(&self, local_mtime: i64) -> i64 {

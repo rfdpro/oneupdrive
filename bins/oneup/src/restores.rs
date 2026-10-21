@@ -195,13 +195,21 @@ pub fn deleted(store: &mut Store, seq: i64) -> Result<String> {
         let Some(d) = crate::cloudbin::list(o, crate::cloudbin::MAX)?.into_iter().find(|d| d.seq == seq) else {
             return Ok(None);
         };
-        let Some(folder) = d.folder.clone() else { return Ok(Some(Err(d))) };
+        let Some(folder) = d.folder.clone() else {
+            return Ok(Some(Err("the folder it was in is gone too: bring that back first")));
+        };
+        // OneDrive brings it back where it was deleted from, whatever is
+        // asked (measured): only when that's the folder it was in here.
+        let land = o.deleted_from(&d.id)?;
+        if land.is_none_or(|(p, n)| p != folder || !oneup_sync::same_name(&n, &d.name)) {
+            return Ok(Some(Err("restore it from OneDrive's recycle bin on the web")));
+        }
         let op = oneup_exec::recover::deleted_op(d.sid, &d.id, &folder, &d.name, d.kind);
         Ok(Some(Ok((d, op))))
     })?;
     let (d, op) = match found {
         None => bail!("that item isn't listed as deleted any more"),
-        Some(Err(_)) => bail!("the folder it was in is gone too: bring that back first"),
+        Some(Err(why)) => bail!("{why}"),
         Some(Ok(x)) => x,
     };
     let Op::Rewind { step, .. } = &op else { bail!("not a restore") };

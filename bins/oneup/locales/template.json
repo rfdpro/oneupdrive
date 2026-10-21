@@ -696,6 +696,7 @@
   "Rename": "",
   "Restart it: `oneup stop`, then `oneup start`.": "",
   "Restore": "",
+  "Restore it from OneDrive's recycle bin on the web": "",
   "Restore puts it back where it was. Copies older than 30 days may be removed when space is short.": "",
   "Restore the version from {when}? The current one stays in the history.": "",
   "Restore the {n, plural, one {# shortcut} other {# shortcuts}} updated {when}": "",

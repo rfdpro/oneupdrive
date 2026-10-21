@@ -86,6 +86,10 @@ pub fn to_row(item: &DriveItem) -> Option<RemoteRow> {
 pub fn apply(ops: &Ops<'_>, rules: &ExcludeSet, mode: Mode, item: &DriveItem, t: &mut Tally) -> Result<()> {
     if item.is_deleted() {
         ops.delete_subtree(&item.id)?;
+        // Where it was deleted from: where OneDrive would restore it.
+        if let Some(parent) = item.parent_id() {
+            ops.note_deleted_from(&item.id, parent)?;
+        }
         ops.unmark_shared(&item.id)?;
         t.deleted += 1;
         return Ok(());
@@ -303,5 +307,31 @@ mod tests {
         assert_eq!(kind(r#"{"id":"v","name":"Personal Vault","size":0}"#), Kind::Package);
         // A shortcut to a folder someone shared.
         assert_eq!(kind(r#"{"id":"s","name":"Shared","remoteItem":{"id":"x"}}"#), Kind::Package);
+    }
+
+    /// Delta's entry for a deleted item names the folder it was deleted
+    /// from (measured), even one it was moved into that this PC never saw:
+    /// where OneDrive would restore it.
+    #[test]
+    fn a_deletion_keeps_the_folder_onedrive_says_it_went_from() {
+        let mut s = oneup_store::Store::open_in_memory().unwrap();
+        let from = s
+            .write(|o| {
+                o.history_start(0)?;
+                let mut t = super::Tally::default();
+                for json in [
+                    r#"{"id":"R","name":"root","root":{},"folder":{"childCount":1}}"#,
+                    r#"{"id":"d","name":"docs","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                    r#"{"id":"a","name":"a.txt","file":{},"parentReference":{"id":"d"}}"#,
+                    r#"{"id":"a","deleted":{"state":"deleted"},"file":{},"parentReference":{"id":"trash"}}"#,
+                ] {
+                    let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                    super::apply(o, &oneup_rules::ExcludeSet::none(), super::Mode::CatchUp, &item, &mut t)?;
+                }
+                assert_eq!(t.deleted, 1);
+                o.deleted_from(&oneup_sync::RemoteId("a".into()))
+            })
+            .unwrap();
+        assert_eq!(from, Some((oneup_sync::RemoteId("trash".into()), "a.txt".into())));
     }
 }

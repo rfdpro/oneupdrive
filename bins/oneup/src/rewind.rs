@@ -713,6 +713,7 @@ pub fn describe(p: &Preview) -> Vec<String> {
             Skip::UnknownContent => "its content then wasn't recorded",
             Skip::ExistedBefore => "was there then, not synced",
             Skip::Keeps => "holds what's left alone",
+            Skip::DeletedElsewhere => "restore it from OneDrive's recycle bin on the web",
         };
         out.push(format!("skipped    {path}  ({why})"));
     }
