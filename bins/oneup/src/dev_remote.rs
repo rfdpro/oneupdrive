@@ -27,6 +27,12 @@ pub enum DevRemote {
     /// the recycle bin afterwards): prints each answer and what the folder
     /// holds
     RestoreProbe { folder: String },
+    /// Measure what Graph says, for an item deleted after a move, about
+    /// the folder it was deleted from: in a new folder `folder`, a.txt is
+    /// made in docs/, moved into trash/, and trash/ deleted; prints
+    /// `GET /items/{id}` (plain and `?includeDeletedItems=true`) and the
+    /// delta entries since before the move, then deletes the folder
+    DeletedParentProbe { folder: String },
     /// Print a file's time, size and tags, and its version history
     /// (read-only)
     Versions { path: String },
@@ -271,6 +277,48 @@ pub async fn run(graph: Arc<Graph>, cmd: &DevRemote) -> Result<()> {
             println!("y now: {:?}", graph.item_by_path(&format!("{folder}/y")).await?.map(|i| i.id));
             list("the folder after it").await?;
             // Clean up: the probe folder goes to the recycle bin.
+            let d = graph.item_by_path(folder).await?.context("the probe folder")?;
+            graph.delete_item(&d.id, d.e_tag.as_deref().unwrap_or_default()).await?;
+            println!("{folder} deleted (in the recycle bin)");
+        }
+        DevRemote::DeletedParentProbe { folder } => {
+            let (parent, name) = split(folder)?;
+            if graph.item_by_path(folder).await?.is_some() {
+                bail!("{folder} exists already; pick a new name");
+            }
+            let top = if parent == "/" { graph.root().await?.id } else { parent_id(parent).await? };
+            let dir = graph.create_folder(&top, &name).await?;
+            let docs = graph.create_folder(&dir.id, "docs").await?;
+            let trash = graph.create_folder(&dir.id, "trash").await?;
+            let a = graph.upload_small(&docs.id, "a.txt", None, b"a").await?;
+            println!("ids: folder {} docs {} trash {} a.txt {}", dir.id, docs.id, trash.id, a.id);
+            let cursor = graph.latest_cursor().await?;
+            let a_now = graph.item(&a.id).await?.context("a.txt")?;
+            graph.move_item(&a.id, a_now.e_tag.as_deref().unwrap_or_default(), &trash.id, "a.txt").await?;
+            let t_now = graph.item(&trash.id).await?.context("trash")?;
+            graph.delete_item(&trash.id, t_now.e_tag.as_deref().unwrap_or_default()).await?;
+            for (label, url) in [
+                ("GET item", graph.item_url(&a.id)),
+                ("GET item ?includeDeletedItems=true", format!("{}?includeDeletedItems=true", graph.item_url(&a.id))),
+            ] {
+                match graph.get::<serde_json::Value>(&url).await {
+                    Ok(v) => println!("{label}: 200 {}", v),
+                    Err(e) => println!("{label}: {:?} {e}", e.status()),
+                }
+            }
+            // The delta since before the move, as the mirror reads it.
+            let mut next = Some(cursor);
+            while let Some(url) = next.take() {
+                let v: serde_json::Value = graph.get(&url).await?;
+                for it in v["value"].as_array().into_iter().flatten() {
+                    if [a.id.as_str(), trash.id.as_str(), docs.id.as_str()]
+                        .contains(&it["id"].as_str().unwrap_or_default())
+                    {
+                        println!("delta: {it}");
+                    }
+                }
+                next = v["@odata.nextLink"].as_str().map(str::to_string);
+            }
             let d = graph.item_by_path(folder).await?.context("the probe folder")?;
             graph.delete_item(&d.id, d.e_tag.as_deref().unwrap_or_default()).await?;
             println!("{folder} deleted (in the recycle bin)");
