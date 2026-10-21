@@ -1,6 +1,6 @@
 # Earlier versions and sharing
 
-OneDrive keeps earlier versions of your files (the *version history*; not the same as the [kept copies](glossary.md) on this PC), and can make links to share them. OneUpDrive shows both on the settings window's **Files** page: select a file, then **Versions** or **Share**. The **Shared** page lists everything you share. To get there for one file, right-click it in File Explorer and choose **OneUpDrive → Version history** or **OneUpDrive → Copy share link…**.
+OneDrive keeps earlier versions of your files (the *version history*; not the same as the [kept copies](glossary.md) on this PC), and can make links to share them. OneUpDrive shows both on the settings window's **Files** page: select a file, then **Versions** or **Share**. The **Sharing** page lists everything you share. To get there for one file, right-click it in File Explorer and choose **OneUpDrive → Version history** or **OneUpDrive → Copy share link…**.
 
 ## Version history
 The list shows each version OneDrive keeps: when it was saved, its size and who saved it, newest first.
@@ -15,15 +15,15 @@ The settings window's **Recovery** page shows the same for any file you name, ne
 ## Sharing
 **Copy link** makes a link and puts it on the clipboard: either **anyone with the link can view**, or **can view and edit**. Send it however you like. From a terminal: `oneup share "C:\…\Photos"` (add `--edit` for an editing link).
 
-Anyone who gets the link can open it, so share links with care. The settings window's **Shared** page lists every link you made and lets you remove them.
+Anyone who gets the link can open it, so share links with care. The settings window's **Sharing** page lists every link you made and lets you remove them.
 
 ## What you share
-The settings window's **Shared** page lists everything you share in OneDrive: each file or folder, each link or person it's shared with, whether they can view or edit, when the link expires, and when you shared it. Links that anyone can open and that never expire are counted at the top. What's inside a shared folder is shared with it and isn't listed on its own (unless it's also shared by itself). Items inside folders you excluded from syncing aren't listed (an excluded folder that's shared itself is). OneUpDrive asks OneDrive a page at a time; **Show more** goes on. After you share a large folder, the first look takes longer: OneUpDrive checks once what's inside it.
+The settings window's **Sharing** page lists everything you share in OneDrive: each file or folder, each link or person it's shared with, whether they can view or edit, when the link expires, and when you shared it. Links that anyone can open and that never expire are counted at the top. What's inside a shared folder is shared with it and isn't listed on its own (unless it's also shared by itself). Items inside folders you excluded from syncing aren't listed (an excluded folder that's shared itself is). OneUpDrive asks OneDrive a page at a time; **Show more** goes on. After you share a large folder, the first look takes longer: OneUpDrive checks once what's inside it.
 
 * **Stop sharing** removes one link or one person's access. A removed link stops working for everyone who has it. The file itself doesn't change.
 * **Set expiry** (only with experimental options on, `oneup settings --experimental on`) sets the last day a link works. OneDrive's documentation doesn't cover changing an expiry, so OneUpDrive checks what OneDrive did and tells you the date it now has.
 
-If the item or the link changed in OneDrive since the list was shown, nothing is changed and you're asked to look again. A link shared through a folder can only be removed on that folder. Each change is in **Activity → Recent**, recorded before OneDrive is asked: the kind of link and what happened, never the link itself or the people. If OneUpDrive stops before it knows how a change ended, the next look at **Shared** (or `oneup shared`) checks with OneDrive and records it.
+If the item or the link changed in OneDrive since the list was shown, nothing is changed and you're asked to look again. A link shared through a folder can only be removed on that folder. Each change is in **Activity → Recent**, recorded before OneDrive is asked: the kind of link and what happened, never the link itself or the people. If OneUpDrive stops before it knows how a change ended, the next look at **Sharing** (or `oneup shared`) checks with OneDrive and records it.
 
 **Shared with you** lists what other people share with your account. Microsoft is retiring the part of OneDrive that answers this, so the list may come back empty.
 

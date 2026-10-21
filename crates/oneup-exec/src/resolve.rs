@@ -13,7 +13,9 @@
 //!   on the eTag it saw). One changed in OneDrive since it last synced
 //!   comes back here instead: a change wins over a deletion.
 //! * **Delete here**, for an item gone from OneDrive without evidence: the
-//!   mirror image. The local copies go to the version store, and one
+//!   mirror image. The local copies go to the version store, whatever the
+//!   version-store settings (the deletion is noted as answered, not
+//!   reported, so nothing shows OneDrive's recycle bin has it), and one
 //!   changed here since it last synced is uploaded instead.
 //! * **Restore** and **upload again**: the item's Synced record, and those
 //!   under it, are dropped, so the side that still has it reads as new and
@@ -147,7 +149,7 @@ impl Change {
             }
             What::GoneThere(items) => {
                 for (_, r) in &items {
-                    o.note_remote_deleted(&r.0)?;
+                    o.note_remote_deleted_by_answer(&r.0)?;
                 }
                 o.dirty_mark_synced(&items.iter().map(|(s, _)| *s).collect::<Vec<_>>())?;
             }
@@ -159,6 +161,21 @@ impl Change {
         }
         Ok(None)
     }
+}
+
+/// Of a round's operations (and those still to come), the recyclings whose
+/// deletion OneDrive reported, sorted: the gate's
+/// `Context::cloud_deleted`. A deletion noted only from a "Delete here"
+/// answer isn't one of them, so its copy here is kept.
+pub fn cloud_deleted<'a>(o: &Ops<'_>, ops: impl IntoIterator<Item = &'a Op>) -> oneup_store::Result<Vec<Sid>> {
+    let sids: Vec<i64> = ops
+        .into_iter()
+        .filter_map(|op| match op {
+            Op::RecycleLocal { sid, .. } => i64::try_from(*sid).ok(),
+            _ => None,
+        })
+        .collect();
+    Ok(o.remote_gone_reported(&sids)?.into_iter().filter_map(|s| Sid::try_from(s).ok()).collect())
 }
 
 /// Whether local item `id` is on this PC: in the Local tree, or still

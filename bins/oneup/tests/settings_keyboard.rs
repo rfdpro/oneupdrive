@@ -167,6 +167,18 @@ const DRIVER: &str = r##"<script>
     document.querySelector("#st-menu").hidePopover(); await sleep(150);
     check("closing it gives focus back to its button", document.activeElement.id === "st-btn", at());
 
+    // Settings, at the foot of the list: its pages replace the list, and Back returns.
+    const before = document.querySelector(".page.on").id;
+    const gear = document.querySelector("#nav-open-settings");
+    gear.focus(); gear.click(); await sleep(100);
+    check("Settings shows the settings pages", document.querySelector("#nav-app").hidden
+      && !document.querySelector("#nav-settings").hidden && document.querySelector("#general").classList.contains("on"), "");
+    check("focus goes to Back", document.activeElement.id === "nav-back", at());
+    document.activeElement.click(); await sleep(100);
+    check("Back returns to the page before", !document.querySelector("#nav-app").hidden
+      && document.querySelector(".page.on").id === before, document.querySelector(".page.on").id);
+    check("focus goes back to Settings", document.activeElement.id === "nav-open-settings", at());
+
     // Apps: a program opens its files from the keyboard, and keeps focus across reloads.
     document.querySelector('nav [data-page="apps"]').click(); await sleep(400);
     const prog = document.querySelector("#apps-table .cell-btn");
@@ -187,6 +199,15 @@ const DRIVER: &str = r##"<script>
       document.querySelector('[data-net-this="transfer"]').value);
     check("the metered ones too", document.querySelector('[data-net-metered="transfer"]').value === "paused"
       && document.querySelector('[data-net-metered="budget_mb"]').value === "2000", document.querySelector('[data-net-metered="budget_mb"]').value);
+    // This network and Metered connections start folded; each opens from its heading.
+    for (const id of ["#net-this", "#net-metered"]) {
+      const d = document.querySelector(id), sum = d.querySelector("summary");
+      check(id + " starts folded", !d.open, "");
+      sum.focus();
+      check(id + "'s heading takes focus", document.activeElement === sum, at());
+      sum.click(); await sleep(50);
+      check(id + " opens", d.open, "");
+    }
     for (const sel of ['[data-sync="interval_minutes"]', '[data-net-this="transfer"]', '[data-net-metered="upload_kib"]']) {
       const e = document.querySelector(sel);
       e.focus();
@@ -196,7 +217,8 @@ const DRIVER: &str = r##"<script>
     // Recovery: focus follows the rewind's list and answers.
     window.confirm = () => true;
     document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);
-    document.querySelector("#rw-at").value = "2026-01-01T10:00:00";
+    document.querySelector("#rw-date").value = "2026-01-01";
+    document.querySelector("#rw-time").value = "10:00";
     document.querySelector("#rw-preview").focus();
     document.querySelector("#rw-preview").click(); await sleep(300);
     const more = document.querySelector("#rw-actions button");

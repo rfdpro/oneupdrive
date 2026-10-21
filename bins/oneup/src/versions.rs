@@ -17,6 +17,7 @@ const KEY_MAX_PERCENT: &str = "versions.max_percent";
 const KEY_ROTATE: &str = "versions.rotate";
 const KEY_OVERFLOW: &str = "versions.overflow";
 const KEY_KEEP_REPLACED: &str = "versions.keep_replaced";
+const KEY_KEEP_REMOVED: &str = "versions.keep_removed";
 const KEY_MAX_CHANGES: &str = "safety.max_changes";
 const KEY_MAX_SHARE: &str = "safety.max_percent";
 const KEY_CONTENT_GUARD: &str = "safety.content_guard";
@@ -63,6 +64,7 @@ pub struct Changes {
     pub rotate: Option<bool>,
     pub overflow: Option<OverflowPolicy>,
     pub keep_replaced: Option<bool>,
+    pub keep_removed: Option<bool>,
 }
 
 impl Changes {
@@ -73,6 +75,7 @@ impl Changes {
             && self.rotate.is_none()
             && self.overflow.is_none()
             && self.keep_replaced.is_none()
+            && self.keep_removed.is_none()
     }
 }
 
@@ -82,14 +85,17 @@ pub fn policy(store: &Store) -> Result<Policy> {
     let d = Policy::default();
     let overflow = match store.read(|o| o.meta_get(KEY_OVERFLOW))?.as_deref() {
         Some("keep") => OverflowPolicy::Keep,
+        Some("discard") => OverflowPolicy::Discard,
         Some("hold") => OverflowPolicy::Hold,
         _ => d.overflow,
     };
     let keep_replaced = flag(store, KEY_KEEP_REPLACED)?.unwrap_or(d.keep_replaced);
+    let keep_removed = flag(store, KEY_KEEP_REMOVED)?.unwrap_or(d.keep_removed);
     let num = |k: &str| -> Result<Option<usize>> { Ok(store.read(|o| o.meta_get(k))?.and_then(|v| v.parse().ok())) };
     Ok(Policy {
         overflow,
         keep_replaced,
+        keep_removed,
         max_count: num(KEY_MAX_CHANGES)?.filter(|&n| n > 0).unwrap_or(d.max_count),
         max_percent: num(KEY_MAX_SHARE)?
             .and_then(|n| u32::try_from(n).ok())
@@ -141,14 +147,26 @@ pub fn set(store: &mut Store, c: &Changes) -> Result<()> {
             o.meta_set(KEY_ROTATE, on_off(v))?;
         }
         if let Some(v) = c.overflow {
-            o.meta_set(KEY_OVERFLOW, if v == OverflowPolicy::Keep { "keep" } else { "hold" })?;
+            o.meta_set(KEY_OVERFLOW, overflow_name(v))?;
         }
         if let Some(v) = c.keep_replaced {
             o.meta_set(KEY_KEEP_REPLACED, on_off(v))?;
         }
+        if let Some(v) = c.keep_removed {
+            o.meta_set(KEY_KEEP_REMOVED, on_off(v))?;
+        }
         Ok(())
     })?;
     Ok(())
+}
+
+/// How an overflow policy is saved, and named in the settings window.
+pub fn overflow_name(p: OverflowPolicy) -> &'static str {
+    match p {
+        OverflowPolicy::Hold => "hold",
+        OverflowPolicy::Keep => "keep",
+        OverflowPolicy::Discard => "discard",
+    }
 }
 
 /// The version-store settings, one line each.
@@ -167,7 +185,19 @@ pub fn describe(store: &Store) -> Result<String> {
         OverflowPolicy::Keep => {
             "If removed files don't fit in the store, sync keeps them anyway (the store goes over its limit) and tells you."
         }
+        OverflowPolicy::Discard => {
+            "If removed files don't fit in the store, sync removes them without a local copy (OneDrive's recycle bin \
+             has them) and tells you."
+        }
     };
+    if !p.keep_removed {
+        return Ok(format!(
+            "Copies aren't kept: files deleted or replaced in OneDrive are removed from this PC without a local copy \
+             (OneDrive's recycle bin and version history have them; a file that differs from OneDrive's version is \
+             kept anyway).\n{}\n{rotate}\n{overflow}",
+            describe_trim(&t)
+        ));
+    }
     let replaced = if p.keep_replaced {
         "Files replaced by a newer version from OneDrive are kept here too."
     } else {

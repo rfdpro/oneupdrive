@@ -119,7 +119,8 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         },
         "versions": {
             "keep_replaced": policy.keep_replaced,
-            "overflow": if policy.overflow == OverflowPolicy::Keep { "keep" } else { "hold" },
+            "keep_removed": policy.keep_removed,
+            "overflow": crate::versions::overflow_name(policy.overflow),
             "rotate": trim.rotate,
             "min_days": trim.min_age_days,
             "max_gib": trim.max_gib,
@@ -748,10 +749,12 @@ pub fn versions_changes(v: &Value) -> Result<crate::versions::Changes> {
             .map(|x| match x.as_str() {
                 Some("keep") => Ok(OverflowPolicy::Keep),
                 Some("hold") => Ok(OverflowPolicy::Hold),
-                _ => bail!("overflow: hold or keep"),
+                Some("discard") => Ok(OverflowPolicy::Discard),
+                _ => bail!("overflow: hold, keep or discard"),
             })
             .transpose()?,
         keep_replaced: flag("keep_replaced")?,
+        keep_removed: flag("keep_removed")?,
     })
 }
 
@@ -1399,6 +1402,8 @@ mod tests {
 
     #[test]
     fn version_store_changes_are_checked() {
+        let c = versions_changes(&json!({ "overflow": "discard", "keep_removed": false })).unwrap();
+        assert_eq!((c.overflow, c.keep_removed), (Some(OverflowPolicy::Discard), Some(false)));
         let c = versions_changes(&json!({ "overflow": "keep", "rotate": true, "max_gib": 2.5 })).unwrap();
         assert_eq!(
             (c.overflow, c.rotate, c.max_gib, c.keep_replaced),

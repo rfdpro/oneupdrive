@@ -172,10 +172,36 @@
             background: var(--accent);
         }
         
-        nav hr {
-            border: 0;
-            border-top: 1px solid var(--line);
-            margin: 8px 10px;
+        .nav-group {
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
+        }
+
+        /* Settings sits at the foot of the list; its pages replace the list. */
+        .nav-foot {
+            margin-top: auto;
+        }
+
+        nav button svg {
+            width: 16px;
+            height: 16px;
+            flex: none;
+            color: var(--muted);
+        }
+
+        .nav-back svg {
+            transform: scaleX(-1);
+        }
+
+        .nav-back {
+            color: var(--muted) !important;
+        }
+
+        .nav-title {
+            font: 600 12px/1 "Segoe UI Variable Text", "Segoe UI", sans-serif;
+            color: var(--muted);
+            padding: 14px 12px 8px;
         }
         /* The gutter is always kept, so pages don't shift or misalign when one needs a scroll bar. */
         
@@ -187,8 +213,9 @@
             padding: 17px 30px 44px;
         }
         
+        /* The same gutters as every page, so switching to Files doesn't shift the header. */
         main.wide {
-            padding: 17px 22px 0;
+            padding: 17px 30px 0;
             overflow: hidden;
             display: flex;
             flex-direction: column;
@@ -216,14 +243,16 @@
             min-height: 0;
         }
         
+        /* Every page's title keeps the same 18px below it, whatever comes
+           next (a subtitle sits closer), so pages line up as you switch. */
         h2 {
             font: 600 26px/1.2 "Segoe UI Variable Display", "Segoe UI", sans-serif;
-            margin: 0 0 4px;
+            margin: 0 0 18px;
             letter-spacing: -.01em;
         }
         
         h2+p.lead {
-            margin: 0 0 18px;
+            margin: -14px 0 18px;
         }
 
         /* A problem the agent ran into, above every page while it lasts. */
@@ -267,12 +296,6 @@
             }
         }
 
-        /* Controls straight under a page's title (no subtitle). */
-        h2+.ls-bar,
-        h2+.actions {
-            margin-top: 18px;
-        }
-        
         h3 {
             font-size: 14px;
             font-weight: 600;
@@ -384,6 +407,69 @@
             font-size: 12px;
             margin: 6px 2px 0;
         }
+
+        /* A page section that folds away: its heading is the toggle. */
+        details.sect>summary {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin: 24px 0 8px;
+            list-style: none;
+            cursor: pointer;
+            width: fit-content;
+            border-radius: 4px;
+        }
+
+        details.sect>summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.sect>summary h3 {
+            margin: 0;
+        }
+
+        details.sect>summary svg {
+            width: 14px;
+            height: 14px;
+            color: var(--muted);
+            transition: transform .15s;
+        }
+
+        details.sect[open]>summary svg {
+            transform: rotate(90deg);
+        }
+
+        details.sect>summary:hover h3 {
+            color: var(--accent);
+        }
+
+        details.sect h4 {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--muted);
+            margin: 18px 0 8px;
+        }
+
+        details.sect>summary+h4 {
+            margin-top: 4px;
+        }
+
+        /* A card's own message ("Nothing kept.") and footnote, inset like its rows. */
+        .card>.say {
+            margin: 0;
+            padding: 14px 16px;
+            color: var(--muted);
+        }
+
+        .card>.note {
+            margin: 0;
+            padding: 10px 16px 12px;
+        }
+
+        .card>.row+.note,
+        .card>table+.note {
+            border-top: 1px solid var(--line);
+        }
         
         code {
             font: 12.5px "Cascadia Mono", Consolas, monospace;
@@ -447,6 +533,8 @@
         input[type=search],
         input[type=number],
         input[type=password],
+        input[type=date],
+        input[type=time],
         select,
         textarea {
             font: inherit;
@@ -466,6 +554,49 @@
         
         input[type=number] {
             width: 100px;
+        }
+
+        input[type=date],
+        input[type=time] {
+            font-variant-numeric: tabular-nums;
+            min-height: 32px;
+        }
+
+        input[type=date]::-webkit-calendar-picker-indicator,
+        input[type=time]::-webkit-calendar-picker-indicator {
+            opacity: .6;
+            cursor: pointer;
+        }
+
+        input[type=date]::-webkit-calendar-picker-indicator:hover,
+        input[type=time]::-webkit-calendar-picker-indicator:hover {
+            opacity: 1;
+        }
+
+        /* Recovery: the rewind's folder and moment. */
+        .rw-folder {
+            width: 320px;
+        }
+
+        .rw-at {
+            display: flex;
+            gap: 8px;
+        }
+
+        .rw-at input[type=date] {
+            width: 160px;
+        }
+
+        .rw-at input[type=time] {
+            width: 150px;
+        }
+
+        #rw-ago.bad {
+            color: var(--bad);
+        }
+
+        .rw-go {
+            margin-left: auto;
         }
         
         textarea {
@@ -1003,7 +1134,7 @@
             display: flex;
             align-items: center;
             gap: 12px;
-            margin-bottom: 12px;
+            margin-bottom: 16px;
         }
         
         .files-head h2 {
@@ -1872,25 +2003,32 @@
     <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 13V3.5M4 7.2 8 3.2l4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3" y="7" width="10" height="7" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.3 7V5.2a2.7 2.7 0 0 1 5.4 0V7" fill="none" stroke="currentColor" stroke-width="1.3"/></symbol>
     <symbol id="i-share" viewBox="0 0 16 16"><circle cx="5" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="4" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="12" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m6.8 7 3-1.8M6.8 9l3 1.8" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 16 16"><path d="M13.01 6.26 L14.54 6.56 L14.54 9.44 L13.01 9.74 L12.77 10.31 L13.64 11.61 L11.61 13.64 L10.31 12.77 L9.74 13.01 L9.44 14.54 L6.56 14.54 L6.26 13.01 L5.69 12.77 L4.39 13.64 L2.36 11.61 L3.23 10.31 L2.99 9.74 L1.46 9.44 L1.46 6.56 L2.99 6.26 L3.23 5.69 L2.36 4.39 L4.39 2.36 L5.69 3.23 L6.26 2.99 L6.56 1.46 L9.44 1.46 L9.74 2.99 L10.31 3.23 L11.61 2.36 L13.64 4.39 L12.77 5.69Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="2.1" fill="none" stroke="currentColor" stroke-width="1.2"/></symbol>
     <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
   </defs>
 </svg>
     <nav aria-label="Pages">
         <div class="brand"><svg role="img" aria-label="OneUpDrive"><use href="#mark"/></svg><span>OneUpDrive</span></div>
-        <button data-page="setup" id="nav-setup" hidden>Set up</button>
-        <button data-page="files" aria-current="page">Files</button>
-        <button data-page="find">Search</button>
-        <button data-page="apps">Apps</button>
-        <button data-page="lists">Activity</button>
-        <button data-page="shared">Shared</button>
-        <button data-page="recovery">Recovery</button>
-        <hr>
-        <button data-page="general">General</button>
-        <button data-page="accounts">Accounts</button>
-        <button data-page="office">Office</button>
-        <button data-page="safety">Safety</button>
-        <button data-page="network">Network</button>
-        <button data-page="about">About</button>
+        <div class="nav-group" id="nav-app">
+            <button data-page="setup" id="nav-setup" hidden>Set up</button>
+            <button data-page="files" aria-current="page">Files</button>
+            <button data-page="find">Search</button>
+            <button data-page="apps">Apps</button>
+            <button data-page="lists">Activity</button>
+            <button data-page="shared">Sharing</button>
+            <button data-page="recovery">Recovery</button>
+        </div>
+        <div class="nav-group" id="nav-settings" role="group" aria-labelledby="nav-settings-title" hidden>
+            <button class="nav-back" id="nav-back"><svg aria-hidden="true"><use href="#i-chev"/></svg>Back</button>
+            <div class="nav-title" id="nav-settings-title">Settings</div>
+            <button data-page="general">General</button>
+            <button data-page="accounts">Accounts</button>
+            <button data-page="office">Office</button>
+            <button data-page="safety">Safety</button>
+            <button data-page="network">Network</button>
+            <button data-page="about">About</button>
+        </div>
+        <button class="nav-foot" id="nav-open-settings"><svg aria-hidden="true"><use href="#i-gear"/></svg>Settings</button>
     </nav>
     <main id="main">
         <!-- The background agent: what it's doing, and its controls -->
@@ -2111,7 +2249,7 @@
 
         <!-- Shared: what this account shares and who can open it; what others share with it -->
         <section class="page" id="shared">
-            <h2>Shared</h2>
+            <h2>Sharing</h2>
             <div class="ls-bar">
                 <div class="seg" id="sg-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="by" aria-pressed="true">Shared by you</button>
@@ -2134,9 +2272,22 @@
             <h2>Recovery</h2>
             <h3>Rewind a folder</h3>
             <div class="card">
-                <div class="row block">
-                    <div class="label"><small id="rw-since">Puts a folder back the way it was at a moment you choose. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.</small></div>
-                    <div class="field"><input type="text" id="rw-folder" placeholder="Folder, like /Documents (/ for everything)" spellcheck="false" aria-label="Folder to rewind" aria-describedby="rw-since"><input type="datetime-local" id="rw-at" step="1" aria-label="Moment to rewind to"><button class="btn" id="rw-preview">Preview</button></div>
+                <div class="row">
+                    <div class="label"><b>Folder</b><small>/ for everything</small></div>
+                    <input type="text" id="rw-folder" class="rw-folder" placeholder="/Documents" spellcheck="false" aria-label="Folder to rewind" aria-describedby="rw-since"></div>
+                <div class="row">
+                    <div class="label"><b>Rewind to</b><small id="rw-ago" aria-live="polite"></small></div>
+                    <div class="rw-at" role="group" aria-label="Moment to rewind to">
+                        <input type="date" id="rw-date" aria-label="Date to rewind to" aria-describedby="rw-ago">
+                        <input type="time" id="rw-time" step="60" aria-label="Time to rewind to" aria-describedby="rw-ago"></div>
+                </div>
+                <div class="row">
+                    <div class="seg" id="rw-quick" role="group" aria-label="Rewind to">
+                        <button type="button" data-ago="900000" aria-pressed="false">15 minutes ago</button>
+                        <button type="button" data-ago="3600000" aria-pressed="false">1 hour ago</button>
+                        <button type="button" data-ago="today" aria-pressed="false">Start of today</button>
+                        <button type="button" data-ago="86400000" aria-pressed="false">This time yesterday</button></div>
+                    <button class="btn primary rw-go" id="rw-preview">Preview</button>
                 </div>
                 <div class="row block" id="rw-result" hidden>
                     <ul class="facts" id="rw-groups"></ul>
@@ -2145,6 +2296,7 @@
                     <div class="actions" id="rw-actions"></div>
                 </div>
             </div>
+            <p class="note" id="rw-since">Puts a folder back the way it was at a moment you choose. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.</p>
             <h3>Conflicts</h3>
             <div class="card" id="cf-card">
                 <p class="say" id="cf-sum" role="status">Looking…</p>
@@ -2184,12 +2336,12 @@
             <h3>Kept copies</h3>
             <div class="card">
                 <div class="row">
-                    <div class="label"><b>Copies of files removed from this PC</b><small>In the hidden <code>.oneup\versions</code> folder</small></div><button class="btn" data-open="kept">Open folder</button></div>
-                <div class="row">
+                    <div class="label"><b>Keep copies of removed files</b><small>Files deleted or replaced in OneDrive</small></div><label class="toggle"><input type="checkbox" data-ver="keep_removed" aria-label="Keep copies of removed files"><span></span></label></div>
+                <div class="row ver-keeping">
                     <div class="label"><b>Also keep files replaced from OneDrive</b><small>OneDrive's version history has them anyway</small></div><label class="toggle"><input type="checkbox" data-ver="keep_replaced" aria-label="Also keep replaced files"><span></span></label></div>
-                <div class="row">
+                <div class="row ver-keeping">
                     <div class="label"><b>When removed files don't fit</b></div>
-                    <select data-ver="overflow" aria-label="When removed files don't fit"><option value="hold">Ask me</option><option value="keep">Keep them and tell me</option></select></div>
+                    <select data-ver="overflow" aria-label="When removed files don't fit"><option value="hold">Ask me</option><option value="keep">Keep them and tell me</option><option value="discard">Delete immediately</option></select></div>
                 <div class="row">
                     <div class="label"><b>Delete the oldest copies to make room</b></div><label class="toggle"><input type="checkbox" data-ver="rotate" aria-label="Delete the oldest copies to make room"><span></span></label></div>
                 <div class="row">
@@ -2198,7 +2350,10 @@
                     <div class="label"><b>Space for kept copies</b><small>GiB, and at most this % of the disk</small></div>
                     <div class="actions"><input type="number" min="0" step="0.5" data-ver="max_gib" aria-label="Space for kept copies (GiB)"><input type="number" min="0" max="100" step="0.5" data-ver="max_percent" aria-label="Space for kept copies (% of the disk)"></div>
                 </div>
+                <div class="row">
+                    <div class="label"><b>Kept copies</b><small>In the hidden <code>.oneup\versions</code> folder</small></div><button class="btn" data-open="kept">Open folder</button></div>
             </div>
+            <p class="note" id="ver-off-note" hidden>Files that match OneDrive's version are removed without a copy. Duplicates you remove and files a rewind sets aside are still kept.</p>
         </section>
 
         <!-- Office -->
@@ -2269,8 +2424,8 @@
                 <div class="row">
                     <div class="label"><b>Get OneDrive's changes at once</b><small>Keeps push notifications on</small></div><label class="toggle"><input type="checkbox" data-sync="keep_push" aria-label="Get OneDrive's changes at once"><span></span></label></div>
             </div>
-            <div id="net-this">
-            <h3>This network</h3>
+            <details class="sect" id="net-this">
+            <summary><svg aria-hidden="true"><use href="#i-chev"/></svg><h3>This network</h3></summary>
             <div class="card">
                 <div class="row">
                     <div class="label"><b id="net-name"></b><small id="net-detail"></small></div><button class="btn" id="net-forget" hidden>Forget</button></div>
@@ -2293,13 +2448,14 @@
                 <div class="row">
                     <div class="label"><b>Get OneDrive's changes at once</b><small>With a sync interval</small></div><select aria-label="This network: Get OneDrive's changes at once" data-net-this="keep_push"><option value="">As other networks</option><option value="on">On</option><option value="off">Off</option></select></div>
             </div>
-            </div>
+            </details>
             <h3>Work offline</h3>
             <div class="card">
                 <div class="row">
                     <div class="label"><b>Work offline</b><small>Nothing syncs over the network. Opening an online-only file still downloads it.</small></div><label class="toggle"><input type="checkbox" id="net-offline" aria-label="Work offline"><span></span></label></div>
             </div>
-            <h3>Metered connections</h3>
+            <details class="sect" id="net-metered">
+            <summary><svg aria-hidden="true"><use href="#i-chev"/></svg><h3>Metered connections</h3></summary>
             <div class="card">
                 <div class="row">
                     <div class="label"><b>What syncs</b><small>Opening an online-only file always downloads it</small></div><select aria-label="Metered connections: What syncs" data-net-metered="transfer"><option value="paused">Nothing (paused)</option><option value="everything">Everything</option><option value="metadata">Names and folders only</option><option value="small">Files under the size limit</option><option value="opened">Only files I open or change</option></select></div>
@@ -2316,6 +2472,7 @@
                 <div class="row">
                     <div class="label"><b>Get OneDrive's changes at once</b><small>With a sync interval</small></div><select aria-label="Metered connections: Get OneDrive's changes at once" data-net-metered="keep_push"><option value="">As other networks</option><option value="on">On</option><option value="off">Off</option></select></div>
             </div>
+            </details>
         </section>
 
         <!-- General -->
@@ -2339,24 +2496,6 @@
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
             <p class="note">Memory and priority apply after a restart.</p>
-            <h3>Memory and hashing</h3>
-            <div class="card" id="tune"></div>
-            <p class="note">Empty uses the default. Applies after a restart.</p>
-            <h3>File changes</h3>
-            <div class="card">
-                <div class="row">
-                    <div class="label"><b>Timeout highly active files</b><small>Don't upload files with constant updates on every change, wait for quiet period.</small></div>
-                    <label class="toggle"><input type="checkbox" data-agent="hold_busy_files" aria-label="Timeout highly active files"><span></span></label></div>
-                <div class="row">
-                    <div class="label"><b>Timeout (seconds)</b><small>Ensure file is quiet before sending update</small></div><input type="number" min="1" data-agent="busy_quiet_s" aria-label="Timeout (seconds)"></div>
-            </div>
-            <h3 id="hooks">Hooks</h3>
-            <div class="card">
-                <div class="row">
-                    <div class="label"><b>Run hooks</b><small id="hk-state">Programs started on sync events, set in config.toml</small></div>
-                    <label class="toggle"><input type="checkbox" id="hk-run" aria-label="Run hooks"><span></span></label></div>
-                <div id="hk-list"></div>
-            </div>
             <h3 id="shortcuts">Shortcuts</h3>
             <div class="card">
                 <div class="row">
@@ -2373,6 +2512,27 @@
                 <div class="row">
                     <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
             </div>
+            <details class="sect" id="advanced">
+            <summary><svg aria-hidden="true"><use href="#i-chev"/></svg><h3>Advanced</h3></summary>
+            <h4 id="hooks">Hooks</h4>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Run hooks</b><small id="hk-state">Programs started on sync events, set in config.toml</small></div>
+                    <label class="toggle"><input type="checkbox" id="hk-run" aria-label="Run hooks"><span></span></label></div>
+                <div id="hk-list"></div>
+            </div>
+            <h4>Memory and hashing</h4>
+            <div class="card" id="tune"></div>
+            <p class="note">Empty uses the default. Applies after a restart.</p>
+            <h4>File changes</h4>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Timeout highly active files</b><small>Don't upload files with constant updates on every change, wait for quiet period.</small></div>
+                    <label class="toggle"><input type="checkbox" data-agent="hold_busy_files" aria-label="Timeout highly active files"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Timeout (seconds)</b><small>Ensure file is quiet before sending update</small></div><input type="number" min="1" data-agent="busy_quiet_s" aria-label="Timeout (seconds)"></div>
+            </div>
+            </details>
         </section>
 
         <!-- Accounts -->
@@ -2873,15 +3033,35 @@
         }
 
         // ---- navigation
+        // The settings pages, behind the sidebar's Settings button; the page
+        // each list showed last, to come back to.
+        const SETTINGS_PAGES = ["general", "accounts", "office", "safety", "network", "about"];
+        const NAV = {
+            app: "files",
+            settings: "general"
+        };
+
         function show(page) {
             if (LIST_PAGES[page]) {
                 L.tab = LIST_PAGES[page];
                 page = "lists";
             }
-            $$("nav button").forEach(x => x.toggleAttribute("aria-current", x.dataset.page === page));
-            $$("nav button").forEach(x => {
+            $$("nav button[data-page]").forEach(x => x.toggleAttribute("aria-current", x.dataset.page === page));
+            $$("nav button[data-page]").forEach(x => {
                 if (x.dataset.page === page) x.setAttribute("aria-current", "page");
             });
+            const inSettings = SETTINGS_PAGES.includes(page);
+            if (inSettings) NAV.settings = page;
+            else NAV.app = page;
+            // Switching lists from Settings or Back: focus follows to the
+            // other one (read before hiding it, which drops focus).
+            const switcher = $("#nav-settings").hidden === inSettings && document.activeElement?.matches("#nav-open-settings, #nav-back");
+            $("#nav-app").hidden = inSettings;
+            $("#nav-settings").hidden = !inSettings;
+            $("#nav-open-settings").hidden = inSettings;
+            if (switcher) {
+                (inSettings ? $("#nav-back") : $("#nav-open-settings")).focus();
+            }
             $$(".page").forEach(p => p.classList.toggle("on", p.id === page));
             $("#main").classList.toggle("wide", page === "files");
             $("#agent").hidden = page === "setup";
@@ -2901,7 +3081,9 @@
             if (page === "shared") loadSharing();
             if (page === "recovery") loadRecovery();
         }
-        $$("nav button").forEach(b => b.onclick = () => show(b.dataset.page));
+        $$("nav button[data-page]").forEach(b => b.onclick = () => show(b.dataset.page));
+        $("#nav-open-settings").onclick = () => show(NAV.settings);
+        $("#nav-back").onclick = () => show(NAV.app);
         document.addEventListener("click", e => {
             const g = e.target.closest("[data-goto]");
             if (g) show(g.dataset.goto);
@@ -3064,6 +3246,7 @@
                 const v = s.versions[e.dataset.ver];
                 e.type === "checkbox" ? e.checked = v : e.value = v ?? "";
             });
+            keepingShown(s.versions.keep_removed !== false);
             $$("[data-safety]").forEach(e => e.value = s.safety[e.dataset.safety]);
             $("#guard-on").checked = s.safety.content_guard > 0;
             $("#guard-n").value = s.safety.content_guard || 20;
@@ -3226,6 +3409,28 @@
         }
         $$("[data-agent]").forEach(e => e.onchange = () => saveField(e, "agent", e.dataset.agent));
         $$("[data-ver]").forEach(e => e.onchange = () => saveField(e, "versions", e.dataset.ver));
+
+        // Not keeping copies, or deleting what doesn't fit: those files are
+        // then only in OneDrive's recycle bin, so it's confirmed once.
+        function keepingShown(on) {
+            $$(".ver-keeping").forEach(r => r.hidden = !on);
+            $("#ver-off-note").hidden = on;
+        }
+        $('[data-ver="keep_removed"]').onchange = e => {
+            if (!e.target.checked && !confirm(tr("Stop keeping copies of files deleted or replaced in OneDrive? OneDrive's recycle bin keeps deleted files for up to 30 days, less when it's full."))) {
+                e.target.checked = true;
+                return;
+            }
+            keepingShown(e.target.checked);
+            saveField(e.target, "versions", "keep_removed");
+        };
+        $('[data-ver="overflow"]').onchange = e => {
+            if (e.target.value === "discard" && !confirm(tr("Delete removed files that don't fit without a copy? OneDrive's recycle bin keeps them for up to 30 days, less when it's full."))) {
+                load();
+                return;
+            }
+            saveField(e.target, "versions", "overflow");
+        };
         $$("[data-safety]").forEach(e => e.onchange = () => saveField(e, "safety", e.dataset.safety));
         $("#guard-on").onchange = e => {
             $("#guard-row").hidden = !e.target.checked;
@@ -3923,8 +4128,10 @@
             }
         }
         const RW_ORDER = ["Restore", "Revert", "MoveBack", "Remove", "SetAside"];
+        // The rewind on show (its preview), and how far back the history goes.
         let RW = {
-            preview: null
+            preview: null,
+            since: 0
         };
 
         function localInput(ms) {
@@ -3932,13 +4139,77 @@
             return d.toISOString().slice(0, 19);
         }
 
+        // ---- the rewind's moment: a date and a time, the quick picks, and how
+        // long ago it is.
+
+        function rewindAt() {
+            const d = $("#rw-date").value,
+                t = $("#rw-time").value;
+            return d && t ? new Date(d + "T" + t).getTime() : NaN;
+        }
+
+        function setRewindAt(ms) {
+            const v = localInput(ms);
+            $("#rw-date").value = v.slice(0, 10);
+            // Whole minutes show as such; a moment with seconds keeps them.
+            $("#rw-time").value = v.slice(17, 19) === "00" ? v.slice(11, 16) : v.slice(11, 19);
+            rewindAtShown();
+        }
+
+        // Picks fall on a whole minute, like the time field.
+        function quickPick(b, now) {
+            if (b.dataset.ago !== "today") return Math.floor((now - Number(b.dataset.ago)) / 60000) * 60000;
+            const d = new Date(now);
+            d.setHours(0, 0, 0, 0);
+            return d.getTime();
+        }
+
+        function rewindAtShown() {
+            const at = rewindAt(),
+                now = Date.now();
+            let say = "";
+            if (!at) say = tr("Choose a date and time.");
+            else if (at > now) say = tr("That's in the future.");
+            else if (RW.since && at < RW.since) say = tr("Before the history starts ({when}).", {
+                when: when(RW.since)
+            });
+            else say = ago(now - at);
+            $("#rw-ago").textContent = say;
+            $("#rw-ago").classList.toggle("bad", !!at && (at > now || (RW.since && at < RW.since)));
+            $$("#rw-quick button").forEach(b => {
+                const pick = quickPick(b, now);
+                b.disabled = !!RW.since && pick < RW.since;
+                b.setAttribute("aria-pressed", String(!!at && Math.abs(pick - at) < 60000));
+            });
+            $("#rw-date").max = localInput(now).slice(0, 10);
+            if (RW.since) $("#rw-date").min = localInput(RW.since).slice(0, 10);
+        }
+
+        // "3 hours ago", in the window's language.
+        function ago(ms) {
+            const f = new Intl.RelativeTimeFormat(FMT, {
+                numeric: "auto"
+            });
+            const m = Math.round(ms / 60000);
+            if (m < 1) return tr("Now");
+            if (m < 60) return f.format(-m, "minute");
+            const h = Math.round(m / 60);
+            if (h < 48) return f.format(-h, "hour");
+            return f.format(-Math.round(h / 24), "day");
+        }
+        $("#rw-date").oninput = rewindAtShown;
+        $("#rw-time").oninput = rewindAtShown;
+        $$("#rw-quick button").forEach(b => b.onclick = () => setRewindAt(quickPick(b, Date.now())));
+
         async function loadRecovery() {
             const st = await call("rewind_state").catch(() => null);
             if (st) {
                 $("#rw-since").textContent = st.since_ms ? tr("Puts a folder back the way it was at a moment you choose, back to {when}. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.", {
                     when: when(st.since_ms)
                 }) : tr("Rewinding starts once the first sync has finished.");
-                if (!$("#rw-at").value) $("#rw-at").value = localInput(Date.now() - 3600000);
+                RW.since = st.since_ms || 0;
+                if (!rewindAt()) setRewindAt(Math.floor((Date.now() - 3600000) / 60000) * 60000);
+                else rewindAtShown();
                 if (st.job) rewindUnderWay(st);
             }
             loadConflicts();
@@ -4090,7 +4361,7 @@
         function rewindUnderWay(st) {
             const j = st.job;
             $("#rw-folder").value = j.folder;
-            $("#rw-at").value = localInput(j.at_ms);
+            setRewindAt(j.at_ms);
             const a = {
                 folder: j.folder || "/",
                 when: when(j.at_ms),
@@ -4128,10 +4399,10 @@
         }
 
         $("#rw-preview").onclick = () => {
-            const at = new Date($("#rw-at").value).getTime();
+            const at = rewindAt();
             if (!at) {
                 toast(tr("Choose a moment"), true);
-                $("#rw-at").focus();
+                $($("#rw-date").value ? "#rw-time" : "#rw-date").focus();
                 return;
             }
             rewindPreview({
