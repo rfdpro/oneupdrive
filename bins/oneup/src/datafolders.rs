@@ -100,3 +100,46 @@ pub fn for_path_in(path: &Path, dirs: Vec<PathBuf>) -> Option<(PathBuf, String)>
     }
     best.map(|(d, rel, _)| (d, rel))
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// A data folder at `dir` syncing `local`, whose database is at schema
+    /// version 23, older than this build's: opening it as a store would
+    /// upgrade it.
+    pub(crate) fn older_folder(dir: &Path, local: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let db = dir.join("state.db");
+        {
+            let mut s = oneup_store::Store::open(&db, 1024).unwrap();
+            s.write(|o| o.meta_set(crate::sync::KEY_LOCAL, &local.to_string_lossy())).unwrap();
+        }
+        rusqlite::Connection::open(&db).unwrap().execute_batch("PRAGMA user_version = 23;").unwrap();
+    }
+
+    pub(crate) fn version(dir: &Path) -> i64 {
+        rusqlite::Connection::open(dir.join("state.db"))
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Finding which data folder a path is in reads the folders' databases
+    /// and leaves them as they were: not upgraded, none made.
+    #[test]
+    fn finding_a_paths_folder_never_upgrades_or_makes_a_database() {
+        let root = std::env::temp_dir().join(format!("oneup-datafolders-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (synced, older, empty) = (root.join("Sync"), root.join("older"), root.join("empty"));
+        std::fs::create_dir_all(synced.join("Docs")).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        older_folder(&older, &synced);
+        let (dir, rel) = for_path_in(&synced.join("Docs"), vec![empty.clone(), older.clone()]).unwrap();
+        assert_eq!((dir, rel.as_str()), (older.clone(), "Docs"));
+        assert_eq!(version(&older), 23, "not upgraded");
+        assert!(!empty.join("state.db").exists(), "none made");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}

@@ -107,8 +107,12 @@ fn synced_folders(main: &Path, out: &mut Vec<(PathBuf, String)>) -> Result<()> {
 /// that folder's agent, maybe another build (`Store::peek_meta`).
 fn other_folder(d: &Path) -> Result<Option<PathBuf>> {
     let db = d.join("state.db");
-    if !db.exists() {
-        return Ok(None);
+    // Only a database that isn't there syncs nothing; one that can't be
+    // looked at makes the listing incomplete.
+    match std::fs::metadata(&db) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
     }
     Ok(oneup_store::Store::peek_meta(&db, crate::sync::KEY_LOCAL)?.map(PathBuf::from))
 }
@@ -470,6 +474,23 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use oneup_ipc::{Event, EventKind};
+
+    /// Another account's synced folder is read from its database, which is
+    /// left as it was: not upgraded, none made where there's none.
+    #[test]
+    fn another_accounts_folder_is_read_without_upgrading_its_database() {
+        use crate::datafolders::tests::{older_folder, version};
+        let root = std::env::temp_dir().join(format!("oneup-hooks-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (older, empty) = (root.join("older"), root.join("empty"));
+        std::fs::create_dir_all(&empty).unwrap();
+        older_folder(&older, &root.join("Sync"));
+        assert_eq!(other_folder(&older).unwrap(), Some(root.join("Sync")));
+        assert_eq!(version(&older), 23, "not upgraded");
+        assert_eq!(other_folder(&empty).unwrap(), None);
+        assert!(!empty.join("state.db").exists(), "none made");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn ran(code: Option<i32>, timed_out: bool) -> Ran {
         Ran {
