@@ -176,6 +176,17 @@ fn place_row(
                 match was {
                     ItemState::Included => {
                         ops.prune_subtree(&row.id, false)?;
+                        // The folder may have moved under one of its own
+                        // descendants (pages apply one at a time, so the
+                        // store can hold that loop for a while): pruning
+                        // its subtree took the new parent with it, and the
+                        // folder is inside that pruned subtree now.
+                        if ops.item_state(&parent)? != ItemState::Included {
+                            ops.prune_subtree(&row.id, true)?;
+                            ops.add_pruned(&row.id, &parent)?;
+                            t.pruned += 1;
+                            return Ok(Placed::Discarded);
+                        }
                     }
                     // Its own tombstone goes; tombstones below it stay valid.
                     ItemState::Pruned => ops.remove_pruned_one(&row.id)?,
@@ -348,5 +359,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(from, Some((oneup_sync::RemoteId("trash".into()), "a.txt".into())));
+    }
+
+    /// Pages apply one at a time, so a move of two folders past each other
+    /// can leave the store with `a` under `b` and `b` under `a` until the
+    /// page with the second. A folder that is excluded as it moves under one
+    /// of its own descendants took that new parent with it when its subtree
+    /// was pruned, and must not stay behind with a parent that is gone.
+    #[test]
+    fn an_excluded_folder_moved_under_its_own_descendant_is_pruned() {
+        let mut s = oneup_store::Store::open_in_memory().unwrap();
+        s.write(|o| {
+            let mut t = super::Tally::default();
+            let rules = oneup_rules::ExcludeSet::from_names(["node_modules"]);
+            // R > a > b; then OneDrive moves `a` (now node_modules) under `b`,
+            // and `b` under an excluded folder `x`.
+            for json in [
+                r#"{"id":"R","name":"root","root":{},"folder":{"childCount":2}}"#,
+                r#"{"id":"x","name":"node_modules","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"a","name":"a","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":0},"parentReference":{"id":"a"}}"#,
+                r#"{"id":"a","name":"node_modules","folder":{"childCount":1},"parentReference":{"id":"b"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":1},"parentReference":{"id":"x"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                super::apply(o, &rules, super::Mode::CatchUp, &item, &mut t)?;
+            }
+            assert_eq!(o.check_invariants()?, Vec::<String>::new());
+            assert_eq!(o.item_state("a")?, oneup_store::ItemState::Pruned);
+            assert_eq!(o.item_state("b")?, oneup_store::ItemState::Pruned);
+            Ok(())
+        })
+        .unwrap();
     }
 }
