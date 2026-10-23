@@ -38,8 +38,10 @@ jobs:
       #   backups:  4,000,000 / (4 x 1,075/s) = ~16 min
       #   converge with the store check: 20,000 / (4 x 2.4/s) = ~35 min
       #   backups with the store check:  20,000 / (4 x 3/s)   = ~28 min
-      #   mirror in memory: 8 jobs x 250,000 = 2,000,000 seeds;
-      #     250,000 / (4 x 13.5/s) = ~77 min each
+      #   mirror in memory: 8 jobs x 125,000 = 1,000,000 seeds. The first
+      #     night's 250,000 each ran 76 to 132 min, and five of eight hit
+      #     the 150 min limit: a runner does ~8/s per process, not 13.5/s.
+      #     125,000 / (4 x 8/s) = ~65 min each
       #   mirror on disk (what only a file shows: WAL, reopening the file):
       #     12,000 seeds, 8 processes at ~4/s = ~50 min
       # Each job prints its real rate in the run summary; adjust here if one
@@ -50,14 +52,14 @@ jobs:
           - { name: backups, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 4000000, shard: 0, shards: 1, store: "0", db: "", procs: 4 }
           - { name: converge-store, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 20000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
           - { name: backups-store, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 20000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
-          - { name: mirror-memory-1, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 0, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-2, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 1, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-3, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 2, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-4, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 3, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-5, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 4, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-6, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 5, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-7, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 6, shards: 8, store: "", db: memory, procs: 4 }
-          - { name: mirror-memory-8, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 250000, shard: 7, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-1, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 0, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-2, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 1, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-3, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 2, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-4, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 3, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-5, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 4, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-6, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 5, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-7, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 6, shards: 8, store: "", db: memory, procs: 4 }
+          - { name: mirror-memory-8, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 7, shards: 8, store: "", db: memory, procs: 4 }
           - { name: mirror-disk, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 12000, shard: 0, shards: 1, store: "", db: "", procs: 8 }
     steps:
       - uses: actions/checkout@v4
