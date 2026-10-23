@@ -108,7 +108,11 @@ fuzz_target!(|data: &[u8]| {
             // Names round-trip in their folder only.
             let (parent, name) = text.split_once('\n').unwrap_or(("p", &text));
             let Ok(enc) = names::encrypt_name(&key(), name, parent) else { return };
-            assert!(names::decrypt_name(&key(), &enc, parent).is_ok());
+            // Except the names a reader refuses even when authentic: no
+            // file has them, and they could reach outside their folder.
+            if !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0']) {
+                assert!(names::decrypt_name(&key(), &enc, parent).is_ok());
+            }
             assert!(names::decrypt_name(&key(), &enc, &format!("{parent}x")).is_err());
         }
     }
