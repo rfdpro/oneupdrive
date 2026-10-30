@@ -22,6 +22,7 @@ window.ERRS = [];
 window.addEventListener("error", e => ERRS.push(e.message + " @" + e.lineno));
 window.addEventListener("unhandledrejection", e => ERRS.push(String(e.reason && e.reason.message || e.reason)));
 const HOST_LISTENERS = [];
+const HOST_CALLS = [];
 const HOST_ANSWERS = {
   status: null, stopped: null,
   snapshot: a => a && a.root ? {rules: {presets: [], exclude: [], paused: [], cloud: "pull"}, priority: {first: [], last: []},
@@ -57,6 +58,12 @@ const HOST_ANSWERS = {
   rewind_start: a => ({...HOST_ANSWERS.rewind_preview(a), started: true}),
   // The folder changed before the approval: another list comes back.
   rewind_approve: a => ({...HOST_ANSWERS.rewind_preview(a), code: "fedcba9876543210", approved: false, changed: true}),
+  unsynced: {items: ["/1.", "/bad?.txt"].map(path => ({path, kind: "invalid_name", why: "Name not allowed",
+    detail: "OneDrive doesn't allow this name; rename it", subject: "l:" + path, here: true,
+    choices: [{code: "rename", label: "Rename", bulk: false}, {code: "repair-names", label: "Repair", bulk: true}]}))},
+  unsynced_preview: {items: 2, tops: ["/1.", "/bad?.txt"], renames: [{path: "/1.", name: "1"}, {path: "/bad?.txt", name: "bad_.txt"}],
+    refused: ["/busy.: an answer is already queued"], code: "repair-preview-code"},
+  unsynced_resolve: "Queued: repair names for 2 items.",
   rewind_cancel: "", conflicts: [],
   cloud_bin: [{seq: 7, at_ms: 5000, path: "/Docs/gone.txt", folder: false, size: 3, restorable: true}],
   cloud_bin_restore: "/Docs/gone.txt",
@@ -64,6 +71,7 @@ const HOST_ANSWERS = {
 window.chrome = {webview: {
   postMessage(text) {
     const m = JSON.parse(text);
+    HOST_CALLS.push(m);
     let v = HOST_ANSWERS[m.op];
     if (typeof v === "function") v = v(m.args);
     if (v === undefined) v = {};
@@ -178,6 +186,26 @@ const DRIVER: &str = r##"<script>
     check("Back returns to the page before", !document.querySelector("#nav-app").hidden
       && document.querySelector(".page.on").id === before, document.querySelector(".page.on").id);
     check("focus goes back to Settings", document.activeElement.id === "nav-open-settings", at());
+
+    // Bulk repair is a before/after preview, never a silent rename.
+    document.querySelector('nav [data-page="lists"]').click(); await sleep(200);
+    document.querySelector('[data-tab="unsynced"]').click(); await sleep(300);
+    const repairButton = () => [...document.querySelectorAll("#lists button")].find(b => b.textContent === "Repair names");
+    check("invalid names offer bulk repair", !!repairButton(), document.querySelector("#lists").textContent);
+    repairButton().click(); await sleep(200);
+    const repairDialog = document.querySelector("#dlg-resolve");
+    check("repair shows every proposed new name", repairDialog.open && document.querySelectorAll("#rs-repairs tbody tr").length === 2
+      && document.querySelector("#rs-repairs").textContent.includes("bad_.txt"), repairDialog.textContent);
+    check("repair shows skipped items", document.querySelector("#rs-facts").textContent.includes("/busy."), repairDialog.textContent);
+    check("preview doesn't queue anything", !HOST_CALLS.some(m => m.op === "unsynced_resolve"), "");
+    repairDialog.querySelector('[value="cancel"]').click(); await sleep(100);
+    check("cancel doesn't queue anything", !HOST_CALLS.some(m => m.op === "unsynced_resolve"), "");
+    repairButton().click(); await sleep(200);
+    document.querySelector("#rs-go").click(); await sleep(300);
+    const queuedRepair = HOST_CALLS.find(m => m.op === "unsynced_resolve");
+    check("repair confirms exactly the previewed batch", queuedRepair && queuedRepair.args.choice === "repair-names"
+      && queuedRepair.args.all && queuedRepair.args.expect === "repair-preview-code", JSON.stringify(queuedRepair));
+    check("repair closes after queueing", !repairDialog.open, repairDialog.open);
 
     // Apps: a program opens its files from the keyboard, and keeps focus across reloads.
     document.querySelector('nav [data-page="apps"]').click(); await sleep(400);

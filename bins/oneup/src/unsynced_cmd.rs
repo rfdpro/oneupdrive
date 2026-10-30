@@ -80,7 +80,11 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
     if !a.yes {
         println!("Would {}:", would(choice, a.name));
         for r in &p.asked {
-            println!("  {}", r.path);
+            if let Some(name) = &r.name {
+                println!("  {} -> {name}", r.path);
+            } else {
+                println!("  {}", r.path);
+            }
         }
         println!("{}. Add --yes to go ahead, or --yes --expect {} for exactly these.", capital(&what), p.code);
         return Ok(());
@@ -93,6 +97,7 @@ pub async fn resolve(dir: &Path, mut store: Store, a: Ask<'_>) -> Result<()> {
         Choice::DeleteHere => format!("delete {what} on this PC"),
         Choice::Upload => format!("upload {what}"),
         Choice::Rename => format!("rename {what} to {}", a.name.unwrap_or_default().trim()),
+        Choice::RepairNames => oneup_app::t!("repair names for {items}", items = what),
         Choice::Exclude => unreachable!("handled above"),
     };
     println!("Queued: {done}.");
@@ -111,6 +116,7 @@ fn would(choice: Choice, name: Option<&str>) -> String {
         Choice::DeleteHere => "delete on this PC, into its kept copies (.oneup\\versions)".into(),
         Choice::Upload => "upload again".into(),
         Choice::Rename => format!("rename to {}", name.unwrap_or_default().trim()),
+        Choice::RepairNames => oneup_app::t!("repair names"),
         Choice::Exclude => "exclude".into(),
     }
 }

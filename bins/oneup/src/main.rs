@@ -1242,6 +1242,9 @@ struct ResolveArgs {
     /// A name OneDrive refuses, or one differing only in case: rename it
     #[arg(long, group = "choice", value_name = "NAME")]
     rename: Option<String>,
+    /// Suggest valid, distinct names for invalid names and case clashes
+    #[arg(long, group = "choice")]
+    repair_names: bool,
     /// Leave it out of sync (adds a rule)
     #[arg(long, group = "choice")]
     exclude: bool,
@@ -1263,6 +1266,7 @@ impl ResolveArgs {
             (self.delete_here, C::DeleteHere),
             (self.upload, C::Upload),
             (self.rename.is_some(), C::Rename),
+            (self.repair_names, C::RepairNames),
             (self.exclude, C::Exclude),
         ]
         .into_iter()
