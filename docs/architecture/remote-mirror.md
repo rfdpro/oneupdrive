@@ -49,7 +49,8 @@ The only code that decides how an entry changes the mirror. It is pure (store tr
 * Parent unknown → orphan buffer.
 * A folder matching an exclusion rule → stored as an opaque excluded row; anything already stored below it is pruned.
 * During **catch-up**, a folder that appears with content but whose contents we don't have gets its own delta unit. This covers a folder moved *out of* an excluded area, which Graph reports without its children. The same happens when a rule change re-includes a folder.
-* Deletions remove the whole stored subtree (Graph reports only the top item) and its tombstones, and record deletion evidence for every Synced item in it.
+* Re-including a folder clears only its own tombstone. Descendant tombstones stay until those folders arrive, so descendants moved elsewhere still get their contents enumerated even when delivered by an enumeration stream.
+* Deletions remove the whole stored subtree (Graph reports only the top item) and its tombstones, and record deletion evidence for every Synced item in it. New evidence marks the Synced parents for planning even when a mirror rebuild already removed the Remote rows.
 * Items that are neither files nor folders (the Personal Vault, OneNote notebooks, some shortcuts) are stored as **packages**, never synced: downloading one would make an empty file.
 * Every entry sets or clears the item's shared mark from its `shared` facet ([§ Sharing](#sharing)); a deletion clears it with the subtree.
 

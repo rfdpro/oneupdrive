@@ -3,6 +3,9 @@
 OneUpDrive tells you about a problem in plain words, says whether it deals with it by itself, and what you can do. Your files are never changed by guesswork while a problem lasts.
 
 ## Where problems show
+
+If a folder exists in OneDrive but is missing on this PC, run `oneup problems` and `oneup unsynced`. A missing item with no recorded deletion waits for your decision: `oneup unsynced resolve PATH` shows the choices. OneUpDrive does not delete a cloud copy just because a local scan did not find it. Excluded folders stay in OneDrive; check `oneup rules` too.
+
 * **The icon** turns red. Its menu says "Problem: …" (or "Stopped: …" if the problem stopped OneUpDrive), with **Error details…**.
 * **A notification**, for a problem that needs you (sign-in, a full disk…) straight away, and for one that usually clears by itself (no connection, OneDrive errors) once it has lasted about 15 minutes.
 * **The settings window** shows a red card above every page: what happened, what to do, when OneUpDrive tries again, and:

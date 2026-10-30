@@ -473,14 +473,21 @@ impl Ops<'_> {
     /// delete record). Only Synced items need it; returns whether `id` is
     /// one. Never call this for "not found by a rescan": that isn't evidence.
     pub fn note_local_deleted(&self, id: u128) -> Result<bool> {
-        Ok(self
+        let noted = self
             .c
             .prepare_cached(
                 "INSERT OR IGNORE INTO local_gone(file_id)
                  SELECT local_id FROM synced_item WHERE local_id = ?1",
             )?
             .execute([blob(id)])?
-            > 0)
+            > 0;
+        // A POSIX deletion can first move the item outside the tree. Its
+        // later delete record changes no Local row, but must re-plan the
+        // Synced parent that previously held it as missing.
+        if noted && let Some(base) = self.synced_by_local(id)? {
+            self.dirty_mark_synced(&[base.sid])?;
+        }
+        Ok(noted)
     }
 
     /// Withdraws local deletion evidence for `id`. Only for the executor,
@@ -557,6 +564,17 @@ impl Ops<'_> {
     /// [`Ops::delete_subtree`] before it drops the rows, so a deleted folder
     /// is evidence for everything inside it.
     pub(crate) fn note_remote_subtree_deleted(&self) -> Result<()> {
+        // A rebuilt mirror may already lack these rows. New delta evidence
+        // must still wake their Synced parents, without a Remote deletion
+        // trigger to do it. Keep this in SQL for large deleted subtrees.
+        self.c.execute(
+            "INSERT INTO dirty(side, id)
+             SELECT DISTINCT 2, s.parent_sid FROM synced_item s
+             WHERE s.remote_id IN (SELECT id FROM t_sub) AND s.parent_sid IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM remote_gone g WHERE g.id = s.remote_id)
+             ON CONFLICT(side, id) DO NOTHING",
+            [],
+        )?;
         self.c.execute(NOTE_SUBTREE_GONE, [])?;
         Ok(())
     }
@@ -1127,6 +1145,43 @@ pub(crate) mod tests {
             // Removing the row drops its evidence.
             o.synced_remove(1)?;
             assert_eq!(o.synced_stats()?.remote_tombstones + o.synced_stats()?.local_tombstones, 0);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_delete_record_after_an_item_left_the_tree_replans_its_parent() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.local_remove_subtree(3)?;
+            // An earlier round saw Missing and used up the tree's marks.
+            o.dirty_clear(i64::MAX)?;
+            assert!(o.dirty_scope()?.folders.is_empty());
+            assert!(o.note_local_deleted(3)?);
+            let folders = o.dirty_scope()?.folders;
+            assert!(folders.contains(&ROOT), "late evidence must wake the parent: {folders:?}");
+            let planned = oneup_sync::plan(o, folders.iter().copied())?;
+            assert!(planned.iter().any(|op| matches!(op, oneup_sync::Op::DeleteRemote { .. })), "{planned:?}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_delta_deletion_after_a_mirror_row_went_missing_replans_its_parent() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.c.execute("DELETE FROM remote_item WHERE id = 'd'", [])?;
+            o.dirty_clear(i64::MAX)?;
+            assert!(o.dirty_scope()?.folders.is_empty());
+            o.delete_subtree("d")?;
+            let folders = o.dirty_scope()?.folders;
+            assert!(folders.contains(&ROOT), "late evidence must wake the parent: {folders:?}");
+            let planned = oneup_sync::plan(o, folders.iter().copied())?;
+            assert!(planned.iter().any(|op| matches!(op, oneup_sync::Op::RecycleLocal { .. })), "{planned:?}");
             Ok(())
         })
         .unwrap();
