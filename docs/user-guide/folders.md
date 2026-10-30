@@ -34,6 +34,8 @@ Each folder syncs **Both ways** or as a **Backup**; pick it on the folder's tab 
 * puts this PC's version back if a backed-up file was changed in OneDrive (the changed one stays in OneDrive's version history), and sends a file again if it was deleted there;
 * moves aside, in OneDrive, anything there that's in the way of a file from this PC (it gets "(conflict 1)" in its name).
 
+If you move and edit a backed-up file, OneUpDrive follows its new location before sending the edit. You can delete its old empty folder without holding up the file's backup.
+
 Switching a backup back to **Both ways** brings home what the backup kept in OneDrive after you deleted it here. Delete those again to remove them from OneDrive too.
 
 ## Backing up your Desktop, Documents and Pictures
