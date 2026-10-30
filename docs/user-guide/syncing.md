@@ -201,6 +201,8 @@ An item leaves the list once it syncs, once it's gone, once you exclude it, or o
 ### Resolving what can't sync
 The settings window's **Activity** page, **Sync failures** tab, has a button for each way to resolve an item; so does the command line. What you can do depends on why it can't sync:
 
+Names ending in a period or space appear here too, even if File Explorer cannot open them. Use **Rename** to give the item a name OneDrive allows.
+
 | Why | Choices |
 |---|---|
 | Gone from this PC (no recorded deletion) | **Delete in OneDrive** (into OneDrive's recycle bin), or **Restore** (download it again). In a backup pair: **Keep in OneDrive**. |
