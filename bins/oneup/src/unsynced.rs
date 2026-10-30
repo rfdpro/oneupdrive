@@ -209,6 +209,10 @@ pub fn update<'a>(
             r.more = true;
         }
     }
+    // On Windows canonicalizing the root gives us a verbatim path. Append
+    // names afterwards so trailing dots/spaces aren't normalized away: those
+    // are precisely the names this list must keep visible until repaired.
+    let root = std::fs::canonicalize(root)?;
     r.items.retain(|i| {
         let full = i.path.trim_start_matches('/').split('/').fold(root.to_path_buf(), |p, x| p.join(x));
         match std::fs::symlink_metadata(&full) {
@@ -286,6 +290,32 @@ pub fn show(store: &Store) -> Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_names_stay_listed_until_removed_or_excluded() {
+        let dir = std::env::temp_dir().join(format!("oneup-unsynced-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exact = std::fs::canonicalize(&dir).unwrap();
+        std::fs::create_dir_all(exact.join("folder.")).unwrap();
+        for name in ["1.", "space ", "folder./2."] {
+            std::fs::write(exact.join(name), b"x").unwrap();
+        }
+        let mut s = Store::open_in_memory().unwrap();
+        let none = RuleSet::new(&[] as &[&str], &[] as &[&str]).unwrap();
+        let found = ["/1.", "/space ", "/folder./2."];
+        update(&mut s, &dir, &none, found.map(|p| (p.to_string(), Why::InvalidName)), [], false).unwrap();
+        let paths = |s: &Store| load(s).unwrap().items.into_iter().map(|i| i.path).collect::<Vec<_>>();
+        assert_eq!(paths(&s), found, "existing invalid names must remain visible");
+        update(&mut s, &dir, &none, [], [], false).unwrap();
+        assert_eq!(paths(&s), found, "idle rounds must retain the failures");
+
+        std::fs::remove_file(exact.join("1.")).unwrap();
+        let excluded = RuleSet::new(&[] as &[&str], &["folder./"]).unwrap();
+        update(&mut s, &dir, &excluded, [], [], false).unwrap();
+        assert_eq!(paths(&s), ["/space "], "removed and excluded items must leave the list");
+        std::fs::remove_dir_all(exact).unwrap();
+    }
 
     #[test]
     fn items_leave_once_synced_gone_or_excluded() {

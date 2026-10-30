@@ -201,22 +201,30 @@ An item leaves the list once it syncs, once it's gone, once you exclude it, or o
 ### Resolving what can't sync
 The settings window's **Activity** page, **Sync failures** tab, has a button for each way to resolve an item; so does the command line. What you can do depends on why it can't sync:
 
+Names ending in a period or space appear here too, even if File Explorer cannot open them. Use **Rename** to give the item a name OneDrive allows.
+
 | Why | Choices |
 |---|---|
 | Gone from this PC (no recorded deletion) | **Delete in OneDrive** (into OneDrive's recycle bin), or **Restore** (download it again). In a backup pair: **Keep in OneDrive**. |
 | Gone from OneDrive (no recorded deletion) | **Delete here** (into the kept copies in `.oneup\versions`), or **Upload** (send it again). In a backup pair: **Upload**. |
-| Name not allowed, or names that differ only in capitals | **Rename** (to a name OneDrive allows, not taken here or in OneDrive). |
+| Name not allowed, or names that differ only in capitals | **Rename** (choose a name), or **Repair** (suggest an available name). |
 | Too large, a hard link, or its name taken by a link | **Exclude** (leave it out with a rule), or change it in File Explorer. |
 | Folder not empty | **Contents** shows what it still holds (often items your rules leave out). Delete or move them yourself, or clear OneDrive's leftovers under **Excluded in OneDrive**. |
 | Backup only | Change it in File Explorer or on OneDrive's website. |
 
 A folder counts with everything in it. OneUpDrive carries your choice out in its next round, with the usual checks: if the item came back, or changed on the other side since, nothing is deleted (an edit wins over a deletion and is synced instead), and the activity log says why. Many deletions at once still make it stop and ask first (see [Safety stop](#safety-stop)).
 
+**Repair names** previews names for the listed invalid names and case clashes together. It removes leading spaces and trailing spaces or periods, replaces forbidden characters, adjusts reserved names, and adds numbered suffixes where names are taken. It keeps file extensions where space allows. The preview shows every proposed rename and any skipped items. **Repair** queues exactly that preview; if the items or available names changed, refresh the list and preview again. Files already queued are skipped. Folders and files inside them each need their own name repaired.
+
+Repairs cover at most 1,000 listed items at a time. They run through the usual safety checks and may wait for a safety stop. **Rename** is still available for choosing a different name yourself.
+
 ```powershell
 oneup --data-dir … unsynced resolve /docs/old.txt                        # what you can do about it
 oneup --data-dir … unsynced resolve /docs/old.txt --delete-in-onedrive   # shows what it would do
 oneup --data-dir … unsynced resolve /docs/old.txt --delete-in-onedrive --yes
 oneup --data-dir … unsynced resolve "/old notes." --rename "old notes" --yes
+oneup --data-dir … unsynced resolve --all --repair-names                  # preview each old and new name
+oneup --data-dir … unsynced resolve --all --repair-names --yes --expect CODE
 oneup --data-dir … unsynced resolve --all --upload --yes                 # every item it fits
 ```
 

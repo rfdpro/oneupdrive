@@ -932,7 +932,9 @@ pub fn unsynced_preview(
     }
     let p = crate::resolve::prepare(&store, &items, choice, name, backup)?;
     let tops: Vec<&str> = p.asked.iter().map(|r| r.path.as_str()).collect();
-    Ok(json!({ "items": p.items, "tops": tops, "refused": p.refused, "code": p.code }))
+    let renames: Vec<Value> =
+        p.asked.iter().filter_map(|r| r.name.as_ref().map(|name| json!({"path": r.path, "name": name}))).collect();
+    Ok(json!({ "items": p.items, "tops": tops, "renames": renames, "refused": p.refused, "code": p.code }))
 }
 
 /// The lists of the safety stops standing now (`crate::stoplist`), each

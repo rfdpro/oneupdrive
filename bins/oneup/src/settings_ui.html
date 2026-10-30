@@ -2697,6 +2697,7 @@
             </div>
             <div class="db">
                 <ul class="facts" id="rs-facts"></ul>
+                <div id="rs-repairs" style="max-height:50vh;overflow:auto" hidden></div>
                 <div class="field" id="rs-name-box"><input type="text" id="rs-name" spellcheck="false" aria-label="New name"></div>
             </div>
             <div class="df"><span class="muted" id="rs-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="rs-go"></button></div>
@@ -4598,7 +4599,7 @@
                 // All of a kind at once: only while the whole kind is shown.
                 const top = all.find(i => !i.nested) || all[0];
                 if (all.length > 1 && group.length === all.length && !all.some(i => i.queued)) {
-                    for (const c of top.choices.filter(c => c.bulk)) act.append(smallBtn(allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
+                    for (const c of top.choices.filter(c => c.bulk)) act.append(smallBtn(c.code === "repair-names" ? tr("Repair names") : allLabel(c.label, all.length), () => resolveAsk(c, all, true), c.deletes ? "danger" : ""));
                 }
                 // The reason, without what the buttons beside it say.
                 const why = group[0].i.detail.split("; ")[0];
@@ -4728,10 +4729,11 @@
 
         async function resolveAsk(c, items, bulk) {
             const rename = c.code === "rename",
+                repair = c.code === "repair-names",
                 exclude = c.code === "exclude";
             const one = items[0];
             if (!bulk && exclude) return resolveGo(c, items, false);
-            if (!bulk && !c.deletes && !rename) {
+            if (!bulk && !c.deletes && !rename && !repair) {
                 const pv = await preview(c, items, false).catch(e => {
                     toast(e.message, true);
                     return null;
@@ -4742,6 +4744,9 @@
                 textContent: t
             });
             const facts = [];
+            const repairs = $("#rs-repairs");
+            repairs.replaceChildren();
+            repairs.hidden = !repair;
             let expect = null;
             if (rename) facts.push(li(one.path));
             else {
@@ -4751,20 +4756,23 @@
                 });
                 if (!pv) return;
                 expect = pv.code;
-                facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
-                if (pv.tops.length > 5) facts.push(li(tr("and {n} more", {
+                if (repair) {
+                    repairs.append(el("table", {className: "list", "aria-label": tr("Name repairs")},
+                        el("thead", {}, el("tr", {}, el("th", {textContent: tr("Item")}), el("th", {textContent: tr("New name")}))),
+                        el("tbody", {}, ...pv.renames.map(r => el("tr", {}, cell(r.path, null, "wrap path"), cell(r.name, null, "wrap path"))))));
+                    facts.push(li(tr("{n, plural, one {# item} other {# items}} in all", {n: pv.items})));
+                } else facts.push(...pv.tops.slice(0, 5).map(t => li(t)));
+                if (!repair && pv.tops.length > 5) facts.push(li(tr("and {n} more", {
                     n: pv.tops.length - 5
                 })));
                 if (pv.items > pv.tops.length) facts.push(li(tr("{n, plural, one {# item} other {# items}} in all", {
                     n: pv.items
                 })));
-                if (pv.refused.length) facts.push(li(tr("{n} skipped: {why}", {
-                    n: pv.refused.length,
-                    why: pv.refused[0]
-                })));
+                if (repair) facts.push(...pv.refused.map(r => li(tr("Skipped: {why}", {why: r}))));
+                else if (pv.refused.length) facts.push(li(tr("{n} skipped: {why}", {n: pv.refused.length, why: pv.refused[0]})));
             }
             if (DELETED_TO[c.code]) facts.push(li(DELETED_TO[c.code]));
-            $("#rs-title").textContent = rename ? tr("Rename") : tr("{choice}?", {
+            $("#rs-title").textContent = repair ? tr("Repair names") : rename ? tr("Rename") : tr("{choice}?", {
                 choice: bulk ? allLabel(c.label, items.length) : c.label
             });
             $("#rs-facts").replaceChildren(...facts);

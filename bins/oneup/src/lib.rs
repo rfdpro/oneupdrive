@@ -54,6 +54,7 @@ pub mod problems;
 pub mod prune;
 #[cfg(windows)]
 pub mod recyclebin;
+pub mod repair_names;
 pub mod resolve;
 pub mod restores;
 pub mod rewind;
