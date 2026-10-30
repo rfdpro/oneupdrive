@@ -1982,6 +1982,37 @@ fn lid(w: &World, name: &str) -> u128 {
 }
 
 #[test]
+fn a_backup_sends_a_moved_and_edited_file_after_its_old_folder_was_deleted() {
+    let mut w = synced();
+    let (local_file, remote_file) = (lid(&w, "inner.txt"), rid(&w, "inner.txt"));
+    let (local_folder, remote_folder) = (lid(&w, "Docs"), rid(&w, "Docs"));
+    let (mine, theirs) = (w.content(), w.content());
+    let stamp = w.clock + 1;
+    edit(w.local.get_mut(&local_file), |it| {
+        it.parent = Some(LOCAL_ROOT);
+        it.content = mine;
+        it.mtime = stamp;
+    });
+    let etag = w.etag();
+    edit(w.remote.get_mut(&remote_file), |it| {
+        it.parent = Some(REMOTE_ROOT.into());
+        it.name = "elsewhere.txt".into();
+        it.content = theirs;
+        it.etag = etag;
+    });
+    w.local.remove(&local_folder);
+    w.local_gone.insert(local_folder);
+    w.remote.remove(&remote_folder);
+    w.remote_gone.insert(remote_folder);
+    let before = local_view(&w);
+    settle_flow(&mut w, false, Flow::Backup);
+    assert_eq!(local_view(&w), before, "a backup must not change this PC");
+    assert_eq!(remote_view(&w).get("inner.txt"), Some(&(NodeKind::File, mine)));
+    assert_eq!(rid(&w, "inner.txt"), remote_file, "keep the cloud item's version history");
+    assert!(w.remote_versions.contains(&theirs), "keep the cloud edit in version history");
+}
+
+#[test]
 fn first_sync_adopts_identical_files_and_keeps_both_on_difference() {
     let mut w = World::new();
     let same = w.content();

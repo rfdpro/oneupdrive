@@ -287,33 +287,8 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
     let lc = if file { local_change(b, &l) } else { LocalChange::Same };
     let rc = file && remote_changed(b, &r);
 
-    // Both changed content: identical edits are just recorded; otherwise
-    // keep both (never last-writer-wins, `data-safety.md` invariant 9).
-    if lc == LocalChange::Changed && rc {
-        match l.hash {
-            None => cx.out.push(Op::Hash(lpre(&l))),
-            Some(h) if r.hash == Some(h) => cx.out.push(Op::Record(Base {
-                local: Some(l.id),
-                local_mtime: l.mtime,
-                size: r.size,
-                hash: r.hash,
-                remote_etag: r.etag.clone(),
-                ..b.clone()
-            })),
-            // One-way: this PC's version wins; the cloud's goes into its
-            // version history.
-            Some(_) if cx.backup => upload_over(cx, b, &l, &r)?,
-            Some(_) => {
-                let Some(dir) = l.parent else { return Ok(()) };
-                let name = conflict_name(&l.name, NodeKind::File, &mut cx.taken);
-                cx.out.push(Op::ConflictCopy { sid: b.sid, local: lpre(&l), dir, name });
-            }
-        }
-        return Ok(());
-    }
-
-    // Location first; content (if also changed) next round, so each
-    // operation's preconditions describe what the planner saw.
+    // A backup settles location before content, even when both copies were
+    // edited: the old agreed folder may already be gone.
     let here = b.parent.map(|p| (p, b.name.clone()));
     let lloc = local_loc(t, &l)?;
     let rloc = remote_loc(t, &r)?;
@@ -346,6 +321,32 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         move_remote_to(cx, b, &r, lloc)?;
         return Ok(());
     }
+
+    // Both changed content: identical edits are just recorded; otherwise
+    // keep both (never last-writer-wins, `data-safety.md` invariant 9).
+    if lc == LocalChange::Changed && rc {
+        match l.hash {
+            None => cx.out.push(Op::Hash(lpre(&l))),
+            Some(h) if r.hash == Some(h) => cx.out.push(Op::Record(Base {
+                local: Some(l.id),
+                local_mtime: l.mtime,
+                size: r.size,
+                hash: r.hash,
+                remote_etag: r.etag.clone(),
+                ..b.clone()
+            })),
+            // One-way: this PC's version wins; the cloud's goes into its
+            // version history.
+            Some(_) if cx.backup => upload_over(cx, b, &l, &r)?,
+            Some(_) => {
+                let Some(dir) = l.parent else { return Ok(()) };
+                let name = conflict_name(&l.name, NodeKind::File, &mut cx.taken);
+                cx.out.push(Op::ConflictCopy { sid: b.sid, local: lpre(&l), dir, name });
+            }
+        }
+        return Ok(());
+    }
+
     if lm && rm && lloc == rloc {
         // Both moved to the same place. (Both "unknown" — moved into folders
         // not synced yet — is not the same place: wait for those folders.)
