@@ -52,7 +52,7 @@ For each batch of records, the **last** record of each file ID decides:
 
 | Last record | Parent (from the record) | Effect |
 |---|---|---|
-| `FILE_DELETE` | any | Row removed. If a Synced row links the ID, its deletion is recorded as **evidence** (`local_gone`), even if the row had already left the tree (see below) |
+| `FILE_DELETE` | any | Row removed. If a Synced row links the ID, its deletion is recorded as **evidence** (`local_gone`) and its Synced parent marked for planning, even if the row had already left the tree (see below) |
 | anything else | a listed folder in the tree | The item is read from its parent's **listing**, without opening it (below). The row is stored or updated (create, edit, rename, move). A folder new to the tree is queued and listed with the scanner's code, so a folder moved in from elsewhere arrives whole |
 | anything else | outside the tree, or an excluded folder | Rows removed **without** evidence: moved out isn't deleted. The reconciler sees Missing and holds; then, if the user's Recycle Bin index has the item's path or a folder above it, the agent records the evidence (below) |
 

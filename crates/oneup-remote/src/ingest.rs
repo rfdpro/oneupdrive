@@ -204,7 +204,10 @@ fn place_row(
                         ItemState::Included => false,
                     };
                 if matches!(was, ItemState::Pruned | ItemState::Excluded) {
-                    ops.unprune_subtree(&row.id)?;
+                    // Descendants may have moved elsewhere and arrive later
+                    // in this enumeration. Keep their tombstones so their
+                    // own arrival still schedules the contents we dropped.
+                    ops.remove_pruned_one(&row.id)?;
                 }
                 ops.upsert_item(&row, false)?;
                 if needs_enum {
@@ -295,7 +298,7 @@ pub fn reapply_rules(ops: &Ops<'_>, rules: &ExcludeSet) -> Result<Tally> {
     }
     for id in to_include {
         if let Some(row) = ops.get_item(&id)? {
-            ops.unprune_subtree(&id)?;
+            ops.remove_pruned_one(&id)?;
             ops.upsert_item(&row, false)?;
             t.needs_enumeration.push(id);
             t.stored += 1;
@@ -308,6 +311,36 @@ pub fn reapply_rules(ops: &Ops<'_>, rules: &ExcludeSet) -> Result<Tally> {
 mod tests {
     use oneup_graph::DriveItem;
     use oneup_store::Kind;
+
+    #[test]
+    fn a_returning_folder_keeps_moved_descendants_due_for_enumeration() {
+        let mut s = oneup_store::Store::open_in_memory().unwrap();
+        s.write(|o| {
+            let rules = oneup_rules::ExcludeSet::from_names(["node_modules"]);
+            let mut t = super::Tally::default();
+            for json in [
+                r#"{"id":"R","name":"root","root":{},"folder":{}}"#,
+                r#"{"id":"x","name":"node_modules","folder":{},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"a","name":"a","folder":{},"parentReference":{"id":"x"}}"#,
+                r#"{"id":"b","name":"b","folder":{},"parentReference":{"id":"a"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                super::apply(o, &rules, super::Mode::CatchUp, &item, &mut t)?;
+            }
+            // Both move out. Enumerating a no longer delivers b's contents.
+            let mut t = super::Tally::default();
+            for json in [
+                r#"{"id":"a","name":"a","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                super::apply(o, &rules, super::Mode::Enumerate, &item, &mut t)?;
+            }
+            assert_eq!(t.needs_enumeration, ["a", "b"]);
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn items_that_are_neither_files_nor_folders_stay_in_onedrive() {
