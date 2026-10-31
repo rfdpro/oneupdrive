@@ -33,6 +33,43 @@ pub struct Version {
 }
 
 impl LocalFs {
+    /// A pin that a cloud update must preserve, bound to this incarnation
+    /// of the file ID. The executor records it durably before the update.
+    pub fn pinned_placeholder(&self, pre: &LocalPre) -> Result<Option<i64>> {
+        let (h, _, _) = self.open_ours(pre)?;
+        let info = provider::info(&h.as_file()).map_err(placeholder_error)?;
+        if info.is_some_and(|i| i.pin == provider::Pin::Pinned) {
+            return Ok(Some(provider::identity(&h.as_file()).map_err(placeholder_error)?.1));
+        }
+        Ok(None)
+    }
+
+    /// Settles a cloud update's saved pin, including after a crash. A
+    /// reused file ID or a file moved out of this root is left alone.
+    pub fn restore_placeholder_pin(&self, id: LocalId, created: i64) -> Result<()> {
+        let h = match self.volume().open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()) {
+            Ok(h) => h,
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if provider::identity(&h.as_file()).map_err(placeholder_error)? != (id.0, created) {
+            return Ok(());
+        }
+        let path = long(&win::final_path(&h)?);
+        if !self.is_inside_pub(&path) {
+            return Ok(());
+        }
+        let f = provider::open(&path).map_err(placeholder_error)?;
+        if provider::identity(&f).map_err(placeholder_error)? != (id.0, created) {
+            return Err(Error::Changed);
+        }
+        if let Some(i) = provider::info(&f).map_err(placeholder_error)?
+            && i.pin == provider::Pin::Unspecified
+        {
+            provider::set_pin(&f, provider::Pin::Pinned).map_err(placeholder_error)?;
+        }
+        Ok(())
+    }
     /// Where item `id` is, if it's one of our **dehydrated** placeholders
     /// (judged by attributes, which never downloads anything). Read from
     /// its folder's listing where the state database last saw it, so the
@@ -246,10 +283,20 @@ impl LocalFs {
     /// version (OneDrive's history has it). Then it's dehydrated with the new
     /// identity. An ordinary file (not yet converted) is refused: it's
     /// replaced the full-file way.
-    pub fn replace_placeholder(&self, a: &Approved, v: &Version, synced: Option<&Hash>) -> Result<Done> {
+    pub fn replace_placeholder(
+        &self,
+        a: &Approved,
+        v: &Version,
+        synced: Option<&Hash>,
+        pinned: Option<i64>,
+    ) -> Result<Done> {
         let Op::Download { to, replace: Some(pre), .. } = a.op() else { return Err(Error::WrongOp) };
         let (h, _entry, path) = self.open_ours(pre)?;
         let info = provider::info(&h.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
+        let repin = info.pin == provider::Pin::Pinned;
+        if repin && pinned != Some(provider::identity(&h.as_file()).map_err(placeholder_error)?.1) {
+            return Err(Error::Changed);
+        }
         // As for an ordinary file (`place_download`), under the share-none
         // handle: changes beside a database that aren't in it would be
         // applied to the new version. Its first bytes are read only if all
@@ -265,10 +312,11 @@ impl LocalFs {
         if info.on_disk == 0 {
             // Held: its old content can't arrive and be edited meanwhile.
             let _hold = self.hold_dehydrated(&h).ok_or(Error::Changed)?;
-            provider::update_dehydrated(&h.as_file(), &identity, v.identity.size, v.modified)
+            let update = || provider::update_dehydrated(&h.as_file(), &identity, v.identity.size, v.modified);
+            if repin { provider::updating_pinned(&h.as_file(), update) } else { update() }
                 .map_err(placeholder_error)?;
         } else if pre.stamp.is_some_and(|(size, _)| info.on_disk < size) {
-            return self.replace_partial(h, pre, *to, &path, v);
+            return self.replace_partial(h, pre, *to, &path, v, pinned);
         } else {
             let proved = self.is_synced_pub(&h, pre, synced)?;
             if a.old_copy() != OldCopy::DropIfSynced || !proved {
@@ -282,7 +330,8 @@ impl LocalFs {
             provider::set_in_sync(&h.as_file()).map_err(placeholder_error)?;
             oneup_cfapi::ours::note(pre.id.0);
             let x = Exclusive::from_file(h.into_file());
-            x.dehydrate(Some((&identity, v.identity.size, v.modified))).map_err(placeholder_error)?;
+            let update = || x.dehydrate(Some((&identity, v.identity.size, v.modified)));
+            if repin { provider::updating_pinned(x.file(), update) } else { update() }.map_err(placeholder_error)?;
             drop(x);
             let h = win::open_path_for_dehydrated(&path)?;
             let id = win::file_id(&h)?.1;
@@ -303,11 +352,19 @@ impl LocalFs {
         to: LocalId,
         path: &std::path::Path,
         v: &Version,
+        pinned: Option<i64>,
     ) -> Result<Done> {
         let (x, hold) = self.open_partial(h, pre, path)?;
         oneup_cfapi::ours::note(pre.id.0);
         let x = Exclusive::from_file(x.into_file());
-        x.dehydrate(Some((&v.identity.encode(), v.identity.size, v.modified))).map_err(placeholder_error)?;
+        let repin =
+            provider::info(x.file()).map_err(placeholder_error)?.is_some_and(|i| i.pin == provider::Pin::Pinned);
+        if repin && pinned != Some(provider::identity(x.file()).map_err(placeholder_error)?.1) {
+            return Err(Error::Changed);
+        }
+        let identity = v.identity.encode();
+        let update = || x.dehydrate(Some((&identity, v.identity.size, v.modified)));
+        if repin { provider::updating_pinned(x.file(), update) } else { update() }.map_err(placeholder_error)?;
         drop(x);
         drop(hold);
         let h = win::open_path_for_dehydrated(path)?;

@@ -2078,10 +2078,21 @@ impl<C: Cloud> Executor<C> {
                         self.refused_or(a, placed, notes).await?
                     }
                     // Reads the old copy, to see whether it can go.
-                    Some(_) => {
+                    Some(pre) => {
+                        let old = pre.clone();
+                        let pinned = self.off_task(a, move |fs, _| fs.pinned_placeholder(&old)).await??;
+                        if let Some(created) = pinned {
+                            let pending = Pending::Pinned { local: pre.id, created };
+                            store
+                                .write_ahead(|o| {
+                                    Ok::<_, Fail>(o.meta_set_ahead(&pending_of(pre.id), &pending.encode())?)
+                                })
+                                .await?;
+                        }
                         let new = v.clone();
-                        let placed =
-                            self.off_task(a, move |fs, a| fs.replace_placeholder(a, &new, synced.as_ref())).await?;
+                        let placed = self
+                            .off_task(a, move |fs, a| fs.replace_placeholder(a, &new, synced.as_ref(), pinned))
+                            .await?;
                         match placed {
                             Err(FxError::DatabaseWaits) => return Err(self.database_refused(a, notes).await),
                             r => r?,
@@ -2570,6 +2581,11 @@ impl<C: Cloud> Executor<C> {
     async fn recover(&self, store: &Db<'_>, key: &str) -> Res {
         let Some(p) = store.write(|o| Ok::<_, Fail>(o.meta_get(key)?)).await? else { return Ok(()) };
         let pending = Pending::decode(&p);
+        if let Some(Pending::Pinned { local, created }) = &pending {
+            self.fs
+                .restore_placeholder_pin(*local, *created)
+                .map_err(|e| Fail::Halt(format!("couldn't restore a file's pin after a cloud update: {e}")))?;
+        }
         let undo = match &pending {
             // Recycling and replacing take the item out of the folder.
             Some(Pending::Evidence(id)) => self.fs.is_present(*id),
@@ -2579,6 +2595,7 @@ impl<C: Cloud> Executor<C> {
             // Setting a copy aside takes it out of the folder; still there,
             // nothing happened and the record stays.
             Some(Pending::Aside { local, .. }) => self.fs.is_present(*local),
+            Some(Pending::Pinned { .. }) => false,
             None => false,
         };
         tracing::debug!(undo, "settling an unfinished write-ahead record");
@@ -2644,6 +2661,9 @@ fn pending_key(op: &Op) -> Option<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Pending {
+    /// A cloud update temporarily clears this file's pin. Its creation
+    /// time prevents restoring a pin onto a reused file ID after a crash.
+    Pinned { local: LocalId, created: i64 },
     /// Deletion evidence noted for an item about to be recycled or replaced.
     Evidence(LocalId),
     /// Synced item `sid` detached from `local`, about to be renamed `name`.
@@ -2660,6 +2680,7 @@ enum Pending {
 impl Pending {
     fn encode(&self) -> String {
         match self {
+            Pending::Pinned { local, created } => format!("pinned {:x} {created}", local.0),
             Pending::Evidence(id) => format!("evidence {:x}", id.0),
             Pending::Detached { sid, local, name } => format!("detached {sid} {:x} {name}", local.0),
             Pending::Removing { sid, local } => format!("removing {sid} {:x}", local.0),
@@ -2670,6 +2691,10 @@ impl Pending {
     fn decode(s: &str) -> Option<Self> {
         let mut it = s.splitn(4, ' ');
         match it.next()? {
+            "pinned" => Some(Pending::Pinned {
+                local: LocalId(u128::from_str_radix(it.next()?, 16).ok()?),
+                created: it.next()?.parse().ok()?,
+            }),
             "evidence" => Some(Pending::Evidence(LocalId(u128::from_str_radix(it.next()?, 16).ok()?))),
             "detached" => {
                 let sid = it.next()?.parse().ok()?;
@@ -2869,6 +2894,7 @@ mod tests {
     #[test]
     fn pending_records_round_trip() {
         for p in [
+            Pending::Pinned { local: LocalId(u128::MAX), created: 134365417764745155 },
             Pending::Evidence(LocalId(u128::MAX)),
             Pending::Detached { sid: 7, local: LocalId(0x1234), name: "a b (conflict 1).txt".into() },
         ] {

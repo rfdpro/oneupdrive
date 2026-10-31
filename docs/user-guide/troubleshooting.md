@@ -38,6 +38,14 @@ OneUpDrive tries again by itself after a minute, then waits twice as long each t
 
 ## The problems
 
+### A deleted folder remains in OneDrive
+
+OneUpDrive removes a folder from OneDrive only when it is empty. Excluded files can keep it there; `oneup unsynced` lists the folder as not empty. It waits for a change to that folder, even while other files are being retried. Review what remains on the OneDrive website before deleting it there. OneUpDrive picks up that deletion through OneDrive's change feed.
+
+### A pinned file changed in OneDrive
+
+Cloud edits update files marked **Always keep on this device** too. The file keeps that setting, and OneUpDrive downloads the new version automatically.
+
 <a id="setup"></a>
 ### Nothing to sync yet
 No folder is set up to sync with OneDrive for this account, so there's nothing for OneUpDrive to do.
