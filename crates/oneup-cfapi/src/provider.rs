@@ -602,6 +602,18 @@ fn metadata(size: i64, modified: i64, folder: bool) -> CF_FS_METADATA {
     }
 }
 
+fn updated_metadata(f: &File, size: i64, modified: i64) -> Result<CF_FS_METADATA> {
+    use std::os::windows::fs::MetadataExt;
+    let mut md = metadata(size, modified, false);
+    // Creation time identifies this incarnation of the file ID, including
+    // while recovering a cloud update interrupted before its pin returned.
+    let old = f.metadata()?;
+    md.BasicInfo.CreationTime = old.creation_time() as i64;
+    md.BasicInfo.LastAccessTime = old.last_access_time() as i64;
+    md.BasicInfo.FileAttributes = old.file_attributes();
+    Ok(md)
+}
+
 /// "Always keep on this device" and "Free up space", as Windows stores them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pin {
@@ -716,7 +728,7 @@ pub fn update_dehydrated(f: &File, identity: &[u8], size: i64, modified: i64) ->
     if i.on_disk != 0 {
         return Err(Error::Hydrated);
     }
-    let md = metadata(size, modified, false);
+    let md = updated_metadata(f, size, modified)?;
     // SAFETY: `md` and `identity` outlive the synchronous call.
     let r = unsafe {
         CfUpdatePlaceholder(
@@ -727,12 +739,26 @@ pub fn update_dehydrated(f: &File, identity: &[u8], size: i64, modified: i64) ->
             None,
             // VERIFY_IN_SYNC as well: should it have been hydrated and edited
             // since the check above, the edit is never dehydrated away.
-            CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+            CF_UPDATE_FLAG_MARK_IN_SYNC
+                | CF_UPDATE_FLAG_DEHYDRATE
+                | CF_UPDATE_FLAG_VERIFY_IN_SYNC
+                | CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA,
             None,
             None,
         )
     };
     win("CfUpdatePlaceholder", r)
+}
+
+/// Temporarily clears a pin for a cloud version update, restoring it even
+/// when the update fails. The caller must hold the file exclusively (or
+/// hold its dehydrated identity) and durably record the pin first.
+pub fn updating_pinned<T>(f: &File, update: impl FnOnce() -> Result<T>) -> Result<T> {
+    set_pin(f, Pin::Unspecified)?;
+    let result = update();
+    let restored = set_pin(f, Pin::Pinned);
+    restored?;
+    result
 }
 
 /// Marks the placeholder in sync without touching its content or identity:
@@ -854,11 +880,12 @@ impl Exclusive {
     /// the placeholder also takes a new identity, size and time (a cloud
     /// edit) and stays in sync.
     pub fn dehydrate(&self, new: Option<(&[u8], i64, i64)>) -> Result<()> {
-        let md = new.map(|(_, size, modified)| metadata(size, modified, false));
+        let md = new.map(|(_, size, modified)| updated_metadata(&self.0, size, modified)).transpose()?;
         let (id, len) = new.map_or((None, 0), |(id, _, _)| (Some(id.as_ptr().cast::<c_void>()), id.len() as u32));
         let mut flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_VERIFY_IN_SYNC;
         if new.is_some() {
-            flags |= CF_UPDATE_FLAG_MARK_IN_SYNC;
+            // Pass zero lengths through too: a cloud file can become empty.
+            flags |= CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA;
         }
         // SAFETY: `md` and the identity bytes outlive the synchronous call.
         let r = unsafe {

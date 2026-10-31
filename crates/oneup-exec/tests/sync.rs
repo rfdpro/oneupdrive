@@ -3562,6 +3562,48 @@ async fn on_demand_placeholders_follow_both_sides() {
     drop(od);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn everyday_a_pinned_file_follows_a_cloud_edit() {
+    let cloud = Fake::new();
+    cloud.add("a.txt", Some(b"the old version"));
+    let (od, mut s) = on_demand_sync("pinned-cloud-edit", &cloud);
+    s.quiesce().await;
+    let p = s.p("a.txt");
+    assert_eq!(app_read(&p).as_deref(), Some(&b"the old version"[..]));
+    provider::set_pin(&provider::open(&p).unwrap(), provider::Pin::Pinned).unwrap();
+    let identity = provider::identity(&provider::open(&p).unwrap()).unwrap();
+    for content in [b"new version".as_slice(), b"", b"a longer cloud version", b"same length cloud edit"] {
+        cloud.edit("a.txt", content);
+        s.quiesce().await;
+        assert_eq!(placeholder(&p).pin, provider::Pin::Pinned);
+        assert_eq!(provider::identity(&provider::open(&p).unwrap()).unwrap(), identity);
+        assert_eq!(app_read(&p).as_deref(), Some(content));
+    }
+    assert!(cloud.holds(b"the old version"));
+    let f = provider::open(&p).unwrap();
+    let refused: provider::Result<()> = provider::updating_pinned(&f, || Err(provider::Error::Hydrated));
+    assert!(refused.is_err());
+    assert_eq!(provider::info(&f).unwrap().unwrap().pin, provider::Pin::Pinned);
+    drop(f);
+    // A process stopped after unpinning leaves a durable intent. Recovery
+    // restores the pin before another operation touches this item.
+    s.obs
+        .store_mut()
+        .write_durable(|o| {
+            o.meta_set_ahead(
+                &format!("exec.pending.{:x}", identity.0),
+                &format!("pinned {:x} {}", identity.0, identity.1),
+            )
+        })
+        .unwrap();
+    provider::set_pin(&provider::open(&p).unwrap(), provider::Pin::Unspecified).unwrap();
+    s.quiesce().await;
+    assert_eq!(placeholder(&p).pin, provider::Pin::Pinned);
+    assert!(s.obs.store().read(|o| o.meta_get(&format!("exec.pending.{:x}", identity.0))).unwrap().is_none());
+    drop(s);
+    drop(od);
+}
+
 /// Files already here with the same content as OneDrive's (a first sync
 /// over an existing folder, as after moving over from the OneDrive app)
 /// become placeholders in sync with their content kept, as uploads and

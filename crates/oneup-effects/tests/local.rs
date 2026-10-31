@@ -333,7 +333,7 @@ fn partly_downloaded_placeholders_change_without_being_read() {
         link: Link::Existing(1),
     };
     let v = oneup_effects::Version { identity: new.clone(), modified: 0 };
-    let replaced = fs.replace_placeholder(&approve(replace), &v, Some(&old.hash));
+    let replaced = fs.replace_placeholder(&approve(replace), &v, Some(&old.hash), None);
     // A cloud deletion, kept or discarded: removed, nothing kept.
     let removed = fs.apply(&approve(Op::RecycleLocal { sid: 2, local: pre(&r.p(names[1])) }));
     let discard = approve_discard(Op::RecycleLocal { sid: 3, local: pre(&r.p(names[2])) });

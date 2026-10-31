@@ -2251,7 +2251,7 @@ impl Engine {
                 self.found_full(&mut store).await?;
             }
             out.totals.add(&report);
-            let (clean, mut end) = settle(&report, failures.waiting, &mut changed_rounds);
+            let (_, mut end) = settle(&report, failures.waiting, &mut changed_rounds);
             if recycled > 0 && matches!(end, Some(End::Settled)) {
                 end = None; // another round, to carry the deletions out
             }
@@ -2266,11 +2266,7 @@ impl Engine {
                 // Kept for what's tried again later: skips unless only a
                 // change can end them, failures, uploads OneDrive had no
                 // room for, and what waited.
-                let mut retried = Touched::default();
-                let skipped = report.skipped.iter().filter(|(_, s)| !clean || *s == Skip::CloudFull);
-                for op in skipped.map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)).chain(&later) {
-                    retried.add(op);
-                }
+                let retried = retry_marks(&report, &later);
                 store.write(|o| {
                     o.dirty_clear_except(upto, &retried.local, &retried.remote, &retried.synced)?;
                     o.meta_set(KEY_RULES, &fingerprint)?;
@@ -3419,6 +3415,15 @@ struct Touched {
     local: Vec<LocalId>,
     remote: Vec<RemoteId>,
     synced: Vec<oneup_sync::Sid>,
+}
+
+fn retry_marks(report: &Report, later: &[Op]) -> Touched {
+    let mut retried = Touched::default();
+    let skipped = report.skipped.iter().filter(|(_, s)| !waits_for_a_change(*s));
+    for op in skipped.map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)).chain(later) {
+        retried.add(op);
+    }
+    retried
 }
 
 impl Touched {
@@ -4647,6 +4652,23 @@ mod tests {
         // would back off; the marks stay all the same (`rounds`).
         let paused = Report { not_run: vec![op()], ..Report::default() };
         assert_eq!(settle(&paused, 0, &mut 0), (true, Some(End::Settled)));
+    }
+
+    #[test]
+    fn a_retry_does_not_keep_unrelated_nonempty_folders_scheduled() {
+        let report = Report {
+            skipped: vec![
+                (Op::Forget(1), Skip::NotEmpty),
+                (Op::Forget(2), Skip::Changed),
+                (Op::Forget(3), Skip::Refused),
+                (Op::Forget(4), Skip::NameTaken),
+                (Op::Forget(5), Skip::CloudFull),
+                (Op::Forget(6), Skip::Busy),
+            ],
+            failed: vec![(Op::Forget(7), "offline".into())],
+            ..Report::default()
+        };
+        assert_eq!(retry_marks(&report, &[Op::Forget(8)]).synced, vec![2, 5, 6, 7, 8]);
     }
 
     /// A pair's OneDrive folder is found with names compared as Windows

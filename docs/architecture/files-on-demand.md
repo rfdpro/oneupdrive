@@ -40,6 +40,9 @@ The reconciler stays as it is. It plans *what* should happen, and on-demand mode
 **`LocalFs` knows it's on demand** when its folder is registered as OneUpDrive's sync root with this pair's token. The effects for it are in `oneup-effects/src/ondemand.rs`; the full-file download and mkdir paths refuse in that mode, so no content is ever written into the sync root (invariant 12).
 
 ## Hydration (`FETCH_DATA`, `oneup_exec::hydrate`)
+
+Cloud updates preserve **Always keep on this device**. Windows refuses dehydration while a file is pinned, so the executor first records its file ID and creation time durably (`Pending::Pinned`). The effects layer clears the pin only for the update, under the exclusive handle or dehydrated-identity hold, and restores it even if the update fails. Recovery restores a pin left cleared by an interruption before clearing the intent; an access failure retains the intent and halts the round. Creation time is preserved across placeholder updates so recovery can distinguish this file from a reused ID. Metadata updates pass zero lengths through too, so a cloud file can become empty. The placement pass downloads the updated pinned version.
+
 `Hydrator<C: Cloud>` (`Serve` is its `Provider`), connected by `oneupd` while the pair is on demand.
 1. The callback hands over the identity, the requested range, and the requesting process. It answers on a tokio task: the Cloud Files callback thread is never blocked on the network.
 2. Check: the identity decodes; its size equals the placeholder's; the Remote tree's current version of the item (eTag, size, hash, read through the hydrator's own database connection) equals the identity's. Otherwise **fail** the request (`STATUS_CLOUD_FILE_NOT_IN_SYNC`) and wake the agent, so the next round updates the placeholder.
