@@ -264,6 +264,10 @@ mod win {
         args.get(k).and_then(Value::as_u64).map_or(default, |n| n as usize).clamp(1, 20_000)
     }
 
+    fn recovery_number(args: &Value, key: &str) -> Result<i64> {
+        args.get(key).and_then(Value::as_i64).with_context(|| format!("missing or invalid {key}"))
+    }
+
     /// How many more items the Shared page can hold (it says; at most its
     /// own cap).
     fn room(args: &Value) -> usize {
@@ -662,6 +666,11 @@ mod win {
                 tokio::task::spawn_blocking(move || settingsapi::activity(&d, &rel, 40)).await?
             }
             // The Activity page's lists.
+            "item_history" => {
+                let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
+                let before = args.get("before").and_then(Value::as_i64);
+                tokio::task::spawn_blocking(move || settingsapi::activity_page(&d, &rel, before, 100)).await?
+            }
             "activity_log" => {
                 let (d, limit) = (dir.to_path_buf(), count(args, "limit", 200));
                 tokio::task::spawn_blocking(move || settingsapi::activity(&d, "", limit)).await?
@@ -739,7 +748,7 @@ mod win {
                     Some(code) => a.extend(["--before-stop".into(), code.into()]),
                     None => {
                         a.push(text(args, "folder").into());
-                        a.extend(["--to".into(), count(args, "at_ms", 0).to_string().into()]);
+                        a.extend(["--to".into(), recovery_number(args, "at_ms")?.to_string().into()]);
                     }
                 }
                 if op == "rewind_start" {
@@ -797,7 +806,7 @@ mod win {
                 tokio::task::spawn_blocking(move || settingsapi::cloud_bin(&d)).await?
             }
             "cloud_bin_restore" => {
-                let seq = i64::try_from(count(args, "seq", 0)).unwrap_or(0);
+                let seq = recovery_number(args, "seq")?;
                 let d = dir.to_path_buf();
                 let at = tokio::task::spawn_blocking(move || settingsapi::cloud_bin_restore(&d, seq)).await??;
                 let _ = agent(dir, Call::SyncNow).await;
@@ -1258,6 +1267,16 @@ mod win {
     mod tests {
         #![allow(clippy::unwrap_used)]
         use super::*;
+
+        #[test]
+        fn recovery_preserves_dates_and_history_ids() {
+            let args = serde_json::json!({"at_ms": 1793401200000_i64, "seq": 123456});
+            assert_eq!(recovery_number(&args, "at_ms").unwrap(), 1793401200000);
+            assert_eq!(recovery_number(&args, "seq").unwrap(), 123456);
+            for invalid in [Value::Null, json!({"at_ms": "today"}), json!({"at_ms": 1.5})] {
+                assert!(recovery_number(&invalid, "at_ms").is_err());
+            }
+        }
 
         /// `handle` gets a root's own data folder: looking the root up again
         /// from there fails (it broke Recent activity, Kept on this PC and

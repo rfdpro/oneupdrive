@@ -134,12 +134,18 @@ impl Ops<'_> {
     /// item itself, or anything inside it if it's a folder) if given. Paths
     /// compare case-insensitively (ASCII), as Windows names do.
     pub fn activity_recent(&self, path: Option<&str>, limit: usize) -> Result<Vec<Entry>> {
+        self.activity_page(path, None, limit)
+    }
+
+    /// A page of retained activity, older than `before` when supplied.
+    pub fn activity_page(&self, path: Option<&str>, before: Option<i64>, limit: usize) -> Result<Vec<Entry>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let before = before.unwrap_or(i64::MAX);
         let rows = match path {
             None => self
                 .c
-                .prepare_cached(&format!("SELECT {COLS} FROM activity ORDER BY seq DESC LIMIT ?1"))?
-                .query_map([limit], entry)?
+                .prepare_cached(&format!("SELECT {COLS} FROM activity WHERE seq < ?2 ORDER BY seq DESC LIMIT ?1"))?
+                .query_map([limit, before], entry)?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
             Some(p) => {
                 let p = p.trim_end_matches('/');
@@ -148,10 +154,10 @@ impl Ops<'_> {
                 self.c
                     .prepare_cached(&format!(
                         "SELECT {COLS} FROM activity
-                         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')
+                         WHERE (path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')) AND seq < ?3
                          ORDER BY seq DESC LIMIT ?2"
                     ))?
-                    .query_map(rusqlite::params![p, limit], entry)?
+                    .query_map(rusqlite::params![p, limit, before], entry)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
@@ -209,6 +215,20 @@ mod tests {
         // Names compare case-insensitively, as on Windows.
         assert_eq!(s.read(|o| o.activity_recent(Some("/DOCS"), 10)).unwrap().len(), 2);
         assert_eq!(s.read(|o| o.activity_recent(None, 1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn history_pages_stay_within_the_folder_and_do_not_repeat() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| o.activity_add(&[e(1, "/docs/a"), e(2, "/docs2/b"), e(3, "/docs/c"), e(4, "/docs")])).unwrap();
+        for path in [None, Some("/DOCS/")] {
+            let first = s.read(|o| o.activity_page(path, None, 2)).unwrap();
+            assert_eq!(first.iter().map(|e| e.at_ms).collect::<Vec<_>>(), [4, 3]);
+            let next = s.read(|o| o.activity_page(path, Some(first[1].seq), 2)).unwrap();
+            let want = if path.is_some() { vec![1] } else { vec![2, 1] };
+            assert_eq!(next.iter().map(|e| e.at_ms).collect::<Vec<_>>(), want);
+            assert!(s.read(|o| o.activity_page(path, Some(next.last().unwrap().seq), 2)).unwrap().is_empty());
+        }
     }
 
     #[test]

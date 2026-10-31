@@ -10,6 +10,7 @@ OneUpDrive fits into File Explorer the way the OneDrive app does.
   * **Open with AutoSave**: open a Word, Excel or PowerPoint file from OneDrive, with AutoSave ([Office](office.md));
   * **Copy share link…** and **Version history**: [earlier versions and sharing links](versions-and-sharing.md);
   * **Why does this sync?**: which rule applies, and what sync last did with it, in the [settings window](settings-window.md#files);
+  * **View history**: [activity and available restore copies](recovery.md#view-an-items-history) for a file or folder;
   * **Sync activity**: what happened to it lately, also in the settings window;
   * **Sync this first**: send or download it before anything else that's waiting;
   * **View online**: open it on onedrive.com (for a vault, a note instead: the website only shows encrypted files).

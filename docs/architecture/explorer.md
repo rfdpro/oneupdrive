@@ -26,6 +26,7 @@ Explorer's richer integration (navigation pane, status UI, context-menu verbs fo
 
 ## Our commands in the context menu
 `crates/oneup-shellext` (`oneup_shell.dll`): a COM in-process server declared in the identity package as a **surrogate server** (`com:SurrogateServer`), so Windows loads it in a separate `dllhost.exe`, never in Explorer, and a `desktop3:CloudFilesContextMenus` verb, which shows only for items inside OneUpDrive's sync roots. It offers one **OneUpDrive** entry (`IExplorerCommand` with sub-commands; the sub-menu is filled only when it opens, so `Shell.Application`'s `Verbs()` doesn't list them):
+* **View history**: the settings window's Files page with the item selected and its History section open (`oneup-settings --page itemhistory --item PATH`), combining retained activity and available recovery sources;
 * **Why does this sync?** and **Sync activity**: the settings window's Files page with the item selected and its *Why* or *Recent activity* section open (`oneup-settings --page itemwhy|itemactivity --item PATH`);
 * **Sync this first**: `oneup sync-now` for it;
 * **View online**: its page on onedrive.com (Graph's `webUrl`; for a vault, a message instead, since the website shows only encrypted files);

@@ -828,11 +828,16 @@ impl Setup {
 /// What sync did with `rel` in the data folder's synced folder (everything
 /// if empty), newest first, as `oneup activity` shows it.
 pub fn activity(dir: &Path, rel: &str, limit: usize) -> Result<Value> {
+    activity_page(dir, rel, None, limit)
+}
+
+/// A page of an item's retained activity, newest first.
+pub fn activity_page(dir: &Path, rel: &str, before: Option<i64>, limit: usize) -> Result<Value> {
     use oneup_store::ActivityOutcome as O;
     let store = crate::setup::open_store(dir, 1024)?;
     let rel = rel.trim_matches('/');
     let path = (!rel.is_empty()).then(|| format!("/{rel}"));
-    let list = store.read(|o| o.activity_recent(path.as_deref(), limit))?;
+    let list = store.read(|o| o.activity_page(path.as_deref(), before, limit))?;
     Ok(list
         .into_iter()
         .map(|e| {
@@ -843,7 +848,7 @@ pub fn activity(dir: &Path, rel: &str, limit: usize) -> Result<Value> {
                 O::Waiting => "waiting",
                 O::Note => "note",
             };
-            json!({ "at_ms": e.at_ms, "outcome": outcome, "action": e.action, "path": e.path, "detail": e.detail })
+            json!({ "seq": e.seq, "at_ms": e.at_ms, "outcome": outcome, "action": e.action, "path": e.path, "detail": e.detail })
         })
         .collect())
 }

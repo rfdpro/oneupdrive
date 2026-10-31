@@ -5,6 +5,7 @@
 //!
 //! * `explain`: why the item syncs or not, and `activity`: what sync did
 //!   with it lately, on the settings window's Files page.
+//! * `history`: the Files page's History section, with activity and recovery copies.
 //! * `first`: transfer it before anything else (the agent must be running).
 //! * `online`: open it on onedrive.com.
 //! * `versions`, `share`: the settings window's "Versions & sharing" page
@@ -25,6 +26,7 @@ pub async fn run(verb: &str, path: &Path) -> Result<()> {
         let (dir, rel) = oneup_app::datafolders::for_path(path)
             .with_context(|| format!("{} isn't in a folder OneUpDrive syncs", path.display()))?;
         match verb {
+            "history" => item_page(&dir, path, "itemhistory"),
             "explain" => item_page(&dir, path, "itemwhy"),
             "activity" => item_page(&dir, path, "itemactivity"),
             "first" => crate::agent::sync_now(&dir, Some(rel.clone()).filter(|r| !r.is_empty())).await,
@@ -43,7 +45,7 @@ pub async fn run(verb: &str, path: &Path) -> Result<()> {
 }
 
 /// The settings window's Files page with `path` selected and one of its
-/// sections open: `item` (Versions), `itemwhy` or `itemactivity`.
+/// sections open: `item` (Versions), `itemhistory`, `itemwhy` or `itemactivity`.
 fn item_page(dir: &Path, path: &Path, page: &str) -> Result<()> {
     // Its own main data folder's window (a pair's items show there too).
     let main = oneup_app::vaultpair::main_dir(dir);

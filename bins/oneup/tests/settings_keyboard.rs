@@ -67,6 +67,9 @@ const HOST_ANSWERS = {
   rewind_cancel: "", conflicts: [],
   cloud_bin: [{seq: 7, at_ms: 5000, path: "/Docs/gone.txt", folder: false, size: 3, restorable: true}],
   cloud_bin_restore: "/Docs/gone.txt",
+  item_history: a => a.before ? [{seq: 1, at_ms: 1000, outcome: "done", action: "upload", path: "/Docs/old.txt", detail: "Older edit"}]
+    : Array.from({length: 100}, (_, i) => ({seq: 101-i, at_ms: 5000, outcome: "done", action: "upload", path: "/Docs/a.txt", detail: "Saved edit"})),
+  item_versions: {versions: [{id: "v1", modified_ms: 2000, size: 3, current: false}]},
 };
 window.chrome = {webview: {
   postMessage(text) {
@@ -144,6 +147,25 @@ const DRIVER: &str = r##"<script>
     renderTree();
     ctx.hidePopover(); await sleep(150);
     check("closing the menu gives focus back to the row", at() === "Docs", at());
+
+    // History opens from a folder's menu, pages activity and scopes local copies.
+    HOST_ANSWERS.kept = [
+      {id: "local1", origin: "Docs/kept.txt", name: "kept.txt", at_ms: 3000, bytes: 4},
+      {id: "local2", origin: "Docs2/unrelated.txt", name: "unrelated.txt", at_ms: 3000, bytes: 4}];
+    key("ContextMenu"); await sleep(100);
+    [...ctx.querySelectorAll("button")].find(b => b.textContent === "View history").click();
+    await sleep(300);
+    const history = [...document.querySelectorAll("#details details")].find(d => d.querySelector("summary").textContent === "History");
+    check("View history opens the history panel", history && history.open, history && history.textContent);
+    check("history shows local copies and recorded cloud deletions", history.textContent.includes("kept.txt") && history.textContent.includes("gone.txt") && !history.textContent.includes("unrelated.txt"), history.textContent);
+    const historyMore = [...history.querySelectorAll("button")].find(b => b.textContent === "Show more");
+    historyMore.click(); await sleep(150);
+    check("history can page back to older activity", history.textContent.includes("Older edit") && historyMore.hidden, history.textContent);
+    check("history matching respects folder boundaries", historyMatches("Docs/a", {rel: "Docs", folder: true}) && !historyMatches("Docs2/a", {rel: "Docs", folder: true}) && !historyMatches("Docs/a", {rel: "Docs", folder: false}), "");
+    const fileHistory = document.createElement("div");
+    await historyInto(fileHistory, {rel: "Docs/inner.doc", path: "C:\\Sync\\Docs\\inner.doc", folder: false, cloud: true});
+    await sleep(150);
+    check("file history offers cloud version restore", fileHistory.textContent.includes("OneDrive versions") && [...fileHistory.querySelectorAll("button")].some(b => b.textContent === "Restore"), fileHistory.textContent);
 
     // The folder tabs: one tab stop; the arrows move and choose.
     const tabs = () => [...document.querySelectorAll("#roots [role=tab]")];
