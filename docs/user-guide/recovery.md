@@ -2,6 +2,13 @@
 
 The settings window's **Recovery** page gathers every way to get something back. Each has an `oneup` command too.
 
+## View an item's history
+Right-click a file or folder and choose **View history** (under **OneUpDrive** in File Explorer). The Files page opens **History** for that item.
+
+History shows retained activity, with **Show more** for older entries, local kept copies and recorded OneDrive recycle-bin entries. A folder includes entries for its contents. Files also show their OneDrive versions. Use **Restore** beside an available copy or version. A disabled recycle-bin restore means it cannot currently be restored there; use OneDrive's website instead.
+
+For a folder in the main sync folder, **Rewind** opens Recovery with that folder selected. Choose a moment, then **Preview** to review the changes before starting. History is limited to what OneUpDrive recorded and still retains; a path reused by another file can show earlier activity at that path. Cloud copies may have expired since they were recorded.
+
 ## Rewind a folder
 Puts a folder back the way it was at a moment you choose: files deleted since come back, edited files get their content of then, moved and renamed files go back where they were, and files created since are removed. It's the way back from ransomware, a script gone wrong, or a sync that did something you didn't want.
 

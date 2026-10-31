@@ -833,11 +833,13 @@
             vertical-align: top;
         }
 
+        .item-history td.wrap,
         #ls-table td.wrap,
         #recovery td.wrap {
             overflow-wrap: anywhere;
         }
 
+        .item-history td small,
         #ls-table td small,
         #recovery td small {
             display: block;
@@ -6132,6 +6134,11 @@
                     renderDetails();
                 });
             }
+            item(tr("View history"), () => {
+                F.openSection = "History";
+                F.detailsFor = null;
+                renderDetails();
+            });
             item(tr("Why it syncs (or not)"), () => {
                 F.openSection = "Why";
                 F.detailsFor = null;
@@ -7186,6 +7193,9 @@
                 }), acts.children.length ? acts : null);
             const parts = [head];
             parts.push(syncSection(n));
+            parts.push(acc(tr("History"), el("div", {textContent: tr("Looking…")}), {
+                onopen: b => historyInto(b, n)
+            }));
             if (F.root.on_demand && n.here && n.state === "synced") parts.push(placeSection(n));
             if (!n.folder && n.path && n.cloud && F.root.kind !== "vault") parts.push(acc(tr("Versions"), el("div", {
                 className: "muted",
@@ -7320,6 +7330,71 @@
                 note: PLACE[n.placement] || ""
             });
         }
+        function historyMatches(path, n) {
+            if (!path) return false;
+            const clean = p => p.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLowerCase();
+            const p = clean(path), rel = clean(n.rel);
+            return p === rel || (n.folder && (!rel || p.startsWith(rel + "/")));
+        }
+
+        async function historyInto(b, n) {
+            b.classList.add("item-history");
+            const root = {...F.root};
+            const section = title => {
+                const body = el("div", {textContent: tr("Looking…")});
+                b.append(el("h4", {textContent: title}), body);
+                return body;
+            };
+            b.replaceChildren();
+            const activity = section(tr("Recent activity"));
+            activity.style.maxHeight = "20rem";
+            activity.style.overflow = "auto";
+            const rows = el("tbody");
+            activity.replaceChildren(el("table", {className: "list"}, rows));
+            const more = smallBtn(tr("Show more"), () => page());
+            activity.append(more);
+            let before = null;
+            async function page() {
+                more.disabled = true;
+                try {
+                    const list = await call("item_history", {root: root.id, rel: n.rel, before});
+                    rows.append(...list.map(e => el("tr", {},
+                        cell(e.path, when(e.at_ms), "wrap path"),
+                        cell((DID[e.outcome] || (x => x))(e.action), e.detail, "wrap path"))));
+                    if (!list.length && before === null) activity.prepend(el("p", {textContent: tr("Nothing recorded yet.")}));
+                    if (list.length) before = list[list.length - 1].seq;
+                    more.hidden = list.length < 100;
+                } catch (e) {
+                    toast(e.message);
+                } finally { more.disabled = false; }
+            }
+            page();
+            keptInto(section(tr("Kept on this PC")), root, n);
+            if (!n.folder && n.path && n.cloud && root.kind !== "vault")
+                versionsInto(section(tr("OneDrive versions")), n);
+            if (root.kind !== "vault") {
+                const bin = section(tr("Deleted from OneDrive"));
+                try {
+                    const list = (await call("cloud_bin", {root: root.id})).filter(x => historyMatches(x.path, n));
+                    bin.replaceChildren(el("p", {className: "note", textContent: tr("Only items OneUpDrive saw deleted are listed: OneDrive's recycle bin can't be read in full. OneDrive's website shows all of it.")}));
+                    if (!list.length) bin.append(el("p", {textContent: tr("Nothing deleted.")}));
+                    for (const x of list) {
+                        const restore = smallBtn(tr("Restore"), async () => {
+                            await run(call("cloud_bin_restore", {root: root.id, seq: x.seq}), tr("Queued"));
+                        });
+                        restore.disabled = !x.restorable;
+                        bin.append(el("div", {className: "actions"},
+                            el("span", {textContent: x.path + " - " + when(x.at_ms)}), restore));
+                    }
+                } catch (e) { bin.textContent = e.message; }
+            }
+            if (n.folder && root.kind === "main") b.append(smallBtn(tr("Rewind"), () => {
+                show("recovery");
+                $("#rw-folder").value = "/" + n.rel;
+                $("#rw-at").focus();
+            }));
+        }
+
         async function versionsInto(b, n) {
             try {
                 const v = await call("item_versions", {
@@ -7463,11 +7538,10 @@
             }
         }
         // Files sync removed or replaced here, kept in the folder's version store.
-        async function keptInto(b, r) {
+        async function keptInto(b, r, subject = null) {
             try {
-                const list = await call("kept", {
-                    root: r.id
-                });
+                const all = await call("kept", {root: r.id});
+                const list = subject ? all.filter(x => historyMatches(x.origin, subject)) : all;
                 if (!list.length) return b.replaceChildren(el("p", {
                     className: "say",
                     textContent: tr("Nothing kept.")
@@ -7497,7 +7571,7 @@
                             toast(tr("Queued: {path}", {
                                 path: at.replace(/^\\\\\?\\/, "")
                             }));
-                            keptInto(b, r);
+                            keptInto(b, r, subject);
                         }
                     }))));
                 b.replaceChildren(el("table", {
@@ -8530,6 +8604,7 @@
             storage: "files",
             vaults: "files",
             item: "files",
+            itemhistory: "files",
             itemwhy: "files",
             itemactivity: "files",
             problem: "files",
@@ -8680,6 +8755,7 @@
             // Explorer's commands for a file: the section they're about.
             const section = {
                 item: "Versions",
+                itemhistory: "History",
                 itemwhy: "Why",
                 itemactivity: "Recent activity"
             }[start];

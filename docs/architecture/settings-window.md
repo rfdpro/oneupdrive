@@ -88,3 +88,9 @@ The settings window sets its own AppUserModelID (`OneUpDrive.Settings`, through 
 
 ## The mark
 The icon is drawn in code (`tray::mark`, `tray::render`): a cloud cut along a chevron, its top lifted a step ("one up"), sky to azure above and azure to indigo below, transparent gap between. `packaging/oneupdrive.ico` (every program's icon, and the settings window's title bar and taskbar button through `LoadIconW`) is generated from it (`ONEUP_WRITE_ICON=1 cargo test -p oneup --lib the_icon_file`); the tray's status icons put their badges on the same mark. The page draws the same geometry as an inline SVG; the identity package's logos are rendered from it at their sizes.
+
+### Item history
+
+The Files details panel's **History** section opens from **View history** in the Files context menu or Explorer (`shell-verb history`, `--page itemhistory --item PATH`). It combines path-scoped activity, local kept copies, cloud versions for a live file and recorded cloud recycle-bin entries. A folder includes descendant paths, with a separator boundary to exclude similarly named siblings. These are records at a path, not a promise of continuous identity across renames or path reuse.
+
+Activity uses `item_history` and keyset pagination by sequence number, 100 entries per request. Reads use the activity indexes and the bounded retained log, without enumerating the sync tree. Local-copy and recycle-bin lists reuse the existing recovery listings and restore commands; cloud versions reuse the existing version list and restore flow. Rewind from a main-folder history opens the existing preview and approval flow. The history view adds no mutation path.

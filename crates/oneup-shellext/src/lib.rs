@@ -53,14 +53,24 @@ enum Verb {
     Versions,
     Share,
     Office,
+    History,
 }
 
-const VERBS: [Verb; 7] =
-    [Verb::Office, Verb::Share, Verb::Versions, Verb::Online, Verb::First, Verb::Explain, Verb::Activity];
+const VERBS: [Verb; 8] = [
+    Verb::Office,
+    Verb::History,
+    Verb::Share,
+    Verb::Versions,
+    Verb::Online,
+    Verb::First,
+    Verb::Explain,
+    Verb::Activity,
+];
 
 impl Verb {
     fn title(self) -> &'static str {
         match self {
+            Verb::History => "View history",
             Verb::Explain => "Why does this sync?",
             Verb::Activity => "Sync activity",
             Verb::First => "Sync this first",
@@ -72,6 +82,7 @@ impl Verb {
     }
     fn arg(self) -> &'static str {
         match self {
+            Verb::History => "history",
             Verb::Explain => "explain",
             Verb::Activity => "activity",
             Verb::First => "first",
