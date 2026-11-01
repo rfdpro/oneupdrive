@@ -347,7 +347,21 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
             _ => false,
         };
         let verdict = set.verdict(&child, folder);
-        let (mut state, why) = state_of(&verdict, synced, l.is_some(), r.is_some());
+        let (mut state, mut why) = state_of(&verdict, synced, l.is_some(), r.is_some());
+        let initial_held = store.read(|o| {
+            let local = l.as_ref().map(|n| oneup_store::initial::local_key(n.file_id));
+            let remote = r.as_ref().map(|n| format!("r:{}", n.0.id));
+            for key in local.into_iter().chain(remote) {
+                if o.initial_held(&key)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if initial_held {
+            state = "left_out";
+            why = Some(json!({"kind":"initial"}));
+        }
         if !folder && oneup_plan::names::not_synced(&name).is_some() {
             state = "never";
         } else if link {
@@ -677,7 +691,22 @@ pub fn set_sync(data_dir: &Path, rel: &str, folder: bool, on: bool) -> Result<St
     if rel.is_empty() {
         bail!("that's the whole synced folder");
     }
-    let store = crate::setup::open_store(data_dir, 1024)?;
+    let mut store = crate::setup::open_store(data_dir, 1024)?;
+    if on {
+        let keys = store.read(|o| {
+            let local = crate::resolve::local_at(o, &rel)?.map(|l| oneup_store::initial::local_key(l.0));
+            let remote = crate::resolve::remote_at(o, &rel)?.map(|r| format!("r:{}", r.0));
+            Ok(local.into_iter().chain(remote).collect::<Vec<_>>())
+        })?;
+        store.write_durable(|o| {
+            for key in &keys {
+                if o.initial_held(key)? {
+                    o.initial_select(key, true)?;
+                }
+            }
+            Ok(())
+        })?;
+    }
     let mut rules = config::load_rules(data_dir, &store)?;
     let exact = rule_for(&rel, folder);
     let exception = format!("!{exact}");

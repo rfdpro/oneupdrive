@@ -25,6 +25,16 @@ const HOST_LISTENERS = [];
 const HOST_CALLS = [];
 const HOST_ANSWERS = {
   status: null, stopped: null,
+  setup_items: a => ({items: a.side === "r" ? [{key:"r:old",path:"/cloud.txt",folder:false,selected:true}]
+    : [{key:"l:1",path:"/local.txt",folder:false,selected:false}],next:null}),
+  setup_select: null,
+  shared_settings_preview: {code:"reviewed-settings",enabled:false,
+    local:{scope:"/",rules:{presets:[],exclude:[]},sync:{interval_minutes:0,keep_push:false},databases:{wait:true,presets:[],patterns:[]}},
+    cloud:{scope:"/",rules:{presets:["dev"],exclude:["build/"]},sync:{interval_minutes:15,keep_push:true},databases:{wait:true,presets:[],patterns:[]}}},
+  shared_settings_import: null, shared_settings_publish:null, shared_settings_disable:null,
+  setup_preview: {token: "abc", text: "First page\n", next: 11},
+  setup_preview_page: a => a.offset === 11 ? {token: "abc", text: "Last page\n", next: null}
+    : {token: "abc", text: "First page\n", next: 11},
   snapshot: a => a && a.root ? {rules: {presets: [], exclude: [], paused: [], cloud: "pull"}, priority: {first: [], last: []},
       databases: {wait: true, presets: [], patterns: [], keep_syncing: []},
       space: {free_unused_days: 0, low_disk_percent: 10, free_when_low: false}} :
@@ -290,6 +300,27 @@ const DRIVER: &str = r##"<script>
     check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore && restore.outerHTML);
     restore.focus(); restore.click(); await sleep(300);
     check("restoring keeps focus in the list as it reloads", document.querySelector("#rc-bin").contains(document.activeElement), at());
+    document.querySelector("#nav-setup").click();
+    document.querySelector("#preview-btn").click(); await sleep(300);
+    check("setup shows the first preview page", document.querySelector("#preview").textContent === "First page\n", "");
+    check("setup has another page", !document.querySelector("#preview-next").disabled, "");
+    document.querySelector("#preview-next").click(); await sleep(300);
+    check("setup can reach the last preview page", document.querySelector("#preview").textContent === "Last page\n"
+      && document.querySelector("#preview-next").disabled, "");
+    document.querySelector("#preview-prev").click(); await sleep(300);
+    check("setup can return to the first page", document.querySelector("#preview").textContent === "First page\n"
+      && document.querySelector("#preview-prev").disabled, "");
+    const localChoice = document.querySelector("#setup-choice-list input");
+    check("initial local-only file starts unselected", localChoice && !localChoice.checked, "");
+    localChoice.click(); await sleep(300);
+    check("choosing an upload records that item and requires a new preview", HOST_CALLS.some(m=>m.op==="setup_select" && m.args.key==="l:1" && m.args.selected)
+      && document.querySelector("#start-btn").disabled, "");
+    document.querySelector("#shared-review").click(); await sleep(300);
+    check("portable settings are compared before import", document.querySelector("#shared-comparison").textContent.includes("build/")
+      && !HOST_CALLS.some(m=>m.op==="shared_settings_import"), "");
+    check("automatic publication needs opt-in", !document.querySelector("#shared-auto").checked, "");
+    document.querySelector("#shared-import").click(); await sleep(500);
+    check("import binds the reviewed document", HOST_CALLS.some(m=>m.op==="shared_settings_import" && m.args.code==="reviewed-settings" && !m.args.automatic), "");
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }

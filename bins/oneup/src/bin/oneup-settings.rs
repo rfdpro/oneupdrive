@@ -925,10 +925,107 @@ mod win {
             }
             "setup_preview" => {
                 let s = settingsapi::Setup::from_json(args)?;
-                Ok(Value::from(oneup(s.preview(dir)).await?))
+                if s.preset != "imported" && oneup_app::config::path(dir).try_exists()? {
+                    let store = oneup_app::setup::open_store(dir, 1024)?;
+                    let mut rules = oneup_app::config::load_rules(dir, &store)?;
+                    rules.presets = if s.preset == "dev" { vec!["dev".into()] } else { Vec::new() };
+                    oneup_app::config::save_rules(dir, &rules)?;
+                }
+                let dir = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let token = format!(
+                        "{:x}-{:x}",
+                        std::process::id(),
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+                    );
+                    let path = oneup_app::setup_preview::path(&dir, &token)?;
+                    let staging = path.with_extension("tmp");
+                    let result = (|| -> Result<Value> {
+                        let output = std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)?;
+                        let status = std::process::Command::new(oneup_app::launch::sibling("oneup.exe")?)
+                            .args(s.preview(&dir))
+                            .creation_flags(0x0800_0000)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(output.try_clone()?)
+                            .stderr(output.try_clone()?)
+                            .status()?;
+                        output.sync_all()?;
+                        drop(output);
+                        std::fs::rename(&staging, &path)?;
+                        let page = oneup_app::setup_preview::page(&dir, &token, 0)?;
+                        if !status.success() {
+                            bail!("{}", page["text"].as_str().unwrap_or("Comparison failed"));
+                        }
+                        Ok(page)
+                    })();
+                    if result.is_err() {
+                        let _ = std::fs::remove_file(staging);
+                        let _ = std::fs::remove_file(path);
+                    }
+                    result
+                })
+                .await?
+            }
+            "setup_preview_page" => oneup_app::setup_preview::page(
+                dir,
+                args["token"].as_str().context("preview token required")?,
+                args["offset"].as_u64().context("preview position required")?,
+            ),
+            "setup_items" => oneup_app::initial::page(
+                dir,
+                args["side"].as_str().unwrap_or("l"),
+                args["after"].as_str().unwrap_or(""),
+            ),
+            "move_missing" => {
+                if flag(args, "refresh") {
+                    oneup_app::initial::collect_missing(dir)?;
+                }
+                oneup_app::initial::page(dir, "m", args["after"].as_str().unwrap_or(""))
+            }
+            "setup_select" => {
+                oneup_app::initial::select(
+                    dir,
+                    args["key"].as_str().context("item required")?,
+                    args["selected"].as_bool().context("choice required")?,
+                )?;
+                Ok(Value::Null)
+            }
+            "shared_settings_preview" => oneup_app::shared_settings::preview(dir, &*graph(dir)?).await,
+            "shared_settings_state" => Ok(oneup_app::shared_settings::state(dir)),
+            "shared_settings_import" => {
+                oneup_app::shared_settings::import(
+                    dir,
+                    &*graph(dir)?,
+                    args["code"].as_str().context("review settings first")?,
+                    flag(args, "automatic"),
+                )
+                .await?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
+            "shared_settings_publish" => {
+                oneup_app::shared_settings::publish(
+                    dir,
+                    &*graph(dir)?,
+                    args["code"].as_str().context("review settings first")?,
+                    flag(args, "automatic"),
+                )
+                .await?;
+                Ok(Value::Null)
+            }
+            "shared_settings_disable" => {
+                oneup_app::shared_settings::disable(dir)?;
+                Ok(Value::Null)
             }
             "setup_start" => {
+                oneup_app::initial::ready(dir)?;
                 let s = settingsapi::Setup::from_json(args)?;
+                let shared = oneup_app::shared_settings::state(dir);
+                if let Some(scope) = shared["scope"].as_str()
+                    && scope != s.remote
+                {
+                    bail!("imported settings concern another OneDrive folder; review again");
+                }
                 let text = oneup(s.pair(dir)).await?;
                 if flag(args, "autostart") {
                     let launcher = oneup_app::launch::sibling("oneupd-start.exe")?;

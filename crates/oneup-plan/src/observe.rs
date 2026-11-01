@@ -98,9 +98,23 @@ pub fn basis(o: &Ops<'_>) -> Result<Basis, Error> {
 pub fn observe(
     o: &Ops<'_>,
     max_examples: usize,
+    check: Option<&mut dyn ContentCheck>,
+    progress: &Progress,
+    cancel: &AtomicBool,
+) -> Result<(Basis, Report), Error> {
+    observe_visit(o, max_examples, check, progress, cancel, &mut |_| Ok(()))
+}
+
+/// Streams report entries to a visitor, so callers can retain a complete
+/// paged report without retaining the tree in memory. The driver itself
+/// still changes no user content.
+pub fn observe_visit(
+    o: &Ops<'_>,
+    max_examples: usize,
     mut check: Option<&mut dyn ContentCheck>,
     progress: &Progress,
     cancel: &AtomicBool,
+    visit: &mut dyn FnMut(&Entry) -> Result<(), Error>,
 ) -> Result<(Basis, Report), Error> {
     let basis = basis(o)?;
     let Some(local_root) = o.local_root()? else {
@@ -137,6 +151,7 @@ pub fn observe(
         };
         let plan = plan_folder(&path, inherit, local, remote);
         for e in plan.entries {
+            visit(&e)?;
             report.add(e);
         }
         for req in plan.verify {
@@ -151,7 +166,9 @@ pub fn observe(
                 progress.hashed_files.fetch_add(1, Relaxed);
                 progress.hashed_bytes.fetch_add(size, Relaxed);
             }
-            report.add(Entry { path: req.path, category: after_verify(outcome), is_folder: false, bytes: size });
+            let entry = Entry { path: req.path, category: after_verify(outcome), is_folder: false, bytes: size };
+            visit(&entry)?;
+            report.add(entry);
         }
         // Reversed so the stack pops subfolders in name order (examples then
         // read like a sorted listing).
@@ -252,6 +269,50 @@ mod tests {
 
     fn run(s: &Store, check: Option<&mut dyn ContentCheck>) -> Result<(Basis, Report), Error> {
         s.read(|o| Ok(observe(o, 10, check, &Progress::default(), &AtomicBool::new(false)))).unwrap()
+    }
+
+    #[test]
+    fn streaming_missing_items_keeps_the_complete_list_without_expanding_examples() {
+        let mut s = store(true, CursorState::Current, RULES);
+        s.write(|o| {
+            for n in 0..250u128 {
+                let mut row = lrow((1u128 << 100) + n, Some(1), &format!("missing-{n}.txt"), LocalKind::File, 7);
+                row.attributes = 0x0040_0000;
+                row.reparse_tag = 0x9000_001a;
+                o.local_put(&row)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut count = 0;
+        let (_, report) = s
+            .write(|o| {
+                Ok(observe_visit(o, 0, None, &Progress::default(), &AtomicBool::new(false), &mut |e| {
+                    if e.category == Category::Parked(Park::OnlineOnlyNotInCloud) {
+                        count += 1;
+                        o.initial_put(&format!("m:{count:04}"), &e.path, false, false)?;
+                    }
+                    Ok(())
+                }))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 250);
+        assert!(report.examples.values().all(Vec::is_empty));
+        let first = s.read(|o| o.initial_page("m", "", 200)).unwrap();
+        assert_eq!(first.len(), 200);
+        let second = s.read(|o| o.initial_page("m", &first.last().unwrap().key, 200)).unwrap();
+        assert_eq!(second.len(), 50);
+        s.write(|o| o.initial_select(&first[0].key, true)).unwrap();
+        assert!(
+            s.read(|o| o.meta_get("initial.revision")).unwrap().is_none(),
+            "acknowledgements do not re-plan the tree"
+        );
+        assert_eq!(
+            run(&s, None).unwrap().1.tally(Category::Parked(Park::OnlineOnlyNotInCloud)).files,
+            250,
+            "acknowledgement does not turn an unverified placeholder into a verified cloud copy"
+        );
     }
 
     #[test]

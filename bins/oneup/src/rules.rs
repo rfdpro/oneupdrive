@@ -490,6 +490,11 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     let name = parts.last().copied().unwrap_or_default();
 
     println!("{shown}");
+    if let Some(row) = &row
+        && store.read(|o| o.initial_held(&oneup_store::initial::local_key(row.file_id)))?
+    {
+        println!("  left out during setup; select it in Files or use `oneup setup-files --path \"/{rel}\" --sync on`");
+    }
     for p in &problems {
         println!("  note: {p}");
     }

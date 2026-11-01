@@ -25,6 +25,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
     let token = store.read(|o| o.meta_get(crate::sync::KEY_TOKEN))?.unwrap_or_default();
     let on_demand = local.as_deref().is_some_and(|l| crate::ondemand::is_on(Path::new(l), &token));
     let autostart = crate::launch::autostart(crate::launch::RUN_KEY, dir).ok().flatten().is_some();
+    let shared_settings = crate::shared_settings::state(dir);
     let space = config::load_space(dir)?;
     let updates = config::load_updates(dir)?;
     let (first, last) = config::load_priority(dir)?;
@@ -109,6 +110,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "value": t.set,
         })).collect::<Vec<_>>(),
         "autostart": autostart,
+        "shared_settings": {"enabled":shared_settings["enabled"]==true,"error":shared_settings["error"]},
         "rules": {
             "presets": presets,
             "exclude": r.exclude,
@@ -771,9 +773,6 @@ pub struct Setup {
     pub on_demand: bool,
 }
 
-/// How many changes the preview lists (the totals cover the rest).
-pub const PREVIEW_LINES: usize = 200;
-
 impl Setup {
     pub fn from_json(v: &Value) -> Result<Self> {
         let local = v.get("local").and_then(Value::as_str).map(str::trim).unwrap_or_default();
@@ -793,7 +792,7 @@ impl Setup {
         }
         let remote = crate::sync::normalize_remote(v.get("remote").and_then(Value::as_str).unwrap_or_default())?;
         let preset = v.get("preset").and_then(Value::as_str).unwrap_or("dev");
-        if crate::setup::preset_rules(preset).is_none() {
+        if preset != "imported" && crate::setup::preset_rules(preset).is_none() {
             bail!("unknown list of things to leave out: {preset}");
         }
         let on_demand = v.get("on_demand").and_then(Value::as_bool).unwrap_or(true);
@@ -803,14 +802,21 @@ impl Setup {
     fn sync(&self, dir: &Path) -> Vec<std::ffi::OsString> {
         let mut a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "sync".into()];
         a.push(self.local.clone().into());
-        a.extend(["--remote".into(), self.remote.clone().into(), "--exclude".into(), self.preset.clone().into()]);
+        a.extend([
+            "--remote".into(),
+            self.remote.clone().into(),
+            "--exclude".into(),
+            (if self.preset == "imported" { "none" } else { &self.preset }).into(),
+            "--review-initial".into(),
+        ]);
         a
     }
 
     /// `oneup` arguments for the preview (changes nothing).
     pub fn preview(&self, dir: &Path) -> Vec<std::ffi::OsString> {
         let mut a = self.sync(dir);
-        a.extend(["--dry-run".into(), "--limit".into(), PREVIEW_LINES.to_string().into()]);
+        // The host streams the complete comparison to disk and pages it.
+        a.push("--dry-run".into());
         a
     }
 
@@ -1345,7 +1351,8 @@ mod tests {
         let text = |a: Vec<std::ffi::OsString>| a.iter().map(|x| x.to_string_lossy().into_owned()).collect::<Vec<_>>();
         let p = text(s.preview(dir));
         assert_eq!(&p[..3], ["--data-dir", "D", "sync"]);
-        assert!(p.ends_with(&["--dry-run".into(), "--limit".into(), PREVIEW_LINES.to_string()]));
+        assert!(p.ends_with(&["--dry-run".into()]));
+        assert!(!p.contains(&"--limit".to_string()));
         let p = text(s.pair(dir));
         assert!(p.ends_with(&["--pair-only".into(), "--on-demand".into()]));
         assert!(!p.contains(&"--dry-run".to_string()));

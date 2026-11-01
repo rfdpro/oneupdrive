@@ -2092,7 +2092,7 @@
                             <b>Exclude</b>
                             <div class="field"><select id="setup-preset" aria-label="Exclude">
           <option value="dev">Developer folders (node_modules, .venv, target, build caches…)</option>
-          <option value="none">Nothing</option></select></div>
+          <option value="none">Nothing</option><option value="imported" id="setup-imported" hidden>Imported exclusions</option></select></div>
                             <p class="note">Change it later in Files &gt; Exclude.</p>
                         </div>
                     </div>
@@ -2108,6 +2108,7 @@
                                 <label class="toggle"><input type="checkbox" id="setup-autostart" checked aria-label="Start with Windows"><span></span></label></div>
                         </div>
                     </div>
+                    <div id="setup-shared-slot"></div>
                     <!-- Moving over: checked while the app still manages the folder, then the app unlinked -->
                     <div class="step" id="step-check" hidden>
                         <div class="num">5</div>
@@ -2137,6 +2138,14 @@
                     <button class="btn primary" id="start-btn" disabled>Start syncing</button><span class="muted" id="setup-busy" role="status"></span></div>
                 <div class="card" id="preview-card" hidden>
                     <div class="row block"><pre class="out" id="preview" style="margin:0"></pre></div>
+                    <div class="actions"><button class="btn" id="preview-prev" disabled>Previous</button><button class="btn" id="preview-next" disabled>Next</button><span id="preview-page" role="status"></span></div>
+                </div>
+                <div id="setup-choices" hidden>
+                    <h3>Choose initial files</h3>
+                    <p class="note">Select local-only items to upload. Unselected items stay on this PC. Clear a OneDrive item to leave it in OneDrive. Folder choices include their listed contents. Select Preview after changing choices. No files are deleted.</p>
+                    <div class="actions"><select id="setup-choice-side" aria-label="Initial files"><option value="l">Only on this PC</option><option value="r">Only in OneDrive</option></select><button class="btn" id="setup-choice-refresh">Refresh</button></div>
+                    <div class="card" id="setup-choice-list"></div>
+                    <div class="actions"><button class="btn" id="setup-choice-prev" disabled>Previous</button><button class="btn" id="setup-choice-next" disabled>Next</button><span id="setup-choice-status" role="status"></span></div>
                 </div>
             </fieldset>
         </section>
@@ -2480,6 +2489,14 @@
         <!-- General -->
         <section class="page" id="general">
             <h2>General</h2>
+            <div id="general-shared-slot"><div id="shared-settings">
+                <h3>Shared settings</h3>
+                <p class="note">Share exclusions, the sync interval and database rules through oneup.settings in OneDrive. Review before importing on another PC.</p>
+                <div class="actions"><button class="btn" id="shared-review">Review</button><button class="btn" id="shared-import" disabled>Import</button><button class="btn" id="shared-publish" disabled>Publish</button><button class="btn" id="shared-disable">Disable</button></div>
+                <label class="ck"><input type="checkbox" id="shared-auto"><span>Publish future settings changes</span></label>
+                <p class="note" id="shared-status" role="status"></p>
+                <div id="shared-comparison" hidden style="overflow:auto"></div>
+            </div></div>
             <h3>Start-up</h3>
             <div class="card">
                 <div class="row">
@@ -3236,6 +3253,10 @@
         // The on/off switches are checkboxes underneath: screen readers say "on" and "off".
         $$(".toggle input").forEach(i => i.setAttribute("role", "switch"));
         function fill(s) {
+            if (!sharedPreview && s.shared_settings) {
+                $("#shared-auto").checked=!!s.shared_settings.enabled;
+                $("#shared-status").textContent=s.shared_settings.error || "";
+            }
             snap = s;
             setupState(s);
             fillOffice(s);
@@ -3356,7 +3377,11 @@
                 }, el("b", {
                     textContent: (p.pair ? p.pair + ": " : "") + p.title
                 }), el("small", {
-                    textContent: p.detail + " " + p.action
+                    textContent: p.detail,
+                    style: "overflow-wrap:anywhere"
+                }), el("p", {
+                    className: "note",
+                    textContent: p.action
                 })))));
                 box.hidden = !r.problems.length;
             } catch {
@@ -5292,6 +5317,7 @@
 
         function stateOf(n) {
             const w = n.why || {};
+            if (w.kind === "initial") return ["off", tr("Left out during setup")];
             // Where an exclusion comes from, in the row itself.
             if (n.state === "left_out") {
                 if (w.inside) return ["off", tr("In excluded folder")];
@@ -5672,6 +5698,7 @@
 
         function whyShort(n) {
             const w = n.why || {};
+            if (w.kind === "initial") return tr("Left out during setup");
             if (w.inside) return tr("Inside excluded {folder}", {
                 folder: w.inside
             });
@@ -8192,11 +8219,74 @@
             }
         };
 
+        // ---- portable settings review
+        let sharedPreview = null;
+        let sharedDiscovered = false;
+        const sharedFields = [
+            ["rules", "presets", tr("Exclusion presets")], ["rules", "exclude", tr("Exclusions")],
+            ["sync", "interval_minutes", tr("Sync interval (minutes)")], ["sync", "keep_push", tr("Get OneDrive's changes at once")],
+            ["databases", "wait", tr("Wait for programs to close databases")],
+            ["databases", "presets", tr("Database presets")], ["databases", "patterns", tr("Database patterns")]
+        ];
+        const sharedValue = v => Array.isArray(v) ? v.join("\n") || "–" : typeof v === "boolean" ? (v ? tr("On") : tr("Off")) : String(v ?? "–");
+        async function reviewSharedSettings() {
+            $("#shared-status").textContent = tr("Looking…");
+            $("#shared-import").disabled = $("#shared-publish").disabled = true;
+            sharedPreview = null;
+            try {
+                const p = await call("shared_settings_preview");
+                sharedPreview = p;
+                $("#shared-auto").checked = !!p.enabled;
+                const table = el("table", {className:"list"},el("thead",{},el("tr",{},
+                    ...[tr("Setting"),tr("This PC"),tr("OneDrive")].map(t=>el("th",{textContent:t})))));
+                table.append(el("tbody",{},...sharedFields.map(([section,key,label])=>el("tr",{},
+                    el("td",{textContent:label}),
+                    el("td",{textContent:sharedValue(p.local[section][key]),style:"white-space:pre-wrap;overflow-wrap:anywhere"}),
+                    el("td",{textContent:p.cloud ? sharedValue(p.cloud[section][key]) : "–",style:"white-space:pre-wrap;overflow-wrap:anywhere"})))));
+                $("#shared-comparison").replaceChildren(table);
+                $("#shared-comparison").hidden = false;
+                $("#shared-status").textContent = p.error || (p.cloud ? tr("OneDrive folder: {folder}",{folder:p.cloud.scope}) : tr("No shared settings in OneDrive."));
+                $("#shared-import").disabled = !p.cloud;
+                $("#shared-publish").disabled = false;
+            } catch(e) { $("#shared-status").textContent = e.message; }
+        }
+        async function applySharedSettings(action) {
+            if (!sharedPreview) return;
+            const p = sharedPreview;
+            $("#shared-import").disabled = $("#shared-publish").disabled = true;
+            try {
+                await call(action,{code:p.code,automatic:$("#shared-auto").checked});
+                if (action === "shared_settings_import") {
+                    $("#setup-remote").value = p.cloud.scope;
+                    $("#setup-imported").hidden = false;
+                    $("#setup-preset").value = "imported";
+                    stale();
+                }
+                await load();
+                await reviewSharedSettings();
+            } catch(e) { sharedPreview=null; $("#shared-status").textContent=e.message; }
+        }
+        $("#shared-review").onclick = () => reviewSharedSettings();
+        $("#shared-import").onclick = () => applySharedSettings("shared_settings_import");
+        $("#shared-publish").onclick = () => applySharedSettings("shared_settings_publish");
+        $("#shared-disable").onclick = async() => {
+            try {
+                await run(call("shared_settings_disable"));
+                $("#shared-auto").checked=false;
+                $("#shared-status").textContent=tr("Automatic settings publication disabled.");
+            } catch {}
+        };
         // ---- first-run setup
         let firstFill = true;
 
         function setupState(s) {
             const need = !s.pair.local;
+            $(need ? "#setup-shared-slot" : "#general-shared-slot").append($("#shared-settings"));
+            if (!s.signed_in) sharedDiscovered = false;
+            if (need && s.signed_in && !sharedDiscovered) {
+                sharedDiscovered = true;
+                reviewSharedSettings();
+            }
             $("#nav-setup").hidden = !need;
             if (need && firstFill) {
                 show("setup");
@@ -8465,12 +8555,44 @@
                 why: c.cloud.not_ready
             }), true);
             else if (c.cloud && !c.cloud.all_in_cloud) {
-                li(tr("{files} online-only files and {folders} folders aren't in OneDrive at the same place. Don't unlink yet: they would be lost.", {
+                li(tr("{files} online-only files and {folders} folders are missing from this OneDrive listing. Review them before unlinking.", {
                     files: c.cloud.missing_files,
                     folders: c.cloud.missing_folders
                 }), true);
                 for (const p of c.cloud.examples || []) li("  " + p, true);
-                li(tr("Usually OneDrive is just behind: check again. If they're still listed, find them in OneDrive online (or its recycle bin), or set them to Always keep on this device first."), true);
+                li(tr("If you need these items, find them in OneDrive or its recycle bin, or download them first. If you no longer need them, acknowledge them below and finish unlinking in the OneDrive app."), true);
+                const missing = el("div",{});
+                const review = el("button",{className:"btn",textContent:tr("Review")});
+                review.onclick = async() => {
+                    review.disabled=true;
+                    const offsets=[""]; let page=0,next=null;
+                    const rows=el("div",{className:"card"});
+                    const previous=el("button",{className:"btn",textContent:tr("Previous"),disabled:true});
+                    const following=el("button",{className:"btn",textContent:tr("Next"),disabled:true});
+                    const loadPage=async(refresh=false)=> {
+                        const r=await call("move_missing",{refresh,after:offsets[page]});
+                        next=r.next;
+                        rows.replaceChildren(...r.items.map(i=> {
+                            const input=el("input",{type:"checkbox",checked:i.selected,
+                                "aria-label":tr("No longer needed: {path}",{path:i.path})});
+                            input.onchange=async()=> {
+                                input.disabled=true;
+                                try {await call("setup_select",{key:i.key,selected:input.checked});i.selected=input.checked;}
+                                catch(e) {input.checked=i.selected;toast(e.message,true);}
+                                finally {input.disabled=false;}
+                            };
+                            return el("label",{className:"row"},input,el("span",{textContent:i.path,style:"overflow-wrap:anywhere"}));
+                        }));
+                        previous.disabled=page===0; following.disabled=!next;
+                    };
+                    previous.onclick=()=> {if(page) {page--;run(loadPage());}};
+                    following.onclick=()=> {if(next) {offsets[++page]=next;run(loadPage());}};
+                    missing.replaceChildren(el("p",{className:"note",textContent:tr("Select items you no longer need. Nothing is removed here. OneUpDrive can finish unlinking only when all online-only items have cloud copies.")}),
+                        rows,el("div",{className:"actions"},previous,following));
+                    try {await loadPage(true);}catch(e) {toast(e.message,true);review.disabled=false;}
+                };
+                missing.append(review);
+                box.append(missing);
             } else if (s.online_only > 0) li(tr("Every online-only file is in OneDrive. Safe to unlink."));
             if (c.carried) {
                 const k = c.carried,
@@ -8507,6 +8629,10 @@
 
         function stale() {
             $("#start-btn").disabled = true;
+            setupPreviewGeneration++;
+            setupPreview = null;
+            $("#preview-prev").disabled = $("#preview-next").disabled = true;
+            $("#preview-page").textContent = "";
         }
         ["#setup-local", "#setup-remote"].forEach(id => $(id).addEventListener("input", stale));
         $("#setup-preset").onchange = stale;
@@ -8564,15 +8690,90 @@
                 $("#preview-btn").disabled = false;
             }
         }
+        let setupPreview = null;
+        let setupPreviewGeneration = 0;
+        let previewOffsets = [0];
+        let previewPage = 0;
+        let initialAfter = [""];
+        let initialPage = 0;
+        let initialNext = null;
+        let initialGeneration = 0;
+        async function loadInitialChoices(reset = false) {
+            const generation=++initialGeneration;
+            if (reset) { initialAfter = [""]; initialPage = 0; }
+            const side = $("#setup-choice-side").value;
+            const r = await call("setup_items", {side, after: initialAfter[initialPage]});
+            if (generation!==initialGeneration) return;
+            initialNext = r.next;
+            $("#setup-choice-list").replaceChildren(...r.items.map(i => {
+                const input = el("input", {type:"checkbox", checked:i.selected,
+                    "aria-label": (side === "l" ? tr("Upload") : tr("Download")) + " " + i.path});
+                input.onchange = async() => {
+                    input.disabled = true;
+                    $("#start-btn").disabled = true;
+                    try {
+                        await call("setup_select", {key:i.key, selected:input.checked});
+                        await loadInitialChoices();
+                        stale();
+                    } catch(e) { input.checked = i.selected; toast(e.message,true); }
+                    finally { input.disabled = false; }
+                };
+                return el("label", {className:"row"},input,el("span", {
+                    className:"path",textContent:i.path + (i.folder ? "/" : ""),style:"overflow-wrap:anywhere"}));
+            }));
+            $("#setup-choice-status").textContent = r.items.length ? tr("Page {n, number}",{n:initialPage+1}) : tr("Nothing found.");
+            $("#setup-choice-prev").disabled = initialPage === 0;
+            $("#setup-choice-next").disabled = !initialNext;
+        }
+        $("#setup-choice-side").onchange = () => run(loadInitialChoices(true));
+        $("#setup-choice-refresh").onclick = () => run(loadInitialChoices(true));
+        $("#setup-choice-prev").onclick = () => { if(initialPage) { initialPage--; run(loadInitialChoices()); } };
+        $("#setup-choice-next").onclick = () => { if(initialNext) { initialAfter[++initialPage]=initialNext; run(loadInitialChoices()); } };
+        function showSetupPreview(out) {
+            setupPreview = out;
+            $("#preview").textContent = out.text;
+            $("#preview-prev").disabled = previewPage === 0;
+            $("#preview-next").disabled = out.next == null;
+            $("#preview-page").textContent = tr("Page {n, number}", {n: previewPage + 1});
+        }
+        async function turnSetupPreview(delta) {
+            if (!setupPreview) return;
+            const current = setupPreview;
+            const to = previewPage + delta;
+            const offset = delta > 0 ? setupPreview.next : previewOffsets[to];
+            if (to < 0 || offset == null) return;
+            $("#preview-prev").disabled = $("#preview-next").disabled = true;
+            try {
+                const out = await call("setup_preview_page", {token: setupPreview.token, offset});
+                if (setupPreview !== current) return;
+                previewOffsets[to] = offset;
+                previewPage = to;
+                showSetupPreview(out);
+            } catch (e) {
+                if (setupPreview !== current) return;
+                toast(e.message, true);
+                showSetupPreview(setupPreview);
+            }
+        }
+        $("#preview-prev").onclick = () => turnSetupPreview(-1);
+        $("#preview-next").onclick = () => turnSetupPreview(1);
         $("#preview-btn").onclick = async() => {
             if (!snap.signed_in) return toast(tr("Sign in first"), true);
+            stale();
+            const generation = setupPreviewGeneration;
             $("#preview-card").hidden = false;
             $("#preview").textContent = "";
             try {
                 const out = await busy(tr("Comparing both sides…"), call("setup_preview", setupArgs()));
-                $("#preview").textContent = out;
+                if (generation !== setupPreviewGeneration) return;
+                previewOffsets = [0];
+                previewPage = 0;
+                showSetupPreview(out);
+                $("#setup-choices").hidden = false;
+                await loadInitialChoices(true);
                 $("#start-btn").disabled = false;
             } catch (e) {
+                if (generation !== setupPreviewGeneration) return;
                 $("#preview").textContent = e.message;
                 toast(tr("The preview didn't finish"), true);
             }
@@ -8580,6 +8781,7 @@
         $("#start-btn").onclick = async() => {
             try {
                 const out = await busy(tr("Setting up…"), call("setup_start", setupArgs()));
+                stale();
                 $("#preview").textContent = out;
                 toast(tr("Syncing has started"));
                 await load();

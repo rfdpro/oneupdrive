@@ -254,13 +254,13 @@ pub fn collect_in(f: &Facts, now_ms: i64, loc: &Locale) -> Vec<Item> {
     for name in &f.edits_not_found {
         out.push(Item::new(
             "edit_not_found",
-            t_in!(loc, "Edit in OneDrive not found"),
+            t_in!(loc, "Older cloud version could not be verified"),
             t_in!(
                 loc,
-                "{name}: an upload may have gone over an edit made in OneDrive, which the file's version history doesn't show.",
+                "{name}: OneUpDrive could not verify whether an upload replaced another cloud edit. Automatic version-history checks have stopped.",
                 name = name.as_str()
             ),
-            t_in!(loc, "Look for it in the file's version history in OneDrive."),
+            t_in!(loc, "Review the file's version history on OneDrive."),
         ));
     }
     if f.stale_note {
@@ -427,6 +427,14 @@ fn from_status(s: &Status, now_ms: i64, loc: &Locale, out: &mut Vec<Item>) {
             t_in!(loc, "Failed: {n, plural, one {# item} other {# items}}", n = r.count),
             t_in!(loc, "Tried again in {time}.", time = left),
             t_in!(loc, "`oneup activity` says why."),
+        ));
+    }
+    for d in s.databases.iter().filter(|d| d.why != "live") {
+        out.push(Item::new(
+            "waiting_database",
+            t_in!(loc, "Database waiting: {path}", path = d.path.as_str()),
+            d.detail.clone(),
+            t_in!(loc, "Close the program using it, or exclude it on Files > Exclude > Databases."),
         ));
     }
     for d in s.databases.iter().filter(|d| d.why == "live") {
@@ -754,7 +762,7 @@ mod tests {
         s.auto_pause = Some("battery saver is on".into());
         s.unsynced = Some(Unsynced { count: 4, more: false });
         s.retrying = Some(Retrying { count: 2, next_ms: 60_000 });
-        // A warning is listed; a database waiting its turn isn't a problem.
+        // Both a waiting database and a warning must be visible.
         let note = |why: &str| oneup_ipc::DatabaseNote {
             path: "/Mail/archive.pst".into(),
             format: "outlook".into(),
@@ -781,19 +789,20 @@ mod tests {
                 "auto_paused",
                 "unsynced",
                 "retrying",
+                "waiting_database",
                 "live_database",
                 "paused_folder",
                 "conflict"
             ]
         );
-        assert!(items[7].action.contains("oneup databases --exclude \"/Mail/archive.pst\""), "{}", items[7].action);
+        assert!(items[8].action.contains("oneup databases --exclude \"/Mail/archive.pst\""), "{}", items[8].action);
         assert_eq!(items[1].code.as_deref(), Some("00000000000000ab"));
         assert!(items[1].action.contains("oneup approve 00000000000000ab"), "{}", items[1].action);
         assert!(items[2].action.contains("oneup keep 00000000000000cd"));
         assert!(items[3].detail.contains("this PC") && items[3].detail.contains("30 min"), "{}", items[3].detail);
         assert_eq!(items[5].title, "Sync failure: 4 items");
-        assert!(items[8].action.contains("oneup resume --folder \"Videos\""));
-        assert!(items[9].detail.contains("/docs/a.txt") && items[9].detail.contains("a (1).txt"));
+        assert!(items[9].action.contains("oneup resume --folder \"Videos\""));
+        assert!(items[10].detail.contains("/docs/a.txt") && items[10].detail.contains("a (1).txt"));
         assert!(items.iter().all(|i| i.pair.is_none()));
     }
 
