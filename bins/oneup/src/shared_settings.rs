@@ -66,7 +66,7 @@ pub fn validate(v: &Value) -> Result<()> {
     for (section, key) in
         [("rules", "presets"), ("rules", "exclude"), ("databases", "presets"), ("databases", "patterns")]
     {
-        if !v[section][key].is_array() {
+        if !v[section][key].as_array().is_some_and(|a| a.iter().all(Value::is_string)) {
             bail!("invalid shared setting list");
         }
     }
@@ -205,9 +205,11 @@ pub fn import_document(dir: &Path, v: &Value) -> Result<()> {
             let item = match x {
                 Value::Bool(b) => toml_edit::value(*b),
                 Value::Number(n) => toml_edit::value(n.as_i64().context("invalid setting number")?),
-                Value::Array(a) => {
-                    toml_edit::value(a.iter().map(|x| x.as_str().unwrap_or_default()).collect::<toml_edit::Array>())
-                }
+                Value::Array(a) => toml_edit::value(
+                    a.iter()
+                        .map(|x| x.as_str().context("invalid shared setting list"))
+                        .collect::<Result<toml_edit::Array>>()?,
+                ),
                 _ => bail!("invalid portable setting"),
             };
             doc[section][key] = item;
@@ -425,6 +427,16 @@ mod tests {
         ] {
             assert!(import_document(&dir, &invalid).is_err());
             assert_eq!(std::fs::read_to_string(config::path(&dir)).unwrap(), text);
+        }
+        for (section, key) in
+            [("rules", "presets"), ("rules", "exclude"), ("databases", "presets"), ("databases", "patterns")]
+        {
+            for element in [Value::Null, json!(123), json!(false), json!({"bad": "value"})] {
+                let mut invalid = doc.clone();
+                invalid[section][key] = json!([element]);
+                assert!(import_document(&dir, &invalid).is_err(), "{section}.{key} must contain only strings");
+                assert_eq!(std::fs::read_to_string(config::path(&dir)).unwrap(), text);
+            }
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

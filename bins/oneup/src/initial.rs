@@ -56,7 +56,9 @@ pub fn collect(store: &mut Store, rules: &RuleSet) -> Result<()> {
                 !rules.excludes(p, true)
             }));
         }
-        o.initial_end()
+        // Visibility can change with rules or previews. Keep identity
+        // answers so removing an exclusion cannot silently include them.
+        Ok(())
     })?;
     Ok(())
 }
@@ -198,8 +200,19 @@ mod tests {
         );
         assert_eq!(visible.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["upload.txt"]);
         assert!(s.read(|o| Trees::remote_children(o, &RemoteId("root".into()))).unwrap().is_empty());
+        // Temporarily hiding candidates must not erase their answers.
+        let excluded = RuleSet::new::<&str>(&[], &["/old/", "/cloud.txt"]).unwrap();
+        collect(&mut s, &excluded).unwrap();
+        assert!(s.read(|o| o.initial_held(&local_key(high + 1))).unwrap());
+        assert!(s.read(|o| o.initial_held("r:cloud")).unwrap());
+        assert!(s.read(|o| o.initial_page("l", "", 100)).unwrap().is_empty());
+        assert!(s.read(|o| o.initial_page("r", "", 100)).unwrap().is_empty());
         // A new preview preserves answers, including the 128-bit IDs.
         collect(&mut s, &RuleSet::default()).unwrap();
+        assert!(s.read(|o| o.initial_held(&local_key(high + 1))).unwrap());
+        assert!(s.read(|o| o.initial_held("r:cloud")).unwrap());
+        assert!(!s.read(|o| o.initial_held(&local_key(high + 2))).unwrap());
+        assert_eq!(s.read(|o| o.initial_page("l", "", 100)).unwrap().len(), 3);
         let ops = s.read(|o| oneup_sync::plan(o, [ROOT])).unwrap();
         assert!(ops.iter().all(|op| !matches!(op, Op::DeleteRemote { .. } | Op::RecycleLocal { .. })));
         assert!(ops.iter().any(|op| matches!(op, Op::MkdirRemote { .. })));

@@ -8,7 +8,7 @@ The settings window and `oneup setup-files` read bounded keyset pages and change
 
 The store's `Trees` view hides unselected items from both child queries and ID reads. Hidden ID reads return `Missing`, never `Deleted`; no answer generates deletion evidence. New items outside held folders use normal sync. A revision change makes the next planning pass reconsider all folders. Files displays held items as left out during setup and can include them again; `oneup explain` identifies the local choice.
 
-Initial inclusion decisions require durable transactions before setup can proceed. The store refuses changing those decisions through a normal transaction.
+Initial inclusion decisions require durable transactions before setup can proceed. The store refuses changing those decisions through a normal transaction. Candidate visibility is separate from the recorded answer: temporarily excluding an item hides it from setup pages without erasing its choice, so removing an exclusion cannot silently include it.
 
 ## Portable document
 

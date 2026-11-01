@@ -35,11 +35,6 @@ impl Ops<'_> {
         self.c.execute("UPDATE initial_choice SET active=0 WHERE substr(key,1,2) IN ('l:','r:')", [])?;
         Ok(())
     }
-    pub fn initial_end(&self) -> Result<()> {
-        self.require_durable()?;
-        self.c.execute("DELETE FROM initial_choice WHERE active=0", [])?;
-        Ok(())
-    }
     pub fn initial_path(&self, key: &str) -> Result<Option<String>> {
         if let Some(id) = local_id(key) {
             return self.local_path_of(id);
@@ -83,7 +78,7 @@ impl Ops<'_> {
         let end = format!("{side};");
         let mut q = self.c.prepare_cached(
             "SELECT key,path,folder,selected FROM initial_choice
-            WHERE key >= ?1 AND key < ?2 AND key > ?3 ORDER BY key LIMIT ?4",
+            WHERE key >= ?1 AND key < ?2 AND key > ?3 AND active=1 ORDER BY key LIMIT ?4",
         )?;
         Ok(q.query_map(params![start, end, after, limit.min(201) as i64], |r| {
             Ok(InitialChoice { key: r.get(0)?, path: r.get(1)?, folder: r.get(2)?, selected: r.get(3)? })
