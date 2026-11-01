@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 oneup-cfapi = { path = "../oneup-cfapi" }
 oneup-gate = { path = "../oneup-gate" }
+# Removing a sharing link or setting its expiry (`sharing`).
+oneup-graph = { path = "../oneup-graph" }
 oneup-hash = { path = "../oneup-hash" }
 oneup-ntfs = { path = "../oneup-ntfs" }
 oneup-rules = { path = "../oneup-rules" }
@@ -18,6 +20,14 @@ oneup-sync = { path = "../oneup-sync" }
 oneup-sys = { path = "../oneup-sys" }
 thiserror = "2"
 tracing = "0.1"
+
+[features]
+# Test-only: `LocalFs::crash_after` stops an effect part-way, as if the
+# process had been killed there (`oneup-exec`'s `crash-test` turns it on;
+# production builds never do).
+crash-test = []
+# Test support: `sharing::fake`, an in-memory OneDrive's sharing.
+fake = []
 
 [lints]
 workspace = true

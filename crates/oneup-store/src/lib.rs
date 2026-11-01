@@ -16,8 +16,14 @@
 //! Since schema v3 it also holds the **Local tree**, a read-only scan of a
 //! local folder (see [`local`]), and since v4 the **Synced tree** with the
 //! deletion evidence the reconciler relies on (see [`synced`]), and since v5
-//! the marks of folders that need planning again (see [`dirty`]), and since
-//! v17 when failed operations are tried again (see [`retry`]).
+//! the marks of folders that need planning again (see [`dirty`]), since
+//! v17 when failed operations are tried again (see [`retry`]), since v18
+//! an index of the Remote tree's names for search (see [`search`]), since
+//! v19 the cloud folders by size, for rule suggestions (see [`choose`]),
+//! since v20 the hashes of local-only files made for finding duplicates
+//! (see [`dupes`]), and since v21 which cloud items are shared (see
+//! [`shared`]), and since v22 what applying pin rules keeps
+//! (see [`pins`]).
 //!
 //! The Remote and Local trees are *derived metadata*: rows can always be
 //! rebuilt from OneDrive or by rescanning. The Synced tree is not: it is the
@@ -34,7 +40,7 @@
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 
 pub mod local;
 pub use local::{LOCAL_SCAN_FORMAT, LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip};
@@ -43,11 +49,21 @@ pub use synced::SyncedStats;
 pub mod dirty;
 pub use dirty::DirtyScope;
 pub mod activity;
+pub mod choose;
+pub mod pins;
+pub use choose::Totals;
+pub mod dupes;
+pub mod history;
 pub mod retry;
 mod rulefile;
+pub mod search;
+pub mod shared;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
+pub use dupes::{DupCursor, DupGroup, DupSummary};
 pub use retry::{Item as RetryItem, Retry};
+pub use search::{Found, Hit, IndexState};
+pub use shared::{IntendedChange, Intent, MarkPage, SharedRow};
 pub use usage::{AppFile, AppUse, UseKind};
 
 #[derive(Debug, thiserror::Error)]
@@ -58,6 +74,11 @@ pub enum Error {
     TooNew { found: i64, supported: i64 },
     #[error("corrupt row: {0}")]
     Corrupt(String),
+    /// A write that must outlive its effect ([`Ops::require_durable`])
+    /// outside a durable transaction ([`Store::write_durable`]): a bug,
+    /// refused before anything is committed.
+    #[error("a write ahead of an effect outside a durable transaction")]
+    NotDurable,
 }
 
 impl Error {
@@ -97,7 +118,7 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 25;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -370,8 +391,23 @@ static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::ne
 
 /// Tables small enough to read whole at every round: what a round may
 /// scan ([`Store::tree_scans`]). Everything else grows with the tree.
+/// (`remote_name_config` holds the name index's few settings, which FTS5
+/// reads once per connection.)
 #[cfg(feature = "statement-log")]
-const SMALL_TABLES: &[&str] = &["meta", "cursor", "enum_unit", "local_root", "remote_orphan", "dirty", "t_sub"];
+const SMALL_TABLES: &[&str] = &[
+    "meta",
+    "cursor",
+    "enum_unit",
+    "local_root",
+    "remote_orphan",
+    "dirty",
+    // Records whose items wait to sync: as few as what waits.
+    "synced_unsettled",
+    "t_sub",
+    "search_queue",
+    "remote_name_config",
+    "sharing_intent",
+];
 
 #[cfg(feature = "statement-log")]
 impl Store {
@@ -412,7 +448,9 @@ impl Store {
                 st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3))?.collect::<rusqlite::Result<_>>()?;
             for step in steps {
                 let Some(name) = step.strip_prefix("SCAN ").and_then(|t| t.split(' ').next()) else { continue };
-                if !SMALL_TABLES.contains(&table_of(sql, name)) && !step.contains("CONSTANT ROW") {
+                let table = table_of(sql, name);
+                let table = table.strip_prefix("main.").unwrap_or(table);
+                if !SMALL_TABLES.contains(&table) && !step.contains("CONSTANT ROW") {
                     out.push(format!("{step}  <-  {sql}"));
                 }
             }
@@ -439,6 +477,14 @@ fn table_of<'a>(sql: &'a str, name: &'a str) -> &'a str {
     name
 }
 
+/// A read-only connection to the database at `path`, which must exist:
+/// never upgraded, never written.
+fn peek(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_WAIT)?;
+    Ok(conn)
+}
+
 impl Store {
     /// Opens (creating if needed) the database. `cache_kib` bounds SQLite's
     /// page cache, which is how the memory profile reaches the store.
@@ -448,6 +494,34 @@ impl Store {
 
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?, 2048)
+    }
+
+    /// The ID of the cloud root the database at `path` mirrors, if it has
+    /// one, read without opening it as a store: read-only, never upgraded,
+    /// whatever its version. For a look at another data folder's database
+    /// (the test-account guard reads the default one's drive): opening it
+    /// would upgrade it under the agent using it, an older build that then
+    /// writes to a schema it doesn't know.
+    pub fn peek_remote_root_id(path: &Path) -> Result<Option<String>> {
+        // `remote_item` and its root (kind 2) are there since v1.
+        Ok(peek(path)?.query_row("SELECT id FROM remote_item WHERE kind = 2 LIMIT 1", [], |r| r.get(0)).optional()?)
+    }
+
+    /// `key` in the `meta` table (there since v1) of the database at
+    /// `path`, read as [`Store::peek_remote_root_id`] reads: for which
+    /// folder another data folder syncs.
+    pub fn peek_meta(path: &Path, key: &str) -> Result<Option<String>> {
+        Ok(peek(path)?.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// Another connection to the same database file, for a reader on
+    /// another thread. `None` for an in-memory database, which no other
+    /// connection can reach.
+    pub fn reopen(&self, cache_kib: u32) -> Result<Option<Self>> {
+        match self.conn.path() {
+            Some(p) if !p.is_empty() => Ok(Some(Self::open(Path::new(p), cache_kib)?)),
+            _ => Ok(None),
+        }
     }
 
     fn init(mut conn: Connection, cache_kib: u32) -> Result<Self> {
@@ -462,8 +536,12 @@ impl Store {
             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |ctx| Ok(ctx.get::<Option<String>>(0)?.map(|s| oneup_sync::fold(&s))),
         )?;
-        // The mirror is rebuildable from the cloud, so NORMAL durability (WAL)
-        // is sufficient here. The future op journal will use FULL.
+        // NORMAL: a commit survives the process dying but not a power cut
+        // or an OS crash, which may roll back the last commits (WAL keeps
+        // them in order, so it's always the newest that go). Enough for the
+        // mirror and everything the next round finds again. Write-ahead
+        // records must outlive their effect, so they commit at FULL
+        // (`Store::write_durable`).
         conn.execute_batch(&format!(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -493,10 +571,13 @@ impl Store {
     /// WAL mode SQLite fails that at once ("database is locked", without
     /// waiting) when another connection committed in between, which has
     /// stopped the agent.
+    ///
+    /// Changes to the Remote tree reach the name index ([`search`]) just
+    /// before the commit.
     pub fn write<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let out = f(&Ops { c: &tx })?;
-        tx.commit()?;
+        commit(tx)?;
         Ok(out)
     }
 
@@ -508,7 +589,95 @@ impl Store {
     ) -> std::result::Result<T, E> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(Error::from)?;
         let out = f(&Ops { c: &tx })?;
-        tx.commit().map_err(Error::from)?;
+        commit(tx)?;
+        Ok(out)
+    }
+
+    /// [`Store::try_write`] without waiting for another connection's write:
+    /// if one holds the database now, nothing runs and `Err` hands `f` back
+    /// with the busy error ([`Error::is_busy`]), so the caller can wait its
+    /// own way. The executor waits without holding up the operations under
+    /// way, which [`BUSY_WAIT`] inside SQLite would.
+    pub fn try_write_now<T, E, F>(&mut self, f: F) -> std::result::Result<std::result::Result<T, E>, (F, Error)>
+    where
+        E: From<Error>,
+        F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
+    {
+        self.try_write_now_as(false, f)
+    }
+
+    /// [`Store::try_write_now`]; `durable`: the transaction counts itself
+    /// first ([`Store::write_durable`]), the caller having set FULL.
+    fn try_write_now_as<T, E, F>(
+        &mut self,
+        durable: bool,
+        f: F,
+    ) -> std::result::Result<std::result::Result<T, E>, (F, Error)>
+    where
+        E: From<Error>,
+        F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
+    {
+        let begun = self
+            .conn
+            .busy_timeout(std::time::Duration::ZERO)
+            .and_then(|()| rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate));
+        // Back before anything else runs on this connection.
+        let restored = self.conn.busy_timeout(BUSY_WAIT);
+        let tx = match (begun, restored) {
+            (Ok(tx), Ok(())) => tx,
+            (Err(e), _) => {
+                let e = Error::from(e);
+                return if e.is_busy() { Err((f, e)) } else { Ok(Err(e.into())) };
+            }
+            (Ok(_), Err(e)) => return Ok(Err(Error::from(e).into())),
+        };
+        if durable && let Err(e) = (Ops { c: &tx }).count_durable() {
+            return Ok(Err(e.into()));
+        }
+        let out = match f(&Ops { c: &tx }) {
+            Ok(out) => out,
+            Err(e) => return Ok(Err(e)),
+        };
+        Ok(commit(tx).map(|()| out).map_err(Into::into))
+    }
+
+    /// [`Store::write`], committed durably (`synchronous = FULL`): on disk,
+    /// the WAL flushed, before it returns, so it survives a power cut or an
+    /// OS crash, and so does every commit before it. For a transaction that
+    /// must outlive the effect that follows it (`data-safety.md` invariant
+    /// 7): a record written ahead of the effect, or state whose rollback
+    /// would make the next round undo what the effect did. Everything else
+    /// commits at NORMAL, which skips the flush.
+    ///
+    /// Each also counts itself in `meta` ([`Ops::durable_commits`]). SQLite
+    /// flushes only a commit that changed a page (one that rewrites a row as
+    /// it was changes none), so without it a durable commit could leave the
+    /// commits before it unflushed.
+    pub fn write_durable<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
+        self.durably(|s| s.write(|o| o.count_durable().and_then(|()| f(o))))?
+    }
+
+    /// [`Store::try_write_now`], committed durably ([`Store::write_durable`]).
+    pub fn try_write_now_durable<T, E, F>(&mut self, f: F) -> std::result::Result<std::result::Result<T, E>, (F, Error)>
+    where
+        E: From<Error>,
+        F: FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
+    {
+        match self.durably(|s| s.try_write_now_as(true, f)) {
+            Ok(r) => r,
+            Err(e) => Ok(Err(e.into())),
+        }
+    }
+
+    /// Runs `f` with the connection at `synchronous = FULL`, and puts it
+    /// back to NORMAL afterwards, whatever `f` returned. Should that fail,
+    /// the connection stays at FULL: slower, never less safe.
+    fn durably<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> Result<R> {
+        // SQLite refuses this inside a transaction, and none is open here:
+        // every one is begun and ended within a call.
+        self.conn.pragma_update(None, "synchronous", "FULL")?;
+        let out = f(self);
+        let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
         Ok(out)
     }
 
@@ -563,10 +732,28 @@ impl Store {
         Ok(busy == 0)
     }
 
+    /// Reads in one transaction: everything `f` reads is the same snapshot
+    /// of the database, whatever other connections write meanwhile.
+    pub fn snapshot<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let out = f(&Ops { c: &tx })?;
+        tx.rollback()?;
+        Ok(out)
+    }
+
     /// Read-only access outside an explicit transaction.
     pub fn read<T>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
         f(&Ops { c: &self.conn })
     }
+}
+
+/// Commits a write transaction: every write path ends here, so changes to
+/// the Remote tree always reach the name index ([`search`]) before the
+/// commit, whichever way the transaction was opened.
+fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
+    Ops { c: &tx }.search_apply()?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn user_version(c: &Connection) -> Result<i64> {
@@ -582,7 +769,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 17] = [
+    let steps: [(i64, String); 25] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -600,6 +787,14 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (15, synced::MIGRATE_V15.into()),
         (16, format!("{} {MIGRATE_V16}", synced::MIGRATE_V16)),
         (17, retry::MIGRATE_V17.into()),
+        (18, search::MIGRATE_V18.into()),
+        (19, choose::MIGRATE_V19.into()),
+        (20, dupes::MIGRATE_V20.into()),
+        (21, shared::MIGRATE_V21.into()),
+        (22, pins::migrate_v22()),
+        (23, history::migrate_v23()),
+        (24, history::MIGRATE_V24.into()),
+        (25, String::new()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -608,9 +803,86 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             return Err(Error::TooNew { found: at, supported: SCHEMA_VERSION });
         }
         if at < to {
+            if to == 24 {
+                settle_v23(&tx)?;
+            }
+            if to == 25 && add_column(&tx, synced::V25_COLUMN)? {
+                // Evidence from before can't be told apart: an answer given
+                // under an older build, not carried out yet, may be among it.
+                // Counted as answered, those copies are kept.
+                tx.execute_batch("UPDATE remote_gone SET answered = 1;")?;
+            }
             tx.execute_batch(&format!("{sql} PRAGMA user_version = {to};"))?;
         }
         tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Adds `(table, column, definition)` unless the table has it already, so
+/// the step can run again over a store that has it (an upgrade replayed).
+/// Whether it added it.
+fn add_column(tx: &Connection, (table, column, def): (&str, &str, &str)) -> Result<bool> {
+    let has: bool =
+        tx.query_row("SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)", [table, column], |r| {
+            r.get(0)
+        })?;
+    if !has {
+        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {def};"))?;
+    }
+    Ok(!has)
+}
+
+/// Before v24's refold: a store that a pre-release build marked v23 with
+/// an earlier shape of v20 to v23 (tables, indexes, triggers or columns
+/// missing) gets what it lacks, from the same definitions. A v23 store that
+/// has them all is left as it is. The columns come first, so the indexes
+/// and triggers on them can be made.
+///
+/// Such a store's history is stopped (`Ops::history_stop`): the draft
+/// started it at the upgrade, maybe in the middle of a first sync, whose
+/// records would read to a rewind as items created since. The next
+/// settled round starts it again.
+fn settle_v23(tx: &Connection) -> Result<()> {
+    let objects =
+        |tx: &Connection| -> Result<i64> { Ok(tx.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?) };
+    let before = objects(tx)?;
+    let mut earlier = false;
+    for (table, column, def) in [
+        ("pin_changed", "seen", "INTEGER NOT NULL DEFAULT 0"),
+        ("pin_user", "created", "INTEGER"),
+        ("synced_item", "fold", "TEXT"),
+    ] {
+        let (exists, has): (bool, bool) = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1),
+                    EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            [table, column],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if exists && !has {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {def};"))?;
+            earlier = true;
+        }
+    }
+    // The steps' own SQL, making only what isn't there; their column
+    // additions and fills are the loop above and v24.
+    let missing = |sql: &str| {
+        sql.lines()
+            .filter(|l| !l.starts_with("ALTER TABLE") && !l.starts_with("UPDATE "))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            )
+            .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+            .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
+            .replace("CREATE TRIGGER ", "CREATE TRIGGER IF NOT EXISTS ")
+    };
+    for sql in [dupes::MIGRATE_V20.to_string(), pins::migrate_v22(), history::migrate_v23()] {
+        tx.execute_batch(&missing(&sql))?;
+    }
+    if earlier || objects(tx)? != before {
+        Ops { c: tx }.history_stop()?;
     }
     Ok(())
 }
@@ -620,7 +892,10 @@ pub struct Ops<'a> {
     c: &'a Connection,
 }
 
-const ITEM_COLS: &str = "id, parent_id, name, kind, size, etag, qxh, mtime";
+/// In `meta`: the number of durable commits ([`Store::write_durable`]).
+const DURABLE_COMMITS: &str = "store.durable_commits";
+
+pub(crate) const ITEM_COLS: &str = "id, parent_id, name, kind, size, etag, qxh, mtime";
 
 /// Cloud files at least this large are worth copying in OneDrive instead of
 /// uploading when a new local file has the same content (server-side
@@ -681,6 +956,42 @@ impl Ops<'_> {
             [key, value],
         )?;
         Ok(())
+    }
+
+    /// [`Ops::meta_set`] for a record written ahead of an effect, which
+    /// must be on disk before the effect starts (`data-safety.md`
+    /// invariant 7): refused ([`Error::NotDurable`]) unless the transaction
+    /// commits durably ([`Store::write_durable`]).
+    pub fn meta_set_ahead(&self, key: &str, value: &str) -> Result<()> {
+        self.require_durable()?;
+        self.meta_set(key, value)
+    }
+
+    /// Refuses ([`Error::NotDurable`]) unless this transaction commits
+    /// durably ([`Store::write_durable`]). For a transaction that must
+    /// outlive the effect after it, so one written the fast way fails in
+    /// every test that runs it instead of only after a power cut.
+    pub fn require_durable(&self) -> Result<()> {
+        // 2 is FULL, 3 EXTRA.
+        let level: i64 = self.c.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+        if level < 2 {
+            return Err(Error::NotDurable);
+        }
+        Ok(())
+    }
+
+    /// How many durable commits this database has had
+    /// ([`Store::write_durable`]).
+    pub fn durable_commits(&self) -> Result<u64> {
+        Ok(self.meta_get(DURABLE_COMMITS)?.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Counts a durable commit: a page it is sure to change, so SQLite
+    /// flushes it.
+    fn count_durable(&self) -> Result<()> {
+        self.require_durable()?;
+        let n = self.durable_commits()?.wrapping_add(1);
+        self.meta_set(DURABLE_COMMITS, &n.to_string())
     }
 
     pub fn meta_delete(&self, key: &str) -> Result<()> {
@@ -774,6 +1085,20 @@ impl Ops<'_> {
         Ok(u64::try_from(n - 1).unwrap_or(0))
     }
 
+    /// [`Ops::remote_subtree_count`], and whether that's all of it: no
+    /// folder below `id` was skipped by name when listing (`is_excluded`),
+    /// whose contents the store never saw. Otherwise it's a lower bound.
+    pub fn remote_subtree_known(&self, id: &str) -> Result<(u64, bool)> {
+        self.load_subtree(id)?;
+        let (n, skipped): (i64, i64) = self.c.query_row(
+            "SELECT count(*), coalesce(sum(is_excluded != 0 AND id != ?1), 0)
+             FROM remote_item WHERE id IN (SELECT id FROM t_sub)",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((u64::try_from(n - 1).unwrap_or(0), skipped == 0))
+    }
+
     fn load_subtree(&self, id: &str) -> Result<()> {
         // Everything that reads `t_sub` back must look rows up from it (`IN`),
         // not join it: with no table statistics SQLite drives such a join
@@ -799,6 +1124,7 @@ impl Ops<'_> {
     pub fn delete_subtree(&self, id: &str) -> Result<usize> {
         self.load_subtree(id)?;
         self.note_remote_subtree_deleted()?;
+        self.note_gone_subtree()?;
         self.c.execute(
             "DELETE FROM remote_pruned WHERE id IN (
                  WITH RECURSIVE ps(id) AS (
@@ -809,6 +1135,7 @@ impl Ops<'_> {
             [],
         )?;
         self.c.execute("DELETE FROM remote_orphan WHERE id IN (SELECT id FROM t_sub)", [])?;
+        self.unmark_shared_subtree()?;
         Ok(self.c.execute("DELETE FROM remote_item WHERE id IN (SELECT id FROM t_sub)", [])?)
     }
 
@@ -822,6 +1149,7 @@ impl Ops<'_> {
             self.c.execute("DELETE FROM t_sub WHERE id = ?1", [id])?;
         }
         self.c.execute(PRUNE_TOMBSTONES, [])?;
+        self.unmark_shared_subtree()?;
         Ok(self.c.execute("DELETE FROM remote_item WHERE id IN (SELECT id FROM t_sub)", [])?)
     }
 
@@ -1018,6 +1346,11 @@ impl Ops<'_> {
     /// Drops orphans waiting on `parent_id` (used when the parent turns out
     /// to no longer exist). Returns how many were dropped.
     pub fn drop_orphans_of(&self, parent_id: &str) -> Result<usize> {
+        // Their shared marks go too: they'll never be placed.
+        self.c.execute(
+            "DELETE FROM remote_shared WHERE id IN (SELECT id FROM remote_orphan WHERE parent_id = ?1)",
+            [parent_id],
+        )?;
         Ok(self.c.execute("DELETE FROM remote_orphan WHERE parent_id = ?1", [parent_id])?)
     }
 
@@ -1131,11 +1464,15 @@ impl Ops<'_> {
     /// cursor and the rules it was built with), so the next mirror run starts
     /// from scratch. The Local tree and user settings in `meta` are kept.
     pub fn clear_remote(&self) -> Result<()> {
-        self.c.execute_batch(
-            "DELETE FROM remote_item; DELETE FROM remote_pruned; DELETE FROM remote_orphan;
-             DELETE FROM enum_unit; DELETE FROM cursor; DELETE FROM meta WHERE key = 'rules';",
-        )?;
-        Ok(())
+        // The name index is emptied at once, not one queued removal per item.
+        self.search_clear_with(|| {
+            self.c.execute_batch(
+                "DELETE FROM remote_item; DELETE FROM remote_pruned; DELETE FROM remote_orphan;
+                 DELETE FROM enum_unit; DELETE FROM cursor; DELETE FROM meta WHERE key = 'rules';
+                 DELETE FROM remote_shared;",
+            )?;
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------ cursor
@@ -1260,7 +1597,7 @@ impl Ops<'_> {
     }
 }
 
-fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
+pub(crate) fn fix_kind((kind, mut row): (i64, RemoteRow)) -> Result<RemoteRow> {
     row.kind = Kind::try_from(kind)?;
     Ok(row)
 }
@@ -1296,6 +1633,122 @@ mod tests {
         .unwrap();
         let keys: Vec<String> = s.read(|o| o.meta_under("exec.pending")).unwrap().into_iter().map(|(k, _)| k).collect();
         assert_eq!(keys, ["exec.pending", "exec.pending.a", "exec.pending.b"]);
+    }
+
+    fn synchronous(s: &Store) -> i64 {
+        s.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap()
+    }
+
+    /// A write-ahead record's transaction commits at FULL (2), and the
+    /// connection is back at NORMAL (1) afterwards, also after the
+    /// transaction failed or the busy path handed the closure back.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn durable_writes_commit_at_full_and_go_back_to_normal() {
+        let path = std::env::temp_dir().join(format!("oneup-store-durable-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        assert_eq!(synchronous(&s), 1);
+        s.write_durable(|o| {
+            assert_eq!(o.c.query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))?, 2);
+            o.meta_set_ahead("exec.pending.1", "evidence 1")
+        })
+        .unwrap();
+        assert_eq!(synchronous(&s), 1);
+        assert_eq!(s.read(|o| o.meta_get("exec.pending.1")).unwrap().as_deref(), Some("evidence 1"));
+
+        let failed = s.write_durable(|o| {
+            o.meta_set_ahead("exec.pending.2", "evidence 2")?;
+            Err::<(), _>(Error::Corrupt("injected".into()))
+        });
+        assert!(matches!(failed, Err(Error::Corrupt(_))));
+        assert_eq!(synchronous(&s), 1, "back to NORMAL after an error");
+        assert_eq!(s.read(|o| o.meta_get("exec.pending.2")).unwrap(), None, "rolled back");
+
+        // The executor's way in: without waiting, the closure handed back.
+        let other = Store::open(&path, 1024).unwrap();
+        other.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let busy = s.try_write_now_durable(|o| o.meta_set_ahead("exec.pending.3", "x"));
+        assert!(matches!(busy, Err((_, ref e)) if e.is_busy()));
+        assert_eq!(synchronous(&s), 1, "back to NORMAL after a busy try");
+        other.conn.execute_batch("ROLLBACK").unwrap();
+        s.try_write_now_durable(|o| o.meta_set_ahead("exec.pending.3", "x")).map_err(|(_, e)| e).unwrap().unwrap();
+        assert_eq!(synchronous(&s), 1);
+        assert_eq!(s.read(|o| o.durable_commits()).unwrap(), 2, "the failed and the busy ones don't count");
+
+        // A durable commit that changes nothing else still changes a page,
+        // so SQLite flushes it, and every commit before it.
+        s.write(|o| o.meta_set("plain", "1")).unwrap();
+        s.write_durable(|o| o.require_durable()).unwrap();
+        assert_eq!(s.read(|o| o.durable_commits()).unwrap(), 3);
+        drop((s, other));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// A write-ahead record outside a durable transaction is a bug: refused,
+    /// and nothing of the transaction is kept.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_write_ahead_record_outside_a_durable_transaction_is_refused() {
+        let mut s = Store::open_in_memory().unwrap();
+        let r = s.write(|o| {
+            o.meta_set("other", "1")?;
+            o.meta_set_ahead("exec.pending.1", "evidence 1")
+        });
+        assert!(matches!(r, Err(Error::NotDurable)), "{r:?}");
+        assert_eq!(s.read(|o| o.meta_under("exec.pending")).unwrap(), vec![]);
+        assert_eq!(s.read(|o| o.meta_get("other")).unwrap(), None);
+    }
+
+    /// What a durable write-ahead record costs: `n` operations' records,
+    /// each written (at NORMAL, or durably at FULL) and then cleared at
+    /// NORMAL as the final record does, on a file in the temp folder. A
+    /// measurement, not a check: `cargo test -p oneup-store --release --lib
+    /// -- --ignored --nocapture durable_commit_cost`.
+    #[test]
+    #[ignore = "measurement"]
+    #[allow(clippy::unwrap_used)]
+    fn durable_commit_cost() {
+        let n: u32 = 1_000;
+        let path = std::env::temp_dir().join(format!("oneup-store-cost-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        let mut run = |durable: bool| {
+            let started = std::time::Instant::now();
+            for i in 0..n {
+                // A new key each time, as a record is: rewriting an unchanged
+                // row writes no page, so would commit without a flush.
+                let key = format!("exec.pending.{i:x}");
+                let value = format!("evidence {i:x}");
+                if durable {
+                    s.write_durable(|o| o.meta_set_ahead(&key, &value)).unwrap();
+                } else {
+                    s.write(|o| o.meta_set(&key, &value)).unwrap();
+                }
+                s.write(|o| o.meta_delete(&key)).unwrap();
+            }
+            started.elapsed()
+        };
+        run(false);
+        let (mut normal, mut full) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        // Alternated, so neither has a quieter disk to itself.
+        for _ in 0..3 {
+            normal += run(false);
+            full += run(true);
+        }
+        let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / f64::from(3 * n);
+        println!(
+            "record + clear, per operation: NORMAL {:.0} us, FULL {:.0} us ({} operations each)",
+            per(normal),
+            per(full),
+            3 * n
+        );
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
     }
 
     #[test]
@@ -1389,6 +1842,31 @@ mod tests {
         assert!(scans("-- TRIGGER t").is_empty());
     }
 
+    /// A snapshot reads one state of the database: another connection's
+    /// write in between doesn't show in its later reads.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_snapshot_reads_one_state() {
+        let path = std::env::temp_dir().join(format!("oneup-store-snapshot-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut a = Store::open(&path, 1024).unwrap();
+        let mut b = Store::open(&path, 1024).unwrap();
+        a.write(|o| o.meta_set("k", "1")).unwrap();
+        let (first, second) = a
+            .snapshot(|o| {
+                let first = o.meta_get("k")?;
+                b.write(|o| o.meta_set("k", "2")).unwrap();
+                Ok((first, o.meta_get("k")?))
+            })
+            .unwrap();
+        assert_eq!((first.as_deref(), second.as_deref()), (Some("1"), Some("1")));
+        assert_eq!(a.read(|o| o.meta_get("k")).unwrap().as_deref(), Some("2"));
+        drop((a, b));
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
     /// Two connections that each read and then write, at the same time (the
     /// agent and its hydration service, say): every write waits its turn.
     /// With deferred transactions, some failed at once with "database is
@@ -1419,6 +1897,40 @@ mod tests {
         assert_eq!(s.read(|o| o.meta_get("a")).unwrap().as_deref(), Some("300"));
         assert_eq!(s.read(|o| o.meta_get("b")).unwrap().as_deref(), Some("300"));
         drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
+        }
+    }
+
+    /// While another connection writes, a write that doesn't wait runs
+    /// nothing and hands its work back at once; reads go on meanwhile, and
+    /// the connection still waits its full time for ordinary writes.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_write_that_doesnt_wait_hands_its_work_back_while_another_writes() {
+        let path = std::env::temp_dir().join(format!("oneup-store-now-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut s = Store::open(&path, 1024).unwrap();
+        let other = Store::open(&path, 1024).unwrap();
+        other.conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO meta (key, value) VALUES ('other', '1');").unwrap();
+        let started = std::time::Instant::now();
+        let ran = std::cell::Cell::new(false);
+        let work = |o: &Ops<'_>| -> Result<()> {
+            ran.set(true);
+            o.meta_set("mine", "1")
+        };
+        let Err((work, e)) = s.try_write_now(work) else { panic!("the database is held") };
+        assert!(e.is_busy(), "{e}");
+        assert!(!ran.get());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "didn't wait");
+        assert_eq!(s.read(|o| o.meta_get("mine")).unwrap(), None, "reads go on");
+        other.conn.execute_batch("COMMIT").unwrap();
+        s.try_write_now(work).ok().unwrap().unwrap();
+        assert!(ran.get());
+        assert_eq!(s.read(|o| o.meta_get("other")).unwrap().as_deref(), Some("1"));
+        let waits: i64 = s.conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        assert_eq!(waits, i64::try_from(BUSY_WAIT.as_millis()).unwrap(), "ordinary writes still wait");
+        drop((s, other));
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{ext}", path.display()));
         }
@@ -1764,6 +2276,141 @@ mod tests {
         assert_eq!(s.read(|o| o.local_root()).unwrap(), None);
         assert_eq!(s.read(|o| o.local_stats()).unwrap(), LocalStats::default());
         drop(s);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A store a pre-release build marked v23 with an earlier shape of v20
+    /// to v23 (no duplicates table, older pin tables, no record of where
+    /// deleted items went, no folded names) ends up as a new store is.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_store_marked_v23_in_an_earlier_shape_is_settled() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (fresh, earlier) = (dir.join("fresh.db"), dir.join("earlier.db"));
+        drop(Store::open(&fresh, 1024).unwrap());
+        drop(Store::open(&earlier, 1024).unwrap());
+        Connection::open(&earlier)
+            .unwrap()
+            .execute_batch(&format!(
+                "{} DROP TABLE pin_user_hold; DROP TRIGGER pin_user_folder; DROP TRIGGER pin_user_folder_lost;
+                 ALTER TABLE pin_changed DROP COLUMN seen; ALTER TABLE pin_user DROP COLUMN created;
+                 DROP INDEX remote_deleted_from_at; DROP TABLE remote_deleted_from;
+                 DROP INDEX synced_item_fold; ALTER TABLE synced_item DROP COLUMN fold;
+                 PRAGMA user_version = 23;",
+                dupes::UNDO_V20
+            ))
+            .unwrap();
+        // The draft started the history at the upgrade.
+        let started = "INSERT INTO meta(key, value) VALUES ('history.on', '1'), ('history.since', '5');
+             INSERT INTO synced_history(at_ms, sid, change) VALUES (6, 1, 0);
+             INSERT INTO synced_unsettled(sid) VALUES (1);";
+        Connection::open(&earlier).unwrap().execute_batch(started).unwrap();
+        assert_ne!(shape(&earlier), shape(&fresh));
+        drop(Store::open(&earlier, 1024).unwrap());
+        assert_eq!(shape(&earlier), shape(&fresh));
+        assert_eq!(history_kept(&earlier), (0, 0, 0), "the draft's history is stopped");
+        // A v23 store in the final shape: v24 changes nothing but the
+        // version, and a history it keeps stays.
+        Connection::open(&fresh).unwrap().execute_batch(&format!("{started} PRAGMA user_version = 23;")).unwrap();
+        let before = shape(&fresh);
+        drop(Store::open(&fresh, 1024).unwrap());
+        assert_eq!(shape(&fresh).1, before.1);
+        assert_eq!(history_kept(&fresh), (2, 1, 1), "kept");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The history's keys in `meta`, its rows and its marks.
+    #[allow(clippy::unwrap_used)]
+    fn history_kept(path: &Path) -> (i64, i64, i64) {
+        let c = Connection::open(path).unwrap();
+        let n = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        (
+            n("SELECT count(*) FROM meta WHERE key IN ('history.on', 'history.since')"),
+            n("SELECT count(*) FROM synced_history"),
+            n("SELECT count(*) FROM synced_unsettled"),
+        )
+    }
+
+    /// Every table's columns, and every index's and trigger's definition,
+    /// spaced alike, with the schema version.
+    #[allow(clippy::unwrap_used)]
+    fn shape(path: &Path) -> (i64, Vec<(String, String, String)>) {
+        let c = Connection::open(path).unwrap();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let mut st = c
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+            .unwrap();
+        let rows: Vec<(String, String, Option<String>)> =
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect();
+        let out = rows
+            .into_iter()
+            .map(|(t, n, sql)| {
+                let what = if t == "table" {
+                    let mut cols = c
+                        .prepare(&format!(
+                            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info('{n}')"
+                        ))
+                        .unwrap();
+                    let cols: Vec<String> = cols
+                        .query_map([], |r| {
+                            Ok(format!(
+                                "{} {} {} {:?} {}",
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, Option<String>>(3)?,
+                                r.get::<_, i64>(4)?
+                            ))
+                        })
+                        .unwrap()
+                        .map(|r| r.unwrap())
+                        .collect();
+                    cols.join(", ")
+                } else {
+                    sql.unwrap_or_default()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .replace(" IF NOT EXISTS", "")
+                };
+                (t, n, what)
+            })
+            .collect();
+        (v, out)
+    }
+
+    /// A look at another data folder's database reads its cloud root and
+    /// leaves it at its version, older or newer than this build's: no
+    /// upgrade under an agent of another build, no refusal of a newer one.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_peek_reads_the_cloud_root_and_never_upgrades() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, version) in [(0, 1), (1, SCHEMA_VERSION - 1), (2, SCHEMA_VERSION + 1)] {
+            let path = dir.join(format!("state{n}.db"));
+            {
+                let c = Connection::open(&path).unwrap();
+                c.execute_batch(&format!(
+                    "PRAGMA journal_mode = WAL; {SCHEMA_V1}
+                     INSERT INTO remote_item(id, parent_id, name, kind) VALUES ('d1!101', NULL, 'root', 2);
+                     INSERT INTO meta(key, value) VALUES ('sync.local_path', 'C:/Sync');
+                     PRAGMA user_version = {version};"
+                ))
+                .unwrap();
+            }
+            assert_eq!(Store::peek_remote_root_id(&path).unwrap().as_deref(), Some("d1!101"), "v{version}");
+            assert_eq!(Store::peek_meta(&path, "sync.local_path").unwrap().as_deref(), Some("C:/Sync"));
+            assert_eq!(Store::peek_meta(&path, "none").unwrap(), None);
+            let c = Connection::open(&path).unwrap();
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(v, version, "left at its version");
+        }
+        assert!(Store::peek_remote_root_id(&dir.join("none.db")).is_err(), "never made");
+        assert!(!dir.join("none.db").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

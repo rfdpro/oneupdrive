@@ -9,7 +9,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 # Push notifications (`push`): WebSocket over rustls, trusting Windows' own
 # certificate store.
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -20,14 +20,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "sync", "time"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tracing = "0.1"
 url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+# Reading back what was logged (`search_text_never_reaches_errors_or_logs`).
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

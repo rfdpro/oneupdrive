@@ -61,6 +61,31 @@ fn inside(exe: &Path, dir: &Path) -> bool {
 
 /// The processes whose executable is inside `dir` (any depth).
 pub fn inside_dir(dir: &Path) -> Result<Vec<Process>> {
+    Ok(all()?.into_iter().filter(|p| inside(&p.exe, dir)).collect())
+}
+
+/// This Windows user's processes (in any session: they share the user's
+/// registry) whose executable is called `file_name` (compared as Windows
+/// compares ASCII names; `file_name` is a program's name, like
+/// `OneDrive.exe`).
+pub fn named(file_name: &str) -> Result<Vec<Process>> {
+    let me = crate::pipe::current_user_sid().map_err(|e| Error::Io { op: "current user", source: e })?;
+    Ok(all()?
+        .into_iter()
+        .filter(|p| p.exe.file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(file_name)))
+        .filter(|p| user_of(p.pid).is_some_and(|u| u == me))
+        .collect())
+}
+
+/// The SID of the user running process `pid`, if it can be asked.
+fn user_of(pid: u32) -> Option<String> {
+    let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    crate::pipe::user_sid_of(h.0).ok()
+}
+
+/// Every process whose executable can be asked (this user's, and those that
+/// allow limited queries).
+fn all() -> Result<Vec<Process>> {
     let mut pids = vec![0u32; 4096];
     loop {
         let mut got = 0u32;
@@ -79,7 +104,7 @@ pub fn inside_dir(dir: &Path) -> Result<Vec<Process>> {
         .into_iter()
         .filter_map(|pid| {
             let exe = image(&open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)?;
-            inside(&exe, dir).then_some(Process { pid, exe })
+            Some(Process { pid, exe })
         })
         .collect())
 }
@@ -103,6 +128,44 @@ pub fn terminate(p: &Process, wait_ms: u32) -> Result<bool> {
     Ok(true)
 }
 
+/// Any descendant process of `parent` (the deepest found), by walking the
+/// parent links in a snapshot of the system's processes. For tests that
+/// start a child and want to prove it, and its children, are in a job.
+#[cfg(test)]
+pub fn any_descendant(parent: u32) -> Option<u32> {
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+    };
+    // SAFETY: a snapshot of all processes; the handle is owned below.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?;
+    let snap = Owned(snap);
+    let mut entry = PROCESSENTRY32 { dwSize: size_of::<PROCESSENTRY32>() as u32, ..Default::default() };
+    let mut parents: Vec<(u32, u32)> = Vec::new();
+    // SAFETY: `entry` is a valid, sized structure for each call.
+    let mut more = unsafe { Process32First(snap.0, &mut entry) }.is_ok();
+    while more {
+        parents.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        // SAFETY: as above.
+        more = unsafe { Process32Next(snap.0, &mut entry) }.is_ok();
+    }
+    // The deepest descendant: walk down as far as the links go.
+    let mut frontier = vec![parent];
+    let mut deepest = None;
+    for _ in 0..64 {
+        let next: Vec<u32> = parents
+            .iter()
+            .filter(|(pid, ppid)| frontier.contains(ppid) && *pid != parent)
+            .map(|(pid, _)| *pid)
+            .collect();
+        if next.is_empty() {
+            break;
+        }
+        deepest = next.first().copied();
+        frontier = next;
+    }
+    deepest
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -120,6 +183,11 @@ mod tests {
         let found = inside_dir(&system).unwrap();
         let p = found.iter().find(|p| p.pid == child.id()).expect("found by its folder").clone();
         assert!(p.exe.to_string_lossy().to_lowercase().ends_with("cmd.exe"));
+        assert!(named("CMD.EXE").unwrap().iter().any(|q| q.pid == p.pid), "found by its name");
+        assert_eq!(user_of(p.pid), Some(crate::pipe::current_user_sid().unwrap()), "this user's");
+        // The System process isn't this user's (nor can it be asked).
+        assert_ne!(user_of(4), user_of(p.pid));
+        assert!(!named("cmd").unwrap().iter().any(|q| q.pid == p.pid), "a whole name");
         assert!(!inside_dir(&std::env::temp_dir()).unwrap().iter().any(|q| q.pid == p.pid));
         // Another executable under that ID: left alone.
         let wrong = Process { pid: p.pid, exe: system.join("notepad.exe") };

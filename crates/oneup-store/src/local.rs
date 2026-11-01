@@ -99,7 +99,7 @@ pub struct LocalRow {
 }
 
 impl LocalRow {
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, i64, Self)> {
+    pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, i64, Self)> {
         let id: Vec<u8> = r.get("file_id")?;
         let parent: Option<Vec<u8>> = r.get("parent_id")?;
         Ok((
@@ -121,7 +121,7 @@ impl LocalRow {
     }
 }
 
-fn fix_local((kind, skip, mut row): (i64, i64, LocalRow)) -> Result<LocalRow> {
+pub(crate) fn fix_local((kind, skip, mut row): (i64, i64, LocalRow)) -> Result<LocalRow> {
     row.kind = LocalKind::try_from(kind)?;
     row.skip = Skip::try_from(skip)?;
     Ok(row)
@@ -213,7 +213,8 @@ pub(crate) fn local_named_sql() -> String {
     format!("SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3")
 }
 
-const LOCAL_COLS: &str = "file_id, parent_id, name, name_lossy, kind, size, mtime, attributes, reparse_tag, skip";
+pub(crate) const LOCAL_COLS: &str =
+    "file_id, parent_id, name, name_lossy, kind, size, mtime, attributes, reparse_tag, skip";
 
 /// `%needle%` for `LIKE … ESCAPE '\'`, with the needle's own `%`, `_` and
 /// `\` taken literally.
@@ -262,6 +263,12 @@ impl Ops<'_> {
     /// stores the root folder's row and queues it for listing.
     pub fn local_begin(&self, root: &LocalRoot, root_row: &LocalRow) -> Result<()> {
         debug_assert_eq!(root_row.kind, LocalKind::Root);
+        // The pin rules' own notes go with the rows; for the same folder
+        // they're set aside to be put back (`crate::pins`).
+        let same = self
+            .local_root()?
+            .is_some_and(|r| r.volume_serial == root.volume_serial && r.root_file_id == root.root_file_id);
+        self.pins_hold_for_rescan(same)?;
         self.c.execute_batch("DELETE FROM local_scan_queue; DELETE FROM local_item; DELETE FROM local_root;")?;
         self.c.execute(
             "INSERT INTO local_root (id, path, volume_serial, root_file_id, rules, journal_id, start_usn,
@@ -475,6 +482,16 @@ impl Ops<'_> {
         let mut st = self.c.prepare_cached(&format!("SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1"))?;
         let rows = st.query_map([blob(parent_id)], LocalRow::from_row)?;
         rows.map(|r| fix_local(r?)).collect()
+    }
+
+    /// How many entries folder `parent_id` holds, counting no further than
+    /// `limit` (so a large folder costs `limit` index entries, not all).
+    pub fn local_child_count_upto(&self, parent_id: u128, limit: usize) -> Result<usize> {
+        let n: i64 = self
+            .c
+            .prepare_cached("SELECT count(*) FROM (SELECT 1 FROM local_item WHERE parent_id = ?1 LIMIT ?2)")?
+            .query_row(rusqlite::params![blob(parent_id), i64::try_from(limit).unwrap_or(i64::MAX)], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
     }
 
     /// How many entries folder `parent_id` holds, and the first `limit` of
@@ -708,6 +725,28 @@ mod tests {
             finished_at_ms: None,
             sync_root_provider: Some("OneDrive".into()),
         }
+    }
+
+    #[test]
+    fn child_counts_stop_at_the_limit_and_a_second_connection_reads_the_same_file() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = Store::open(&dir.join("state.db"), 1024).unwrap();
+        scanned(&mut s);
+        s.read(|o| {
+            assert_eq!(o.local_child_count_upto(2, 10)?, 2);
+            assert_eq!(o.local_child_count_upto(2, 1)?, 1, "never counts past the limit");
+            assert_eq!(o.local_child_count_upto(3, 10)?, 0);
+            Ok(())
+        })
+        .unwrap();
+        let reader = s.reopen(256).unwrap().unwrap();
+        s.write(|o| o.local_put(&row(9, Some(2), "late.txt", LocalKind::File)).map(|_| ())).unwrap();
+        assert_eq!(reader.read(|o| o.local_path_of(9)).unwrap().as_deref(), Some("/a/late.txt"));
+        assert!(Store::open_in_memory().unwrap().reopen(256).unwrap().is_none());
+        drop((s, reader));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// root(1) / a(2) / { f(3), node_modules(4, excluded) }, plus a link(5)

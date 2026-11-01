@@ -46,18 +46,21 @@ pub enum Choice {
     /// Gone from OneDrive: upload it again.
     Upload,
     Rename,
+    /// Suggest a distinct valid name for each item, then queue ordinary renames.
+    RepairNames,
     /// Leave it out of sync with a rule.
     Exclude,
 }
 
 impl Choice {
-    pub const ALL: [Choice; 7] = [
+    pub const ALL: [Choice; 8] = [
         Choice::DeleteInOnedrive,
         Choice::KeepInOnedrive,
         Choice::Restore,
         Choice::DeleteHere,
         Choice::Upload,
         Choice::Rename,
+        Choice::RepairNames,
         Choice::Exclude,
     ];
 
@@ -70,6 +73,7 @@ impl Choice {
             Choice::DeleteHere => "delete-here",
             Choice::Upload => "upload",
             Choice::Rename => "rename",
+            Choice::RepairNames => "repair-names",
             Choice::Exclude => "exclude",
         }
     }
@@ -87,6 +91,7 @@ impl Choice {
             Choice::DeleteHere => "Delete here",
             Choice::Upload => "Upload",
             Choice::Rename => "Rename",
+            Choice::RepairNames => crate::t_key!("Repair"),
             Choice::Exclude => "Exclude",
         }
     }
@@ -110,7 +115,7 @@ pub fn choices(why: Why, backup: bool) -> &'static [Choice] {
         Why::GoneHere => &[Choice::DeleteInOnedrive, Choice::Restore],
         Why::GoneThere if backup => &[Choice::Upload],
         Why::GoneThere => &[Choice::DeleteHere, Choice::Upload],
-        Why::NameClash | Why::InvalidName => &[Choice::Rename],
+        Why::NameClash | Why::InvalidName => &[Choice::Rename, Choice::RepairNames],
         Why::TooLarge | Why::Special | Why::NameTaken => &[Choice::Exclude],
         // A backup can't do what it waits for, and a folder still holding
         // items needs a look at them first (`inside`).
@@ -264,6 +269,9 @@ pub fn check(
     if !choices(item.why, backup).contains(&choice) || choice == Choice::Exclude {
         return Ok(Err(format!("not offered for \"{}\"", item.why.title())));
     }
+    if choice == Choice::RepairNames {
+        return Ok(Err(crate::t!("Preview name repairs first")));
+    }
     let worked = if choice == Choice::Rename {
         let name = name.unwrap_or_default().trim();
         if oneup_plan::names::is_invalid(name) {
@@ -300,6 +308,7 @@ fn done(choice: Choice, items: usize, name: Option<&str>) -> String {
         Choice::DeleteHere => format!("you chose to delete it on this PC{more}"),
         Choice::Upload => format!("you chose to upload it again{more}"),
         Choice::Rename => format!("you chose to rename it to {}", name.unwrap_or_default()),
+        Choice::RepairNames => crate::t!("You chose to repair names"),
         Choice::Exclude => "you chose to exclude it".into(),
     }
 }
@@ -429,7 +438,7 @@ pub fn select<'a>(
     let Some(paths) = paths else {
         let Some(c) = choice.filter(|c| c.in_bulk()) else {
             anyhow::bail!(
-                "--all needs --delete-in-onedrive, --keep-in-onedrive, --restore, --delete-here, --upload or --exclude"
+                "--all needs --delete-in-onedrive, --keep-in-onedrive, --restore, --delete-here, --upload, --repair-names or --exclude"
             );
         };
         return Ok(record.items.iter().filter(|i| choices(i.why, backup).contains(&c)).collect());
@@ -446,6 +455,9 @@ pub fn select<'a>(
 /// nothing): the answers to queue, each bound to its item, and how many
 /// items they concern. An item inside another chosen folder goes with it.
 pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str>, backup: bool) -> Result<Prepared> {
+    if choice == Choice::RepairNames {
+        return crate::repair_names::prepare(store, items, backup);
+    }
     let mut items: Vec<&Item> = items.to_vec();
     items.sort_by(|x, y| x.path.cmp(&y.path));
     let mut tops: Vec<&Item> = Vec::new();
@@ -483,8 +495,9 @@ pub fn prepare(store: &Store, items: &[&Item], choice: Choice, name: Option<&str
 
 /// Whether record path `path` is inside folder `top`.
 pub fn below(path: &str, top: &str) -> bool {
-    let (p, t) = (path.as_bytes(), top.trim_end_matches('/').as_bytes());
-    p.len() > t.len() && p[..t.len()].eq_ignore_ascii_case(t) && p[t.len()] == b'/'
+    // Folded as names compare; a byte cut could split a character or
+    // miss where folding changes a character's length.
+    oneup_sync::strip_folded_prefix(path, top.trim_end_matches('/')).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// An item inside a folder held as not empty ([`inside`]).
@@ -540,6 +553,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inside_a_folder_is_told_as_names_compare() {
+        assert!(below("/Docs/a.txt", "/docs"));
+        assert!(below("/Docs/a.txt", "/docs/"));
+        assert!(!below("/Docs", "/docs"));
+        assert!(!below("/Docsx/a", "/docs"));
+        // Greek final sigma folds like sigma; the Kelvin sign isn't k.
+        assert!(below("/ΟΔΟΣ/a", "/οδος"));
+        assert!(!below("/\u{212A}it/a", "/kit"));
+        // Folding makes 'ſ' (2 bytes) 'S' (1 byte): a byte cut would land
+        // in the wrong place.
+        assert!(below("/ſa/b", "/Sa"));
+        assert!(below("/éa/b", "/ÉA"));
+    }
+
+    #[test]
     fn each_kind_offers_what_resolves_it_and_a_backup_never_changes_this_pc() {
         use Choice as C;
         assert_eq!(choices(Why::GoneHere, false), [C::DeleteInOnedrive, C::Restore]);
@@ -547,7 +575,7 @@ mod tests {
         assert_eq!(choices(Why::GoneThere, false), [C::DeleteHere, C::Upload]);
         assert_eq!(choices(Why::GoneThere, true), [C::Upload]);
         for w in [Why::NameClash, Why::InvalidName] {
-            assert_eq!(choices(w, false), [C::Rename]);
+            assert_eq!(choices(w, false), [C::Rename, C::RepairNames]);
         }
         for w in [Why::TooLarge, Why::Special, Why::NameTaken] {
             assert_eq!(choices(w, true), [C::Exclude]);

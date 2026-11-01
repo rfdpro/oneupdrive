@@ -3,11 +3,11 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError, VersionMark};
+use oneup_exec::{Cloud, CloudError, Replaced, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::key::Masterkey;
@@ -90,6 +90,10 @@ impl Cloud for Fake {
     fn concurrent(&self) -> bool {
         true
     }
+
+    fn moves_keep_ids(&self) -> bool {
+        true
+    }
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<[u8; 20]>, CloudError> {
         let c = self.0.lock().unwrap().check(pre)?.content.clone();
         out.write_all(&c)?;
@@ -101,7 +105,7 @@ impl Cloud for Fake {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn oneup_exec::Source,
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let mut content = Vec::new();
         src.read_to_end(&mut content)?;
@@ -124,8 +128,11 @@ impl Cloud for Fake {
     async fn version_mark(&self, _: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
         Ok(None)
     }
-    async fn replaced_other(&self, _: &RemoteId, _: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+    async fn uploaded_version(&self, _: &RemoteId, _: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
         Ok(None)
+    }
+    async fn replaced_other(&self, _: &RemoteId, _: &VersionMark, _: &VersionMark) -> Result<Replaced, CloudError> {
+        Ok(Replaced::Planned)
     }
     async fn download_version(&self, _: &RemoteId, _: &str, _: &mut (dyn Write + Send)) -> Result<u64, CloudError> {
         Err(CloudError::Other("no version history".into()))
@@ -169,6 +176,12 @@ impl Cloud for Fake {
     async fn item(&self, id: &RemoteId) -> Result<Option<RemoteRow>, CloudError> {
         let s = self.0.lock().unwrap();
         Ok(s.items.contains_key(&id.0).then(|| s.row(&id.0)))
+    }
+    async fn versions(&self, _: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        Err(CloudError::Other("no version history here".into()))
+    }
+    async fn restore(&self, _: &RemoteId, _: &RemoteId, _: &str) -> Result<RemoteRow, CloudError> {
+        Err(CloudError::Other("no recycle bin here".into()))
     }
     async fn prune(&self, pre: &RemotePre) -> Result<(), CloudError> {
         let mut s = self.0.lock().unwrap();

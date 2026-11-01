@@ -19,5 +19,8 @@ Please **don't open a public issue**. Use GitHub's private vulnerability reporti
 * Updates are installed only if Authenticode-signed by the same publisher as the running copy.
 * What the agent learns about program usage (the Apps page) stays on the PC: program names, counts and the paths of recently used files, never contents.
 * Logs never contain tokens, keys or file contents.
-* Crypto uses audited RustCrypto implementations only, with key material zeroized after use.
+* Crypto uses audited RustCrypto implementations only, with key material zeroized after use (the known gaps are listed in [vault-crypto-review.md](docs/architecture/vault-crypto-review.md)).
 * Vaults: masterkey-file vaults only (no remote key-loading endpoints), with the vault config signature verified before any field is trusted. See [vaults.md](docs/architecture/vaults.md).
+
+## Vault cryptography review
+Vaults are **experimental** until someone outside the project has reviewed their cryptography. Our self-review, its findings and what we'd like a reviewer to look at are in [vault-crypto-review.md](docs/architecture/vault-crypto-review.md) (see its appendix). If you can help, contact us through the Security tab.

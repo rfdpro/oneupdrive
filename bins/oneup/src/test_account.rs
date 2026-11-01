@@ -41,10 +41,10 @@ pub fn default_dir() -> Result<PathBuf> {
 pub fn same_dir(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
-        _ => {
-            a.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase()
-                == b.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase()
-        }
+        _ => oneup_sync::same_name(
+            a.to_string_lossy().trim_end_matches(['\\', '/']),
+            b.to_string_lossy().trim_end_matches(['\\', '/']),
+        ),
     }
 }
 
@@ -91,15 +91,15 @@ pub fn remove(dir: &Path) -> Result<()> {
 /// The drive mirrored in the default data folder, if any: in OneDrive
 /// Personal, item IDs start with the drive ID (`<drive>!<n>`). Used to refuse
 /// a test-account sign-in that is really the personal account. Only reads
-/// the local database; never contacts the personal account.
+/// the local database, read-only and never upgraded (the default folder's
+/// agent may be another build); never contacts the personal account.
 pub fn personal_drive(default: &Path) -> Option<String> {
     let db = default.join("state.db");
     if !db.exists() {
         return None;
     }
-    let store = oneup_store::Store::open(&db, 1024).ok()?;
-    let root = store.read(|ops| ops.remote_root()).ok()??;
-    root.id.split_once('!').map(|(drive, _)| drive.to_lowercase())
+    let root = oneup_store::Store::peek_remote_root_id(&db).ok()??;
+    root.split_once('!').map(|(drive, _)| drive.to_lowercase())
 }
 
 /// Whether drive ID `drive` is the same drive as `personal` (from
@@ -113,6 +113,13 @@ pub fn is_same_drive(drive: &str, personal: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folders_that_are_not_there_compare_as_names_do() {
+        let p = |s: &str| std::path::PathBuf::from(s);
+        assert!(same_dir(&p(r"Z:\oneup-none\ΟΔΟΣ"), &p(r"z:\ONEUP-NONE\οδος\")));
+        assert!(!same_dir(&p("Z:\\oneup-none\\\u{212A}it"), &p(r"Z:\oneup-none\kit")), "the Kelvin sign isn't k");
+    }
 
     #[test]
     fn marker_round_trips_and_rejects_incomplete_files() {

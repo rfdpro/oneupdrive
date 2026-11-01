@@ -48,10 +48,17 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Random bytes (the operating system's generator) that aren't secret:
+/// nonces, salts, IDs. Keys use [`fill_random`], so they're made where
+/// they're kept rather than copied out of a returned array.
 fn random<const N: usize>() -> Result<[u8; N]> {
     let mut b = [0u8; N];
-    getrandom::fill(&mut b).map_err(|e| Error::Io(std::io::Error::other(format!("random: {e}"))))?;
+    fill_random(&mut b)?;
     Ok(b)
+}
+
+fn fill_random(buf: &mut [u8]) -> Result<()> {
+    getrandom::fill(buf).map_err(|e| Error::Io(std::io::Error::other(format!("random: {e}"))))
 }
 
 /// A random UUID (version 4), as Cryptomator uses for directory IDs and

@@ -1,0 +1,80 @@
+{
+ "@odata.deltaLink": "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=abc",
+ "value": [
+  {
+   "id": "f1",
+   "name": "Docs",
+   "parentReference": {
+    "id": "root"
+   },
+   "folder": {
+    "childCount": 1
+   },
+   "eTag": "\"{f1},1\"",
+   "fileSystemInfo": {
+    "lastModifiedDateTime": "2024-01-02T03:04:05Z"
+   }
+  },
+  {
+   "id": "a1",
+   "name": "a.txt",
+   "size": 5,
+   "parentReference": {
+    "id": "f1"
+   },
+   "file": {
+    "hashes": {
+     "quickXorHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }
+   },
+   "fileSystemInfo": {
+    "lastModifiedDateTime": "2024-01-02T03:04:05.123Z"
+   }
+  },
+  {
+   "id": "nm",
+   "name": "node_modules",
+   "parentReference": {
+    "id": "f1"
+   },
+   "folder": {
+    "childCount": 3
+   }
+  },
+  {
+   "id": "x1",
+   "name": "in-junk.js",
+   "parentReference": {
+    "id": "nm"
+   },
+   "file": {}
+  },
+  {
+   "id": "o1",
+   "name": "orphan",
+   "parentReference": {
+    "id": "missing"
+   },
+   "folder": {}
+  },
+  {
+   "id": "pk",
+   "name": "Notebook",
+   "parentReference": {
+    "id": "root"
+   },
+   "package": {
+    "type": "oneNote"
+   }
+  },
+  {
+   "id": "d1",
+   "deleted": {
+    "state": "deleted"
+   },
+   "parentReference": {
+    "id": "f1"
+   }
+  }
+ ]
+}

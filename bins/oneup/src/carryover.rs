@@ -89,7 +89,7 @@ pub fn capture(store: &Store, app: &crate::moveover::App) -> Result<CarryOver> {
                     continue;
                 }
                 let child = if rel.is_empty() { r.name.clone() } else { format!("{rel}/{}", r.name) };
-                match here.iter().find(|l| l.name.eq_ignore_ascii_case(&r.name)) {
+                match here.iter().find(|l| oneup_sync::same_name(&l.name, &r.name)) {
                     None => not_on_pc.push(child),
                     Some(l) if l.kind == LocalKind::Folder && l.skip == Skip::None => {
                         stack.push((l.file_id, r.id, child));
@@ -163,7 +163,7 @@ pub fn apply(data_dir: &Path, store: &mut Store, local: &Path, remote: &str) -> 
     let mut rules = crate::config::load_rules(data_dir, store)?;
     let mut added = 0;
     let mut add = |r: String| {
-        if !rules.exclude.iter().any(|x| x.eq_ignore_ascii_case(&r)) {
+        if !rules.exclude.iter().any(|x| oneup_sync::same_name(x, &r)) {
             rules.exclude.push(r);
             added += 1;
         }
@@ -175,7 +175,7 @@ pub fn apply(data_dir: &Path, store: &mut Store, local: &Path, remote: &str) -> 
     let mut paused = 0;
     if whole_drive {
         for f in &c.not_on_pc {
-            if !rules.paused.iter().any(|x| x.eq_ignore_ascii_case(f)) {
+            if !rules.paused.iter().any(|x| oneup_sync::same_name(x, f)) {
                 rules.paused.push(f.clone());
                 paused += 1;
             }

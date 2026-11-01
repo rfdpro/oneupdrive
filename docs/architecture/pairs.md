@@ -28,6 +28,8 @@ A pair's flow is in its store (`meta sync.flow`, `crate::flow`). `plan_flow(tree
 | New on both, different | rename here aside, both kept | upload over the cloud's (version history keeps it) |
 | A cloud item in the way of a name this PC needs | rename *here* aside (`RenameLocal`) | rename the *cloud* item aside: `Op::RenameRemote`, a remote rename outside the Synced tree under `If-Match`, not counted by the breakers (like `RenameLocal`) |
 
+A backup settles a file's location before replacing its content, including when both copies were edited. The old agreed folder may have been deleted after the file moved out; trying the replacement there first would leave the file waiting without ever planning its move. The move keeps the cloud item's identity, and the later replacement keeps the cloud edit in version history.
+
 Last, `plan_flow` turns anything that would still change this PC into a `HoldReason::OneWay` hold and drops cloud deletions, whatever the rules above produced. The simulation (`backups_send_this_pc_and_never_change_it`, 3,000 seeds, SQLite planning identical) checks that no backup plan changes this PC or deletes from the cloud, that settling leaves this PC as it was, and that every local file is then in the cloud at its path with its content (unless held).
 
 **Switching back to both ways** (`flow::set`): the Synced rows of what this PC deleted while backing up (`Store::synced_gone_locally`, deepest first, a folder only once its rows below are gone) are removed first, so those cloud items read as new and come back here, instead of the old deletions being carried out in the cloud.

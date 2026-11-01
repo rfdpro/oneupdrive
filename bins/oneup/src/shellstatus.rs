@@ -47,6 +47,7 @@ impl ShellStatus {
         } else if let Some(p) = &s.problem {
             ("error", "Problem", format!("{} Select for details.", p.title))
         } else if let Some(why) = &s.auto_pause {
+            let why = crate::autopause::said(why, s.auto_pause_hours.as_deref(), &crate::l10n::Locale::english());
             ("paused", "Paused", format!("Paused: {why}."))
         } else {
             match s.activity {
@@ -134,10 +135,14 @@ mod tests {
             overflow: None,
             problem: None,
             auto_pause: None,
+            auto_pause_hours: None,
             prune_offer: None,
             progress: None,
             unsynced: None,
             retrying: None,
+            databases: Vec::new(),
+            databases_more: 0,
+            network: None,
         };
         let f = ShellStatus::from_status(&s, Path::new(r"C:\Data"), Some((5, 10)));
         assert_eq!((f.state, f.label.as_str(), f.kind, f.local.as_str()), ("insync", "Up to date", "main", r"C:\Sync"));

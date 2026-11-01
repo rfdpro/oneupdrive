@@ -10,6 +10,8 @@ pub enum Error {
     #[cfg(windows)]
     #[error("{op} failed: {source}")]
     Win32 { op: &'static str, source: windows::core::Error },
+    #[error("{op} failed: {source}")]
+    Io { op: &'static str, source: std::io::Error },
     #[error("not supported on this platform")]
     Unsupported,
 }
@@ -23,6 +25,10 @@ pub mod authenticode;
 #[cfg(windows)]
 pub mod clipboard;
 #[cfg(windows)]
+pub mod contained;
+#[cfg(windows)]
+pub mod fs_links;
+#[cfg(windows)]
 pub mod hello;
 #[cfg(windows)]
 pub mod identity;
@@ -31,6 +37,12 @@ pub mod in_use;
 #[cfg(windows)]
 pub mod known;
 #[cfg(windows)]
+pub mod locale;
+#[cfg(windows)]
+pub mod mutex;
+#[cfg(windows)]
+pub mod network;
+#[cfg(windows)]
 pub mod processes;
 #[cfg(windows)]
 pub mod shortcut;
@@ -38,6 +50,8 @@ pub mod shortcut;
 pub mod signal;
 #[cfg(windows)]
 pub mod tray;
+#[cfg(windows)]
+pub mod version_info;
 #[cfg(windows)]
 pub mod webview;
 
@@ -193,8 +207,20 @@ pub mod pipe {
     use windows::Win32::Security::{
         GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
+    use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{HSTRING, PWSTR};
+
+    /// The process id at the other end of a connected named-pipe instance,
+    /// `raw` being its handle (`as_raw_handle`). Lets the agent tell which
+    /// program is calling (to refuse its own hook processes).
+    pub fn client_process_id(raw: isize) -> Option<u32> {
+        let mut pid = 0u32;
+        // SAFETY: `raw` is a connected pipe-server handle the caller owns
+        // for the call; `pid` is a valid out location.
+        unsafe { GetNamedPipeClientProcessId(HANDLE(raw as *mut c_void), &mut pid) }.ok()?;
+        (pid != 0).then_some(pid)
+    }
 
     fn io(op: &'static str, e: windows::core::Error) -> std::io::Error {
         std::io::Error::other(format!("{op}: {e}"))
@@ -202,11 +228,17 @@ pub mod pipe {
 
     /// The current user's SID, as a string (`S-1-5-21-…`).
     pub fn current_user_sid() -> std::io::Result<String> {
+        // SAFETY: the pseudo-handle of the current process is always valid.
+        user_sid_of(unsafe { GetCurrentProcess() })
+    }
+
+    /// The SID of the user running `process` (a handle with at least
+    /// limited query access), as a string.
+    pub(crate) fn user_sid_of(process: HANDLE) -> std::io::Result<String> {
         let mut token = HANDLE::default();
-        // SAFETY: the pseudo-handle of the current process is always valid;
-        // `token` is a valid out-pointer.
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-            .map_err(|e| io("OpenProcessToken", e))?;
+        // SAFETY: `process` is a valid process handle (the caller's
+        // promise); `token` is a valid out-pointer.
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.map_err(|e| io("OpenProcessToken", e))?;
         struct Owned(HANDLE);
         impl Drop for Owned {
             fn drop(&mut self) {
@@ -468,6 +500,19 @@ pub mod priority {
             .map_err(std::io::Error::other)
         }
     }
+
+    /// Background mode for the calling thread alone (lower CPU, disk and
+    /// memory priority): for threads that only start and watch other
+    /// programs, so they never compete with the sync work in the process.
+    pub fn set_thread_background() -> std::io::Result<()> {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+        // SAFETY: the pseudo-handle of the current thread needs no closing.
+        match unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } {
+            // Already in background mode (ERROR_THREAD_MODE_ALREADY_BACKGROUND).
+            Err(e) if e.code().0 as u32 & 0xFFFF == 400 => Ok(()),
+            r => r.map_err(std::io::Error::other),
+        }
+    }
 }
 
 /// Handles this process passes on to programs it starts.
@@ -690,6 +735,202 @@ pub mod user_registry {
         let r = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(key)) };
         if r == ERROR_FILE_NOT_FOUND { Ok(()) } else { check("RegDeleteTreeW", r) }
     }
+
+    /// One value of a key as stored: its name (empty for the key's default
+    /// value), its registry type (`REG_SZ` is 1, `REG_DWORD` 4…) and its
+    /// raw bytes.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RawValue {
+        pub name: String,
+        pub kind: u32,
+        pub data: Vec<u8>,
+    }
+
+    /// A key and everything under it, each list sorted by name.
+    #[derive(Debug, Clone, PartialEq, Eq, Default)]
+    pub struct Tree {
+        pub values: Vec<RawValue>,
+        pub keys: Vec<(String, Tree)>,
+    }
+
+    impl Tree {
+        /// Value `name`'s text, if it's a string value.
+        pub fn text(&self, name: &str) -> Option<String> {
+            let v = self.values.iter().find(|v| v.name.eq_ignore_ascii_case(name))?;
+            if v.kind != REG_SZ.0 && v.kind != windows::Win32::System::Registry::REG_EXPAND_SZ.0 {
+                return None;
+            }
+            let wide: Vec<u16> = v.data.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
+            let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+            Some(String::from_utf16_lossy(&wide[..end]))
+        }
+
+        /// Sub-key `name`.
+        pub fn key(&self, name: &str) -> Option<&Tree> {
+            self.keys.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, t)| t)
+        }
+    }
+
+    /// Deeper than this, a key isn't read (the keys this is for are a few
+    /// levels deep).
+    const MAX_DEPTH: usize = 16;
+    /// More values or sub-keys than this in one key, and it isn't read.
+    const MAX_ENTRIES: u32 = 4096;
+
+    /// Key `key` with every value and sub-key under it, as stored; `None` if
+    /// there's no such key. An error for a key deeper than 16 levels or with
+    /// more than 4096 entries in one key.
+    pub fn tree(key: &str) -> std::io::Result<Option<Tree>> {
+        tree_at(key, 0)
+    }
+
+    fn tree_at(key: &str, depth: usize) -> std::io::Result<Option<Tree>> {
+        use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS};
+        use windows::Win32::System::Registry::{
+            HKEY, KEY_READ, RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW,
+        };
+        if depth > MAX_DEPTH {
+            return Err(std::io::Error::other(format!("{key}: nested too deep")));
+        }
+        let mut h = HKEY::default();
+        // SAFETY: the key name outlives the call; `h` is a valid out-pointer.
+        let r = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, &HSTRING::from(key), None, KEY_READ, &mut h) };
+        if r == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        check("RegOpenKeyExW", r)?;
+        let read = || -> std::io::Result<(Vec<RawValue>, Vec<String>)> {
+            let mut values = Vec::new();
+            let mut data = vec![0u8; 4096];
+            let mut i = 0u32;
+            loop {
+                if i >= MAX_ENTRIES {
+                    return Err(std::io::Error::other(format!("{key}: too many values")));
+                }
+                // Value names are at most 16,383 characters.
+                let mut name = vec![0u16; 16_384];
+                let mut name_len = name.len() as u32;
+                let mut kind = 0u32;
+                let mut data_len = data.len() as u32;
+                // SAFETY: every buffer is writable for the length given with it.
+                let r = unsafe {
+                    RegEnumValueW(
+                        h,
+                        i,
+                        Some(windows::core::PWSTR(name.as_mut_ptr())),
+                        &mut name_len,
+                        None,
+                        Some(&mut kind),
+                        Some(data.as_mut_ptr()),
+                        Some(&mut data_len),
+                    )
+                };
+                if r == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if r == ERROR_MORE_DATA {
+                    // The data is bigger than the buffer: again, with room.
+                    data.resize((data_len as usize).max(data.len() * 2), 0);
+                    continue;
+                }
+                check("RegEnumValueW", r)?;
+                values.push(RawValue {
+                    name: String::from_utf16_lossy(&name[..name_len as usize]),
+                    kind,
+                    data: data[..data_len as usize].to_vec(),
+                });
+                i += 1;
+            }
+            let mut keys = Vec::new();
+            for i in 0.. {
+                if i >= MAX_ENTRIES {
+                    return Err(std::io::Error::other(format!("{key}: too many sub-keys")));
+                }
+                // Key names are at most 255 characters.
+                let mut name = vec![0u16; 256];
+                let mut name_len = name.len() as u32;
+                // SAFETY: `name` is writable for `name_len` characters.
+                let r = unsafe {
+                    RegEnumKeyExW(
+                        h,
+                        i,
+                        Some(windows::core::PWSTR(name.as_mut_ptr())),
+                        &mut name_len,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                };
+                if r == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                check("RegEnumKeyExW", r)?;
+                keys.push(String::from_utf16_lossy(&name[..name_len as usize]));
+            }
+            Ok((values, keys))
+        };
+        let got = read();
+        // SAFETY: closing the key we opened, once.
+        let _ = unsafe { RegCloseKey(h) };
+        let (mut values, names) = got?;
+        values.sort_by_key(|v| v.name.to_lowercase());
+        let mut keys = Vec::new();
+        for name in names {
+            // A sub-key removed meanwhile is simply not there.
+            if let Some(t) = tree_at(&format!(r"{key}\{name}"), depth + 1)? {
+                keys.push((name, t));
+            }
+        }
+        keys.sort_by_key(|k| k.0.to_lowercase());
+        Ok(Some(Tree { values, keys }))
+    }
+
+    /// Puts `tree` back under key `key`: creates the keys that are missing
+    /// and sets the values that are missing, and never changes a value
+    /// that's there. Returns how many values it set.
+    pub fn restore_missing(key: &str, tree: &Tree) -> std::io::Result<usize> {
+        use windows::Win32::System::Registry::{
+            HKEY, KEY_WRITE, REG_OPTION_NON_VOLATILE, RRF_NOEXPAND, RRF_RT_ANY, RegCloseKey, RegCreateKeyExW,
+        };
+        let k = HSTRING::from(key);
+        let mut h = HKEY::default();
+        // SAFETY: the key name outlives the call; `h` is a valid out-pointer.
+        let r = unsafe {
+            RegCreateKeyExW(HKEY_CURRENT_USER, &k, None, None, REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut h, None)
+        };
+        check("RegCreateKeyExW", r)?;
+        // SAFETY: closing the key we created or opened, once.
+        let _ = unsafe { RegCloseKey(h) };
+        let mut set = 0;
+        for v in &tree.values {
+            let n = HSTRING::from(v.name.as_str());
+            // SAFETY: a presence query: no buffers.
+            let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, &k, &n, RRF_RT_ANY | RRF_NOEXPAND, None, None, None) };
+            if r != ERROR_FILE_NOT_FOUND {
+                check("RegGetValueW", r)?;
+                continue;
+            }
+            // SAFETY: the strings are NUL-terminated and outlive the call;
+            // `v.data` is `cbdata` bytes long.
+            let r = unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    &k,
+                    &n,
+                    v.kind,
+                    Some(v.data.as_ptr().cast::<c_void>()),
+                    u32::try_from(v.data.len()).map_err(std::io::Error::other)?,
+                )
+            };
+            check("RegSetKeyValueW", r)?;
+            set += 1;
+        }
+        for (name, sub) in &tree.keys {
+            set += restore_missing(&format!(r"{key}\{name}"), sub)?;
+        }
+        Ok(set)
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -750,6 +991,54 @@ mod tests {
         assert!(reg::remove(&key, "v").unwrap());
         assert!(!reg::remove(&key, "v").unwrap());
         reg::remove_key(&key).unwrap();
+    }
+
+    #[test]
+    fn a_registry_tree_is_read_whole_and_put_back_without_overwriting() {
+        use super::user_registry::{self as reg, RawValue, Tree};
+        /// Removes the scratch key however the test ends.
+        struct Scratch(String);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = reg::remove_key(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(format!(r"Software\OneUpDrive-test-tree-{}-{nanos}", std::process::id()));
+        let key = scratch.0.as_str();
+        assert_eq!(reg::tree(key).unwrap(), None);
+        let wide = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
+        let sz = |s: &str| wide(&format!("{s}\0"));
+        let v = |name: &str, kind: u32, data: Vec<u8>| RawValue { name: name.into(), kind, data };
+        let big = vec![7u8; 10_000];
+        let want = Tree {
+            values: vec![
+                v("", 1, sz("Default")),
+                v("Big", 3, big),
+                // Kept as stored: not expanded, every string of the list.
+                v("Expand", 2, sz(r"%LOCALAPPDATA%\x")),
+                v("Multi", 7, wide("one\0two\0\0")),
+                v("n", 4, 5u32.to_le_bytes().to_vec()),
+            ],
+            keys: vec![
+                ("Empty".into(), Tree::default()),
+                // A default value with no bytes at all.
+                ("EmptyDefault".into(), Tree { values: vec![v("", 1, Vec::new())], keys: vec![] }),
+                ("Sub".into(), Tree { values: vec![v("q", 11, 9u64.to_le_bytes().to_vec())], keys: vec![] }),
+            ],
+        };
+        assert_eq!(reg::restore_missing(key, &want).unwrap(), 7);
+        let got = reg::tree(key).unwrap().unwrap();
+        assert_eq!(got, want);
+        assert_eq!(got.text("").as_deref(), Some("Default"));
+        assert_eq!(got.text("Expand").as_deref(), Some(r"%LOCALAPPDATA%\x"));
+        assert_eq!(got.text("n"), None, "a number isn't text");
+        // Putting back again sets nothing, and a value changed since stays.
+        reg::set(key, "", "Changed").unwrap();
+        assert_eq!(reg::restore_missing(key, &want).unwrap(), 0);
+        assert_eq!(reg::get(key, "").unwrap().as_deref(), Some("Changed"));
+        reg::remove_key(key).unwrap();
+        assert_eq!(reg::tree(key).unwrap(), None);
     }
 
     #[tokio::test]

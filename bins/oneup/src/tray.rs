@@ -8,6 +8,9 @@ use std::collections::HashSet;
 use oneup_ipc::{Activity, Problem, Status};
 use oneup_sys::tray::{Glyph, Item, Kind};
 
+use crate::l10n::{Locale, current};
+use crate::{t, t_in, t_key};
+
 /// What the tray knows of the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
@@ -72,44 +75,58 @@ pub fn summary(v: &View) -> String {
 /// menu lists them on a line of their own instead).
 fn headline(v: &View, failures: bool) -> String {
     let s = match v {
-        View::Connecting => return "Connecting…".into(),
-        View::NotRunning => return "Not running".into(),
-        View::Stopped(p) => return format!("Stopped: {}", p.title),
-        View::Unreachable(e) => return format!("Can't connect: {e}"),
+        View::Connecting => return t!("Connecting…"),
+        View::NotRunning => return t!("Not running"),
+        View::Stopped(p) => return t!("Stopped: {what}", what = crate::problem::shown(p, current()).0),
+        View::Unreachable(e) => return t!("Can't connect: {why}", why = e),
         View::Running(s) => s,
     };
     let waiting = s.safety_stops.len() + usize::from(s.overflow.as_ref().is_some_and(|o| o.waiting));
     if waiting > 0 {
-        return if waiting == 1 { "Needs your review".into() } else { format!("{waiting} need your review") };
+        return t!("{n, plural, one {Needs your review} other {# need your review}}", n = waiting);
     }
     if let Some(why) = &s.auto_pause {
-        return format!("Paused: {why}");
+        // The agent says why in English (`autopause`); shown in the reader's language.
+        return t!("Paused: {why}", why = crate::autopause::said(why, s.auto_pause_hours.as_deref(), current()));
     }
     if let Some(p) = working(s) {
-        let pass = if p.round > 1 { format!(" (pass {})", p.round) } else { String::new() };
         let percent = p.items_done * 100 / p.items_total.max(1);
-        return format!("Syncing {} of {} items ({percent}%){pass}", count(p.items_done), count(p.items_total));
+        let (done, total) = (p.items_done, p.items_total);
+        return if p.round > 1 {
+            t!(
+                "Syncing {done} of {total} items ({percent}%) (pass {pass})",
+                done = done,
+                total = total,
+                percent = percent,
+                pass = p.round
+            )
+        } else {
+            t!("Syncing {done} of {total} items ({percent}%)", done = done, total = total, percent = percent)
+        };
     }
     match s.activity {
-        Activity::Starting => "Checking all folders…".into(),
-        Activity::Syncing => "Syncing…".into(),
-        Activity::Paused => "Paused".into(),
-        Activity::Stopping => "Stopping…".into(),
-        Activity::WaitingForYou => "Needs your review".into(),
+        Activity::Starting => t!("Checking all folders…"),
+        Activity::Syncing => t!("Syncing…"),
+        Activity::Paused => t!("Paused"),
+        Activity::Stopping => t!("Stopping…"),
+        Activity::WaitingForYou => t!("Needs your review"),
         Activity::Retrying => match &s.problem {
-            Some(p) => format!("Problem: {}", p.title),
-            None => "Retrying soon".into(),
+            Some(p) => t!("Problem: {what}", what = crate::problem::shown(p, current()).0),
+            None => t!("Retrying soon"),
         },
         // OneDrive full: up to date otherwise, but uploads wait.
         Activity::Idle if s.problem.is_some() => {
-            format!("Problem: {}", s.problem.as_ref().map_or("", |p| p.title.as_str()))
+            t!(
+                "Problem: {what}",
+                what = s.problem.as_ref().map(|p| crate::problem::shown(p, current()).0).unwrap_or_default()
+            )
         }
         Activity::Idle => match (s.paused.local, s.paused.remote) {
-            (true, false) => "Paused: changes to this PC".into(),
-            (false, true) => "Paused: changes to OneDrive".into(),
+            (true, false) => t!("Paused: changes to this PC"),
+            (false, true) => t!("Paused: changes to OneDrive"),
             _ => match &s.unsynced {
-                Some(u) if failures => format!("Up to date · {} failed", unsynced_count(u)),
-                _ => "Up to date".into(),
+                Some(u) if failures => t!("Up to date · {items} failed", items = unsynced_count(u, current())),
+                _ => t!("Up to date"),
             },
         },
     }
@@ -121,14 +138,24 @@ fn headline(v: &View, failures: bool) -> String {
 const PATIENT_ATTEMPTS: u32 = 4;
 
 /// The notification for a problem: what it is and what to do.
-fn problem_notice(title: &str, p: &Problem) -> Notice {
-    Notice { title: title.into(), text: format!("{} {}", p.title, p.action), kind: Kind::Error }
+/// `stopped`: the agent ended with it (else it's being retried).
+fn problem_notice(stopped: bool, p: &Problem, loc: &Locale) -> Notice {
+    let (what, _, action) = crate::problem::shown(p, loc);
+    Notice {
+        title: if stopped { t_in!(loc, "OneUpDrive stopped") } else { t_in!(loc, "Sync problem") },
+        text: t_in!(loc, "{problem} {action}", problem = what, action = action),
+        kind: Kind::Error,
+    }
 }
 
-/// `12 items`, `1,000 items or more`.
-fn unsynced_count(u: &oneup_ipc::Unsynced) -> String {
-    let n = if u.count == 1 { "1 item".to_string() } else { format!("{} items", count(u.count as u64)) };
-    if u.more { format!("{n} or more") } else { n }
+/// `12 items`, `1,000 items or more`, in `loc`'s language.
+pub(crate) fn unsynced_count(u: &oneup_ipc::Unsynced, loc: &Locale) -> String {
+    let n = u.count as u64;
+    if u.more {
+        t_in!(loc, "{n, plural, one {# item} other {# items}} or more", n = n)
+    } else {
+        t_in!(loc, "{n, plural, one {# item} other {# items}}", n = n)
+    }
 }
 
 /// The round being carried out, when that's what the agent is doing (not
@@ -138,27 +165,19 @@ fn working(s: &Status) -> Option<&oneup_ipc::Progress> {
     s.progress.as_ref().filter(|p| busy && p.items_total > 0)
 }
 
-/// `12345` as `12,345`.
-fn count(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+/// A time left, roughly: "about 25 min", "about 2 h 10 min".
+pub(crate) fn time_left(ms: u64) -> String {
+    time_left_in(ms, current())
 }
 
-/// A time left, roughly: "about 25 min", "about 2 h 10 min".
-fn time_left(ms: u64) -> String {
+/// [`time_left`] in `loc`'s language.
+pub(crate) fn time_left_in(ms: u64, loc: &Locale) -> String {
     let min = ms.div_ceil(60_000);
     match min {
-        0 | 1 => "less than a minute".into(),
-        m if m < 60 => format!("about {m} min"),
-        m if m % 60 == 0 || m >= 600 => format!("about {} h", (m + 30) / 60),
-        m => format!("about {} h {} min", m / 60, m % 60),
+        0 | 1 => t_in!(loc, "less than a minute"),
+        m if m < 60 => t_in!(loc, "about {m} min", m = m),
+        m if m % 60 == 0 || m >= 600 => t_in!(loc, "about {h} h", h = (m + 30) / 60),
+        m => t_in!(loc, "about {h} h {m} min", h = m / 60, m = m % 60),
     }
 }
 
@@ -168,11 +187,11 @@ fn progress_detail(p: &oneup_ipc::Progress) -> Option<String> {
     let size = crate::versions::size;
     let mut parts = Vec::new();
     if p.bytes_total > 0 {
-        parts.push(format!("{} of {}", size(p.bytes_done), size(p.bytes_total)));
+        parts.push(t!("{done} of {total}", done = size(p.bytes_done), total = size(p.bytes_total)));
     }
     match p.eta_ms() {
-        Some(ms) => parts.push(format!("{} left", time_left(ms))),
-        None if p.items_done < p.items_total => parts.push("estimating time left".into()),
+        Some(ms) => parts.push(t!("{time} left", time = time_left(ms))),
+        None if p.items_done < p.items_total => parts.push(t!("estimating time left")),
         None => {}
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
@@ -181,7 +200,13 @@ fn progress_detail(p: &oneup_ipc::Progress) -> Option<String> {
 /// A round's progress on one line (`oneup status`).
 pub fn progress_line(p: &oneup_ipc::Progress) -> String {
     let percent = p.items_done * 100 / p.items_total.max(1);
-    let head = format!("round {}: {} of {} items ({percent}%)", p.round, count(p.items_done), count(p.items_total));
+    let head = t!(
+        "round {round}: {done} of {total} items ({percent}%)",
+        round = p.round,
+        done = p.items_done,
+        total = p.items_total,
+        percent = percent
+    );
     match progress_detail(p) {
         Some(d) => format!("{head}, {d}"),
         None => head,
@@ -212,12 +237,17 @@ pub mod id {
     pub const REVIEW_PRUNE: u32 = 45;
     pub const LIST_PRUNE: u32 = 46;
     pub const LIST_UNSYNCED: u32 = 47;
+    /// Allow [`crate::netusage::ALLOW_MB`] more on a used-up data budget.
+    pub const ALLOW_DATA: u32 = 48;
+    /// Work offline, or go back online.
+    pub const OFFLINE: u32 = 49;
     pub const ACTIVITY: u32 = 50;
     pub const PROBLEM: u32 = 51;
     pub const START: u32 = 60;
     pub const STOP: u32 = 61;
     pub const CLOSE: u32 = 70;
     pub const SETTINGS: u32 = 80;
+    pub const SEARCH: u32 = 81;
     pub const UPDATE: u32 = 90;
     /// The status line: opens the settings window, where it's told at length.
     pub const STATUS: u32 = 1;
@@ -226,8 +256,13 @@ pub mod id {
 }
 
 /// The pause choices: label, minutes (`None`: until resumed).
-pub const PAUSES: &[(&str, Option<u64>)] =
-    &[("30 minutes", Some(30)), ("2 hours", Some(120)), ("8 hours", Some(480)), ("Until I resume", None)];
+/// (`t_key!`: translated where they're shown.)
+pub const PAUSES: &[(&str, Option<u64>)] = &[
+    (t_key!("30 minutes"), Some(30)),
+    (t_key!("2 hours"), Some(120)),
+    (t_key!("8 hours"), Some(480)),
+    (t_key!("Until I resume"), None),
+];
 
 /// The menu's pictures: symbols from Windows' icon font.
 mod glyph {
@@ -239,6 +274,7 @@ mod glyph {
     pub const PLAY: Glyph = Glyph::Symbol('\u{E768}');
     pub const HISTORY: Glyph = Glyph::Symbol('\u{E81C}');
     pub const SETTINGS: Glyph = Glyph::Symbol('\u{E713}');
+    pub const SEARCH: Glyph = Glyph::Symbol('\u{E721}');
     pub const POWER: Glyph = Glyph::Symbol('\u{E7E8}');
     pub const CLOSE: Glyph = Glyph::Symbol('\u{E711}');
     pub const WARNING: Glyph = Glyph::Symbol('\u{E7BA}');
@@ -269,25 +305,47 @@ fn note(label: impl Into<String>) -> Item {
     Item::Action { id: id::NOTE, label: label.into(), enabled: false, glyph: None }
 }
 
-/// The notification for a new safety stop.
-fn stop_notice(st: &oneup_ipc::SafetyStop) -> Notice {
+/// The data budget in use, when it's used up.
+fn budget_reached(s: &Status) -> Option<&oneup_ipc::DataUse> {
+    s.network.as_ref()?.data.as_ref().filter(|d| d.reached)
+}
+
+/// The notification for a new safety stop, in `loc`'s language.
+pub(crate) fn stop_notice(st: &oneup_ipc::SafetyStop, loc: &Locale) -> Notice {
     if st.kind == "content" {
         return Notice {
-            title: "Files may be encrypted".into(),
-            text: format!(
-                "{} changed files look encrypted, possibly by ransomware. They weren't uploaded. Check them before continuing.",
-                st.count
+            title: t_in!(loc, "Files may be encrypted"),
+            text: t_in!(
+                loc,
+                "{n} changed files look encrypted, possibly by ransomware. They weren't uploaded. Check them before continuing.",
+                n = st.count
             ),
             kind: Kind::Warning,
         };
     }
-    let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
+    if st.kind == "removal" {
+        return Notice {
+            title: t_in!(loc, "Approve removing duplicates"),
+            text: t_in!(loc, "The duplicates you chose are removed once you approve."),
+            kind: Kind::Info,
+        };
+    }
+    let n = st.items();
     Notice {
-        title: "Review needed".into(),
-        text: format!(
-            "{} items {side} would be deleted, overwritten or moved. Nothing changes until you review.",
-            st.count
-        ),
+        title: t_in!(loc, "Review needed"),
+        text: if st.side == "local" {
+            t_in!(
+                loc,
+                "{n} items on this PC would be deleted, overwritten or moved. Nothing changes until you review.",
+                n = n
+            )
+        } else {
+            t_in!(
+                loc,
+                "{n} items in OneDrive would be deleted, overwritten or moved. Nothing changes until you review.",
+                n = n
+            )
+        },
         kind: Kind::Warning,
     }
 }
@@ -309,82 +367,91 @@ pub fn menu(v: &View, update: Option<&str>) -> Vec<Item> {
             let waiting = items.len();
             for (i, st) in s.safety_stops.iter().enumerate() {
                 let label = if st.kind == "content" {
-                    format!("Possibly encrypted: {} files…", st.count)
+                    t!("Possibly encrypted: {n} files…", n = st.count)
+                } else if st.kind == "removal" {
+                    t!("Review removing duplicates…")
+                } else if st.side == "local" {
+                    t!("Review {n} changes on this PC…", n = st.items())
                 } else {
-                    let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
-                    format!("Review {} changes {side}…", st.count)
+                    t!("Review {n} changes in OneDrive…", n = st.items())
                 };
                 items.push(action(id::REVIEW_STOP + i as u32, label, glyph::WARNING));
             }
             if let Some(o) = &s.overflow
                 && o.waiting
             {
-                let label = format!("Review {} removed files…", o.count);
+                let label = t!("Review {n} removed files…", n = o.count);
                 items.push(action(id::REVIEW_OVERFLOW, label, glyph::WARNING));
             }
             if let Some(o) = &s.prune_offer {
                 let sub = vec![
-                    Item::Action {
-                        id: id::REVIEW_PRUNE, label: "Remove or keep…".into(), enabled: true, glyph: None
-                    },
-                    Item::Action { id: id::LIST_PRUNE, label: "Show list".into(), enabled: true, glyph: None },
+                    Item::Action { id: id::REVIEW_PRUNE, label: t!("Remove or keep…"), enabled: true, glyph: None },
+                    Item::Action { id: id::LIST_PRUNE, label: t!("Show list"), enabled: true, glyph: None },
                 ];
                 items.push(Item::Submenu {
-                    label: format!("Excluded, in OneDrive: {}", o.items),
+                    label: t!("Excluded, in OneDrive: {n}", n = o.items),
                     items: sub,
                     glyph: Some(glyph::CLOUD),
                 });
             }
             if s.problem.is_some() {
-                items.push(action(id::PROBLEM, "Error details…", glyph::ERROR));
+                items.push(action(id::PROBLEM, t!("Error details…"), glyph::ERROR));
             }
             if let Some(u) = &s.unsynced {
-                let label = format!("Sync failure: {}", unsynced_count(u));
+                let label = t!("Sync failure: {items}", items = unsynced_count(u, current()));
                 items.push(action(id::LIST_UNSYNCED, label, glyph::INFO));
+            }
+            if budget_reached(s).is_some() {
+                let label = t!("Allow {mb} MB more", mb = crate::netusage::ALLOW_MB);
+                items.push(action(id::ALLOW_DATA, label, glyph::WARNING));
             }
             if items.len() > waiting {
                 items.push(Item::Separator);
             }
-            items.push(action(id::OPEN_FOLDER, "Open folder", glyph::FOLDER));
-            items.push(action(id::SYNC_NOW, "Sync now", glyph::SYNC));
+            items.push(action(id::OPEN_FOLDER, t!("Open folder"), glyph::FOLDER));
+            items.push(action(id::SYNC_NOW, t!("Sync now"), glyph::SYNC));
             if s.paused.local || s.paused.remote {
-                items.push(action(id::RESUME, "Resume", glyph::PLAY));
+                items.push(action(id::RESUME, t!("Resume"), glyph::PLAY));
             }
+            let offline = s.network.as_ref().is_some_and(|n| n.offline);
+            let label = if offline { t!("Go back online") } else { t!("Work offline") };
+            items.push(action(id::OFFLINE, label, glyph::CLOUD));
             if !(s.paused.local && s.paused.remote) {
                 let choices = PAUSES
                     .iter()
                     .enumerate()
                     .map(|(i, (label, _))| Item::Action {
                         id: id::PAUSE + i as u32,
-                        label: (*label).into(),
+                        label: crate::l10n::message(label, &[]),
                         enabled: true,
                         glyph: None,
                     })
                     .collect();
-                items.push(Item::Submenu { label: "Pause".into(), items: choices, glyph: Some(glyph::PAUSE) });
+                items.push(Item::Submenu { label: t!("Pause"), items: choices, glyph: Some(glyph::PAUSE) });
             }
         }
-        View::NotRunning => items.push(action(id::START, "Start OneUpDrive", glyph::PLAY)),
+        View::NotRunning => items.push(action(id::START, t!("Start OneUpDrive"), glyph::PLAY)),
         View::Stopped(_) => {
-            items.push(action(id::PROBLEM, "Error details…", glyph::ERROR));
+            items.push(action(id::PROBLEM, t!("Error details…"), glyph::ERROR));
             items.push(Item::Separator);
-            items.push(action(id::START, "Start OneUpDrive", glyph::PLAY));
+            items.push(action(id::START, t!("Start OneUpDrive"), glyph::PLAY));
         }
         View::Connecting | View::Unreachable(_) => {}
     }
     if !matches!(items.last(), Some(Item::Separator)) {
         items.push(Item::Separator);
     }
-    items.push(action(id::ACTIVITY, "Recent activity", glyph::HISTORY));
-    items.push(action(id::SETTINGS, "Settings", glyph::SETTINGS));
+    items.push(action(id::ACTIVITY, t!("Recent activity"), glyph::HISTORY));
+    items.push(action(id::SEARCH, t!("Search"), glyph::SEARCH));
+    items.push(action(id::SETTINGS, t!("Settings"), glyph::SETTINGS));
     items.push(Item::Separator);
     if let Some(version) = update {
-        items.push(action(id::UPDATE, format!("Install update {version}"), glyph::NEW));
+        items.push(action(id::UPDATE, t!("Install update {version}", version = version), glyph::NEW));
     }
     if matches!(v, View::Running(_)) {
-        items.push(action(id::STOP, "Stop OneUpDrive", glyph::POWER));
+        items.push(action(id::STOP, t!("Stop OneUpDrive"), glyph::POWER));
     }
-    items.push(action(id::CLOSE, "Hide icon", glyph::CLOSE));
+    items.push(action(id::CLOSE, t!("Hide icon"), glyph::CLOSE));
     items
 }
 
@@ -420,17 +487,17 @@ impl Notices {
                 self.stop_expected |= s.activity == Activity::Stopping;
                 for st in &s.safety_stops {
                     if self.shown.insert(st.code.clone()) {
-                        out.push(stop_notice(st));
+                        out.push(stop_notice(st, current()));
                     }
                 }
                 if let Some(o) = &s.prune_offer
                     && self.shown.insert(o.code.clone())
                 {
                     out.push(Notice {
-                        title: "Excluded items in OneDrive".into(),
-                        text: format!(
-                            "{} excluded items are still in OneDrive. Click to remove or keep them.",
-                            o.items
+                        title: t!("Excluded items in OneDrive"),
+                        text: t!(
+                            "{n} excluded items are still in OneDrive. Click to remove or keep them.",
+                            n = o.items
                         ),
                         kind: Kind::Info,
                     });
@@ -440,10 +507,25 @@ impl Notices {
                     && self.shown.insert(o.code.clone())
                 {
                     out.push(Notice {
-                        title: "Review needed".into(),
-                        text: format!(
-                            "{} files deleted in OneDrive don't fit in the version store. They stay here until you decide.",
-                            o.count
+                        title: t!("Review needed"),
+                        text: t!(
+                            "{n} files deleted in OneDrive don't fit in the version store. They stay here until you decide.",
+                            n = o.count
+                        ),
+                        kind: Kind::Warning,
+                    });
+                }
+                if let Some(d) = budget_reached(s)
+                    && self.shown.insert(format!("budget:{}:{}", d.month, d.budget))
+                {
+                    let size = crate::versions::size;
+                    out.push(Notice {
+                        title: t!("Data budget reached"),
+                        text: t!(
+                            "Sync paused: {used} of {budget} used this month on this network. Allow {mb} MB more from this icon's menu.",
+                            used = size(d.up + d.down),
+                            budget = size(d.budget),
+                            mb = crate::netusage::ALLOW_MB
                         ),
                         kind: Kind::Warning,
                     });
@@ -453,17 +535,17 @@ impl Notices {
                     if (!patient || p.attempts >= PATIENT_ATTEMPTS)
                         && self.shown.insert(format!("problem:{}:{}", p.kind, p.since_ms))
                     {
-                        out.push(problem_notice("Sync problem", p));
+                        out.push(problem_notice(false, p, current()));
                     }
                 }
             }
             View::NotRunning | View::Stopped(_) => {
                 if self.was_running && !self.stop_expected {
                     out.push(match v {
-                        View::Stopped(p) => problem_notice("OneUpDrive stopped", p),
+                        View::Stopped(p) => problem_notice(true, p, current()),
                         _ => Notice {
-                            title: "OneUpDrive stopped".into(),
-                            text: "Files aren't syncing. Start it from this icon's menu.".into(),
+                            title: t!("OneUpDrive stopped"),
+                            text: t!("Files aren't syncing. Start it from this icon's menu."),
                             kind: Kind::Error,
                         },
                     });
@@ -672,10 +754,23 @@ pub fn render(look: Look, size: u32) -> Vec<u8> {
 }
 
 /// A name for the single-instance lock of `data_dir`'s tray.
+/// The event raised when `[search]` changed (`oneup search`, the settings
+/// window), so the icon takes up a new hotkey (`oneup_sys::signal`).
+pub fn settings_signal(data_dir: &std::path::Path) -> String {
+    instance_name(data_dir).replace("-tray-", "-search-settings-")
+}
+
+/// Tells `data_dir`'s icon, if it's showing, that `[search]` changed.
+pub fn settings_changed(data_dir: &std::path::Path) {
+    let _ = oneup_sys::signal::raise(&settings_signal(data_dir));
+}
+
 pub fn instance_name(data_dir: &std::path::Path) -> String {
-    // FNV-1a over the lower-cased path: the same folder, however it's typed.
+    // FNV-1a over the path folded as Windows compares names: the same
+    // folder, however it's typed. (Only processes of one version need to
+    // agree on it.)
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in data_dir.to_string_lossy().to_lowercase().trim_end_matches('\\').bytes() {
+    for b in oneup_sync::fold(data_dir.to_string_lossy().trim_end_matches('\\')).bytes() {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     format!("OneUpDrive-tray-{h:016x}")
@@ -702,10 +797,14 @@ mod tests {
             overflow: None,
             problem: None,
             auto_pause: None,
+            auto_pause_hours: None,
             prune_offer: None,
             progress: None,
             unsynced: None,
             retrying: None,
+            databases: Vec::new(),
+            databases_more: 0,
+            network: None,
         }
     }
 
@@ -742,7 +841,7 @@ mod tests {
         assert_eq!(tip(&up(s)), "OneUpDrive: Paused");
         assert_eq!(time_left(90 * 60_000), "about 1 h 30 min");
         assert_eq!(time_left(30_000), "less than a minute");
-        assert_eq!(count(1_234_567), "1,234,567");
+        assert_eq!(crate::l10n::number(1_234_567u64), "1,234,567");
     }
 
     /// `packaging/oneupdrive.ico` must be what [`ico`] draws. To redraw it:
@@ -770,6 +869,7 @@ mod tests {
             kind: "mass".into(),
             side: "local".into(),
             count: 40,
+            at_least: false,
             recent: 0,
             synced_items: 100,
             code: code.into(),
@@ -883,6 +983,32 @@ mod tests {
     /// Problems that need the user are notified at once, once a spell;
     /// those that usually clear by themselves only once they've lasted.
     #[test]
+    fn a_problem_notice_is_one_message_in_the_readers_language() {
+        let de = r#"{
+            "Sync problem": "Synchronisierungsproblem",
+            "OneUpDrive stopped": "OneUpDrive angehalten",
+            "{problem} {action}": "{problem} Bitte: {action}",
+            "This PC's disk is full": "Der Datenträger ist voll",
+            "Free up space on the disk, or turn on Files On-Demand (Settings > Files) so files download only when opened.": "Schaffen Sie Platz."
+        }"#;
+        let de =
+            Locale::with_catalogue("de", de, "de-DE", crate::l10n::Numbers::new(",", ".", "3;0")).expect("catalogue");
+        let e = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let p = crate::problem::describe(&e, None, 0, Some(1));
+        assert_eq!(p.kind, "disk-full");
+        let n = problem_notice(false, &p, &de);
+        assert_eq!(n.title, "Synchronisierungsproblem");
+        assert_eq!(n.text, "Der Datenträger ist voll Bitte: Schaffen Sie Platz.");
+        assert_eq!(problem_notice(true, &p, &de).title, "OneUpDrive angehalten");
+        let en = problem_notice(true, &p, &Locale::english());
+        assert_eq!(en.title, "OneUpDrive stopped");
+        assert_eq!(
+            en.text,
+            "This PC's disk is full Free up space on the disk, or turn on Files On-Demand (Settings > Files) so files download only when opened."
+        );
+    }
+
+    #[test]
     fn problems_are_notified_when_worth_it() {
         let mut n = Notices::default();
         let with = |p: Problem| up(Status { problem: Some(p), ..status(Activity::Retrying) });
@@ -909,6 +1035,26 @@ mod tests {
         assert_eq!(look(&v), Look::UpToDate);
         assert!(ids(&menu_of(&v)).contains(&id::LIST_UNSYNCED));
         assert!(Notices::default().update(&v).is_empty());
+    }
+
+    /// A used-up data budget is said once (again once more is allowed and
+    /// used up too) and can be answered from the menu.
+    #[test]
+    fn a_reached_data_budget_is_notified_and_answered_from_the_menu() {
+        let mut s = status(Activity::Idle);
+        let data = oneup_ipc::DataUse { month: "2026-10".into(), up: 3, down: 7, budget: 10, reached: true };
+        s.network = Some(oneup_ipc::NetStatus { data: Some(data.clone()), ..oneup_ipc::NetStatus::default() });
+        s.auto_pause = Some("data budget reached".into());
+        let mut n = Notices::default();
+        let first = n.update(&up(s.clone()));
+        assert!(first.iter().any(|x| x.title == "Data budget reached"), "{first:?}");
+        assert!(n.update(&up(s.clone())).is_empty(), "once");
+        assert!(ids(&menu_of(&up(s.clone()))).contains(&id::ALLOW_DATA));
+        let more = oneup_ipc::DataUse { budget: 20, ..data };
+        s.network = Some(oneup_ipc::NetStatus { data: Some(more), ..oneup_ipc::NetStatus::default() });
+        assert_eq!(n.update(&up(s.clone())).len(), 1, "used up again");
+        s.network = None;
+        assert!(!ids(&menu_of(&up(s))).contains(&id::ALLOW_DATA));
     }
 
     #[test]
@@ -957,6 +1103,15 @@ mod tests {
         let a = instance_name(std::path::Path::new(r"C:\Users\x\AppData\Local\OneUpDrive-test"));
         assert_eq!(a, instance_name(std::path::Path::new(r"c:\users\X\appdata\local\oneupdrive-test\")));
         assert_ne!(a, instance_name(std::path::Path::new(r"C:\Users\x\AppData\Local\OneUpDrive")));
+        // Beyond ASCII too, as Windows compares names: a word-final sigma
+        // is a sigma; the Kelvin sign isn't k.
+        let greek = instance_name(std::path::Path::new(r"D:\Data\ΟΔΟΣ"));
+        assert_eq!(greek, instance_name(std::path::Path::new(r"d:\data\οδος\")));
+        assert_eq!(greek, instance_name(std::path::Path::new(r"D:\DATA\οδοσ")));
+        assert_ne!(
+            instance_name(std::path::Path::new("D:\\\u{212A}it")),
+            instance_name(std::path::Path::new(r"D:\kit"))
+        );
     }
 
     #[test]

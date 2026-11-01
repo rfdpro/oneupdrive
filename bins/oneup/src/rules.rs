@@ -20,6 +20,12 @@ pub struct Changes {
     pub off: Vec<String>,
     pub add: Vec<String>,
     pub remove: Vec<String>,
+    pub pin: Vec<String>,
+    pub unpin: Vec<String>,
+    /// Go ahead with pin rules that download files.
+    pub yes: bool,
+    /// The go-ahead for the downloads the agent waits at.
+    pub allow_downloads: bool,
 }
 
 impl Changes {
@@ -29,6 +35,9 @@ impl Changes {
             && self.off.is_empty()
             && self.add.is_empty()
             && self.remove.is_empty()
+            && self.pin.is_empty()
+            && self.unpin.is_empty()
+            && !self.allow_downloads
     }
 }
 
@@ -38,17 +47,38 @@ pub async fn run(data_dir: &Path, store: &Store, changes: &Changes) -> Result<()
     if !changes.is_empty() {
         let before = rules.clone();
         apply(&mut rules, changes)?;
+        if changes.allow_downloads {
+            let mut s = oneup_app::setup::open_store(data_dir, 1024)?;
+            oneup_app::pinrules::allow(&mut s, 0)?;
+            println!("Pin rules download what they wait for now.");
+        }
+        // Any change of pin rules that would download files is shown and
+        // needs a yes (`--yes`), as is one whose count couldn't finish.
+        let approved = if rules.pin == before.pin {
+            None
+        } else {
+            match pin_go_ahead(store, &rules.pin, changes.yes)? {
+                Some(bytes) => Some(bytes),
+                None => return Ok(()),
+            }
+        };
         if rules == before {
-            println!("Nothing to change.");
+            if !changes.allow_downloads {
+                println!("Nothing to change.");
+            }
         } else {
             config::save_rules(data_dir, &rules)?;
+            if let Some(bytes) = approved {
+                let mut s = oneup_app::setup::open_store(data_dir, 1024)?;
+                oneup_app::pinrules::approve(&mut s, &rules.pin_set().fingerprint(), bytes)?;
+            }
             println!("Saved in {}.", config::path(data_dir).display());
             if crate::agent::nudge(data_dir).await {
                 println!("The background agent applies them now.");
             }
         }
     }
-    show(&rules)
+    show(data_dir, &rules)
 }
 
 fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
@@ -56,6 +86,7 @@ fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
         rules.cloud = config::CloudCopies::from_name(m)
             .with_context(|| format!("`{m}`: OneDrive's copies of excluded items can be keep, prune or pull"))?;
     }
+    // Preset names are OneUpDrive's own ASCII words, not file names.
     for name in &c.on {
         let p = preset(name).with_context(|| format!("no preset called `{name}` (see `oneup rules`)"))?;
         if !rules.presets.iter().any(|x| x.eq_ignore_ascii_case(p.name)) {
@@ -78,10 +109,23 @@ fn apply(rules: &mut Rules, c: &Changes) -> Result<()> {
             bail!("`{r}` isn't one of your rules (`oneup rules` lists them)");
         }
     }
+    for r in &c.pin {
+        config::check_rule(r)?;
+        if !rules.pin.contains(r) {
+            rules.pin.push(r.clone());
+        }
+    }
+    for r in &c.unpin {
+        let n = rules.pin.len();
+        rules.pin.retain(|x| x != r);
+        if rules.pin.len() == n {
+            bail!("`{r}` isn't one of your pin rules (`oneup rules` lists them)");
+        }
+    }
     Ok(())
 }
 
-fn show(rules: &Rules) -> Result<()> {
+fn show(data_dir: &Path, rules: &Rules) -> Result<()> {
     println!("Presets (none is on unless you turn it on: oneup rules --on NAME / --off NAME):");
     for p in PRESETS {
         let on = rules.presets.iter().any(|x| x.eq_ignore_ascii_case(p.name));
@@ -96,6 +140,21 @@ fn show(rules: &Rules) -> Result<()> {
         println!("  {r}");
     }
     println!("Rule files: a .oneupignore in any synced folder adds rules for that folder and below.");
+    println!("Always kept on this PC with Files On-Demand (oneup rules --pin RULE / --unpin RULE):");
+    if rules.pin.is_empty() {
+        println!("  none");
+    }
+    for r in &rules.pin {
+        println!("  {r}");
+    }
+    if let Ok(s) = oneup_app::setup::open_store(data_dir, 1024)
+        && let Some(bytes) = oneup_app::pinrules::waiting(&s)?
+    {
+        println!(
+            "  Waiting for your go-ahead to download more ({} next): oneup rules --allow-downloads",
+            oneup_app::versions::size(bytes)
+        );
+    }
     println!(
         "OneDrive's copies of excluded items: {} (oneup rules --cloud keep|prune|pull)",
         match rules.cloud {
@@ -111,6 +170,123 @@ fn show(rules: &Rules) -> Result<()> {
     let pruned = rules.rule_set()?.pruning().patterns();
     if !pruned.is_empty() {
         println!("Folders not even looked inside (what makes them cheap): {}", pruned.join(", "));
+    }
+    Ok(())
+}
+
+/// `oneup rules --suggest`: folders worth excluding, the largest and the
+/// busiest lately (`oneup_app::suggest`). Suggestions only.
+pub fn suggest(data_dir: &Path, store: &Store) -> Result<()> {
+    let s = oneup_app::suggest::suggest(data_dir, store, 5, oneup_app::control::now_ms())?;
+    println!("Largest folders in OneDrive:");
+    if s.largest.is_empty() {
+        println!("  none found");
+    }
+    for x in &s.largest {
+        println!("  {:>10}  /{}", oneup_app::versions::size(x.weight), x.rel);
+    }
+    println!("Busiest folders (changes synced in the last {} days):", oneup_app::suggest::DAYS);
+    if s.busiest.is_empty() {
+        println!("  none found");
+    }
+    for x in &s.busiest {
+        println!("  {:>10}  /{}", x.weight, x.rel);
+    }
+    if !s.largest.is_empty() || !s.busiest.is_empty() {
+        println!("To exclude one: oneup rules --exclude-path PATH (shows what stops syncing first)");
+    }
+    Ok(())
+}
+
+/// Whether pin rules `lines` may be saved, and the bytes approved with
+/// them: what they'd download is shown, and anything to download (or a
+/// count that couldn't finish) needs `--yes`. `None`: not saved.
+fn pin_go_ahead(store: &Store, lines: &[String], yes: bool) -> Result<Option<u64>> {
+    let (files, bytes, all) = oneup_app::pinrules::preview(store, lines, std::time::Duration::from_secs(10))?;
+    if !oneup_app::pinrules::must_ask(files, all) {
+        return Ok(Some(0));
+    }
+    let pair = oneup_app::sync::pairing(store)?;
+    let free = oneup_app::pinrules::free_space(&pair.local);
+    println!(
+        "Kept on this PC from now on: {}{files} online-only file(s), {}, to download{}.",
+        if all { "" } else { "at least " },
+        oneup_app::versions::size(bytes),
+        free.map(|f| format!(" ({} free)", oneup_app::versions::size(f))).unwrap_or_default()
+    );
+    if !yes {
+        println!("Nothing saved. To keep them on this PC: add --yes");
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// `rel` from a path the user typed (full, or inside the synced folder).
+fn rel_of(store: &Store, path: &str) -> Result<String> {
+    let pair = oneup_app::sync::pairing(store)?;
+    let rel = crate::activity::normalize(&crate::activity::within(&pair.local, path)?);
+    Ok(oneup_app::filetree::clean(&rel))
+}
+
+/// Whether the item at `rel` is a folder, on this PC or in OneDrive.
+fn is_folder(store: &Store, rel: &str) -> Result<bool> {
+    let pair = oneup_app::sync::pairing(store)?;
+    let full = rel.split('/').fold(pair.local.clone(), |p, x| p.join(x));
+    Ok(full.is_dir()
+        || oneup_app::sync::find_remote(store, &format!("{}/{rel}", pair.remote.trim_end_matches('/')))?.is_some())
+}
+
+/// `oneup rules --exclude-path PATH [--yes]`: what unticking the item in
+/// the settings window does, with the same preview first.
+pub async fn exclude_path(data_dir: &Path, store: &Store, path: &str, yes: bool) -> Result<()> {
+    let rel = rel_of(store, path)?;
+    let folder = is_folder(store, &rel)?;
+    let p = oneup_app::filetree::preview(data_dir, &rel, folder, None, None)?;
+    let size = |v: &serde_json::Value| oneup_app::versions::size(v["bytes"].as_u64().unwrap_or(0));
+    let count = |v: &serde_json::Value| {
+        let n = v["files"].as_u64().unwrap_or(0);
+        if v["skipped"].as_u64().unwrap_or(0) > 0 { format!("at least {n}") } else { n.to_string() }
+    };
+    println!("/{rel}");
+    if p["here"].is_object() {
+        println!("  on this PC: {} file(s), {}", count(&p["here"]), size(&p["here"]));
+    }
+    if p["cloud"].is_object() {
+        println!("  in OneDrive: {} file(s), {}", count(&p["cloud"]), size(&p["cloud"]));
+    }
+    let then = match p["mode"].as_str().unwrap_or_default() {
+        "keep" => "stops syncing; both copies stay as they are",
+        "prune" => {
+            "stops uploading; OneDrive's copies go to its recycle bin once they're here (safety stops apply); \
+             copies here stay"
+        }
+        _ => "stops uploading; OneDrive's copies and their changes still come here; copies here stay",
+    };
+    println!("  then: {then}");
+    let online = p["here"]["online_files"].as_u64().unwrap_or(0);
+    if online > 0 && p["mode"] == "prune" {
+        println!("  {online} online-only file(s) download first");
+    }
+    println!("  Nothing is deleted from this PC. Change what happens in OneDrive: oneup rules --cloud");
+    if !yes {
+        println!("To exclude it: add --yes");
+        return Ok(());
+    }
+    // Only what was just shown, even if the folder moved meanwhile.
+    println!("{}", oneup_app::filetree::exclude_checked(data_dir, &p["token"])?);
+    if crate::agent::nudge(data_dir).await {
+        println!("The background agent applies it now.");
+    }
+    Ok(())
+}
+
+/// `oneup rules --include-path PATH`: what ticking it again does.
+pub async fn include_path(data_dir: &Path, store: &Store, path: &str) -> Result<()> {
+    let rel = rel_of(store, path)?;
+    let folder = is_folder(store, &rel)?;
+    println!("{}", oneup_app::filetree::set_sync(data_dir, &rel, folder, true)?);
+    if crate::agent::nudge(data_dir).await {
+        println!("The background agent applies it now.");
     }
     Ok(())
 }
@@ -177,16 +353,44 @@ pub async fn pin(data_dir: &Path, store: &Store, path: &str, keep: bool) -> Resu
         bail!("Files On-Demand is off for this folder: every file is kept on this PC already (`oneup on-demand on`)");
     }
     let rel = crate::activity::normalize(&crate::activity::within(&pair.local, path)?);
-    let full =
-        rel.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).fold(pair.local.clone(), |p, x| p.join(x));
-    let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
-    let pin = if keep { provider::Pin::Pinned } else { provider::Pin::Unpinned };
-    if full.is_dir() { provider::set_pin_tree(&f, pin) } else { provider::set_pin(&f, pin) }
-        .with_context(|| format!("{rel} isn't an online-only-capable item"))?;
+    let at = |rel: &str| {
+        rel.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).fold(pair.local.clone(), |p, x| p.join(x))
+    };
+    let full = at(&rel);
+    // What the person chose is recorded first, durably, then the pin is
+    // set: a crash or an agent pass in between can't undo it.
+    let mut w = oneup_app::setup::open_store(data_dir, 1024)?;
     if keep {
+        // Kept by the person: theirs, the folder's contents too, so no rule
+        // undoes it later (and a file freed by name is kept again).
+        oneup_app::pinrules::keep_by_hand(&mut w, &rel, &mut || {
+            let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
+            if full.is_dir() {
+                provider::set_pin_tree(&f, provider::Pin::Pinned)
+            } else {
+                provider::set_pin(&f, provider::Pin::Pinned)
+            }
+            .with_context(|| format!("{rel} isn't an online-only-capable item"))
+        })?;
         println!("{rel}: always kept on this device; the background agent downloads what isn't here yet.");
     } else {
+        // A file named itself is freed even if kept on this device (a pin
+        // rule then leaves it freed); in a folder, what's kept is skipped.
+        let pins = config::load_rules(data_dir, store)?.pin_set();
+        let mut set = |rel: &str| -> Result<()> {
+            let full = at(rel);
+            let f = provider::open(&full).with_context(|| format!("{} isn't in the synced folder", full.display()))?;
+            provider::set_pin(&f, provider::Pin::Unpinned)
+                .with_context(|| format!("{rel} isn't an online-only-capable item"))
+        };
+        let plan = oneup_app::pinrules::free_plan(&mut w, &pins, &rel, &mut set)?;
+        if plan.released.is_some() {
+            println!("{rel}: no longer kept on this device; it stays online-only until you keep it again (oneup pin).");
+        }
         println!("{rel}: online-only; the background agent frees the space (what's in OneDrive stays there).");
+        if plan.skipped > 0 {
+            println!("  {} kept file(s) skipped (always kept on this device, or by a pin rule).", plan.skipped);
+        }
     }
     if !crate::agent::nudge(data_dir).await {
         println!("(The background agent isn't running; it does this when it starts: `oneup start`.)");
@@ -203,7 +407,7 @@ pub async fn pause_folder(data_dir: &Path, store: &Store, path: &str, pause: boo
         bail!("that's the whole synced folder: use `oneup pause` without --folder");
     }
     let mut rules = config::load_rules(data_dir, store)?;
-    let same = |p: &String| p.trim_matches(['/', '\\']).replace('\\', "/").eq_ignore_ascii_case(&rel);
+    let same = |p: &String| oneup_sync::same_name(&p.trim_matches(['/', '\\']).replace('\\', "/"), &rel);
     let had = rules.paused.iter().any(same);
     if pause && !had {
         rules.paused.push(rel.clone());
@@ -269,7 +473,7 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
         {
             problems.push(format!("{} ignored: {p}", Path::new(&dir_rel).join(".oneupignore").display()));
         }
-        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| c.name.eq_ignore_ascii_case(part));
+        row = store.read(|o| o.local_children(dir.file_id))?.into_iter().find(|c| oneup_sync::same_name(&c.name, part));
     }
     if row.as_ref().is_some_and(|r| r.skip == Skip::Excluded) && skipped_at.is_none() && !parts.is_empty() {
         skipped_at = Some(rel.to_string());
@@ -290,7 +494,7 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
         println!("  note: {p}");
     }
     // Built-in reasons first: no rule can change them.
-    let engine = parts.first().is_some_and(|p| p.eq_ignore_ascii_case(ENGINE_DIR));
+    let engine = parts.first().is_some_and(|p| oneup_sync::same_name(p, ENGINE_DIR));
     let builtin = if engine {
         Some("OneUpDrive's own folder (version store and staging); never synced".to_string())
     } else if !is_dir && names::not_synced(name).is_some() {
@@ -325,6 +529,19 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     if engine {
         return Ok(());
     }
+    let released = match &row {
+        Some(r) => store.read(|o| o.pin_released_has(r.file_id))?,
+        None => false,
+    };
+    if released {
+        println!("  freed on request: no pin rule keeps it until you keep it on this device again (oneup pin)");
+    } else if let Some(rule) = config::load_rules(data_dir, store)?.pin_set().pinned_by(rel, is_dir) {
+        println!("  always kept on this PC: pin rule {rule} (with Files On-Demand)");
+        // What wins over what, said where someone looks for why.
+        println!(
+            "  \"Free up space\" on this file itself frees it and the rule leaves it freed; through a folder, the rule keeps it"
+        );
+    }
     let listed = skipped_at.is_none();
     if let Some(at) = skipped_at {
         let at = if at.is_empty() { "the synced folder".into() } else { format!("/{at}") };
@@ -346,6 +563,9 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
             };
             println!("  {state}");
         }
+    }
+    if !is_dir && !parts.is_empty() {
+        database(data_dir, store, &row, rel, name).await?;
     }
     // A failed operation waiting its turn (`oneup_app::backoff`), on this
     // PC's item or OneDrive's.
@@ -373,16 +593,68 @@ pub async fn explain(data_dir: &Path, store: Store, path: &str) -> Result<()> {
     // (`oneup_app::resolve`).
     let at = format!("/{rel}");
     let record = oneup_app::unsynced::load(store)?;
-    if let Some(i) = record.items.iter().find(|i| i.path.eq_ignore_ascii_case(&at)) {
+    if let Some(i) = record.items.iter().find(|i| oneup_sync::same_name(&i.path, &at)) {
         println!("  can't sync: {} (`oneup unsynced resolve` shows what you can do)", i.why.label());
     }
+    // Waiting for a network that lets its contents through
+    // (`oneup_app::network`).
+    if let Some(w) = oneup_app::network::load_waiting(store)?
+        && let Some((_, bytes, up)) = w.items.iter().find(|(p, _, _)| p.eq_ignore_ascii_case(&at))
+    {
+        let way = if *up { "upload" } else { "download" };
+        println!("  waiting: its {way} ({}): {}", oneup_app::versions::size(*bytes), w.why);
+    }
     let queued = store.read(oneup_app::resolve::queued)?;
-    if let Some(q) = queued.iter().find(|q| q.path.eq_ignore_ascii_case(&at)) {
+    if let Some(q) = queued.iter().find(|q| oneup_sync::same_name(&q.path, &at)) {
         println!("  your choice waits for the next round: {}", q.choice.label());
     }
     let last = store.read(|o| o.activity_recent(Some(&format!("/{rel}")), 1))?;
     if let Some(e) = last.first() {
         println!("  last activity: {}", crate::activity::line(e, crate::activity::local_offset()));
+    }
+    // The hooks a change to it starts (`oneup hooks`).
+    match oneup_app::hooks::explain(data_dir, rel) {
+        Ok(lines) => lines.iter().for_each(|l| println!("  {l}")),
+        Err(e) => println!("  hooks: {e:#}"),
+    }
+    Ok(())
+}
+
+/// `oneup explain`'s lines about a database file (`oneup_app::databases`):
+/// what it is by its name and the `[databases]` patterns (the file isn't
+/// read), and, from a running agent, what it waits for.
+async fn database(data_dir: &Path, store: &Store, row: &Option<LocalRow>, rel: &str, name: &str) -> Result<()> {
+    use oneup_rules::database::{Companion, Consistent};
+    let settings = config::load_databases(data_dir)?;
+    // A working file beside its namesake never syncs (`oneup_plan::park`).
+    if let Some((_, main)) = Companion::of_name(name)
+        && let Some(parent) = row.as_ref().and_then(|r| r.parent_id)
+        && !store.read(|o| o.local_named(parent, main))?.is_empty()
+        && !settings.databases()?.opted_out(&format!("{}{main}", rel.strip_suffix(name).unwrap_or_default()))
+    {
+        println!(
+            "  not synced: a working file of {main}, beside it; it stays on this PC (`!{main}` in `oneup databases` opts it out)"
+        );
+        return Ok(());
+    }
+    if let Some(r) = settings.databases()?.by_name(rel) {
+        let when = match r.format.consistent() {
+            Consistent::Sqlite => "sent once every change is in the file",
+            Consistent::WhileClosed => "sent only while no other program has it open",
+        };
+        let off = if settings.wait { "" } else { "; waiting is off ([databases] wait), so it syncs like any file" };
+        println!("  database: {} ({}): {when}, replaced only while closed{off}", r.format.label(), r.by.describe());
+        if r.format.never_live() && !oneup_app::databases::kept_syncing(&settings.keep_syncing, &format!("/{rel}")) {
+            println!("  note: doesn't sync safely while in use (`oneup databases --exclude` excludes it)");
+        }
+    }
+    if let Ok(mut client) = oneup_ipc::connect(data_dir).await
+        && let Ok(s) = client.call(&oneup_ipc::Call::Status).await
+    {
+        let at = format!("/{rel}");
+        for n in s.databases.iter().filter(|n| n.why != "live" && oneup_sync::same_name(&n.path, &at)) {
+            println!("  waiting: {}", oneup_app::databases::detail(n));
+        }
     }
     Ok(())
 }
@@ -396,6 +668,11 @@ mod tests {
     fn changes_turn_presets_on_and_off_and_edit_rules() {
         let mut r = Rules::default();
         let c = Changes { on: vec!["DEV".into(), "temp".into()], add: vec!["*.iso".into()], ..Changes::default() };
+        apply(&mut r, &Changes { pin: vec!["*.psd".into(), "*.psd".into()], ..Changes::default() }).unwrap();
+        assert_eq!(r.pin, ["*.psd"]);
+        assert!(apply(&mut r, &Changes { unpin: vec!["*.png".into()], ..Changes::default() }).is_err());
+        apply(&mut r, &Changes { unpin: vec!["*.psd".into()], ..Changes::default() }).unwrap();
+        assert!(r.pin.is_empty());
         apply(&mut r, &c).unwrap();
         assert_eq!(r.presets, ["dev", "temp"]);
         assert_eq!(r.exclude, ["*.iso"]);

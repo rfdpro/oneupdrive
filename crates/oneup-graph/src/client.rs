@@ -29,6 +29,14 @@ pub struct NetStats {
     pub retry_after_max_s: AtomicU64,
     /// Responses carrying `RateLimit-*` early-warning headers.
     pub rate_limit_warnings: AtomicU64,
+    /// Request bodies sent, in bytes: every attempt of each, file contents
+    /// and JSON alike (what the data budget counts going up).
+    pub sent: AtomicU64,
+    /// Requests without a body to send that got an answer, and the time
+    /// they took until it began (milliseconds, in all): the round trip
+    /// plus the service's own time, for judging the link.
+    pub timed: AtomicU64,
+    pub timed_ms: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -41,14 +49,25 @@ pub struct Graph {
     /// if only a folder is synced ([`Graph::scoped`]).
     drive: String,
     scope: Option<String>,
+    /// Where Graph is: [`GRAPH`], or a loopback server in tests.
+    base: String,
     pub stats: NetStats,
     /// Bandwidth caps for file content (`rules.md` § User controls).
     pub upload: crate::throttle::Throttle,
     pub download: crate::throttle::Throttle,
+    /// What background transfers may still move on the network's data
+    /// budget, taken from as bytes go ([`crate::budget`]).
+    pub budget: crate::budget::Budget,
+    /// How long transfers of contents were under way, side by side
+    /// counted once.
+    pub transferring: crate::throttle::Active,
     /// How long a download may receive nothing before it's abandoned.
     stall: Duration,
     /// For [`Graph::download_version`], which must see the redirect.
     no_redirect: std::sync::OnceLock<reqwest::Client>,
+    /// The largest upload fragment to send, in bytes (0: as the sizer
+    /// chooses); set lower on a poor link.
+    fragment_cap: std::sync::atomic::AtomicUsize,
 }
 
 /// The settings every OneUpDrive HTTP client starts from: a bounded
@@ -90,6 +109,36 @@ fn encode_id(id: &str) -> String {
     encode_drive_path(id)
 }
 
+/// How a search is sent ([`Graph::search`]).
+fn search_req(url: &str) -> Req<'_> {
+    Req { label: Some("OneDrive search"), private: true, retry: false, ..Req::new(reqwest::Method::GET, url) }
+}
+
+/// The URL of a search below `top` (the drive's root or a folder): the
+/// text as an OData string (`'` doubled), percent-encoded whole.
+fn search_url(top: &str, text: &str, n: u32) -> String {
+    let quoted = format!("'{}'", text.replace('\'', "''"));
+    let q: String = quoted
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("{top}/search(q={q})?$top={n}&$select={ITEM_SELECT}")
+}
+
+/// Percent-encodes an ID as exactly one path segment: a `/` in it (a
+/// permission's ID can have one) is encoded too, never a separator.
+fn encode_segment(id: &str) -> String {
+    id.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// One request, described so it can be rebuilt for each attempt.
 struct Req<'a> {
     method: reqwest::Method,
@@ -103,13 +152,27 @@ struct Req<'a> {
     content_range: Option<String>,
     timeout: Option<Duration>,
     /// Shown in errors instead of the URL (pre-authenticated URLs carry a
-    /// session token and must never be logged).
+    /// session token and must never be logged). With a label, network
+    /// errors are logged and returned without their URL too.
     label: Option<&'static str>,
+    /// The URL holds what the user typed (a search): besides the URL, an
+    /// error leaves out the reply's body, which may repeat it.
+    private: bool,
     /// Sent again after a network error or a server error. Off for an
     /// upload fragment: its upload session owns those retries, asking the
     /// session where it is first, and counts them per fragment. Throttling
     /// (429, 503) is waited out either way, and isn't a retry.
     retry: bool,
+    /// The body is a file's contents: each attempt waits for the upload
+    /// cap and must fit in the data budget right before it goes.
+    content: bool,
+    /// Don't follow a redirect: a 3xx answer is the result (its
+    /// `Location` in the measure), for a caller that fetches it itself.
+    no_redirect: bool,
+    /// For a file the user opens: doesn't wait for a permit (background
+    /// transfers may hold them all), only for a pause the service asked
+    /// for.
+    priority: bool,
 }
 
 impl<'a> Req<'a> {
@@ -124,8 +187,18 @@ impl<'a> Req<'a> {
             content_range: None,
             timeout: None,
             label: None,
+            private: false,
             retry: true,
+            content: false,
+            no_redirect: false,
+            priority: false,
         }
+    }
+
+    /// `e` as it may be logged or returned: without the URL when the
+    /// request is labelled.
+    fn plain(&self, e: reqwest::Error) -> reqwest::Error {
+        if self.label.is_some() { e.without_url() } else { e }
     }
 }
 
@@ -163,6 +236,8 @@ struct Measure {
     attempts: u32,
     /// Waiting for the limiter: throttling pauses all requests there.
     paused: Duration,
+    /// Waiting for the upload cap (file contents).
+    capped: Duration,
     /// The response's `Location` header (asynchronous jobs).
     location: Option<String>,
 }
@@ -228,11 +303,20 @@ impl Graph {
     /// An item's eTag, kind and pre-authenticated download URL. `None` if
     /// it no longer exists.
     pub async fn download_info(&self, id: &str) -> Result<Option<crate::model::DownloadInfo>> {
+        self.download_info_for(id, false).await
+    }
+
+    /// [`Graph::download_info`]; `opened`: for a file the user opens, which
+    /// doesn't wait behind background transfers for a request permit (only
+    /// for a pause the service asked for).
+    pub async fn download_info_for(&self, id: &str, opened: bool) -> Result<Option<crate::model::DownloadInfo>> {
         // The full item: OneDrive Personal leaves the link out of a
         // `$select`ed answer (measured: every time), which then cost a
         // second request per download.
         let url = format!("{}/items/{}", self.drive_url(), encode_id(id));
-        match self.get::<crate::model::DownloadInfo>(&url).await {
+        let req = Req { priority: opened, ..Req::new(reqwest::Method::GET, &url) };
+        let got = self.send(&req).await.and_then(|(_, body)| Ok(serde_json::from_slice(&body)?));
+        match got {
             Ok(it) => Ok(Some(it)),
             Err(e) if e.status() == Some(404) => Ok(None),
             Err(e) => Err(e),
@@ -268,7 +352,38 @@ impl Graph {
     /// once bytes have been written: the caller verifies the whole file by
     /// hash and starts over on failure.
     pub async fn download_to(&self, url: &str, out: &mut (dyn std::io::Write + Send)) -> Result<u64> {
-        let _permit = self.limiter.acquire().await;
+        self.download_within(url, out, true).await
+    }
+
+    /// [`Graph::download_to`]; `budgeted`: on the data budget, which stops
+    /// it once used up ([`crate::budget`]). Not for a file the user opens.
+    /// Every byte received counts as it arrives, also of a download that
+    /// fails later.
+    pub async fn download_within(
+        &self,
+        url: &str,
+        out: &mut (dyn std::io::Write + Send),
+        budgeted: bool,
+    ) -> Result<u64> {
+        if budgeted && self.budget.left() == Some(0) {
+            return Err(Error::OverBudget);
+        }
+        // A file the user opens doesn't wait for the limiter: background
+        // transfers hold its permits, and near the data budget's limit
+        // they may hold them while they wait their turn to read
+        // ([`crate::budget`]). The user's own action comes first.
+        // It still waits out any pause the service asked for (429/503 with
+        // `Retry-After`): never hammer the service, whoever asks.
+        let _permit = if budgeted {
+            Some(self.limiter.acquire().await)
+        } else {
+            self.limiter.unpaused().await;
+            None
+        };
+        if budgeted && self.budget.left() == Some(0) {
+            return Err(Error::OverBudget);
+        }
+        let _busy = self.transferring.begin();
         self.stats.requests.fetch_add(1, Relaxed);
         // A dead connection holds the limiter's permit while it hangs, so
         // waiting for the answer and for each read is bounded.
@@ -285,13 +400,53 @@ impl Graph {
             return Err(Error::Status { status, what: "download".into(), body: String::new() });
         }
         let mut n = 0u64;
-        while let Some(chunk) = tokio::time::timeout(self.stall, resp.chunk()).await.map_err(stalled)?? {
+        let expected = resp.content_length();
+        // The budget is used up: the download is complete only if nothing
+        // more comes (it was the last chunk), else it stops.
+        let mut over = false;
+        loop {
+            // All of it arrived: done, even with nothing left to spend.
+            if expected.is_some_and(|len| n >= len) {
+                break;
+            }
+            if over && expected.is_some() {
+                return Err(Error::OverBudget);
+            }
+            // Near the limit, budgeted downloads read one at a time, and
+            // only while something is left ([`crate::budget`]). With
+            // nothing left and no length told, one more read tells whether
+            // it was all: the end of the body, or one read too many.
+            let near = match budgeted && !over {
+                false => None,
+                true => match self.budget.before_read().await {
+                    Ok(g) => g,
+                    Err(_) if expected.is_none() => {
+                        over = true;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            let Some(chunk) = tokio::time::timeout(self.stall, resp.chunk()).await.map_err(stalled)?? else {
+                break;
+            };
+            // Counted as it arrives, before anything else is done with it:
+            // a write that fails used the traffic too.
+            self.stats.bytes.fetch_add(chunk.len() as u64, Relaxed);
+            let fit = self.budget.received(chunk.len() as u64);
+            drop(near);
             out.write_all(&chunk).map_err(Error::Local)?;
             n += chunk.len() as u64;
+            if budgeted && (over || !fit) {
+                if over && expected.is_none() {
+                    // More came after the budget was used up.
+                    return Err(Error::OverBudget);
+                }
+                over = true;
+            }
             // Not reading meanwhile slows the sender down (TCP flow control).
             self.download.take(chunk.len() as u64).await;
         }
-        self.stats.bytes.fetch_add(n, Relaxed);
         Ok(n)
     }
 
@@ -313,7 +468,7 @@ impl Graph {
         replace: Option<(&str, &str)>,
         content: &[u8],
     ) -> Result<DriveItem> {
-        self.upload.take(content.len() as u64).await;
+        let _busy = self.transferring.begin();
         let url = match replace {
             Some((id, _)) => format!("{}/items/{}/content", self.drive_url(), encode_id(id)),
             None => format!(
@@ -327,6 +482,7 @@ impl Graph {
             bytes: Some(content),
             if_match: replace.map(|(_, tag)| tag),
             timeout: Some(TRANSFER_TIMEOUT),
+            content: true,
             ..Req::new(reqwest::Method::PUT, &url)
         };
         self.json(&req).await
@@ -362,9 +518,7 @@ impl Graph {
     /// it is ([`Graph::upload_status`]) and goes on from there. Throttling
     /// is still waited out here.
     pub async fn upload_fragment(&self, upload_url: &str, start: u64, total: u64, bytes: &[u8]) -> Result<Fragment> {
-        let capped = std::time::Instant::now();
-        self.upload.take(bytes.len() as u64).await;
-        let capped = capped.elapsed();
+        let _busy = self.transferring.begin();
         let end = start + bytes.len() as u64 - 1;
         let req = Req {
             auth: false,
@@ -373,11 +527,12 @@ impl Graph {
             timeout: Some(TRANSFER_TIMEOUT),
             label: Some("upload session fragment"),
             retry: false,
+            content: true,
             ..Req::new(reqwest::Method::PUT, upload_url)
         };
         let (status, body, m) = self.send_measured(&req).await?;
         let item = if status == 202 { None } else { Some(serde_json::from_slice(&body)?) };
-        Ok(Fragment { item, paused: m.paused, capped })
+        Ok(Fragment { item, paused: m.paused, capped: m.capped })
     }
 
     /// Asks OneDrive to copy file `source` into folder `parent` as `name`
@@ -572,6 +727,32 @@ impl Graph {
         self.json(&req).await
     }
 
+    /// Brings deleted item `id` back from the OneDrive recycle bin
+    /// (`POST /items/{id}/restore`, documented for OneDrive Personal only).
+    /// Measured: it comes back where it was deleted from, under the name it
+    /// had, whatever `parent` and `name` say; an item holding that name is
+    /// renamed `name(1)` (no 409); 404: it's no longer in the recycle bin.
+    /// The one remote change without `If-Match` (an item in the recycle bin
+    /// has no eTag Graph takes); the caller checks the name is free first
+    /// (`data-safety.md` invariant 2).
+    pub async fn restore_deleted(&self, id: &str, parent: &str, name: &str) -> Result<DriveItem> {
+        let url = format!("{}/items/{}/restore", self.drive_url(), encode_id(id));
+        let body = restore_body(parent, name);
+        let req = Req { json: Some(&body), ..Req::new(reqwest::Method::POST, &url) };
+        self.json(&req).await
+    }
+
+    /// Folder `parent`'s child named `name` (as OneDrive compares names),
+    /// if it has one. Read-only.
+    pub async fn child_named(&self, parent: &str, name: &str) -> Result<Option<DriveItem>> {
+        let url = format!("{}/items/{}:/{}:", self.drive_url(), encode_id(parent), encode_drive_path(name));
+        match self.get(&url).await {
+            Ok(it) => Ok(Some(it)),
+            Err(e) if e.status() == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Deletes an item into the OneDrive recycle bin, if its eTag is still
     /// `etag`. **Graph deletes a folder with everything in it**: callers
     /// must check that a folder is empty first.
@@ -581,10 +762,52 @@ impl Graph {
         self.send(&req).await.map(|_| ())
     }
 
+    /// Removes permission `perm` (a sharing link, or people's access) from
+    /// item `id`, if the item's eTag is still `etag` (412 otherwise; Graph
+    /// documents `If-Match` for this request). Only a permission that isn't
+    /// inherited can be removed. Never touches the item's content. Only for
+    /// `oneup_effects::sharing`, behind the gate's token.
+    pub async fn delete_permission(&self, id: &str, perm: &str, etag: &str) -> Result<()> {
+        let url = format!("{}/items/{}/permissions/{}", self.drive_url(), encode_segment(id), encode_segment(perm));
+        let req = Req { if_match: Some(etag), ..Req::new(reqwest::Method::DELETE, &url) };
+        self.send(&req).await.map(|_| ())
+    }
+
+    /// Sets when permission `perm` of item `id` stops working, if the
+    /// item's eTag is still `etag`. **Graph documents only `roles` as
+    /// changeable this way**: OneDrive may ignore the date, so the caller
+    /// checks the permission it returns. Only for `oneup_effects::sharing`,
+    /// behind the gate's token.
+    pub async fn set_permission_expiry(
+        &self,
+        id: &str,
+        perm: &str,
+        etag: &str,
+        expires_ms: i64,
+    ) -> Result<crate::model::Permission> {
+        let when = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(expires_ms) * 1_000_000)
+            .ok()
+            .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+            .ok_or(Error::Invalid("the expiry date is out of range"))?;
+        let url = format!("{}/items/{}/permissions/{}", self.drive_url(), encode_segment(id), encode_segment(perm));
+        let body = serde_json::json!({ "expirationDateTime": when });
+        let req = Req { json: Some(&body), if_match: Some(etag), ..Req::new(reqwest::Method::PATCH, &url) };
+        let v: serde_json::Value = self.json(&req).await?;
+        crate::model::Permission::from_json(&v)
+            .ok_or_else(|| Error::refused(200, "changing a permission", "no permission in the answer".into()))
+    }
+
     async fn json<T: DeserializeOwned>(&self, req: &Req<'_>) -> Result<T> {
         let (_, body) = self.send(req).await?;
         Ok(serde_json::from_slice(&body)?)
     }
+}
+
+/// The body of a restore ([`Graph::restore_deleted`]): where to, and
+/// nothing about a name that's taken, so OneDrive refuses one (409) rather
+/// than replace or rename anything.
+fn restore_body(parent: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({ "parentReference": { "id": parent }, "name": name })
 }
 
 impl Graph {
@@ -596,11 +819,25 @@ impl Graph {
             stats: NetStats::default(),
             upload: crate::throttle::Throttle::default(),
             download: crate::throttle::Throttle::default(),
+            budget: crate::budget::Budget::default(),
+            transferring: crate::throttle::Active::default(),
             stall: STALL_TIMEOUT,
             no_redirect: std::sync::OnceLock::new(),
             drive: "/me/drive".into(),
             scope: None,
+            base: GRAPH.into(),
+            fragment_cap: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Caps upload fragments at `bytes` (`None`: no cap), so a dropped
+    /// connection on a poor link costs less to send again.
+    pub fn set_fragment_cap(&self, bytes: Option<usize>) {
+        self.fragment_cap.store(bytes.unwrap_or(0), Relaxed);
+    }
+
+    pub fn fragment_cap(&self) -> Option<usize> {
+        Some(self.fragment_cap.load(Relaxed)).filter(|n| *n > 0)
     }
 
     /// Addresses only folder `root` (by ID) of drive `drive` (another
@@ -629,7 +866,25 @@ impl Graph {
     }
 
     fn drive_url(&self) -> String {
-        format!("{GRAPH}{}", self.drive)
+        format!("{}{}", self.base, self.drive)
+    }
+
+    /// Talks to `base` instead of Graph (tests: a loopback server).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_base_for_tests(mut self, base: &str) -> Self {
+        self.base = base.to_string();
+        self
+    }
+
+    /// A client for tests against a loopback server at `base`, signed in
+    /// with a made-up token, `at_once` requests at a time.
+    #[doc(hidden)]
+    pub async fn for_tests(base: &str, at_once: usize) -> Graph {
+        let store = crate::DpapiFileStore::new(std::env::temp_dir().join("oneup-graph-test-none.dpapi"));
+        let auth = Arc::new(Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
+        auth.set_access_for_tests("t").await;
+        Graph::new(reqwest::Client::new(), auth, Aimd::new(at_once, at_once)).with_base_for_tests(base)
     }
 
     /// Makes the scope's root folder look like a drive root.
@@ -676,12 +931,19 @@ impl Graph {
         // Throttling is the service pacing us, not a failure: honouring
         // Retry-After doesn't use up attempts (but is bounded, to never hang forever).
         let mut throttled = 0u32;
+        // What each attempt sends (the data budget counts every attempt).
+        let body_len = match (req.json, req.bytes) {
+            (Some(j), _) => serde_json::to_vec(j).map_or(0, |v| v.len()) as u64,
+            (None, Some(b)) => b.len() as u64,
+            (None, None) => 0,
+        };
         loop {
             attempt += 1;
             if attempt > MAX_ATTEMPTS || throttled > MAX_THROTTLES {
                 return Err(Error::Exhausted(attempt));
             }
-            let mut rb = self.http.request(req.method.clone(), url);
+            let http = if req.no_redirect { self.no_redirect_client()? } else { &self.http };
+            let mut rb = http.request(req.method.clone(), url);
             let mut token = None;
             if req.auth {
                 match self.auth.access_token().await {
@@ -717,13 +979,38 @@ impl Graph {
                 (None, None) if req.method != reqwest::Method::GET => rb.header(reqwest::header::CONTENT_LENGTH, 0),
                 (None, None) => rb,
             };
+            // File contents: each attempt keeps to the upload cap as it is
+            // then (a wait follows a change of cap).
+            if req.content {
+                measure.capped += self.upload.take(body_len).await;
+            }
             let waiting = std::time::Instant::now();
-            let permit = self.limiter.acquire().await;
+            let permit = if req.priority {
+                self.limiter.unpaused().await;
+                None
+            } else {
+                Some(self.limiter.acquire().await)
+            };
             measure.paused += waiting.elapsed();
+            // ...and must fit in the data budget as it is right before it
+            // goes, which a change of network may have set meanwhile.
+            if req.content && !self.budget.send(body_len) {
+                return Err(Error::OverBudget);
+            }
+            // File contents took theirs above; the rest uses the budget too.
+            self.stats.sent.fetch_add(body_len, Relaxed);
+            if !req.content {
+                self.budget.spent(body_len);
+            }
             measure.attempts += 1;
             self.stats.requests.fetch_add(1, Relaxed);
+            let asked = std::time::Instant::now();
             let sent = rb.send().await;
-            let resp = match sent {
+            if sent.is_ok() && req.bytes.is_none() {
+                self.stats.timed.fetch_add(1, Relaxed);
+                self.stats.timed_ms.fetch_add(u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX), Relaxed);
+            }
+            let resp = match sent.map_err(|e| req.plain(e)) {
                 Ok(r) => r,
                 Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
@@ -768,12 +1055,16 @@ impl Graph {
                 tokio::time::sleep(backoff(attempt)).await;
                 continue;
             }
-            let body = if (200..300).contains(&status) {
-                resp.bytes().await.map(Vec::from)
+            // Counted chunk by chunk as they arrive: a body cut off midway
+            // used that traffic too.
+            // A redirect asked not to be followed is an answer too.
+            let answered = (200..300).contains(&status) || (req.no_redirect && (300..400).contains(&status));
+            let body = if answered {
+                self.read_counted(resp).await
             } else {
-                crate::error_body(resp).await
+                crate::error_body_counted(resp, Some(&|n| self.received(n))).await
             };
-            let body = match body {
+            let body = match body.map_err(|e| req.plain(e)) {
                 Ok(b) => b,
                 Err(e) if !req.retry => return Err(e.into()),
                 Err(e) => {
@@ -785,18 +1076,44 @@ impl Graph {
                 }
             };
             drop(permit);
-            self.stats.bytes.fetch_add(body.len() as u64, Relaxed);
             measure.location = location;
-            if !(200..300).contains(&status) {
+            if !answered {
                 let what = match req.label {
                     Some(l) => l.to_string(),
                     None => url.split('?').next().unwrap_or(url).to_string(),
                 };
-                return Err(Error::refused(status, what, String::from_utf8_lossy(&body).into_owned()));
+                let body = if req.private { String::new() } else { String::from_utf8_lossy(&body).into_owned() };
+                return Err(Error::refused(status, what, body));
             }
             self.limiter.on_success();
             return Ok((status, body, measure));
         }
+    }
+
+    /// A response's body, each chunk counted in `NetStats::bytes` as it
+    /// arrives.
+    async fn read_counted(&self, mut resp: reqwest::Response) -> reqwest::Result<Vec<u8>> {
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            self.received(chunk.len() as u64);
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// `n` bytes of an answer arrived: counted, and taken from the data
+    /// budget (an answer is never held, but it uses the budget).
+    fn received(&self, n: u64) {
+        self.stats.bytes.fetch_add(n, Relaxed);
+        self.budget.spent(n);
+    }
+
+    /// Traffic outside requests (the push channel's messages): counted
+    /// and taken from the data budget.
+    pub fn count_other(&self, sent: u64, received: u64) {
+        self.stats.sent.fetch_add(sent, Relaxed);
+        self.received(received);
+        self.budget.spent(sent);
     }
 
     /// OneDrive sends `RateLimit-*` headers (best effort) once usage passes
@@ -888,14 +1205,17 @@ impl Graph {
 
     /// The item's page on OneDrive's website; `None` if it no longer exists.
     pub async fn web_url(&self, id: &str) -> Result<Option<String>> {
-        match self
-            .get::<serde_json::Value>(&format!("{}/items/{}?$select=webUrl", self.drive_url(), encode_id(id)))
-            .await
-        {
+        match self.get::<serde_json::Value>(&self.web_url_request(id)).await {
             Ok(v) => Ok(v.get("webUrl").and_then(|u| u.as_str()).map(str::to_string)),
             Err(e) if e.status() == Some(404) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Where [`Graph::web_url`] asks: the item in the client's drive (another
+    /// person's, for a scoped client of a shared folder).
+    fn web_url_request(&self, id: &str) -> String {
+        format!("{}/items/{}?$select=webUrl", self.drive_url(), encode_id(id))
     }
 
     /// A file's earlier versions in OneDrive, newest first (the current one
@@ -922,6 +1242,25 @@ impl Graph {
     /// Streams version `version` of file `id` into `out`. Its content is
     /// served from a pre-authenticated address OneDrive redirects to; the
     /// token is sent only to Graph, never there.
+    /// Item `id`'s eTag, and its current version as its version history
+    /// lists it: the ID its cTag gives (`c:{…},3` is version `3.0`; empty
+    /// without one), its time (`lastModifiedDateTime`) and size. `None` if
+    /// it no longer exists.
+    pub async fn current_version(&self, id: &str) -> Result<Option<(Option<String>, crate::model::FileVersion)>> {
+        let url =
+            format!("{}/items/{}?$select=id,eTag,cTag,size,lastModifiedDateTime", self.drive_url(), encode_id(id));
+        match self.get::<serde_json::Value>(&url).await {
+            Ok(v) => {
+                let etag = v.get("eTag").and_then(serde_json::Value::as_str).map(str::to_string);
+                let version = v.get("cTag").and_then(serde_json::Value::as_str).and_then(crate::model::content_version);
+                Ok(crate::model::FileVersion::from_json(&v)
+                    .map(|f| (etag, crate::model::FileVersion { id: version.unwrap_or_default(), ..f })))
+            }
+            Err(e) if e.status() == Some(404) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn download_version(
         &self,
         id: &str,
@@ -931,27 +1270,34 @@ impl Graph {
         let url = format!("{}/items/{}/versions/{}/content", self.drive_url(), encode_id(id), encode_id(version));
         // Only the redirect is read here; the content comes through
         // `download_to`, with its transfer timeout and stall detection.
-        let http = match self.no_redirect.get() {
-            Some(c) => c,
-            None => {
-                let c = http_builder().redirect(reqwest::redirect::Policy::none()).build()?;
-                self.no_redirect.get_or_init(|| c)
-            }
-        };
-        let _permit = self.limiter.acquire().await;
-        let resp = http.get(&url).bearer_auth(self.auth.access_token().await?).send().await?;
-        let status = resp.status().as_u16();
-        let to = match status {
-            301 | 302 | 303 | 307 | 308 => resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|l| l.to_str().ok())
-                .map(str::to_string)
-                .ok_or_else(|| Error::Status { status, what: "version download".into(), body: "no address".into() })?,
-            _ => return Err(Error::Status { status, what: "version download".into(), body: String::new() }),
-        };
-        drop(_permit);
+        let to = self.redirect_of(&url, true).await?;
         self.download_to(&to, out).await
+    }
+
+    /// Where `url` redirects to, asked without following it, through the
+    /// same throttling, retries and counting as every request (a 429 or
+    /// 503 pauses everyone for its `Retry-After`).
+    async fn redirect_of(&self, url: &str, auth: bool) -> Result<String> {
+        let req =
+            Req { auth, no_redirect: true, label: Some("version download"), ..Req::new(reqwest::Method::GET, url) };
+        let (status, _, m) = self.send_measured(&req).await?;
+        match status {
+            301 | 302 | 303 | 307 | 308 => m.location.ok_or_else(|| Error::Status {
+                status,
+                what: "version download".into(),
+                body: "no address".into(),
+            }),
+            _ => Err(Error::Status { status, what: "version download".into(), body: String::new() }),
+        }
+    }
+
+    /// The client that doesn't follow redirects.
+    fn no_redirect_client(&self) -> Result<&reqwest::Client> {
+        if let Some(c) = self.no_redirect.get() {
+            return Ok(c);
+        }
+        let c = http_builder().redirect(reqwest::redirect::Policy::none()).build()?;
+        Ok(self.no_redirect.get_or_init(|| c))
     }
 
     /// Graph's `restoreVersion`, with `If-Match: etag`. **OneDrive Personal
@@ -998,6 +1344,134 @@ impl Graph {
                 None => return Ok(out),
             }
         }
+    }
+
+    /// OneDrive's own search (`search(q=…)`, documented for OneDrive
+    /// Personal): items whose name, metadata or **content** match `text`,
+    /// as OneDrive ranks them, up to `top` (one page). Read-only, but the
+    /// text is sent to Microsoft: only on the user's say-so.
+    ///
+    /// The text never reaches a log or an error: they name the request
+    /// "OneDrive search", without its URL or OneDrive's reply. Not retried
+    /// (a network error is logged with its URL otherwise); the person can
+    /// search again.
+    pub async fn search(&self, text: &str, top: u32) -> Result<Vec<DriveItem>> {
+        let url = search_url(&self.top_url(), text, top);
+        self.search_at(&url).await
+    }
+
+    async fn search_at(&self, url: &str) -> Result<Vec<DriveItem>> {
+        let (_, body) = self.send(&search_req(url)).await?;
+        let page: Page = serde_json::from_slice(&body)?;
+        Ok(page.value.into_iter().filter(|it| !it.is_deleted()).map(|it| self.rooted(it)).collect())
+    }
+
+    /// The sharing of items `ids`, in the order given: each one's eTag and
+    /// all its permissions (links and people, inherited ones too), or
+    /// `None` if it no longer exists. Read-only, for the sharing audit on
+    /// demand: ten items per round trip (two batched requests each).
+    pub async fn sharing(&self, ids: &[&str]) -> Result<Vec<Result<Option<crate::model::ItemSharing>>>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(BATCH_MAX / 2) {
+            let reqs: Vec<BatchReq> = chunk
+                .iter()
+                .flat_map(|id| {
+                    let item = format!("{}/items/{}", self.drive, encode_segment(id));
+                    [
+                        BatchReq {
+                            method: reqwest::Method::GET,
+                            url: format!("{item}?$select=id,eTag,root"),
+                            if_match: None,
+                            body: None,
+                        },
+                        BatchReq {
+                            method: reqwest::Method::GET,
+                            url: format!("{item}/permissions"),
+                            if_match: None,
+                            body: None,
+                        },
+                    ]
+                })
+                .collect();
+            let answers = self.batch(&reqs).await?;
+            for pair in answers.chunks(2) {
+                let [item, perms] = pair else { continue };
+                out.push(self.item_sharing(item, perms).await);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn item_sharing(&self, item: &BatchResp, perms: &BatchResp) -> Result<Option<crate::model::ItemSharing>> {
+        // Only the item's own 404 says it's gone. Its permissions not found
+        // while the item is there isn't an answer to act on (a check that
+        // a permission is gone must know the item still exists).
+        if item.status == 404 {
+            return Ok(None);
+        }
+        let it = item.item()?;
+        if !(200..300).contains(&perms.status) {
+            return Err(perms.error("reading who an item is shared with"));
+        }
+        let mut permissions = Vec::new();
+        let mut page = perms.body.clone();
+        loop {
+            permissions.extend(
+                page.get("value")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(crate::model::Permission::from_json),
+            );
+            match page.get("@odata.nextLink").and_then(|n| n.as_str()) {
+                Some(n) => page = self.get(n).await?,
+                None => break,
+            }
+        }
+        let etag = it.e_tag.clone().ok_or_else(|| item.error("an item without an eTag"))?;
+        Ok(Some(crate::model::ItemSharing { etag, root: it.is_root(), permissions }))
+    }
+
+    /// Everything other people shared with the signed-in account, files and
+    /// folders (`sharedWithMe`; see [`Graph::shared_folders`] for the
+    /// permission it needs). Microsoft deprecated the request: it works in a
+    /// degraded state until November 2026 and then returns nothing. At most
+    /// `limit` items; the flag says whether there were more.
+    pub async fn shared_with_me(&self, limit: usize) -> Result<(Vec<crate::model::SharedItem>, bool)> {
+        let mut url = format!("{GRAPH}/me/drive/sharedWithMe");
+        let mut out = Vec::new();
+        loop {
+            let v: serde_json::Value = self.get(&url).await?;
+            out.extend(
+                v.get("value")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(crate::model::SharedItem::from_json),
+            );
+            let next = v.get("@odata.nextLink").and_then(|n| n.as_str());
+            if out.len() >= limit {
+                let more = out.len() > limit || next.is_some();
+                out.truncate(limit);
+                return Ok((out, more));
+            }
+            match next {
+                Some(n) => url = n.to_string(),
+                None => return Ok((out, false)),
+            }
+        }
+    }
+
+    /// First page URL of a listing of the whole drive with only what tells
+    /// shared items apart (`oneup shared --scan`, for items shared before
+    /// the mirror kept the `shared` facet).
+    pub fn shared_scan_url(&self) -> String {
+        format!("{}/delta?$top={PAGE_SIZE}&$select=id,shared,deleted", self.top_url())
+    }
+
+    /// An item's URL (`items/{id}`), for a request of the caller's own.
+    pub fn item_url(&self, id: &str) -> String {
+        format!("{}/items/{}", self.drive_url(), encode_id(id))
     }
 
     /// First page URL for a folder's direct children.
@@ -1059,18 +1533,380 @@ fn backoff(attempt: u32) -> Duration {
 mod tests {
     use super::*;
 
+    /// What's logged, for a test to read back.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
+        type Writer = Logged;
+        fn make_writer(&'a self) -> Logged {
+            self.clone()
+        }
+    }
+
+    /// What someone searches for is sent to OneDrive and nowhere else: a
+    /// failed search's error and the log name the request, not its URL,
+    /// and leave out a reply that repeats the text.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn search_text_never_reaches_errors_or_logs() {
+        use std::io::{Read, Write};
+        let logged = Logged::default();
+        let sub = tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).with_writer(logged.clone()).finish();
+        let _log = tracing::subscriber::set_default(sub);
+        let url = |port: u16| format!("http://127.0.0.1:{port}/me/drive/root/search(q='salary%20review')");
+        let g = graph();
+        // Nobody listening: a network error.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let u = url(port);
+        let refused = g.send(&Req { auth: false, ..search_req(&u) }).await.unwrap_err();
+        // OneDrive refusing it, its reply repeating the text.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let answer = std::thread::spawn(move || {
+            let (mut c, _) = server.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf).unwrap();
+            let body = r#"{"error":{"code":"invalidRequest","message":"bad query: salary review"}}"#;
+            write!(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                .unwrap();
+        });
+        let u = url(port);
+        let bad = g.send(&Req { auth: false, ..search_req(&u) }).await.unwrap_err();
+        answer.join().unwrap();
+        assert!(matches!(&bad, Error::Status { status: 400, what, .. } if what == "OneDrive search"), "{bad:?}");
+        let log = String::from_utf8(logged.0.lock().unwrap().clone()).unwrap();
+        for text in [format!("{refused} {refused:?}"), format!("{bad} {bad:?}"), log] {
+            assert!(!text.contains("salary"), "{text}");
+        }
+    }
+
+    /// A pair's client searches its own folder, in the drive that holds it
+    /// (another person's for a shared folder), and asks that drive for an
+    /// item's web page.
+    #[test]
+    fn a_scoped_client_searches_and_opens_inside_its_folder() {
+        let g = graph();
+        assert!(search_url(&g.top_url(), "tax", 5).starts_with(&format!("{GRAPH}/me/drive/root/search(q=")));
+        assert_eq!(g.web_url_request("A!1"), format!("{GRAPH}/me/drive/items/A%211?$select=webUrl"));
+        let g = graph().scoped(Some("abc!1"), "ABC!7");
+        assert!(
+            search_url(&g.top_url(), "tax", 5).starts_with(&format!("{GRAPH}/drives/abc%211/items/ABC%217/search(q=")),
+            "{}",
+            search_url(&g.top_url(), "tax", 5)
+        );
+        assert_eq!(g.web_url_request("B!2"), format!("{GRAPH}/drives/abc%211/items/B%212?$select=webUrl"));
+        let own = graph().scoped(None, "F!3");
+        assert!(search_url(&own.top_url(), "tax", 5).starts_with(&format!("{GRAPH}/me/drive/items/F%213/search(q=")));
+    }
+
+    #[test]
+    fn a_search_sends_the_text_as_one_quoted_string() {
+        let url = search_url("https://g/me/drive/root", "Bob's tax 2023/€", 50);
+        assert_eq!(
+            url.split('?').next(),
+            Some("https://g/me/drive/root/search(q=%27Bob%27%27s%20tax%202023%2F%E2%82%AC%27)")
+        );
+        assert!(url.contains("$top=50&$select="), "{url}");
+    }
+
     #[test]
     fn path_encoding_normalises_separators() {
         assert_eq!(encode_drive_path("/Trade/Trader/.venv"), "Trade/Trader/.venv");
         assert_eq!(encode_drive_path(r"\Trade\Trader"), "Trade/Trader");
         assert_eq!(encode_drive_path("/a b/#c%"), "a%20b/%23c%25");
         assert_eq!(encode_drive_path("/naïve"), "na%C3%AFve");
+        // An ID is one segment, whatever it holds.
+        assert_eq!(encode_segment("aTo/w+I="), "aTo%2Fw%2BI%3D");
+        assert_eq!(encode_segment("ABC!12"), "ABC%2112");
     }
 
     fn graph() -> Graph {
+        graph_with(1)
+    }
+
+    /// A client for loopback servers, with `n` requests at once.
+    fn graph_with(n: usize) -> Graph {
         let store = crate::DpapiFileStore::new(std::env::temp_dir().join("oneup-graph-test-none.dpapi"));
         let auth = Arc::new(Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
-        Graph::new(reqwest::Client::new(), auth, crate::Aimd::new(1, 1))
+        Graph::new(reqwest::Client::new(), auth, crate::Aimd::new(n, n))
+    }
+
+    /// A loopback server sending `body` bytes of each `size`-byte download,
+    /// then dropping the connection (all of it: a complete download).
+    async fn serve_body(size: usize, body: usize) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = s.read(&mut buf).await;
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {size}\r\n\r\n");
+                    let _ = s.write_all(head.as_bytes()).await;
+                    for c in vec![7u8; body].chunks(64 * 1024) {
+                        if s.write_all(c).await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = s.flush().await;
+                });
+            }
+        });
+        url
+    }
+
+    /// A one-connection server answering with `head` then `body` (written
+    /// in the pieces given, a moment apart), then closing.
+    async fn serve_raw(head: String, pieces: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let _ = s.read(&mut buf).await;
+            s.write_all(head.as_bytes()).await.unwrap();
+            for p in pieces {
+                s.write_all(&p).await.unwrap();
+                s.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = s.shutdown().await;
+        });
+        url
+    }
+
+    /// The last chunk of a download that goes past the budget completes it
+    /// (received and counted anyway, so not thrown away); a body of no told
+    /// length that uses the budget up exactly is complete too, the end of
+    /// it told by one more read.
+    #[tokio::test]
+    async fn a_download_completed_by_its_last_chunk_is_kept() {
+        let head = |len: Option<usize>| match len {
+            Some(n) => format!("HTTP/1.1 200 OK\r\ncontent-length: {n}\r\n\r\n"),
+            None => "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n".to_string(),
+        };
+        let url = serve_raw(head(Some(250_100)), vec![vec![1u8; 250_000], vec![2u8; 100]]).await;
+        let g = graph();
+        g.budget.set(Some(250_050));
+        let mut out = Vec::new();
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap();
+        assert_eq!(r.unwrap(), 250_100, "complete, not refused");
+        assert_eq!(g.budget.left(), Some(0));
+
+        let url = serve_raw(head(None), vec![vec![1u8; 100_000]]).await;
+        let g = graph();
+        g.budget.set(Some(100_000));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
+        assert_eq!(r.unwrap(), 100_000, "an exact fit of no told length");
+
+        // ...but one of no told length that goes on is stopped.
+        let url = serve_raw(head(None), vec![vec![1u8; 100_000], vec![2u8; 100_000]]).await;
+        let g = graph();
+        g.budget.set(Some(100_000));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
+        assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+    }
+
+    /// Every byte of an ordinary request takes from the live budget as it
+    /// goes: its JSON body and its answer, chunk by chunk (a large listing
+    /// can't run past it until the agent next counts).
+    #[tokio::test]
+    async fn answers_and_request_bodies_take_from_the_budget_as_they_go() {
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789012345678901234567890123456789";
+        let whole =
+            "HTTP/1.1 200 OK\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"nextExpectedRanges\":[\"5-\"]}";
+        let (url, _) = serve_each(vec![partial, whole]).await;
+        let g = graph();
+        g.budget.set(Some(1000));
+        tokio::time::timeout(Duration::from_secs(30), g.upload_status(&url)).await.unwrap().unwrap();
+        assert_eq!(g.budget.left(), Some(1000 - 40 - 29));
+        g.count_other(5, 7);
+        assert_eq!(g.budget.left(), Some(1000 - 40 - 29 - 12), "the push channel's too");
+    }
+
+    /// The redirect to a version's content is asked through the shared
+    /// throttling: a 429 pauses everyone for its `Retry-After` and is asked
+    /// again, then the address comes back unfollowed.
+    #[tokio::test]
+    async fn a_versions_redirect_honours_the_services_pause() {
+        let throttled =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let moved = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (url, count) = serve_each(vec![throttled, moved]).await;
+        let g = graph();
+        let started = std::time::Instant::now();
+        let to = tokio::time::timeout(Duration::from_secs(10), g.redirect_of(&url, false)).await.unwrap().unwrap();
+        assert_eq!(to, "http://127.0.0.1:9/content");
+        assert_eq!(count.load(Relaxed), 2, "asked again after the pause");
+        assert_eq!(g.stats.throttled.load(Relaxed), 1, "the shared limiter paused");
+        assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
+    }
+
+    /// A file the user opens skips the limit on requests at once, but
+    /// still waits out a pause the service asked for (`Retry-After`).
+    #[tokio::test]
+    async fn a_file_the_user_opens_still_waits_out_the_services_pause() {
+        let g = graph();
+        let _held = g.limiter().acquire().await;
+        let url = serve_body(1000, 1000).await;
+        g.limiter().on_throttle(Duration::from_millis(800));
+        let started = std::time::Instant::now();
+        let opened =
+            tokio::time::timeout(Duration::from_secs(5), g.download_within(&url, &mut Vec::new(), false)).await;
+        assert_eq!(opened.expect("not held up by the permits").unwrap(), 1000);
+        assert!(started.elapsed() >= Duration::from_millis(700), "waited {:?}", started.elapsed());
+    }
+
+    /// With every request permit held by background transfers, a file the
+    /// user opens still downloads; a background one waits its turn.
+    #[tokio::test]
+    async fn a_file_the_user_opens_doesnt_wait_behind_background_transfers() {
+        let g = graph();
+        let _held = g.limiter().acquire().await;
+        let url = serve_body(1000, 1000).await;
+        let opened =
+            tokio::time::timeout(Duration::from_secs(5), g.download_within(&url, &mut Vec::new(), false)).await;
+        assert_eq!(opened.expect("not held up").unwrap(), 1000);
+        let background = tokio::time::timeout(Duration::from_millis(300), g.download_to(&url, &mut Vec::new())).await;
+        assert!(background.is_err(), "waits for a permit");
+    }
+
+    /// A response cut off midway counts what arrived; the retry counts
+    /// again.
+    #[tokio::test]
+    async fn a_body_cut_off_midway_counts_what_arrived() {
+        let partial = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789012345678901234567890123456789";
+        let whole =
+            "HTTP/1.1 200 OK\r\nContent-Length: 29\r\nConnection: close\r\n\r\n{\"nextExpectedRanges\":[\"5-\"]}";
+        let (url, count) = serve_each(vec![partial, whole]).await;
+        let g = graph();
+        let next = tokio::time::timeout(Duration::from_secs(30), g.upload_status(&url)).await.unwrap().unwrap();
+        assert_eq!(next, Some(5));
+        assert_eq!(count.load(Relaxed), 2, "read again");
+        assert_eq!(g.stats.bytes.load(Relaxed), 40 + 29, "the cut-off part counts");
+    }
+
+    /// Downloads that use up exactly what's left are complete, not
+    /// refused; one with chunks still to come once the budget is used up is.
+    #[tokio::test]
+    async fn a_download_that_fits_the_budget_exactly_completes() {
+        const SIZE: usize = 300_000;
+        let url = serve_body(SIZE, SIZE).await;
+        let g = graph();
+        g.budget.set(Some(SIZE as u64));
+        let mut out = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap();
+        assert_eq!(n.unwrap(), SIZE as u64);
+        assert_eq!(g.budget.left(), Some(0));
+        g.budget.set(Some(SIZE as u64 / 4));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Vec::new())).await.unwrap();
+        assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+    }
+
+    /// What arrives counts even when it can't be written (a full disk):
+    /// the traffic was used.
+    #[tokio::test]
+    async fn bytes_received_count_even_when_writing_them_fails() {
+        struct Full;
+        impl std::io::Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk full"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let url = serve_body(200_000, 200_000).await;
+        let g = graph();
+        g.budget.set(Some(10_000_000));
+        let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut Full)).await.unwrap();
+        assert!(matches!(r, Err(Error::Local(_))), "{r:?}");
+        let got = g.stats.bytes.load(Relaxed);
+        assert!(got > 0, "counted");
+        assert_eq!(g.budget.left(), Some(10_000_000 - got), "and taken from the budget");
+    }
+
+    /// Eight downloads side by side, each dropping at 90%, tried again and
+    /// again: together they pass a 3 MB budget by one read at most, not
+    /// one read each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn downloads_side_by_side_pass_the_budget_by_one_read_at_most() {
+        const SIZE: usize = 1_000_000;
+        const BUDGET: u64 = 3_000_000;
+        let url = serve_body(SIZE, SIZE * 9 / 10).await;
+        let g = Arc::new(graph_with(8));
+        g.budget.set(Some(BUDGET));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (g, url) = (Arc::clone(&g), url.clone());
+                tokio::spawn(async move {
+                    for _ in 0..20 {
+                        let r = tokio::time::timeout(Duration::from_secs(20), g.download_to(&url, &mut Vec::new()))
+                            .await
+                            .unwrap();
+                        if matches!(r, Err(Error::OverBudget)) {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+            .collect();
+        for t in tasks {
+            assert!(t.await.unwrap(), "each stopped on the budget");
+        }
+        let got = g.stats.bytes.load(Relaxed);
+        assert!(got <= BUDGET + crate::budget::READ_MAX, "{got} bytes on a {BUDGET} budget");
+    }
+
+    /// An upload body counts and is checked against the budget at every
+    /// attempt, right before it goes: a throttled fragment sent twice
+    /// counts twice; a switch to a network whose budget is used up, while
+    /// the fragment waits for the cap, stops it before anything is sent.
+    #[tokio::test]
+    async fn each_attempt_of_an_upload_counts_and_is_checked_as_it_goes() {
+        let throttled =
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let accepted = "HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+        let (url, count) = serve_each(vec![throttled, accepted]).await;
+        let g = graph();
+        g.budget.set(Some(100));
+        g.upload_fragment(&url, 0, 10, b"0123456789").await.unwrap();
+        assert_eq!(count.load(Relaxed), 2);
+        assert_eq!(g.stats.sent.load(Relaxed), 20, "both sends");
+        assert_eq!(g.budget.left(), Some(80 - 2), "both sends, and the answer");
+
+        // Waiting for a 1 KB/s cap; meanwhile another network, no cap, and
+        // its budget used up.
+        let (url, count) = serve_each(vec![accepted]).await;
+        let g = Arc::new(graph());
+        g.upload.set(1000);
+        g.budget.set(Some(1_000_000));
+        let g2 = Arc::clone(&g);
+        let up = tokio::spawn(async move { g2.upload_fragment(&url, 0, 2000, &[0u8; 2000]).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        g.budget.set(Some(0));
+        g.upload.set(0);
+        let r = tokio::time::timeout(Duration::from_secs(1), up).await.expect("the new cap applied at once").unwrap();
+        assert!(matches!(r, Err(Error::OverBudget)), "{r:?}");
+        assert_eq!(count.load(Relaxed), 0, "nothing sent");
+        assert_eq!(g.stats.sent.load(Relaxed), 0);
     }
 
     #[test]
@@ -1097,6 +1933,8 @@ mod tests {
             deleted: None,
             root: None,
             file_system_info: None,
+            shared: None,
+            c_tag: None,
         };
         let r = g.rooted(item("ABC!7"));
         assert!(r.is_root() && r.parent_id().is_none(), "the scope's folder stands in for the root");
@@ -1123,6 +1961,68 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         url
+    }
+
+    /// The roadmap's flaky-link budget test: a 1 MB download that drops at
+    /// 90% every time (as rounds try it again) and an upload: what they
+    /// use stays within a 3 MB budget (over by one read at most), the
+    /// download stops once it's used up and nothing more is sent, while a
+    /// file the user opens still comes.
+    #[tokio::test]
+    async fn repeated_drops_stay_within_the_data_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const SIZE: usize = 1_000_000;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/f", l.local_addr().unwrap());
+        let served = Arc::new(AtomicU64::new(0));
+        let s2 = Arc::clone(&served);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else { return };
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = s.read(&mut buf).await;
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {SIZE}\r\n\r\n");
+                let _ = s.write_all(head.as_bytes()).await;
+                let body = vec![7u8; SIZE * 9 / 10];
+                for c in body.chunks(16 * 1024) {
+                    if s.write_all(c).await.is_err() {
+                        break;
+                    }
+                    s2.fetch_add(c.len() as u64, Relaxed);
+                }
+                // The connection drops.
+                drop(s);
+            }
+        });
+        let g = graph();
+        const BUDGET: u64 = 3_000_000;
+        g.budget.set(Some(BUDGET));
+        let mut tries = 0;
+        let stopped = loop {
+            tries += 1;
+            assert!(tries < 20, "never stopped");
+            let mut out = Vec::new();
+            match tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap() {
+                Err(Error::OverBudget) => break tries,
+                Err(_) => {}
+                Ok(_) => panic!("the server never sends it whole"),
+            }
+        };
+        let got = g.stats.bytes.load(Relaxed);
+        // Over by what one read brings at most.
+        assert!(got <= BUDGET + 512 * 1024, "{got} bytes received on a {BUDGET} budget");
+        assert!(got >= BUDGET - (SIZE as u64), "it used the budget before stopping: {got}");
+        assert!(stopped >= 4, "stopped on try {stopped}");
+        // Used up: nothing more goes out, and no request is made.
+        let before = g.stats.requests.load(Relaxed);
+        assert!(matches!(g.download_to(&url, &mut Vec::new()).await, Err(Error::OverBudget)));
+        assert!(matches!(g.upload_fragment("http://127.0.0.1:9/u", 0, 10, &[0u8; 10]).await, Err(Error::OverBudget)));
+        assert_eq!(g.stats.requests.load(Relaxed), before);
+        // A file the user opens comes anyway (and counts).
+        let mut out = Vec::new();
+        let opened = tokio::time::timeout(Duration::from_secs(10), g.download_within(&url, &mut out, false)).await;
+        assert!(!matches!(opened.unwrap(), Err(Error::OverBudget)));
+        assert!(out.len() >= SIZE / 2);
     }
 
     /// A loopback HTTP server answering each request (one per connection,
@@ -1197,10 +2097,22 @@ mod tests {
         assert_eq!(count.load(Relaxed), 2, "the throttled send was waited out and sent again");
     }
 
+    /// A restore asks for nothing to be replaced: its body names the folder
+    /// and the name only (no conflict behaviour), so a taken name is
+    /// refused.
+    #[test]
+    fn a_restore_never_asks_to_replace() {
+        let body = restore_body("P", "a.txt");
+        assert_eq!(body, serde_json::json!({ "parentReference": { "id": "P" }, "name": "a.txt" }));
+        assert!(!body.to_string().contains("conflictBehavior"));
+    }
+
     #[tokio::test]
     async fn a_download_that_stops_receiving_fails_instead_of_hanging() {
         let mut g = graph();
-        g.stall = Duration::from_millis(300);
+        // Long enough for a loopback request to be answered while the
+        // crate's other tests run in parallel (300 ms wasn't).
+        g.stall = Duration::from_millis(1500);
         let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc".to_vec(), vec![], Duration::ZERO).await;
         let mut out = Vec::new();
         let r = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await;
@@ -1211,13 +2123,13 @@ mod tests {
     #[tokio::test]
     async fn a_slow_download_that_keeps_moving_completes() {
         let mut g = graph();
-        g.stall = Duration::from_millis(300);
-        // Ten bytes, 100 ms apart: much longer in total than the stall limit.
-        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n".to_vec();
-        let url = serve(head, vec![b"x"; 10], Duration::from_millis(100)).await;
+        g.stall = Duration::from_millis(1500);
+        // Six bytes, 500 ms apart: twice the stall limit in total.
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n".to_vec();
+        let url = serve(head, vec![b"x"; 6], Duration::from_millis(500)).await;
         let mut out = Vec::new();
         let n = tokio::time::timeout(Duration::from_secs(10), g.download_to(&url, &mut out)).await.unwrap().unwrap();
-        assert_eq!((n, out.as_slice()), (10, b"xxxxxxxxxx".as_slice()));
+        assert_eq!((n, out.as_slice()), (6, b"xxxxxx".as_slice()));
     }
 
     #[tokio::test]
@@ -1266,6 +2178,140 @@ Content-Length: 50000000
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A loopback server answering each request (one per connection, read
+    /// whole first) with the next of `answers`, the last one again after
+    /// that, and keeping each request as text (request line, headers, body).
+    async fn serve_capture(answers: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = Arc::clone(&got);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = l.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let k = s.read(&mut buf).await.unwrap_or(0);
+                    if k == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..k]);
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let i = {
+                    let mut g = kept.lock().unwrap();
+                    g.push(String::from_utf8_lossy(&req).into_owned());
+                    g.len() - 1
+                };
+                let _ = s.write_all(answers[i.min(answers.len() - 1)].as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+        (base, got)
+    }
+
+    /// A client signed in (access token `tok`) talking to `base`.
+    fn signed_in(base: &str) -> Graph {
+        let auth = Arc::new(Auth::with_token("tok"));
+        Graph { base: base.into(), ..Graph::new(reqwest::Client::new(), auth, crate::Aimd::new(1, 1)) }
+    }
+
+    fn answer(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// How a batched pair of answers (the item, its permissions) is read:
+    /// only the item's own 404 says it's gone.
+    #[tokio::test]
+    async fn only_the_items_own_not_found_says_it_is_gone() {
+        let g = graph();
+        let resp = |status: u16, body: serde_json::Value| BatchResp { status, body };
+        let item = resp(200, serde_json::json!({ "id": "I!1", "eTag": "\"{E},3\"" }));
+        let perms =
+            resp(200, serde_json::json!({ "value": [{ "id": "p1", "roles": ["read"], "link": { "type": "view" } }] }));
+        let not_found = || resp(404, serde_json::json!({ "error": { "code": "itemNotFound" } }));
+
+        // Both there.
+        let s = g.item_sharing(&item, &perms).await.unwrap().unwrap();
+        assert_eq!((s.etag.as_str(), s.root, s.permissions.len()), ("\"{E},3\"", false, 1));
+        assert_eq!(s.permissions[0].id, "p1");
+        // The item gone (its permissions with it).
+        assert_eq!(g.item_sharing(&not_found(), &not_found()).await.unwrap(), None);
+        assert_eq!(g.item_sharing(&not_found(), &perms).await.unwrap(), None);
+        // The item there, its permissions not found: no answer to act on.
+        let e = g.item_sharing(&item, &not_found()).await.unwrap_err();
+        assert_eq!(e.status(), Some(404));
+        // An item without an eTag can't be acted on either.
+        let e = g.item_sharing(&resp(200, serde_json::json!({ "id": "I!1" })), &perms).await.unwrap_err();
+        assert!(e.status().is_some(), "{e}");
+    }
+
+    /// Removing a permission is a DELETE of exactly that permission,
+    /// conditional on the item's eTag (`If-Match`), with the token.
+    #[tokio::test]
+    async fn a_permission_is_removed_only_under_the_items_etag() {
+        let (base, got) = serve_capture(vec![answer("204 No Content", "")]).await;
+        signed_in(&base).delete_permission("I!1", "p/1", "\"{E},3\"").await.unwrap();
+        let reqs = got.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        let r = reqs[0].to_ascii_lowercase();
+        assert!(r.starts_with("delete /me/drive/items/i%211/permissions/p%2f1 http/1.1\r\n"), "{r}");
+        assert!(r.contains("\r\nif-match: \"{e},3\"\r\n"), "{r}");
+        assert!(r.contains("\r\nauthorization: bearer tok\r\n"), "{r}");
+    }
+
+    /// An eTag that moved on: 412, refused at once, never sent again.
+    #[tokio::test]
+    async fn a_removal_under_a_moved_etag_is_refused_and_not_retried() {
+        let body = r#"{"error":{"code":"resourceModified","message":"x"}}"#;
+        let (base, got) = serve_capture(vec![answer("412 Precondition Failed", body)]).await;
+        let e = signed_in(&base).delete_permission("I!1", "p1", "\"{E},3\"").await.unwrap_err();
+        assert_eq!((e.status(), e.code().as_deref()), (Some(412), Some("resourceModified")));
+        assert_eq!(got.lock().unwrap().len(), 1);
+        let (base, got) = serve_capture(vec![answer("412 Precondition Failed", body)]).await;
+        let e = signed_in(&base).set_permission_expiry("I!1", "p1", "\"{E},3\"", 0).await.unwrap_err();
+        assert_eq!(e.status(), Some(412));
+        assert_eq!(got.lock().unwrap().len(), 1);
+    }
+
+    /// Setting an expiry is a PATCH of that permission's
+    /// `expirationDateTime`, under the item's eTag; OneDrive's answer comes
+    /// back as the permission it now has.
+    #[tokio::test]
+    async fn an_expiry_is_patched_under_the_items_etag() {
+        let when = "2030-01-31T23:59:59Z";
+        let ms = time::OffsetDateTime::parse(when, &time::format_description::well_known::Rfc3339)
+            .map(|t| i64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap())
+            .unwrap();
+        let reply = format!(r#"{{"id":"p1","roles":["read"],"expirationDateTime":"{when}"}}"#);
+        let (base, got) = serve_capture(vec![answer("200 OK", &reply)]).await;
+        let p = signed_in(&base).set_permission_expiry("I!1", "p1", "\"{E},3\"", ms).await.unwrap();
+        assert_eq!((p.id.as_str(), p.expires_ms), ("p1", Some(ms)));
+        let reqs = got.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        let r = &reqs[0];
+        assert!(r.to_ascii_lowercase().starts_with("patch /me/drive/items/i%211/permissions/p1 http/1.1\r\n"), "{r}");
+        assert!(r.to_ascii_lowercase().contains("\r\nif-match: \"{e},3\"\r\n"), "{r}");
+        let body = &r[r.find("\r\n\r\n").unwrap() + 4..];
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v, serde_json::json!({ "expirationDateTime": when }));
     }
 
     #[test]

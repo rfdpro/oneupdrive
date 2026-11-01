@@ -24,6 +24,19 @@
 //! over its cap; the safety gate holds a batch that needs more (the
 //! overflow decision, `oneup_gate`).
 
+/// What putting a kept item back moves, and where
+/// ([`crate::LocalFs::kept_target`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptTarget {
+    /// The kept item: its file ID and stamp (none for a folder).
+    pub item: oneup_sync::LocalPre,
+    /// The folder it goes into.
+    pub dir: oneup_sync::LocalId,
+    pub name: String,
+    /// Where that is, relative to the sync folder.
+    pub rel: String,
+}
+
 /// One item in the version store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {

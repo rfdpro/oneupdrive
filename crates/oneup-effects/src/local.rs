@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oneup_gate::{Approved, OldCopy};
 use oneup_ntfs::FileId;
 use oneup_ntfs::dirent::{DirEntry, FILE_ATTRIBUTE_REPARSE_POINT};
-use oneup_ntfs::win::{self, Handle, Volume, WriteWatch};
+use oneup_ntfs::win::{self, Handle, Volume, WatchedFile};
 use oneup_rules::ENGINE_DIR;
+use oneup_sync::rewind::Step;
 use oneup_sync::{Hash, LocalId, LocalPre, Op};
 
 use crate::name::is_valid_name;
@@ -76,6 +77,11 @@ pub enum Error {
     NotEmpty,
     #[error("the name can't be used on Windows")]
     BadName,
+    /// A file to replace has changes beside it that aren't in it yet (a
+    /// SQLite database's `-wal` or `-journal`): replacing it would let
+    /// SQLite apply them to the new file. Nothing was done; try later.
+    #[error("a database with changes beside it that aren't in it yet")]
+    DatabaseWaits,
     #[error("outside the sync folder")]
     Outside,
     /// The token is for an operation this layer doesn't run (a remote or
@@ -160,53 +166,101 @@ impl Drop for Staged {
 }
 
 /// A local file opened for an upload, at the checked stamp. Other programs
-/// may keep using it, writing included: a save must never fail because
-/// the file is being uploaded. Instead, every read through this fails with
-/// [`ChangedMeanwhile`] once anyone has written the file since it was
-/// opened, so a copy mixing two versions never completes an upload.
+/// may keep using it, writing, replacing and deleting it included: a save
+/// must never fail because the file is being uploaded. Instead, every read
+/// through this fails with [`ChangedMeanwhile`] once anyone has written
+/// the file since it was opened, or needed it closed (`win::WatchedFile`),
+/// so a copy mixing two versions never completes an upload.
 #[derive(Debug)]
 pub struct UploadSource {
-    file: File,
-    watch: WriteWatch,
+    file: WatchedFile,
     pub size: i64,
     pub mtime: i64,
+    /// Where it was opened (`\\?\` form).
+    path: PathBuf,
+    /// Other files watched with it: the rest of a SQLite database's group
+    /// ([`LocalFs::check_database_upload`]). A change to any of them counts
+    /// as a change to this one.
+    also: Vec<WatchedFile>,
+    /// The SQLite database this file belongs to (or is): every read checks
+    /// that nothing waits outside it (`-wal`, `-journal`), so one created
+    /// during the read counts as a change too.
+    sqlite: Option<(PathBuf, crate::database::Look)>,
 }
 
 impl UploadSource {
-    /// Whether nobody has written the file since it was opened: what was
-    /// read so far is the checked version.
+    /// Whether nobody has written the file (or needed it closed) since it
+    /// was opened, nor any file watched with it: what was read so far is
+    /// the checked version.
     pub fn unchanged(&self) -> bool {
-        !self.watch.broken()
+        !self.file.broken()
+            && self.also.iter().all(|w| !w.broken())
+            && self.sqlite.as_ref().is_none_or(|(main, look)| matches!(look.sqlite_wait(main), Ok(None)))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn watch_also(&mut self, w: WatchedFile) {
+        self.also.push(w);
+    }
+
+    pub(crate) fn watch_sqlite(&mut self, main: PathBuf, look: crate::database::Look) {
+        self.sqlite = Some((main, look));
     }
 
     pub fn rewind(&mut self) -> std::io::Result<()> {
-        use std::io::Seek as _;
-        self.file.rewind()
+        self.file.rewind();
+        Ok(())
     }
 }
 
 impl std::io::Read for UploadSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.file.read(buf)?;
+        let read = self.file.read(buf);
         if !self.unchanged() {
             return Err(std::io::Error::other(ChangedMeanwhile));
         }
-        Ok(n)
+        read
     }
 }
 
-/// A planned file opened for reading at its checked stamp, watched for
-/// writes from the open on.
+/// A file read and hashed while its program could go on saving it
+/// ([`LocalFs::witness`]): it stands for that content until written, or
+/// needed closed by another program (its watched handle then closes).
+pub struct Witnessed {
+    /// `None`: a dehydrated placeholder whose identity vouched (nothing
+    /// here to write).
+    file: Option<WatchedFile>,
+}
+
+impl Witnessed {
+    /// No write since it was read.
+    pub fn unchanged(&self) -> bool {
+        self.file.as_ref().is_none_or(|f| !f.broken())
+    }
+}
+
+/// A planned file opened for reading at its checked stamp, watched from
+/// the open on.
 struct OpenedToRead {
-    handle: Handle,
-    watch: WriteWatch,
+    file: WatchedFile,
     size: i64,
     mtime: i64,
+    path: PathBuf,
 }
 
 impl OpenedToRead {
     fn into_source(self) -> UploadSource {
-        UploadSource { file: self.handle.into_file(), watch: self.watch, size: self.size, mtime: self.mtime }
+        UploadSource {
+            file: self.file,
+            size: self.size,
+            mtime: self.mtime,
+            path: self.path,
+            also: Vec::new(),
+            sqlite: None,
+        }
     }
 }
 
@@ -218,6 +272,21 @@ pub struct ChangedMeanwhile;
 impl ChangedMeanwhile {
     pub fn is(e: &std::io::Error) -> bool {
         e.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
+/// Test-only (feature `crash-test`): what an effect stopped by an injected
+/// crash returns ([`LocalFs::crash_after`]). It travels as an I/O error, so
+/// `Error` is the same with the feature on or off.
+#[cfg(feature = "crash-test")]
+#[derive(Debug, thiserror::Error)]
+#[error("injected crash")]
+pub struct Crashed;
+
+#[cfg(feature = "crash-test")]
+impl Crashed {
+    pub fn is(e: &Error) -> bool {
+        matches!(e, Error::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<Self>()))
     }
 }
 
@@ -236,6 +305,57 @@ pub struct LocalFs {
     /// (Files On-Demand): our placeholders are items like any other, and
     /// cloud content arrives as placeholders (`ondemand.rs`).
     on_demand: bool,
+    locator: Locate,
+    /// What counts as a database, for the checks made under a hold
+    /// ([`LocalFs::set_databases`]).
+    databases: std::sync::RwLock<oneup_rules::database::Databases>,
+    /// Crash points left to pass before the injected crash; negative: off.
+    #[cfg(feature = "crash-test")]
+    crash: std::sync::atomic::AtomicI64,
+    /// Test-only: asking Windows which programs have a file open fails.
+    #[cfg(feature = "crash-test")]
+    restart_manager_fails: std::sync::atomic::AtomicBool,
+    /// Test-only: reading the attributes of files with this name ending
+    /// fails.
+    #[cfg(feature = "crash-test")]
+    metadata_fails: std::sync::RwLock<Option<String>>,
+    /// See [`LocalFs::on_removing`].
+    #[cfg(feature = "crash-test")]
+    removing: Removing,
+}
+
+/// Test-only: called with a duplicate's path while [`LocalFs::remove_copy`]
+/// holds it open exclusively, its place checked ([`LocalFs::on_removing`]).
+#[cfg(feature = "crash-test")]
+pub type RemovingHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(feature = "crash-test")]
+#[derive(Default)]
+struct Removing(std::sync::Mutex<Option<RemovingHook>>);
+
+#[cfg(feature = "crash-test")]
+impl std::fmt::Debug for Removing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Removing")
+    }
+}
+
+/// Where the state database last saw a local item: its path relative to
+/// the sync folder, `/`-separated (`/a/b.txt`; `/` for the folder itself).
+/// The effects find items there by path, and by ID only if it no longer
+/// leads to them: while a file is open through a handle opened by ID, a
+/// program saving it by renaming another file over it fails
+/// (`win::Volume`'s docs). Only a hint: what is found there is used only if
+/// its file ID is the item's.
+pub type Locator = Box<dyn Fn(LocalId) -> Option<String> + Send + Sync>;
+
+#[derive(Default)]
+struct Locate(Option<Locator>);
+
+impl std::fmt::Debug for Locate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Locate(Some)" } else { "Locate(None)" })
+    }
 }
 
 impl LocalFs {
@@ -280,6 +400,16 @@ impl LocalFs {
             engine,
             seq: AtomicU64::new(0),
             on_demand,
+            locator: Locate::default(),
+            databases: std::sync::RwLock::default(),
+            #[cfg(feature = "crash-test")]
+            crash: std::sync::atomic::AtomicI64::new(-1),
+            #[cfg(feature = "crash-test")]
+            restart_manager_fails: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "crash-test")]
+            metadata_fails: std::sync::RwLock::default(),
+            #[cfg(feature = "crash-test")]
+            removing: Removing::default(),
         };
         match std::fs::read_to_string(fs.engine.join(MARKER)) {
             Ok(_) => {}
@@ -347,13 +477,122 @@ impl LocalFs {
         LocalId(self.root_id.0)
     }
 
+    /// Lets the effects find items where the state database last saw them
+    /// ([`Locator`]). Without one, every item is found by ID.
+    pub fn set_locator(&mut self, locator: Locator) {
+        self.locator = Locate(Some(locator));
+    }
+
+    /// How many items had to be opened by ID to be found: for tests and
+    /// diagnostics.
+    pub fn opened_by_id(&self) -> u64 {
+        self.volume.opened_by_id()
+    }
+
+    /// Where item `id` is expected ([`Locator`]), as a full path, if a
+    /// locator knows it.
+    pub(crate) fn hint(&self, id: FileId) -> Option<PathBuf> {
+        let rel = (self.locator.0.as_ref()?)(LocalId(id.0))?;
+        let mut path = self.root.clone();
+        for part in rel.split('/').filter(|p| !p.is_empty()) {
+            // Names from the store are single components; anything else
+            // isn't a usable hint (`\\?\` paths aren't normalised).
+            if part == "." || part == ".." || part.contains('\\') {
+                return None;
+            }
+            path.push(part);
+        }
+        Some(path)
+    }
+
+    /// What counts as a database from now on (`[databases]`), for the
+    /// checks the effects make themselves.
+    pub fn set_databases(&self, d: oneup_rules::database::Databases) {
+        *self.databases.write().unwrap_or_else(std::sync::PoisonError::into_inner) = d;
+    }
+
+    /// What counts as a database now ([`LocalFs::set_databases`]).
+    pub fn databases(&self) -> oneup_rules::database::Databases {
+        self.databases.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Test-only: asking Windows which programs have a file open fails
+    /// (`true`) or works again.
+    #[cfg(feature = "crash-test")]
+    pub fn fail_restart_manager(&self, on: bool) {
+        self.restart_manager_fails.store(on, Relaxed);
+    }
+
+    #[cfg(feature = "crash-test")]
+    pub(crate) fn restart_manager_fails(&self) -> bool {
+        self.restart_manager_fails.load(Relaxed)
+    }
+
+    /// Test-only: reading the attributes of a file whose name ends with
+    /// `suffix` (what's beside a database) fails, as when access is denied;
+    /// `None` makes it work again.
+    #[cfg(feature = "crash-test")]
+    pub fn fail_metadata(&self, suffix: Option<&str>) {
+        *self.metadata_fails.write().unwrap_or_else(std::sync::PoisonError::into_inner) = suffix.map(str::to_string);
+    }
+
+    #[cfg(feature = "crash-test")]
+    pub(crate) fn metadata_fails(&self) -> Option<String> {
+        self.metadata_fails.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
     /// Whether the sync folder is in Files On-Demand mode (see `ondemand.rs`).
     pub fn on_demand(&self) -> bool {
         self.on_demand
     }
 
+    /// Test-only: the crash point after `n` others have passed (here and
+    /// wherever the caller counts through [`LocalFs::crash_now`]) is where
+    /// the process dies. One inside an effect stops it there and returns
+    /// [`Crashed`]: nothing after it runs, no rollback included. `None`
+    /// turns it off.
+    #[cfg(feature = "crash-test")]
+    pub fn crash_after(&self, n: Option<u32>) {
+        self.crash.store(n.map_or(-1, i64::from), Relaxed);
+    }
+
+    /// Test-only: `f` runs inside [`LocalFs::remove_copy`] once the copy is
+    /// open exclusively and its place checked, just before it leaves it, so
+    /// a test can try what another program might do in that moment. `None`
+    /// turns it off.
+    #[cfg(feature = "crash-test")]
+    pub fn on_removing(&self, f: Option<RemovingHook>) {
+        *self.removing.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = f;
+    }
+
+    /// Test-only: whether a crash is still to come ([`LocalFs::crash_after`]).
+    #[cfg(feature = "crash-test")]
+    pub fn crash_armed(&self) -> bool {
+        self.crash.load(Relaxed) >= 0
+    }
+
+    /// Test-only: counts a crash point; `true` if the process dies here.
+    #[cfg(feature = "crash-test")]
+    pub fn crash_now(&self) -> bool {
+        self.crash.fetch_sub(1, Relaxed) == 0
+    }
+
+    /// A place inside a multi-step effect where a killed process would
+    /// leave it half done. Without the `crash-test` feature, nothing.
+    fn crash_point(&self) -> Result<()> {
+        #[cfg(feature = "crash-test")]
+        if self.crash_now() {
+            return Err(Error::Io(std::io::Error::other(Crashed)));
+        }
+        Ok(())
+    }
+
     pub(crate) fn volume(&self) -> &Volume {
         &self.volume
+    }
+
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
     }
 
     pub(crate) fn is_inside_pub(&self, path: &Path) -> bool {
@@ -395,7 +634,7 @@ impl LocalFs {
     /// Whether the item with this ID still exists inside the sync folder
     /// (outside OneUpDrive's own folder). Read-only.
     pub fn is_present(&self, id: LocalId) -> bool {
-        let Ok(h) = self.volume.open_attributes_by_id(FileId(id.0)) else { return false };
+        let Ok(h) = self.volume.open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()) else { return false };
         win::final_path(&h).is_ok_and(|p| self.is_inside(&long(&p)))
     }
 
@@ -404,7 +643,7 @@ impl LocalFs {
     /// outside the sync folder (or in OneUpDrive's own), `None` when it
     /// can't be told (access denied, a path that can't be read). Read-only.
     pub fn presence(&self, id: LocalId) -> Option<bool> {
-        match self.volume.open_attributes_by_id(FileId(id.0)) {
+        match self.volume.open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()) {
             Err(e) if e.is_not_found() => Some(false),
             Err(_) => None,
             Ok(h) => win::final_path(&h).ok().map(|p| self.is_inside(&long(&p))),
@@ -414,7 +653,7 @@ impl LocalFs {
     /// The current name of the item with this ID, if it exists inside the
     /// sync folder (outside OneUpDrive's own folder). Read-only.
     pub fn name_of(&self, id: LocalId) -> Option<String> {
-        let h = self.volume.open_attributes_by_id(FileId(id.0)).ok()?;
+        let h = self.volume.open_attributes(FileId(id.0), self.hint(FileId(id.0)).as_deref()).ok()?;
         let p = long(&win::final_path(&h).ok()?);
         if !self.is_inside(&p) {
             return None;
@@ -435,8 +674,158 @@ impl LocalFs {
             Op::RenameLocal { local, dir, name } | Op::ConflictCopy { local, dir, name, .. } => {
                 self.move_item(local, *dir, name, true)
             }
-            Op::RecycleLocal { local, .. } => self.recycle_item(local, OldCopy::Keep, None),
+            Op::RecycleLocal { local, .. } => self.recycle_item(local, OldCopy::Keep, None, None),
             _ => Err(Error::WrongOp),
+        }
+    }
+
+    /// Reads file `pre` and hashes it without stopping its program from
+    /// saving it (watched, `win::WatchedFile`, never an exclusive handle): it's
+    /// witnessed if it's still the planned stamp, at path `at` in the synced
+    /// folder ("/A/B/name", by its handle's final path, as Windows compares
+    /// names), and
+    /// hashes to `hash` with no write during the read. The witness then
+    /// stands until the file is written ([`Witnessed::unchanged`]). A
+    /// placeholder is never read: with `vouched`, one whose identity vouches
+    /// for `hash` is witnessed by that (its content is OneDrive's). `None`:
+    /// not witnessed.
+    pub fn witness(&self, pre: &LocalPre, at: &str, hash: &Hash, vouched: bool) -> Result<Option<Witnessed>> {
+        let Some((size, _)) = pre.stamp else { return Err(Error::WrongOp) };
+        if let Some((h, _, path)) = self.open_if_dehydrated(pre)? {
+            let ok = vouched && self.identity_hash(&h, size) == Some(*hash) && self.is_at(&path, at);
+            return Ok(ok.then_some(Witnessed { file: None }));
+        }
+        let mut opened = match self.open_for_read(pre) {
+            Ok(o) => o,
+            Err(Error::Changed | Error::NotOrdinary) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let Some(path) = opened.file.with_handle(win::final_path) else { return Ok(None) };
+        if !self.is_at(&long(&path?), at) {
+            return Ok(None);
+        }
+        let ordinary = opened.file.with_handle(|h| self.is_ordinary(h)).unwrap_or(false);
+        if !ordinary {
+            let vouches = opened.file.with_handle(|h| self.identity_hash(h, size)).flatten() == Some(*hash);
+            let w = Witnessed { file: Some(opened.file) };
+            return Ok((vouched && vouches && w.unchanged()).then_some(w));
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        let got = match oneup_hash::hash_reader(&mut opened.file, &mut buf) {
+            Ok(got) => got,
+            Err(_) if opened.file.broken() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let same = i64::try_from(got.len()).ok() == Some(size) && got.finalize() == *hash;
+        let w = Witnessed { file: Some(opened.file) };
+        Ok((same && w.unchanged()).then_some(w))
+    }
+
+    /// Whether `path` (an item's final path) is `at` in the synced folder
+    /// ("/A/B/name"), every name as Windows compares names: a folder above
+    /// it moved or renamed makes it another path.
+    fn is_at(&self, path: &Path, at: &str) -> bool {
+        let mut want = self.root.clone();
+        want.extend(at.split('/').filter(|p| !p.is_empty()));
+        let fold = |p: &Path| oneup_sync::fold(&p.to_string_lossy());
+        fold(path) == fold(&want)
+    }
+
+    /// Runs the part on this PC of an approved [`Op::RemoveCopy`], once its
+    /// OneDrive copy (if it has one) is gone: the file goes into the version
+    /// store, if it's still the planned stamp, at its planned path (its
+    /// folders' names and its own, by the exclusive handle's final path) and, read
+    /// through that handle, still the chosen content (`hash`): an edit that
+    /// kept the size and restored the time, another file that took the ID,
+    /// or the same file moved elsewhere, is left alone. A placeholder isn't
+    /// read (a dehydrated one would be downloaded): only for a synced copy,
+    /// whose OneDrive copy this same operation removed, and only if its
+    /// identity vouches for the chosen content; a dehydrated one then has
+    /// nothing to keep (OneDrive's recycle bin has its content) and is
+    /// deleted once it's out of its place, and a partly downloaded one is
+    /// left alone. `kept`: the watch on the copy that stays here, if it's
+    /// here; checked once the copy has left its place ([`Self::unless_saved`]):
+    /// saved since it was witnessed, the copy goes back and nothing is
+    /// removed.
+    pub fn remove_copy(&self, a: &Approved, kept: Option<&Witnessed>) -> Result<Done> {
+        let Op::RemoveCopy { local: Some(pre), local_dir: Some(_), local_up, remote, name, hash, .. } = a.op() else {
+            return Err(Error::WrongOp);
+        };
+        let Some((size, _)) = pre.stamp else { return Err(Error::WrongOp) };
+        let (h, entry, path) = self.open_item(pre)?;
+        if entry.is_dir() {
+            return Err(Error::WrongOp);
+        }
+        if !self.is_at(&path, &local_up.path(name)) {
+            return Err(Error::Changed);
+        }
+        // From here on the path checked is the copy's until it leaves it:
+        // while it's open, no folder above it can be moved or renamed
+        // (`a_folder_above_a_copy_being_removed_cant_move`).
+        #[cfg(feature = "crash-test")]
+        if let Some(f) = self.removing.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            f(&path);
+        }
+        if !self.is_ordinary(&h) {
+            if remote.is_none() || !self.on_demand || self.identity_hash(&h, size) != Some(*hash) {
+                return Err(Error::NotOrdinary);
+            }
+            if self.is_dehydrated(&h) {
+                // Under the hold no fetch can bring it content. It leaves its
+                // place the same way, so the survivor's check comes after,
+                // and is deleted from the version store only then.
+                let _hold = self.hold_dehydrated(&h).ok_or(Error::Changed)?;
+                let slot = self.keep(&h, &entry, &path)?;
+                self.unless_saved(kept, &h, &slot, &path)?;
+                win::delete_handle(&h)?;
+                drop(h);
+                self.drop_slot(&slot);
+                return Ok(Done::Recycled { kept: None });
+            }
+            if self.is_partial(&h, size) {
+                return Err(Error::NotOrdinary);
+            }
+            let slot = self.keep(&h, &entry, &path)?;
+            self.unless_saved(kept, &h, &slot, &path)?;
+            drop(h);
+            self.revert_kept(&slot, size);
+            return Ok(Done::Recycled { kept: Some(slot) });
+        }
+        let mut buf = vec![0u8; 1 << 20];
+        let got = oneup_hash::hash_reader(&*h.as_file(), &mut buf)?;
+        if i64::try_from(got.len()).ok() != Some(size) || got.finalize() != *hash {
+            tracing::info!("a duplicate chosen for removal has other content now, so it was left alone");
+            return Err(Error::Changed);
+        }
+        let slot = self.keep(&h, &entry, &path)?;
+        self.unless_saved(kept, &h, &slot, &path)?;
+        Ok(Done::Recycled { kept: Some(slot) })
+    }
+
+    /// A removal's last check, once the copy (open as `h`) has left its
+    /// place `from` for the version store (`slot`): if the copy that stays
+    /// here (`kept`) was saved since it was witnessed, the copy goes back
+    /// where it was, through the same handle and never over anything, and
+    /// nothing is removed ([`Error::Changed`]). So no save of the survivor
+    /// goes unseen while the copy is still in its place: one after this
+    /// check comes after the removal. Couldn't it go back (another file took
+    /// its name in that moment), it stays in the version store.
+    fn unless_saved(&self, kept: Option<&Witnessed>, h: &Handle, slot: &Path, from: &Path) -> Result<()> {
+        if kept.is_none_or(Witnessed::unchanged) {
+            return Ok(());
+        }
+        match win::rename_handle(h, from) {
+            Ok(()) => {
+                self.drop_slot(slot);
+                tracing::info!(
+                    "the copy of a duplicate that stays was saved meanwhile, so the chosen copy was left alone"
+                );
+                Err(Error::Changed)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the copy of a duplicate that stays was saved meanwhile; the chosen copy stays in the version store");
+                Ok(())
+            }
         }
     }
 
@@ -446,10 +835,20 @@ impl LocalFs {
     /// deleted without a local copy (OneDrive's recycle bin has it);
     /// otherwise it goes into the version store.
     pub fn recycle(&self, a: &Approved, synced: Option<&Hash>) -> Result<Done> {
-        let Op::RecycleLocal { local, .. } = a.op() else {
-            return Err(Error::WrongOp);
-        };
-        self.recycle_item(local, a.old_copy(), synced)
+        match a.op() {
+            // One that follows a rewind only from where it was then (`at`).
+            Op::RecycleLocal { local, .. } => self.recycle_item(local, a.old_copy(), synced, a.at()),
+            // A rewind sets a copy changed here aside: it's never the synced
+            // version, so it's always kept.
+            Op::Rewind { step, .. } => match &**step {
+                // Only from where the approval saw it (`at`).
+                Step::SetAside { local, at } | Step::Discard { local, at } => {
+                    self.recycle_item(local, OldCopy::Keep, None, Some(at))
+                }
+                _ => Err(Error::WrongOp),
+            },
+            _ => Err(Error::WrongOp),
+        }
     }
 
     /// A new, empty staging file for a download.
@@ -503,10 +902,20 @@ impl LocalFs {
                 {
                     return Err(Error::Changed);
                 }
+                // Checked under the exclusive handle, which keeps SQLite
+                // from opening the database (and so from writing beside
+                // it) until the replacement is done.
+                if self.pending_beside(&old, &old_path, old_entry.size)? {
+                    return Err(Error::DatabaseWaits);
+                }
                 // Decided before anything moves, under the exclusive handle,
                 // so the content checked is the content dropped.
                 let drop_old = a.old_copy() == OldCopy::DropIfSynced && self.is_synced(&old, pre, synced)?;
                 let kept = self.keep(&old, &old_entry, &old_path)?;
+                // Killed here, the old version is in the version store and
+                // the new one in staging, which the next start clears: the
+                // name is free until the next round downloads it again.
+                self.crash_point()?;
                 if let Err(e) = win::rename_handle(&new, &old_path) {
                     return match win::rename_handle(&old, &old_path) {
                         Ok(()) => {
@@ -521,7 +930,9 @@ impl LocalFs {
                         }
                     };
                 }
-                if drop_old { self.discard_kept(old, &kept) } else { Some(kept) }
+                // Killed here, both versions are kept: the new one in place.
+                self.crash_point()?;
+                if drop_old { self.discard_kept(old, &kept)? } else { Some(kept) }
             }
         };
         // Placed: the staging path no longer holds anything of ours.
@@ -534,13 +945,21 @@ impl LocalFs {
     /// Opens the local file of an approved [`Op::Upload`] for reading, after
     /// checking it is still the planned stamp.
     pub fn open_upload(&self, a: &Approved) -> Result<UploadSource> {
-        let Op::Upload { local, .. } = a.op() else {
+        let Op::Upload { local, name, .. } = a.op() else {
             return Err(Error::WrongOp);
         };
-        let opened = self.open_for_read(local)?;
+        let opened = match self.open_for_read(local) {
+            // SQLite deletes a rollback journal at the end of every
+            // transaction, and a file being deleted refuses to be opened
+            // (access denied): it changed.
+            Err(Error::Win(_)) if oneup_rules::database::Companion::of_name(name).is_some() => {
+                return Err(Error::Changed);
+            }
+            r => r?,
+        };
         // Reading a placeholder whose content isn't all here would ask the
         // cloud (ourselves) for it.
-        if self.on_demand && !self.fully_on_disk(&opened.handle, opened.size) {
+        if self.on_demand && !self.on_disk(&opened) {
             return Err(Error::NotOrdinary);
         }
         Ok(opened.into_source())
@@ -553,7 +972,7 @@ impl LocalFs {
     pub fn sample(&self, pre: &LocalPre, max: usize) -> Option<Vec<u8>> {
         use std::io::Read;
         let opened = self.open_for_read(pre).ok()?;
-        if self.on_demand && !self.fully_on_disk(&opened.handle, opened.size) {
+        if self.on_demand && !self.on_disk(&opened) {
             return None;
         }
         let mut head = Vec::with_capacity(max);
@@ -573,14 +992,13 @@ impl LocalFs {
         }
         let opened = self.open_for_read(pre)?;
         let (size, mtime) = (opened.size, opened.mtime);
-        let handle = &opened.handle;
         if self.on_demand {
             // A placeholder whose identity vouches for its content is never
             // read (a dehydrated one would be downloaded from ourselves).
-            if let Some(hash) = self.identity_hash(handle, size) {
+            if let Some(hash) = opened.file.with_handle(|h| self.identity_hash(h, size)).flatten() {
                 return Ok(Done::Hashed { hash, size, mtime });
             }
-            if !self.fully_on_disk(handle, size) {
+            if !self.on_disk(&opened) {
                 return Err(Error::NotOrdinary);
             }
         }
@@ -612,9 +1030,14 @@ impl LocalFs {
     fn move_item(&self, pre: &LocalPre, to: LocalId, name: &str, in_place: bool) -> Result<Done> {
         let (_pin, dir) = self.pin_folder(to)?;
         let target = dir.join(self.checked_name(to, name)?);
-        let (h, _, path) = self.open_item(pre)?;
+        let (h, entry, path) = self.open_item(pre)?;
         if in_place && path.parent() != Some(dir.as_path()) {
             return Err(Error::Changed);
+        }
+        // Databases and their working files, judged on the actual names
+        // right before the move (`database::check_move`).
+        if !entry.is_dir() {
+            self.check_move(&h, &path, entry.size, Some(&target))?;
         }
         let was_in_sync = self.on_demand && self.is_in_sync(&h);
         win::rename_handle(&h, &target)?;
@@ -625,8 +1048,22 @@ impl LocalFs {
         Ok(Done::Placed { parent: to, entry, kept: None })
     }
 
-    fn recycle_item(&self, pre: &LocalPre, old: OldCopy, synced: Option<&Hash>) -> Result<Done> {
+    /// `at`: where the item must be, from the sync folder (`/a/b.txt`),
+    /// checked on the handle it's moved by: one moved or renamed since (its
+    /// ID, size and last-write time unchanged) is left alone.
+    fn recycle_item(&self, pre: &LocalPre, old: OldCopy, synced: Option<&Hash>, at: Option<&str>) -> Result<Done> {
         let (h, entry, path) = self.open_item(pre)?;
+        if let Some(at) = at {
+            let rel = path.strip_prefix(&self.root).map_err(|_| Error::Outside)?;
+            let rel = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+            if !oneup_sync::same_name(&rel, at) {
+                return Err(Error::Changed);
+            }
+        }
+        // As for a move (`database::check_move`).
+        if !entry.is_dir() {
+            self.check_move(&h, &path, entry.size, None)?;
+        }
         if entry.is_dir() {
             // Children can still be added after this check (the folder is
             // shared for writing); they would then move along into the
@@ -689,16 +1126,19 @@ impl LocalFs {
 
     /// Deletes an old copy just moved into the version store, through the
     /// handle it was checked on, and removes its slot. If that fails, it
-    /// simply stays in the store (`Some`).
-    fn discard_kept(&self, h: Handle, kept: &Path) -> Option<PathBuf> {
+    /// simply stays in the store (`Some`). Errs only for an injected crash.
+    fn discard_kept(&self, h: Handle, kept: &Path) -> Result<Option<PathBuf>> {
         if let Err(e) = win::delete_handle(&h) {
             tracing::warn!(error = %e, "an old copy couldn't be removed; it stays in the version store");
-            return Some(kept.to_path_buf());
+            return Ok(Some(kept.to_path_buf()));
         }
         // The deletion completes when the handle closes.
         drop(h);
+        // Killed here, the slot holds only its origin, which the store's
+        // listing skips.
+        self.crash_point()?;
         self.drop_slot(kept);
-        None
+        Ok(None)
     }
 
     // ------------------------------------------------------- version store
@@ -766,13 +1206,13 @@ impl LocalFs {
         }
     }
 
-    /// Moves a kept item back into the sync folder: to `to` (a path relative
-    /// to the sync folder, `\` or `/` separated) or else where it came from.
-    /// Never replaces anything: if the name is taken, the item is restored
-    /// as `name (restored N).ext` beside it. The folder it goes into must
-    /// exist. Returns the path it was restored to, relative to the sync
-    /// folder. The next sync uploads it like any new file.
-    pub fn restore(&self, slot_id: &str, to: Option<&str>) -> Result<String> {
+    /// What putting kept item `slot_id` back would move, and where: to `to`
+    /// (a path relative to the sync folder, `\\` or `/` separated) or else
+    /// where it came from. The kept item by its file ID and stamp (size and
+    /// last-write time; none for a folder) and the destination folder by its
+    /// file ID, for a [`Step::RestoreKept`] that acts on exactly these. The
+    /// folder must exist.
+    pub fn kept_target(&self, slot_id: &str, to: Option<&str>) -> Result<crate::KeptTarget> {
         if !is_valid_name(slot_id, false) {
             return Err(Error::BadName);
         }
@@ -793,7 +1233,6 @@ impl LocalFs {
                 return Err(Error::BadName);
             }
         }
-        // Pin the destination folder so it can't be swapped while we move.
         let mut dir = self.root.clone();
         for f in folders {
             dir.push(f);
@@ -801,19 +1240,56 @@ impl LocalFs {
         let probe = win::open_dir(&dir).map_err(|_| Error::Changed)?;
         let (_, dir_id) = win::file_id(&probe)?;
         drop(probe);
-        let (_pin, dir_path) = self.pin_folder(LocalId(dir_id.0))?;
-
+        // An ordinary folder in the sync folder.
+        drop(self.pin_folder(LocalId(dir_id.0))?);
         let is_dir = item.file_type().is_ok_and(|t| t.is_dir());
         let h = win::open_path_for_change(&item.path(), is_dir)?;
+        let (_, id) = win::file_id(&h)?;
+        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        let stamp = if is_dir { None } else { Some((i64::try_from(entry.size).unwrap_or(i64::MAX), entry.modified)) };
+        check_placeholder(&entry, stamp, false)?;
+        Ok(crate::KeptTarget {
+            item: LocalPre { id: LocalId(id.0), stamp },
+            dir: LocalId(dir_id.0),
+            name: (*name).to_string(),
+            rel: parts.join("\\"),
+        })
+    }
+
+    /// Runs an approved [`Step::RestoreKept`]: the kept item, opened by its
+    /// file ID and checked on that handle (in its slot, its size and
+    /// last-write time as chosen), moves into the destination folder, pinned
+    /// by its file ID. Never replaces anything: if the name is taken, it's
+    /// restored as `name (restored N).ext` beside it. Returns the path it
+    /// was restored to, relative to the sync folder. The next sync uploads
+    /// it like any new file.
+    pub fn restore_approved(&self, a: &Approved) -> Result<String> {
+        let Op::Rewind { step, .. } = a.op() else { return Err(Error::WrongOp) };
+        let Step::RestoreKept { slot, item, dir, name } = &**step else { return Err(Error::WrongOp) };
+        if !is_valid_name(slot, false) {
+            return Err(Error::BadName);
+        }
+        let is_dir = item.stamp.is_none();
+        let slot_dir = self.engine.join(VERSIONS).join(slot);
+        let id = FileId(item.id.0);
+        let h = self.volume.open_for_change(id, is_dir, None).map_err(|_| Error::Changed)?;
+        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        check_placeholder(&entry, item.stamp, false)?;
+        let at = long(&win::final_path(&h)?);
+        if at.parent() != Some(slot_dir.as_path()) {
+            return Err(Error::Changed);
+        }
+        let name = self.checked_name(*dir, name)?;
+        // The destination pinned so it can't be swapped while we move.
+        let (_pin, dir_path) = self.pin_folder(*dir)?;
+        let rel_dir = dir_path.strip_prefix(&self.root).map(Path::to_path_buf).unwrap_or_default();
         for n in 0..100 {
-            let candidate = if n == 0 { (*name).to_string() } else { restored_name(name, n, is_dir) };
+            let candidate = if n == 0 { name.to_string() } else { restored_name(name, n, is_dir) };
             match win::rename_handle(&h, &dir_path.join(&candidate)) {
                 Ok(()) => {
                     drop(h);
-                    self.drop_slot(&slot.join(item.file_name()));
-                    let mut out: Vec<&str> = folders.to_vec();
-                    out.push(&candidate);
-                    return Ok(out.join("\\"));
+                    self.drop_slot(&at);
+                    return Ok(rel_dir.join(&candidate).to_string_lossy().into_owned());
                 }
                 Err(e) if e.is_exists() => continue,
                 Err(e) => return Err(e.into()),
@@ -908,7 +1384,7 @@ impl LocalFs {
         if let Some((h, entry, path)) = self.open_if_dehydrated(pre)? {
             return Ok((h, entry, path));
         }
-        let h = self.volume.open_for_change(id, pre.stamp.is_none())?;
+        let h = self.volume.open_for_change(id, pre.stamp.is_none(), self.hint(id).as_deref())?;
         let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
         check_placeholder(&entry, pre.stamp, self.on_demand)?;
         let path = long(&win::final_path(&h)?);
@@ -916,6 +1392,15 @@ impl LocalFs {
             return Err(Error::Outside);
         }
         Ok((h, entry, path))
+    }
+
+    /// Whether an opened file's content may be read: all of it on disk, and
+    /// an ordinary file or one of OneUpDrive's own placeholders (its
+    /// identity decodes as ours, `LocalFs::readable_here`), asked through
+    /// its own handle. Every read of user content in on-demand mode (an
+    /// upload, a hash, a sample) goes through this.
+    fn on_disk(&self, opened: &OpenedToRead) -> bool {
+        opened.file.with_handle(|h| self.readable_here(h, opened.size)).unwrap_or(false)
     }
 
     fn open_for_read(&self, pre: &LocalPre) -> Result<OpenedToRead> {
@@ -927,13 +1412,13 @@ impl LocalFs {
             // Opening it with data access would download it from ourselves.
             return Err(Error::NotOrdinary);
         }
-        let (h, watch, path) = self.volume.open_watched(id)?;
-        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        let (file, path) = self.volume.open_watched(id, self.hint(id).as_deref())?;
+        let entry = file.with_handle(|h| win::stat_handle(h, id)).ok_or(Error::Changed)??.ok_or(Error::Changed)?;
         check_placeholder(&entry, Some(stamp), self.on_demand)?;
         if !self.is_inside(&path) {
             return Err(Error::Outside);
         }
-        Ok(OpenedToRead { handle: h, watch, size: stamp.0, mtime: stamp.1 })
+        Ok(OpenedToRead { file, size: stamp.0, mtime: stamp.1, path })
     }
 
     /// Opens destination folder `id`, pinned in place for as long as the
@@ -978,12 +1463,17 @@ impl LocalFs {
     /// and returns its new path.
     fn keep(&self, h: &Handle, entry: &DirEntry, from: &Path) -> Result<PathBuf> {
         let slot = self.new_slot()?;
+        // Killed here, an empty slot is left, which the store's listing
+        // skips; the item is where it was.
+        self.crash_point()?;
         let name = if entry.name_lossy || entry.name.is_empty() { "item" } else { entry.name.as_str() };
         let kept = slot.join(name);
         if let Err(e) = win::rename_handle(h, &kept) {
             let _ = std::fs::remove_dir(&slot);
             return Err(e.into());
         }
+        // Killed here, the item is kept without its origin.
+        self.crash_point()?;
         // Best effort: where it came from, for `oneup restore`. The item is
         // safe either way.
         if let Ok(rel) = from.strip_prefix(&self.root) {
@@ -1048,7 +1538,7 @@ pub(crate) fn check_placeholder(entry: &DirEntry, stamp: Option<(i64, i64)>, our
 }
 
 /// A Cloud Files reparse tag (`IO_REPARSE_TAG_CLOUD` and its variants).
-fn is_cloud_tag(tag: u32) -> bool {
+pub(crate) fn is_cloud_tag(tag: u32) -> bool {
     tag & 0xFFFF_0FFF == 0x9000_001A
 }
 

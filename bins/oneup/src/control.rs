@@ -15,15 +15,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use oneup_gate::{Breaker, Overflow, OverflowOutcome, Side};
 use oneup_ipc::{
-    Activity, Answer, Call, Direction, INVALID_PARAMS, LastRun, NO_SUCH_BATCH, PauseState, RpcError, SafetyStop, Status,
+    Activity, Answer, Call, Direction, EventKind, Events, INVALID_PARAMS, LastRun, NO_SUCH_BATCH, PauseState, RpcError,
+    SafetyStop, Status,
 };
 use oneup_sync::Op;
 use tokio::sync::Notify;
 
+use crate::events::{Feed, New};
 use crate::sync::{Answers, Controls, Offer};
 
 /// In the data folder: the agent's pause (JSON), while there is one.
 pub const PAUSE_FILE: &str = "agent-pause.json";
+/// In the data folder while the user works offline (empty).
+pub const OFFLINE_FILE: &str = "agent-offline";
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -37,6 +41,11 @@ pub fn now_ms() -> i64 {
 pub struct LivePause {
     local: AtomicBool,
     remote: AtomicBool,
+    /// The network's policy now (`crate::network`), for transfers of file
+    /// contents: set the moment Windows reports another network.
+    net: Mutex<crate::network::Policy>,
+    /// The folder uses Files On-Demand: downloads are placeholders.
+    on_demand: AtomicBool,
 }
 
 impl LivePause {
@@ -45,22 +54,51 @@ impl LivePause {
         self.remote.store(remote, Relaxed);
     }
 
+    fn set_net(&self, p: &crate::network::Policy) {
+        *self.net.lock().unwrap_or_else(|e| e.into_inner()) = p.clone();
+    }
+
+    /// Whether the network lets `op` through now. A download's size isn't
+    /// known here: under a size limit, a download after a change of
+    /// network waits for the next round, which knows it.
+    /// Whether the network's policy now lets a transfer of `bytes`
+    /// (unknown: `None`) go `way` (working offline: nothing does).
+    pub fn allows(&self, way: crate::network::Way, bytes: Option<u64>) -> bool {
+        self.net.lock().unwrap_or_else(|e| e.into_inner()).allows(way, bytes)
+    }
+
+    fn net_allows(&self, op: &Op) -> bool {
+        match crate::network::content(op, self.on_demand.load(Relaxed), |_| None) {
+            Some((way, bytes)) => self.net.lock().unwrap_or_else(|e| e.into_inner()).allows(way, bytes),
+            None => true,
+        }
+    }
+
     /// For one round: whether an operation may run now. Not one that
     /// changes a side paused since the round began, nor, after that, any
     /// other changing that side, even if it resumed meanwhile: they may
     /// depend on one that didn't run. Bookkeeping always may.
+    ///
+    /// The same for a change of network: once its policy differs from the
+    /// one the round was planned under, a transfer of file contents it
+    /// doesn't let through stops that side for the rest of the round.
     pub fn round_check(&self) -> impl Fn(&Op) -> bool + Sync + '_ {
         let stopped = [AtomicBool::new(false), AtomicBool::new(false)];
+        let planned = self.net.lock().unwrap_or_else(|e| e.into_inner()).clone();
         move |op| {
-            let (i, paused) = match Side::changed_by(op) {
-                Some(Side::Local) => (0, &self.local),
-                Some(Side::Remote) => (1, &self.remote),
-                None => return true,
-            };
-            if paused.load(Relaxed) {
-                stopped[i].store(true, Relaxed);
+            // A duplicate removed from both sides changes both.
+            let changed = *self.net.lock().unwrap_or_else(|e| e.into_inner()) != planned;
+            let mut ok = true;
+            for (i, side, paused) in [(0, Side::Local, &self.local), (1, Side::Remote, &self.remote)] {
+                if !oneup_gate::changes(op, side) {
+                    continue;
+                }
+                if paused.load(Relaxed) || (changed && !self.net_allows(op)) {
+                    stopped[i].store(true, Relaxed);
+                }
+                ok &= !stopped[i].load(Relaxed);
             }
-            !stopped[i].load(Relaxed)
+            ok
         }
     }
 }
@@ -72,15 +110,29 @@ pub struct Control {
     live: Arc<LivePause>,
     /// Where the pause is saved (`None`: nowhere, in tests).
     pause_file: Option<PathBuf>,
+    /// Where working offline is noted (`None`: nowhere, in tests).
+    offline_file: Option<PathBuf>,
     /// Pinged when a call changed something the loop must act on.
     pub wake: Notify,
+    /// Pinged when the user turns working offline on or off, for a round
+    /// under way (its push channel closes at once).
+    pub offline_changed: Notify,
     /// Whether the push channel is live (set by the push task).
     pub push_up: Arc<AtomicBool>,
     /// Pinged once when a `stop` call arrives.
     pub stop: Notify,
+    /// The link to OneDrive is poor (`crate::link`): retries wait longer.
+    poor_link: AtomicBool,
     stopping: AtomicBool,
     /// The status revision, for clients that watch it (`Call::Watch`).
     rev: tokio::sync::watch::Sender<u64>,
+    /// What happened, for `oneup watch` and hooks (`Call::Events`).
+    pub events: Arc<Feed>,
+    /// Whether a client's process may use the pipe: the agent sets this so
+    /// its own hook processes are turned away (`crate::hooks`), so a hook
+    /// can't approve a safety stop or read the status. `None` (tests, `oneup
+    /// sync`): everyone may.
+    may_serve: std::sync::OnceLock<Box<dyn Fn(u32) -> bool + Send + Sync>>,
 }
 
 struct Shared {
@@ -104,7 +156,7 @@ struct Shared {
     /// [`Control::take_resolved`] collects it for the activity log).
     problem: Option<oneup_ipc::Problem>,
     resolved: Option<oneup_ipc::Problem>,
-    auto_pause: Option<String>,
+    auto_pause: Option<crate::autopause::Reason>,
     /// Paths to transfer first (`oneup sync-now PATH`), until a round settles.
     first: Vec<String>,
     /// The round being carried out, while one is.
@@ -113,11 +165,28 @@ struct Shared {
     unsynced: Option<oneup_ipc::Unsynced>,
     /// Failed items waiting before they're tried again (`crate::backoff`).
     retrying: Option<oneup_ipc::Retrying>,
+    databases: Vec<oneup_ipc::DatabaseNote>,
+    databases_more: u64,
     /// OneDrive is full: uploads wait, everything else goes on. Shown as
     /// the problem while no other one is.
     cloud_full: Option<oneup_ipc::Problem>,
+    /// The network and what it lets sync do (`crate::network`).
+    net: oneup_ipc::NetStatus,
+    /// What the network's profile lets rounds do.
+    policy: crate::network::Policy,
+    /// More data the user allowed on a used-up budget, for the agent to
+    /// add: (profile, month, MB), each for the profile and month it was
+    /// asked for (`crate::netusage`).
+    allowed: Vec<(String, String, u64)>,
+    /// The profile in effect, the month, and whether its budget is used
+    /// up: what an "allow more" answers.
+    budget_spot: Option<(String, String, bool)>,
+    /// The user chose to work offline (kept in [`OFFLINE_FILE`]).
+    offline: bool,
     /// The status as watchers last saw it (its `rev` left at 0).
     shown: Option<Status>,
+    /// The sides paused when that was last told as an event, and why.
+    paused_told: (bool, bool, Option<String>),
 }
 
 fn code(f: u64) -> String {
@@ -128,7 +197,15 @@ fn code(f: u64) -> String {
 /// both).
 fn paused_sides(s: &Shared) -> (bool, bool) {
     let auto = s.auto_pause.is_some();
-    (s.pause.local || auto, s.pause.remote || auto)
+    // Offline, nothing changes OneDrive; this PC's side still runs.
+    (s.pause.local || auto, s.pause.remote || auto || s.offline)
+}
+
+/// Whether the user paused sync (either side) in data folder `dir`, as
+/// saved, at `now`: what other work started by hand stops for.
+pub fn paused_in(dir: &Path, now: i64) -> bool {
+    let p = load_pause(&dir.join(PAUSE_FILE));
+    (p.local || p.remote) && p.until_ms.is_none_or(|u| u > now)
 }
 
 /// Reads a saved pause; anything unreadable counts as "not paused" (it's
@@ -155,9 +232,11 @@ impl Control {
     /// those given on the command line.
     pub fn new(data_dir: Option<&Path>, local: String, remote: String, answers: Answers) -> Self {
         let pause_file = data_dir.map(|d| d.join(PAUSE_FILE));
+        let offline_file = data_dir.map(|d| d.join(OFFLINE_FILE));
+        let offline = offline_file.as_deref().is_some_and(Path::exists);
         let pause = pause_file.as_deref().map(load_pause).unwrap_or_default();
         let live = LivePause::default();
-        live.set(pause.local, pause.remote);
+        live.set(pause.local, pause.remote || offline);
         Self {
             live: Arc::new(live),
             state: Mutex::new(Shared {
@@ -179,16 +258,35 @@ impl Control {
                 progress: None,
                 unsynced: None,
                 retrying: None,
+                databases: Vec::new(),
+                databases_more: 0,
                 cloud_full: None,
+                net: oneup_ipc::NetStatus::default(),
+                policy: crate::network::Policy::default(),
+                allowed: Vec::new(),
+                budget_spot: None,
+                offline,
                 shown: None,
+                paused_told: (pause.local, pause.remote, None),
             }),
             pause_file,
+            offline_file,
             wake: Notify::new(),
+            offline_changed: Notify::new(),
             push_up: Arc::new(AtomicBool::new(false)),
             stop: Notify::new(),
+            poor_link: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             rev: tokio::sync::watch::Sender::new(0),
+            events: Arc::new(Feed::new()),
+            may_serve: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Serve a client process only when `may_serve` returns true (the agent
+    /// turns away its own hook processes). Set once, before the pipe serves.
+    pub fn gate_clients(&self, may_serve: Box<dyn Fn(u32) -> bool + Send + Sync>) {
+        let _ = self.may_serve.set(may_serve);
     }
 
     /// Moves the revision on if the status changed, and passes the pause
@@ -197,11 +295,45 @@ impl Control {
     fn publish(&self, s: &mut Shared) {
         let (local, remote) = paused_sides(s);
         self.live.set(local, remote);
+        self.tell_pause(s, local, remote);
         let now = Status { rev: 0, ..self.status(s) };
         if s.shown.as_ref() != Some(&now) {
             s.shown = Some(now);
             self.rev.send_modify(|r| *r += 1);
         }
+    }
+
+    /// A pause beginning or ending, as an event: which sides, and why if
+    /// the agent paused by itself.
+    fn tell_pause(&self, s: &mut Shared, local: bool, remote: bool) {
+        // Events are English data, like the activity log.
+        let english = crate::l10n::Locale::english();
+        let now = (local, remote, s.auto_pause.as_ref().map(|r| r.said(&english)));
+        if s.paused_told == now {
+            return;
+        }
+        let sides = |l: bool, r: bool| match (l, r) {
+            (true, true) => "both directions",
+            (true, false) => "changes to this PC",
+            (false, true) => "changes to OneDrive",
+            (false, false) => "",
+        };
+        let (was_l, was_r, _) = s.paused_told;
+        let mut news = Vec::new();
+        let (began_l, began_r) = (local && !was_l, remote && !was_r);
+        if began_l || began_r || (now.2.is_some() && now.2 != s.paused_told.2) {
+            let detail = match &now.2 {
+                Some(why) => format!("{}; by itself: {why}", sides(local, remote)),
+                None => sides(local, remote).to_string(),
+            };
+            news.push(New::about_sync(EventKind::Paused, detail));
+        }
+        let (ended_l, ended_r) = (was_l && !local, was_r && !remote);
+        if ended_l || ended_r {
+            news.push(New::about_sync(EventKind::Resumed, sides(ended_l, ended_r)));
+        }
+        s.paused_told = now;
+        self.events.push(news);
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -242,7 +374,17 @@ impl Control {
             pause_remote,
             first: s.first.clone(),
             live: Some(Arc::clone(&self.live)),
+            net: crate::network::Policy { offline: s.offline, ..s.policy.clone() },
         }
+    }
+
+    /// Drops approval codes the rounds have used: each approves its list
+    /// once (`sync::Engine::spent_answers`).
+    pub fn forget_approvals(&self, codes: &[u64]) {
+        if codes.is_empty() {
+            return;
+        }
+        self.lock().answers.approve.retain(|c| !codes.contains(c));
     }
 
     /// The paths asked to go first have been dealt with (a round settled).
@@ -279,6 +421,17 @@ impl Control {
         self.publish(&mut s);
     }
 
+    /// The database files held back or warned about after the last rounds
+    /// (`crate::databases`).
+    pub fn set_databases(&self, d: Vec<oneup_ipc::DatabaseNote>, more: u64) {
+        let mut s = self.lock();
+        if s.databases != d || s.databases_more != more {
+            s.databases = d;
+            s.databases_more = more;
+            self.publish(&mut s);
+        }
+    }
+
     /// OneDrive is full (`crate::problem::cloud_full`), or no longer.
     pub fn set_cloud_full(&self, p: Option<oneup_ipc::Problem>) {
         let mut s = self.lock();
@@ -286,8 +439,68 @@ impl Control {
         self.publish(&mut s);
     }
 
+    /// How the agent uses the network now (`crate::network`, `crate::pace`).
+    pub fn set_network(&self, n: oneup_ipc::NetStatus) {
+        let mut s = self.lock();
+        let link = std::mem::take(&mut s.net.link);
+        s.net = oneup_ipc::NetStatus { link, offline: s.offline, ..n };
+        self.publish(&mut s);
+    }
+
+    /// What the network's profile lets rounds do: the next ones, and the
+    /// one under way from its next operation on.
+    pub fn set_policy(&self, p: crate::network::Policy) {
+        let mut s = self.lock();
+        self.live.set_net(&crate::network::Policy { offline: s.offline, ..p.clone() });
+        s.policy = p;
+    }
+
+    /// Whether the link to OneDrive is poor (`crate::link`).
+    pub fn set_poor_link(&self, poor: bool) {
+        if self.poor_link.swap(poor, Relaxed) != poor {
+            let mut s = self.lock();
+            s.net.link = if poor { "poor".into() } else { String::new() };
+            self.publish(&mut s);
+        }
+    }
+
+    pub fn poor_link(&self) -> bool {
+        self.poor_link.load(Relaxed)
+    }
+
+    /// Whether the user chose to work offline.
+    pub fn offline(&self) -> bool {
+        self.lock().offline
+    }
+
+    /// The profile in effect (`crate::network::Key::id`), the month, and
+    /// whether its budget is used up.
+    pub fn set_budget_spot(&self, profile: &str, month: &str, reached: bool) {
+        self.lock().budget_spot = Some((profile.to_string(), month.to_string(), reached));
+    }
+
+    /// More data allowed since last asked: (profile, month, MB), each to
+    /// be added to the profile and month it was asked for.
+    pub fn take_allowed(&self) -> Vec<(String, String, u64)> {
+        std::mem::take(&mut self.lock().allowed)
+    }
+
+    /// Allowances taken but not recorded (the write failed): handed out
+    /// again at the next [`Control::take_allowed`].
+    pub fn allow_again(&self, a: Vec<(String, String, u64)>) {
+        let mut s = self.lock();
+        let later = std::mem::replace(&mut s.allowed, a);
+        s.allowed.extend(later);
+    }
+
+    /// The folder uses Files On-Demand (cloud files arrive as placeholders,
+    /// which move no contents).
+    pub fn set_on_demand(&self, on: bool) {
+        self.live.on_demand.store(on, Relaxed);
+    }
+
     /// Why the agent paused by itself, or `None` when it didn't.
-    pub fn set_auto_pause(&self, why: Option<String>) {
+    pub fn set_auto_pause(&self, why: Option<crate::autopause::Reason>) {
         let mut s = self.lock();
         s.auto_pause = why;
         self.publish(&mut s);
@@ -298,6 +511,12 @@ impl Control {
         let mut s = self.lock();
         if p.is_some() {
             s.activity = Activity::Retrying;
+        }
+        // Once a spell, as the activity log notes it.
+        if let Some(new) = &p
+            && s.problem.as_ref().is_none_or(|old| old.kind != new.kind)
+        {
+            self.events.push(vec![New::about_sync(EventKind::Problem, format!("{}: {}", new.kind, new.title))]);
         }
         s.problem = p;
         self.publish(&mut s);
@@ -333,12 +552,15 @@ impl Control {
                 kind: match b.kind {
                     oneup_gate::BreakerKind::Mass => "mass".into(),
                     oneup_gate::BreakerKind::Suspicious => "content".into(),
+                    oneup_gate::BreakerKind::Removal => "removal".into(),
+                    oneup_gate::BreakerKind::Rewind => "rewind".into(),
                 },
                 side: match b.side {
                     Side::Local => "local".into(),
                     Side::Remote => "remote".into(),
                 },
                 count: b.count,
+                at_least: b.at_least,
                 recent: b.recent,
                 synced_items: b.synced_items,
                 code: code(b.fingerprint.0),
@@ -373,14 +595,25 @@ impl Control {
         // Kept while the agent still reports them: a round already under
         // way when the answer came can trip the same stop once more.
         s.prune_offer = offer;
-        let Shared { answered, stops, overflow, prune_offer, .. } = &mut *s;
+        let Shared { answered, stops, overflow, prune_offer, answers, .. } = &mut *s;
+        // An approval answers the stop it was given for while that stands:
+        // one the rounds didn't take in (the list changed meanwhile) isn't
+        // kept for an identical list some later raising shows.
+        answers.approve.retain(|f| stops.iter().any(|st| st.code == code(*f)));
         answered.retain(|c| {
             stops.iter().any(|st| &st.code == c)
                 || overflow.as_ref().is_some_and(|o| o.waiting && &o.code == c)
                 || prune_offer.as_ref().is_some_and(|o| &o.code == c)
         });
         if let Some(p) = s.problem.take() {
+            self.events.push(vec![New::about_sync(EventKind::Resolved, format!("{}: {}", p.kind, p.title))]);
             s.resolved = Some(p);
+        }
+        if new_stops {
+            // What and where, never the code that approves it.
+            self.events.push(
+                breakers.iter().map(|b| New::about_sync(EventKind::SafetyStop, crate::sync::breaker_what(b))).collect(),
+            );
         }
         self.publish(&mut s);
         Recorded { new_stops, new_overflow, new_offer }
@@ -420,11 +653,15 @@ impl Control {
                 o
             }),
             problem: s.problem.clone().or_else(|| s.cloud_full.clone()),
-            auto_pause: s.auto_pause.clone(),
+            auto_pause: s.auto_pause.as_ref().map(|r| r.key.to_string()),
+            auto_pause_hours: s.auto_pause.as_ref().and_then(|r| r.hours.clone()),
             prune_offer: s.prune_offer.clone().filter(|o| !s.answered.contains(&o.code)),
             progress: s.progress.clone(),
             unsynced: s.unsynced.clone(),
             retrying: s.retrying.clone(),
+            databases: s.databases.clone(),
+            databases_more: s.databases_more,
+            network: (s.net != oneup_ipc::NetStatus::default()).then(|| s.net.clone()),
         }
     }
 
@@ -433,8 +670,41 @@ impl Control {
         let mut wake = true;
         match call {
             // `serve` answers a watch itself; here it is a status.
-            Call::Status | Call::Watch { .. } => wake = false,
+            Call::Status | Call::Watch { .. } | Call::Events { .. } => wake = false,
             Call::SyncNow => {}
+            Call::Offline { on } => {
+                // A stored permit: a round under way sees it at its next look.
+                self.offline_changed.notify_one();
+                if s.offline != on {
+                    s.offline = on;
+                    if let Some(f) = &self.offline_file {
+                        let saved = if on {
+                            crate::ownfile::write(f, b"")
+                        } else {
+                            match std::fs::remove_file(f) {
+                                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                                _ => Ok(()),
+                            }
+                        };
+                        if let Err(e) = saved {
+                            tracing::warn!(error = %e, "can't save working offline; it lasts until oneupd stops");
+                        }
+                    }
+                    tracing::info!(on, "working offline");
+                    s.net.offline = on;
+                    self.live.set_net(&crate::network::Policy { offline: on, ..s.policy.clone() });
+                }
+            }
+            Call::AllowData { mb } => {
+                if !(1..=1_000_000).contains(&mb) {
+                    return Err(RpcError::new(INVALID_PARAMS, "allow from 1 MB to 1,000,000 MB"));
+                }
+                // For the budget used up now, on this network, this month.
+                let Some((profile, month, true)) = s.budget_spot.clone() else {
+                    return Err(RpcError::new(INVALID_PARAMS, "this network's data budget isn't used up"));
+                };
+                s.allowed.push((profile, month, mb));
+            }
             Call::SyncFirst { path } => {
                 // Bounded: a client can't grow the agent's memory.
                 if !s.first.contains(&path) && s.first.len() < 32 {
@@ -545,6 +815,18 @@ impl oneup_ipc::Handler for Control {
     fn changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.rev.subscribe())
     }
+
+    fn events(&self, since: Option<u64>) -> Result<Events, RpcError> {
+        Ok(self.events.page(since))
+    }
+
+    fn event_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.events.subscribe())
+    }
+
+    fn permit(&self, pid: u32) -> bool {
+        self.may_serve.get().is_none_or(|allow| allow(pid))
+    }
 }
 
 #[cfg(test)]
@@ -648,13 +930,127 @@ mod tests {
         assert!(live.round_check()(&there));
 
         // Pausing by itself pauses both sides, for the next rounds too.
-        c.set_auto_pause(Some("on a metered connection".into()));
+        c.set_auto_pause(Some(crate::autopause::Reason { key: "on a metered connection", hours: None }));
         let check = live.round_check();
         assert!(!check(&here) && !check(&there));
         assert!(c.controls().pause_local && c.controls().pause_remote);
         assert!(!c.snapshot().paused.local, "the user's pause is the user's");
         c.set_auto_pause(None);
         assert!(live.round_check()(&here));
+    }
+
+    /// Removing a synced duplicate changes both sides: a pause of either
+    /// stops it.
+    #[test]
+    fn a_pause_of_either_side_stops_removing_a_synced_duplicate() {
+        use oneup_sync::{Keep, LocalId, LocalPre, RemoteId, RemotePre};
+        let remote = RemotePre { id: RemoteId("r".into()), etag: "e".into() };
+        let op = Op::RemoveCopy {
+            sid: Some(1),
+            remote: Some(remote.clone()),
+            remote_dir: None,
+            remote_up: Default::default(),
+            local: Some(LocalPre { id: LocalId(1), stamp: Some((1, 1)) }),
+            local_dir: None,
+            local_up: Default::default(),
+            name: "a".into(),
+            hash: [0; 20],
+            keep: Keep::Remote(remote),
+        };
+        let c = control(None);
+        let live = c.controls().live.unwrap();
+        assert!(live.round_check()(&op));
+        c.call(Call::Pause { direction: Direction::Local, minutes: None }, 0).unwrap();
+        assert!(!live.round_check()(&op), "only this PC is paused");
+    }
+
+    /// Windows reporting a metered network mid-round (the agent sets the
+    /// new policy at once): the next upload doesn't start, nor anything
+    /// else changing OneDrive for the rest of that round; renames on this
+    /// PC still go. The next round plans what waits under the new policy.
+    #[test]
+    fn a_change_of_network_mid_round_stops_its_transfers_at_the_next_operation() {
+        use crate::network::{Policy, Transfer};
+        use oneup_sync::{Link, LocalId, LocalPre, RemoteId, RemotePre};
+        let c = control(None);
+        let live = c.controls().live.unwrap();
+        let upload = Op::Upload {
+            local: LocalPre { id: LocalId(1), stamp: Some((5_000_000, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "a".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let rename = Op::MoveLocal {
+            sid: 2,
+            local: LocalPre { id: LocalId(2), stamp: None },
+            to: LocalId(9),
+            parent: 1,
+            name: "b".into(),
+        };
+        let delete = Op::DeleteRemote { sid: 3, remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() } };
+        let check = live.round_check();
+        assert!(check(&upload), "planned under 'everything'");
+        c.set_policy(Policy { transfer: Transfer::Metadata, ..Policy::default() });
+        assert!(!check(&upload) && !check(&delete), "that side stops for the rest of the round");
+        assert!(check(&rename) && check(&Op::Forget(4)));
+        // The next round is planned under the new policy, which already
+        // left the upload out; what it planned goes.
+        assert!(live.round_check()(&delete));
+        // Back to a network that lets everything through: from the next
+        // operation on.
+        let check = live.round_check();
+        c.set_policy(Policy::default());
+        assert!(check(&upload));
+    }
+
+    /// Working offline holds every change to OneDrive (mid-round too) and
+    /// every transfer, keeps this PC's side going, and lasts across a
+    /// restart until the user goes back online.
+    #[test]
+    fn working_offline_holds_onedrive_and_is_kept_until_turned_off() {
+        use oneup_sync::{LocalId, LocalPre, RemoteId, RemotePre};
+        let dir = std::env::temp_dir().join(format!("oneup-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = control(Some(&dir));
+        let live = c.controls().live.unwrap();
+        let check = live.round_check();
+        let here = Op::RecycleLocal { sid: 1, local: LocalPre { id: LocalId(1), stamp: None } };
+        let there = Op::DeleteRemote { sid: 2, remote: RemotePre { id: RemoteId("r".into()), etag: "e".into() } };
+        let s = c.call(Call::Offline { on: true }, 0).unwrap();
+        assert!(s.network.is_some_and(|n| n.offline));
+        assert!(!check(&there) && check(&here), "mid-round: OneDrive's side stops");
+        let k = c.controls();
+        assert!(k.pause_remote && !k.pause_local && k.net.offline);
+        assert!(!k.net.allows(crate::network::Way::Down, Some(1)));
+        // Kept: an agent started now works offline too.
+        let again = control(Some(&dir));
+        assert!(again.offline() && again.controls().pause_remote);
+        again.call(Call::Offline { on: false }, 0).unwrap();
+        assert!(!control(Some(&dir)).offline());
+        assert!(!again.controls().pause_remote);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn more_data_allowed_is_handed_to_the_agent_once() {
+        let c = control(None);
+        c.set_budget_spot("metered", "2026-10", false);
+        assert!(c.call(Call::AllowData { mb: 500 }, 0).is_err(), "not used up: nothing to allow");
+        c.set_budget_spot("metered", "2026-10", true);
+        assert!(c.call(Call::AllowData { mb: 0 }, 0).is_err());
+        c.call(Call::AllowData { mb: 500 }, 0).unwrap();
+        // Another network before the agent takes it: still the metered
+        // profile's, for the month it was asked in.
+        c.set_budget_spot("{HOME}", "2026-10", true);
+        c.call(Call::AllowData { mb: 200 }, 0).unwrap();
+        let got = c.take_allowed();
+        assert_eq!(got, [("metered".into(), "2026-10".into(), 500), ("{HOME}".into(), "2026-10".into(), 200)]);
+        assert!(c.take_allowed().is_empty());
+        c.allow_again(got.clone());
+        assert_eq!(c.take_allowed(), got, "a failed write hands them out again");
     }
 
     #[test]
@@ -673,6 +1069,70 @@ mod tests {
         assert!(rev(&c) > r1);
     }
 
+    /// Pauses, problems and safety stops reach the event feed (for `oneup
+    /// watch` and hooks) once each, and a stop's event never carries the
+    /// code that approves it.
+    #[test]
+    fn what_happens_to_sync_itself_becomes_events_once() {
+        let c = control(None);
+        let kinds = |c: &Control| -> Vec<(EventKind, String)> {
+            c.events.page(Some(0)).items.into_iter().map(|e| (e.kind, e.detail)).collect()
+        };
+        c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
+        c.call(Call::Pause { direction: Direction::Remote, minutes: None }, 0).unwrap();
+        c.set_auto_pause(Some(crate::autopause::Reason { key: "on a metered connection", hours: None }));
+        c.set_auto_pause(None);
+        c.call(Call::Resume { direction: Direction::Both }, 0).unwrap();
+        let p = |kind: &str| oneup_ipc::Problem {
+            kind: kind.into(),
+            title: "Offline".into(),
+            detail: String::new(),
+            action: String::new(),
+            technical: String::new(),
+            since_ms: 0,
+            attempts: 1,
+            retry_ms: None,
+        };
+        c.set_problem(Some(p("offline")));
+        c.set_problem(Some(p("offline")));
+        let breaker = Breaker {
+            side: Side::Local,
+            count: 300,
+            recent: 0,
+            synced_items: 1000,
+            fingerprint: oneup_gate::Fingerprint(0x1234_5678_9abc_def0),
+            kind: oneup_gate::BreakerKind::Mass,
+            at_least: false,
+            items: Vec::new(),
+            later: Vec::new(),
+            sids: Vec::new(),
+        };
+        c.record(1, None, std::slice::from_ref(&breaker), None, None);
+        c.record(2, None, std::slice::from_ref(&breaker), None, None);
+        let got = kinds(&c);
+        let names: Vec<EventKind> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            names,
+            [
+                EventKind::Paused,
+                EventKind::Paused,
+                EventKind::Resumed,
+                EventKind::Resumed,
+                EventKind::Problem,
+                EventKind::Resolved,
+                EventKind::SafetyStop,
+            ],
+            "{got:?}"
+        );
+        assert_eq!(got[0].1, "changes to OneDrive");
+        assert!(got[1].1.contains("by itself: on a metered connection"), "{got:?}");
+        // Its own pause over, this PC's side goes again; the user's pause
+        // of the other side stands until resumed.
+        assert_eq!((got[2].1.as_str(), got[3].1.as_str()), ("changes to this PC", "changes to OneDrive"));
+        assert!(got[6].1.contains("300 items on this PC"), "{got:?}");
+        assert!(got.iter().all(|(_, d)| !d.contains("123456789abcdef0")), "no approval code");
+    }
+
     #[test]
     fn only_codes_the_agent_is_waiting_for_are_accepted() {
         let c = control(None);
@@ -689,6 +1149,10 @@ mod tests {
             synced_items: 100,
             fingerprint: Fingerprint(0xab),
             kind: oneup_gate::BreakerKind::Mass,
+            items: Vec::new(),
+            later: Vec::new(),
+            sids: Vec::new(),
+            at_least: false,
         };
         let overflow = Overflow {
             count: 2,
@@ -705,6 +1169,9 @@ mod tests {
         let s = answer("00000000000000AB", Answer::Approve).unwrap();
         assert_eq!((s.checked_ms, s.last.unwrap().done), (Some(9), 3));
         assert_eq!(c.controls().answers.approve, vec![0xab]);
+        // Once the rounds used it, it approves nothing more.
+        c.forget_approvals(&[0xab]);
+        assert!(c.controls().answers.approve.is_empty());
         // Answered: no longer waiting, though the rounds carrying it out
         // haven't ended (nor when one under way trips it once more).
         assert!(s.safety_stops.is_empty());
@@ -724,7 +1191,14 @@ mod tests {
         assert_eq!(c.record(10, last(), &[], Some(&done), None), rec(false, true));
         assert_eq!(answer("00000000000000cd", Answer::Keep).unwrap_err().code, NO_SUCH_BATCH);
         // The same stop tripping again later is a new question.
-        assert_eq!(c.record(11, None, &[breaker], None, None), rec(true, false));
+        assert_eq!(c.record(11, None, std::slice::from_ref(&breaker), None, None), rec(true, false));
         assert_eq!(c.snapshot().safety_stops.len(), 1);
+        // An approval the rounds never took in goes once its stop no longer
+        // stands: it doesn't approve an identical list raised later.
+        answer("00000000000000AB", Answer::Approve).unwrap();
+        c.record(12, None, std::slice::from_ref(&breaker), None, None);
+        assert_eq!(c.controls().answers.approve, vec![0xab], "kept while it stands");
+        c.record(13, None, &[], None, None);
+        assert!(c.controls().answers.approve.is_empty(), "dropped once it no longer stands");
     }
 }

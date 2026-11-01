@@ -171,8 +171,17 @@ fn join_path(parent: &str, name: &str) -> String {
 }
 
 /// (Re)queues a folder-scoped delta unit for `id`, resetting any finished one.
+///
+/// The unit's path is empty when the folder has none yet: pages apply one at
+/// a time, so folders that swapped places in OneDrive can sit in a loop
+/// until the page with the last of them. `run_unit` asks OneDrive for the
+/// path when it needs one.
 fn requeue_enumeration(o: &Ops<'_>, id: &str) -> oneup_store::Result<()> {
-    let path = o.path_of(id)?.unwrap_or_default();
+    let path = match o.path_of(id) {
+        Ok(path) => path.unwrap_or_default(),
+        Err(oneup_store::Error::Corrupt(_)) => String::new(),
+        Err(e) => return Err(e),
+    };
     o.requeue_unit(&Unit {
         folder_id: id.to_string(),
         path,
@@ -554,8 +563,20 @@ async fn run_unit<A: RemoteApi>(
                     && tried_path.is_none()
                     && matches!(e.status(), Some(400 | 501)) =>
             {
-                url = api.delta_by_path_url(&unit.path);
-                tried_path = Some(unit.path.clone());
+                let path = if unit.path.is_empty() {
+                    match current_path(&*api, &store, &id).await? {
+                        Some(path) => path,
+                        None => {
+                            let fid = id.clone();
+                            Mirror::<A>::db(&store, move |s| s.write(|o| o.finish_unit(&fid, 0))).await?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    unit.path.clone()
+                };
+                url = api.delta_by_path_url(&path);
+                tried_path = Some(path);
                 continue;
             }
             // Not found. Only a folder gone by its id is done with (catch-up
@@ -672,5 +693,31 @@ mod tests {
         assert!(t.due(t0 + Duration::from_secs(1)));
         assert!(!t.due(t0 + Duration::from_millis(1500)));
         assert!(t.due(t0 + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_folder_in_a_loop_is_queued_without_a_path() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            let mut t = Tally::default();
+            // Two folders that swapped places in OneDrive, the first page of
+            // the change applied: `a` under `b` and `b` under `a`.
+            for json in [
+                r#"{"id":"R","name":"root","root":{},"folder":{"childCount":1}}"#,
+                r#"{"id":"a","name":"a","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":0},"parentReference":{"id":"a"}}"#,
+                r#"{"id":"a","name":"a","folder":{"childCount":1},"parentReference":{"id":"b"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                ingest::apply(o, &ExcludeSet::none(), Mode::CatchUp, &item, &mut t)?;
+            }
+            assert!(o.path_of("a").is_err());
+            requeue_enumeration(o, "a")?;
+            let units = o.pending_units(10)?;
+            assert_eq!(units.len(), 1);
+            assert_eq!((units[0].folder_id.as_str(), units[0].path.as_str()), ("a", ""));
+            Ok(())
+        })
+        .unwrap();
     }
 }

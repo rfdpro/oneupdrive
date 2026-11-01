@@ -602,6 +602,18 @@ fn metadata(size: i64, modified: i64, folder: bool) -> CF_FS_METADATA {
     }
 }
 
+fn updated_metadata(f: &File, size: i64, modified: i64) -> Result<CF_FS_METADATA> {
+    use std::os::windows::fs::MetadataExt;
+    let mut md = metadata(size, modified, false);
+    // Creation time identifies this incarnation of the file ID, including
+    // while recovering a cloud update interrupted before its pin returned.
+    let old = f.metadata()?;
+    md.BasicInfo.CreationTime = old.creation_time() as i64;
+    md.BasicInfo.LastAccessTime = old.last_access_time() as i64;
+    md.BasicInfo.FileAttributes = old.file_attributes();
+    Ok(md)
+}
+
 /// "Always keep on this device" and "Free up space", as Windows stores them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pin {
@@ -716,7 +728,7 @@ pub fn update_dehydrated(f: &File, identity: &[u8], size: i64, modified: i64) ->
     if i.on_disk != 0 {
         return Err(Error::Hydrated);
     }
-    let md = metadata(size, modified, false);
+    let md = updated_metadata(f, size, modified)?;
     // SAFETY: `md` and `identity` outlive the synchronous call.
     let r = unsafe {
         CfUpdatePlaceholder(
@@ -727,12 +739,26 @@ pub fn update_dehydrated(f: &File, identity: &[u8], size: i64, modified: i64) ->
             None,
             // VERIFY_IN_SYNC as well: should it have been hydrated and edited
             // since the check above, the edit is never dehydrated away.
-            CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_VERIFY_IN_SYNC,
+            CF_UPDATE_FLAG_MARK_IN_SYNC
+                | CF_UPDATE_FLAG_DEHYDRATE
+                | CF_UPDATE_FLAG_VERIFY_IN_SYNC
+                | CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA,
             None,
             None,
         )
     };
     win("CfUpdatePlaceholder", r)
+}
+
+/// Temporarily clears a pin for a cloud version update, restoring it even
+/// when the update fails. The caller must hold the file exclusively (or
+/// hold its dehydrated identity) and durably record the pin first.
+pub fn updating_pinned<T>(f: &File, update: impl FnOnce() -> Result<T>) -> Result<T> {
+    set_pin(f, Pin::Unspecified)?;
+    let result = update();
+    let restored = set_pin(f, Pin::Pinned);
+    restored?;
+    result
 }
 
 /// Marks the placeholder in sync without touching its content or identity:
@@ -750,6 +776,37 @@ pub fn set_in_sync(f: &File) -> Result<()> {
 pub fn set_pin_tree(f: &File, pin: Pin) -> Result<()> {
     // SAFETY: a valid handle; synchronous.
     win("CfSetPinState", unsafe { CfSetPinState(handle(f), pin.raw(), CF_SET_PIN_FLAG_RECURSE, None) })
+}
+
+/// The open item's identity: its 128-bit file ID and creation time
+/// (FILETIME), read from the handle, so a caller acting through that same
+/// handle knows which item it has. A file ID can be reused once its file is
+/// gone; with the creation time, a replacement is told apart.
+pub fn identity(f: &File) -> Result<(u128, i64)> {
+    use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx};
+    let mut id = FILE_ID_INFO::default();
+    // SAFETY: a valid handle; the output buffer is a properly sized, writable struct.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle(f),
+            FileIdInfo,
+            std::ptr::from_mut(&mut id).cast::<c_void>(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(|e| Error::Win { what: "GetFileInformationByHandleEx(FileIdInfo)", source: e })?;
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: as above.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle(f),
+            FileBasicInfo,
+            std::ptr::from_mut(&mut basic).cast::<c_void>(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .map_err(|e| Error::Win { what: "GetFileInformationByHandleEx(FileBasicInfo)", source: e })?;
+    Ok((u128::from_le_bytes(id.FileId.Identifier), basic.CreationTime))
 }
 
 /// Sets the pin state ("Always keep on this device" / "Free up space").
@@ -823,11 +880,12 @@ impl Exclusive {
     /// the placeholder also takes a new identity, size and time (a cloud
     /// edit) and stays in sync.
     pub fn dehydrate(&self, new: Option<(&[u8], i64, i64)>) -> Result<()> {
-        let md = new.map(|(_, size, modified)| metadata(size, modified, false));
+        let md = new.map(|(_, size, modified)| updated_metadata(&self.0, size, modified)).transpose()?;
         let (id, len) = new.map_or((None, 0), |(id, _, _)| (Some(id.as_ptr().cast::<c_void>()), id.len() as u32));
         let mut flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_VERIFY_IN_SYNC;
         if new.is_some() {
-            flags |= CF_UPDATE_FLAG_MARK_IN_SYNC;
+            // Pass zero lengths through too: a cloud file can become empty.
+            flags |= CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA;
         }
         // SAFETY: `md` and the identity bytes outlive the synchronous call.
         let r = unsafe {
@@ -886,6 +944,25 @@ impl Exclusive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handle tells which item it has: a file put in place of another
+    /// under the same name has another identity.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn identity_tells_a_replacement_apart() {
+        let dir = std::env::temp_dir().join(format!("oneup-cfapi-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.txt");
+        std::fs::write(&p, b"one").unwrap();
+        let first = identity(&open(&p).unwrap()).unwrap();
+        assert_eq!(identity(&open(&p).unwrap()).unwrap(), first, "the same item");
+        std::fs::remove_file(&p).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&p, b"two").unwrap();
+        assert_ne!(identity(&open(&p).unwrap()).unwrap(), first, "another item");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_hold_and_a_fetch_of_one_identity_exclude_each_other() {

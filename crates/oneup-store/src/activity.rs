@@ -103,21 +103,49 @@ impl Ops<'_> {
         let last: Option<i64> =
             self.c.query_row("SELECT max(seq) FROM activity", [], |r| r.get(0)).optional()?.flatten();
         if let Some(last) = last {
-            self.c.prepare_cached("DELETE FROM activity WHERE seq <= ?1")?.execute([last - KEEP])?;
+            // An entry a pending sharing change will settle stays: its
+            // outcome must have somewhere to go.
+            self.c
+                .prepare_cached("DELETE FROM activity WHERE seq <= ?1 AND seq NOT IN (SELECT seq FROM sharing_intent)")?
+                .execute([last - KEEP])?;
         }
         Ok(())
+    }
+
+    /// Adds one entry for something about to be done, before it's done, and
+    /// returns its sequence number for [`Ops::activity_settle`]: if the
+    /// process dies in between, the record of the attempt stays.
+    pub fn activity_begin(&self, e: &Entry) -> Result<i64> {
+        self.activity_add(std::slice::from_ref(e))?;
+        Ok(self.c.query_row("SELECT max(seq) FROM activity", [], |r| r.get(0))?)
+    }
+
+    /// How an entry [`Ops::activity_begin`] added ended. Returns whether
+    /// the entry was there to settle.
+    pub fn activity_settle(&self, seq: i64, outcome: Outcome, detail: &str) -> Result<bool> {
+        let n = self
+            .c
+            .prepare_cached("UPDATE activity SET outcome = ?2, detail = ?3 WHERE seq = ?1")?
+            .execute(rusqlite::params![seq, outcome.code(), detail])?;
+        Ok(n == 1)
     }
 
     /// The latest `limit` entries, newest first; only those for `path` (the
     /// item itself, or anything inside it if it's a folder) if given. Paths
     /// compare case-insensitively (ASCII), as Windows names do.
     pub fn activity_recent(&self, path: Option<&str>, limit: usize) -> Result<Vec<Entry>> {
+        self.activity_page(path, None, limit)
+    }
+
+    /// A page of retained activity, older than `before` when supplied.
+    pub fn activity_page(&self, path: Option<&str>, before: Option<i64>, limit: usize) -> Result<Vec<Entry>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let before = before.unwrap_or(i64::MAX);
         let rows = match path {
             None => self
                 .c
-                .prepare_cached(&format!("SELECT {COLS} FROM activity ORDER BY seq DESC LIMIT ?1"))?
-                .query_map([limit], entry)?
+                .prepare_cached(&format!("SELECT {COLS} FROM activity WHERE seq < ?2 ORDER BY seq DESC LIMIT ?1"))?
+                .query_map([limit, before], entry)?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
             Some(p) => {
                 let p = p.trim_end_matches('/');
@@ -126,14 +154,34 @@ impl Ops<'_> {
                 self.c
                     .prepare_cached(&format!(
                         "SELECT {COLS} FROM activity
-                         WHERE path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')
+                         WHERE (path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')) AND seq < ?3
                          ORDER BY seq DESC LIMIT ?2"
                     ))?
-                    .query_map(rusqlite::params![p, limit], entry)?
+                    .query_map(rusqlite::params![p, limit, before], entry)?
                     .collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
         Ok(rows)
+    }
+
+    /// The latest `limit` entries that did `action` (done, not skipped or
+    /// failed) at `since_ms` or later, newest first; with `before`, only
+    /// those older than that sequence number (the next page). Reads the
+    /// table from the newest entry back (no index on the action): for a
+    /// command someone runs, not for anything that runs by itself.
+    pub fn activity_done(&self, action: &str, since_ms: i64, before: Option<i64>, limit: usize) -> Result<Vec<Entry>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        Ok(self
+            .c
+            .prepare_cached(&format!(
+                "SELECT {COLS} FROM activity WHERE action = ?1 AND outcome = ?2 AND at_ms >= ?3 AND seq < ?4
+                 ORDER BY seq DESC LIMIT ?5"
+            ))?
+            .query_map(
+                rusqlite::params![action, Outcome::Done.code(), since_ms, before.unwrap_or(i64::MAX), limit],
+                entry,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 }
 
@@ -167,6 +215,50 @@ mod tests {
         // Names compare case-insensitively, as on Windows.
         assert_eq!(s.read(|o| o.activity_recent(Some("/DOCS"), 10)).unwrap().len(), 2);
         assert_eq!(s.read(|o| o.activity_recent(None, 1)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn history_pages_stay_within_the_folder_and_do_not_repeat() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| o.activity_add(&[e(1, "/docs/a"), e(2, "/docs2/b"), e(3, "/docs/c"), e(4, "/docs")])).unwrap();
+        for path in [None, Some("/DOCS/")] {
+            let first = s.read(|o| o.activity_page(path, None, 2)).unwrap();
+            assert_eq!(first.iter().map(|e| e.at_ms).collect::<Vec<_>>(), [4, 3]);
+            let next = s.read(|o| o.activity_page(path, Some(first[1].seq), 2)).unwrap();
+            let want = if path.is_some() { vec![1] } else { vec![2, 1] };
+            assert_eq!(next.iter().map(|e| e.at_ms).collect::<Vec<_>>(), want);
+            assert!(s.read(|o| o.activity_page(path, Some(next.last().unwrap().seq), 2)).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn done_entries_of_one_action_since_a_time() {
+        let mut s = Store::open_in_memory().unwrap();
+        let keep = |at, outcome| Entry { action: "keep both".into(), outcome, ..e(at, "/a.txt") };
+        s.write(|o| {
+            o.activity_add(&[keep(1, Outcome::Done), e(2, "/b"), keep(3, Outcome::Failed), keep(4, Outcome::Done)])
+        })
+        .unwrap();
+        let got = s.read(|o| o.activity_done("keep both", 0, None, 10)).unwrap();
+        assert_eq!(got.iter().map(|e| e.at_ms).collect::<Vec<_>>(), [4, 1]);
+        assert_eq!(s.read(|o| o.activity_done("keep both", 2, None, 10)).unwrap().len(), 1);
+        let first = s.read(|o| o.activity_done("keep both", 0, None, 1)).unwrap();
+        assert_eq!(first[0].at_ms, 4);
+        // The next page starts after the last entry of this one.
+        let next = s.read(|o| o.activity_done("keep both", 0, Some(first[0].seq), 1)).unwrap();
+        assert_eq!(next[0].at_ms, 1);
+        assert!(s.read(|o| o.activity_done("keep both", 0, Some(next[0].seq), 1)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_entry_begun_first_is_settled_in_place() {
+        let mut s = Store::open_in_memory().unwrap();
+        let seq = s.write(|o| o.activity_begin(&Entry { outcome: Outcome::Waiting, ..e(1, "/a") })).unwrap();
+        s.write(|o| o.activity_add(&[e(2, "/b")])).unwrap();
+        assert_eq!(s.read(|o| o.activity_recent(Some("/a"), 1)).unwrap()[0].outcome, Outcome::Waiting);
+        s.write(|o| o.activity_settle(seq, Outcome::Done, "done")).unwrap();
+        let a = &s.read(|o| o.activity_recent(Some("/a"), 1)).unwrap()[0];
+        assert_eq!((a.outcome, a.detail.as_str(), a.at_ms), (Outcome::Done, "done", 1));
     }
 
     #[test]

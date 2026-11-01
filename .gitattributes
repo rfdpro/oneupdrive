@@ -2,3 +2,5 @@
 *.svg text eol=lf
 *.png binary
 *.ico binary
+# Fuzz inputs are bytes: never convert line endings.
+fuzz/seeds/** binary

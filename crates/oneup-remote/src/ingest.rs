@@ -86,6 +86,11 @@ pub fn to_row(item: &DriveItem) -> Option<RemoteRow> {
 pub fn apply(ops: &Ops<'_>, rules: &ExcludeSet, mode: Mode, item: &DriveItem, t: &mut Tally) -> Result<()> {
     if item.is_deleted() {
         ops.delete_subtree(&item.id)?;
+        // Where it was deleted from: where OneDrive would restore it.
+        if let Some(parent) = item.parent_id() {
+            ops.note_deleted_from(&item.id, parent)?;
+        }
+        ops.unmark_shared(&item.id)?;
         t.deleted += 1;
         return Ok(());
     }
@@ -94,7 +99,24 @@ pub fn apply(ops: &Ops<'_>, rules: &ExcludeSet, mode: Mode, item: &DriveItem, t:
         return Ok(());
     };
     let child_count = item.folder.as_ref().and_then(|f| f.child_count);
-    apply_row(ops, rules, mode, row, child_count, t)
+    let placed = place_row(ops, rules, mode, row, child_count, t)?;
+    // Every entry says whether it's shared now (`ITEM_SELECT` asks for the
+    // facet), so the mark follows each change: kept for an item stored, or
+    // waiting as an orphan (whose mark goes if it's dropped or pruned when
+    // placed), never for one discarded inside an excluded folder.
+    match (placed, item.sharing()) {
+        (Placed::Kept, Some(at)) => ops.mark_shared(&item.id, at),
+        _ => ops.unmark_shared(&item.id),
+    }
+}
+
+/// Where [`place_row`] put an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placed {
+    /// Stored, or waiting for its parent in the orphan buffer.
+    Kept,
+    /// Dropped: inside an excluded folder, or not placeable.
+    Discarded,
 }
 
 /// Applies one row (from Graph or from the orphan buffer). `child_count` is
@@ -107,14 +129,29 @@ pub fn apply_row(
     child_count: Option<i64>,
     t: &mut Tally,
 ) -> Result<()> {
+    let id = row.id.clone();
+    if place_row(ops, rules, mode, row, child_count, t)? == Placed::Discarded {
+        ops.unmark_shared(&id)?;
+    }
+    Ok(())
+}
+
+fn place_row(
+    ops: &Ops<'_>,
+    rules: &ExcludeSet,
+    mode: Mode,
+    row: RemoteRow,
+    child_count: Option<i64>,
+    t: &mut Tally,
+) -> Result<Placed> {
     if row.kind == Kind::Root {
         ops.upsert_item(&row, false)?;
         t.stored += 1;
-        return Ok(());
+        return Ok(Placed::Kept);
     }
     let Some(parent) = row.parent_id.clone() else {
         t.ignored += 1;
-        return Ok(());
+        return Ok(Placed::Discarded);
     };
     let was = ops.item_state(&row.id)?;
     match ops.item_state(&parent)? {
@@ -127,6 +164,7 @@ pub fn apply_row(
                 ops.add_pruned(&row.id, &parent)?;
             }
             t.pruned += 1;
+            return Ok(Placed::Discarded);
         }
         ItemState::Absent => {
             ops.put_orphan(&row, mode == Mode::CatchUp)?;
@@ -138,6 +176,17 @@ pub fn apply_row(
                 match was {
                     ItemState::Included => {
                         ops.prune_subtree(&row.id, false)?;
+                        // The folder may have moved under one of its own
+                        // descendants (pages apply one at a time, so the
+                        // store can hold that loop for a while): pruning
+                        // its subtree took the new parent with it, and the
+                        // folder is inside that pruned subtree now.
+                        if ops.item_state(&parent)? != ItemState::Included {
+                            ops.prune_subtree(&row.id, true)?;
+                            ops.add_pruned(&row.id, &parent)?;
+                            t.pruned += 1;
+                            return Ok(Placed::Discarded);
+                        }
                     }
                     // Its own tombstone goes; tombstones below it stay valid.
                     ItemState::Pruned => ops.remove_pruned_one(&row.id)?,
@@ -155,7 +204,10 @@ pub fn apply_row(
                         ItemState::Included => false,
                     };
                 if matches!(was, ItemState::Pruned | ItemState::Excluded) {
-                    ops.unprune_subtree(&row.id)?;
+                    // Descendants may have moved elsewhere and arrive later
+                    // in this enumeration. Keep their tombstones so their
+                    // own arrival still schedules the contents we dropped.
+                    ops.remove_pruned_one(&row.id)?;
                 }
                 ops.upsert_item(&row, false)?;
                 if needs_enum {
@@ -165,7 +217,7 @@ pub fn apply_row(
             }
         }
     }
-    Ok(())
+    Ok(Placed::Kept)
 }
 
 /// Whether a folder named `name` in folder `parent` is excluded: by the
@@ -246,7 +298,7 @@ pub fn reapply_rules(ops: &Ops<'_>, rules: &ExcludeSet) -> Result<Tally> {
     }
     for id in to_include {
         if let Some(row) = ops.get_item(&id)? {
-            ops.unprune_subtree(&id)?;
+            ops.remove_pruned_one(&id)?;
             ops.upsert_item(&row, false)?;
             t.needs_enumeration.push(id);
             t.stored += 1;
@@ -261,6 +313,36 @@ mod tests {
     use oneup_store::Kind;
 
     #[test]
+    fn a_returning_folder_keeps_moved_descendants_due_for_enumeration() {
+        let mut s = oneup_store::Store::open_in_memory().unwrap();
+        s.write(|o| {
+            let rules = oneup_rules::ExcludeSet::from_names(["node_modules"]);
+            let mut t = super::Tally::default();
+            for json in [
+                r#"{"id":"R","name":"root","root":{},"folder":{}}"#,
+                r#"{"id":"x","name":"node_modules","folder":{},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"a","name":"a","folder":{},"parentReference":{"id":"x"}}"#,
+                r#"{"id":"b","name":"b","folder":{},"parentReference":{"id":"a"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                super::apply(o, &rules, super::Mode::CatchUp, &item, &mut t)?;
+            }
+            // Both move out. Enumerating a no longer delivers b's contents.
+            let mut t = super::Tally::default();
+            for json in [
+                r#"{"id":"a","name":"a","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                super::apply(o, &rules, super::Mode::Enumerate, &item, &mut t)?;
+            }
+            assert_eq!(t.needs_enumeration, ["a", "b"]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn items_that_are_neither_files_nor_folders_stay_in_onedrive() {
         let kind = |json: &str| super::to_row(&serde_json::from_str::<DriveItem>(json).unwrap()).unwrap().kind;
         assert_eq!(kind(r#"{"id":"a","name":"a.txt","file":{}}"#), Kind::File);
@@ -269,5 +351,78 @@ mod tests {
         assert_eq!(kind(r#"{"id":"v","name":"Personal Vault","size":0}"#), Kind::Package);
         // A shortcut to a folder someone shared.
         assert_eq!(kind(r#"{"id":"s","name":"Shared","remoteItem":{"id":"x"}}"#), Kind::Package);
+    }
+
+    /// Delta's entry for a deleted item names the folder it was deleted
+    /// from (measured), even one it was moved into that this PC never saw:
+    /// where OneDrive would restore it.
+    #[test]
+    fn a_deletion_keeps_the_folder_onedrive_says_it_went_from() {
+        let mut s = oneup_store::Store::open_in_memory().unwrap();
+        let from = s
+            .write(|o| {
+                o.history_start(0)?;
+                let mut t = super::Tally::default();
+                // a.txt synced (only an item a record links is restored).
+                let base = |sid, parent, name: &str, kind, remote: &str| oneup_sync::Base {
+                    sid,
+                    parent,
+                    name: name.into(),
+                    kind,
+                    size: 0,
+                    hash: None,
+                    local: Some(oneup_sync::LocalId(u128::from(sid) + 100)),
+                    local_mtime: 1,
+                    remote: Some(oneup_sync::RemoteId(remote.into())),
+                    remote_etag: "e".into(),
+                };
+                o.synced_put(&base(oneup_sync::ROOT, None, "", oneup_sync::NodeKind::Folder, "R"))?;
+                o.synced_put(&base(2, Some(oneup_sync::ROOT), "a.txt", oneup_sync::NodeKind::File, "a"))?;
+                for json in [
+                    r#"{"id":"R","name":"root","root":{},"folder":{"childCount":1}}"#,
+                    r#"{"id":"d","name":"docs","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                    r#"{"id":"a","name":"a.txt","file":{},"parentReference":{"id":"d"}}"#,
+                    r#"{"id":"a","deleted":{"state":"deleted"},"file":{},"parentReference":{"id":"trash"}}"#,
+                ] {
+                    let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                    super::apply(o, &oneup_rules::ExcludeSet::none(), super::Mode::CatchUp, &item, &mut t)?;
+                }
+                assert_eq!(t.deleted, 1);
+                o.deleted_from(&oneup_sync::RemoteId("a".into()))
+            })
+            .unwrap();
+        assert_eq!(from, Some((oneup_sync::RemoteId("trash".into()), "a.txt".into())));
+    }
+
+    /// Pages apply one at a time, so a move of two folders past each other
+    /// can leave the store with `a` under `b` and `b` under `a` until the
+    /// page with the second. A folder that is excluded as it moves under one
+    /// of its own descendants took that new parent with it when its subtree
+    /// was pruned, and must not stay behind with a parent that is gone.
+    #[test]
+    fn an_excluded_folder_moved_under_its_own_descendant_is_pruned() {
+        let mut s = oneup_store::Store::open_in_memory().unwrap();
+        s.write(|o| {
+            let mut t = super::Tally::default();
+            let rules = oneup_rules::ExcludeSet::from_names(["node_modules"]);
+            // R > a > b; then OneDrive moves `a` (now node_modules) under `b`,
+            // and `b` under an excluded folder `x`.
+            for json in [
+                r#"{"id":"R","name":"root","root":{},"folder":{"childCount":2}}"#,
+                r#"{"id":"x","name":"node_modules","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"a","name":"a","folder":{"childCount":1},"parentReference":{"id":"R"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":0},"parentReference":{"id":"a"}}"#,
+                r#"{"id":"a","name":"node_modules","folder":{"childCount":1},"parentReference":{"id":"b"}}"#,
+                r#"{"id":"b","name":"b","folder":{"childCount":1},"parentReference":{"id":"x"}}"#,
+            ] {
+                let item = serde_json::from_str::<DriveItem>(json).unwrap();
+                super::apply(o, &rules, super::Mode::CatchUp, &item, &mut t)?;
+            }
+            assert_eq!(o.check_invariants()?, Vec::<String>::new());
+            assert_eq!(o.item_state("a")?, oneup_store::ItemState::Pruned);
+            assert_eq!(o.item_state("b")?, oneup_store::ItemState::Pruned);
+            Ok(())
+        })
+        .unwrap();
     }
 }

@@ -15,7 +15,7 @@ This page explains how OneUpDrive works in plain terms. Each section links to th
 |---|---|
 | `oneup-ntfs`, `oneup-local` | The change journal, folder listing and the Local tree ([local-tree.md](local-tree.md)) |
 | `oneup-graph`, `oneup-remote` | Microsoft Graph and the Remote tree ([remote-mirror.md](remote-mirror.md)) |
-| `oneup-store` | The SQLite state database: the three trees, deletion evidence, dirty marks, activity, usage |
+| `oneup-store` | The SQLite state database: the three trees, deletion evidence, dirty marks, activity, usage, the name index for search ([search.md](search.md)) |
 | `oneup-rules` | Exclusion rules, presets and `explain` ([rules.md](rules.md)) |
 | `oneup-plan`, `oneup-sync` | The first-run planner ([planner.md](planner.md)) and the three-tree reconciler ([sync-engine.md](sync-engine.md)); both pure |
 | `oneup-gate` | The safety gate: breakers, the content guard, approvals; pure ([data-safety.md](data-safety.md)) |
@@ -23,6 +23,7 @@ This page explains how OneUpDrive works in plain terms. Each section links to th
 | `oneup-exec` | The executor, hydration service and placement pass |
 | `oneup-cfapi` | The Cloud Files provider ([files-on-demand.md](files-on-demand.md)) |
 | `oneup-ipc` | The control API |
+| `oneup-hooks` | Event hooks: the user's programs started on sync events, contained ([hooks.md](hooks.md)) |
 | `oneup-vault`, `oneup-vaultsync` | Cryptomator vaults and vault pairs ([vaults.md](vaults.md)) |
 | `oneup-sys`, `oneup-shellext` | Windows helpers; the Explorer extension |
 
@@ -50,8 +51,20 @@ Office edits a file in OneDrive itself when it's opened from its OneDrive addres
 ## Encrypted vaults
 Folders encrypted in the Cryptomator format, so OneDrive only ever sees ciphertext. A vault in OneDrive syncs with a folder on the PC, decrypted (online-only files decrypted when opened, by default), by an agent of its own that runs only while the vault is unlocked ([vaults.md](vaults.md)).
 
+## Finding files
+Every name in OneDrive is already in the Remote tree, so search needs no network: a trigram index of those names, kept current by the same kind of database triggers as the dirty marks, finds any part of a name across millions of items in milliseconds, online-only files included, and each result says whether it's here, online-only or excluded. OneDrive's own search inside files is an opt-in extra that sends the search text to Microsoft ([search.md](search.md)).
+
+## Database files
+A database copied mid-write is broken. SQLite databases go up only once every change is in the file (their `-wal` checkpointed), read with their `-wal` and `-journal` watched; other databases (KeePass, Access, Outlook, …) only while no program has them open; a newer version from OneDrive waits until the database is closed. SQLite's working files never sync beside their database, and Outlook data files and virtual disks come with an offer to exclude them ([databases.md](databases.md)).
+
 ## Knowing how files are used
 The agent counts which programs open online-only files (Windows names them in each download request) and which write files (asked of Windows' Restart Manager as the change journal reports each write), per hour, on the PC only. The same records drive the automatic space policies, which make long-unused files online-only, and the content guard reads the start of each edited file before upload to catch files that suddenly look encrypted ([usage.md](usage.md)).
+
+## Languages and accessibility
+What the window, the tray and the command line say is looked up by its English text in a catalogue for the user's display language, with English wherever a translation is missing; numbers and dates follow the regional format ([localisation.md](localisation.md)). The settings window works from the keyboard and with a screen reader, and follows Windows' contrast themes ([settings-window.md § Accessibility](settings-window.md#accessibility)).
+
+## Scripts and hooks
+The agent's events (synced, conflict, failure, safety stop, paused/resumed, problem) are a feed: `oneup watch` and scripts read it over the control channel, and hooks start the user's programs on them, in the background, bounded and contained. A program in a synced folder never runs as a hook, so a change in the cloud can't become code on the PC ([hooks.md](hooks.md)).
 
 ## Data safety
 No deletion without explicit evidence, every change checked against the latest state right before it happens, every transfer verified by hash, circuit breakers on mass changes and on edited files that look encrypted, and both copies kept on conflict. The full list of invariants: [data-safety.md](data-safety.md).

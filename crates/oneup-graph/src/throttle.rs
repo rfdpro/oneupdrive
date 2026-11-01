@@ -16,11 +16,19 @@ pub struct Throttle {
     next: Mutex<Option<Instant>>,
     /// Every byte that went this way, capped or not (for progress).
     moved: AtomicU64,
+    /// Pinged when the cap changes: a transfer waiting its slot books it
+    /// again at the new cap (a switch to a capped network applies to it).
+    changed: tokio::sync::Notify,
 }
 
 impl Default for Throttle {
     fn default() -> Self {
-        Self { rate: AtomicU64::new(0), next: Mutex::new(None), moved: AtomicU64::new(0) }
+        Self {
+            rate: AtomicU64::new(0),
+            next: Mutex::new(None),
+            moved: AtomicU64::new(0),
+            changed: tokio::sync::Notify::new(),
+        }
     }
 }
 
@@ -29,6 +37,7 @@ impl Throttle {
     pub fn set(&self, bytes_per_s: u64) {
         if self.rate.swap(bytes_per_s, Relaxed) != bytes_per_s {
             *self.next.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            self.changed.notify_waiters();
         }
     }
 
@@ -47,6 +56,10 @@ impl Throttle {
     /// small file goes in one) keeps to it.
     pub fn book(&self, n: u64, now: Instant) -> Duration {
         self.moved.fetch_add(n, Relaxed);
+        self.slot(n, now)
+    }
+
+    fn slot(&self, n: u64, now: Instant) -> Duration {
         let rate = self.rate.load(Relaxed);
         if rate == 0 || n == 0 {
             return Duration::ZERO;
@@ -57,18 +70,105 @@ impl Throttle {
         end.saturating_duration_since(now)
     }
 
-    /// Waits until `n` more bytes may go.
-    pub async fn take(&self, n: u64) {
-        let wait = self.book(n, Instant::now());
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
+    /// Waits until `n` more bytes may go; returns how long it waited. A
+    /// change of cap meanwhile books them again at the new one.
+    pub async fn take(&self, n: u64) -> Duration {
+        self.moved.fetch_add(n, Relaxed);
+        let started = tokio::time::Instant::now();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let wait = self.slot(n, Instant::now());
+            if wait.is_zero() {
+                return started.elapsed();
+            }
+            tokio::select! {
+                () = tokio::time::sleep(wait) => return started.elapsed(),
+                () = &mut changed => {}
+            }
         }
+    }
+}
+
+/// How long any transfer was under way: the union of their times, so
+/// transfers side by side count once, and the time spent planning or
+/// waiting between them not at all (for judging how fast the link moves
+/// contents).
+#[derive(Debug, Default)]
+pub struct Active {
+    state: Mutex<(usize, Option<Instant>, Duration)>,
+}
+
+/// Held while a transfer is under way ([`Active::begin`]).
+pub struct Transferring<'a>(&'a Active);
+
+impl Drop for Transferring<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.0 -= 1;
+        if s.0 == 0
+            && let Some(t) = s.1.take()
+        {
+            s.2 += t.elapsed();
+        }
+    }
+}
+
+impl Active {
+    pub fn begin(&self) -> Transferring<'_> {
+        let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if s.0 == 0 {
+            s.1 = Some(Instant::now());
+        }
+        s.0 += 1;
+        Transferring(self)
+    }
+
+    /// The time some transfer was under way so far.
+    pub fn total(&self) -> Duration {
+        let s = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        s.2 + s.1.map_or(Duration::ZERO, |t| t.elapsed())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transfer waiting its slot when the cap changes waits by the new
+    /// cap: lowered, longer; lifted, it goes at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_transfer_follows_a_change_of_cap() {
+        let t = std::sync::Arc::new(Throttle::default());
+        t.set(1000);
+        let t2 = std::sync::Arc::clone(&t);
+        let waiting = tokio::spawn(async move { t2.take(1000).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        t.set(100);
+        let waited = waiting.await.unwrap();
+        assert!(waited >= Duration::from_secs(10), "lowered: {waited:?}");
+        let t2 = std::sync::Arc::clone(&t);
+        let waiting = tokio::spawn(async move { t2.take(1000).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        t.set(0);
+        assert!(waiting.await.unwrap() < Duration::from_secs(1), "lifted");
+    }
+
+    #[test]
+    fn transfers_side_by_side_count_once_and_idle_time_not_at_all() {
+        let a = Active::default();
+        let one = a.begin();
+        std::thread::sleep(Duration::from_millis(30));
+        let two = a.begin();
+        std::thread::sleep(Duration::from_millis(30));
+        drop(one);
+        drop(two);
+        let busy = a.total();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(a.total(), busy, "idle time isn't counted");
+        assert!(busy >= Duration::from_millis(60) && busy < Duration::from_millis(110), "{busy:?}");
+    }
 
     #[test]
     fn bytes_are_spread_at_the_cap() {

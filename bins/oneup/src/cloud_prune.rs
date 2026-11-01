@@ -37,7 +37,7 @@ pub async fn run(
         let kept = all.len();
         let found = prune::without_kept(&store, all)?;
         let kept = kept - found.len();
-        let found = prune::counted(&graph, found).await?;
+        let found = prune::counted(&*graph, found).await?;
         print_list(&found);
         if kept > 0 {
             println!("({kept} more you chose to keep in OneDrive aren't listed.)");
@@ -66,7 +66,7 @@ pub async fn run(
         return Ok(());
     }
     let (ready, waiting): (Vec<Candidate>, Vec<Candidate>) = found.into_iter().partition(Candidate::ready);
-    let ready = prune::counted(&graph, ready).await?;
+    let ready = prune::counted(&*graph, ready).await?;
     print_list(&ready);
     let (_, report) = engine.prune(store, &ready).await?;
     println!(
@@ -166,7 +166,7 @@ fn print_list(found: &[Candidate]) {
     let (mut items, mut bytes) = (0u64, 0i64);
     for c in found {
         let what = if c.folder {
-            let n = if c.unlisted { format!("at least {} items", c.items) } else { format!("{} items", c.items) };
+            let n = if c.exact { format!("{} items", c.items) } else { format!("at least {} items", c.items) };
             format!("folder, {n}")
         } else {
             "file".into()
@@ -201,7 +201,7 @@ async fn show_details(
     let (rules, _) = oneup_app::rulefiles::load(data_dir, store, &mut Default::default())?;
     let found = prune::candidates(store, &rules, Scope::All, brings)?;
     let want = format!("/{}", path.trim_matches(['/', '\\']).replace('\\', "/"));
-    let Some(c) = found.iter().find(|c| c.path.eq_ignore_ascii_case(&want)) else {
+    let Some(c) = found.iter().find(|c| oneup_sync::same_name(&c.path, &want)) else {
         bail!("{want} isn't one of the excluded items in OneDrive (`oneup cloud prune` lists them)");
     };
     if !c.folder {

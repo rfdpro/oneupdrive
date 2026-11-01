@@ -20,14 +20,17 @@
 mod merge;
 pub mod model;
 pub mod op;
+mod pending;
 mod resolve;
+pub mod rewind;
 
 pub use merge::{conflict_candidate, conflict_name};
 pub use model::{
-    Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold, fold_char,
+    Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold, fold_char, same_name,
     strip_folded_prefix,
 };
-pub use op::{Dir, HoldReason, Link, LocalPre, Op, RemotePre, Vacates};
+pub use op::{Dir, HoldReason, Keep, Link, LocalPre, Op, RemotePre, Up, Vacates};
+pub use pending::pending_deletes;
 
 /// Plans one round over the given Synced folders (each folder's *children*
 /// are decided). A full pass passes every Synced folder ([`all_folders`]);

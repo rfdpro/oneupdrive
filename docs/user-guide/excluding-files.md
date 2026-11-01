@@ -1,8 +1,37 @@
 # Choosing what syncs
 
-Some files don't belong in the cloud: downloaded dependencies, build output, temporary files. Syncing them wastes your computer's resources. On one developer's PC, **9 out of 10** files the OneDrive app was tracking were exactly this kind of junk.
+Some files don't belong in the cloud: downloaded dependencies, build output, temporary files. Syncing them wastes your computer's resources.
 
-In the settings window, all of this is on the **Files** page: right-click an item and choose **Exclude** (or **Sync again**), or see everything excluded under **Exclude**. Excluding something **never deletes it**, from your PC or from OneDrive. It stops it being **uploaded**: what's already in OneDrive still shows up here (online-only, with Files On-Demand) and opens as usual (see [What happens to OneDrive's copies](#what-happens-to-onedrives-copies)). Rule changes take effect at once, with no rescan: a running background agent applies them as soon as `oneup rules` saves them, or as soon as you save a `.oneupignore` file.
+In the settings window, all of this is on the **Files** page: untick an item's box in the tree (or right-click it and choose **Exclude…**), tick it to sync it again, or see everything excluded under **Exclude**. Excluding something **never deletes it**, from your PC or from OneDrive. It stops it being **uploaded**: what's already in OneDrive still shows up here (online-only, with Files On-Demand) and opens as usual (see [What happens to OneDrive's copies](#what-happens-to-onedrives-copies)). Rule changes take effect at once, with no rescan: a running background agent applies them as soon as `oneup rules` saves them, or as soon as you save a `.oneupignore` file.
+
+## Ticking and unticking in the file tree
+Each file and folder on the **Files** page has a box:
+
+* **Ticked**: it syncs.
+* **Unticked**: it's excluded. The status beside it says why: *Excluded by preset*, *Excluded by rule* (one of yours), *By .oneupignore*, or *In excluded folder*. Point at the box for the exact rule.
+* **Partly ticked** (a dash): the folder syncs, but one of your rules excludes something inside it (*Some excluded*). Rules that apply everywhere, such as `*.iso` or a preset, don't mark every folder. A folder with a `.oneupignore` file somewhere inside says so when you point at its box ("Has a .oneupignore inside").
+* **Greyed out**: the window can't change it here. A paused folder is resumed from its details; a folder inside an excluded one comes back by ticking that folder; a `.oneupignore` rule is changed in that file.
+
+**Unticking** shows first what stops syncing: how many files and how much is inside it on this PC (and how many of those are online-only) and in OneDrive ("at least" when it holds folders OneUpDrive doesn't look inside), and what then happens to OneDrive's copies (the setting below, which you can change in the same dialog; it applies to every excluded item). **Exclude** writes a rule naming exactly that item, like `/Projects/old/`, into `config.toml`. Nothing is deleted from your PC.
+
+**Ticking** an item a preset or one of your broader rules excludes adds an exception (`!/Projects/old/`); ticking one you unticked removes its rule.
+
+From the command line:
+
+```powershell
+oneup --data-dir … rules --exclude-path "Projects\old"         # what would stop syncing (changes nothing)
+oneup --data-dir … rules --exclude-path "Projects\old" --yes   # exclude it (refused if it moved or was replaced meanwhile)
+oneup --data-dir … rules --include-path "Projects\old"         # sync it again
+```
+
+## Suggestions
+**Exclude** lists a few folders worth a look: the **largest** in OneDrive, and the **busiest**, those whose files changed most often in the last 7 days. A folder that's nearly all one folder inside it suggests the one inside. They're only suggestions: nothing is excluded unless you choose **Exclude**, which shows the same summary as unticking. Folders already excluded aren't suggested.
+
+```powershell
+oneup --data-dir … rules --suggest
+```
+
+The largest come from the sizes OneDrive reports for its folders, so a folder only on this PC isn't among them until it's uploaded.
 
 ## Presets
 Ready-made rule sets. None is on unless you turn it on, because what's junk to one person is work to another.
@@ -19,7 +48,7 @@ oneup --data-dir … rules --on dev        # turn a preset on
 oneup --data-dir … rules --off dev       # and off
 ```
 
-Some files are never synced, whatever the rules say, as with the OneDrive app: Office lock files (`~$…`), `*.tmp`, `desktop.ini`, names OneDrive doesn't accept, and files over 250 GB.
+Some files are never synced, whatever the rules say, as with the OneDrive app: Office lock files (`~$…`), `*.tmp`, `desktop.ini`, names OneDrive doesn't accept, and files over 250 GB. Neither are the `-wal`, `-shm` and `-journal` files beside a SQLite database: see [Databases](databases.md).
 
 ## Your own rules
 Rules are written like a `.gitignore` file, one per line:
@@ -63,7 +92,7 @@ Remove the rule and syncing picks up where it left off: an edit you made meanwhi
 If you move a synced file *into* an excluded folder, OneUpDrive doesn't treat that as a deletion: the OneDrive copy stays, and the file is listed as held.
 
 ## What happens to OneDrive's copies
-Excluding always stops uploads. What comes the other way is your choice (**Files**, **Exclude**, **Advanced**, or `oneup rules --cloud`):
+Excluding always stops uploads. What comes the other way is your choice (**Files**, **Exclude**, **Rules as text**, or `oneup rules --cloud`):
 
 ```powershell
 oneup --data-dir … rules --cloud pull    # bring them and their changes here, never upload (the default)
@@ -92,15 +121,13 @@ oneup --data-dir … cloud prune --keep                   # keep them in OneDriv
 
 With the agent running, `--yes` asks it to do exactly what it found. Without it, only what's completely here is removed (downloading needs the agent); the rest is listed as not on this PC yet.
 
-Folders OneUpDrive never looks inside (like `node_modules`, below) are removed whole when this PC has a folder of the same name in the same place, and not offered otherwise; the list shows how many items OneDrive says they hold.
+Folders OneUpDrive never looks inside (like `node_modules`, below) are removed whole when this PC has a folder of the same name in the same place, and not offered otherwise. OneDrive only says how many items such a folder holds directly, not what's in its subfolders, so the list says "at least N items", and removing one always asks first (a safety stop), however small it looks.
 
 ## Folders that aren't even looked inside
 Folders that a preset or one of your `config.toml` rules skips by name alone (such as `node_modules/`) aren't even looked inside, on your PC or in OneDrive. That's what makes them cheap: millions of files there cost nothing. It also means OneDrive's copies of them don't appear here, whatever the setting above. `oneup rules` lists these names. Turn a preset off, or remove such a rule, and OneUpDrive looks through just those folders again on its own, on both sides; nothing else is rescanned. A name that a `!` rule might bring back is always looked inside, so the rules are followed exactly.
 
 ## "Sync pending" in Explorer
 With Files On-Demand, File Explorer shows a blue two-arrow **Sync pending** icon on anything in your OneDrive folder that isn't a OneDrive file, which includes everything you excluded (they stay on your PC on purpose), and on the folders above it. It can also show it on folders that hold nothing unsynced at all. This is Windows' own display, not something OneUpDrive is still working on: `oneup status` says whether OneUpDrive is up to date, and `oneup unsynced` lists anything that really can't sync. `oneup explain PATH` tells you which rule excludes an item.
-
-Ways to make Explorer show these as fine were tried and set aside.
 
 ## "Why is this file (not) syncing?"
 ```

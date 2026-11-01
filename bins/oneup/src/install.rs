@@ -114,13 +114,41 @@ pub async fn stop_agents(dirs: &[PathBuf], limit: Duration) {
     }
 }
 
-/// Releases `dir`'s Files On-Demand folder, if it has one.
+/// Releases `dir`'s Files On-Demand folder, if it has one. Its database is
+/// only read (`Store::peek_meta`): an agent that didn't stop in time may
+/// be another build, and opening the database as a store would upgrade it
+/// under that agent.
 fn release(dir: &Path) {
-    let Ok(store) = crate::setup::open_store(dir, 1024) else { return };
-    let get = |k| store.read(|o| o.meta_get(k)).ok().flatten();
+    let db = dir.join("state.db");
+    let get = |k| oneup_store::Store::peek_meta(&db, k).ok().flatten();
     if let (Some(local), Some(token)) = (get(crate::sync::KEY_LOCAL), get(crate::sync::KEY_TOKEN))
         && crate::ondemand::is_on(Path::new(&local), &token)
     {
         let _ = crate::syncroot::unregister(Path::new(&local), &token);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    /// Uninstalling reads each folder's database and leaves it as it was:
+    /// an older one isn't upgraded under an agent that didn't stop, and
+    /// none is made where there's none.
+    #[test]
+    fn releasing_a_folder_never_upgrades_or_makes_its_database() {
+        use crate::datafolders::tests::{older_folder, version};
+        let root = std::env::temp_dir().join(format!("oneup-install-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (older, empty) = (root.join("older"), root.join("empty"));
+        std::fs::create_dir_all(&empty).unwrap();
+        // A synced folder but no token: nothing to release.
+        older_folder(&older, &root.join("Sync"));
+        release(&older);
+        release(&empty);
+        assert_eq!(version(&older), 23, "not upgraded");
+        assert!(!empty.join("state.db").exists(), "none made");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -17,6 +17,7 @@
 
 use std::io::{Read, Write};
 
+use futures_util::future::BoxFuture;
 use oneup_store::RemoteRow;
 use oneup_sync::{RemoteId, RemotePre};
 
@@ -79,6 +80,18 @@ pub struct VersionMark {
     pub size: Option<i64>,
 }
 
+/// What a replacement went over ([`Cloud::replaced_other`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replaced {
+    /// The version it was meant to replace: nothing else to keep.
+    Planned,
+    /// Another one: an edit that reached OneDrive while it committed.
+    Other(VersionMark),
+    /// The history can't tell: it doesn't list the planned version, or
+    /// nothing after it (not yet, or the replacement never committed).
+    Unknown,
+}
+
 pub trait Cloud: Send + Sync {
     /// Streams the content of file `pre.id` into `out`, provided its eTag
     /// is still `pre.etag`. `Some(hash)`: the content was transformed on
@@ -90,7 +103,8 @@ pub trait Cloud: Send + Sync {
         out: &mut (dyn Write + Send),
     ) -> impl Future<Output = Result<Option<Hash>, CloudError>> + Send;
 
-    /// Uploads `size` bytes from `src` as `name` in folder `parent`. With
+    /// Uploads `size` bytes from `src` as `name` in folder `parent`, read
+    /// through [`Source::fill`] where the cloud can (see [`Source`]). With
     /// `replace`, as a new version of that item (which keeps its ID and
     /// history) provided its eTag still matches; without, only if the name
     /// is free. Returns the item as the cloud now has it, with its hash,
@@ -102,7 +116,7 @@ pub trait Cloud: Send + Sync {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> impl Future<Output = Result<(RemoteRow, Option<Hash>), CloudError>> + Send;
 
     /// Before replacing file `pre` with `size` bytes: the version it holds
@@ -120,15 +134,26 @@ pub trait Cloud: Send + Sync {
         size: i64,
     ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
 
-    /// After replacing file `id`, which held `mark`'s version: the version
-    /// the replacement went over, if it was another one (an edit that
-    /// reached OneDrive while the upload committed). `None`: it went over
-    /// `mark`'s, as planned, or the history can't tell. Read-only.
+    /// Right after an upload replaced file `id`, leaving eTag `etag`: the
+    /// version its history lists the upload as, by its ID where it can
+    /// (from the commit's answer; or read from the file, only while it
+    /// still has `etag`). `None`: it can't be told. Read-only.
+    fn uploaded_version(
+        &self,
+        id: &RemoteId,
+        etag: Option<&str>,
+    ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
+
+    /// After replacing file `id`, which held `mark`'s version, with the
+    /// version `ours` ([`Cloud::uploaded_version`]): what the replacement
+    /// went over. The history may not list `ours` yet: then it can't tell.
+    /// Read-only.
     fn replaced_other(
         &self,
         id: &RemoteId,
         mark: &VersionMark,
-    ) -> impl Future<Output = Result<Option<VersionMark>, CloudError>> + Send;
+        ours: &VersionMark,
+    ) -> impl Future<Output = Result<Replaced, CloudError>> + Send;
 
     /// Streams the content of version `version` of file `id` into `out`;
     /// returns its size. Read-only.
@@ -139,10 +164,32 @@ pub trait Cloud: Send + Sync {
         out: &mut (dyn Write + Send),
     ) -> impl Future<Output = Result<u64, CloudError>> + Send;
 
+    /// The file's versions in OneDrive's history, newest first (its current
+    /// one included). Read-only. No default, like [`Cloud::children`].
+    fn versions(&self, id: &RemoteId) -> impl Future<Output = Result<Vec<VersionMark>, CloudError>> + Send;
+
+    /// Brings deleted item `id` back from OneDrive's recycle bin into folder
+    /// `parent` as `name`, only if the name is free there; returns it as the
+    /// cloud now has it. [`CloudError::Changed`]: it's no longer in the
+    /// recycle bin. No default, like [`Cloud::children`].
+    fn restore(
+        &self,
+        id: &RemoteId,
+        parent: &RemoteId,
+        name: &str,
+    ) -> impl Future<Output = Result<RemoteRow, CloudError>> + Send;
+
     /// Whether operations may run several at a time. `false`: the executor
     /// runs one at a time. No default, like [`Cloud::children`]: a wrapper
     /// that didn't pass a `false` on would run its cloud concurrently.
     fn concurrent(&self) -> bool;
+
+    /// Whether a move keeps the item's ID, as OneDrive's does. `false` for
+    /// a vault, where a move can rebuild the entry under a new ID: the
+    /// executor then writes the move ahead (see `crate::moving`). No
+    /// default, like [`Cloud::concurrent`]: a wrapper that didn't pass a
+    /// `false` on would lose that record.
+    fn moves_keep_ids(&self) -> bool;
 
     /// Downloads coming up in the round, in the planner's order: a hint, so
     /// a cloud that reads each download's link first may read the coming
@@ -201,6 +248,33 @@ pub trait Cloud: Send + Sync {
         async { Err(CloudError::Other("this cloud can't re-read items".into())) }
     }
 
+    /// Whether folder `parent` has an item named `name` in the cloud now
+    /// (`None`: this cloud can't tell). Read-only; asked right before a
+    /// restore from the recycle bin, which takes the name from whatever
+    /// holds it.
+    fn name_taken(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<bool>, CloudError>> + Send {
+        let _ = (parent, name);
+        async { Ok(None) }
+    }
+
+    /// Whether item `id` is in folder `parent` under `name` in the cloud now
+    /// (`Some(false)` if it's gone; `None`: this cloud can't tell).
+    /// Read-only; for a move here that follows one in the cloud, which a
+    /// listing behind the cloud can show after it was undone.
+    fn is_at(
+        &self,
+        id: &RemoteId,
+        parent: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<Option<bool>, CloudError>> + Send {
+        let _ = (id, parent, name);
+        async { Ok(None) }
+    }
+
     /// Some of folder `id`'s children as the cloud has them now (one page
     /// of a listing; empty: it has none). Read-only; for moving a folder
     /// in parts ([`CloudError::TooManyItems`]), which moves what it gets
@@ -226,6 +300,53 @@ pub trait Cloud: Send + Sync {
     }
 }
 
+/// What an upload reads its content from ([`Cloud::upload`]).
+///
+/// A file's content is read where it doesn't hold anything else up: the
+/// executor's sources ([`Source::fill`]) read on a blocking thread, so a
+/// slow disk, or a large fragment, doesn't stall the operations under way,
+/// which share one task. Through `Read`, they read in place: a cloud that
+/// transforms the content on the way (a vault, which encrypts it) reads
+/// that way, and runs one operation at a time ([`Cloud::concurrent`]).
+pub trait Source: Read + Send {
+    /// Reads into `buf[..want]` until it's full or the source ends, and
+    /// returns `buf` with how many bytes were read. By default in place.
+    ///
+    /// # Panics
+    /// If `want` is more than `buf.len()`.
+    fn fill(&mut self, mut buf: Vec<u8>, want: usize) -> BoxFuture<'_, (Vec<u8>, std::io::Result<usize>)> {
+        let read = read_full(self, &mut buf[..want]);
+        Box::pin(std::future::ready((buf, read)))
+    }
+
+    /// Whether reading it again gives the same bytes while the file is
+    /// unchanged, so an upload cut short may go on from where it ended
+    /// (`crate::graph`, resumable sessions). Not for content transformed
+    /// on the way (a vault encrypts with fresh randomness each time). Off
+    /// by default.
+    fn resumable(&self) -> bool {
+        false
+    }
+}
+
+impl Source for &[u8] {}
+
+impl Source for std::fs::File {}
+
+/// Reads until `buf` is full or `src` ends; returns the bytes read.
+pub fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match src.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
 /// Passes bytes through while computing their QuickXorHash, so content is
 /// verified without being read twice.
 pub(crate) struct Hashing<T> {
@@ -236,14 +357,6 @@ pub(crate) struct Hashing<T> {
 impl<T> Hashing<T> {
     pub fn new(inner: T) -> Self {
         Self { inner, hash: oneup_hash::QuickXorHash::new() }
-    }
-}
-
-impl<T: Read> Read for Hashing<T> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hash.update(&buf[..n]);
-        Ok(n)
     }
 }
 

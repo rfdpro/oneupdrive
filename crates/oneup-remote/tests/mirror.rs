@@ -38,6 +38,9 @@ struct Inner {
     during_enumeration: Vec<Box<dyn FnOnce(&mut Inner) + Send>>,
     /// Human-readable record of mutations, printed when a simulation fails.
     trace: Vec<String>,
+    /// Items shared directly, and when. Like Graph, an item inside a shared
+    /// folder carries the folder's `shared` facet too.
+    shared: BTreeMap<String, i64>,
 }
 
 impl Inner {
@@ -79,6 +82,37 @@ impl Inner {
         self.trace.push(format!("seq {} rename {id} -> {name:?}", self.seq));
     }
 
+    /// Shares (`Some(when)`) or stops sharing an item. Only the item itself
+    /// is reported changed: what inherits its sharing isn't.
+    fn share(&mut self, id: &str, at: Option<i64>) {
+        match at {
+            Some(t) => self.shared.insert(id.to_string(), t),
+            None => self.shared.remove(id),
+        };
+        self.touch(id);
+        self.trace.push(format!("seq {} share {id} {at:?}", self.seq));
+    }
+
+    /// The `shared` facet `id` carries: its own sharing, or the nearest
+    /// shared folder's above it.
+    fn shared_facet(&self, id: &str) -> Option<oneup_graph::model::SharedFacet> {
+        let mut cur = Some(id.to_string());
+        while let Some(c) = cur {
+            if let Some(t) = self.shared.get(&c) {
+                // Times within the first day, in seconds: enough here.
+                let s = t / 1000;
+                let when = format!("1970-01-01T{:02}:{:02}:{:02}Z", s / 3600, s / 60 % 60, s % 60);
+                return Some(oneup_graph::model::SharedFacet {
+                    scope: Some("users".into()),
+                    shared_date_time: Some(when),
+                    shared_by: None,
+                });
+            }
+            cur = self.nodes.get(&c).and_then(|n| n.parent.clone());
+        }
+        None
+    }
+
     fn children(&self, id: &str) -> Vec<String> {
         self.nodes.iter().filter(|(_, n)| n.parent.as_deref() == Some(id)).map(|(k, _)| k.clone()).collect()
     }
@@ -118,6 +152,8 @@ impl Inner {
             deleted: None,
             root: (n.kind == Kind::Root).then(Facet::default),
             file_system_info: None,
+            shared: self.shared_facet(id),
+            c_tag: None,
         })
     }
 
@@ -134,6 +170,8 @@ impl Inner {
             deleted: Some(Facet::default()),
             root: None,
             file_system_info: None,
+            shared: None,
+            c_tag: None,
         }
     }
 }
@@ -432,6 +470,66 @@ async fn changes_during_enumeration_are_caught_up() {
     assert_eq!(actual(&m), expected(&fake, &ExcludeSet::dev()));
 }
 
+/// The sharing audit's list comes from the mirror alone: shared items are
+/// marked as delta delivers them, and the marks follow later changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_items_are_marked_from_the_listing_and_follow_changes() {
+    let fake = Arc::new(Fake::new(3, true));
+    populate(&fake);
+    let find = |i: &Inner, name: &str| i.nodes.iter().find(|(_, n)| n.name == name).map(|(k, _)| k.clone()).unwrap();
+    let (docs, notes, f0, code, nm, deep) = fake.with(|i| {
+        let docs = find(i, "Documents");
+        i.share(&docs, Some(1_000_000));
+        let f0 = find(i, "f0.rs");
+        i.share(&f0, Some(2_000_000));
+        // An excluded folder shared, and a file shared inside one.
+        let nm = find(i, "node_modules");
+        i.share(&nm, Some(5_000_000));
+        let deep = find(i, "deep.js");
+        i.share(&deep, Some(6_000_000));
+        (docs, find(i, "notes.txt"), f0, find(i, "Code"), nm, deep)
+    });
+    let path = temp_db("shared");
+    let marked = |m: &Mirror<Fake>, id: &str| m.read(|o| o.is_marked_shared(id)).unwrap();
+    // Every mark is for an item the mirror holds: none leaked.
+    let no_leaks = |m: &Mirror<Fake>| {
+        let mut held = 0;
+        let mut after: Option<String> = None;
+        loop {
+            let page = m.read(|o| o.shared_page(after.as_deref(), 7)).unwrap();
+            assert!(page.unheld.is_empty(), "marks nothing will list: {:?}", page.unheld);
+            let Some(last) = page.last else { break };
+            after = Some(last);
+            held += page.rows.len() as u64;
+        }
+        assert_eq!(m.read(|o| o.shared_count()).unwrap(), held, "marks for items the mirror doesn't hold");
+    };
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), ExcludeSet::dev());
+    m.run().await.unwrap();
+    assert!(marked(&m, &docs) && marked(&m, &f0) && marked(&m, &nm));
+    assert!(marked(&m, &notes), "what inherits a folder's sharing carries the facet too");
+    assert!(!marked(&m, &deep), "nothing inside an excluded folder is kept");
+    no_leaks(&m);
+    drop(m);
+
+    fake.with(|i| i.share(&f0, None));
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), ExcludeSet::dev());
+    m.run().await.unwrap();
+    assert!(!marked(&m, &f0));
+    no_leaks(&m);
+    drop(m);
+
+    // Deleted from OneDrive: the marks go with it.
+    fake.with(|i| {
+        i.delete(&docs);
+        i.share(&code, Some(3_000_000));
+    });
+    let m = mirror(&fake, Store::open(&path, 1024).unwrap(), ExcludeSet::dev());
+    m.run().await.unwrap();
+    assert!(!marked(&m, &docs) && !marked(&m, &notes) && marked(&m, &code));
+    no_leaks(&m);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn incremental_changes_including_moves_across_exclusion_boundaries() {
     let fake = Arc::new(Fake::new(4, false));
@@ -717,102 +815,201 @@ fn random_mutation(i: &mut Inner, rng: &mut Rng) {
     }
 }
 
+/// The seeds to run: `SIM_SEED` alone if set (whatever the range), else
+/// `SIM_SEEDS` of them (default 60, which keeps CI fast) from
+/// `SIM_SEED_FROM` (default 1).
+fn seeds() -> std::ops::RangeInclusive<u64> {
+    let var = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    if let Some(only) = var("SIM_SEED") {
+        return only..=only;
+    }
+    let from = var("SIM_SEED_FROM").unwrap_or(1).max(1);
+    let count = var("SIM_SEEDS").unwrap_or(60);
+    from..=from.saturating_add(count).saturating_sub(1)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn randomized_simulation_converges_every_round() {
-    // More seeds locally with SIM_SEEDS=N; 60 keeps CI fast.
-    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
-    let only: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
-    for seed in (1..=seeds).filter(|s| only.is_none_or(|o| o == *s)) {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let fake = Arc::new(Fake::new(1 + rng.below(6), rng.below(2) == 0));
-        populate(&fake);
+    for seed in seeds() {
+        // On its own task, so a failure anywhere in the seed (not only the
+        // checks that name it) still says which seed to replay.
+        if let Err(e) = tokio::spawn(simulate(seed)).await {
+            eprintln!("simulation failed for seed {seed}; replay with SIM_SEED={seed}");
+            match e.try_into_panic() {
+                Ok(p) => std::panic::resume_unwind(p),
+                Err(e) => panic!("seed {seed}: {e}"),
+            }
+        }
+    }
+}
+
+/// Where one seed keeps the mirror's database. Each run opens it afresh,
+/// as the agent does after a restart, so it must outlive every `Store`.
+///
+/// `SIM_DB=memory` keeps it in memory: a shared-cache SQLite database,
+/// alive while `_keep` holds a connection to it. Every reopen still goes
+/// through `Store::open` and sees what the last run committed; what only
+/// a file shows (WAL files, on-disk layout) is left to the default, on
+/// disk, which is several times slower because each seed creates and
+/// reopens a database file a dozen times.
+enum SimDb {
+    Disk(std::path::PathBuf),
+    Memory { uri: std::path::PathBuf, _keep: Store },
+}
+
+impl SimDb {
+    fn new(seed: u64) -> Self {
+        if std::env::var("SIM_DB").is_ok_and(|v| v == "memory") {
+            SimDb::memory(&format!("sim-{seed}"))
+        } else {
+            SimDb::Disk(temp_db(&format!("sim-{seed}")))
+        }
+    }
+
+    fn memory(tag: &str) -> Self {
+        // A URI (rusqlite opens with SQLITE_OPEN_URI). The name is per
+        // process, and seeds in one process run one at a time.
+        let uri = std::path::PathBuf::from(format!("file:oneup-{tag}?mode=memory&cache=shared"));
+        let keep = Store::open(&uri, 1024).unwrap();
+        SimDb::Memory { uri, _keep: keep }
+    }
+
+    fn open(&self) -> Store {
+        match self {
+            SimDb::Disk(path) => Store::open(path, 1024).unwrap(),
+            SimDb::Memory { uri, .. } => Store::open(uri, 1024).unwrap(),
+        }
+    }
+}
+
+impl Drop for SimDb {
+    fn drop(&mut self) {
+        if let SimDb::Disk(path) = self
+            && let Some(dir) = path.parent()
+        {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// The in-memory lane is only worth its seeds if a reopened store holds
+/// what the last run committed, as a file does.
+#[tokio::test(flavor = "multi_thread")]
+async fn in_memory_sim_db_keeps_its_contents_across_reopens() {
+    let fake = Arc::new(Fake::new(5, false));
+    populate(&fake);
+    let db = SimDb::memory("reopen-check");
+    let m = mirror(&fake, db.open(), ExcludeSet::dev());
+    assert!(m.run().await.unwrap().fresh);
+    drop(m);
+    let again = mirror(&fake, db.open(), ExcludeSet::dev());
+    assert_eq!(actual(&again), expected(&fake, &ExcludeSet::dev()), "before running again");
+    assert!(!again.run().await.unwrap().fresh, "a reopened store resumes");
+}
+
+/// One seed of [`randomized_simulation_converges_every_round`].
+async fn simulate(seed: u64) {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let fake = Arc::new(Fake::new(1 + rng.below(6), rng.below(2) == 0));
+    populate(&fake);
+    fake.with(|i| {
+        for _ in 0..40 {
+            random_mutation(i, &mut rng);
+        }
+    });
+    let db = SimDb::new(seed);
+    let rules = if rng.below(4) == 0 { ExcludeSet::none() } else { ExcludeSet::dev() };
+    // Vary the split strategy: fixed depth, size-based deep listing, or delta-everything.
+    let list_depth = rng.below(3) as u32;
+    // Hints: none, correct (and growing stale as later rounds mutate the
+    // drive), pure garbage, or both mixed. None of them may change the result.
+    let hint = match rng.below(4) {
+        0 => None,
+        1 => Some(SplitHint::from_excluded_paths(excluded_paths(&fake, &rules))),
+        2 => Some(SplitHint::from_excluded_paths(random_paths(&mut rng))),
+        _ => {
+            let mut h = SplitHint::from_excluded_paths(excluded_paths(&fake, &rules));
+            h.add(random_paths(&mut rng));
+            Some(h)
+        }
+    };
+    let cfg = Config {
+        list_depth,
+        max_list_depth: list_depth + rng.below(5) as u32,
+        split_bytes: [0, 30, 100, i64::MAX][rng.below(4)],
+        rules: rules.clone(),
+        max_tasks: 1 + rng.below(6),
+        hint: hint.map(Arc::new),
+    };
+    for round in 0..6 {
+        // Sometimes change things while the enumeration/catch-up runs.
+        let n_during = rng.below(4);
+        let seed_during = rng.next();
         fake.with(|i| {
-            for _ in 0..40 {
-                random_mutation(i, &mut rng);
-            }
+            i.during_enumeration.push(Box::new(move |i: &mut Inner| {
+                let mut r = Rng(seed_during | 1);
+                for _ in 0..n_during {
+                    random_mutation(i, &mut r);
+                }
+            }));
         });
-        let path = temp_db(&format!("sim-{seed}"));
-        let rules = if rng.below(4) == 0 { ExcludeSet::none() } else { ExcludeSet::dev() };
-        // Vary the split strategy: fixed depth, size-based deep listing, or delta-everything.
-        let list_depth = rng.below(3) as u32;
-        // Hints: none, correct (and growing stale as later rounds mutate the
-        // drive), pure garbage, or both mixed. None of them may change the result.
-        let hint = match rng.below(4) {
-            0 => None,
-            1 => Some(SplitHint::from_excluded_paths(excluded_paths(&fake, &rules))),
-            2 => Some(SplitHint::from_excluded_paths(random_paths(&mut rng))),
-            _ => {
-                let mut h = SplitHint::from_excluded_paths(excluded_paths(&fake, &rules));
-                h.add(random_paths(&mut rng));
-                Some(h)
-            }
-        };
-        let cfg = Config {
-            list_depth,
-            max_list_depth: list_depth + rng.below(5) as u32,
-            split_bytes: [0, 30, 100, i64::MAX][rng.below(4)],
-            rules: rules.clone(),
-            max_tasks: 1 + rng.below(6),
-            hint: hint.map(Arc::new),
-        };
-        for round in 0..6 {
-            // Sometimes change things while the enumeration/catch-up runs.
-            let n_during = rng.below(4);
-            let seed_during = rng.next();
-            fake.with(|i| {
-                i.during_enumeration.push(Box::new(move |i: &mut Inner| {
-                    let mut r = Rng(seed_during | 1);
-                    for _ in 0..n_during {
-                        random_mutation(i, &mut r);
-                    }
-                }));
-            });
-            fake.with(|i| i.trace.push(format!("== round {round}")));
-            // Sometimes fail part-way, then resume.
-            if rng.below(3) == 0 {
-                fake.served.store(0, SeqCst);
-                fake.fail_after.store(rng.below(8) as i64, SeqCst);
-                let mf = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
-                let r = mf.run().await;
-                debug_dump(&mf, &format!("after failing run ({:?})", r.err()));
-                drop(mf);
-                fake.fail_after.store(-1, SeqCst);
-            }
-            let m = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
-            m.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round}: {e}"));
-            debug_dump(&m, &format!("after run 1 of round {round}"));
-            // "during enumeration" changes only fire on a fresh cursor, so run
-            // once more to pick up anything made after the last cursor.
-            let m2 = mirror_with(&fake, Store::open(&path, 1024).unwrap(), cfg.clone());
-            drop(m);
-            m2.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round} (2nd): {e}"));
-            if actual(&m2) != expected(&fake, &rules) {
-                let trace = fake.with(|i| {
-                    i.trace.join(
-                        "
+        fake.with(|i| i.trace.push(format!("== round {round}")));
+        // Sometimes fail part-way, then resume.
+        if rng.below(3) == 0 {
+            fake.served.store(0, SeqCst);
+            fake.fail_after.store(rng.below(8) as i64, SeqCst);
+            let mf = mirror_with(&fake, db.open(), cfg.clone());
+            let r = mf.run().await;
+            debug_dump(&mf, &format!("after failing run ({:?})", r.err()));
+            drop(mf);
+            fake.fail_after.store(-1, SeqCst);
+        }
+        let m = mirror_with(&fake, db.open(), cfg.clone());
+        m.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round}: {e}"));
+        debug_dump(&m, &format!("after run 1 of round {round}"));
+        // "during enumeration" changes only fire on a fresh cursor, so run
+        // once more to pick up anything made after the last cursor.
+        let m2 = mirror_with(&fake, db.open(), cfg.clone());
+        drop(m);
+        m2.run().await.unwrap_or_else(|e| panic!("seed {seed} round {round} (2nd): {e}"));
+        if actual(&m2) != expected(&fake, &rules) {
+            let trace = fake.with(|i| {
+                i.trace.join(
+                    "
 ",
-                    )
-                });
-                let (got, want) = (actual(&m2), expected(&fake, &rules));
-                panic!(
-                    "seed {seed} round {round} cfg {cfg:?}
+                )
+            });
+            let (got, want) = (actual(&m2), expected(&fake, &rules));
+            panic!(
+                "seed {seed} round {round} cfg {cfg:?}
 missing: {:?}
 unexpected: {:?}
 trace:
 {trace}",
-                    want.difference(&got).collect::<Vec<_>>(),
-                    got.difference(&want).collect::<Vec<_>>()
-                );
-            }
-            drop(m2);
-            fake.with(|i| {
-                i.during_enumeration.clear();
-                for _ in 0..rng.below(15) + 1 {
-                    random_mutation(i, &mut rng);
-                }
-            });
+                want.difference(&got).collect::<Vec<_>>(),
+                got.difference(&want).collect::<Vec<_>>()
+            );
         }
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        // The name index follows every change the mirror made: each item
+        // is found by its name, and nothing else is in it.
+        m2.read(|o| {
+            assert!(o.search_problems()?.is_empty(), "seed {seed} round {round}: {:?}", o.search_problems()?);
+            for (r, _) in
+                o.all_items()?.into_iter().filter(|(r, _)| r.kind != Kind::Root && r.name.chars().count() >= 3)
+            {
+                let found = o.search_names(&r.name, usize::MAX >> 4)?;
+                assert!(found.hits.iter().any(|h| h.row.id == r.id), "seed {seed} round {round}: {} not found", r.name);
+            }
+            Ok(())
+        })
+        .unwrap();
+        drop(m2);
+        fake.with(|i| {
+            i.during_enumeration.clear();
+            for _ in 0..rng.below(15) + 1 {
+                random_mutation(i, &mut rng);
+            }
+        });
     }
 }
 

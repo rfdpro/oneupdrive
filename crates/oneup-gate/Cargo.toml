@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 oneup-sync = { path = "../oneup-sync" }
+sha2 = "0.10"
 thiserror = "2"
 
 [lints]

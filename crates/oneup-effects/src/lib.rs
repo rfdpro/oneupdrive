@@ -28,16 +28,27 @@
 //!   to the last synced version, which OneDrive has. It is deleted through
 //!   that same handle. Anything else is kept (`data-safety.md` invariant 1).
 //!
-//! One effect isn't an operation of a round: [`release::release_root`]
+//! Two effects aren't operations of a round: [`release::release_root`]
 //! finishes another program's stalled unlinking, for the gate's
-//! [`oneup_gate::release::Release`] token.
+//! [`oneup_gate::release::Release`] token, and [`sharing::apply`] removes a
+//! sharing link or sets its expiry in OneDrive, for the gate's
+//! [`oneup_gate::sharing::PermissionChange`] token (who can open an item,
+//! never its content).
 //!
 //! A failed check is [`Error::Changed`], which the executor treats as "skip;
 //! plan again from fresh state next round".
+//!
+//! Effects of more than one step (keeping an item in the version store,
+//! replacing a file by a download) have crash points between their steps
+//! under the test-only `crash-test` feature (`LocalFs::crash_after`), so
+//! the executor's crash tests also stop them half done.
 
 pub mod name;
+pub mod sharing;
 pub mod versions;
 
+#[cfg(windows)]
+mod database;
 #[cfg(windows)]
 mod local;
 #[cfg(windows)]
@@ -46,8 +57,12 @@ mod ondemand;
 pub mod release;
 
 #[cfg(windows)]
-pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Staged, UploadSource};
+pub use database::{DbState, UploadCheck, Wait, staged_format};
+#[cfg(all(windows, feature = "crash-test"))]
+pub use local::Crashed;
+#[cfg(windows)]
+pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource, Witnessed};
 #[cfg(windows)]
 pub use ondemand::{EXCLUDED_MARK, Version};
 pub use oneup_ntfs::dirent::DirEntry;
-pub use versions::{Slot, Trim};
+pub use versions::{KeptTarget, Slot, Trim};

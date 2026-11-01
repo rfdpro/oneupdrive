@@ -18,6 +18,9 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+# Test-only: `Executor::crash_after` stops a round as if the process had
+# been killed.
+oneup-exec = { path = "../oneup-exec", features = ["crash-test"] }
 oneup-cfapi = { path = "../oneup-cfapi" }
 oneup-effects = { path = "../oneup-effects" }
 oneup-gate = { path = "../oneup-gate" }

@@ -10,19 +10,22 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use oneup_vault::folder::{Dir, Folder, Kind};
+use zeroize::Zeroizing;
 
 const PASSWORD_ENV: &str = "ONEUP_VAULT_PASSWORD";
 
-fn password(confirm: bool) -> Result<String> {
+/// Wiped from memory when dropped (the environment variable's copy, for
+/// scripts and tests, stays in the process's environment).
+fn password(confirm: bool) -> Result<Zeroizing<String>> {
     if let Ok(p) = std::env::var(PASSWORD_ENV) {
-        return Ok(p);
+        return Ok(Zeroizing::new(p));
     }
-    let p = rpassword::prompt_password("Vault password: ").context("reading the password")?;
+    let p = Zeroizing::new(rpassword::prompt_password("Vault password: ").context("reading the password")?);
     if confirm {
         if p.chars().count() < 8 {
             bail!("use at least 8 characters (a long passphrase is best)");
         }
-        let again = rpassword::prompt_password("Again: ").context("reading the password")?;
+        let again = Zeroizing::new(rpassword::prompt_password("Again: ").context("reading the password")?);
         if again != p {
             bail!("the passwords don't match");
         }
@@ -192,7 +195,7 @@ use oneup_graph::Graph;
 fn find(main: &Path, name: &str) -> Result<Entry> {
     vaultpair::list(main)
         .into_iter()
-        .find(|e| e.name.eq_ignore_ascii_case(name) || e.remote.eq_ignore_ascii_case(name))
+        .find(|e| oneup_sync::same_name(&e.name, name) || oneup_sync::same_name(&e.remote, name))
         .with_context(|| format!("no vault called {name} here (`oneup vault list`)"))
 }
 
@@ -221,6 +224,8 @@ pub async fn add(
     if start {
         crate::agent::start_with(&added.entry.dir, Some(&added.key)).await?;
     } else {
+        // Not running on purpose until something starts it.
+        oneup_app::problem::note_asked_to_stop(&added.entry.dir)?;
         println!("`oneup vault unlock {}` starts syncing it.", added.entry.name);
     }
     Ok(())
@@ -255,7 +260,12 @@ pub async fn new(
         added.entry.name
     );
     show_recovery(&added.key);
-    if start { crate::agent::start_with(&added.entry.dir, Some(&added.key)).await } else { Ok(()) }
+    if start {
+        crate::agent::start_with(&added.entry.dir, Some(&added.key)).await
+    } else {
+        // Not running on purpose until something starts it.
+        Ok(oneup_app::problem::note_asked_to_stop(&added.entry.dir)?)
+    }
 }
 
 /// The keys of a synced vault: remembered, or from its password.
@@ -275,10 +285,10 @@ pub async fn recovery_key(main: &Path, graph: Arc<Graph>, name: &str) -> Result<
 pub async fn change_password(main: &Path, graph: Arc<Graph>, name: &str, with_recovery: bool) -> Result<()> {
     let e = find(main, name)?;
     let key = if with_recovery {
-        let text = match std::env::var("ONEUP_VAULT_RECOVERY_KEY") {
+        let text = Zeroizing::new(match std::env::var("ONEUP_VAULT_RECOVERY_KEY") {
             Ok(t) => t,
             Err(_) => rpassword::prompt_password("Recovery key: ").context("reading the recovery key")?,
-        };
+        });
         vaultpair::keys_from_recovery(main, &graph, &e, &text).await?
     } else {
         println!("Current password:");

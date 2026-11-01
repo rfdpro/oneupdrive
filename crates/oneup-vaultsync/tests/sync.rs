@@ -39,6 +39,8 @@ struct Pair {
     exec: Executor<VaultCloud<Fake>>,
     s: Setup,
     conn: Option<provider::Connection>,
+    /// Moves cut short that rounds recorded where they went.
+    relinked: usize,
     _hydrator: Option<Arc<Hydrator<VaultCloud<Fake>>>>,
 }
 
@@ -92,7 +94,7 @@ impl Pair {
             (None, None)
         };
         let obs = Observer::open(store, Config::new(rules)).unwrap();
-        Self { dir, db, obs, exec, s, conn, _hydrator: hydrator }
+        Self { dir, db, obs, exec, s, conn, relinked: 0, _hydrator: hydrator }
     }
 
     fn p(&self, rel: &str) -> PathBuf {
@@ -100,9 +102,16 @@ impl Pair {
     }
 
     /// One round as the agent runs it for a vault pair: the local journal,
-    /// the decrypted view of the cloud listing, a plan, the gate, the
-    /// executor.
+    /// the decrypted view of the cloud listing, the settling of moves a
+    /// round cut short, a plan, the gate, the executor.
     async fn round(&mut self) -> Report {
+        let report = self.attempt().await;
+        assert!(report.halted.is_none() && report.failed.is_empty(), "{report:?}");
+        report
+    }
+
+    /// [`Pair::round`], however it ends.
+    async fn attempt(&mut self) -> Report {
         self.obs.catch_up().unwrap();
         let mut cache = oneup_vaultsync::project::Cache::default();
         let p = project(&self.s.src, &self.s.vault, &mut cache).await.unwrap();
@@ -110,6 +119,7 @@ impl Pair {
         *self.s.nodes.write().unwrap() = p.nodes.clone();
         let store = self.obs.store_mut();
         apply(store, &self.s.src, &p).unwrap();
+        self.relinked += self.exec.settle_moves(store).unwrap().relinked;
         let ops = store
             .read(|o| {
                 let p = Parked::new(o);
@@ -118,9 +128,12 @@ impl Pair {
             .unwrap();
         let r = review_in(&Policy::default(), &Context::default(), ops);
         assert!(r.breakers.is_empty(), "{:?}", r.breakers);
-        let report = self.exec.run(store, r.approved).await;
-        assert!(report.halted.is_none() && report.failed.is_empty(), "{report:?}");
-        report
+        self.exec.run(store, r.approved).await
+    }
+
+    /// What the version store holds (recycled or replaced items).
+    fn versions(&self) -> usize {
+        std::fs::read_dir(self.p(".oneup/versions")).map_or(0, |d| d.flatten().count())
     }
 
     /// Rounds until one does nothing.
@@ -308,5 +321,154 @@ async fn a_vault_pair_on_demand_decrypts_only_what_is_opened() {
     p.quiesce().await;
     assert_eq!(info(&long).on_disk, 0, "still online-only");
     assert_eq!(app_read(&long).unwrap(), b"unopened", "and opens with its content");
+    drop(p);
+}
+
+/// Another client moves a long-named file into another folder by moving
+/// its `.c9s` folder whole (renamed, with its `name.c9s` rewritten), and
+/// the next round plans to follow it here. Before that move runs, the
+/// entry's contents move out (a later move of that client that changed
+/// the entry's shape, whose old entry stayed behind with only its name),
+/// so the listing shows a shell where the file went. The executor asks
+/// OneDrive (`Cloud::is_at`), finds the entry without its contents, and
+/// doesn't follow it: the file stays where it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vault_move_to_an_entry_left_without_its_contents_is_not_followed() {
+    use oneup_store::Kind;
+    use oneup_sync::Op;
+    use oneup_vault::names::{self, Stored};
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = format!("{}.txt", "a long name ".repeat(20));
+    let a = RemoteId(s.vc.mkdir(&root, "A").await.unwrap().id);
+    let b = RemoteId(s.vc.mkdir(&root, "B").await.unwrap().id);
+    s.vc.upload(&a, &long, None, 4, &mut &b"long"[..]).await.unwrap();
+    s.vc.upload(&b, "b.txt", None, 1, &mut &b"b"[..]).await.unwrap();
+    let mut p = Pair::new("shell-move", s, false);
+    p.quiesce().await;
+    assert!(p.p(&format!("A/{long}")).exists());
+
+    // The other client's move of the whole `.c9s` folder into B.
+    p.s.refresh().await;
+    let holder = p.s.id(&format!("/A/{long}"));
+    let to = p.s.nodes.read().unwrap()[&b.0].clone();
+    let (b_dir, b_storage) = (to.dir_id.unwrap(), to.storage.unwrap());
+    let enc = names::encrypt_name(&p.s.vault.key, &long, &b_dir).unwrap();
+    let Stored::Short { dir, name } = Stored::of(enc, p.s.vault.threshold) else { panic!("a long name") };
+    let (rows, contents) = {
+        let mut c = p.s.cloud.0.lock().unwrap();
+        let (e1, e2) = (c.bump(), c.bump());
+        let h = c.items.get_mut(&holder.0).unwrap();
+        (h.parent, h.name, h.etag) = (Some(b_storage), dir, e1);
+        let name_file = c.child(&holder.0, names::NAME_FILE).unwrap();
+        let n = c.items.get_mut(&name_file).unwrap();
+        (n.content, n.etag) = (name.into_bytes(), e2);
+        let contents = c.child(&holder.0, names::CONTENTS_FILE).unwrap();
+        (vec![c.row(&holder.0), c.row(&name_file)], contents)
+    };
+    p.s.listing.lock().unwrap().write(|o| rows.iter().try_for_each(|r| o.upsert_item(r, false))).unwrap();
+
+    // The round's plan follows it here.
+    p.obs.catch_up().unwrap();
+    let mut cache = oneup_vaultsync::project::Cache::default();
+    let projected = project(&p.s.src, &p.s.vault, &mut cache).await.unwrap();
+    assert!(projected.problems.is_empty(), "{:?}", projected.problems);
+    *p.s.nodes.write().unwrap() = projected.nodes.clone();
+    let store = p.obs.store_mut();
+    apply(store, &p.s.src, &projected).unwrap();
+    let ops = store.read(|o| plan(&Parked::new(o), all_folders(&Parked::new(o))?)).unwrap();
+    assert!(ops.iter().any(|op| matches!(op, Op::MoveLocal { .. })), "{ops:?}");
+    let r = review_in(&Policy::default(), &Context::default(), ops);
+
+    // Meanwhile its contents leave the moved entry, which the listing
+    // doesn't show yet.
+    {
+        let mut c = p.s.cloud.0.lock().unwrap();
+        let aside = c.create(&root.0, "aside", true, vec![]).unwrap();
+        assert!(!c.items[&contents].folder);
+        c.items.get_mut(&contents).unwrap().parent = Some(aside);
+        assert!(c.row(&holder.0).kind == Kind::Folder);
+    }
+    let report = p.exec.run(store, r.approved).await;
+    assert!(report.halted.is_none() && report.failed.is_empty(), "{report:?}");
+    assert!(
+        report.skipped.iter().any(|(op, k)| matches!(op, Op::MoveLocal { .. }) && *k == oneup_exec::Skip::Changed),
+        "{report:?}"
+    );
+    assert!(p.p(&format!("A/{long}")).exists(), "the file stays where it is");
+    assert!(!p.p(&format!("B/{long}")).exists());
+}
+
+/// A vault move that rebuilds the entry under a new ID (a name that becomes
+/// too long to store as it is, or a long name that no longer is), with the
+/// process killed after the move and before its record: the next round
+/// records it where it went (`Executor::settle_moves`) instead of reading
+/// the old ID's removal as a deletion. Nothing is recycled or duplicated,
+/// a folder's contents included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vault_move_cut_short_by_a_crash_is_recorded_where_it_went() {
+    let long = format!("{}.txt", "a long name ".repeat(20));
+    let long_dir = format!("{}end", "a long folder name ".repeat(12));
+    // (before, after): a file whose name becomes long, a folder whose long
+    // name becomes short.
+    let cases = [("f.txt".to_string(), long.clone()), (long_dir.clone(), "short".to_string())];
+    for (i, (from, to)) in cases.into_iter().enumerate() {
+        let mut s = setup();
+        s.refresh().await;
+        let mut p = Pair::new(&format!("move-crash{i}"), s, false);
+        let folder = from == long_dir;
+        if folder {
+            write(&p.p(&format!("{from}/inner.txt")), b"inner");
+        } else {
+            write(&p.p(&from), b"content");
+        }
+        p.quiesce().await;
+        let before = p.local();
+
+        std::fs::rename(p.p(&from), p.p(&to)).unwrap();
+        p.exec.crash_after(Some(0));
+        let r = p.attempt().await;
+        assert_eq!(r.halted.as_deref(), Some(oneup_exec::CRASHED), "case {i}: {r:?}");
+        p.exec.crash_after(None);
+        p.quiesce().await;
+
+        let want: BTreeMap<String, Option<Vec<u8>>> =
+            before.into_iter().map(|(k, v)| (k.replacen(&format!("/{from}"), &format!("/{to}"), 1), v)).collect();
+        assert_eq!(p.local(), want, "case {i}: here");
+        assert_eq!(p.vault(), want, "case {i}: in the vault");
+        assert_eq!(p.versions(), 0, "case {i}: nothing recycled");
+        assert_eq!(p.relinked, 1, "case {i}: recorded where it went, not held");
+        assert!(p.obs.store().read(|o| o.meta_under("exec.moving")).unwrap().is_empty(), "case {i}");
+    }
+}
+
+/// The same with Files On-Demand, for an online-only file: once the move is
+/// recorded where it went, its placeholder names the rebuilt entry, so it
+/// still opens with its content (the old ID is gone; hydrating by it would
+/// be refused for good).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_online_only_file_whose_vault_move_a_crash_cut_short_still_opens() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    s.vc.upload(&root, "f.txt", None, 7, &mut &b"content"[..]).await.unwrap();
+    let mut p = Pair::new("move-crash-ondemand", s, true);
+    p.quiesce().await;
+    let info = |f: &Path| provider::info(&provider::open(f).unwrap()).unwrap().unwrap();
+    assert_eq!(info(&p.p("f.txt")).on_disk, 0, "online-only");
+
+    let long = p.p(&format!("{}.txt", "a long name ".repeat(20)));
+    std::fs::rename(p.p("f.txt"), &long).unwrap();
+    p.exec.crash_after(Some(0));
+    let r = p.attempt().await;
+    assert_eq!(r.halted.as_deref(), Some(oneup_exec::CRASHED), "{r:?}");
+    p.exec.crash_after(None);
+    p.quiesce().await;
+
+    assert_eq!(p.relinked, 1, "recorded where it went");
+    assert_eq!(info(&long).on_disk, 0, "still online-only");
+    assert_eq!(app_read(&long).unwrap(), b"content", "and opens with its content");
+    assert_eq!(p.versions(), 0);
     drop(p);
 }

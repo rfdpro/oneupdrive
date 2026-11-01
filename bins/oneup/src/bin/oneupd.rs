@@ -21,8 +21,9 @@
 //!
 //! **Control** (`oneup_app::control`, over `oneup_ipc`'s pipe): `oneup
 //! status`, `pause`/`resume` (both directions or one, optionally timed; kept
-//! across restarts), `approve`/`keep`/`discard`, and `sync-now`, all while
-//! the agent keeps running. While both directions are paused, no rounds run
+//! across restarts), `approve`/`keep`/`discard`, `sync-now` and `watch`
+//! (its events), all while the agent keeps running. Event hooks
+//! (`oneup_app::hooks`) start the user's programs on those events. While both directions are paused, no rounds run
 //! at all; the journal is still read, so nothing is missed. A pause that
 //! comes during a round (the user's, or the agent's own on a metered
 //! connection and the like) stops that side's operations from the next one
@@ -30,7 +31,8 @@
 //!
 //! **Safety.** Everything `oneup sync` guarantees holds (same gate, same
 //! effects layer). In addition, the safety stops count what the agent did
-//! in the last [`WINDOW`], so a mass deletion trickling in as many small
+//! in the last 15 minutes ([`oneup_app::safetywindow`], kept in the state
+//! store across restarts), so a mass deletion trickling in as many small
 //! rounds still trips them ([`oneup_gate::Recent`]). A tripped stop changes
 //! nothing and waits for the user's `oneup approve CODE`; later rounds
 //! change nothing either while it stands. Removed files that don't fit in
@@ -45,7 +47,6 @@
 //! only, like `oneup sync`. One process per data folder (`sync.lock`). Ctrl+C stops after the current
 //! round; a second Ctrl+C stops at once.
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -56,7 +57,9 @@ use clap::Parser;
 use oneup_app::autopause;
 use oneup_app::busy::Busy;
 use oneup_app::control::{Control, now_ms};
+use oneup_app::pace::{Pacer, Woke};
 use oneup_app::problem;
+use oneup_app::safetywindow::SafetyWindow;
 use oneup_app::setup::{self, DirLock, KEY_PRESET};
 use oneup_app::sync::{self, Answers, Asker, End, Halted, Scope};
 use oneup_gate::Recent;
@@ -65,8 +68,6 @@ use oneup_ipc::{Activity, LastRun};
 use oneup_store::Store;
 use tokio::sync::Notify;
 
-/// How far back the safety stops look (see the module docs).
-const WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Rounds per wake-up before the agent pauses briefly and starts over.
 const MAX_ROUNDS: usize = 20;
 /// After a journal wake-up, how long to let a burst of changes (a program
@@ -249,6 +250,12 @@ async fn run(args: Args) -> Result<()> {
             false
         }
     };
+    // What config.toml sets instead of the memory profile's, in the log.
+    let set: Vec<String> =
+        settings.tuned().iter().filter(|t| t.set.is_some()).map(|t| format!("{} {}", t.knob.name(), t.value)).collect();
+    if !set.is_empty() {
+        println!("oneupd: memory profile {}, with {}", settings.memory, set.join(", "));
+    }
     let cache_kib = settings.cache_kib();
     let memory = Memory { cache_kib, map_bytes: Memory::map_bytes(cache_kib, !settings.background && priority_set) };
     // Before the hydration service and the program tracker open their own
@@ -256,7 +263,7 @@ async fn run(args: Args) -> Result<()> {
     if settings.compact_database {
         sync::compact(&mut setup::open_store(dir, cache_kib)?, dir);
     }
-    let control = {
+    let (control, synced_folder) = {
         let store = setup::open_store(dir, cache_kib)?;
         let pair = sync::pairing(&store)?;
         let local = pair.local.display().to_string();
@@ -268,8 +275,21 @@ async fn run(args: Args) -> Result<()> {
             discard: args.discard.clone(),
             ..Answers::default()
         };
-        Arc::new(Control::new(Some(dir), local, pair.remote, answers))
+        (Arc::new(Control::new(Some(dir), local, pair.remote, answers)), pair.local)
     };
+    // Event hooks (config.toml [[hook]]): programs started on the events of
+    // `control.events`. They mustn't inherit this process's output handle
+    // (its log): Windows hands a child every inheritable handle.
+    oneup_sys::inherit::keep_std_handles();
+    // The hooks' processes share one registry, so the control pipe can
+    // refuse them: a hook can't approve a safety stop or read the status.
+    let hook_jobs = std::sync::Arc::new(oneup_sys::contained::HookJobs::new());
+    {
+        let jobs = std::sync::Arc::clone(&hook_jobs);
+        control.gate_clients(Box::new(move |pid| jobs.may_serve(pid)));
+    }
+    let mut hooks =
+        oneup_app::hooks::AgentHooks::start(dir, &synced_folder, &control.events, std::sync::Arc::clone(&hook_jobs));
     let p = control.controls();
     if p.pause_local || p.pause_remote {
         println!("oneupd: {} (`oneup resume` to continue)", describe_pause(p.pause_local, p.pause_remote));
@@ -287,10 +307,14 @@ async fn run(args: Args) -> Result<()> {
     let stop = Arc::new(Stop { flag: AtomicBool::new(false), notify: Notify::new() });
     {
         // `oneup stop` works like Ctrl+C: after the current round.
-        let (stop, control) = (Arc::clone(&stop), Arc::clone(&control));
+        let (stop, control, dir) = (Arc::clone(&stop), Arc::clone(&control), dir.clone());
         tokio::spawn(async move {
             control.stop.notified().await;
             println!("oneupd: stopping after the current round (asked by `oneup stop`)");
+            // Not running on purpose: `oneup problems` leaves it out.
+            if let Err(e) = problem::note_asked_to_stop(&dir) {
+                tracing::warn!(error = %e, "couldn't note that oneupd was asked to stop");
+            }
             stop.flag.store(true, Relaxed);
             stop.notify.notify_one();
         });
@@ -334,6 +358,25 @@ async fn run(args: Args) -> Result<()> {
         });
     }
 
+    // Once, after an upgrade: the search index for what the store held
+    // before it (seconds, up to a minute at 3M items, in short steps). Not
+    // while paused, and it stops with the agent; the next start or the
+    // first search carries on.
+    {
+        let (dir, stop, control) = (dir.clone(), Arc::clone(&stop), Arc::clone(&control));
+        let built = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut store = setup::open_store(&dir, cache_kib)?;
+            oneup_app::search::build_index(&mut store, || {
+                let p = control.controls();
+                !stop.requested() && !(p.pause_local && p.pause_remote)
+            })
+        })
+        .await?;
+        if let Err(e) = built {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't build the search index; the first search will");
+        }
+    }
+
     // Explorer's status flyout, for a folder registered with the shell.
     let flyout = {
         let token = setup::open_store(dir, 1024)?.read(|o| o.meta_get("sync.token"))?;
@@ -343,11 +386,15 @@ async fn run(args: Args) -> Result<()> {
     // ---- run; on an error, start over after a growing pause
     let mut pause = ERROR_FIRST;
     // Outlives each attempt: a mass deletion trickling in must still trip
-    // the stops when an error restarts the rounds in between.
-    let mut window = Window::default();
+    // the stops when an error restarts the rounds in between. Read from the
+    // store by the first attempt, so a restart doesn't forget it either.
+    let mut window: Option<SafetyWindow> = None;
+    // How good the link is (`oneup_app::link`): outlives an error too.
+    let mut link = oneup_app::link::Link::default();
     loop {
         let started = Instant::now();
-        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window).await {
+        match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window, &mut hooks, &mut link).await
+        {
             Ok(()) => {
                 println!("oneupd: stopped.");
                 end_flyout(dir, flyout);
@@ -373,18 +420,21 @@ async fn run(args: Args) -> Result<()> {
                 tracing::error!("{e:#}");
                 let before = control.problem();
                 pause = error_pause(pause, before.is_none(), started.elapsed());
-                let retry_ms = now_ms() + i64::try_from(pause.as_millis()).unwrap_or(i64::MAX);
+                // Longer on a poor link (`oneup_app::link`).
+                let slower = if control.poor_link() { oneup_app::link::POOR_BACKOFF } else { 1 };
+                let wait = pause * slower;
+                let retry_ms = now_ms() + i64::try_from(wait.as_millis()).unwrap_or(i64::MAX);
                 let p = problem::describe(&e, before.as_ref(), now_ms(), Some(retry_ms));
                 // Once per spell, not at every retry.
                 if before.is_none_or(|b| b.kind != p.kind) {
                     note_problem(dir, &p, false);
                 }
-                println!("oneupd: {}: {e:#}\n        trying again in {} s", p.title, pause.as_secs());
+                println!("oneupd: {}: {e:#}\n        trying again in {} s", p.title, wait.as_secs());
                 control.set_problem(Some(p));
                 // Retry now (the settings window, `oneup sync-now`) cuts the
                 // pause short; the next one still grows.
                 tokio::select! {
-                    () = stop.sleep(pause) => {}
+                    () = stop.sleep(wait) => {}
                     () = control.wake.notified() => println!("oneupd: trying again now, as asked"),
                 }
                 if stop.requested() {
@@ -461,7 +511,8 @@ impl Memory {
 
 /// Syncs until stopped (`Ok`) or an error. Everything is reopened from the
 /// database each time, so a retry starts from a clean state, except the
-/// safety window (`window`), which the caller keeps across retries.
+/// safety window (`window`), which the caller keeps across retries (`None`
+/// until the first attempt reads it from the store).
 #[allow(clippy::too_many_arguments)]
 async fn agent(
     dir: &Path,
@@ -471,12 +522,37 @@ async fn agent(
     control: &Control,
     memory: Memory,
     key: Option<&oneup_vault::key::Masterkey>,
-    window: &mut Window,
+    window: &mut Option<SafetyWindow>,
+    hooks: &mut oneup_app::hooks::AgentHooks,
+    link: &mut oneup_app::link::Link,
 ) -> Result<()> {
     let mut store = setup::open_store(dir, memory.cache_kib)?;
     if memory.map_bytes > 0 {
         store.map_memory(memory.map_bytes)?;
     }
+    let window = match window {
+        // A retry: what the failed attempt counted may not be saved yet.
+        // Nothing runs until it is.
+        Some(w) => {
+            w.save(&mut store).context("can't record the safety window")?;
+            w
+        }
+        None => {
+            let (w, readable) = SafetyWindow::load(&store, now_ms())?;
+            if !readable {
+                // Counted as full for 15 minutes instead: every deletion,
+                // overwrite or move waits for approval meanwhile.
+                let detail = "the record of the last 15 minutes couldn't be read; every deletion, overwrite or move \
+                              needs approval for 15 minutes"
+                    .to_string();
+                tracing::warn!("{detail}");
+                println!("oneupd: {detail}");
+                w.save(&mut store).context("can't record the safety window")?;
+                sync::note(&mut store, "safety window", detail)?;
+            }
+            window.insert(w)
+        }
+    };
     if store.read(|o| o.meta_get(KEY_PRESET))?.is_none() {
         anyhow::bail!("no exclusion choice recorded; run `oneup sync` once first");
     }
@@ -493,6 +569,7 @@ async fn agent(
     let busy = Arc::new(Busy::new(oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?.busy));
     engine.hold_busy(Arc::clone(&busy));
     engine.back_off();
+    engine.publish_events(Arc::clone(&control.events));
     // The watcher's own connection, to tell synced items' delete records.
     let deletes = setup::open_store(dir, 1024)
         .inspect_err(|e| tracing::warn!(error = %e, "deletions during a journal loss will be held"))
@@ -505,9 +582,11 @@ async fn agent(
         // Explorer's entry was brought up to date before connecting
         // (`prepare_registration`).
         let stale = Arc::clone(&remote);
-        let h = oneup_exec::hydrate::Hydrator::new(
-            // Decrypting, for a vault pair.
+        let h = oneup_exec::hydrate::Hydrator::with_ours(
+            // Decrypting, for a vault pair. Programs opening files aren't
+            // held by the data budget; OneUpDrive's own downloads are.
             engine.hydration_cloud(),
+            Some(engine.pinning_cloud()),
             setup::open_store(dir, 4 * 1024)?,
             dir.join("hydration"),
             Path::new(&root.path),
@@ -520,11 +599,9 @@ async fn agent(
         None
     };
     let push_up = Arc::clone(&control.push_up);
-    // Aborted when this attempt ends, so a restart never runs two channels.
-    // A folder in someone else's drive has no push channel for us: the
-    // timer covers it.
-    let _push = (!args.no_push && !graph.is_other_drive())
-        .then(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
+    // Opened and closed as the sync interval wants it (`oneup_app::pace`);
+    // aborted when this attempt ends, so a restart never runs two channels.
+    let mut push_channel = PushChannel { task: None, up: Arc::clone(&push_up) };
 
     let poll = Duration::from_secs(args.poll_seconds.max(15));
     // Every folder only when the marks may not cover everything (see
@@ -532,7 +609,26 @@ async fn agent(
     let mut scope = sync::start_scope(&store)?;
     let mut retry = RETRY_FIRST;
     let mut settings = oneup_app::config::kept(dir, oneup_app::config::load_agent(dir))?;
-    let mut auto_was: Option<String> = None;
+    let mut auto_was: Option<autopause::Reason> = None;
+    let mut pacer = Pacer::default();
+    let mut woke = Woke::Start;
+    // What the last pass held for another network (`oneup_app::network`).
+    let mut waiting = oneup_app::network::load_waiting(&store)?;
+    let mut net_use = NetUse::new(dir, graph)?;
+    // Windows' network changes, as they happen (`oneup_sys::network`): a
+    // switch to a metered network, or the internet coming back, takes
+    // effect within seconds, whether the agent waits or rounds run.
+    let net_events = Arc::new(oneup_app::network::Events::default());
+    let _net_watch = {
+        let ev = Arc::clone(&net_events);
+        oneup_sys::network::watch(move || ev.changed())
+            .inspect_err(|e| tracing::warn!(error = %e, "network changes are noticed at each wake-up only"))
+            .ok()
+    };
+    // How good the link is (`oneup_app::link`), kept across retries; the
+    // transport follows it from the start of this attempt.
+    apply_link(graph, link.is_poor());
+    control.set_on_demand(engine.local().on_demand());
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
         // wake-up; a broken config.toml keeps the last good settings
@@ -540,13 +636,36 @@ async fn agent(
             Ok(s) => settings = s,
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "config.toml: keeping the previous settings"),
         }
+        // The network and its profile (`oneup_app::network`): caps, the
+        // interval, what transfers.
+        let Looked { net, profile, usage, why: net_why } = net_use.look(dir, &settings, graph, control)?;
+        pacer.set(profile.interval);
+        // A folder in someone else's drive has no push channel for us: the
+        // timer covers it.
+        let want = push_wanted(
+            !args.no_push && !graph.is_other_drive(),
+            pacer.wants_push(),
+            control.offline(),
+            net_why.is_some(),
+        );
+        if want {
+            push_channel
+                .open(|| AbortOnDrop(tokio::spawn(push(Arc::clone(graph), Arc::clone(&remote), Arc::clone(&push_up)))));
+        } else {
+            push_channel.close();
+        }
         busy.set_settings(settings.busy);
+        // The hooks, if config.toml changed (`oneup hooks` nudges the agent).
+        hooks.refresh();
         let minute = autopause::local_minute_of_day();
-        let auto = auto_pause(&settings, minute);
+        let auto = auto_pause(&settings, minute, net_why);
         if auto != auto_was {
             match &auto {
-                Some(why) => println!("oneupd: pausing by itself: {why}"),
-                None => println!("oneupd: resuming ({} no longer applies)", auto_was.as_deref().unwrap_or("")),
+                Some(why) => println!("oneupd: pausing by itself: {}", why.english()),
+                None => println!(
+                    "oneupd: resuming ({} no longer applies)",
+                    auto_was.as_ref().map(autopause::Reason::english).unwrap_or_default()
+                ),
             }
             auto_was.clone_from(&auto);
         }
@@ -555,7 +674,14 @@ async fn agent(
         // ---- a timed pause may be over; a changed pause is saved
         let paused = control.settle_pause(now_ms());
         let mut held_until = None;
+        // With a sync interval, a pass waits for its turn unless the user
+        // asked (`oneup_app::pace`).
+        let hold = pacer.decide(woke, Instant::now());
+        let mut continuing = false;
+        // Whether the wait below is the interval's (a pass ran or waits).
+        let mut paced = true;
         let next = if auto.is_some() {
+            paced = false;
             control.set_activity(Activity::Paused);
             // Looked at again at the next wake-up or check, or when the
             // quiet hours end.
@@ -564,30 +690,65 @@ async fn agent(
                 .map_or(check, |m| check.min(Duration::from_secs(u64::from(m) * 60 + 5)))
         } else if paused.local && paused.remote {
             control.set_activity(Activity::Paused);
+            paced = false;
             PAUSED_WAIT
+        } else if let Some(wait) = hold {
+            // Not yet: changes collect meanwhile.
+            wait
         } else {
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
+            pacer.started(started);
+            let counted = LinkCounters::of(graph);
             let mut executed = Recent::default();
-            let recent = window.recent();
+            let recent = window.recent(now_ms());
+            // Each round records the window, with what it may do, before it
+            // changes anything (`sync::Keep`).
+            let base = window.clone();
+            let keep =
+                move |store: &mut Store, extra: Recent| -> Result<()> { Ok(base.save_with(store, extra, now_ms())?) };
             let rounds = watching_auto_pause(
-                engine.rounds(store, scope, &|| control.controls(), recent, &mut executed, MAX_ROUNDS, &|p| {
-                    control.set_progress(p)
-                }),
+                engine.rounds(
+                    store,
+                    scope,
+                    &|| control.controls(),
+                    recent,
+                    &mut executed,
+                    MAX_ROUNDS,
+                    &|p| control.set_progress(p),
+                    Some(&keep),
+                ),
+                dir,
                 &settings,
                 control,
+                graph,
+                &mut net_use,
+                &net_events,
+                &mut push_channel,
             )
             .await;
             // Before the error, if any: the retry must still count them.
-            window.add(executed);
+            window.add(executed, now_ms());
+            // Approvals used are dropped: a code approves its list once.
+            control.forget_approvals(&engine.spent_answers());
+            // What the rounds used, recorded now (a stop or an error next
+            // keeps it too: `NetUse` charges once more as it goes).
+            net_use.charge_now();
             let (s, out) = rounds?;
             store = s;
+            waiting.clone_from(&out.waiting);
+            adapt(&mut store, graph, link, &counted.since(graph), control);
+            if executed != Recent::default() {
+                window.save(&mut store).context("can't record the safety window")?;
+            }
             held_until = out.held_until;
             control.set_unsynced(oneup_app::unsynced::count(&oneup_app::unsynced::load(&store)?));
             // Failed items waiting their turn (`oneup_app::backoff`); the
             // wait below ends when the first one's comes (`held_until`).
             let (count, next_ms) = store.read(|o| o.retry_waiting(now_ms()))?;
             control.set_retrying(next_ms.filter(|_| count > 0).map(|next_ms| oneup_ipc::Retrying { count, next_ms }));
+            let (notes, more) = engine.database_notes();
+            control.set_databases(notes, more);
             if !out.totals.is_quiet() {
                 out.totals.print(out.rounds);
             }
@@ -635,7 +796,21 @@ async fn agent(
             match out.end {
                 End::Settled => {
                     control.clear_first();
-                    store = engine.placement(store, &control.controls()).await?;
+                    // Pinned files download under the network as it is
+                    // before each one: Windows' events are followed meanwhile.
+                    let placed = watching_auto_pause(
+                        engine.placement(store, &|| control.controls()),
+                        dir,
+                        &settings,
+                        control,
+                        graph,
+                        &mut net_use,
+                        &net_events,
+                        &mut push_channel,
+                    )
+                    .await;
+                    net_use.charge_now();
+                    store = placed?;
                     // Removes kept copies on this PC: not while changes
                     // to it are paused.
                     if !control.controls().pause_local {
@@ -653,16 +828,21 @@ async fn agent(
                     if !control.controls().pause_local {
                         tokio::task::block_in_place(|| engine.clear_excluded_marks(&mut store))?;
                     }
-                    if more { CONVERT_GAP } else { check }
+                    if more || engine.pins_pending() { CONVERT_GAP } else { check }
                 }
                 End::Retry => {
-                    let wait = retry.min(check);
+                    // Longer on a poor link.
+                    let slower = if link.is_poor() { oneup_app::link::POOR_BACKOFF } else { 1 };
+                    let wait = (retry * slower).min(check);
                     retry = (retry * 2).min(RETRY_MAX);
                     control.set_activity(Activity::Retrying);
                     println!("oneupd: retrying the skipped items in {} s", wait.as_secs());
                     wait
                 }
-                End::Unsettled => Duration::from_secs(5),
+                End::Unsettled => {
+                    continuing = true;
+                    Duration::from_secs(5)
+                }
                 // Nothing ran. The next wake-up (a change, a check, or the
                 // user's answer) plans it again; the stop is shown once.
                 End::Stopped => {
@@ -672,8 +852,12 @@ async fn agent(
             }
         };
         // A held upload goes once its file has been left alone, a failed
-        // operation once its wait is over.
-        let next = held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now())));
+        // operation once its wait is over; with a sync interval, both wait
+        // for the next pass, which is when OneDrive is checked too.
+        let next = match pacer.due() {
+            Some(due) if paced && !continuing => due.saturating_duration_since(Instant::now()),
+            _ => held_until.map_or(next, |u| next.min(u.saturating_duration_since(Instant::now()))),
+        };
         // A timed pause ends the wait when it's over.
         let next = match paused.until_ms {
             Some(u) if paused.local || paused.remote => {
@@ -681,19 +865,69 @@ async fn agent(
             }
             _ => next,
         };
+        control.set_network(net_status(&pacer, &net, &profile, waiting.as_ref(), &usage));
 
         // ---- wait for something to do
-        store = wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next).await?;
+        let (s, w) =
+            wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer, &net_events).await?;
+        store = s;
+        woke = if w == Woke::Timer && continuing { Woke::Continue } else { w };
         if stop.requested() {
             return Ok(());
         }
     }
 }
 
-/// Why the agent pauses by itself now (config.toml [agent]), if it does.
-fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<String> {
+/// What `oneup status` shows of the network and the sync interval.
+fn net_status(
+    pacer: &Pacer,
+    net: &oneup_sys::network::Network,
+    profile: &oneup_app::network::Profile,
+    waiting: Option<&oneup_app::network::Waiting>,
+    usage: &oneup_app::netusage::Usage,
+) -> oneup_ipc::NetStatus {
+    let budget = profile.budget_bytes();
+    let data = (budget.is_some() || profile.key != oneup_app::network::Key::Default).then(|| oneup_ipc::DataUse {
+        month: usage.month.clone(),
+        up: usage.up,
+        down: usage.down,
+        budget: budget.map_or(0, |b| b.saturating_add(usage.extra)),
+        reached: usage.reached(budget),
+    });
+    let next_ms = pacer.due().map(|d| {
+        let left = d.saturating_duration_since(Instant::now());
+        now_ms() + i64::try_from(left.as_millis()).unwrap_or(i64::MAX / 2)
+    });
+    oneup_ipc::NetStatus {
+        name: net.name.clone(),
+        metered: net.metered,
+        profile: match profile.key {
+            oneup_app::network::Key::Default => "default",
+            oneup_app::network::Key::Metered => "metered",
+            oneup_app::network::Key::Network(_) => "own",
+        }
+        .into(),
+        transfer: profile.transfer.label(profile.small_mb),
+        connectivity: net.connectivity.name().into(),
+        interval_min: pacer.interval().minutes,
+        next_ms,
+        waiting: waiting.map(|w| oneup_ipc::NetWaiting { count: w.count, bytes: w.bytes, why: w.why.clone() }),
+        data,
+        // Kept by `Control::set_network` (`set_poor_link` and the user's
+        // offline call set them).
+        link: String::new(),
+        offline: false,
+    }
+}
+
+/// Why the agent pauses by itself now (config.toml), if it does.
+fn auto_pause(
+    settings: &oneup_app::config::Agent,
+    minute: u32,
+    network: Option<autopause::Reason>,
+) -> Option<autopause::Reason> {
     let conditions = autopause::Conditions {
-        metered: oneup_sys::conditions::metered(),
+        network,
         battery_saver: oneup_sys::conditions::battery_saver(),
         full_screen: oneup_sys::conditions::full_screen(),
         minute_of_day: minute,
@@ -704,10 +938,16 @@ fn auto_pause(settings: &oneup_app::config::Agent, minute: u32) -> Option<String
 /// Runs `rounds`, looking at the automatic pauses again meanwhile: one that
 /// begins pauses the round under way at its next operation (through
 /// `control`). Ending one waits for the rounds to end.
+#[allow(clippy::too_many_arguments)]
 async fn watching_auto_pause<T>(
     rounds: impl Future<Output = T>,
+    dir: &Path,
     settings: &oneup_app::config::Agent,
     control: &Control,
+    graph: &Graph,
+    net_use: &mut NetUse,
+    net_events: &oneup_app::network::Events,
+    push_channel: &mut PushChannel,
 ) -> T {
     tokio::pin!(rounds);
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + AUTO_PAUSE_CHECK, AUTO_PAUSE_CHECK);
@@ -715,8 +955,47 @@ async fn watching_auto_pause<T>(
     loop {
         tokio::select! {
             r = &mut rounds => return r,
+            // Working offline, asked during the round: no push channel from
+            // now on (rounds already hold OneDrive's side through the pause).
+            () = control.offline_changed.notified() => {
+                if control.offline() {
+                    push_channel.close();
+                }
+            }
+            () = net_events.next() => {
+                // Another network, mid-round: its policy (and a pause, if
+                // it pauses) applies from the next operation on.
+                let why = match tokio::task::block_in_place(|| net_use.look(dir, settings, graph, control)) {
+                    Ok(l) => l.why,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't read the network");
+                        None
+                    }
+                };
+                // A network pause (metered, waiting for the internet, the
+                // budget used up) closes the push channel at once too.
+                if why.is_some() {
+                    push_channel.close();
+                }
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day(), why) {
+                    control.set_auto_pause(Some(why));
+                }
+            }
             _ = tick.tick() => {
-                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day()) {
+                // Also counts the data used so far, so a budget reached
+                // mid-round pauses it (the network itself is read only
+                // when Windows reports a change).
+                let why = match tokio::task::block_in_place(|| net_use.count(settings, graph, control)) {
+                    Ok(why) => why,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "couldn't count the data used");
+                        None
+                    }
+                };
+                if why.is_some() {
+                    push_channel.close();
+                }
+                if let Some(why) = auto_pause(settings, autopause::local_minute_of_day(), why) {
                     control.set_auto_pause(Some(why));
                 }
             }
@@ -731,6 +1010,11 @@ async fn watching_auto_pause<T>(
 ///
 /// "New" because marks left by a round with skipped items stay until their
 /// retry (`timeout`); only marks made after the wait began cut it short.
+///
+/// With a sync interval (`pacer`), changes in the synced folder are still
+/// read from the journal as they come, but don't end the wait; nor do
+/// OneDrive's notifications, unless the push channel is kept for them.
+#[allow(clippy::too_many_arguments)]
 async fn wait(
     mut store: Store,
     rules: &oneup_rules::ExcludeSet,
@@ -739,38 +1023,47 @@ async fn wait(
     stop: &Stop,
     control: &Notify,
     timeout: Duration,
-) -> Result<Store> {
+    pacer: &Pacer,
+    net: &oneup_app::network::Events,
+) -> Result<(Store, Woke)> {
     let deadline = tokio::time::Instant::now() + timeout;
     let seen = store.read(|o| o.dirty_last())?;
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => return Ok(store),
-            _ = stop.notify.notified() => return Ok(store),
+            _ = tokio::time::sleep_until(deadline) => return Ok((store, Woke::Timer)),
+            _ = stop.notify.notified() => return Ok((store, Woke::Stop)),
             _ = control.notified() => {
                 tracing::debug!("control call");
-                return Ok(store);
+                return Ok((store, Woke::User));
+            }
+            () = net.next() => {
+                tracing::debug!("network change");
+                return Ok((store, Woke::Network));
             }
             _ = remote.notified() => {
                 // Something changed in OneDrive (or the channel dropped). A
                 // change often comes as a few notifications in a row.
                 tracing::debug!("push notification");
-                stop.sleep(PUSH_SETTLE).await;
-                return Ok(store);
+                if pacer.wakes_on(Woke::Cloud) {
+                    stop.sleep(PUSH_SETTLE).await;
+                    return Ok((store, Woke::Cloud));
+                }
+                continue;
             }
             _ = journal.notified() => {}
         }
         // A control call doesn't wait for the burst to settle.
         tokio::select! {
             _ = stop.sleep(SETTLE) => {}
-            _ = control.notified() => return Ok(store),
+            _ = control.notified() => return Ok((store, Woke::User)),
         }
         if stop.requested() {
-            return Ok(store);
+            return Ok((store, Woke::Stop));
         }
         store = sync::observe(store, rules).await?;
-        if store.read(|o| o.dirty_last())? > seen {
+        if pacer.wakes_on(Woke::Local) && store.read(|o| o.dirty_last())? > seen {
             tracing::debug!("change in the synced folder");
-            return Ok(store);
+            return Ok((store, Woke::Local));
         }
     }
 }
@@ -951,6 +1244,7 @@ async fn push(graph: Arc<Graph>, remote: Arc<Notify>, up: Arc<AtomicBool>) {
             Ok(ep) => {
                 oneup_graph::push::listen(
                     &ep,
+                    &graph,
                     || {
                         up.store(true, Relaxed);
                         tracing::info!("push channel live");
@@ -1034,7 +1328,10 @@ async fn publish_flyout(dir: PathBuf, token: String, control: Arc<Control>, grap
     let mut shown: Option<ShellStatus> = None;
     loop {
         // Someone else's drive (a shared folder) has no quota of ours.
-        if !graph.is_other_drive() && quota_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3600)) {
+        if !graph.is_other_drive()
+            && !control.offline()
+            && quota_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3600))
+        {
             if let Ok(q) = graph.quota().await {
                 quota = q;
             }
@@ -1062,6 +1359,311 @@ fn end_flyout(dir: &Path, task: Option<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// Counts the data the agent uses on each network profile
+/// (`oneup_app::netusage`), with its own database connection: it's asked
+/// while rounds hold the agent's.
+struct NetUse {
+    /// Charged once more when this attempt ends, however it ends.
+    ledger: oneup_app::netusage::Ledger,
+    /// The network and profile last read: what the timed count between
+    /// network changes goes by.
+    last: Option<(oneup_sys::network::Network, oneup_app::network::Profile)>,
+    /// The profile whose budget the transport takes reservations of, and
+    /// that budget (`None`: no budget).
+    target: Arc<std::sync::Mutex<Option<(String, u64)>>>,
+}
+
+/// The network now, its profile, this month's use there, and why sync
+/// pauses on it (its profile, or a reached budget), if it does.
+struct Looked {
+    net: oneup_sys::network::Network,
+    profile: oneup_app::network::Profile,
+    usage: oneup_app::netusage::Usage,
+    why: Option<autopause::Reason>,
+}
+
+impl NetUse {
+    /// The count and the budget are the account's, shared by its agents
+    /// (its extra pairs and vaults): kept in its main data folder's store,
+    /// the budget taken a reservation at a time (`netusage::reserve`).
+    fn new(dir: &Path, graph: &Arc<Graph>) -> Result<Self> {
+        let g = Arc::clone(graph);
+        let counters = Box::new(move || Self::counters(&g));
+        let main = oneup_app::vaultpair::main_dir(dir);
+        let owner = std::process::id().to_string();
+        let target: Arc<std::sync::Mutex<Option<(String, u64)>>> = Arc::default();
+        // More of the shared budget when the transport's runs low.
+        let reserve = {
+            let store = std::sync::Mutex::new(setup::open_store(&main, 1024)?);
+            let (target, owner) = (Arc::clone(&target), owner.clone());
+            Box::new(move |want: u64| -> u64 {
+                let Some((profile, budget)) = target.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+                    return 0;
+                };
+                let month = oneup_app::netusage::month_of(now_ms());
+                let mut s = store.lock().unwrap_or_else(|p| p.into_inner());
+                let alive = oneup_app::netusage::agent_alive;
+                oneup_app::netusage::reserve(&mut s, &profile, &month, &owner, want, budget, &alive).unwrap_or_else(
+                    |e| {
+                        tracing::warn!(error = %e, "couldn't take more of the data budget");
+                        0
+                    },
+                )
+            }) as oneup_graph::budget::Refill
+        };
+        graph.budget.set_refill(Some(reserve));
+        Ok(Self {
+            ledger: oneup_app::netusage::Ledger::new(setup::open_store(&main, 1024)?, counters, owner),
+            last: None,
+            target,
+        })
+    }
+
+    /// Adds what went since the last charge to the profile in effect
+    /// meanwhile (`netusage::Account`).
+    fn charge(&mut self) -> Result<()> {
+        Ok(self.ledger.charge()?)
+    }
+
+    /// [`NetUse::charge`], saying so if it fails (charged at the next).
+    fn charge_now(&mut self) {
+        if let Err(e) = tokio::task::block_in_place(|| self.charge()) {
+            tracing::warn!(error = %format!("{e:#}"), "couldn't record the data used; it's counted next time");
+        }
+    }
+
+    /// This month's use on `profile`, with what the user allowed since the
+    /// last look added to it, and why sync pauses (the connection, the
+    /// profile, or the budget), applying the profile.
+    fn settle(
+        &mut self,
+        net: &oneup_sys::network::Network,
+        profile: &oneup_app::network::Profile,
+        settings: &oneup_app::config::Agent,
+        graph: &Graph,
+        control: &Control,
+    ) -> Result<(oneup_app::netusage::Usage, Option<autopause::Reason>)> {
+        use oneup_app::netusage;
+        let month = netusage::month_of(now_ms());
+        // More allowed, each to the profile and month it was asked for
+        // (not whichever network is in effect now).
+        let mut allowed = control.take_allowed();
+        while let Some((p, m, mb)) = allowed.first().cloned() {
+            let extra = mb.saturating_mul(1_000_000);
+            if let Err(e) = netusage::add(self.ledger.db(), &p, &m, 0, 0, extra) {
+                // Not lost: asked again at the next look.
+                control.allow_again(allowed);
+                return Err(e.into());
+            }
+            allowed.remove(0);
+            println!("oneupd: {} more allowed this month", oneup_app::versions::size(extra));
+        }
+        let owner = self.ledger.owner().to_string();
+        // A stopped agent's reservation, counted as used before what's left
+        // is worked out (otherwise it stays held until a transfer reserves).
+        netusage::reap_stopped(self.ledger.db(), profile.key.id(), &month, &owner, &netusage::agent_alive)?;
+        let usage = netusage::load(self.ledger.db(), profile.key.id(), &month)?;
+        let budget = profile.budget_bytes();
+        // The transport takes reservations of this profile's budget; a
+        // change of profile or budget starts it again from nothing held.
+        let want = budget.map(|b| (profile.key.id().to_string(), b));
+        let changed = {
+            let mut t = self.target.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = *t != want;
+            t.clone_from(&want);
+            changed
+        };
+        if changed {
+            graph.budget.set(want.as_ref().map(|_| 0));
+        }
+        let left = match budget {
+            Some(b) => Some(netusage::left_for(self.ledger.db(), profile.key.id(), &month, &owner, b)?),
+            None => None,
+        };
+        control.set_budget_spot(profile.key.id(), &month, usage.reached(budget));
+        let why = oneup_app::network::connection_reason(net.connectivity)
+            .or_else(|| oneup_app::network::pause_reason(profile))
+            .or_else(|| netusage::pause_reason(&usage, budget));
+        oneup_app::network::apply_profile(
+            control,
+            &graph.upload,
+            &graph.download,
+            settings,
+            profile,
+            left,
+            autopause::local_minute_of_day(),
+        );
+        Ok((usage, why))
+    }
+
+    /// Between network changes (the timer while rounds run): counts the
+    /// data used and judges the budget, by the network last read. Doesn't
+    /// ask Windows anything.
+    fn count(
+        &mut self,
+        settings: &oneup_app::config::Agent,
+        graph: &Graph,
+        control: &Control,
+    ) -> Result<Option<autopause::Reason>> {
+        self.charge()?;
+        let Some((net, profile)) = self.last.clone() else { return Ok(None) };
+        Ok(self.settle(&net, &profile, settings, graph, control)?.1)
+    }
+
+    /// Bytes sent (every request body, each attempt) and received (every
+    /// response, as it arrives) so far.
+    fn counters(graph: &Graph) -> (u64, u64) {
+        (graph.stats.sent.load(Relaxed), graph.stats.bytes.load(Relaxed))
+    }
+
+    /// Reads the network and its profile, adds what was used since the last
+    /// look (and what the user allowed meanwhile) to that profile, and
+    /// hands the rounds the policy with what's left of the budget.
+    fn look(
+        &mut self,
+        dir: &Path,
+        settings: &oneup_app::config::Agent,
+        graph: &Graph,
+        control: &Control,
+    ) -> Result<Looked> {
+        // What went until now is the profile's that was in effect.
+        self.charge()?;
+        let (net, profile) = oneup_app::network::situation(dir, settings);
+        self.ledger.switch(profile.key.id());
+        let (usage, why) = self.settle(&net, &profile, settings, graph, control)?;
+        self.last = Some((net.clone(), profile.clone()));
+        Ok(Looked { net, profile, usage, why })
+    }
+}
+
+/// The Graph client's counters a pass's link sample is the difference of.
+#[derive(Clone, Copy)]
+struct LinkCounters {
+    requests: u64,
+    retries: u64,
+    timed: u64,
+    timed_ms: u64,
+    bytes: u64,
+    /// How long transfers were under way (side by side counted once).
+    busy: Duration,
+}
+
+impl LinkCounters {
+    fn of(graph: &Graph) -> Self {
+        let s = &graph.stats;
+        Self {
+            requests: s.requests.load(Relaxed),
+            retries: s.retries.load(Relaxed),
+            timed: s.timed.load(Relaxed),
+            timed_ms: s.timed_ms.load(Relaxed),
+            bytes: graph.upload.moved() + graph.download.moved(),
+            busy: graph.transferring.total(),
+        }
+    }
+
+    /// What the requests since saw. Speed is over the time transfers were
+    /// under way, not the whole pass (planning, listing).
+    fn since(&self, graph: &Graph) -> oneup_app::link::Sample {
+        let now = Self::of(graph);
+        oneup_app::link::Sample {
+            requests: now.requests.saturating_sub(self.requests),
+            retries: now.retries.saturating_sub(self.retries),
+            timed: now.timed.saturating_sub(self.timed),
+            timed_ms: now.timed_ms.saturating_sub(self.timed_ms),
+            bytes: now.bytes.saturating_sub(self.bytes),
+            secs: now.busy.saturating_sub(self.busy).as_secs_f64(),
+            capped: graph.upload.get() > 0 || graph.download.get() > 0,
+        }
+    }
+}
+
+/// Sets the transport's requests at once and upload fragments for a poor
+/// link or lifts them, unless they're as wanted already; returns whether
+/// it changed them. At the start of each attempt too: the client outlives
+/// an error that restarts the agent's rounds.
+fn apply_link(graph: &Graph, poor: bool) -> bool {
+    use oneup_app::link::{POOR_FRAGMENT, POOR_REQUESTS};
+    let want = (poor.then_some(POOR_REQUESTS), poor.then_some(POOR_FRAGMENT));
+    if (graph.limiter().cap(), graph.fragment_cap()) == want {
+        return false;
+    }
+    graph.limiter().set_cap(want.0);
+    graph.set_fragment_cap(want.1);
+    true
+}
+
+/// Judges the link from the pass just run and, when it turns poor or good
+/// again, sets how many requests go at once and how large upload fragments
+/// are (requests and uploads under way finish as they are), saying so.
+fn adapt(
+    store: &mut Store,
+    graph: &Graph,
+    link: &mut oneup_app::link::Link,
+    s: &oneup_app::link::Sample,
+    control: &Control,
+) {
+    let was = link.is_poor();
+    let poor = link.observe(s);
+    control.set_poor_link(poor);
+    // The transport follows the state whatever it had (`apply_link`).
+    let changed = apply_link(graph, poor);
+    if poor == was && !changed {
+        return;
+    }
+    let detail = if poor {
+        format!(
+            "the connection is poor ({} of {} requests retried); fewer requests at once, smaller upload pieces, longer waits",
+            s.retries, s.requests
+        )
+    } else {
+        "the connection is good again; transfers back to normal".to_string()
+    };
+    println!("oneupd: {detail}");
+    let e = oneup_store::ActivityEntry {
+        seq: 0,
+        at_ms: now_ms(),
+        outcome: oneup_store::ActivityOutcome::Note,
+        action: "network".into(),
+        path: String::new(),
+        detail,
+    };
+    if let Err(e) = store.write(|o| o.activity_add(&[e])) {
+        tracing::warn!(error = %e, "couldn't note the link in the activity log");
+    }
+}
+
+/// Whether OneDrive's push channel should be open: it may be (`allowed`:
+/// not turned off, our own drive), the sync interval wants it, and nothing
+/// keeps the agent off the network: working offline, or a network pause
+/// (`network_pause`: a pausing profile, waiting for the internet, the data
+/// budget used up). Its pings use data and its notifications would only
+/// wake a paused agent.
+fn push_wanted(allowed: bool, interval_wants: bool, offline: bool, network_pause: bool) -> bool {
+    allowed && interval_wants && !offline && !network_pause
+}
+
+/// OneDrive's push channel, opened and closed as [`push_wanted`] says.
+struct PushChannel {
+    task: Option<AbortOnDrop>,
+    up: Arc<AtomicBool>,
+}
+
+impl PushChannel {
+    fn open(&mut self, start: impl FnOnce() -> AbortOnDrop) {
+        if self.task.is_none() {
+            self.task = Some(start());
+        }
+    }
+
+    /// Closes it at once (aborting the task ends its connection).
+    fn close(&mut self) {
+        if self.task.take().is_some() {
+            self.up.store(false, Relaxed);
+            println!("oneupd: OneDrive's push channel closed; OneDrive is checked with each pass");
+        }
+    }
+}
+
 /// Aborts a task when dropped.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -1071,30 +1673,81 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Mass-sensitive operations carried out in the last [`WINDOW`].
-#[derive(Default)]
-struct Window {
-    done: VecDeque<(Instant, Recent)>,
-}
-
-impl Window {
-    fn add(&mut self, r: Recent) {
-        if r.local + r.remote + r.suspicious > 0 {
-            self.done.push_back((Instant::now(), r));
-        }
-    }
-
-    fn recent(&mut self) -> Recent {
-        while self.done.front().is_some_and(|(t, _)| t.elapsed() > WINDOW) {
-            self.done.pop_front();
-        }
-        self.done.iter().fold(Recent::default(), |a, (_, r)| a.plus(*r))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Work offline, asked while a round runs (a long upload): the push
+    /// channel closes then, not when the round ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn working_offline_closes_the_push_channel_during_a_round() {
+        let dir = std::env::temp_dir().join(format!("oneupd-offline-push-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = oneup_graph::DpapiFileStore::new(dir.join("none.dpapi"));
+        let auth = Arc::new(oneup_graph::Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
+        let graph = Arc::new(Graph::new(reqwest::Client::new(), auth, oneup_graph::Aimd::new(8, 8)));
+        let control = Control::new(None, "L".into(), "/R".into(), Default::default());
+        let mut net_use = NetUse::new(&dir, &graph).unwrap();
+        let events = oneup_app::network::Events::default();
+        let up = Arc::new(AtomicBool::new(true));
+        let mut push = PushChannel { task: None, up: Arc::clone(&up) };
+        push.open(|| AbortOnDrop(tokio::spawn(std::future::pending())));
+        let settings = oneup_app::config::Agent::default();
+        let round = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            // Still in the round: the channel must already be closed.
+            !up.load(Relaxed)
+        };
+        let asked = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            oneup_ipc::Handler::handle(&control, oneup_ipc::Call::Offline { on: true }).unwrap();
+        };
+        let (closed_in_round, ()) = tokio::join!(
+            watching_auto_pause(round, &dir, &settings, &control, &graph, &mut net_use, &events, &mut push),
+            asked
+        );
+        assert!(closed_in_round && push.task.is_none());
+        drop(net_use);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The transport's caps for a poor link follow the link's state at the
+    /// start of each attempt, so caps left from before an error are lifted
+    /// once the link counts as good (or set again if it's poor).
+    #[test]
+    fn the_transport_follows_the_links_state_after_an_error() {
+        let store = oneup_graph::DpapiFileStore::new(std::env::temp_dir().join("oneupd-test-none.dpapi"));
+        let auth = Arc::new(oneup_graph::Auth::new(reqwest::Client::new(), "x".into(), "s", Box::new(store)));
+        let g = Graph::new(reqwest::Client::new(), auth, oneup_graph::Aimd::new(8, 8));
+        assert!(apply_link(&g, true));
+        assert_eq!((g.limiter().cap(), g.fragment_cap().is_some()), (Some(oneup_app::link::POOR_REQUESTS), true));
+        assert!(!apply_link(&g, true), "as wanted already");
+        // An error restarted the rounds; the link's state (good) wins.
+        let link = oneup_app::link::Link::default();
+        assert!(apply_link(&g, link.is_poor()));
+        assert_eq!((g.limiter().cap(), g.fragment_cap()), (None, None));
+    }
+
+    /// The push channel stays closed while working offline or while the
+    /// network pauses sync (metered, waiting for the internet, the budget
+    /// used up), as well as when turned off or the interval doesn't want it.
+    #[test]
+    fn the_push_channel_is_closed_whenever_the_network_is_off_limits() {
+        assert!(push_wanted(true, true, false, false));
+        assert!(!push_wanted(true, true, false, true), "a network pause");
+        assert!(!push_wanted(true, true, true, false), "offline");
+        assert!(!push_wanted(true, false, false, false) && !push_wanted(false, true, false, false));
+        let up = Arc::new(AtomicBool::new(true));
+        let mut p = PushChannel { task: None, up: Arc::clone(&up) };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            p.open(|| AbortOnDrop(tokio::spawn(std::future::pending())));
+            assert!(p.task.is_some());
+            p.close();
+        });
+        assert!(p.task.is_none() && !up.load(Relaxed), "closed at once, and not live");
+    }
 
     #[test]
     fn the_error_pause_starts_over_once_the_agent_got_going() {
@@ -1107,18 +1760,6 @@ mod tests {
         assert_eq!(error_pause(pause, false, Duration::from_secs(1)), ERROR_MAX, "still failing at once");
         assert_eq!(error_pause(pause, true, Duration::from_secs(1)), ERROR_FIRST, "rounds finished meanwhile");
         assert_eq!(error_pause(pause, false, ERROR_MAX), ERROR_FIRST, "ran a long while");
-    }
-
-    /// What the stops count adds up across calls of the rounds (the agent
-    /// keeps one window across retries, `run`).
-    #[test]
-    fn the_safety_window_adds_up_what_ran() {
-        let mut w = Window::default();
-        w.add(Recent { local: 190, remote: 0, suspicious: 0 });
-        w.add(Recent::default());
-        w.add(Recent { local: 5, remote: 2, suspicious: 1 });
-        assert_eq!(w.recent(), Recent { local: 195, remote: 2, suspicious: 1 });
-        assert_eq!(w.done.len(), 2, "nothing done, nothing kept");
     }
 
     #[test]

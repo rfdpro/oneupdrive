@@ -63,6 +63,12 @@ CREATE TABLE local_hash (
 ) WITHOUT ROWID;
 ";
 
+/// v24 -> v25: a deletion noted from the user's "Delete here" answer, for
+/// an item gone from OneDrive without evidence, is marked `answered`: only
+/// a deletion OneDrive reported puts the content in its recycle bin, so
+/// only those may be recycled here without a local copy.
+pub(crate) const V25_COLUMN: (&str, &str, &str) = ("remote_gone", "answered", "INTEGER NOT NULL DEFAULT 0");
+
 /// v11 -> v12: an item written to the Local tree is there, so it can't be
 /// deleted: its deletion evidence goes (`data-safety.md` invariant 3). A file
 /// sent to the Recycle Bin counts as deleted (`oneup_app::recyclebin`);
@@ -142,7 +148,7 @@ const BASE_COLS: &str = "sid, parent_sid, name, kind, size, qxh, local_id, local
 
 /// The stored kind codes, shared with `local_item` and `remote_item`
 /// (0 = file, 1 = folder, 2 = root).
-fn node_kind(code: i64) -> Result<NodeKind> {
+pub(crate) fn node_kind(code: i64) -> Result<NodeKind> {
     match code {
         0 => Ok(NodeKind::File),
         1 => Ok(NodeKind::Folder),
@@ -150,7 +156,7 @@ fn node_kind(code: i64) -> Result<NodeKind> {
     }
 }
 
-fn kind_code(k: NodeKind) -> i64 {
+pub(crate) fn kind_code(k: NodeKind) -> i64 {
     match k {
         NodeKind::File => 0,
         NodeKind::Folder => 1,
@@ -160,17 +166,17 @@ fn kind_code(k: NodeKind) -> i64 {
 /// A BLOB that should hold a QuickXorHash. Anything but 20 bytes (never
 /// written by us) reads as "no hash", which only ever makes the reconciler
 /// ask for one; it never makes two different contents look equal.
-fn hash_of(b: Option<Vec<u8>>) -> Option<Hash> {
+pub(crate) fn hash_of(b: Option<Vec<u8>>) -> Option<Hash> {
     b.and_then(|v| <[u8; 20]>::try_from(v.as_slice()).ok())
 }
 
 /// Sids are `u64` in the reconciler and `INTEGER` (i64) in SQLite. They
 /// are allocated by SQLite from 1 upwards, so the cast never wraps.
-fn sid_out(v: i64) -> Sid {
+pub(crate) fn sid_out(v: i64) -> Sid {
     v as Sid
 }
 
-fn sid_in(s: Sid) -> i64 {
+pub(crate) fn sid_in(s: Sid) -> i64 {
     s as i64
 }
 
@@ -240,6 +246,24 @@ const REMOTE_SYNCABLE: &str = "is_excluded = 0";
 
 /// The children lists the reconciler reads ([`Trees`]), each from a parent
 /// index.
+/// A child of `?1` named `?2` as SQLite's `NOCASE` compares (ASCII).
+fn named_sql() -> String {
+    format!(
+        "SELECT {BASE_COLS} FROM synced_item INDEXED BY synced_item_name WHERE parent_sid = ?1 AND name = ?2 COLLATE NOCASE"
+    )
+}
+
+/// A child of `?1` whose name, with letters other than ASCII, folds to `?2`.
+fn folded_sql() -> String {
+    format!("SELECT {BASE_COLS} FROM synced_item INDEXED BY synced_item_fold WHERE parent_sid = ?1 AND fold = ?2")
+}
+
+/// What `synced_item.fold` holds for `name`: its folded form if it has a
+/// letter SQLite's `NOCASE` doesn't fold, else nothing.
+fn folded(name: &str) -> Option<String> {
+    (!name.is_ascii()).then(|| oneup_sync::fold(name))
+}
+
 fn base_children_sql() -> String {
     format!("SELECT {BASE_COLS} FROM synced_item WHERE parent_sid = ?1")
 }
@@ -269,6 +293,14 @@ fn remote_node(r: &Row<'_>) -> rusqlite::Result<RemoteNode> {
         etag: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
     })
 }
+
+/// [`Ops::local_children_links`] (its plan is checked by
+/// `children_queries_use_the_parent_indexes`, as the next one's).
+const LOCAL_CHILDREN_LINKS: &str = "SELECT l.file_id, s.remote_id FROM local_item l
+     JOIN synced_item s ON s.local_id = l.file_id WHERE l.parent_id = ?1";
+/// [`Ops::remote_children_linked`].
+const REMOTE_CHILDREN_LINKED: &str =
+    "SELECT r.id FROM remote_item r JOIN synced_item s ON s.remote_id = r.id WHERE r.parent_id = ?1";
 
 impl Ops<'_> {
     pub fn synced_get(&self, sid: Sid) -> Result<Option<Base>> {
@@ -318,6 +350,23 @@ impl Ops<'_> {
         row.map(fix_base).transpose()
     }
 
+    /// The children of local folder `parent` that have a Synced row, each
+    /// with the cloud item it links (if any): one query, by the parent and
+    /// link indexes.
+    pub fn local_children_links(&self, parent: u128) -> Result<Vec<(u128, Option<String>)>> {
+        let mut st = self.c.prepare_cached(LOCAL_CHILDREN_LINKS)?;
+        let rows = st.query_map([blob(parent)], |r| Ok((id_from_blob(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// The children of cloud folder `parent` that have a Synced row: one
+    /// query, by the parent and link indexes.
+    pub fn remote_children_linked(&self, parent: &str) -> Result<Vec<String>> {
+        let mut st = self.c.prepare_cached(REMOTE_CHILDREN_LINKED)?;
+        let rows = st.query_map([parent], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     pub fn synced_by_remote(&self, id: &str) -> Result<Option<Base>> {
         let row = self
             .c
@@ -338,13 +387,13 @@ impl Ops<'_> {
         self.c
             .prepare_cached(
                 "INSERT INTO synced_item (sid, parent_sid, name, kind, size, qxh, local_id, local_mtime,
-                                          remote_id, remote_etag)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                          remote_id, remote_etag, fold)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(sid) DO UPDATE SET
                     parent_sid = excluded.parent_sid, name = excluded.name, kind = excluded.kind,
                     size = excluded.size, qxh = excluded.qxh, local_id = excluded.local_id,
                     local_mtime = excluded.local_mtime, remote_id = excluded.remote_id,
-                    remote_etag = excluded.remote_etag",
+                    remote_etag = excluded.remote_etag, fold = excluded.fold",
             )?
             .execute(params![
                 sid_in(b.sid),
@@ -357,6 +406,7 @@ impl Ops<'_> {
                 b.local_mtime,
                 b.remote.as_ref().map(|r| r.0.as_str()),
                 b.remote_etag,
+                folded(&b.name),
             ])?;
         Ok(())
     }
@@ -423,14 +473,21 @@ impl Ops<'_> {
     /// delete record). Only Synced items need it; returns whether `id` is
     /// one. Never call this for "not found by a rescan": that isn't evidence.
     pub fn note_local_deleted(&self, id: u128) -> Result<bool> {
-        Ok(self
+        let noted = self
             .c
             .prepare_cached(
                 "INSERT OR IGNORE INTO local_gone(file_id)
                  SELECT local_id FROM synced_item WHERE local_id = ?1",
             )?
             .execute([blob(id)])?
-            > 0)
+            > 0;
+        // A POSIX deletion can first move the item outside the tree. Its
+        // later delete record changes no Local row, but must re-plan the
+        // Synced parent that previously held it as missing.
+        if noted && let Some(base) = self.synced_by_local(id)? {
+            self.dirty_mark_synced(&[base.sid])?;
+        }
+        Ok(noted)
     }
 
     /// Withdraws local deletion evidence for `id`. Only for the executor,
@@ -440,6 +497,15 @@ impl Ops<'_> {
     /// item is still there.
     pub fn unnote_local_deleted(&self, id: u128) -> Result<()> {
         self.c.prepare_cached("DELETE FROM local_gone WHERE file_id = ?1")?.execute([blob(id)])?;
+        Ok(())
+    }
+
+    /// Withdraws cloud deletion evidence for `id`. Only for the executor's
+    /// settling of a vault move cut short (`oneup_exec::Executor::settle_moves`):
+    /// the item was moved under a new ID that can't be found yet, so its
+    /// old ID's removal is no evidence of a deletion.
+    pub fn unnote_remote_deleted(&self, id: &str) -> Result<()> {
+        self.c.prepare_cached("DELETE FROM remote_gone WHERE id = ?1")?.execute([id])?;
         Ok(())
     }
 
@@ -456,11 +522,59 @@ impl Ops<'_> {
             > 0)
     }
 
+    /// Records the user's answer that Synced item with remote `id` is gone
+    /// from OneDrive ("Delete here"), for an item gone without evidence:
+    /// like [`Ops::note_remote_deleted`], marked `answered`, because nothing
+    /// shows its content is in OneDrive's recycle bin, so its copy here is
+    /// always kept ([`Ops::remote_gone_reported`]). Evidence already
+    /// recorded for it stays as it is.
+    pub fn note_remote_deleted_by_answer(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .c
+            .prepare_cached(
+                "INSERT OR IGNORE INTO remote_gone(id, answered)
+                 SELECT remote_id, 1 FROM synced_item WHERE remote_id = ?1",
+            )?
+            .execute([id])?
+            > 0)
+    }
+
+    /// Of Synced items `sids`, those whose deletion OneDrive reported (not
+    /// only the user's answer), sorted: the gate may recycle these without
+    /// a local copy (`oneup_gate::Context::cloud_deleted`). One lookup per
+    /// item, so callers pass a round's recyclings only.
+    pub fn remote_gone_reported(&self, sids: &[i64]) -> Result<Vec<i64>> {
+        let mut q = self.c.prepare_cached(
+            "SELECT 1 FROM synced_item s JOIN remote_gone g ON g.id = s.remote_id
+             WHERE s.sid = ?1 AND g.answered = 0",
+        )?;
+        let mut out = Vec::new();
+        for &sid in sids {
+            if q.exists([sid])? {
+                out.push(sid);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Records evidence for every Synced item in the mirror's `t_sub`
     /// (a subtree a delta `deleted` facet removed). Called by
     /// [`Ops::delete_subtree`] before it drops the rows, so a deleted folder
     /// is evidence for everything inside it.
     pub(crate) fn note_remote_subtree_deleted(&self) -> Result<()> {
+        // A rebuilt mirror may already lack these rows. New delta evidence
+        // must still wake their Synced parents, without a Remote deletion
+        // trigger to do it. Keep this in SQL for large deleted subtrees.
+        self.c.execute(
+            "INSERT INTO dirty(side, id)
+             SELECT DISTINCT 2, s.parent_sid FROM synced_item s
+             WHERE s.remote_id IN (SELECT id FROM t_sub) AND s.parent_sid IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM remote_gone g WHERE g.id = s.remote_id)
+             ON CONFLICT(side, id) DO NOTHING",
+            [],
+        )?;
         self.c.execute(NOTE_SUBTREE_GONE, [])?;
         Ok(())
     }
@@ -579,6 +693,27 @@ impl Trees for Ops<'_> {
         self.synced_children(sid)
     }
 
+    /// Through the indexes on (folder, name): only the matches are read.
+    /// SQLite's `NOCASE` folds ASCII only, so names with other letters are
+    /// also looked for by their folded form (`synced_item.fold`, which only
+    /// they have).
+    fn base_named(&self, parent: Sid, name: &str) -> Result<Vec<Base>> {
+        let mut out = Vec::new();
+        let mut st = self.c.prepare_cached(&named_sql())?;
+        for r in st.query_map(rusqlite::params![sid_in(parent), name], base_from_row)? {
+            out.push(fix_base(r?)?);
+        }
+        let mut st = self.c.prepare_cached(&folded_sql())?;
+        for r in st.query_map(rusqlite::params![sid_in(parent), oneup_sync::fold(name)], base_from_row)? {
+            let b = fix_base(r?)?;
+            if !out.iter().any(|x: &Base| x.sid == b.sid) {
+                out.push(b);
+            }
+        }
+        out.retain(|b| oneup_sync::same_name(&b.name, name));
+        Ok(out)
+    }
+
     fn base_by_local(&self, id: LocalId) -> Result<Option<Base>> {
         self.synced_by_local(id.0)
     }
@@ -670,6 +805,15 @@ impl Trees for Ops<'_> {
     fn has_base_children(&self, sid: Sid) -> Result<bool> {
         self.synced_has_children(sid)
     }
+
+    // Through the name index: one lookup, whatever the folder holds.
+    fn local_has_file(&self, id: LocalId, name: &str) -> Result<bool> {
+        Ok(self.local_named(id.0, name)?.iter().any(|r| r.kind == crate::LocalKind::File))
+    }
+
+    fn remote_has_file(&self, id: &RemoteId, name: &str) -> Result<bool> {
+        Ok(self.remote_named(&id.0, name)?.iter().any(|r| r.kind == crate::Kind::File))
+    }
 }
 
 #[cfg(test)]
@@ -690,6 +834,51 @@ pub(crate) mod tests {
             remote: Some(RemoteId(remote.into())),
             remote_etag: "e".into(),
         }
+    }
+
+    /// A child is found by name, as Windows compares names, through the
+    /// indexes on (folder, name) and (folder, folded name): with 50,000
+    /// siblings whose names have letters other than ASCII, the lookups'
+    /// plans read neither the folder's other children nor the table, and
+    /// a name written before the upgrade is found as one written after.
+    #[test]
+    fn a_child_is_found_by_its_name_without_reading_its_siblings() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.synced_put(&base(ROOT, None, "", NodeKind::Folder, 1, "root"))?;
+            for i in 0..50_000u64 {
+                let name = format!("Überblick {i}.txt");
+                o.synced_put(&base(10 + i, Some(ROOT), &name, NodeKind::File, u128::from(i) + 100, &format!("r{i}")))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let found = s.read(|o| Trees::base_named(o, ROOT, "üBERBLICK 25000.TXT")).unwrap();
+        assert_eq!(found.iter().map(|b| b.sid).collect::<Vec<_>>(), [25_010]);
+        let ascii = s.read(|o| Trees::base_named(o, ROOT, "")).unwrap();
+        assert_eq!(ascii.iter().map(|b| b.sid).collect::<Vec<_>>(), Vec::<Sid>::new());
+        // The plans: each a search of its own index on folder and name.
+        for (sql, index) in [(named_sql(), "synced_item_name"), (folded_sql(), "synced_item_fold")] {
+            let plan: Vec<String> = s
+                .read(|o| {
+                    let mut st = o.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let rows = st.query_map(rusqlite::params![0, "x"], |r| r.get::<_, String>(3))?;
+                    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+                })
+                .unwrap();
+            assert!(
+                plan.iter().all(|p| p.starts_with("SEARCH") && p.contains(index) && p.contains("parent_sid=? AND")),
+                "{plan:?}"
+            );
+        }
+        // Written before the upgrade (no folded form): filled in by it.
+        s.write(|o| Ok(o.c.execute("UPDATE synced_item SET fold = NULL", [])?)).unwrap();
+        assert!(s.read(|o| Trees::base_named(o, ROOT, "überblick 7.txt")).unwrap().is_empty());
+        s.write(|o| {
+            Ok(o.c.execute("UPDATE synced_item SET fold = oneup_fold(name) WHERE name GLOB '*[^ -~]*'", [])?)
+        })
+        .unwrap();
+        assert_eq!(s.read(|o| Trees::base_named(o, ROOT, "überblick 7.txt")).unwrap().len(), 1);
     }
 
     pub(crate) fn lrow(id: u128, parent: Option<u128>, name: &str, kind: LocalKind) -> LocalRow {
@@ -735,6 +924,28 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn a_folders_links_come_in_one_query_per_side() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            // Unlinked on both sides, and one linked inside `d`.
+            o.local_put(&lrow(4, Some(1), "new", LocalKind::File))?;
+            o.upsert_item(&rrow("n", Some("root"), "new", Kind::File), false)?;
+            o.local_put(&lrow(5, Some(3), "in", LocalKind::File))?;
+            o.upsert_item(&rrow("i", Some("d"), "in", Kind::File), false)?;
+            o.synced_insert(&base(0, Some(2), "in", NodeKind::File, 5, "i")).map(|_| ())
+        })
+        .unwrap();
+        let mut local = s.read(|o| o.local_children_links(1)).unwrap();
+        local.sort();
+        assert_eq!(local, [(2, Some("f".to_string())), (3, Some("d".to_string()))]);
+        let mut remote = s.read(|o| o.remote_children_linked("root")).unwrap();
+        remote.sort();
+        assert_eq!(remote, ["d", "f"]);
+        assert_eq!(s.read(|o| o.remote_children_linked("d")).unwrap(), ["i"]);
     }
 
     /// A file restored from the Recycle Bin before its deletion reached
@@ -794,8 +1005,15 @@ pub(crate) mod tests {
         {
             let mut s = Store::open(&path, 1024).unwrap();
             synced(&mut s);
-            s.write(|o| {
+            // Outside `write`, which would look for v18's tables at its end.
+            s.read(|o| {
                 // What a v15 database looks like.
+                o.c.execute_batch(crate::pins::UNDO_V22)?;
+                o.c.execute_batch(crate::shared::UNDO_V21)?;
+                o.c.execute_batch(crate::dupes::UNDO_V20)?;
+                o.c.execute_batch(crate::choose::UNDO_V19)?;
+                o.c.execute_batch(crate::search::UNDO_V18)?;
+                o.c.execute_batch(crate::history::UNDO_V23)?;
                 o.c.execute_batch(
                     "DROP TRIGGER remote_back_ins; DROP TRIGGER remote_back_upd;
                      DROP INDEX enum_unit_pending; DROP INDEX remote_item_root; DROP TABLE retry;
@@ -933,6 +1151,89 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_delete_record_after_an_item_left_the_tree_replans_its_parent() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.local_remove_subtree(3)?;
+            // An earlier round saw Missing and used up the tree's marks.
+            o.dirty_clear(i64::MAX)?;
+            assert!(o.dirty_scope()?.folders.is_empty());
+            assert!(o.note_local_deleted(3)?);
+            let folders = o.dirty_scope()?.folders;
+            assert!(folders.contains(&ROOT), "late evidence must wake the parent: {folders:?}");
+            let planned = oneup_sync::plan(o, folders.iter().copied())?;
+            assert!(planned.iter().any(|op| matches!(op, oneup_sync::Op::DeleteRemote { .. })), "{planned:?}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_delta_deletion_after_a_mirror_row_went_missing_replans_its_parent() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.c.execute("DELETE FROM remote_item WHERE id = 'd'", [])?;
+            o.dirty_clear(i64::MAX)?;
+            assert!(o.dirty_scope()?.folders.is_empty());
+            o.delete_subtree("d")?;
+            let folders = o.dirty_scope()?.folders;
+            assert!(folders.contains(&ROOT), "late evidence must wake the parent: {folders:?}");
+            let planned = oneup_sync::plan(o, folders.iter().copied())?;
+            assert!(planned.iter().any(|op| matches!(op, oneup_sync::Op::RecycleLocal { .. })), "{planned:?}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn only_deletions_onedrive_reported_count_as_reported() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            // f: the user's answer first, then OneDrive's report; d: the
+            // other way round. An answer is never taken for a report.
+            assert!(o.note_remote_deleted_by_answer("f")?);
+            assert_eq!(o.remote_gone_reported(&[1, 2])?, Vec::<i64>::new());
+            o.delete_subtree("d")?;
+            o.delete_subtree("f")?;
+            assert!(!o.note_remote_deleted_by_answer("d")?);
+            assert_eq!(o.remote(&RemoteId("f".into()))?, Seen::Deleted);
+            assert_eq!(o.remote_gone_reported(&[2, 1, 2, 99])?, vec![2]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_upgrade_to_v25_counts_earlier_evidence_as_answered_and_can_run_again() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-v25-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.db");
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            synced(&mut s);
+            s.write(|o| o.delete_subtree("f")).unwrap();
+            let v24 = "ALTER TABLE remote_gone DROP COLUMN answered; PRAGMA user_version = 24;";
+            s.read(|o| Ok(o.c.execute_batch(v24)?)).unwrap();
+        }
+        {
+            let mut s = Store::open(&path, 1024).unwrap();
+            assert_eq!(s.read(|o| o.remote_gone_reported(&[1])).unwrap(), Vec::<i64>::new(), "kept, to be safe");
+            s.write(|o| o.delete_subtree("d")).unwrap();
+            assert_eq!(s.read(|o| o.remote_gone_reported(&[1, 2])).unwrap(), vec![2]);
+            s.read(|o| Ok(o.c.execute_batch("PRAGMA user_version = 24;")?)).unwrap();
+        }
+        // Replayed over a store that has the column: nothing changes.
+        let s = Store::open(&path, 1024).unwrap();
+        assert_eq!(s.read(|o| o.remote_gone_reported(&[1, 2])).unwrap(), vec![2]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_deleted_cloud_folder_is_evidence_for_its_contents() {
         let mut s = Store::open_in_memory().unwrap();
         synced(&mut s);
@@ -1033,7 +1334,14 @@ pub(crate) mod tests {
     #[test]
     fn children_queries_use_the_parent_indexes() {
         let s = Store::open_in_memory().unwrap();
-        for sql in [base_children_sql(), local_children_sql(), remote_children_sql(), SYNCED_HAS_CHILDREN.into()] {
+        for sql in [
+            base_children_sql(),
+            local_children_sql(),
+            remote_children_sql(),
+            SYNCED_HAS_CHILDREN.into(),
+            LOCAL_CHILDREN_LINKS.into(),
+            REMOTE_CHILDREN_LINKED.into(),
+        ] {
             let mut st = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let plan: Vec<String> =
                 st.query_map([rusqlite::types::Null], |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();

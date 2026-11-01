@@ -48,6 +48,10 @@ fn start_agent_with(data_dir: &Path, key: Option<&oneup_vault::key::Masterkey>) 
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+    // First: if starting fails from here on, it's no longer stopped on
+    // purpose (`oneup problems` lists it).
+    crate::problem::start_requested(data_dir)
+        .with_context(|| format!("removing {} from {}", crate::problem::ASKED_FILE, data_dir.display()))?;
     let exe = sibling("oneupd.exe")?;
     let log = data_dir.join(LOG_FILE);
     // Our own files in the data folder: the last run's output is kept.

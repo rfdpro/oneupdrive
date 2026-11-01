@@ -1,0 +1,1 @@
+{"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=next", "value": [{"id": "m1", "name": "moved", "parentReference": {"id": "root"}, "folder": {"childCount": 0}}]}

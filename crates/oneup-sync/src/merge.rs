@@ -59,12 +59,12 @@ fn remote_changed(b: &Base, r: &RemoteNode) -> bool {
 
 /// Where a local item is now, as an agreed location (parent `sid`, name).
 /// `None` if its parent isn't synced yet (it was moved into a new folder).
-fn local_loc<T: Trees + ?Sized>(t: &T, n: &LocalNode) -> Result<Option<(Sid, String)>, T::Error> {
+pub(crate) fn local_loc<T: Trees + ?Sized>(t: &T, n: &LocalNode) -> Result<Option<(Sid, String)>, T::Error> {
     let Some(p) = n.parent else { return Ok(None) };
     Ok(t.base_by_local(p)?.filter(|b| b.kind == NodeKind::Folder).map(|b| (b.sid, n.name.clone())))
 }
 
-fn remote_loc<T: Trees + ?Sized>(t: &T, n: &RemoteNode) -> Result<Option<(Sid, String)>, T::Error> {
+pub(crate) fn remote_loc<T: Trees + ?Sized>(t: &T, n: &RemoteNode) -> Result<Option<(Sid, String)>, T::Error> {
     let Some(p) = &n.parent else { return Ok(None) };
     Ok(t.base_by_remote(p)?.filter(|b| b.kind == NodeKind::Folder).map(|b| (b.sid, n.name.clone())))
 }
@@ -104,6 +104,25 @@ fn remote_within<T: Trees + ?Sized>(t: &T, dir: &RemoteId, item: &RemoteId) -> R
     Ok(false)
 }
 
+/// Whether Synced folder `dir` is `item` or below it in the Synced tree.
+/// Recording `item` in `dir` would make the Synced tree a loop, which no
+/// plan from the top reaches again. The two trees can put a folder inside
+/// one that is still below it in the Synced tree, when the other's own move
+/// isn't recorded yet (refused this round, or waiting); the move waits for
+/// it. A loop already there also answers yes.
+fn base_within<T: Trees + ?Sized>(t: &T, dir: Sid, item: Sid) -> Result<bool, T::Error> {
+    let mut cur = Some(dir);
+    // Deeper than any path OneDrive takes (400 characters).
+    for _ in 0..1024 {
+        let Some(sid) = cur else { return Ok(false) };
+        if sid == item {
+            return Ok(true);
+        }
+        cur = t.base(sid)?.and_then(|b| b.parent);
+    }
+    Ok(true)
+}
+
 /// Suffix of the temporary names given to moves whose destination is being
 /// vacated in the same round ([`crate::resolve`]).
 pub(crate) const STAGING: &str = ".oneup-staging-";
@@ -113,6 +132,15 @@ fn unstaged(name: &str) -> Option<&str> {
     let i = name.rfind(STAGING)?;
     let n = &name[i + STAGING.len()..];
     (i > 0 && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| &name[..i])
+}
+
+/// `name` without any staging suffixes: the name the item is meant to have.
+pub(crate) fn real_name(name: &str) -> &str {
+    let mut n = name;
+    while let Some(real) = unstaged(n) {
+        n = real;
+    }
+    n
 }
 
 /// `name (conflict N).ext`, with N chosen so the folded result isn't in
@@ -130,8 +158,10 @@ pub fn conflict_name(name: &str, kind: NodeKind, taken: &mut BTreeSet<String>) -
 
 /// The `n`th name [`conflict_name`] tries: `name (conflict N).ext`. For a
 /// caller that asks whether each is taken instead of listing every name
-/// in the folder first.
+/// in the folder first. An item under a staging name gets a conflict name
+/// of its real name: the staging suffix isn't an extension.
 pub fn conflict_candidate(name: &str, kind: NodeKind, n: u32) -> String {
+    let name = real_name(name);
     let (stem, ext) = match (kind, name.rfind('.')) {
         // A leading dot (".gitignore") is part of the stem, not an extension.
         (NodeKind::File, Some(i)) if i > 0 => name.split_at(i),
@@ -257,6 +287,41 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
     let lc = if file { local_change(b, &l) } else { LocalChange::Same };
     let rc = file && remote_changed(b, &r);
 
+    // A backup settles location before content, even when both copies were
+    // edited: the old agreed folder may already be gone.
+    let here = b.parent.map(|p| (p, b.name.clone()));
+    let lloc = local_loc(t, &l)?;
+    let rloc = remote_loc(t, &r)?;
+    let lm = lloc != here;
+    let rm = rloc != here;
+    if cx.backup && (lm || rm) {
+        // One-way: the cloud follows this PC's layout, whoever moved it.
+        if lm && rm && lloc == rloc {
+            let Some((parent, _)) = lloc else { return Ok(()) };
+            if b.kind == NodeKind::Folder && base_within(t, parent, b.sid)? {
+                return Ok(());
+            }
+            cx.out.push(Op::Record(Base {
+                parent: Some(parent),
+                name: l.name.clone(),
+                remote_etag: r.etag.clone(),
+                ..b.clone()
+            }));
+            return Ok(());
+        }
+        if let Some((psid, _)) = &lloc
+            && b.kind == NodeKind::Folder
+            && let Some(to) = remote_dir(t, *psid)?
+            && remote_within(t, &to, &r.id)?
+        {
+            // The cloud's layout would put the folder inside itself; wait
+            // until this PC's moves settle it.
+            return Ok(());
+        }
+        move_remote_to(cx, b, &r, lloc)?;
+        return Ok(());
+    }
+
     // Both changed content: identical edits are just recorded; otherwise
     // keep both (never last-writer-wins, `data-safety.md` invariant 9).
     if lc == LocalChange::Changed && rc {
@@ -282,41 +347,13 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         return Ok(());
     }
 
-    // Location first; content (if also changed) next round, so each
-    // operation's preconditions describe what the planner saw.
-    let here = b.parent.map(|p| (p, b.name.clone()));
-    let lloc = local_loc(t, &l)?;
-    let rloc = remote_loc(t, &r)?;
-    let lm = lloc != here;
-    let rm = rloc != here;
-    if cx.backup && (lm || rm) {
-        // One-way: the cloud follows this PC's layout, whoever moved it.
-        if lm && rm && lloc == rloc {
-            let Some((parent, _)) = lloc else { return Ok(()) };
-            cx.out.push(Op::Record(Base {
-                parent: Some(parent),
-                name: l.name.clone(),
-                remote_etag: r.etag.clone(),
-                ..b.clone()
-            }));
-            return Ok(());
-        }
-        if let Some((psid, _)) = &lloc
-            && b.kind == NodeKind::Folder
-            && let Some(to) = remote_dir(t, *psid)?
-            && remote_within(t, &to, &r.id)?
-        {
-            // The cloud's layout would put the folder inside itself; wait
-            // until this PC's moves settle it.
-            return Ok(());
-        }
-        move_remote_to(cx, b, &r, lloc)?;
-        return Ok(());
-    }
     if lm && rm && lloc == rloc {
         // Both moved to the same place. (Both "unknown" — moved into folders
         // not synced yet — is not the same place: wait for those folders.)
         let Some((parent, _)) = lloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, parent, b.sid)? {
+            return Ok(());
+        }
         cx.out.push(Op::Record(Base {
             parent: Some(parent),
             name: l.name.clone(),
@@ -329,6 +366,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         // The cloud moved it (and if both moved, the cloud's location wins:
         // that's a move, not a loss).
         let Some((psid, name)) = rloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
+            return Ok(());
+        }
         let Some(to) = cx.local_dir_for(psid)? else { return Ok(()) };
         if b.kind == NodeKind::Folder && local_within(t, to, l.id)? {
             // Moved into each other on the two sides: following the cloud
@@ -444,6 +484,9 @@ fn move_remote_to<T: Trees + ?Sized>(
     loc: Option<(Sid, String)>,
 ) -> Result<(), T::Error> {
     let Some((psid, name)) = loc else { return Ok(()) };
+    if b.kind == NodeKind::Folder && base_within(cx.t, psid, b.sid)? {
+        return Ok(());
+    }
     let Some(to) = cx.remote_dir_for(psid)? else { return Ok(()) };
     cx.out.push(Op::MoveRemote { sid: b.sid, remote: rpre(r), to, parent: psid, name });
     Ok(())
@@ -459,10 +502,17 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
     let here = b.parent.map(|p| (p, b.name.clone()));
     let rloc = remote_loc(t, &r)?;
     let rc = b.kind == NodeKind::File && remote_changed(b, &r);
-    if rc || rloc != here {
+    // Detached by a conflict copy: the file here was renamed aside, not
+    // deleted, and the cloud's keeps its name. Unchanged there (the conflict
+    // was planned from a listing behind the cloud), it still comes back.
+    let detached = b.local.is_none();
+    if rc || rloc != here || detached {
         // Changed or moved in the cloud since: that change wins over the
         // deletion. Re-create it here at the cloud's location.
         let Some((psid, name)) = rloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
+            return Ok(());
+        }
         let Some(to) = cx.local_dir_for(psid)? else { return Ok(()) };
         let link = Link::Existing(b.sid);
         cx.out.push(match b.kind {
@@ -493,6 +543,9 @@ fn remote_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode) -
     // One-way: what this PC has, the cloud gets back.
     if lc || lloc != here || cx.backup {
         let Some((psid, name)) = lloc else { return Ok(()) };
+        if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
+            return Ok(());
+        }
         let Some(to) = cx.remote_dir_for(psid)? else { return Ok(()) };
         let link = Link::Existing(b.sid);
         cx.out.push(match b.kind {
@@ -660,6 +713,9 @@ fn pair_new<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, l: LocalNode, r: RemoteNode)
 /// depth is bounded by the tree's.
 fn resurrect_local<T: Trees + ?Sized>(t: &T, sid: Sid, r: &RemoteNode) -> Result<Option<Op>, T::Error> {
     let Some((psid, name)) = remote_loc(t, r)? else { return Ok(None) };
+    if base_within(t, psid, sid)? {
+        return Ok(None);
+    }
     if let Some(to) = local_dir(t, psid)? {
         return Ok(Some(Op::MkdirLocal { remote: rpre(r), to, parent: psid, name, link: Link::Existing(sid) }));
     }
@@ -676,6 +732,9 @@ fn resurrect_local<T: Trees + ?Sized>(t: &T, sid: Sid, r: &RemoteNode) -> Result
 /// Mirror image of [`resurrect_local`].
 fn resurrect_remote<T: Trees + ?Sized>(t: &T, sid: Sid, l: &LocalNode) -> Result<Option<Op>, T::Error> {
     let Some((psid, name)) = local_loc(t, l)? else { return Ok(None) };
+    if base_within(t, psid, sid)? {
+        return Ok(None);
+    }
     if let Some(to) = remote_dir(t, psid)? {
         return Ok(Some(Op::MkdirRemote { local: lpre(l), to, parent: psid, name, link: Link::Existing(sid) }));
     }
@@ -714,5 +773,20 @@ mod tests {
         assert_eq!(unstaged("a.oneup-staging-x"), None);
         assert_eq!(unstaged(".oneup-staging-1"), None, "no real name left");
         assert_eq!(unstaged("plain.txt"), None);
+        assert_eq!(real_name("b.oneup-staging-1.oneup-staging-2"), "b");
+        assert_eq!(real_name("plain.txt"), "plain.txt");
+    }
+
+    /// An item still under a staging name can need a conflict name (a
+    /// listing behind the cloud moved it back and forth, simulation seed
+    /// 3727). The name is the real one's: the staging suffix isn't taken for
+    /// the extension, which would leave `Report.docx (conflict 1)` once the
+    /// suffix is dropped, a file Windows no longer opens as a document.
+    #[test]
+    fn conflict_names_of_staging_names_are_the_real_names() {
+        let mut taken = BTreeSet::new();
+        let name = |n: &str, taken: &mut BTreeSet<String>| conflict_name(n, NodeKind::File, taken);
+        assert_eq!(name("Report.docx.oneup-staging-1", &mut taken), "Report (conflict 1).docx");
+        assert_eq!(name("b.oneup-staging-1.oneup-staging-2", &mut taken), "b (conflict 1)");
     }
 }

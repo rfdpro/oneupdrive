@@ -24,13 +24,26 @@ pub fn item(op: &Op) -> Option<RetryItem<'_>> {
         | Op::MoveLocal { local, .. }
         | Op::RenameLocal { local, .. }
         | Op::ConflictCopy { local, .. }
-        | Op::RecycleLocal { local, .. } => RetryItem::Local(local.id),
+        | Op::RecycleLocal { local, .. }
+        | Op::RemoveCopy { remote: None, local: Some(local), .. } => RetryItem::Local(local.id),
+        Op::RemoveCopy { remote: Some(remote), .. } => RetryItem::Remote(&remote.id),
+        Op::RemoveCopy { remote: None, local: None, .. } => return None,
         Op::Download { remote, .. }
         | Op::MkdirLocal { remote, .. }
         | Op::MoveRemote { remote, .. }
         | Op::RenameRemote { remote, .. }
         | Op::DeleteRemote { remote, .. }
         | Op::PruneRemote { remote, .. } => RetryItem::Remote(&remote.id),
+        Op::Rewind { step, .. } => match &**step {
+            oneup_sync::rewind::Step::SetAside { local, .. } | oneup_sync::rewind::Step::Discard { local, .. } => {
+                RetryItem::Local(local.id)
+            }
+            oneup_sync::rewind::Step::Restore { id, .. } => RetryItem::Remote(id),
+            oneup_sync::rewind::Step::Reset { remote, .. }
+            | oneup_sync::rewind::Step::Remove { remote, .. }
+            | oneup_sync::rewind::Step::RevertTo { remote, .. } => RetryItem::Remote(&remote.id),
+            oneup_sync::rewind::Step::Forget | oneup_sync::rewind::Step::RestoreKept { .. } => return None,
+        },
         Op::Pair { .. } | Op::Record(_) | Op::Forget(_) | Op::Hold { .. } => return None,
     })
 }

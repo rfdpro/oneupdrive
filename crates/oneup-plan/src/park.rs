@@ -17,6 +17,25 @@
 //! `.oneup` directly inside the synced OneDrive folder is parked too: the
 //! local side of that name is the engine folder, which is never synced.
 //!
+//! **A SQLite database's working files** (`-wal`, `-shm`, `-journal`)
+//! beside the database they belong to are parked on each side, and so is
+//! their Synced record beside the database's. They're the open program's,
+//! not a copy of anything: a `-wal` or `-journal` holds changes on their
+//! way into the database, so renaming one (a conflict copy), recycling it
+//! (a deletion from OneDrive) or replacing it (a newer one from elsewhere)
+//! under a running program loses committed changes or its way back from a
+//! crash, and one from another PC would be applied to a database it
+//! doesn't belong to. The database itself goes up only once everything is
+//! in it (`docs/architecture/databases.md`), so it needs none of them.
+//! The rule is the name alone: a file named `<X>-wal`, `<X>-shm` or
+//! `<X>-journal` whose folder has a file `<X>` on either side or in the
+//! Synced tree, whatever `<X>` holds; one decision per name, so the file
+//! here, the file in OneDrive and the Synced record are hidden together; a `!` pattern in `[databases]` naming `<X>`
+//! (given with [`Parked::with_databases`]) opts it out. Siblings are found
+//! with the trees' exact-name lookups (`Trees::local_has_file`, indexed in
+//! the store); the Synced tree, which has no name index, is read one folder
+//! at a time, and only that folder's names are kept.
+//!
 //! **The user's rules** (`docs/architecture/rules.md`), when given with
 //! [`Parked::with_rules`], hide what they exclude, judged by each item's
 //! path relative to the synced folder in its own tree. A Synced record is
@@ -36,10 +55,12 @@
 //! operation instead.
 
 use std::cell::{OnceCell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use oneup_rules::RuleSet;
-use oneup_sync::{Base, LocalId, LocalNode, NodeKind, Op, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees};
+use oneup_rules::database::{Companion, Databases};
+use oneup_sync::{Base, LocalId, LocalNode, NodeKind, Op, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees, fold};
 
 use crate::names;
 
@@ -71,6 +92,14 @@ pub struct Parked<'a, T: ?Sized> {
     local_dirs: RefCell<BTreeMap<LocalId, Dir>>,
     remote_dirs: RefCell<BTreeMap<RemoteId, Option<Dir>>>,
     base_dirs: RefCell<BTreeMap<Sid, Dir>>,
+    /// The `[databases]` patterns, for their `!` opt-outs.
+    databases: Option<&'a Databases>,
+    /// No rules: what folders' paths are worked out with when there are
+    /// none.
+    no_rules: RuleSet,
+    /// The (folded) names of the files in the last Synced folder whose
+    /// names were needed: one folder's at a time, read once for it.
+    base_files: RefCell<Option<(Sid, Rc<BTreeSet<String>>)>>,
 }
 
 /// A folder as the rules see it.
@@ -91,7 +120,45 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
             local_dirs: RefCell::default(),
             remote_dirs: RefCell::default(),
             base_dirs: RefCell::default(),
+            databases: None,
+            no_rules: RuleSet::default(),
+            base_files: RefCell::default(),
         }
+    }
+
+    /// Also tells databases by the user's `[databases]` patterns, for
+    /// their working files (see the module docs).
+    pub fn with_databases(self, databases: &'a Databases) -> Self {
+        Self { databases: Some(databases), ..self }
+    }
+
+    /// Whether a `!` pattern in `[databases]` opts the file `main` in the
+    /// folder at `dir` (relative to the synced folder) out.
+    fn opted_out(&self, dir: &str, main: &str) -> bool {
+        let Some(dbs) = self.databases else { return false };
+        let path = if dir.is_empty() { main.to_string() } else { format!("{dir}/{main}") };
+        dbs.opted_out(&path)
+    }
+
+    /// Whether Synced folder `sid` has a file record named `name`.
+    fn base_has_file(&self, sid: Sid, name: &str) -> Result<bool, T::Error> {
+        let cached = self.base_files.borrow().as_ref().filter(|(s, _)| *s == sid).map(|(_, f)| Rc::clone(f));
+        let files = match cached {
+            Some(f) => f,
+            None => {
+                let mut f = BTreeSet::new();
+                self.inner.any_base_child(sid, &mut |c| {
+                    if c.kind == NodeKind::File {
+                        f.insert(fold(&c.name));
+                    }
+                    Ok(false)
+                })?;
+                let f = Rc::new(f);
+                *self.base_files.borrow_mut() = Some((sid, Rc::clone(&f)));
+                f
+            }
+        };
+        Ok(files.contains(&fold(name)))
     }
 
     /// Also hides what the user's `rules` exclude (see the module docs).
@@ -170,13 +237,96 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
         Ok(d)
     }
 
-    /// Whether the Synced record `b` is hidden (see the module docs).
-    fn base_hidden(&self, b: &Base) -> Result<bool, T::Error> {
-        let Some(rules) = self.rules else { return Ok(false) };
-        if !self.base_path_excluded(rules, b)? {
+    /// Whether the local file `n` is a SQLite database's working file
+    /// beside its database (see the module docs): only names that could be
+    /// one look further.
+    fn local_companion(&self, n: &LocalNode) -> Result<bool, T::Error> {
+        let (Some((_, main)), Some(p), NodeKind::File) = (Companion::of_name(&n.name), n.parent, n.kind) else {
+            return Ok(false);
+        };
+        if self.databases.is_some()
+            && self.opted_out(&self.local_dir(self.rules.unwrap_or(&self.no_rules), p)?.path, main)
+        {
             return Ok(false);
         }
-        // Visible on a side (moved out of the excluded part): keep it.
+        match self.inner.base_by_local(p)? {
+            Some(b) => self.namesake(Some(p), b.remote.as_ref(), Some(b.sid), main),
+            None => self.namesake(Some(p), None, None, main),
+        }
+    }
+
+    fn remote_companion(&self, n: &RemoteNode) -> Result<bool, T::Error> {
+        let (Some((_, main)), Some(p), NodeKind::File) = (Companion::of_name(&n.name), &n.parent, n.kind) else {
+            return Ok(false);
+        };
+        if self.databases.is_some() {
+            let Some(dir) = self.remote_dir(self.rules.unwrap_or(&self.no_rules), p)? else { return Ok(false) };
+            if self.opted_out(&dir.path, main) {
+                return Ok(false);
+            }
+        }
+        match self.inner.base_by_remote(p)? {
+            Some(b) => self.namesake(b.local, Some(p), Some(b.sid), main),
+            None => self.namesake(None, Some(p), None, main),
+        }
+    }
+
+    fn base_companion(&self, b: &Base) -> Result<bool, T::Error> {
+        let (Some((_, main)), Some(p), NodeKind::File) = (Companion::of_name(&b.name), b.parent, b.kind) else {
+            return Ok(false);
+        };
+        if self.databases.is_some()
+            && self.opted_out(&self.base_dir(self.rules.unwrap_or(&self.no_rules), p)?.path, main)
+        {
+            return Ok(false);
+        }
+        match self.inner.base(p)? {
+            Some(folder) => self.namesake(folder.local, folder.remote.as_ref(), Some(p), main),
+            None => self.base_has_file(p, main),
+        }
+    }
+
+    /// Whether a folder has a file named `main` on any side: here (`local`),
+    /// in OneDrive (`remote`), or in the Synced tree (`sid`). One decision
+    /// for a working-file name, whichever side asks, so its file here, its
+    /// file in OneDrive and its Synced record are hidden together: one side
+    /// visible beside a hidden record would look new.
+    fn namesake(
+        &self,
+        local: Option<LocalId>,
+        remote: Option<&RemoteId>,
+        sid: Option<Sid>,
+        main: &str,
+    ) -> Result<bool, T::Error> {
+        if let Some(l) = local
+            && self.inner.local_has_file(l, main)?
+        {
+            return Ok(true);
+        }
+        if let Some(r) = remote
+            && self.inner.remote_has_file(r, main)?
+        {
+            return Ok(true);
+        }
+        match sid {
+            Some(sid) => self.base_has_file(sid, main),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether the Synced record `b` is hidden (see the module docs).
+    fn base_hidden(&self, b: &Base) -> Result<bool, T::Error> {
+        let excluded = match self.rules {
+            Some(rules) => self.base_path_excluded(rules, b)?,
+            None => false,
+        };
+        if !excluded && !self.base_companion(b)? {
+            return Ok(false);
+        }
+        // Visible on a side (moved out of the excluded part, or renamed
+        // away from a working file's name): keep it, or that side's item
+        // would look new beside its own hidden record. The planner then
+        // sees the move, or holds what's missing on the other side.
         if let Some(l) = b.local
             && matches!(self.local(l)?, Seen::Present(_))
         {
@@ -320,14 +470,20 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
     fn local(&self, id: LocalId) -> Result<Seen<LocalNode>, T::Error> {
         Ok(match self.inner.local(id)? {
             // Excluded first: an excluded item isn't a problem to report.
-            Seen::Present(n) if self.local_excluded(&n)? || self.local_parked(&n) => Seen::Missing,
+            Seen::Present(n) if self.local_excluded(&n)? || self.local_parked(&n) || self.local_companion(&n)? => {
+                Seen::Missing
+            }
             s => s,
         })
     }
 
     fn remote(&self, id: &RemoteId) -> Result<Seen<RemoteNode>, T::Error> {
         Ok(match self.inner.remote(id)? {
-            Seen::Present(n) if self.remote_excluded(&n)? || self.remote_parked(&n)? => Seen::Missing,
+            Seen::Present(n)
+                if self.remote_excluded(&n)? || self.remote_parked(&n)? || self.remote_companion(&n)? =>
+            {
+                Seen::Missing
+            }
             s => s,
         })
     }
@@ -339,9 +495,10 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for n in self.inner.local_children(id)? {
-            if !self.local_excluded(&n)? && !self.local_parked(&n) {
-                out.push(n);
+        let all = self.inner.local_children(id)?;
+        for n in &all {
+            if !self.local_excluded(n)? && !self.local_parked(n) && !self.local_companion(n)? {
+                out.push(n.clone());
             }
         }
         Ok(out)
@@ -354,9 +511,10 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for n in self.inner.remote_children(id)? {
-            if !self.remote_excluded(&n)? && !self.remote_parked(&n)? {
-                out.push(n);
+        let all = self.inner.remote_children(id)?;
+        for n in &all {
+            if !self.remote_excluded(n)? && !self.remote_parked(n)? && !self.remote_companion(n)? {
+                out.push(n.clone());
             }
         }
         Ok(out)
@@ -379,7 +537,9 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
         {
             return Ok(false);
         }
-        self.inner.any_local_child(id, &mut |n| Ok(!self.local_excluded(n)? && !self.local_parked(n) && f(n)?))
+        self.inner.any_local_child(id, &mut |n| {
+            Ok(!self.local_excluded(n)? && !self.local_parked(n) && !self.local_companion(n)? && f(n)?)
+        })
     }
 
     fn any_remote_child(
@@ -392,7 +552,9 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
         {
             return Ok(false);
         }
-        self.inner.any_remote_child(id, &mut |n| Ok(!self.remote_excluded(n)? && !self.remote_parked(n)? && f(n)?))
+        self.inner.any_remote_child(id, &mut |n| {
+            Ok(!self.remote_excluded(n)? && !self.remote_parked(n)? && !self.remote_companion(n)? && f(n)?)
+        })
     }
 }
 
@@ -411,6 +573,8 @@ mod tests {
         /// A Synced record that must never be read: stands for the rest of
         /// a long children list, which an emptiness check shouldn't need.
         poison: Option<Sid>,
+        /// How many times a local folder's children were listed.
+        listings: std::cell::Cell<usize>,
     }
 
     fn lroot() -> LocalNode {
@@ -483,7 +647,15 @@ mod tests {
             Ok(self.remote.iter().find(|n| &n.id == id).cloned().map_or(Seen::Missing, Seen::Present))
         }
         fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>, Self::Error> {
+            self.listings.set(self.listings.get() + 1);
             Ok(self.local.iter().filter(|n| n.parent == Some(id)).cloned().collect())
+        }
+        // An exact-name lookup, as the store's index gives: no listing.
+        fn local_has_file(&self, id: LocalId, name: &str) -> Result<bool, Self::Error> {
+            Ok(self
+                .local
+                .iter()
+                .any(|n| n.parent == Some(id) && n.kind == NodeKind::File && oneup_sync::same_name(&n.name, name)))
         }
         fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>, Self::Error> {
             Ok(self.remote.iter().filter(|n| n.parent.as_ref() == Some(id)).cloned().collect())
@@ -503,7 +675,7 @@ mod tests {
             remote: Some(RemoteId("r".into())),
             remote_etag: "e".into(),
         };
-        World { local: vec![lroot()], remote: vec![rroot()], base: vec![root], poison: None }
+        World { local: vec![lroot()], remote: vec![rroot()], base: vec![root], poison: None, ..World::default() }
     }
 
     fn uploads(ops: &[Op]) -> Vec<String> {
@@ -536,6 +708,108 @@ mod tests {
                 ("huge.bin".to_string(), Why::TooLarge),
                 ("trailing. ".to_string(), Why::InvalidName),
             ]
+        );
+    }
+
+    /// SQLite's working files beside their database are the open
+    /// program's: never sent, fetched, renamed or removed, on either side,
+    /// nor their Synced records acted on. Without the database beside
+    /// them, files of such names are ordinary.
+    #[test]
+    fn a_sqlite_databases_working_files_stay_with_it() {
+        let mut w = world();
+        for (i, name) in
+            ["app.db", "APP.DB-wal", "app.db-shm", "app.db-journal", "travel-journal", "gone.db-wal"].iter().enumerate()
+        {
+            w.local.push(lfile(10 + i as u128, name, 5));
+        }
+        let rfile = |id: &str, name: &str| RemoteNode {
+            id: RemoteId(id.into()),
+            parent: Some(RemoteId("r".into())),
+            name: name.into(),
+            kind: NodeKind::File,
+            size: 3,
+            hash: None,
+            etag: "e1".into(),
+        };
+        w.remote.push(rfile("x", "theirs.sqlite"));
+        w.remote.push(rfile("xw", "theirs.sqlite-wal"));
+        // Synced before: a database and its -wal, the -wal changed here since.
+        let synced = |sid: Sid, name: &str, local: u128, remote: &str| Base {
+            sid,
+            parent: Some(ROOT),
+            name: name.into(),
+            kind: NodeKind::File,
+            size: 5,
+            hash: None,
+            local: Some(LocalId(local)),
+            local_mtime: 1,
+            remote: Some(RemoteId(remote.into())),
+            remote_etag: "e1".into(),
+        };
+        w.local.push(lfile(30, "old.db", 5));
+        w.local.push(LocalNode { mtime: 2, ..lfile(31, "old.db-wal", 9) });
+        w.remote.push(RemoteNode { size: 5, ..rfile("o", "old.db") });
+        w.remote.push(RemoteNode { size: 5, ..rfile("ow", "old.db-wal") });
+        w.base.push(synced(40, "old.db", 30, "o"));
+        w.base.push(synced(41, "old.db-wal", 31, "ow"));
+        let p = Parked::new(&w);
+        let ops = plan(&p, [ROOT]).unwrap();
+        let mut up = uploads(&ops);
+        up.sort();
+        assert_eq!(up, ["app.db", "gone.db-wal", "travel-journal"]);
+        let down: Vec<&str> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Download { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(down, ["theirs.sqlite"]);
+        assert!(!ops.iter().any(|op| op.subjects().0 == Some(41)), "{ops:?}");
+        assert!(matches!(p.local(LocalId(11)).unwrap(), Seen::Missing));
+        assert!(matches!(p.local(LocalId(14)).unwrap(), Seen::Present(_)));
+        assert!(matches!(p.remote(&RemoteId("xw".into())).unwrap(), Seen::Missing));
+        assert!(p.base_by_local(LocalId(31)).unwrap().is_none());
+    }
+
+    /// A folder of many databases and their working files is listed a
+    /// fixed number of times, not once per working file: each one's
+    /// database is found by an exact-name lookup.
+    #[test]
+    fn a_folder_of_databases_is_listed_a_fixed_number_of_times() {
+        let mut w = world();
+        for i in 0..200u128 {
+            w.local.push(lfile(10 + 2 * i, &format!("db{i}.db"), 5));
+            w.local.push(lfile(11 + 2 * i, &format!("db{i}.db-wal"), 5));
+        }
+        let ops = plan(&Parked::new(&w), [ROOT]).unwrap();
+        assert_eq!(uploads(&ops).len(), 200);
+        assert!(w.listings.get() <= 10, "listed {} times", w.listings.get());
+    }
+
+    /// Working files are parked beside their namesake by the name alone,
+    /// whatever it is (a text file here); a `!` pattern opts the namesake
+    /// out.
+    #[test]
+    fn working_files_are_parked_beside_their_namesake_unless_opted_out() {
+        let mut w = world();
+        for (i, name) in ["notes.txt", "notes.txt-wal", "books.ledger", "books.ledger-wal", "app.db", "app.db-wal"]
+            .iter()
+            .enumerate()
+        {
+            w.local.push(lfile(10 + i as u128, name, 5));
+        }
+        let ups = |p: &Parked<'_, World>| {
+            let mut up = uploads(&plan(p, [ROOT]).unwrap());
+            up.sort();
+            up
+        };
+        assert_eq!(ups(&Parked::new(&w)), ["app.db", "books.ledger", "notes.txt"], "by the name alone");
+        let patterns = Databases::new(true, &[], &["*.ledger", "!app.db"]).unwrap();
+        assert_eq!(
+            ups(&Parked::new(&w).with_databases(&patterns)),
+            ["app.db", "app.db-wal", "books.ledger", "notes.txt"]
         );
     }
 

@@ -63,17 +63,51 @@ pub enum Call {
     },
     /// Stop the agent after the current round.
     Stop,
+    /// Work offline (`on`), or go back online: offline, nothing goes over
+    /// the network but files the user opens; changes queue up. Kept
+    /// across restarts.
+    Offline {
+        on: bool,
+    },
+    /// Allow `mb` more megabytes this month on the network's data budget
+    /// (`NetStatus::data`); the agent goes on if it had paused for it.
+    AllowData {
+        mb: u64,
+    },
     /// Wait until the status differs from revision `since` (or up to
     /// [`crate::WATCH_MAX`]), then return it: lets a client follow the
     /// agent without polling.
     Watch {
         since: u64,
     },
+    /// The events after `since` (an [`Event::seq`]), waiting for one (up to
+    /// [`crate::WATCH_MAX`]) if there are none yet; `None`: none, only where
+    /// the feed is now. Answered with [`Events`], not a status
+    /// ([`crate::Client::events`]).
+    Events {
+        since: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
 struct WatchParams {
     since: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EventsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    since: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OfflineParams {
+    on: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AllowParams {
+    mb: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -110,6 +144,9 @@ impl Call {
             Call::SyncFirst { .. } => "sync_first",
             Call::Stop => "stop",
             Call::Watch { .. } => "watch",
+            Call::Events { .. } => "events",
+            Call::AllowData { .. } => "allow_data",
+            Call::Offline { .. } => "offline",
         }
     }
 
@@ -123,6 +160,9 @@ impl Call {
             Call::Answer { code, answer } => serde_json::to_value(AnswerParams { code: code.clone(), answer: *answer }),
             Call::SyncFirst { path } => serde_json::to_value(PathParams { path: path.clone() }),
             Call::Watch { since } => serde_json::to_value(WatchParams { since: *since }),
+            Call::Events { since } => serde_json::to_value(EventsParams { since: *since }),
+            Call::AllowData { mb } => serde_json::to_value(AllowParams { mb: *mb }),
+            Call::Offline { on } => serde_json::to_value(OfflineParams { on: *on }),
         };
         v.unwrap_or(Value::Null)
     }
@@ -142,6 +182,19 @@ impl Call {
             "watch" => {
                 let WatchParams { since } = p(params)?;
                 Call::Watch { since }
+            }
+            "events" => {
+                // No params at all reads as "from now".
+                let EventsParams { since } = if params.is_null() { EventsParams { since: None } } else { p(params)? };
+                Call::Events { since }
+            }
+            "offline" => {
+                let OfflineParams { on } = p(params)?;
+                Call::Offline { on }
+            }
+            "allow_data" => {
+                let AllowParams { mb } = p(params)?;
+                Call::AllowData { mb }
             }
             "pause" => {
                 let PauseParams { direction, minutes } = p(params)?;
@@ -209,11 +262,22 @@ pub struct SafetyStop {
     /// `local` (this PC) or `remote` (OneDrive).
     pub side: String,
     pub count: usize,
+    /// `count` is only a lower bound (a folder of unknown size is on the
+    /// list).
+    #[serde(default)]
+    pub at_least: bool,
     /// Of the limit, how much the last 15 minutes had used.
     pub recent: usize,
     pub synced_items: u64,
     /// The approval code.
     pub code: String,
+}
+
+impl SafetyStop {
+    /// How many items, as the user is told: `12`, or `at least 12`.
+    pub fn items(&self) -> String {
+        if self.at_least { format!("at least {}", self.count) } else { self.count.to_string() }
+    }
 }
 
 /// A version-store overflow batch.
@@ -344,9 +408,13 @@ pub struct Status {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<Problem>,
     /// Why the agent paused by itself (a metered connection, battery
-    /// saver, quiet hours), if it did.
+    /// saver, quiet hours), if it did: a fixed English message, the key
+    /// readers translate it by (`oneup_app::autopause::Reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_pause: Option<String>,
+    /// The quiet hours `auto_pause` names, as its `{hours}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pause_hours: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prune_offer: Option<PruneOffer>,
     /// The round being carried out, while one is.
@@ -356,6 +424,110 @@ pub struct Status {
     pub unsynced: Option<Unsynced>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrying: Option<Retrying>,
+    /// Database files held back, or warned about
+    /// (`docs/architecture/databases.md`): at most 100.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub databases: Vec<DatabaseNote>,
+    /// How many more were held back than `databases` lists.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub databases_more: u64,
+    /// The network and what it lets sync do (`docs/user-guide/slow-and-metered-networks.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetStatus>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A database file the agent holds back until it's in a state to sync, or
+/// one that shouldn't sync while in use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseNote {
+    /// Relative to the synced folder (`/Mail/archive.pst`).
+    pub path: String,
+    /// `sqlite`, `keepass`, `access`, `thunderbird`, `outlook`,
+    /// `virtual-disk` or `other` (a `[databases]` pattern).
+    pub format: String,
+    /// Why it waits: `wal` (SQLite changes not yet in the file), `journal`
+    /// (a SQLite transaction under way), `open` (open in another program),
+    /// `beside` (a database's working file, or a file going into such a
+    /// name: they never travel).
+    /// `live`: a format that shouldn't sync while in use (Outlook data
+    /// files, virtual disks), whether it waits or not.
+    pub why: String,
+    /// The programs that have it open, as Windows names them
+    /// (`KeePass.exe`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<String>,
+    /// What waits: `up` (sending it), `down` (OneDrive's newer version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    /// All of it in a sentence, as the activity log says it.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// How the agent uses the network now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetStatus {
+    /// The network's name as Windows shows it (empty: not told).
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub metered: bool,
+    /// Which profile applies: `default`, `metered` or `own`.
+    #[serde(default)]
+    pub profile: String,
+    /// What transfers, for people ("names and folders only").
+    #[serde(default)]
+    pub transfer: String,
+    /// `internet`, `constrained` (a network to sign in to), `local`,
+    /// `none` or `unknown`.
+    #[serde(default)]
+    pub connectivity: String,
+    /// Sync every this many minutes; 0: within seconds of a change.
+    #[serde(default)]
+    pub interval_min: u32,
+    /// When the next pass runs (Unix ms), with an interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_ms: Option<i64>,
+    /// File contents waiting for a network that lets them through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<NetWaiting>,
+    /// Data used this month on this network's profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<DataUse>,
+    /// The user chose to work offline.
+    #[serde(default)]
+    pub offline: bool,
+    /// `poor` while the agent has adapted to a poor link; empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
+}
+
+/// Data used this month on the profile in effect, by direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataUse {
+    /// `YYYY-MM`.
+    pub month: String,
+    pub up: u64,
+    pub down: u64,
+    /// The monthly budget with what the user allowed on top, in bytes; 0:
+    /// none.
+    pub budget: u64,
+    /// The budget is used up: sync pauses on this network.
+    pub reached: bool,
+}
+
+/// What waits for another network (`oneup network waiting` lists it, the
+/// largest first).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetWaiting {
+    pub count: u64,
+    pub bytes: u64,
+    /// Why, for people.
+    pub why: String,
 }
 
 /// Items whose operations failed and wait before they're tried again (a
@@ -366,6 +538,95 @@ pub struct Retrying {
     pub count: u64,
     /// When the first is tried again (Unix ms).
     pub next_ms: i64,
+}
+
+/// What happened, for `oneup watch`, hooks and scripts
+/// (`docs/architecture/hooks.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// An item was uploaded, downloaded, made, moved, renamed or removed.
+    Synced,
+    /// Changed on both sides: both versions were kept.
+    Conflict,
+    /// An operation on an item failed.
+    Failure,
+    /// A safety stop tripped and waits for the user.
+    SafetyStop,
+    /// Sync paused (the user's pause or the agent's own), or resumed.
+    Paused,
+    Resumed,
+    /// A problem began, or cleared.
+    Problem,
+    Resolved,
+}
+
+impl EventKind {
+    pub const ALL: [EventKind; 8] = [
+        EventKind::Synced,
+        EventKind::Conflict,
+        EventKind::Failure,
+        EventKind::SafetyStop,
+        EventKind::Paused,
+        EventKind::Resumed,
+        EventKind::Problem,
+        EventKind::Resolved,
+    ];
+
+    /// As written in `config.toml` and shown (`safety_stop`).
+    pub fn name(self) -> &'static str {
+        match self {
+            EventKind::Synced => "synced",
+            EventKind::Conflict => "conflict",
+            EventKind::Failure => "failure",
+            EventKind::SafetyStop => "safety_stop",
+            EventKind::Paused => "paused",
+            EventKind::Resumed => "resumed",
+            EventKind::Problem => "problem",
+            EventKind::Resolved => "resolved",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(s.trim()))
+    }
+
+    /// Whether events of this kind are about one item (and have a path).
+    pub fn has_path(self) -> bool {
+        matches!(self, EventKind::Synced | EventKind::Conflict | EventKind::Failure)
+    }
+}
+
+/// One thing that happened. Never file contents, tokens or approval codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// Goes up by one per event while the agent runs (from 1; a restarted
+    /// agent starts again).
+    pub seq: u64,
+    pub at_ms: i64,
+    pub kind: EventKind,
+    /// The item, relative to the synced folder (`/docs/a.txt`); empty for
+    /// events about sync itself.
+    #[serde(default)]
+    pub path: String,
+    /// What was done (`upload`, `download`, `move`, ...), for items.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub action: String,
+    /// Why, or what else to know, in a few words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+/// A page of events ([`Call::Events`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Events {
+    /// Pass as `since` for the next page.
+    pub next: u64,
+    /// Events after `since` were dropped before they were read (the agent
+    /// keeps the latest few thousand), or the agent restarted.
+    #[serde(default)]
+    pub missed: bool,
+    pub items: Vec<Event>,
 }
 
 // ------------------------------------------------------------- JSON-RPC
@@ -402,11 +663,12 @@ pub(crate) struct Request {
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Response {
+#[serde(bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de>"))]
+pub(crate) struct Response<T = Status> {
     pub jsonrpc: String,
     pub id: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<Status>,
+    pub result: Option<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
 }
@@ -432,7 +694,7 @@ pub(crate) fn decode(line: &str) -> (Value, Result<Call, RpcError>) {
     (req.id, call)
 }
 
-pub(crate) fn reply(id: Value, outcome: Result<Status, RpcError>) -> Response {
+pub(crate) fn reply<T>(id: Value, outcome: Result<T, RpcError>) -> Response<T> {
     let (result, error) = match outcome {
         Ok(s) => (Some(s), None),
         Err(e) => (None, Some(e)),
@@ -478,6 +740,8 @@ mod tests {
             Call::SyncFirst { path: "docs/a b.txt".into() },
             Call::Stop,
             Call::Watch { since: 42 },
+            Call::Events { since: Some(7) },
+            Call::Events { since: None },
             Call::Pause { direction: Direction::Both, minutes: Some(120) },
             Call::Pause { direction: Direction::Local, minutes: None },
             Call::Resume { direction: Direction::Remote },

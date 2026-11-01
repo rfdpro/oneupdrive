@@ -24,8 +24,13 @@ mod activity;
 mod agent;
 mod cloud_check;
 mod cloud_prune;
+mod databases_cmd;
 mod dev_remote;
+mod duplicates_cmd;
+mod find;
+mod hooks_cmd;
 mod migrate;
+mod netcmd;
 mod pair;
 mod rules;
 mod settings;
@@ -37,8 +42,13 @@ mod vault;
 use oneup_app::setup::DirLock;
 use oneup_app::{setup, sync, test_account, versions};
 
+/// `oneup rules` options that change the rules: each of --exclude-path,
+/// --include-path and --suggest does one thing, so combining them with
+/// these is refused rather than one of them silently ignored.
+const RULE_CHANGES: [&str; 8] = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "allow_downloads"];
+
 #[derive(Parser)]
-#[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (pre-alpha, read-only)")]
+#[command(name = "oneup", version, about = "OneUpDrive: a lightweight, careful OneDrive client (beta)")]
 struct Cli {
     /// Where OneUpDrive keeps its state [default: %LOCALAPPDATA%\OneUpDrive]
     #[arg(long, global = true)]
@@ -69,6 +79,13 @@ enum Cmd {
     Plan(PlanArgs),
     /// Show what the background agent is doing, and what the local mirror and the last scan contain
     Status(ProfileArg),
+    /// List everything that needs your attention: safety stops, sync
+    /// failures, problems, pauses, conflicts (this folder, its pairs and vaults)
+    Problems {
+        /// As JSON, for scripts
+        #[arg(long)]
+        json: bool,
+    },
     /// Pause the background agent (oneupd): nothing syncs until `oneup resume`
     /// (or the time given with --for). Kept if oneupd restarts
     Pause {
@@ -132,6 +149,7 @@ enum Cmd {
         state: Option<Toggle>,
     },
     /// Show or change what syncs: presets, your own rules (config.toml)
+    #[command(group(clap::ArgGroup::new("yes_for").multiple(true).args(["exclude_path", "pin", "unpin"])))]
     Rules {
         /// What happens to OneDrive's copies of excluded items (excluding
         /// always stops uploads): pull (the default: bring them and their
@@ -151,6 +169,31 @@ enum Cmd {
         /// Remove one of your rules
         #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
         remove: Vec<String>,
+        /// Add a pin rule: with Files On-Demand, matching files and folders
+        /// are always kept on this PC (e.g. "*.psd", "/Work/")
+        #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
+        pin: Vec<String>,
+        /// Remove a pin rule
+        #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
+        unpin: Vec<String>,
+        /// Let pin rules download what they're waiting for (past what you
+        /// approved when you added them)
+        #[arg(long)]
+        allow_downloads: bool,
+        /// Exclude this file or folder (a full path, or one inside the synced
+        /// folder): shows what stops syncing; --yes to do it
+        #[arg(long, value_name = "PATH", conflicts_with_all = RULE_CHANGES)]
+        exclude_path: Option<String>,
+        /// Sync this excluded file or folder again
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "allow_downloads", "exclude_path", "yes"])]
+        include_path: Option<String>,
+        /// With --exclude-path: exclude it. With --pin/--unpin: save pin rules
+        /// that download files (shown first)
+        #[arg(long, requires = "yes_for")]
+        yes: bool,
+        /// Suggest folders to exclude: the largest, and the busiest lately
+        #[arg(long, conflicts_with_all = ["cloud", "on", "off", "add", "remove", "pin", "unpin", "allow_downloads", "exclude_path", "include_path", "yes"])]
+        suggest: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -211,6 +254,14 @@ enum Cmd {
         /// Developers only: show and allow experimental options (off by default)
         #[arg(long, value_enum, hide = true)]
         experimental: Option<Toggle>,
+        #[command(flatten)]
+        tuning: settings::TuningArgs,
+        /// Sync every this many minutes; `off` (or 0): within seconds of a change
+        #[arg(long, value_name = "MINUTES|off", value_parser = parse_interval)]
+        sync_interval: Option<u32>,
+        /// With a sync interval, still sync OneDrive's changes at once (off by default)
+        #[arg(long, value_enum)]
+        keep_push: Option<Toggle>,
     },
     /// Show or change freeing up space by itself (with Files On-Demand)
     Space {
@@ -242,6 +293,57 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         count: usize,
     },
+    /// Find files and folders in your OneDrive by name, online-only ones
+    /// too, and show where each is
+    Find {
+        /// What the name contains, in any case (at least 3 characters)
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// How many to list at most
+        #[arg(long, default_value_t = oneup_app::search::DEFAULT_LIMIT)]
+        limit: usize,
+        /// Also search inside files with OneDrive's search (sends the search
+        /// text to Microsoft)
+        #[arg(long)]
+        onedrive: bool,
+        /// Print the results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or change search settings (config.toml [search]); to search,
+    /// use `oneup find`
+    Search {
+        /// Also search inside files with OneDrive in the settings window
+        /// (sends the search text to Microsoft; off by default)
+        #[arg(long, value_enum)]
+        onedrive: Option<Toggle>,
+        /// Keys that open search from anywhere (e.g. Ctrl+Alt+F), or `off`
+        #[arg(long, value_name = "KEYS|off")]
+        hotkey: Option<String>,
+    },
+    /// List files with the same content, most space saved first; or remove
+    /// the copies you choose
+    Duplicates {
+        #[command(subcommand)]
+        cmd: Option<DupCmd>,
+        /// As JSON
+        #[arg(long)]
+        json: bool,
+        /// How many groups
+        #[arg(long, default_value_t = 20)]
+        count: usize,
+        /// The next page: the cursor the last page printed
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<String>,
+        /// Instead: hash files on this PC that aren't in OneDrive (1 MiB or
+        /// more), at background priority, so they're compared too. Stops when
+        /// sync is paused; a later run continues
+        #[arg(long)]
+        hash_local: bool,
+        /// With --hash-local: at most this many files this run
+        #[arg(long, value_name = "N", default_value_t = 2000)]
+        max_files: usize,
+    },
     /// Show or change the safety stops: when sync stops and asks you first
     Safety {
         /// Stop when a round would delete, replace or move more than this
@@ -269,6 +371,37 @@ enum Cmd {
         #[arg(long, value_name = "RULE", allow_hyphen_values = true)]
         remove: Vec<String>,
     },
+    /// Show or change how database files sync: sent only in a consistent
+    /// state, replaced only while closed (config.toml [databases])
+    Databases {
+        /// Databases other than SQLite wait for their programs to close them
+        /// (on, the default); SQLite databases always wait until consistent
+        #[arg(long, value_enum)]
+        wait: Option<Toggle>,
+        /// Turn a database preset on (finance, firebird, filemaker, dbase, lotus-notes)
+        #[arg(long, value_name = "PRESET")]
+        on: Vec<String>,
+        /// Turn a database preset off
+        #[arg(long, value_name = "PRESET")]
+        off: Vec<String>,
+        /// Treat files this pattern matches as databases, gitignore style (e.g. "*.ledger"; "!x" for one that isn't)
+        #[arg(long, value_name = "PATTERN", allow_hyphen_values = true)]
+        add: Vec<String>,
+        /// Remove one of your patterns
+        #[arg(long, value_name = "PATTERN", allow_hyphen_values = true)]
+        remove: Vec<String>,
+        /// Exclude this file (an Outlook data file, a virtual disk) from sync
+        #[arg(long, value_name = "PATH")]
+        exclude: Vec<String>,
+        /// Keep this Outlook data file or virtual disk syncing, without the warning
+        #[arg(long, value_name = "PATH")]
+        keep_syncing: Vec<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
     /// Why a file or folder does or doesn't sync
     Explain {
         /// A full path, or one inside the synced folder
@@ -295,6 +428,31 @@ enum Cmd {
         cmd: Option<UnsyncedCmd>,
         #[command(flatten)]
         profile: ProfileArg,
+    },
+    /// Show what the background agent does as it happens: synced items,
+    /// conflicts, failures, safety stops, pauses and problems (Ctrl+C to stop)
+    Watch {
+        /// One JSON object per line, for scripts
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the hooks (programs the background agent starts on events, set
+    /// in config.toml), or pause, resume, turn one on or off
+    Hooks {
+        #[command(subcommand)]
+        cmd: Option<HooksCmd>,
+    },
+    /// Work offline (nothing goes over the network but files you open) or
+    /// go back online; without on/off, list what waits, the largest first
+    Offline {
+        #[arg(value_enum)]
+        state: Option<Toggle>,
+    },
+    /// Show the network this PC is on and what syncs on it, or change that
+    /// for metered networks, this network or the default
+    Network {
+        #[command(subcommand)]
+        cmd: Option<NetworkCmd>,
     },
     /// Check the state database's internal consistency
     Verify(ProfileArg),
@@ -335,10 +493,17 @@ enum Cmd {
         #[arg(long, value_enum, value_name = "ON|OFF")]
         set_rotate: Option<Toggle>,
         /// When removed files don't fit in the store: `hold` leaves them on
-        /// this PC until you decide, `keep` keeps them anyway and tells you
-        /// [default: hold]
-        #[arg(long, value_enum, value_name = "HOLD|KEEP")]
+        /// this PC until you decide, `keep` keeps them anyway and tells you,
+        /// `discard` removes them without a local copy (OneDrive's recycle
+        /// bin has them) and tells you [default: hold]
+        #[arg(long, value_enum, value_name = "HOLD|KEEP|DISCARD")]
         set_overflow: Option<OverflowChoice>,
+        /// Keep copies of files deleted or replaced in OneDrive; off, a file
+        /// that matches the version last synced is removed without a local
+        /// copy (OneDrive's recycle bin or version history has that version)
+        /// [default: on]
+        #[arg(long, value_enum, value_name = "ON|OFF")]
+        set_keep_removed: Option<Toggle>,
         /// Also keep files replaced by a newer version from OneDrive
         /// (OneDrive's version history has them anyway) [default: off]
         #[arg(long, value_enum, value_name = "ON|OFF")]
@@ -354,6 +519,75 @@ enum Cmd {
         /// Where to put it, relative to the synced folder [default: where it was]
         #[arg(long)]
         to: Option<String>,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Rewind a folder to how it was at an earlier moment: lists what would
+    /// change; `--start` has the agent do it, once you approve it as a
+    /// safety stop (`oneup approve CODE`). Nothing is destroyed: what it
+    /// replaces or removes goes to the version store or OneDrive's recycle
+    /// bin and version history
+    Rewind {
+        /// The folder, relative to the synced folder (`/docs`; `/` for all of it)
+        #[arg(required_unless_present_any = ["before_stop", "cancel", "approve", "set_history_days", "set_history_changes"])]
+        folder: Option<String>,
+        /// The moment, in this PC's time: `2026-10-19 14:05`
+        #[arg(long, required_unless_present_any = ["before_stop", "cancel", "approve", "set_history_days", "set_history_changes"])]
+        to: Option<String>,
+        /// The content guard's stop CODE: its folder, to just before its batch
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["folder", "to"])]
+        before_stop: Option<String>,
+        /// Have the agent do it (it waits for your approval)
+        #[arg(long)]
+        start: bool,
+        /// With --start: only if the list is still the one with this CODE
+        /// (the preview's); otherwise the new list is shown and nothing starts
+        #[arg(long, value_name = "CODE", requires = "start")]
+        expect: Option<String>,
+        /// Cancel the rewind under way (what it did stays done)
+        #[arg(long, conflicts_with = "start")]
+        cancel: bool,
+        /// Approve the rewind waiting, only if its list is still the one
+        /// with this CODE; otherwise the new list is shown and nothing is
+        /// approved
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["start", "cancel", "before_stop", "folder", "to"])]
+        approve: Option<String>,
+        /// Keep this many days of history to rewind with [default: 30];
+        /// 0 turns rewinding off and drops the history
+        #[arg(long, value_name = "DAYS")]
+        set_history_days: Option<u32>,
+        /// Keep at most this many changes of history (about 165 bytes
+        /// each) [default: 1000000]; 0 turns rewinding off
+        #[arg(long, value_name = "N")]
+        set_history_changes: Option<u64>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Files changed on both sides, kept as two copies (`name (conflict
+    /// N).ext`): list them, or keep one (the other goes to the version
+    /// store and OneDrive's recycle bin)
+    Conflicts {
+        /// The file whose conflict to answer, relative to the synced folder
+        path: Option<String>,
+        /// Which copy to keep: `original`, `copy` or `both`
+        #[arg(long, value_name = "ORIGINAL|COPY|BOTH", requires = "path")]
+        keep: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        profile: ProfileArg,
+    },
+    /// Items deleted from OneDrive since OneUpDrive began keeping their
+    /// history (OneDrive's own recycle bin can't be listed); `--restore N`
+    /// brings one back from it
+    RecycleBin {
+        /// Bring back this item (its number from the list)
+        #[arg(long, value_name = "N")]
+        restore: Option<usize>,
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         profile: ProfileArg,
     },
@@ -402,6 +636,14 @@ enum Cmd {
         #[arg(long)]
         edit: bool,
     },
+    /// What you share in OneDrive and who can open it (links, people,
+    /// expiry); stop sharing or set an expiry
+    Shared {
+        #[command(subcommand)]
+        cmd: Option<SharedCmd>,
+        #[command(flatten)]
+        list: SharedList,
+    },
     /// Files On-Demand: always keep this file or folder on this PC
     Pin {
         /// A full path, or one inside the synced folder
@@ -425,7 +667,9 @@ enum Cmd {
     #[command(subcommand)]
     Cloud(CloudCmd),
     /// Cryptomator vaults in a local folder (preview: for checking
-    /// compatibility; never changes or removes what exists)
+    /// compatibility; never changes or removes what exists), and encrypted
+    /// vaults synced with OneDrive. Experimental: the encryption hasn't had
+    /// an outside security review yet
     #[command(subcommand)]
     Vault(VaultCmd),
     /// More folder pairs under this sign-in: any OneDrive folder, a folder
@@ -442,6 +686,10 @@ enum Cmd {
         channel: Option<String>,
         #[arg(long)]
         check: bool,
+        /// The tray's automatic download, in a process of its own so a
+        /// change of network can stop it: look and download, nothing else
+        #[arg(long, hide = true)]
+        fetch: bool,
     },
     /// List broken shortcuts to OneDrive files (Desktop, Start menu,
     /// taskbar); `--fix` updates them to the synced folder, `--undo`
@@ -800,6 +1048,20 @@ enum MigrateCmd {
         #[command(flatten)]
         profile: ProfileArg,
     },
+    /// What the OneDrive app left in the registry after moving over: its
+    /// empty personal account settings and its "OneDrive - Personal"
+    /// navigation-pane entry. Moving over clears them; this shows them
+    Leftovers {
+        /// Clear them now (a backup goes to the data folder)
+        #[arg(long, conflicts_with = "undo")]
+        clear: bool,
+        /// Put back what was last cleared
+        #[arg(long)]
+        undo: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -832,9 +1094,9 @@ enum VaultCmd {
     Mkdir { folder: PathBuf, path: String },
     /// Read and verify every file in the vault
     Check { folder: PathBuf },
-    /// Sync a vault in OneDrive with a folder on this PC, decrypted (test
-    /// accounts only, for now). Files are online-only and decrypted when
-    /// opened, unless --full-files
+    /// Sync a vault in OneDrive with a folder on this PC, decrypted
+    /// (experimental). Files are online-only and decrypted when opened, unless
+    /// --full-files
     Add {
         /// The vault's folder in OneDrive (the one with vault.cryptomator)
         remote: String,
@@ -852,7 +1114,7 @@ enum VaultCmd {
         no_start: bool,
     },
     /// Create a new vault in OneDrive and sync it with a new or empty folder
-    /// here (test accounts only, for now). Shows its recovery key
+    /// here (experimental). Shows its recovery key
     New {
         /// A new or empty folder in OneDrive, e.g. /Private
         remote: String,
@@ -909,6 +1171,40 @@ enum VaultCmd {
 }
 
 #[derive(Subcommand)]
+enum HooksCmd {
+    /// Start no hooks until `oneup hooks resume`
+    Pause,
+    Resume,
+    /// Turn a hook on, by name
+    On {
+        name: String,
+    },
+    /// Turn a hook off, by name
+    Off {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DupCmd {
+    /// Preview removing copies, named as `oneup duplicates` lists them; with
+    /// --yes, hand the removal to OneUpDrive, which asks you to approve it.
+    /// Copies in OneDrive go to its recycle bin, copies on this PC to the
+    /// version store; the last copy never goes
+    Remove {
+        paths: Vec<String>,
+        #[arg(long)]
+        yes: bool,
+        /// The code the preview showed: go ahead only if the removal is still
+        /// exactly that
+        #[arg(long, value_name = "CODE")]
+        expect: Option<String>,
+    },
+    /// Drop the removal waiting for approval
+    Cancel,
+}
+
+#[derive(Subcommand)]
 enum UnsyncedCmd {
     /// Resolve items `oneup unsynced` lists; without a choice, shows each
     /// item's choices. OneUpDrive carries it out in its next round
@@ -946,6 +1242,9 @@ struct ResolveArgs {
     /// A name OneDrive refuses, or one differing only in case: rename it
     #[arg(long, group = "choice", value_name = "NAME")]
     rename: Option<String>,
+    /// Suggest valid, distinct names for invalid names and case clashes
+    #[arg(long, group = "choice")]
+    repair_names: bool,
     /// Leave it out of sync (adds a rule)
     #[arg(long, group = "choice")]
     exclude: bool,
@@ -967,11 +1266,156 @@ impl ResolveArgs {
             (self.delete_here, C::DeleteHere),
             (self.upload, C::Upload),
             (self.rename.is_some(), C::Rename),
+            (self.repair_names, C::RepairNames),
             (self.exclude, C::Exclude),
         ]
         .into_iter()
         .find_map(|(on, c)| on.then_some(c))
     }
+}
+
+/// Which network profile to change.
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct NetworkTarget {
+    /// The network this PC is on now (by Windows' ID for it)
+    #[arg(long)]
+    this: bool,
+    /// Every metered network without settings of its own
+    #[arg(long)]
+    metered: bool,
+    /// Networks that aren't metered and have no settings of their own
+    #[arg(long)]
+    default: bool,
+    /// A network by Windows' ID, as `oneup network` shows it
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+}
+
+impl NetworkTarget {
+    fn target(&self) -> oneup_app::network::Target {
+        match (&self.id, self.this, self.metered) {
+            (Some(id), ..) => oneup_app::network::Target::Id(id.clone()),
+            (None, true, _) => oneup_app::network::Target::This,
+            (None, false, true) => oneup_app::network::Target::Metered,
+            _ => oneup_app::network::Target::Default,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TransferArg {
+    /// Nothing syncs (opening an online-only file still downloads it)
+    Paused,
+    Everything,
+    /// Names, folders and online-only files; no file contents
+    Metadata,
+    /// Contents of files under --small-mb
+    Small,
+    /// Only files you open or change
+    Opened,
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Change what syncs on a network
+    Set {
+        #[command(flatten)]
+        target: NetworkTarget,
+        /// What transfers
+        #[arg(long, value_enum)]
+        transfer: Option<TransferArg>,
+        /// With --transfer small: the size limit in MB (default 10)
+        #[arg(long, value_name = "MB")]
+        small_mb: Option<u64>,
+        /// Upload cap in KiB/s (0 = none)
+        #[arg(long, value_name = "KIB_PER_S")]
+        upload_kib: Option<u64>,
+        /// Download cap in KiB/s (0 = none)
+        #[arg(long, value_name = "KIB_PER_S")]
+        download_kib: Option<u64>,
+        /// Sync every this many minutes; `off` (or 0): within seconds of a change
+        #[arg(long, value_name = "MINUTES|off", value_parser = parse_interval)]
+        sync_interval: Option<u32>,
+        /// With a sync interval, still sync OneDrive's changes at once
+        #[arg(long, value_enum)]
+        keep_push: Option<Toggle>,
+        /// A monthly data budget in MB; `off` (or 0): none
+        #[arg(long, value_name = "MB|off", value_parser = parse_guard)]
+        budget_mb: Option<usize>,
+    },
+    /// Remove a network's own settings (it then gets the default or metered profile)
+    Forget {
+        #[command(flatten)]
+        target: NetworkTarget,
+    },
+    /// Allow more data this month on the network's budget (sync goes on if it paused for it)
+    AllowMore {
+        /// How many megabytes
+        #[arg(long, default_value_t = oneup_app::netusage::ALLOW_MB)]
+        mb: u64,
+    },
+    /// List what waits for a network that lets it through, the largest first
+    Waiting {
+        /// How many to list at most
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum SharedCmd {
+    /// Stop sharing: remove one link, or one person's or group's access, as
+    /// `oneup shared` lists it
+    Stop(SharedChange),
+    /// Experimental: set the last day a link or access works
+    Expire {
+        #[command(flatten)]
+        change: SharedChange,
+        /// The last day it works (YYYY-MM-DD; it stops at the end of that day)
+        #[arg(long, value_name = "DATE")]
+        on: String,
+    },
+}
+
+#[derive(clap::Args)]
+struct SharedList {
+    /// Print JSON: one page, with where the next starts (`next`, for --after)
+    #[arg(long)]
+    json: bool,
+    /// Start after this item (a page's `next`)
+    #[arg(long, value_name = "NEXT", conflicts_with = "with_me")]
+    after: Option<String>,
+    /// With --json: at most this many items in the page
+    #[arg(long, default_value_t = 50, requires = "json")]
+    limit: usize,
+    /// List what others share with you instead
+    #[arg(long)]
+    with_me: bool,
+    /// List all of OneDrive once to find items shared before OneUpDrive
+    /// kept track of sharing (slow on a large OneDrive)
+    #[arg(long, conflicts_with = "with_me")]
+    scan: bool,
+}
+
+#[derive(clap::Args)]
+struct SharedChange {
+    /// The item as `oneup shared` lists it (its path in OneDrive), or its ID
+    item: String,
+    /// The link's or access's ID, as listed
+    permission: String,
+    /// The code shown without --yes: go ahead only if it's still exactly
+    /// as it was then
+    #[arg(long, value_name = "CODE", value_parser = parse_share_code)]
+    expect: Option<u64>,
+    /// Go ahead (needs --expect; without it, only shows what would be done
+    /// and its code)
+    #[arg(long, requires = "expect")]
+    yes: bool,
+}
+
+fn parse_share_code(s: &str) -> Result<u64, String> {
+    u64::from_str_radix(s.trim(), 16).map_err(|_| "expected the 16-character code `oneup shared` printed".into())
 }
 
 #[derive(Subcommand)]
@@ -1012,6 +1456,7 @@ impl Toggle {
 enum OverflowChoice {
     Hold,
     Keep,
+    Discard,
 }
 
 fn shortcuts_cmd(dir: &Path, fix: bool, undo: bool, from: Option<&Path>, json: bool) -> Result<()> {
@@ -1058,6 +1503,80 @@ fn shortcuts_cmd(dir: &Path, fix: bool, undo: bool, from: Option<&Path>, json: b
     Ok(())
 }
 
+/// `oneup shared`: the sharing audit (`oneup_app::sharing`).
+async fn shared_cmd(dir: &Path, cmd: Option<&SharedCmd>, list: &SharedList) -> Result<()> {
+    use oneup_app::sharing;
+    let graph = sharing::graph(dir)?;
+    let offset = activity::local_offset();
+    let day = |ms: Option<i64>| ms.map_or_else(|| "–".to_string(), |t| activity::when(t, offset));
+    if let Some(SharedCmd::Stop(c) | SharedCmd::Expire { change: c, .. }) = cmd
+        && c.yes
+    {
+        setup::require_test_account(dir)?;
+    }
+    // Whatever the command, changes an earlier one left unsettled are
+    // settled first (`sharing::begin`). Notes go to stderr: stdout may be JSON.
+    let mut store = setup::open_store(dir, 4 * 1024)?;
+    let mode = if cmd.is_some() { sharing::Mode::Change } else { sharing::Mode::Look };
+    let begun = sharing::begin(dir, &mut store, &graph, mode).await?;
+    for line in sharing::settled_text(begun.settled) {
+        eprintln!("{line}");
+    }
+    if let Some(c) = cmd {
+        let (change, at) = match c {
+            SharedCmd::Stop(change) => (change, oneup_gate::sharing::Change::Stop),
+            SharedCmd::Expire { change, on } => {
+                (change, oneup_gate::sharing::Change::Expire(sharing::end_of_day(on, sharing::local_offset_on)?))
+            }
+        };
+        let lock = begun.lock.as_ref().context("the sharing lock wasn't taken")?;
+        let ask = sharing::Ask {
+            item: &change.item,
+            permission: &change.permission,
+            expect: change.expect,
+            change: at,
+            yes: change.yes,
+            experimental: oneup_app::config::load_experimental(dir)?,
+            now_ms: time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
+        };
+        match sharing::change(&mut store, &graph, lock, &ask).await? {
+            sharing::Outcome::Would { what, code } if code.is_empty() => bail!("{what}"),
+            sharing::Outcome::Would { what, code } => println!("{}", sharing::would_text(&what, &code)),
+            sharing::Outcome::Done(msg) => println!("{msg}"),
+        }
+        return Ok(());
+    }
+    if list.with_me {
+        let found = sharing::with_me_json(&graph, sharing::WITH_ME_MAX).await?;
+        if list.json {
+            println!("{found}");
+        } else {
+            for line in sharing::with_me_text(&found, &day) {
+                println!("{line}");
+            }
+        }
+        return Ok(());
+    }
+    if list.scan {
+        let n = sharing::scan(&mut store, &graph).await?;
+        if !list.json {
+            println!("{}", sharing::scanned_text(n));
+        }
+    }
+    if list.json {
+        // One page; `next` says where the following one starts (--after).
+        let p = sharing::list_page(&mut store, &graph, list.after.as_deref(), list.limit.max(1), sharing::PAGE_CHECKS)
+            .await?;
+        println!("{}", sharing::page_json(&p));
+        return Ok(());
+    }
+    // One page, and how to go on (`--after`): one run's cost stays bounded.
+    for line in sharing::listing_text(&mut store, &graph, list.after.as_deref(), &day).await? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 /// An approval code: the 16 hex digits a safety stop prints.
 /// `oneup updates`: shows or changes `[updates]`; `check` looks for a new
 /// version now, as the settings window's Check now does.
@@ -1100,6 +1619,16 @@ fn updates_cmd(dir: &Path, auto: Option<bool>, channel: Option<&str>, check: boo
         }
     }
     Ok(())
+}
+
+/// A sync interval in minutes, or `off`.
+fn parse_interval(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    let n: u64 = s.parse().map_err(|_| "expected a number of minutes, or off".to_string())?;
+    oneup_app::pace::check_minutes(n).map_err(|e| e.to_string())
 }
 
 fn parse_code(s: &str) -> Result<u64, String> {
@@ -1221,6 +1750,7 @@ async fn run() -> Result<()> {
                 | Cmd::Cloud(_)
                 | Cmd::Migrate(_)
                 | Cmd::Vault(_)
+                | Cmd::Shared { .. }
         )
     {
         bail!(
@@ -1250,6 +1780,7 @@ async fn run() -> Result<()> {
             agent::status(&data_dir(&cli)?).await?;
             status(&cli, p.memory_profile)
         }
+        Cmd::Problems { json } => oneup_app::problems::show(&data_dir(&cli)?, *json).await,
         Cmd::Pause { folder: Some(f), .. } => {
             rules::pause_folder(&data_dir(&cli)?, &open_store(&cli, MemoryProfile::Balanced)?, f, true).await
         }
@@ -1334,6 +1865,17 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Watch { json } => hooks_cmd::watch(&data_dir(&cli)?, *json).await,
+        Cmd::Hooks { cmd } => {
+            let dir = data_dir(&cli)?;
+            match cmd {
+                None => hooks_cmd::list(&dir),
+                Some(HooksCmd::Pause) => hooks_cmd::pause(&dir, true).await,
+                Some(HooksCmd::Resume) => hooks_cmd::pause(&dir, false).await,
+                Some(HooksCmd::On { name }) => hooks_cmd::enable(&dir, name, true).await,
+                Some(HooksCmd::Off { name }) => hooks_cmd::enable(&dir, name, false).await,
+            }
+        }
         Cmd::Stop => {
             let dir = data_dir(&cli)?;
             for p in oneup_app::pairs::list(&dir) {
@@ -1350,15 +1892,43 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Autostart { state } => agent::autostart(&data_dir(&cli)?, state.map(Toggle::on)),
-        Cmd::Rules { cloud, on, off, add, remove, profile } => {
+        Cmd::Rules {
+            cloud,
+            on,
+            off,
+            add,
+            remove,
+            pin,
+            unpin,
+            allow_downloads,
+            exclude_path,
+            include_path,
+            yes,
+            suggest,
+            profile,
+        } => {
+            let dir = data_dir(&cli)?;
+            if *suggest {
+                return rules::suggest(&dir, &open_store(&cli, profile.memory_profile)?);
+            }
+            if let Some(p) = exclude_path {
+                return rules::exclude_path(&dir, &open_store(&cli, profile.memory_profile)?, p, *yes).await;
+            }
+            if let Some(p) = include_path {
+                return rules::include_path(&dir, &open_store(&cli, profile.memory_profile)?, p).await;
+            }
             let changes = rules::Changes {
                 cloud: cloud.clone(),
                 on: on.clone(),
                 off: off.clone(),
                 add: add.clone(),
                 remove: remove.clone(),
+                pin: pin.clone(),
+                unpin: unpin.clone(),
+                yes: *yes,
+                allow_downloads: *allow_downloads,
             };
-            rules::run(&data_dir(&cli)?, &open_store(&cli, profile.memory_profile)?, &changes).await
+            rules::run(&dir, &open_store(&cli, profile.memory_profile)?, &changes).await
         }
         Cmd::Settings {
             upload_kib,
@@ -1379,6 +1949,9 @@ async fn run() -> Result<()> {
             busy_max_s,
             compact_database,
             experimental,
+            tuning,
+            sync_interval,
+            keep_push,
         } => {
             let changes = settings::Changes {
                 upload_kib: *upload_kib,
@@ -1399,6 +1972,9 @@ async fn run() -> Result<()> {
                 busy_max_s: *busy_max_s,
                 compact_database: compact_database.map(Toggle::on),
                 experimental: experimental.map(Toggle::on),
+                tuning: tuning.clone(),
+                sync_interval: *sync_interval,
+                keep_push: keep_push.map(Toggle::on),
             };
             settings::run(&data_dir(&cli)?, &changes).await
         }
@@ -1448,8 +2024,9 @@ async fn run() -> Result<()> {
                 let s = oneup_app::apps::summary(&dir, 90)?;
                 let apps = s["apps"].as_array().cloned().unwrap_or_default();
                 let found = apps.iter().find(|a| {
+                    // A program's display name ("Word") isn't a file name.
                     a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(which))
-                        || a["exe"].as_str().is_some_and(|e| e.eq_ignore_ascii_case(which))
+                        || a["exe"].as_str().is_some_and(|e| oneup_sync::same_name(e, which))
                 });
                 Some(found.and_then(|a| a["exe"].as_str()).unwrap_or(which).to_string())
             };
@@ -1505,6 +2082,25 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Find { text, limit, onedrive, json } => {
+            find::run(&data_dir(&cli)?, cli.client_id.as_deref(), &text.join(" "), *limit, *onedrive, *json).await
+        }
+        Cmd::Search { onedrive, hotkey } => {
+            find::settings(&data_dir(&cli)?, onedrive.map(Toggle::on), hotkey.as_deref())
+        }
+        Cmd::Duplicates { cmd, json, count, after, hash_local, max_files } => {
+            let dir = data_dir(&cli)?;
+            let store = open_store(&cli, MemoryProfile::Balanced)?;
+            match cmd {
+                Some(DupCmd::Remove { paths, yes, expect }) => {
+                    let a = duplicates_cmd::Remove { paths, yes: *yes, expect: expect.as_deref() };
+                    duplicates_cmd::remove(&dir, store, a).await
+                }
+                Some(DupCmd::Cancel) => duplicates_cmd::cancel(&dir, store).await,
+                None if *hash_local => duplicates_cmd::hash_local(&dir, store, *max_files).await,
+                None => duplicates_cmd::list(&dir, &store, *json, *count, after.as_deref()),
+            }
+        }
         Cmd::Safety { max_changes, max_percent, content_guard } => {
             let mut store = open_store(&cli, MemoryProfile::Balanced)?;
             let s = oneup_app::versions::Safety {
@@ -1532,6 +2128,47 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::History { path, open, restore } => history(path, *open, *restore).await,
+        Cmd::Rewind { set_history_days, set_history_changes, profile, .. }
+            if set_history_days.is_some() || set_history_changes.is_some() =>
+        {
+            let mut store = open_store(&cli, profile.memory_profile)?;
+            oneup_app::rewind::set_history(&mut store, *set_history_days, *set_history_changes)?;
+            match store.read(oneup_app::rewind::history_keep)? {
+                Some(k) => println!("History kept for rewinds: {} days, at most {} changes.", k.days, k.rows),
+                None => println!("Rewinding is off: no history is kept."),
+            }
+            Ok(())
+        }
+        Cmd::Rewind { folder, to, before_stop, start, expect, cancel, approve, json, profile, .. } => {
+            let dir = data_dir(&cli)?;
+            let code = |c: &String| u64::from_str_radix(c, 16).ok().filter(|_| c.len() == 16).context("not a code");
+            let expect = expect.as_ref().map(code).transpose()?;
+            let approve = approve.as_ref().map(code).transpose()?;
+            let ask = RewindAsk {
+                folder: folder.as_deref(),
+                to: to.as_deref(),
+                before_stop: before_stop.as_deref(),
+                start: *start,
+                expect,
+                approve,
+                cancel: *cancel,
+                json: *json,
+            };
+            rewind(&dir, open_store(&cli, profile.memory_profile)?, ask).await
+        }
+        Cmd::Conflicts { path, keep, json, profile } => {
+            conflicts(
+                &data_dir(&cli)?,
+                open_store(&cli, profile.memory_profile)?,
+                path.as_deref(),
+                keep.as_deref(),
+                *json,
+            )
+            .await
+        }
+        Cmd::RecycleBin { restore, json, profile } => {
+            recycle_bin(&data_dir(&cli)?, open_store(&cli, profile.memory_profile)?, *restore, *json).await
+        }
         Cmd::OnedriveApp { add, remove, top_files } => {
             let dir = data_dir(&cli)?;
             let mut a = oneup_app::config::load_onedrive_app(&dir)?;
@@ -1541,13 +2178,13 @@ async fn run() -> Result<()> {
                 if p == "/" {
                     bail!("give a folder, like /Office");
                 }
-                if !a.folders.iter().any(|f| f.eq_ignore_ascii_case(&p)) {
+                if !a.folders.iter().any(|f| oneup_sync::same_name(f, &p)) {
                     a.folders.push(p);
                 }
             }
             for p in remove {
                 let p = norm(p);
-                a.folders.retain(|f| !f.eq_ignore_ascii_case(&p));
+                a.folders.retain(|f| !oneup_sync::same_name(f, &p));
             }
             if let Some(t) = top_files {
                 a.top_files = t.on();
@@ -1580,7 +2217,7 @@ async fn run() -> Result<()> {
             let dir = data_dir(&cli)?;
             let v = match find {
                 Some(q) => oneup_app::filetree::find(&dir, q, 50)?,
-                None => oneup_app::filetree::list(&dir, rel)?,
+                None => oneup_app::filetree::list(&dir, rel, &[])?,
             };
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
@@ -1726,6 +2363,9 @@ async fn run() -> Result<()> {
         Cmd::Migrate(MigrateCmd::Check { json, profile }) => {
             migrate::check(&data_dir(&cli)?, &open_store(&cli, profile.memory_profile)?, *json)
         }
+        Cmd::Migrate(MigrateCmd::Leftovers { clear, undo, json }) => {
+            migrate::leftovers(&data_dir(&cli)?, &open_store(&cli, MemoryProfile::Balanced)?, *clear, *undo, *json)
+        }
         Cmd::Migrate(MigrateCmd::FinishUnlink { step, yes, wait_minutes, json, profile }) => {
             use oneup_app::moveover::Step;
             let steps: Vec<Step> = match step {
@@ -1828,12 +2468,17 @@ async fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::Updates { auto, channel, check } => {
+        Cmd::Updates { fetch: true, .. } => {
+            let Some(um) = oneup_app::updates::manager(&data_dir(&cli)?)? else { return Ok(()) };
+            oneup_app::updates::check(um).map(drop)
+        }
+        Cmd::Updates { auto, channel, check, fetch: false } => {
             updates_cmd(&data_dir(&cli)?, auto.map(Toggle::on), channel.as_deref(), *check)
         }
         Cmd::Shortcuts { fix, undo, from, json } => {
             shortcuts_cmd(&data_dir(&cli)?, *fix, *undo, from.as_deref(), *json)
         }
+        Cmd::Shared { cmd, list } => shared_cmd(&data_dir(&cli)?, cmd.as_ref(), list).await,
         Cmd::Accounts { add } => match add {
             Some(AccountsCmd::Add { name }) => {
                 let dir = oneup_app::accounts::add(name)?;
@@ -1868,6 +2513,19 @@ async fn run() -> Result<()> {
             }),
         ),
         Cmd::Priority { first, last, remove } => rules::priority(&data_dir(&cli)?, first, last, remove).await,
+        Cmd::Databases { wait, on, off, add, remove, exclude, keep_syncing, json, profile } => {
+            let changes = databases_cmd::Changes {
+                wait: wait.map(Toggle::on),
+                on: on.clone(),
+                off: off.clone(),
+                add: add.clone(),
+                remove: remove.clone(),
+                exclude: exclude.clone(),
+                keep_syncing: keep_syncing.clone(),
+            };
+            let store = open_store(&cli, profile.memory_profile)?;
+            databases_cmd::run(&data_dir(&cli)?, &store, &changes, *json).await
+        }
         Cmd::Explain { path, profile } => {
             rules::explain(&data_dir(&cli)?, open_store(&cli, profile.memory_profile)?, path).await
         }
@@ -1885,6 +2543,50 @@ async fn run() -> Result<()> {
                 yes: r.yes,
             };
             unsynced_cmd::resolve(&data_dir(&cli)?, open_store(&cli, r.profile.memory_profile)?, ask).await
+        }
+        Cmd::Offline { state: Some(t) } => agent::offline(&data_dir(&cli)?, t.on()).await,
+        Cmd::Offline { state: None } => {
+            agent::status(&data_dir(&cli)?).await?;
+            netcmd::waiting(&open_store(&cli, MemoryProfile::Balanced)?, 30)
+        }
+        Cmd::Network { cmd: None } => netcmd::show(&data_dir(&cli)?),
+        Cmd::Network {
+            cmd:
+                Some(NetworkCmd::Set {
+                    target,
+                    transfer,
+                    small_mb,
+                    upload_kib,
+                    download_kib,
+                    sync_interval,
+                    keep_push,
+                    budget_mb,
+                }),
+        } => {
+            use oneup_app::network::Transfer;
+            let changes = oneup_app::network::Changes {
+                transfer: transfer.map(|t| match t {
+                    TransferArg::Paused => Transfer::Paused,
+                    TransferArg::Everything => Transfer::Everything,
+                    TransferArg::Metadata => Transfer::Metadata,
+                    TransferArg::Small => Transfer::Small,
+                    TransferArg::Opened => Transfer::Opened,
+                }),
+                small_mb: *small_mb,
+                upload_kib: *upload_kib,
+                download_kib: *download_kib,
+                interval: *sync_interval,
+                keep_push: keep_push.map(Toggle::on),
+                budget_mb: budget_mb.map(|n| n as u64),
+            };
+            netcmd::set(&data_dir(&cli)?, &target.target(), &changes).await
+        }
+        Cmd::Network { cmd: Some(NetworkCmd::AllowMore { mb }) } => agent::allow_data(&data_dir(&cli)?, *mb).await,
+        Cmd::Network { cmd: Some(NetworkCmd::Waiting { limit }) } => {
+            netcmd::waiting(&open_store(&cli, MemoryProfile::Balanced)?, *limit)
+        }
+        Cmd::Network { cmd: Some(NetworkCmd::Forget { target }) } => {
+            netcmd::forget(&data_dir(&cli)?, &target.target()).await
         }
         Cmd::Verify(p) => verify(&cli, p.memory_profile),
         Cmd::Diagnose { top, profile } => diagnose(&cli, *top, profile.memory_profile),
@@ -1930,6 +2632,7 @@ async fn run() -> Result<()> {
             set_rotate,
             set_overflow,
             set_keep_replaced,
+            set_keep_removed,
             profile,
         } => {
             let _lock = DirLock::acquire(&data_dir(&cli)?)?;
@@ -1942,8 +2645,10 @@ async fn run() -> Result<()> {
                 overflow: set_overflow.map(|c| match c {
                     OverflowChoice::Hold => oneup_gate::OverflowPolicy::Hold,
                     OverflowChoice::Keep => oneup_gate::OverflowPolicy::Keep,
+                    OverflowChoice::Discard => oneup_gate::OverflowPolicy::Discard,
                 }),
                 keep_replaced: set_keep_replaced.map(Toggle::on),
+                keep_removed: set_keep_removed.map(Toggle::on),
             };
             if !changes.is_empty() {
                 versions::set(&mut store, &changes)?;
@@ -1953,8 +2658,15 @@ async fn run() -> Result<()> {
             versions::versions(&store, *older_than_days, *max_gib, *yes)
         }
         Cmd::Restore { id, to, profile } => {
-            let _lock = DirLock::acquire(&data_dir(&cli)?)?;
-            versions::restore(&open_store(&cli, profile.memory_profile)?, id, to.as_deref())
+            let dir = data_dir(&cli)?;
+            let mut store = open_store(&cli, profile.memory_profile)?;
+            let at = oneup_app::restores::kept(&mut store, id, to.as_deref())?;
+            if agent::nudge(&dir).await {
+                println!("Restoring {at}; `oneup activity` says when it's done.");
+            } else {
+                println!("The next sync restores {at}, then sends it to OneDrive.");
+            }
+            Ok(())
         }
         Cmd::CloudCheck | Cmd::DevRemote(_) | Cmd::UploadBench { .. } => {
             let dir = data_dir(&cli)?;
@@ -1974,6 +2686,230 @@ async fn run() -> Result<()> {
             }
         }
     }
+}
+
+/// What `oneup rewind` was asked.
+struct RewindAsk<'a> {
+    folder: Option<&'a str>,
+    to: Option<&'a str>,
+    before_stop: Option<&'a str>,
+    start: bool,
+    /// The code of the preview the user saw.
+    expect: Option<u64>,
+    /// Approve the rewind waiting, if its list still has this code.
+    approve: Option<u64>,
+    cancel: bool,
+    json: bool,
+}
+
+/// `oneup rewind FOLDER --to TIME [--start]`, `--before-stop CODE`, `--cancel`.
+async fn rewind(dir: &std::path::Path, mut store: Store, ask: RewindAsk<'_>) -> Result<()> {
+    use oneup_app::rewind as rw;
+    let now = oneup_app::sync::now_ms();
+    if ask.cancel {
+        if rw::cancel(&mut store, now)? {
+            agent::nudge(dir).await;
+            println!("Rewind cancelled. What it did stays done.");
+        } else {
+            println!("No rewind is under way.");
+        }
+        return Ok(());
+    }
+    let (folder, at) = match (ask.approve, ask.before_stop) {
+        (Some(_), _) => {
+            let job = store.read(rw::load)?.context("no rewind is waiting for an approval")?;
+            if job.approval.is_some() {
+                bail!("that rewind is approved already");
+            }
+            (job.folder, job.at_ms)
+        }
+        (None, Some(code)) => rw::before_stop(&store, dir, code, now)?,
+        (None, None) => {
+            (ask.folder.unwrap_or("/").to_string(), rw::parse_when(ask.to.context("--to: the moment to rewind to")?)?)
+        }
+    };
+    let (rules, _) = oneup_app::rulefiles::load(dir, &store, &mut oneup_app::rulefiles::Cache::default())?;
+    // Approved only as shown: the list is planned again now, and a change
+    // in the folder since (it syncs meanwhile) gives another list, shown
+    // instead. The agent checks the same again when it takes the answer.
+    let mut approved = false;
+    let (p, started) = if let Some(code) = ask.approve {
+        let p = rw::preview(&store, &rules, &folder, at, now)?;
+        if p.code == code {
+            agent::answer(dir, code, oneup_ipc::Answer::Approve).await?;
+            approved = true;
+        }
+        (p, false)
+    } else if ask.start {
+        let (p, started) = rw::start(&mut store, dir, &rules, &folder, at, now, ask.expect)?;
+        if started {
+            agent::nudge(dir).await;
+        }
+        (p, started)
+    } else {
+        (rw::preview(&store, &rules, &folder, at, now)?, false)
+    };
+    if ask.json {
+        let changes: Vec<serde_json::Value> = p
+            .changes
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "kind": format!("{:?}", c.kind), "folder": c.item == oneup_sync::NodeKind::Folder,
+                    "then": c.then, "now": c.now, "size": c.size, "source": format!("{:?}", c.source),
+                })
+            })
+            .collect();
+        let skipped: Vec<serde_json::Value> = p
+            .skipped
+            .iter()
+            .map(|(path, why)| serde_json::json!({ "path": path, "why": format!("{why:?}") }))
+            .collect();
+        let v = serde_json::json!({
+            "folder": p.folder, "at_ms": p.at_ms, "code": format!("{:016x}", p.code),
+            "started": started, "approved": approved,
+            "changed": (ask.start && !started) || (ask.approve.is_some() && !approved), "changes": changes, "skipped": skipped, "lines": rw::describe(&p),
+        });
+        println!("{v}");
+        return Ok(());
+    }
+    let shown = if folder.trim_matches('/').is_empty() { "the whole folder".to_string() } else { folder.clone() };
+    println!("Rewinding {shown} to {}:", rw::when(at));
+    for l in rw::describe(&p) {
+        println!("  {l}");
+    }
+    if ask.approve.is_some() && !approved {
+        println!(
+            "The list changed since it was shown, so nothing was approved. To approve this one: --approve {:016x}.",
+            p.code
+        );
+    } else if approved {
+        // `agent::answer` said so.
+    } else if ask.start && !started {
+        println!(
+            "The list changed since the preview, so nothing started. To rewind this one: --start --expect {:016x}.",
+            p.code
+        );
+    } else if p.changes.is_empty() {
+        println!("Nothing to change.");
+    } else if ask.start {
+        println!(
+            "The rewind waits for your approval and the rest syncs meanwhile: `oneup rewind --approve {:016x}`.",
+            p.code
+        );
+    } else {
+        println!("Nothing changed. To do it, run this again with --start.");
+    }
+    Ok(())
+}
+
+/// `oneup conflicts [PATH --keep original|copy|both]`.
+async fn conflicts(
+    dir: &std::path::Path,
+    mut store: Store,
+    path: Option<&str>,
+    keep: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use oneup_app::conflicts as cf;
+    let listed = store.read(cf::list)?;
+    if let (Some(path), Some(keep)) = (path, keep) {
+        let want = format!("/{}", path.replace('\\', "/").trim_matches('/'));
+        let c = listed
+            .iter()
+            .find(|l| oneup_sync::same_name(&l.path, &want) || oneup_sync::same_name(&l.copy_path, &want))
+            .with_context(|| format!("no conflict for {want}"))?;
+        match cf::parse_keep(keep)? {
+            None => println!("Both copies stay as they are."),
+            Some(k) => {
+                cf::answer(&mut store, &c.conflict, k)?;
+                if agent::nudge(dir).await {
+                    println!("The agent keeps the copy you chose; the other goes to the version store.");
+                } else {
+                    println!("Queued: the next sync keeps the copy you chose (the agent isn't running).");
+                }
+            }
+        }
+        return Ok(());
+    }
+    if json {
+        let v: Vec<serde_json::Value> = listed.iter().map(cf::to_json).collect();
+        println!("{}", serde_json::Value::Array(v));
+        return Ok(());
+    }
+    if listed.is_empty() {
+        println!("No conflicts.");
+        return Ok(());
+    }
+    let when = |ft: i64| oneup_app::rewind::when(cf::filetime_ms(ft));
+    for l in &listed {
+        let c = &l.conflict;
+        let newer = match c.original.mtime.cmp(&c.copy.mtime) {
+            std::cmp::Ordering::Greater => " (newer)",
+            _ => "",
+        };
+        let copy_newer = if c.copy.mtime > c.original.mtime { " (newer)" } else { "" };
+        println!("{}", l.path);
+        println!(
+            "  original  {}  {}{newer}",
+            oneup_app::versions::size(c.original.size.max(0) as u64),
+            when(c.original.mtime)
+        );
+        println!(
+            "  copy      {}  {}{copy_newer}  {}",
+            oneup_app::versions::size(c.copy.size.max(0) as u64),
+            when(c.copy.mtime),
+            l.copy_path
+        );
+    }
+    println!("Keep one with `oneup conflicts PATH --keep original` (or `copy`).");
+    Ok(())
+}
+
+/// `oneup recycle-bin [--restore N]`.
+async fn recycle_bin(dir: &std::path::Path, mut store: Store, restore: Option<usize>, json: bool) -> Result<()> {
+    use oneup_app::cloudbin;
+    let listed = store.read(|o| cloudbin::list(o, cloudbin::MAX))?;
+    if let Some(n) = restore {
+        let d =
+            listed.get(n.wrapping_sub(1)).with_context(|| format!("there's no item {n} (1 to {})", listed.len()))?;
+        oneup_app::setup::require_test_account(dir)?;
+        if oneup_app::vaultpair::is_vault_dir(dir) {
+            bail!("this is an encrypted vault: OneDrive only has its encrypted files");
+        }
+        let to = oneup_app::restores::deleted(&mut store, d.seq)?;
+        if agent::nudge(dir).await {
+            println!("Bringing it back as {to}; `oneup activity` says when it's done.");
+        } else {
+            println!("The next sync brings it back as {to}.");
+        }
+        return Ok(());
+    }
+    if json {
+        let v: Vec<serde_json::Value> = listed.iter().map(cloudbin::to_json).collect();
+        println!("{}", serde_json::Value::Array(v));
+        return Ok(());
+    }
+    if listed.is_empty() {
+        println!("Nothing deleted from OneDrive since OneUpDrive began keeping its history.");
+        return Ok(());
+    }
+    for (i, d) in listed.iter().enumerate() {
+        let gone = match (&d.folder, d.elsewhere) {
+            (None, _) => "  (its folder is gone too)",
+            (Some(_), true) => "  (restore it from OneDrive's recycle bin on the web)",
+            (Some(_), false) => "",
+        };
+        println!(
+            "  {:>3}  {}  {:>10}  {}{gone}",
+            i + 1,
+            oneup_app::rewind::when(d.at_ms),
+            oneup_app::versions::size(d.size.max(0) as u64),
+            d.path
+        );
+    }
+    println!("Only items OneUpDrive saw deleted are listed; OneDrive's website shows its whole recycle bin.");
+    Ok(())
 }
 
 /// `oneup history PATH [--open N | --restore N]`.
@@ -1996,6 +2932,9 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
             })
             .unwrap_or_else(|| "?".into())
     };
+    // On screen, in the regional format (`when` also names saved copies).
+    let shown =
+        |x: &serde_json::Value| x["modified_ms"].as_i64().map_or_else(|| "?".into(), oneup_app::l10n::date_time);
     if let Some(n) = open {
         let x = pick(n)?;
         let to = oneup_app::item::open_version(path, x["id"].as_str().unwrap_or_default(), &when(x).replace(':', ""))
@@ -2009,8 +2948,12 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
             bail!("version 1 is the current one already");
         }
         let x = pick(n)?;
-        oneup_app::item::restore_version(path, x["id"].as_str().unwrap_or_default()).await?;
-        println!("Version {n} ({}) is the current version again; this PC gets it with the next sync.", when(x));
+        let dir = oneup_app::item::restore_version(path, x["id"].as_str().unwrap_or_default())?;
+        if agent::nudge(&dir).await {
+            println!("Version {n} ({}) is restoring; `oneup activity` says when it's done.", shown(x));
+        } else {
+            println!("Version {n} ({}) is restored by the next sync.", shown(x));
+        }
         return Ok(());
     }
     println!("{} in OneDrive:", v["path"].as_str().unwrap_or_default());
@@ -2018,7 +2961,7 @@ async fn history(path: &std::path::Path, open: Option<usize>, restore: Option<us
         println!(
             "  {:>3}  {}  {:>10}  {}{}",
             i + 1,
-            when(x),
+            shown(x),
             oneup_app::versions::size(x["size"].as_u64().unwrap_or(0)),
             x["by"].as_str().unwrap_or(""),
             if i == 0 { "  (current)" } else { "" }
@@ -2795,6 +3738,17 @@ fn diagnose(cli: &Cli, top: usize, profile: MemoryProfile) -> Result<()> {
 
 fn verify(cli: &Cli, profile: MemoryProfile) -> Result<()> {
     let store = open_store(cli, profile)?;
+    // The search index on its own line: its problems never stop syncing.
+    match store.read(|o| o.search_state())? {
+        oneup_store::IndexState::Building => println!("Search index: being built (by the agent, or the first search)."),
+        oneup_store::IndexState::Broken => {
+            println!("Search index: to be built again (by the agent at its next start, or the first search).")
+        }
+        oneup_store::IndexState::Ready => match store.read(|o| o.search_problems())?.as_slice() {
+            [] => println!("Search index: complete."),
+            found => println!("Search index: {}.", found.join("; ")),
+        },
+    }
     let problems = store.read(|o| o.check_invariants())?;
     if problems.is_empty() {
         println!("Mirror and folder scan are consistent.");
@@ -2808,5 +3762,32 @@ fn verify(cli: &Cli, profile: MemoryProfile) -> Result<()> {
              again rebuilds a folder scan (problems marked \"local:\")",
             problems.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod rules_args_tests {
+    use clap::Parser;
+
+    fn parses(args: &[&str]) -> bool {
+        super::Cli::try_parse_from(std::iter::once("oneup").chain(args.iter().copied())).is_ok()
+    }
+
+    /// Options of `oneup rules` that do different things can't be combined:
+    /// one of them would be ignored. `--yes` only goes with --exclude-path.
+    #[test]
+    fn rules_options_that_would_be_ignored_are_refused() {
+        assert!(parses(&["rules", "--exclude-path", "x", "--yes"]));
+        assert!(parses(&["rules", "--cloud", "prune", "--add", "*.iso"]));
+        assert!(!parses(&["rules", "--cloud", "prune", "--exclude-path", "x", "--yes"]));
+        assert!(!parses(&["rules", "--suggest", "--add", "*.iso"]));
+        assert!(!parses(&["rules", "--suggest", "--exclude-path", "x"]));
+        assert!(!parses(&["rules", "--include-path", "x", "--remove", "y"]));
+        assert!(!parses(&["rules", "--include-path", "x", "--exclude-path", "y"]));
+        assert!(!parses(&["rules", "--yes"]), "--yes needs --exclude-path");
+        assert!(!parses(&["rules", "--include-path", "x", "--yes"]));
+        assert!(parses(&["rules", "--pin", "*.psd", "--yes"]) && parses(&["rules", "--unpin", "!x", "--yes"]));
+        assert!(!parses(&["rules", "--pin", "*.psd", "--exclude-path", "x"]));
+        assert!(!parses(&["rules", "--allow-downloads", "--suggest"]));
     }
 }

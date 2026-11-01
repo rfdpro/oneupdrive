@@ -18,16 +18,27 @@
 //!
 //! 4. the SQLite store plans exactly like the in-memory world: every round
 //!    is also planned from a store holding a copy of the world, and the two
-//!    plans must be identical (`oneup_store::synced`'s `Trees` impl).
+//!    plans must be identical (`oneup_store::synced`'s `Trees` impl);
+//! 5. `data-safety.md` invariant 3: nothing is deleted in the cloud without
+//!    evidence of its deletion here;
+//! 6. rewinding (`oneup_sync::rewind`): rewinding a folder to a moment
+//!    reproduces it as it was then, and rewinding the rewind puts back what
+//!    was there before it.
 //!
-//! `SIM_SEEDS=N` runs more seeds (default 200), `SIM_SEED=n` replays one,
-//! `SIM_DEBUG=1` prints each round's operations, `SIM_STORE=0` skips check 4
-//! (for long runs: it multiplies the run time).
+//! Faults: OneDrive's listing lagging behind the cloud ([`Mirror`]), and the
+//! change journal losing users' latest deletions ([`World::lose_journal`]).
+//!
+//! `SIM_SEEDS=N` runs more seeds (default 200; 50 for the fault runs, which
+//! take longer per seed), `SIM_SEED_FROM=k` starts at seed `k` instead of 1
+//! (to split a long run), `SIM_SEED=n` replays one, `SIM_DEBUG=1` prints each
+//! round's operations, `SIM_STORE=0` skips check 4 (for long runs: it
+//! multiplies the run time).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 
 use oneup_store::{Kind, LocalKind, LocalRow, RemoteRow, Skip, Store};
+use oneup_sync::rewind::{History, Job, Mark, Spot, Step, Was};
 use oneup_sync::{
     Base, Flow, Hash, HoldReason, Link, LocalId, LocalNode, LocalPre, NodeKind, Op, ROOT, RemoteId, RemoteNode,
     RemotePre, Seen, Sid, Trees, all_folders, fold, plan, plan_flow,
@@ -60,7 +71,7 @@ struct LItem {
     mtime: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RItem {
     parent: Option<String>,
     name: String,
@@ -69,11 +80,28 @@ struct RItem {
     etag: u64,
 }
 
+/// OneDrive's listing as the planner reads it when it lags behind the cloud
+/// (delta lag): what our own operations got back as they ran, overwritten
+/// at the start of each round by a delivery of the cloud's state as it was
+/// at the start of the round before. So a delivery can be older than what
+/// an upload, a move or a deletion of ours just saw.
+#[derive(Debug, Clone)]
+struct Mirror {
+    rows: BTreeMap<String, RItem>,
+    /// Deletions delivered (delta `deleted` facets), and our own.
+    gone: BTreeSet<String>,
+    /// What the next delivery brings.
+    next: (BTreeMap<String, RItem>, BTreeSet<String>),
+}
+
 #[derive(Debug, Clone)]
 struct World {
     local: BTreeMap<u128, LItem>,
     /// Local IDs removed with evidence (USN delete records).
     local_gone: BTreeSet<u128>,
+    /// Users' deletions since the observer last read the journal: what a
+    /// journal loss can take ([`World::lose_journal`]).
+    unread: Vec<u128>,
     next_local: u128,
     clock: i64,
     /// (file ID, mtime) pairs whose hash has been computed.
@@ -89,6 +117,23 @@ struct World {
     remote_bin: Vec<Content>,
     remote_versions: Vec<Content>,
 
+    /// `Some` while OneDrive's listing lags ([`World::lag`]).
+    mirror: Option<Mirror>,
+    /// The recycle bin by item (what a restore brings back), and each
+    /// item's earlier contents, oldest first (its version history).
+    remote_bin_items: BTreeMap<String, RItem>,
+    remote_history: BTreeMap<String, Vec<Content>>,
+    /// Every change to a Synced row, as the store's history records it:
+    /// (when, which, what it was until then; `None`: created then). Kept
+    /// only when `track` is set.
+    history: Vec<(i64, Sid, Option<Was>)>,
+    track: bool,
+    /// Records whose item OneDrive can't bring back where it goes: it was
+    /// deleted from another folder (the plan skips it), or that folder is
+    /// gone or its name taken there now. A restore lands only where it was
+    /// deleted from, whatever is asked (measured).
+    unlanded: BTreeSet<Sid>,
+
     bases: BTreeMap<Sid, Base>,
     next_sid: Sid,
     next_content: Content,
@@ -99,6 +144,7 @@ impl World {
         let mut w = World {
             local: BTreeMap::new(),
             local_gone: BTreeSet::new(),
+            unread: Vec::new(),
             next_local: LOCAL_ROOT + 1,
             clock: 1,
             hashed: BTreeSet::new(),
@@ -110,6 +156,12 @@ impl World {
             next_etag: 1,
             remote_bin: Vec::new(),
             remote_versions: Vec::new(),
+            mirror: None,
+            remote_bin_items: BTreeMap::new(),
+            remote_history: BTreeMap::new(),
+            history: Vec::new(),
+            track: false,
+            unlanded: BTreeSet::new(),
             bases: BTreeMap::new(),
             next_sid: ROOT + 1,
             next_content: 1,
@@ -290,6 +342,21 @@ impl World {
         self.bases.get_mut(&sid)
     }
 
+    /// Removes a Synced row with every row below it, as the store does
+    /// (`Ops::synced_remove`): a record whose folder is gone can't stay.
+    fn remove_bases(&mut self, sid: Sid) {
+        let mut out = vec![sid];
+        let mut i = 0;
+        while i < out.len() {
+            let p = out[i];
+            out.extend(self.bases.values().filter(|b| b.parent == Some(p)).map(|b| b.sid));
+            i += 1;
+        }
+        for s in out {
+            self.bases.remove(&s);
+        }
+    }
+
     fn link(&mut self, link: Link, b: Base) -> bool {
         match link {
             Link::New => {
@@ -404,6 +471,7 @@ impl World {
                         let etag = self.etag();
                         let Some(r) = self.remote.get_mut(&rp.id.0) else { return false };
                         self.remote_versions.push(r.content);
+                        self.remote_history.entry(rp.id.0.clone()).or_default().push(r.content);
                         r.content = it.content;
                         r.etag = etag;
                         rp.id.0.clone()
@@ -551,13 +619,20 @@ impl World {
                 if !self.rpre_ok(remote) || self.remote.values().any(|it| it.parent.as_deref() == Some(&remote.id.0)) {
                     return false;
                 }
-                if let Some(it) = self.remote.remove(&remote.id.0)
-                    && it.kind == NodeKind::File
-                {
-                    self.remote_bin.push(it.content);
+                // As the executor: only for a Synced row still there.
+                let Some(b) = self.bases.get(sid) else { return false };
+                assert!(
+                    b.remote.as_ref() == Some(&remote.id) && b.local.is_some_and(|l| self.local_gone.contains(&l.0)),
+                    "invariant 3: deleted in the cloud without evidence of its deletion here: {op:?} {b:?}"
+                );
+                if let Some(it) = self.remote.remove(&remote.id.0) {
+                    if it.kind == NodeKind::File {
+                        self.remote_bin.push(it.content);
+                    }
+                    self.remote_bin_items.insert(remote.id.0.clone(), it);
                 }
                 self.remote_gone.insert(remote.id.0.clone());
-                self.bases.remove(sid);
+                self.remove_bases(*sid);
                 true
             }
             Op::RecycleLocal { sid, local } => {
@@ -571,14 +646,368 @@ impl World {
                     self.local_bin.push(it.content);
                 }
                 self.local_gone.insert(local.id.0);
-                self.bases.remove(sid);
+                self.remove_bases(*sid);
                 true
             }
             // Never planned by the reconciler (`oneup cloud prune` only).
             Op::PruneRemote { .. } => panic!("the reconciler planned a prune"),
             Op::Dehydrate { .. } => panic!("the reconciler planned a dehydration"),
+            Op::RemoveCopy { .. } => panic!("the reconciler planned removing a chosen copy"),
+            Op::Rewind { sid, step } => self.rewind_step(*sid, step),
             Op::Hold { .. } => false,
         }
+    }
+}
+
+// ---------------------------------------------------------------- journal loss
+
+impl World {
+    /// The change journal wraps before the observer reads users' latest
+    /// deletions ([`World::unread`]), and the folder is rescanned. The
+    /// agent's journal watcher kept some of their delete records
+    /// (`SeenDeletes`): those are evidence after the rescan. The rest
+    /// (the watcher was wrapped past too, or over its bound) are lost: their
+    /// items read as Missing and are held. A rescan finds the folder as it
+    /// is, which the model's local side already is.
+    fn lose_journal(&mut self, rng: &mut Rng) {
+        let watcher_lost_all = rng.chance(30);
+        for id in std::mem::take(&mut self.unread) {
+            if watcher_lost_all || rng.chance(50) {
+                self.local_gone.remove(&id);
+            }
+        }
+    }
+
+    /// Synced items held because they're missing here without evidence
+    /// while still in the cloud.
+    fn held_missing(&self) -> Vec<&Base> {
+        let missing = |l: &LocalId| !self.local.contains_key(&l.0) && !self.local_gone.contains(&l.0);
+        let there = |r: &RemoteId| self.remote.contains_key(&r.0);
+        self.bases
+            .values()
+            .filter(|b| b.local.as_ref().is_some_and(missing) && b.remote.as_ref().is_some_and(there))
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------- delta lag
+
+impl World {
+    /// From now on, OneDrive's listing lags behind the cloud ([`Mirror`]).
+    fn lag(&mut self) {
+        let now = (self.remote.clone(), self.remote_gone.clone());
+        self.mirror = Some(Mirror { rows: now.0.clone(), gone: now.1.clone(), next: now });
+    }
+
+    /// The start of a round, while the listing lags: it delivers the cloud
+    /// as it was at the last delivery, over whatever the mirror holds.
+    /// Without `fresh`, nothing new arrives (the lag grows by a round).
+    fn deliver(&mut self, fresh: bool) {
+        let now = (self.remote.clone(), self.remote_gone.clone());
+        let Some(m) = self.mirror.as_mut() else { return };
+        if !fresh {
+            return;
+        }
+        let (rows, gone) = std::mem::replace(&mut m.next, now);
+        // Deletions first: a folder's deletion takes what's stored below it
+        // (`delete_subtree`), and what had moved out comes back with the rows.
+        for id in &gone {
+            m.delete(id);
+        }
+        for (id, it) in rows {
+            m.gone.remove(&id);
+            m.rows.insert(id, it);
+        }
+    }
+
+    /// The trees the planner reads: the cloud through the mirror while the
+    /// listing lags.
+    fn view(&self) -> World {
+        let mut v = self.clone();
+        if let Some(m) = v.mirror.take() {
+            v.remote = m.rows;
+            v.remote_gone = m.gone;
+        }
+        v
+    }
+
+    /// Whether the listing shows the cloud as it is (always, without lag).
+    fn caught_up(&self) -> bool {
+        self.mirror.as_ref().is_none_or(|m| m.rows == self.remote && m.gone == self.remote_gone)
+    }
+
+    /// Runs `op` ([`World::apply`]) of a round planned from `planned`;
+    /// while the listing lags, the mirror stores what it changed in the
+    /// cloud, as the executor records the items its requests return.
+    fn run(&mut self, op: &Op, planned: &World) -> bool {
+        if let Op::MoveLocal { sid, .. } = op {
+            // As the executor asks (`Cloud::is_at`): only while OneDrive
+            // still has the item where the listing had it, which this move
+            // follows. The listing is the mirror, or what the round was
+            // planned from.
+            let rid = self.bases.get(sid).and_then(|b| b.remote.clone());
+            let listing = self.mirror.as_ref().map_or(&planned.remote, |m| &m.rows);
+            if let Some(rid) = rid
+                && let Some(listed) = listing.get(&rid.0)
+                && self.remote.get(&rid.0).is_none_or(|it| (&it.parent, &it.name) != (&listed.parent, &listed.name))
+            {
+                return false;
+            }
+        }
+        if self.mirror.is_none() {
+            return self.apply_logged(op);
+        }
+        let before = self.remote.clone();
+        let ran = self.apply_logged(op);
+        if let Some(m) = self.mirror.as_mut() {
+            for (id, it) in &self.remote {
+                if before.get(id) != Some(it) {
+                    m.gone.remove(id);
+                    m.rows.insert(id.clone(), it.clone());
+                }
+            }
+            for id in before.keys().filter(|id| !self.remote.contains_key(*id)) {
+                m.delete(id);
+            }
+        }
+        ran
+    }
+}
+
+impl Mirror {
+    /// A deletion of `id`: it and everything stored below it are gone, as
+    /// the store's `delete_subtree` records them.
+    fn delete(&mut self, id: &str) {
+        let mut out = vec![id.to_owned()];
+        let mut i = 0;
+        while i < out.len() {
+            let p = out[i].clone();
+            out.extend(self.rows.iter().filter(|(_, it)| it.parent.as_deref() == Some(&p)).map(|(c, _)| c.clone()));
+            i += 1;
+        }
+        for c in out {
+            self.rows.remove(&c);
+            self.gone.insert(c);
+        }
+    }
+}
+
+impl World {
+    /// Carries out one rewind step as the real executor does: OneDrive
+    /// under the step's precondition, the Synced tree left alone (except
+    /// for a copy set aside or a record forgotten).
+    fn rewind_step(&mut self, sid: Sid, step: &Step) -> bool {
+        match step {
+            Step::Restore { id, to, name, content, .. } => {
+                // As OneDrive does (measured): back into the folder it was
+                // deleted from, under the name it had, whatever was asked;
+                // the executor asks only when that's where the step puts it,
+                // into a live folder (OneDrive would bring a folder deleted
+                // with it back too, under its old name), and nothing has the
+                // name there.
+                let Some((Some(land), land_name)) =
+                    self.remote_bin_items.get(&id.0).map(|it| (it.parent.clone(), it.name.clone()))
+                else {
+                    return false;
+                };
+                if land != to.0
+                    || !oneup_sync::same_name(&land_name, name)
+                    || !self.r_is_folder(&land)
+                    || self.r_child(&land, &land_name).is_some()
+                {
+                    self.unlanded.insert(sid);
+                    return false;
+                }
+                let etag = self.etag();
+                let Some(mut it) = self.remote_bin_items.remove(&id.0) else { return false };
+                it.etag = etag;
+                self.remote.insert(id.0.clone(), it);
+                self.remote_gone.remove(&id.0);
+
+                // Done once restored: content still to put back is planned
+                // again from what's there.
+                if let Some((_, hash)) = content
+                    && self.remote.get(&id.0).is_some_and(|r| hash_of(r.content) != *hash)
+                {
+                    self.put_back(&id.0, hash);
+                }
+                true
+            }
+            Step::Reset { remote, place, content, .. } => {
+                if !self.rpre_ok(remote) {
+                    return false;
+                }
+                // Content first, then the place, as the executor does.
+                if let Some((_, hash)) = content {
+                    self.put_back(&remote.id.0, hash);
+                }
+                if let Some((to, name)) = place {
+                    if !self.r_is_folder(&to.0)
+                        || self.r_within(&to.0, &remote.id.0)
+                        || self.r_child(&to.0, name).is_some_and(|c| c != remote.id.0)
+                    {
+                        return false;
+                    }
+                    let etag = self.etag();
+                    if let Some(it) = self.remote.get_mut(&remote.id.0) {
+                        it.parent = Some(to.0.clone());
+                        it.name.clone_from(name);
+                        it.etag = etag;
+                    }
+                }
+                true
+            }
+            Step::Remove { remote, .. } => {
+                let Some(it) = self.remote.get(&remote.id.0) else { return false };
+                // A folder is re-read (its eTag moves with its contents);
+                // what counts is that it's empty.
+                if it.kind == NodeKind::File && !self.rpre_ok(remote) {
+                    return false;
+                }
+                if self.remote.values().any(|c| c.parent.as_deref() == Some(&remote.id.0)) {
+                    return false;
+                }
+                if let Some(it) = self.remote.remove(&remote.id.0) {
+                    if it.kind == NodeKind::File {
+                        self.remote_bin.push(it.content);
+                    }
+                    self.remote_bin_items.insert(remote.id.0.clone(), it);
+                }
+                self.remote_gone.insert(remote.id.0.clone());
+                true
+            }
+            Step::SetAside { local, .. } => {
+                if !self.pre_ok(local) || self.bases.get(&sid).and_then(|b| b.local) != Some(local.id) {
+                    return false;
+                }
+                if let Some(it) = self.local.remove(&local.id.0) {
+                    self.local_versions.push(it.content);
+                }
+                self.remove_bases(sid);
+                true
+            }
+            Step::Discard { .. } | Step::RestoreKept { .. } | Step::RevertTo { .. } => {
+                panic!("a rewind planned a recovery step")
+            }
+            Step::Forget => {
+                let Some(b) = self.bases.get(&sid) else { return false };
+                if b.local.is_some_and(|l| self.local.contains_key(&l.0)) {
+                    return false;
+                }
+                self.bases.remove(&sid);
+                true
+            }
+        }
+    }
+
+    /// Makes the version of file `id`'s history with `hash` its current
+    /// one, the current one going into the history.
+    fn put_back(&mut self, id: &str, hash: &Hash) -> bool {
+        let Some(old) = self.remote_history.get(id).and_then(|h| h.iter().rev().find(|c| hash_of(**c) == *hash)) else {
+            return false;
+        };
+        let old = *old;
+        let etag = self.etag();
+        let Some(it) = self.remote.get_mut(id) else { return false };
+        let now = std::mem::replace(&mut it.content, old);
+        it.etag = etag;
+        self.remote_versions.push(now);
+        self.remote_history.entry(id.to_string()).or_default().push(now);
+        true
+    }
+
+    /// [`World::apply`], recording what each Synced row changed from, as
+    /// the store's history triggers do.
+    fn apply_logged(&mut self, op: &Op) -> bool {
+        if !self.track {
+            return self.apply(op);
+        }
+        let before = self.bases.clone();
+        let ran = self.apply(op);
+        let at = self.tick();
+        let sids: BTreeSet<Sid> = before.keys().chain(self.bases.keys()).copied().collect();
+        for sid in sids {
+            match (before.get(&sid), self.bases.get(&sid)) {
+                (None, Some(_)) => self.history.push((at, sid, None)),
+                (Some(b), None) => self.history.push((at, sid, Some(Was::from(b)))),
+                (Some(b), Some(a)) if Was::from(b) != Was::from(a) => self.history.push((at, sid, Some(Was::from(b)))),
+                _ => {}
+            }
+        }
+        ran
+    }
+}
+
+impl History for World {
+    type Error = Infallible;
+
+    fn change_after(&self, sid: Sid, at: i64) -> Result<Option<Option<Was>>, Infallible> {
+        Ok(self.history.iter().find(|(t, s, _)| *s == sid && *t > at).map(|(_, _, w)| w.clone()))
+    }
+
+    /// The world's last-write times are its own clock, as its moments are.
+    fn written_ms(&self, local_mtime: i64) -> i64 {
+        local_mtime
+    }
+
+    fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, Infallible> {
+        Ok(self.history.iter().rev().find_map(|(_, _, w)| w.clone().filter(|w| w.remote.as_ref() == Some(id))))
+    }
+
+    /// As delta says it (measured): the folder it was in when deleted.
+    fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>, Infallible> {
+        Ok(self
+            .remote_gone
+            .contains(&id.0)
+            .then(|| self.remote_bin_items.get(&id.0))
+            .flatten()
+            .and_then(|it| Some((RemoteId(it.parent.clone()?), it.name.clone()))))
+    }
+
+    fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>, Infallible> {
+        Ok(self
+            .history
+            .iter()
+            .filter(|(t, _, w)| *t > at && w.as_ref().is_some_and(|w| w.parent == Some(parent)))
+            .map(|(_, s, _)| *s)
+            .collect())
+    }
+
+    fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>, Infallible> {
+        let sids: BTreeSet<Sid> = self.history.iter().filter(|(t, _, _)| *t > at).map(|(_, s, _)| *s).collect();
+        Ok((sids.len() <= limit).then(|| sids.into_iter().collect()))
+    }
+
+    /// As the store finds them: records whose item differs from the record
+    /// on either side.
+    fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>, Infallible> {
+        let v = self.unsettled_items();
+        Ok((v.len() <= limit).then_some(v))
+    }
+}
+
+impl World {
+    fn unsettled_items(&self) -> Vec<Sid> {
+        let mut out = BTreeSet::new();
+        for b in self.bases.values() {
+            let parent_local = b.parent.and_then(|p| self.bases.get(&p)).and_then(|p| p.local);
+            let local_ok = match b.local.map(|id| Trees::local(self, id)) {
+                Some(Ok(Seen::Present(n))) => {
+                    n.name == b.name
+                        && n.parent == parent_local
+                        && (b.kind == NodeKind::Folder || (n.size == b.size && n.mtime == b.local_mtime))
+                }
+                _ => b.sid == ROOT,
+            };
+            let remote_ok = match b.remote.as_ref().map(|r| Trees::remote(self, r)) {
+                Some(Ok(Seen::Present(n))) => n.etag == b.remote_etag || b.kind == NodeKind::Folder,
+                _ => false,
+            };
+            if !(local_ok && remote_ok) {
+                out.insert(b.sid);
+            }
+        }
+        out.into_iter().collect()
     }
 }
 
@@ -669,6 +1098,7 @@ impl World {
                 let Some(f) = rng.pick(&files) else { return };
                 let Some(old) = self.local.remove(&f) else { return };
                 self.local_gone.insert(f);
+                self.unread.push(f);
                 let c = self.content();
                 self.l_create(old.parent.unwrap_or(LOCAL_ROOT), &old.name, NodeKind::File, c);
             }
@@ -699,6 +1129,7 @@ impl World {
                             self.local_bin.push(it.content);
                         }
                         self.local_gone.insert(id);
+                        self.unread.push(id);
                     }
                 }
             }
@@ -726,6 +1157,7 @@ impl World {
                 let (c, e) = (self.content(), self.etag());
                 if let Some(it) = self.remote.get_mut(&f) {
                     self.remote_versions.push(it.content);
+                    self.remote_history.entry(f.clone()).or_default().push(it.content);
                     it.content = c;
                     it.etag = e;
                 }
@@ -762,6 +1194,7 @@ impl World {
                         if it.kind == NodeKind::File {
                             self.remote_bin.push(it.content);
                         }
+                        self.remote_bin_items.insert(id.clone(), it);
                         self.remote_gone.insert(id);
                     }
                 }
@@ -833,6 +1266,11 @@ fn store_of(w: &World) -> Store {
         }
         for id in &w.remote_gone {
             o.note_remote_deleted(id)?;
+            if let Some(it) = w.remote_bin_items.get(id)
+                && let Some(parent) = &it.parent
+            {
+                o.deleted_from_put(id, parent, &it.name, 0)?;
+            }
         }
         let problems = o.check_invariants()?;
         assert!(problems.is_empty(), "store invariants: {problems:?}");
@@ -864,7 +1302,14 @@ fn round(w: &mut World, rng: Option<&mut Rng>, debug: bool) -> (usize, usize) {
 }
 
 fn round_flow(w: &mut World, rng: Option<&mut Rng>, debug: bool, flow: Flow) -> (usize, usize) {
-    let snap = w.clone();
+    let mut rng = rng;
+    // A lagging listing sometimes brings nothing new for a while; settling
+    // rounds always get the next delivery.
+    let fresh = w.mirror.is_none() || rng.as_deref_mut().is_none_or(|r| r.chance(70));
+    w.deliver(fresh);
+    // The observer has read the journal.
+    w.unread.clear();
+    let snap = w.view();
     let ops = plan_flow(&snap, all_folders(&snap).unwrap_or_default(), flow).unwrap_or_default();
     if check_store() {
         assert_eq!(plan_from_store(&snap, flow), ops, "the SQLite store planned differently from the in-memory world");
@@ -878,21 +1323,35 @@ fn round_flow(w: &mut World, rng: Option<&mut Rng>, debug: bool, flow: Flow) -> 
             );
         }
     }
+    // Folders a safety stop lists to delete later are deleted with evidence
+    // on that side, and are folders (`pending_deletes`).
+    for op in oneup_sync::pending_deletes(&snap, &snap, &ops, flow).unwrap_or_default() {
+        let (sid, gone) = match &op {
+            Op::DeleteRemote { sid, .. } => {
+                (*sid, snap.bases[sid].local.is_none_or(|l| snap.local_gone.contains(&l.0)))
+            }
+            Op::RecycleLocal { sid, .. } => {
+                (*sid, snap.bases[sid].remote.as_ref().is_none_or(|r| snap.remote_gone.contains(&r.0)))
+            }
+            _ => panic!("not a deletion: {op:?}"),
+        };
+        assert!(gone && snap.bases[&sid].kind == NodeKind::Folder, "listed without evidence: {op:?}");
+    }
     if debug {
         eprintln!("--- round: {} ops", ops.len());
         for op in &ops {
             eprintln!("  {op:?}");
         }
     }
-    let mut rng = rng;
     for op in &ops {
         if let Some(r) = rng.as_deref_mut()
             && r.chance(15)
         {
             w.user(r);
         }
-        w.apply(op);
+        w.run(op, &snap);
     }
+    assert_no_loop(w);
     let actions = ops.iter().filter(|o| o.is_action()).count();
     (actions, ops.len() - actions)
 }
@@ -905,7 +1364,8 @@ fn settle(w: &mut World, debug: bool) -> usize {
 fn settle_flow(w: &mut World, debug: bool, flow: Flow) -> usize {
     for i in 0..60 {
         let (actions, holds) = round_flow(w, None, debug, flow);
-        if actions == 0 {
+        // Behind the cloud, a quiet round proves nothing yet.
+        if actions == 0 && w.caught_up() {
             return holds;
         }
         assert!(i < 59, "no convergence after 60 rounds");
@@ -997,12 +1457,22 @@ fn assert_converged(w: &World, must_survive: &BTreeSet<Content>) {
     assert_eq!(w.bases.len(), w.local.len(), "Synced rows vs local items");
 }
 
+/// The seeds to run: `SIM_SEED` alone if set (whatever the range), else
+/// `SIM_SEEDS` of them (default `default`) from `SIM_SEED_FROM` (default 1).
+fn seeds(default: u64) -> std::ops::RangeInclusive<u64> {
+    let var = |name: &str| std::env::var(name).ok().and_then(|s| s.parse::<u64>().ok());
+    if let Some(only) = var("SIM_SEED") {
+        return only..=only;
+    }
+    let from = var("SIM_SEED_FROM").unwrap_or(1).max(1);
+    let count = var("SIM_SEEDS").unwrap_or(default);
+    from..=from.saturating_add(count).saturating_sub(1)
+}
+
 #[test]
 fn random_histories_converge_without_losing_edits() {
-    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let only: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
     let debug = std::env::var("SIM_DEBUG").is_ok();
-    for seed in (1..=seeds).filter(|s| only.is_none_or(|o| o == *s)) {
+    for seed in seeds(200) {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let mut w = World::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1027,6 +1497,103 @@ fn random_histories_converge_without_losing_edits() {
     }
 }
 
+/// The same random histories with OneDrive's listing lagging behind the
+/// cloud ([`Mirror`]): each round's listing is the cloud as it was a round or
+/// more ago, older than what our own uploads, moves and deletions just saw.
+/// Plans made from it fail their preconditions in the cloud, or move and
+/// rename things here that the next listing moves back; none loses an
+/// edit, and once the listing catches up, both sides converge.
+#[test]
+fn a_lagging_listing_converges_without_losing_edits() {
+    let debug = std::env::var("SIM_DEBUG").is_ok();
+    for seed in seeds(50) {
+        let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+        let mut w = World::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Some history first, so the lag meets synced items.
+            for _ in 0..3 {
+                w.user(&mut rng);
+            }
+            settle(&mut w, debug);
+            w.lag();
+            for _ in 0..25 {
+                for _ in 0..=rng.below(4) {
+                    w.user(&mut rng);
+                }
+                round(&mut w, Some(&mut rng), debug);
+            }
+            let must = unsynced_edits(&w);
+            let holds = settle(&mut w, debug);
+            if debug {
+                eprintln!("local: {:#?}\nremote: {:#?}\nbases: {:#?}", w.local, w.remote, w.bases);
+            }
+            assert_eq!(holds, 0, "held items without any missing evidence");
+            assert_converged(&w, &must);
+        }));
+        if let Err(e) = result {
+            eprintln!("lagging-listing simulation failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1");
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+/// The same random histories with the change journal lost now and then,
+/// while idle or while a round runs ([`World::lose_journal`]): of users'
+/// deletions not read yet, those the journal watcher kept are evidence and
+/// the rest are held. Checked: nothing is deleted in the cloud without
+/// evidence (`World::apply`) and every edit survives on some side; once the
+/// user answers for what's missing (deleted here), both sides converge.
+#[test]
+fn journal_losses_never_invent_or_lose_a_deletion() {
+    let debug = std::env::var("SIM_DEBUG").is_ok();
+    for seed in seeds(50) {
+        let mut rng = Rng(seed.wrapping_mul(0x8EBC_6AF0_9C88_C6E3) | 1);
+        let mut w = World::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..25 {
+                for _ in 0..=rng.below(4) {
+                    w.user(&mut rng);
+                }
+                if rng.chance(10) {
+                    w.lose_journal(&mut rng);
+                }
+                round(&mut w, Some(&mut rng), debug);
+                if rng.chance(20) {
+                    w.lose_journal(&mut rng);
+                }
+            }
+            let must = unsynced_edits(&w);
+            let holds = settle(&mut w, debug);
+            if debug {
+                eprintln!("local: {:#?}\nremote: {:#?}\nbases: {:#?}", w.local, w.remote, w.bases);
+            }
+            // Never deleted in the cloud by sync: `World::apply` checks every
+            // deletion there has evidence here. Held items hold up what
+            // depends on them (an item moved into a held folder waits, and
+            // so does an edit of it), but every edit is still somewhere.
+            assert!(holds >= w.held_missing().len().min(1), "held items aren't reported");
+            let (l, r) = (local_view(&w), remote_view(&w));
+            let live: BTreeSet<Content> = l.values().chain(r.values()).map(|(_, c)| *c).collect();
+            for c in &must {
+                assert!(live.contains(c), "edit {c} was lost");
+            }
+            // The user answers for what's missing here: deleted
+            // (`oneup unsynced resolve`, evidence naming the item). Then
+            // nothing is held, both sides agree, and every edit is on both.
+            let missing: Vec<u128> =
+                w.bases.values().filter_map(|b| b.local).map(|l| l.0).filter(|l| !w.local.contains_key(l)).collect();
+            w.local_gone.extend(missing);
+            let holds = settle(&mut w, debug);
+            assert_eq!(holds, 0, "held items once nothing is missing without evidence");
+            assert_converged(&w, &must);
+        }));
+        if let Err(e) = result {
+            eprintln!("journal-loss simulation failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1");
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
 /// Backup pairs (`Flow::Backup`): random histories on both sides, then
 /// settling. Checked: no plan ever changes this PC or deletes from the cloud
 /// (`round_flow`); settling leaves this PC exactly as it was; and every local
@@ -1034,10 +1601,8 @@ fn random_histories_converge_without_losing_edits() {
 /// it's held as one-way (a folder of the same name in the cloud).
 #[test]
 fn backups_send_this_pc_and_never_change_it() {
-    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
-    let only: Option<u64> = std::env::var("SIM_SEED").ok().and_then(|s| s.parse().ok());
     let debug = std::env::var("SIM_DEBUG").is_ok();
-    for seed in (1..=seeds).filter(|s| only.is_none_or(|o| o == *s)) {
+    for seed in seeds(200) {
         let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
         let mut w = World::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1081,6 +1646,282 @@ bases: {:#?}",
         }));
         if let Err(e) = result {
             eprintln!("backup simulation failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1");
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+/// Rewinds folder `folder` to moment `at` as the agent does: the first
+/// plan is the preview the user approves whole ([`Job`]); each round after
+/// it plans again, runs the steps the approval still covers, and syncs
+/// until both sides agree. Returns the paths (then and now) and records of
+/// what the plans skipped and of what couldn't go on: a step whose name is
+/// taken by something the rewind leaves alone (outside the folder).
+fn rewind(w: &mut World, folder: Sid, at: i64, debug: bool) -> (BTreeSet<String>, BTreeSet<Sid>) {
+    let mut job: Option<Job> = None;
+    let mut skipped = BTreeSet::new();
+    let mut stuck = BTreeSet::new();
+    let mut sids = BTreeSet::new();
+    for _ in 0..30 {
+        let snap = w.clone();
+        let r = match oneup_sync::rewind::plan(&snap, &snap, folder, at, 1 << 20) {
+            Ok(r) => r,
+            Err(e) => panic!("rewind failed: {e:?}"),
+        };
+        // The store reads its history as the world keeps it, and plans the
+        // same rewind (check 4, for rewinds).
+        if check_store() {
+            let mut s = store_of(&snap);
+            s.write(|o| o.history_replace(&snap.history)).expect("writing the history");
+            let marks = snap.unsettled_items();
+            let from_store = s
+                .read(|o| {
+                    oneup_sync::rewind::plan(o, &OwnClock(o, &marks), folder, at, 1 << 20)
+                        .map_err(|e| oneup_store::Error::Corrupt(format!("{e:?}")))
+                })
+                .expect("planning the rewind from the store");
+            assert_eq!(from_store, r, "the store planned the rewind differently");
+        }
+        skipped.extend(r.skipped.iter().map(|(_, p, _)| p.trim_start_matches('/').to_string()));
+        sids.extend(r.skipped.iter().map(|(s, _, _)| *s));
+        w.unlanded.extend(
+            r.skipped
+                .iter()
+                .filter(|(_, _, why)| *why == oneup_sync::rewind::Skip::DeletedElsewhere)
+                .map(|(s, _, _)| *s),
+        );
+        let job = job.get_or_insert_with(|| {
+            let mut all = r.ops.clone();
+            all.extend(r.later.iter().map(|(o, _)| o.clone()));
+            Job::approve(&all)
+        });
+        let ops: Vec<&Op> = r.ops.iter().filter(|o| job.accepts(o)).collect();
+        if debug {
+            eprintln!(
+                "--- rewind: {} steps, {} approved, skipped {:?}, changes {:?}",
+                r.ops.len(),
+                ops.len(),
+                r.skipped,
+                r.changes
+            );
+            for op in &r.ops {
+                eprintln!("  {}{op:?}", if job.accepts(op) { "" } else { "(not approved) " });
+            }
+        }
+        if ops.is_empty() {
+            skipped.extend(r.later.iter().map(|(_, p)| p.trim_start_matches('/').to_string()));
+            sids.extend(r.later.iter().filter_map(|(o, _)| o.subjects().0));
+            return (skipped, sids);
+        }
+        let mut progress = false;
+        let (todo, leave) = job.take(r.ops.clone(), r.paths.clone());
+        // Left alone (not as approved): reported, as the agent does, with
+        // where it is now.
+        for (op, path) in &leave {
+            skipped.insert(path.trim_start_matches('/').to_string());
+            let (_, _, remote) = op.subjects();
+            if let Some(id) = remote.filter(|r| w.remote.contains_key(&r.0)) {
+                skipped.insert(remote_path(w, &id.0));
+            }
+        }
+        for (op, path) in &todo {
+            if w.apply_logged(op) {
+                job.ran(op, mark_now(w, op));
+                progress = true;
+                continue;
+            }
+            stuck.insert(path.trim_start_matches('/').to_string());
+            if let Op::Rewind { sid, .. } = op {
+                sids.insert(*sid);
+            }
+            // And where it is now, if that's elsewhere (moved in since).
+            let (_, _, remote) = op.subjects();
+            if let Some(id) = remote.filter(|r| w.remote.contains_key(&r.0)) {
+                stuck.insert(remote_path(w, &id.0));
+            }
+        }
+        settle(w, debug);
+        // What can't go on (its name taken by something the rewind leaves
+        // alone, outside the folder) stays as it is.
+        if !progress {
+            skipped.extend(stuck);
+            skipped.extend(r.later.iter().map(|(_, p)| p.trim_start_matches('/').to_string()));
+            sids.extend(r.later.iter().filter_map(|(o, _)| o.subjects().0));
+            return (skipped, sids);
+        }
+        stuck = BTreeSet::new();
+    }
+    panic!("the rewind didn't finish");
+}
+
+/// The store's history, with the world's last-write times (its own clock)
+/// and the world's marks.
+struct OwnClock<'a, 'b>(&'a oneup_store::Ops<'b>, &'a [Sid]);
+
+impl History for OwnClock<'_, '_> {
+    type Error = oneup_store::Error;
+
+    fn change_after(&self, sid: Sid, at: i64) -> Result<Option<Option<Was>>, oneup_store::Error> {
+        self.0.change_after(sid, at)
+    }
+
+    fn children_after(&self, parent: Sid, at: i64) -> Result<Vec<Sid>, oneup_store::Error> {
+        self.0.children_after(parent, at)
+    }
+
+    fn last_seen(&self, id: &RemoteId) -> Result<Option<Was>, oneup_store::Error> {
+        self.0.last_seen(id)
+    }
+
+    fn deleted_from(&self, id: &RemoteId) -> Result<Option<(RemoteId, String)>, oneup_store::Error> {
+        self.0.deleted_from(id)
+    }
+
+    fn written_ms(&self, local_mtime: i64) -> i64 {
+        local_mtime
+    }
+
+    fn changed_after(&self, at: i64, limit: usize) -> Result<Option<Vec<Sid>>, oneup_store::Error> {
+        self.0.changed_after(at, limit)
+    }
+
+    fn unsettled(&self, limit: usize) -> Result<Option<Vec<Sid>>, oneup_store::Error> {
+        Ok((self.1.len() <= limit).then(|| self.1.to_vec()))
+    }
+}
+
+/// Cloud item `id`'s path relative to the drive root.
+fn remote_path(w: &World, id: &str) -> String {
+    let mut parts = vec![w.remote[id].name.clone()];
+    let mut cur = w.remote[id].parent.clone();
+    while let Some(p) = cur.filter(|p| p != REMOTE_ROOT) {
+        parts.push(w.remote[&p].name.clone());
+        cur = w.remote[&p].parent.clone();
+    }
+    parts.reverse();
+    parts.join("/")
+}
+
+/// The state a rewind step left its item in.
+fn mark_now(w: &World, op: &Op) -> Mark {
+    let id = match op.rewind_step() {
+        Some(Step::Restore { id, .. }) => id.0.clone(),
+        Some(Step::Reset { remote, .. }) => remote.id.0.clone(),
+        Some(Step::SetAside { .. } | Step::Forget) => return Mark::Record,
+        _ => return Mark::Absent,
+    };
+    match w.remote.get(&id) {
+        Some(it) => Mark::Cloud(Spot::of(&w.rnode(&id, it))),
+        None => Mark::Absent,
+    }
+}
+
+/// A view's part below `path` (`""`: all of it), named from there.
+fn below(view: &BTreeMap<String, (NodeKind, Content)>, path: &str) -> BTreeMap<String, (NodeKind, Content)> {
+    if path.is_empty() {
+        return view.clone();
+    }
+    let inside = format!("{path}/");
+    view.iter().filter_map(|(p, v)| p.strip_prefix(&inside).map(|rest| (rest.to_string(), *v))).collect()
+}
+
+/// Leaves out items at `skipped` paths and below.
+fn without(
+    view: BTreeMap<String, (NodeKind, Content)>,
+    skipped: &BTreeSet<String>,
+) -> BTreeMap<String, (NodeKind, Content)> {
+    view.into_iter().filter(|(p, _)| !skipped.iter().any(|s| p == s || p.starts_with(&format!("{s}/")))).collect()
+}
+
+#[test]
+fn rewinding_a_folder_reproduces_it_and_a_rewind_can_be_rewound() {
+    let debug = std::env::var("SIM_DEBUG").is_ok();
+    for seed in seeds(200) {
+        let mut rng = Rng(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
+        let mut w = World::new();
+        w.track = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let activity = |w: &mut World, rng: &mut Rng| {
+                for _ in 0..12 {
+                    for _ in 0..=rng.below(4) {
+                        w.user(rng);
+                    }
+                    round(w, Some(rng), debug);
+                }
+                assert_eq!(settle(w, debug), 0, "held items after settling");
+                assert_converged(w, &BTreeSet::new());
+            };
+            activity(&mut w, &mut rng);
+            // The folder: the whole drive, or a folder there now.
+            let folders: Vec<(Sid, String)> = w
+                .bases
+                .values()
+                .filter(|b| b.kind == NodeKind::Folder && b.sid != ROOT)
+                .map(|b| (b.sid, local_path(&w, b.local.map_or(0, |l| l.0))))
+                .collect();
+            let (folder, path) = match rng.pick(&folders) {
+                Some(f) if rng.chance(50) => f,
+                _ => (ROOT, String::new()),
+            };
+            let at = w.clock;
+            let then = below(&local_view(&w), &path);
+            let remote_then = w.bases.get(&folder).and_then(|b| b.remote.clone());
+            activity(&mut w, &mut rng);
+            let before_at = w.clock;
+            let before = local_view(&w);
+
+            let name_then = path.rsplit('/').next().unwrap_or_default().to_string();
+            let (skipped, skipped_sids) = rewind(&mut w, folder, at, debug);
+            assert_converged(&w, &BTreeSet::new());
+            if folder == ROOT {
+                // But what OneDrive can't bring back where it was deleted
+                // (and what waits for that), left out of the comparisons.
+                assert!(skipped.is_empty() || !w.unlanded.is_empty(), "the whole drive is covered: {skipped:?}");
+            }
+            // The folder is back under its name then, wherever the folder
+            // it's in is now (that one isn't rewound).
+            // (A folder restored from the recycle bin has a new record.)
+            let record = w.bases.get(&folder).or_else(|| {
+                let r = remote_then.as_ref()?;
+                w.bases.values().find(|b| b.remote.as_ref() == Some(r))
+            });
+            let path_now = match record.and_then(|b| b.local) {
+                Some(l) if folder != ROOT => local_path(&w, l.0),
+                _ => String::new(),
+            };
+            // Unless its own name is taken by something outside it, which
+            // the rewind leaves alone.
+            if !skipped_sids.contains(&folder) {
+                assert_eq!(path_now.rsplit('/').next().unwrap_or_default(), name_then, "the folder's name");
+                // Named from the folder, by where it was then or is now.
+                let (inside, inside_now) = (format!("{path}/"), format!("{path_now}/"));
+                let skipped: BTreeSet<String> = skipped
+                    .iter()
+                    .filter_map(|s| {
+                        if path.is_empty() {
+                            return Some(s.clone());
+                        }
+                        s.strip_prefix(&inside).or_else(|| s.strip_prefix(&inside_now)).map(str::to_string)
+                    })
+                    .collect();
+                let now = below(&local_view(&w), &path_now);
+                assert_eq!(without(now, &skipped), without(then, &skipped), "the rewind didn't reproduce {path:?}");
+            }
+            assert_eq!(local_view(&w), remote_view(&w));
+
+            // Rewinding the rewind: the drive as it was just before.
+            w.unlanded.clear();
+            let (skipped, _) = rewind(&mut w, ROOT, before_at, debug);
+            assert_converged(&w, &BTreeSet::new());
+            assert!(skipped.is_empty() || !w.unlanded.is_empty(), "the whole drive is covered: {skipped:?}");
+            assert_eq!(
+                without(local_view(&w), &skipped),
+                without(before, &skipped),
+                "rewinding the rewind didn't put back what was there"
+            );
+        }));
+        if let Err(e) = result {
+            eprintln!("rewind simulation failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1");
             std::panic::resume_unwind(e);
         }
     }
@@ -1138,6 +1979,37 @@ fn rid(w: &World, name: &str) -> String {
 
 fn lid(w: &World, name: &str) -> u128 {
     w.local.iter().find(|(_, it)| it.name == name).map(|(i, _)| *i).unwrap_or_default()
+}
+
+#[test]
+fn a_backup_sends_a_moved_and_edited_file_after_its_old_folder_was_deleted() {
+    let mut w = synced();
+    let (local_file, remote_file) = (lid(&w, "inner.txt"), rid(&w, "inner.txt"));
+    let (local_folder, remote_folder) = (lid(&w, "Docs"), rid(&w, "Docs"));
+    let (mine, theirs) = (w.content(), w.content());
+    let stamp = w.clock + 1;
+    edit(w.local.get_mut(&local_file), |it| {
+        it.parent = Some(LOCAL_ROOT);
+        it.content = mine;
+        it.mtime = stamp;
+    });
+    let etag = w.etag();
+    edit(w.remote.get_mut(&remote_file), |it| {
+        it.parent = Some(REMOTE_ROOT.into());
+        it.name = "elsewhere.txt".into();
+        it.content = theirs;
+        it.etag = etag;
+    });
+    w.local.remove(&local_folder);
+    w.local_gone.insert(local_folder);
+    w.remote.remove(&remote_folder);
+    w.remote_gone.insert(remote_folder);
+    let before = local_view(&w);
+    settle_flow(&mut w, false, Flow::Backup);
+    assert_eq!(local_view(&w), before, "a backup must not change this PC");
+    assert_eq!(remote_view(&w).get("inner.txt"), Some(&(NodeKind::File, mine)));
+    assert_eq!(rid(&w, "inner.txt"), remote_file, "keep the cloud item's version history");
+    assert!(w.remote_versions.contains(&theirs), "keep the cloud edit in version history");
 }
 
 #[test]
@@ -1255,6 +2127,164 @@ fn folders_moved_into_each_other_dont_loop() {
     edit(w.remote.get_mut(&rb), |it| it.parent = Some(ra.clone())); // in the cloud: A/B
     settle(&mut w, false);
     assert_converged(&w, &BTreeSet::new());
+}
+
+/// Renamed here, renamed in OneDrive, renamed here again while the listing
+/// still shows the item under its first name (delta lag): the round plans
+/// to follow that name, which OneDrive no longer has, so the move here is
+/// refused (as the executor refuses it, `Cloud::is_at`), and the second
+/// rename is sent once the listing catches up.
+#[test]
+fn a_lagging_listing_never_undoes_a_rename_here() {
+    let mut w = synced();
+    w.lag();
+    let id = lid(&w, "doc.txt");
+    edit(w.local.get_mut(&id), |it| it.name = "b2".into());
+    round(&mut w, None, false);
+    assert_eq!(w.remote.get(&rid(&w, "b2")).map(|it| it.name.as_str()), Some("b2"));
+    edit(w.local.get_mut(&id), |it| it.name = "b3".into());
+    round(&mut w, None, false);
+    assert_eq!(w.local[&id].name, "b3", "the listing's old name was followed");
+    settle(&mut w, false);
+    assert_converged(&w, &BTreeSet::new());
+    assert_eq!(w.local[&id].name, "b3");
+}
+
+/// Every Synced row reaches the top of the Synced tree: a loop is never
+/// planned again (full passes walk the tree from its root).
+fn assert_no_loop(w: &World) {
+    for b in w.bases.values() {
+        let mut cur = Some(b.sid);
+        for _ in 0..=w.bases.len() {
+            cur = cur.and_then(|s| w.bases.get(&s)).and_then(|b| b.parent);
+        }
+        assert_eq!(cur, None, "{b:?} doesn't reach the top of the Synced tree");
+    }
+}
+
+/// Synced `C/A` and `X`, with their local IDs `(c, a)`.
+fn c_holding_a() -> (World, u128, u128) {
+    let mut w = World::new();
+    let c = w.l_create(LOCAL_ROOT, "C", NodeKind::Folder, 0);
+    let a = w.l_create(c, "A", NodeKind::Folder, 0);
+    w.l_create(LOCAL_ROOT, "X", NodeKind::Folder, 0);
+    settle(&mut w, false);
+    (w, c, a)
+}
+
+/// Moves cloud item `name` into cloud folder `into`, as a user on the web.
+fn move_in_cloud(w: &mut World, name: &str, into: &str) {
+    let (id, to) = (rid(w, name), rid(w, into));
+    let e = w.etag();
+    edit(w.remote.get_mut(&id), |it| (it.parent, it.etag) = (Some(to), e));
+}
+
+/// A round in which A's own operation is refused (its preconditions
+/// failed, a name was in the way): what puts C inside A must wait for it,
+/// or the Synced tree would have C below A while A is still below C. Then
+/// the rounds settle without losing `must`.
+fn refuse_a_once_then_settle(mut w: World, must: &BTreeSet<Content>) {
+    let sid_a = w.bases.values().find(|b| b.name == "A").map(|b| b.sid);
+    for op in plan_both(&w) {
+        if op.subjects().0 != sid_a {
+            w.apply(&op);
+        }
+    }
+    assert_no_loop(&w);
+    settle(&mut w, false);
+    assert_converged(&w, must);
+}
+
+/// Here, A goes to the top and C into A; in the cloud, A goes into X. C's
+/// move into A waits for A's (simulation seed 60953 of the journal-loss
+/// run).
+#[test]
+fn a_folder_never_moves_below_itself_in_the_synced_tree() {
+    let (mut w, c, a) = c_holding_a();
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    edit(w.local.get_mut(&c), |it| it.parent = Some(a));
+    move_in_cloud(&mut w, "A", "X");
+    refuse_a_once_then_settle(w, &BTreeSet::new());
+}
+
+/// Here, A goes to the top and C is deleted; in the cloud, A goes into X
+/// and C into A. The cloud's move beats the deletion, so C is made here
+/// again inside A (`local_gone`), once A's move is recorded. With
+/// `new_file`, a new cloud file in C needs C here too (`resurrect_local`).
+fn deleted_here_moved_there(new_file: bool) {
+    let (mut w, _, a) = c_holding_a();
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    take_local(&mut w, "C", Gone::Deleted);
+    move_in_cloud(&mut w, "A", "X");
+    move_in_cloud(&mut w, "C", "A");
+    let mut must = BTreeSet::new();
+    if new_file {
+        let c = w.content();
+        let rc = rid(&w, "C");
+        w.r_create(&rc, "new.txt", NodeKind::File, c);
+        must.insert(c);
+    }
+    refuse_a_once_then_settle(w, &must);
+}
+
+#[test]
+fn a_folder_made_here_again_never_lands_below_itself() {
+    deleted_here_moved_there(false);
+}
+
+#[test]
+fn a_folder_made_here_again_for_new_contents_never_lands_below_itself() {
+    deleted_here_moved_there(true);
+}
+
+/// The mirror image: in the cloud, A goes into X and C is deleted; here,
+/// A goes to the top and C into A. C is made in the cloud again inside A
+/// (`remote_gone`), once A's move is recorded. With `new_file`, a new file
+/// here in C needs C in the cloud too (`resurrect_remote`).
+fn deleted_there_moved_here(new_file: bool) {
+    let (mut w, c, a) = c_holding_a();
+    move_in_cloud(&mut w, "A", "X");
+    take_remote(&mut w, "C", Gone::Deleted);
+    edit(w.local.get_mut(&a), |it| it.parent = Some(LOCAL_ROOT));
+    edit(w.local.get_mut(&c), |it| it.parent = Some(a));
+    let mut must = BTreeSet::new();
+    if new_file {
+        let n = w.content();
+        w.l_create(c, "new.txt", NodeKind::File, n);
+        must.insert(n);
+    }
+    refuse_a_once_then_settle(w, &must);
+}
+
+#[test]
+fn a_folder_made_in_the_cloud_again_never_lands_below_itself() {
+    deleted_there_moved_here(false);
+}
+
+#[test]
+fn a_folder_made_in_the_cloud_again_for_new_contents_never_lands_below_itself() {
+    deleted_there_moved_here(true);
+}
+
+/// A conflict copy detaches the Synced row from the local file it renames.
+/// If the cloud's side then turns out unchanged (the conflict was planned
+/// from a listing behind the cloud, simulation seed 6 of the delta-lag
+/// run), the cloud's file keeps its name and comes back here, as after any
+/// conflict; it isn't deleted as if the file had been deleted here.
+#[test]
+fn a_conflict_copy_never_deletes_the_cloud_original() {
+    let mut w = synced();
+    let (l, r) = (lid(&w, "doc.txt"), rid(&w, "doc.txt"));
+    let original = w.remote[&r].content;
+    let (c, m) = (w.content(), w.tick());
+    edit(w.local.get_mut(&l), |it| (it.content, it.mtime, it.name) = (c, m, "doc (conflict 1).txt".into()));
+    let sid = w.bases.values().find(|b| b.name == "doc.txt").map_or(0, |b| b.sid);
+    edit(w.bases.get_mut(&sid), |b| b.local = None);
+    let ops = plan_both(&w);
+    assert!(!ops.iter().any(|o| matches!(o, Op::DeleteRemote { .. })), "{ops:?}");
+    settle(&mut w, false);
+    assert_converged(&w, &[c].into());
+    assert_eq!(w.remote.get(&r).map(|it| (it.name.as_str(), it.content)), Some(("doc.txt", original)));
 }
 
 /// How a scenario takes an item away from one side.

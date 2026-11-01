@@ -38,8 +38,9 @@ mod win {
         /// The data folder whose settings to show
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Open on this page (files, apps, activity, unsynced, excluded,
-        /// stops, general, accounts, office, safety, network, about)
+        /// Open on this page (files, find, apps, activity, unsynced,
+        /// excluded, stops, shared, general, accounts, office, safety,
+        /// network, about)
         #[arg(long, default_value = "")]
         page: String,
         /// For the "item" page: the file or folder to show
@@ -75,7 +76,9 @@ mod win {
         let page = PAGE
             .replace("{{START_PAGE}}", &start)
             // A JSON string inside the page's script; `<` escaped so it can't end it.
-            .replace("\"{{START_ITEM}}\"", &Value::from(item).to_string().replace('<', "\\u003c"));
+            .replace("\"{{START_ITEM}}\"", &Value::from(item).to_string().replace('<', "\\u003c"))
+            // The language's translations and the regional format (`oneup_app::l10n`).
+            .replace("\"{{L10N}}\"", &oneup_app::l10n::current().page_json());
         let opts =
             webview::Options { title: "OneUpDrive", width: 1140, height: 760, data_dir: &webdata, html: &page, dark };
         let mut watching = false;
@@ -211,7 +214,7 @@ mod win {
         let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
         vaultpair::list(dir)
             .into_iter()
-            .find(|e| e.name.eq_ignore_ascii_case(name))
+            .find(|e| oneup_sync::same_name(&e.name, name))
             .with_context(|| format!("no vault called {name}"))
     }
 
@@ -261,6 +264,16 @@ mod win {
         args.get(k).and_then(Value::as_u64).map_or(default, |n| n as usize).clamp(1, 20_000)
     }
 
+    fn recovery_number(args: &Value, key: &str) -> Result<i64> {
+        args.get(key).and_then(Value::as_i64).with_context(|| format!("missing or invalid {key}"))
+    }
+
+    /// How many more items the Shared page can hold (it says; at most its
+    /// own cap).
+    fn room(args: &Value) -> usize {
+        args.get("room").and_then(Value::as_u64).map_or(0, |n| n as usize).min(500)
+    }
+
     fn text(args: &Value, k: &str) -> String {
         args.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
     }
@@ -303,7 +316,8 @@ mod win {
             }
             "tree" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
-                tokio::task::spawn_blocking(move || oneup_app::filetree::list(&d, &rel)).await?
+                let steps = oneup_app::filetree::steps_from(&args["steps"])?;
+                tokio::task::spawn_blocking(move || oneup_app::filetree::list(&d, &rel, &steps)).await?
             }
             "remove_preview" => {
                 // What stopping a folder's sync would take away from this PC.
@@ -321,7 +335,38 @@ mod win {
             }
             "tree_sizes" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
-                tokio::task::spawn_blocking(move || oneup_app::filetree::sizes(&d, &rel)).await?
+                let steps = oneup_app::filetree::steps_from(&args["steps"])?;
+                tokio::task::spawn_blocking(move || oneup_app::filetree::sizes(&d, &rel, &steps)).await?
+            }
+            // The Search page: names from the index (built first, once,
+            // with its progress told to the page), then, if asked,
+            // OneDrive's own search inside files.
+            "search" => {
+                let (d, q, p) = (dir.to_path_buf(), text(args, "q"), poster.clone());
+                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let store = oneup_app::search::open(&d, |n| {
+                        p.post(json!({ "event": "search_build", "items": n }).to_string());
+                    })?;
+                    Ok(oneup_app::search::to_json(&oneup_app::search::find(&d, &store, &q, limit)?))
+                })
+                .await?
+            }
+            "search_onedrive" => {
+                // Nothing goes to Microsoft unless the setting says so.
+                if !oneup_app::config::load_search(dir)?.onedrive {
+                    bail!("turn on Search inside files first");
+                }
+                let q = text(args, "q");
+                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                let g = oneup_app::search::graph(dir, None)?;
+                let found = oneup_app::search::find_in_onedrive(dir, &g, &q, limit).await?;
+                Ok(oneup_app::search::to_json(&found))
+            }
+            "open_in_onedrive" => {
+                let g = oneup_app::search::graph(dir, None)?;
+                oneup_app::search::open_in_onedrive(&g, &text(args, "id")).await?;
+                Ok(Value::Null)
             }
             "tree_find" => {
                 let (d, q) = (dir.to_path_buf(), text(args, "q"));
@@ -356,10 +401,61 @@ mod win {
                 Ok(Value::from(tokio::task::spawn_blocking(move || oneup_app::filetree::rule_files(&d)).await??))
             }
             "tree_sync" => {
-                let msg =
-                    oneup_app::filetree::set_sync(dir, &text(args, "rel"), flag(args, "folder"), flag(args, "on"))?;
+                let msg = settingsapi::tree_sync(dir, args)?;
                 let _ = agent(dir, Call::SyncNow).await;
                 Ok(Value::from(msg))
+            }
+            "tree_preview" => {
+                // What unticking an item would take out of sync, before it's done.
+                let (d, rel, folder) = (dir.to_path_buf(), text(args, "rel"), flag(args, "folder"));
+                let local = args.get("local_id").and_then(Value::as_str).map(str::parse::<u128>).transpose()?;
+                let remote = args.get("remote_id").and_then(Value::as_str).map(str::to_string);
+                tokio::task::spawn_blocking(move || oneup_app::filetree::preview(&d, &rel, folder, local, remote))
+                    .await?
+            }
+            "pin_preview" => {
+                // What pin rules would download, before they're saved.
+                let d = dir.to_path_buf();
+                let lines: Vec<String> = args["pin"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let store = oneup_app::setup::open_store(&d, 4 * 1024)?;
+                    let (files, bytes, all) =
+                        oneup_app::pinrules::preview(&store, &lines, std::time::Duration::from_secs(10))?;
+                    let local = oneup_app::sync::pairing(&store)?.local;
+                    let free = oneup_app::pinrules::free_space(&local);
+                    let ask = oneup_app::pinrules::must_ask(files, all);
+                    Ok(json!({ "files": files, "bytes": bytes, "all": all, "free": free, "ask": ask }))
+                })
+                .await?
+            }
+            "pin_save" => {
+                // Pin rules the person saw the downloads of, with that yes.
+                let lines: Vec<String> = args["pin"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                let bytes = args.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                settingsapi::save_pins(dir, &lines, bytes)?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
+            "pin_allow" => {
+                let mut store = oneup_app::setup::open_store(dir, 1024)?;
+                oneup_app::pinrules::allow(&mut store, 0)?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
+            "rule_suggestions" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || -> Result<Value> {
+                    let store = oneup_app::setup::open_store(&d, 4 * 1024)?;
+                    let now = oneup_app::control::now_ms();
+                    Ok(oneup_app::suggest::to_json(&oneup_app::suggest::suggest(&d, &store, 5, now)?))
+                })
+                .await?
             }
             "tree_pause" => {
                 let msg = oneup_app::filetree::set_paused(dir, &text(args, "rel"), flag(args, "on"))?;
@@ -402,6 +498,35 @@ mod win {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::largest_json(&d, 10)).await?
             }
+            // The Duplicates view (`oneup_app::duplicates`).
+            "duplicates" => {
+                let (d, after, limit) = (dir.to_path_buf(), text(args, "after"), count(args, "limit", 30));
+                tokio::task::spawn_blocking(move || settingsapi::duplicates(&d, Some(&after), limit.min(200))).await?
+            }
+            "duplicates_preview" => {
+                let (d, copies) = (dir.to_path_buf(), args["copies"].as_array().cloned().unwrap_or_default());
+                tokio::task::spawn_blocking(move || settingsapi::duplicates_preview(&d, &copies)).await?
+            }
+            // Queued as previewed; the agent then stops for approval.
+            "duplicates_remove" => {
+                let (d, copies) = (dir.to_path_buf(), args["copies"].as_array().cloned().unwrap_or_default());
+                let expect = text(args, "expect");
+                let out =
+                    tokio::task::spawn_blocking(move || settingsapi::duplicates_remove(&d, &copies, &expect)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(out)
+            }
+            "duplicates_cancel" => {
+                let out = settingsapi::duplicates_cancel(dir)?;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(out)
+            }
+            // At background priority, in its own process; bounded per run.
+            "duplicates_hash" => {
+                let a: Vec<std::ffi::OsString> =
+                    vec!["--data-dir".into(), dir.into(), "duplicates".into(), "--hash-local".into()];
+                Ok(Value::from(oneup(a).await?))
+            }
             "reveal" => {
                 let path = args.get("path").and_then(Value::as_str).context("no path")?;
                 std::process::Command::new("explorer.exe")
@@ -441,7 +566,11 @@ mod win {
             }
             "vault_add" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
-                let (remote, local, password) = (s("remote"), s("local"), s("password"));
+                let (remote, local) = (s("remote"), s("local"));
+                // As typed: spaces at either end are part of a password.
+                let password = zeroize::Zeroizing::new(
+                    args.get("password").and_then(Value::as_str).unwrap_or_default().to_string(),
+                );
                 if remote.is_empty() || local.is_empty() || password.is_empty() {
                     bail!("fill in the vault's OneDrive folder, a folder on this PC and the password");
                 }
@@ -462,7 +591,9 @@ mod win {
             "vault_create" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
                 let (remote, local) = (s("remote"), s("local"));
-                let password = args.get("password").and_then(Value::as_str).unwrap_or_default().to_string();
+                let password = zeroize::Zeroizing::new(
+                    args.get("password").and_then(Value::as_str).unwrap_or_default().to_string(),
+                );
                 if remote.is_empty() || local.is_empty() {
                     bail!("fill in the new vault's OneDrive folder and a folder on this PC");
                 }
@@ -484,7 +615,8 @@ mod win {
             }
             "vault_password" => {
                 let e = vault(dir, args)?;
-                let new = args.get("new").and_then(Value::as_str).unwrap_or_default().to_string();
+                let new =
+                    zeroize::Zeroizing::new(args.get("new").and_then(Value::as_str).unwrap_or_default().to_string());
                 let key = match args.get("recovery").and_then(Value::as_str).filter(|r| !r.trim().is_empty()) {
                     Some(r) => vaultpair::keys_from_recovery(dir, &graph(dir)?, &e, r).await?,
                     None => vault_keys(dir, &e, args).await?,
@@ -534,6 +666,11 @@ mod win {
                 tokio::task::spawn_blocking(move || settingsapi::activity(&d, &rel, 40)).await?
             }
             // The Activity page's lists.
+            "item_history" => {
+                let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
+                let before = args.get("before").and_then(Value::as_i64);
+                tokio::task::spawn_blocking(move || settingsapi::activity_page(&d, &rel, before, 100)).await?
+            }
             "activity_log" => {
                 let (d, limit) = (dir.to_path_buf(), count(args, "limit", 200));
                 tokio::task::spawn_blocking(move || settingsapi::activity(&d, "", limit)).await?
@@ -599,16 +736,88 @@ mod win {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::kept(&d)).await?
             }
-            "kept_restore" => {
-                // The agent is stopped around it: restoring writes into the folder.
-                let (d, id) = (dir.to_path_buf(), text(args, "id"));
-                let was = stop_and_wait(&d).await;
-                let d2 = d.clone();
-                let at = tokio::task::spawn_blocking(move || settingsapi::kept_restore(&d2, &id)).await;
-                if was {
-                    oneup_app::launch::start_agent(&d)?;
+            // The Recovery page: rewinding a folder (`oneup rewind`, with the
+            // same checks), conflicts and items deleted from OneDrive.
+            "rewind_state" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || settingsapi::rewind_state(&d)).await?
+            }
+            "rewind_preview" | "rewind_start" => {
+                let mut a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "rewind".into()];
+                match args.get("before_stop").and_then(Value::as_str) {
+                    Some(code) => a.extend(["--before-stop".into(), code.into()]),
+                    None => {
+                        a.push(text(args, "folder").into());
+                        a.extend(["--to".into(), recovery_number(args, "at_ms")?.to_string().into()]);
+                    }
                 }
-                Ok(Value::from(at??))
+                if op == "rewind_start" {
+                    // Only the list the person saw: a changed one comes back
+                    // to be shown, and nothing starts.
+                    let code = text(args, "expect");
+                    if code.len() != 16 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
+                        bail!("not a code");
+                    }
+                    a.extend(["--start".into(), "--expect".into(), code.into()]);
+                }
+                a.push("--json".into());
+                let out = oneup(a).await?;
+                let line = out.lines().rev().find(|l| l.starts_with('{')).context("no answer from oneup")?;
+                Ok(serde_json::from_str(line)?)
+            }
+            "rewind_cancel" => {
+                let a: Vec<std::ffi::OsString> =
+                    vec!["--data-dir".into(), dir.into(), "rewind".into(), "--cancel".into()];
+                Ok(Value::from(oneup(a).await?))
+            }
+            // The page showed the rewind's list and its code; the person
+            // approves exactly that (`oneup rewind --approve CODE`): a list
+            // that changed meanwhile comes back to be shown instead.
+            "rewind_approve" => {
+                let code = text(args, "code");
+                if code.len() != 16 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("not a code");
+                }
+                let a: Vec<std::ffi::OsString> = vec![
+                    "--data-dir".into(),
+                    dir.into(),
+                    "rewind".into(),
+                    "--approve".into(),
+                    code.into(),
+                    "--json".into(),
+                ];
+                let out = oneup(a).await?;
+                let line = out.lines().rev().find(|l| l.starts_with('{')).context("no answer from oneup")?;
+                Ok(serde_json::from_str(line)?)
+            }
+            "conflicts" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || settingsapi::conflicts(&d)).await?
+            }
+            "conflict_keep" => {
+                let (d, keep) = (dir.to_path_buf(), text(args, "keep"));
+                let listed = args.get("conflict").cloned().unwrap_or(Value::Null);
+                tokio::task::spawn_blocking(move || settingsapi::conflict_keep(&d, &listed, &keep)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
+            "cloud_bin" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || settingsapi::cloud_bin(&d)).await?
+            }
+            "cloud_bin_restore" => {
+                let seq = recovery_number(args, "seq")?;
+                let d = dir.to_path_buf();
+                let at = tokio::task::spawn_blocking(move || settingsapi::cloud_bin_restore(&d, seq)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::from(at))
+            }
+            "kept_restore" => {
+                // Asked of the agent, whose next round puts it back.
+                let (d, id) = (dir.to_path_buf(), text(args, "id"));
+                let at = tokio::task::spawn_blocking(move || settingsapi::kept_restore(&d, &id)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::from(at))
             }
             "shortcuts" => {
                 let d = dir.to_path_buf();
@@ -641,6 +850,23 @@ mod win {
                     Ok(json!({ "changed": o.changed, "skipped": o.skipped.len() }))
                 })
                 .await?
+            }
+            // Event hooks (config.toml [[hook]]): the list, each checked
+            // as the agent checks it, and turning them on and off.
+            "hooks" => {
+                let d = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || oneup_app::hooks::json(&d)).await?
+            }
+            "hook_enable" | "hooks_pause" => {
+                let on = args.get("on").and_then(Value::as_bool).context("on: expected true or false")?;
+                if op == "hook_enable" {
+                    oneup_app::config::set_hook_enabled(dir, &text(args, "name"), on)?;
+                } else {
+                    oneup_app::config::set_hooks_paused(dir, on)?;
+                }
+                // The agent reads config.toml again when nudged.
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
             }
             "sync_first" => agent(dir, Call::SyncFirst { path: text(args, "rel") }).await,
             "sign_out" => {
@@ -716,6 +942,15 @@ mod win {
             "status" => Ok(agent(dir, Call::Status).await.unwrap_or(Value::Null)),
             // Why the agent stopped, if an error stopped it.
             "stopped" => Ok(json!(oneup_app::problem::load_stopped(dir))),
+            // Everything that needs the user, as `oneup problems` lists it.
+            "problems" => {
+                let all: Vec<Value> = oneup_app::problems::list(dir, oneup_app::l10n::current())
+                    .await
+                    .iter()
+                    .map(oneup_app::problems::Item::to_json)
+                    .collect();
+                Ok(json!({ "problems": all }))
+            }
             "save" => {
                 let section = args.get("section").and_then(Value::as_str).unwrap_or_default();
                 settingsapi::save(dir, section, args.get("value").unwrap_or(&Value::Null))?;
@@ -729,11 +964,28 @@ mod win {
                     Some("pause") => Call::Pause { direction: Direction::Both, minutes: None },
                     Some("resume") => Call::Resume { direction: Direction::Both },
                     Some("stop") => Call::Stop,
+                    // More on the network's used-up data budget.
+                    Some("allow_data") => Call::AllowData { mb: oneup_app::netusage::ALLOW_MB },
+                    Some("offline") => Call::Offline { on: args.get("on").and_then(Value::as_bool).unwrap_or(false) },
                     // Accepts the agent's offer to bring excluded items here
                     // and remove them from OneDrive (by its code).
                     Some("prune") => Call::Answer { code: text(args, "code"), answer: Answer::Prune },
                     // Settles the offer: the items stay in OneDrive.
                     Some("keep_in_cloud") => Call::Answer { code: text(args, "code"), answer: Answer::KeepInCloud },
+                    // Approves removing the duplicates the user chose, by its
+                    // stop's code: only such a stop (the others are
+                    // reviewed from the icon's menu, with their list).
+                    Some("approve_removal") => {
+                        let code = text(args, "code");
+                        let status = agent(dir, Call::Status).await?;
+                        let ours = status["safety_stops"]
+                            .as_array()
+                            .is_some_and(|v| v.iter().any(|s| s["kind"] == "removal" && s["code"] == code.as_str()));
+                        if !ours {
+                            bail!("that removal isn't waiting any more; look again");
+                        }
+                        Call::Answer { code, answer: Answer::Approve }
+                    }
                     _ => bail!("unknown control call"),
                 };
                 agent(dir, call).await
@@ -808,7 +1060,8 @@ mod win {
             }
             "item_restore" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
-                oneup_app::item::restore_version(Path::new(&s("path")), &s("id")).await?;
+                let d = oneup_app::item::restore_version(Path::new(&s("path")), &s("id"))?;
+                let _ = agent(&d, Call::SyncNow).await;
                 Ok(Value::Null)
             }
             "item_share" => {
@@ -872,6 +1125,37 @@ mod win {
                         .map(|f| json!({ "name": f.name, "owner": f.owner, "drive_id": f.drive_id, "id": f.id }))
                         .collect::<Vec<_>>(),
                 ))
+            }
+            // The Shared page (`oneup_app::sharing`): what this account
+            // shares and who can open it, and what others share with it.
+            // One bounded page; `after` is the previous page's `next`.
+            // Both tabs go through `sharing::window_tab`, which settles what
+            // an earlier change left unsettled when a tab opens.
+            "sharing_list" => {
+                let after = args.get("after").and_then(Value::as_str);
+                oneup_app::sharing::window_tab_for(dir, oneup_app::sharing::Tab::ByYou, after, room(args)).await
+            }
+            "sharing_with_me" => {
+                oneup_app::sharing::window_tab_for(dir, oneup_app::sharing::Tab::WithMe, None, room(args)).await
+            }
+            // Stop sharing / Set expiry: `oneup shared stop|expire`, with the
+            // same checks as typed, for the permission as the page listed it
+            // (its code). The page asked first, so it goes ahead (`--yes`).
+            "sharing_change" => {
+                let what = text(args, "what");
+                let mut a: Vec<std::ffi::OsString> = vec!["--data-dir".into(), dir.into(), "shared".into()];
+                match what.as_str() {
+                    "stop" => a.push("stop".into()),
+                    "expire" => a.push("expire".into()),
+                    _ => bail!("unknown change: {what}"),
+                }
+                if what == "expire" {
+                    a.extend(["--on".into(), text(args, "on").into()]);
+                }
+                a.extend(["--expect".into(), text(args, "code").into(), "--yes".into()]);
+                // The item and permission last, after `--`: never read as options.
+                a.extend(["--".into(), text(args, "item").into(), text(args, "permission").into()]);
+                Ok(Value::from(oneup(a).await?.trim().to_string()))
             }
             "pair_add_shared" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
@@ -983,6 +1267,16 @@ mod win {
     mod tests {
         #![allow(clippy::unwrap_used)]
         use super::*;
+
+        #[test]
+        fn recovery_preserves_dates_and_history_ids() {
+            let args = serde_json::json!({"at_ms": 1793401200000_i64, "seq": 123456});
+            assert_eq!(recovery_number(&args, "at_ms").unwrap(), 1793401200000);
+            assert_eq!(recovery_number(&args, "seq").unwrap(), 123456);
+            for invalid in [Value::Null, json!({"at_ms": "today"}), json!({"at_ms": 1.5})] {
+                assert!(recovery_number(&invalid, "at_ms").is_err());
+            }
+        }
 
         /// `handle` gets a root's own data folder: looking the root up again
         /// from there fails (it broke Recent activity, Kept on this PC and

@@ -1,0 +1,67 @@
+# cargo-deny configuration: licenses, RustSec advisories, duplicate versions
+# and crate sources. CI runs `cargo deny check` (.github/workflows/ci.yml).
+
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Each entry names the advisory, why it doesn't reach OneUpDrive, and what
+# removes it. cargo-deny warns when an entry no longer matches anything;
+# delete it then.
+ignore = [
+    # zip 8 (direct, and velopack 1.2 requires ^8.6; the fix is zip 9). All
+    # three are in `ZipArchive::extract` / `ZipStreamReader::extract` and
+    # Unix permission bits. Neither we (updates.rs) nor velopack (bundle.rs)
+    # call those: both read single entries with `by_name`/`by_index` into a
+    # path they chose. Drop these when velopack moves to zip 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract() only; not called (see comment)" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract() only; not called (see comment)" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract() only; not called (see comment)" },
+    # derivative is unmaintained (no vulnerability). A proc-macro used by
+    # velopack at build time; nothing of it ships. Drop when velopack does.
+    { id = "RUSTSEC-2024-0388", reason = "build-time proc-macro of velopack; unmaintained, not vulnerable" },
+]
+
+[licenses]
+version = 2
+# Must match `accepted` in packaging/about.toml exactly (same entries, same
+# order); CI fails if they differ. Change both together.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "BSL-1.0",
+    "0BSD",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+# The list mirrors about.toml, so some entries may match no crate today.
+unused-allowed-license = "allow"
+
+# OneUpDrive's own crates (publish = false) are not third-party.
+[licenses.private]
+ignore = true
+
+[bans]
+# Two versions of a crate cost build time and binary size but are not a
+# defect; report them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

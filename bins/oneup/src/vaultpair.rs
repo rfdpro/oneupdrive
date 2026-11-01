@@ -19,12 +19,11 @@
 //! see `rulefiles`), and a vault's folder may not overlap any synced
 //! folder: decrypted files must never be uploaded as they are.
 
-use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{Context, Result, bail};
-use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone, VersionMark};
+use oneup_exec::{Cloud, CloudError, GraphCloud, Meta, MetaDone, Replaced, VersionMark};
 use oneup_graph::Graph;
 use oneup_store::{RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
@@ -121,7 +120,7 @@ pub fn new_name(main: &Path, remote: &str) -> String {
     let taken = list(main);
     (1..)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-        .find(|n| taken.iter().all(|e| !e.name.eq_ignore_ascii_case(n)) && !main.join(VAULTS).join(n).exists())
+        .find(|n| taken.iter().all(|e| !oneup_sync::same_name(&e.name, n)) && !main.join(VAULTS).join(n).exists())
         .unwrap_or(base)
 }
 
@@ -166,7 +165,8 @@ fn hello_name(dir: &Path) -> Result<String> {
 #[cfg(windows)]
 pub fn save_key_hello(dir: &Path, key: &Masterkey) -> Result<()> {
     let challenge = oneup_vault::sealed::new_challenge()?;
-    let secret = Zeroizing::new(oneup_sys::hello::secret(&hello_name(dir)?, &challenge, true)?);
+    let mut secret = Zeroizing::new([0u8; 32]);
+    oneup_sys::hello::secret(&hello_name(dir)?, &challenge, true, &mut secret)?;
     let blob = oneup_vault::sealed::seal(key, &secret, &challenge)?;
     crate::ownfile::write(&dir.join(HELLO_FILE), &blob)?;
     Ok(())
@@ -178,7 +178,8 @@ pub fn save_key_hello(dir: &Path, key: &Masterkey) -> Result<()> {
 pub fn load_key_hello(dir: &Path) -> Result<Option<Masterkey>> {
     let Ok(blob) = std::fs::read(dir.join(HELLO_FILE)) else { return Ok(None) };
     let challenge = oneup_vault::sealed::challenge(&blob)?;
-    let secret = Zeroizing::new(oneup_sys::hello::secret(&hello_name(dir)?, &challenge, false)?);
+    let mut secret = Zeroizing::new([0u8; 32]);
+    oneup_sys::hello::secret(&hello_name(dir)?, &challenge, false, &mut secret)?;
     Ok(Some(oneup_vault::sealed::open(&blob, &secret)?))
 }
 
@@ -195,22 +196,77 @@ pub fn forget_hello(dir: &Path) -> Result<bool> {
     }
 }
 
-/// The keys as one line of hex, for handing them to the agent.
+/// The length of [`key_line`]: 64 bytes in hex and a newline.
+const KEY_LINE_LEN: usize = 129;
+
+/// The keys as one line of hex, for handing them to the agent. Written
+/// into a string of its final size, so a string that grows leaves no
+/// partial copy behind.
 pub fn key_line(key: &Masterkey) -> Zeroizing<String> {
-    Zeroizing::new(key.export().iter().map(|b| format!("{b:02x}")).collect::<String>() + "\n")
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut line = Zeroizing::new(String::with_capacity(KEY_LINE_LEN));
+    for b in key.export().iter() {
+        line.push(char::from(HEX[usize::from(b >> 4)]));
+        line.push(char::from(HEX[usize::from(b & 15)]));
+    }
+    line.push('\n');
+    line
 }
 
-/// The agent's side of [`key_line`]: one line from standard input.
+/// The agent's side of [`key_line`]: one line from standard input, read
+/// straight from its handle. Rust's own `stdin()` keeps a buffer for the
+/// life of the process, which would hold the keys long after they're used.
 pub fn key_from_stdin() -> Result<Masterkey> {
-    let mut line = Zeroizing::new(String::new());
-    std::io::stdin().lock().read_line(&mut line).context("reading the vault's keys")?;
-    let hex = line.trim();
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::io::AsHandle as _;
+        std::io::stdin().as_handle().try_clone_to_owned()
+    };
+    #[cfg(not(windows))]
+    let handle = {
+        use std::os::fd::AsFd as _;
+        std::io::stdin().as_fd().try_clone_to_owned()
+    };
+    read_key_line(&mut std::fs::File::from(handle.context("reading the vault's keys")?))
+}
+
+/// One [`key_line`] from `input`, read into a fixed, zeroed-on-drop buffer
+/// (no buffered reader or growing string keeps a copy). The line must end
+/// with its newline: input that stops before it (the sender died mid-write)
+/// is refused rather than guessed at.
+fn read_key_line(input: &mut impl std::io::Read) -> Result<Masterkey> {
+    let mut line = Zeroizing::new([0u8; KEY_LINE_LEN + 1]);
+    let mut n = 0;
+    while n < line.len() && !line[..n].contains(&b'\n') {
+        match input.read(&mut line[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("reading the vault's keys"),
+        }
+    }
+    if !line[..n].contains(&b'\n') {
+        bail!("no vault keys on standard input");
+    }
+    keys_from_line(&line[..n])
+}
+
+/// The keys in a [`key_line`].
+fn keys_from_line(line: &[u8]) -> Result<Masterkey> {
+    let end = line.iter().position(|&b| b == b'\n').unwrap_or(line.len());
+    let hex = line[..end].strip_suffix(b"\r").unwrap_or(&line[..end]);
     if hex.len() != 128 {
         bail!("no vault keys on standard input");
     }
+    let nibble = |c: u8| match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err(anyhow::anyhow!("the vault keys aren't hex")),
+    };
     let mut raw = Zeroizing::new([0u8; 64]);
-    for (i, b) in raw.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).context("the vault keys aren't hex")?;
+    for (b, pair) in raw.iter_mut().zip(hex.as_chunks::<2>().0) {
+        *b = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Ok(Masterkey::import(&raw))
 }
@@ -238,7 +294,7 @@ fn children(main: &Store, root: &str) -> Result<Vec<RemoteRow>> {
 /// [`unlock`] from the vault folder's listed items (no database held while
 /// waiting on OneDrive).
 async fn unlock_in(graph: &Arc<Graph>, kids: Vec<RemoteRow>, password: &str) -> Result<(Masterkey, usize)> {
-    let find = |n: &str| kids.iter().find(|r| r.name.eq_ignore_ascii_case(n)).cloned();
+    let find = |n: &str| kids.iter().find(|r| oneup_sync::same_name(&r.name, n)).cloned();
     let cfg = find(oneup_vault::config::FILE).context("this OneDrive folder isn't a vault (no vault.cryptomator)")?;
     let cloud = GraphCloud::new(Arc::clone(graph));
     let token = String::from_utf8(fetch(&cloud, &cfg).await?).context("vault.cryptomator isn't text")?;
@@ -378,7 +434,7 @@ impl Cloud for PairCloud {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn std::io::Read + Send),
+        src: &mut dyn oneup_exec::Source,
     ) -> Result<(RemoteRow, Option<Hash>), CloudError> {
         match self {
             PairCloud::Plain(c) => c.upload(parent, name, replace, size, src).await,
@@ -393,10 +449,22 @@ impl Cloud for PairCloud {
         }
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+    async fn uploaded_version(&self, id: &RemoteId, etag: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
         match self {
-            PairCloud::Plain(c) => c.replaced_other(id, mark).await,
-            PairCloud::Vault(c) => c.replaced_other(id, mark).await,
+            PairCloud::Plain(c) => c.uploaded_version(id, etag).await,
+            PairCloud::Vault(c) => c.uploaded_version(id, etag).await,
+        }
+    }
+
+    async fn replaced_other(
+        &self,
+        id: &RemoteId,
+        mark: &VersionMark,
+        ours: &VersionMark,
+    ) -> Result<Replaced, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.replaced_other(id, mark, ours).await,
+            PairCloud::Vault(c) => c.replaced_other(id, mark, ours).await,
         }
     }
 
@@ -412,6 +480,20 @@ impl Cloud for PairCloud {
         }
     }
 
+    async fn versions(&self, id: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.versions(id).await,
+            PairCloud::Vault(c) => c.versions(id).await,
+        }
+    }
+
+    async fn restore(&self, id: &RemoteId, parent: &RemoteId, name: &str) -> Result<RemoteRow, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.restore(id, parent, name).await,
+            PairCloud::Vault(c) => c.restore(id, parent, name).await,
+        }
+    }
+
     fn upcoming(&self, downloads: &[RemotePre]) {
         match self {
             PairCloud::Plain(c) => c.upcoming(downloads),
@@ -424,6 +506,13 @@ impl Cloud for PairCloud {
         match self {
             PairCloud::Plain(c) => c.concurrent(),
             PairCloud::Vault(c) => c.concurrent(),
+        }
+    }
+
+    fn moves_keep_ids(&self) -> bool {
+        match self {
+            PairCloud::Plain(c) => c.moves_keep_ids(),
+            PairCloud::Vault(c) => c.moves_keep_ids(),
         }
     }
 
@@ -479,6 +568,13 @@ impl Cloud for PairCloud {
         match self {
             PairCloud::Plain(c) => c.item(id).await,
             PairCloud::Vault(c) => c.inner().item(id).await,
+        }
+    }
+
+    async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.is_at(id, parent, name).await,
+            PairCloud::Vault(c) => c.is_at(id, parent, name).await,
         }
     }
 
@@ -715,7 +811,7 @@ pub async fn create(
 async fn config_token(graph: &Arc<Graph>, kids: &[RemoteRow]) -> Result<String> {
     let cfg = kids
         .iter()
-        .find(|r| r.name.eq_ignore_ascii_case(oneup_vault::config::FILE))
+        .find(|r| oneup_sync::same_name(&r.name, oneup_vault::config::FILE))
         .context("this OneDrive folder isn't a vault (no vault.cryptomator)")?;
     String::from_utf8(fetch(&GraphCloud::new(Arc::clone(graph)), cfg).await?).context("vault.cryptomator isn't text")
 }
@@ -756,7 +852,7 @@ pub async fn set_password(main: &Path, graph: Arc<Graph>, e: &Entry, key: &Maste
     oneup_vault::config::Config::verify(&token, key)?;
     let file = kids
         .iter()
-        .find(|r| r.name.eq_ignore_ascii_case(oneup_vault::key::FILE))
+        .find(|r| oneup_sync::same_name(&r.name, oneup_vault::key::FILE))
         .context("the vault's masterkey.cryptomator is missing")?;
     let json = key.to_file(password)?;
     let pre = RemotePre { id: RemoteId(file.id.clone()), etag: file.etag.clone().unwrap_or_default() };
@@ -813,5 +909,81 @@ mod tests {
         assert!(same_remote("/ΟΔΟΣ", "/οδοσ"), "final sigma folds as sigma");
         assert!(!same_remote("/\u{212A}it", "/kit"), "the Kelvin sign is its own letter");
         assert!(!same_remote("/Vault", "/Vault2"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn keys_go_to_the_agent_as_one_exact_line() {
+        let key = oneup_vault::key::Masterkey::generate().unwrap();
+        let line = super::key_line(&key);
+        assert_eq!((line.len(), line.capacity()), (super::KEY_LINE_LEN, super::KEY_LINE_LEN));
+        let back = super::keys_from_line(line.as_bytes()).unwrap();
+        assert_eq!(*back.export(), *key.export());
+        let crlf = line.trim_end().to_uppercase() + "\r\n";
+        assert_eq!(*super::keys_from_line(crlf.as_bytes()).unwrap().export(), *key.export());
+        // Not hex, too short, or non-ASCII of the right length: refused, never a panic.
+        assert!(super::keys_from_line(b"").is_err());
+        assert!(super::keys_from_line(&[b'g'; 128]).is_err());
+        assert!(super::keys_from_line(&line.as_bytes()[..100]).is_err());
+        assert!(super::keys_from_line("é".repeat(64).as_bytes()).is_err());
+    }
+
+    /// A reader that hands out its data in steps: `Ok(bytes)` gives at most
+    /// that many bytes (one call each), `Err(kind)` fails that call once.
+    struct Steps {
+        data: Vec<u8>,
+        at: usize,
+        steps: std::collections::VecDeque<Result<usize, std::io::ErrorKind>>,
+    }
+
+    impl std::io::Read for Steps {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let max = match self.steps.pop_front() {
+                Some(Err(kind)) => return Err(kind.into()),
+                Some(Ok(max)) => max,
+                None => usize::MAX,
+            };
+            let n = buf.len().min(max).min(self.data.len() - self.at);
+            buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    fn steps(data: &[u8], steps: Vec<Result<usize, std::io::ErrorKind>>) -> Steps {
+        Steps { data: data.to_vec(), at: 0, steps: steps.into() }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn the_agent_reads_its_key_line_however_the_pipe_delivers_it() {
+        use std::io::ErrorKind::{BrokenPipe, Interrupted};
+        let key = oneup_vault::key::Masterkey::generate().unwrap();
+        let line = super::key_line(&key);
+        let bytes = line.as_bytes();
+
+        // One byte at a time, with interruptions along the way (retried).
+        let mut one = Vec::new();
+        for i in 0..bytes.len() {
+            if i % 10 == 0 {
+                one.push(Err(Interrupted));
+            }
+            one.push(Ok(1));
+        }
+        let got = super::read_key_line(&mut steps(bytes, one)).unwrap();
+        assert_eq!(*got.export(), *key.export());
+        // All at once.
+        assert_eq!(*super::read_key_line(&mut steps(bytes, vec![])).unwrap().export(), *key.export());
+
+        // Ends before its newline: half a line, or all the hex but no newline.
+        assert!(super::read_key_line(&mut steps(&bytes[..64], vec![])).is_err());
+        assert!(super::read_key_line(&mut steps(&bytes[..128], vec![])).is_err());
+        assert!(super::read_key_line(&mut steps(b"", vec![])).is_err());
+        // Another I/O error: returned, not retried, no panic.
+        let e = super::read_key_line(&mut steps(bytes, vec![Ok(5), Err(BrokenPipe)])).err().unwrap();
+        assert!(e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == BrokenPipe)));
+        // Too much on the line: refused.
+        let long = [&bytes[..128], b"00\n"].concat();
+        assert!(super::read_key_line(&mut steps(&long, vec![])).is_err());
     }
 }

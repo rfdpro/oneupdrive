@@ -145,19 +145,21 @@ pub fn replace(replaced: &Path, replacement: &Path) -> crate::Result<()> {
     use windows::Win32::Foundation::{ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2};
     use windows::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACE_FILE_FLAGS, ReplaceFileW};
     use windows::core::{HRESULT, PCWSTR};
-    // SAFETY: both paths are NUL-terminated wide strings that outlive the
-    // call; no backup file, and the reserved pointers are null. (Its
-    // write-through flag is documented as unsupported, so none.)
-    unsafe {
-        ReplaceFileW(
-            &HSTRING::from(replaced.as_os_str()),
-            &HSTRING::from(replacement.as_os_str()),
-            PCWSTR::null(),
-            REPLACE_FILE_FLAGS(0),
-            None,
-            None,
-        )
-    }
+    retry_busy(|| {
+        // SAFETY: both paths are NUL-terminated wide strings that outlive
+        // the call; no backup file, and the reserved pointers are null. (Its
+        // write-through flag is documented as unsupported, so none.)
+        unsafe {
+            ReplaceFileW(
+                &HSTRING::from(replaced.as_os_str()),
+                &HSTRING::from(replacement.as_os_str()),
+                PCWSTR::null(),
+                REPLACE_FILE_FLAGS(0),
+                None,
+                None,
+            )
+        }
+    })
     .inspect_err(|e| {
         let partial = [ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2]
             .iter()
@@ -182,15 +184,41 @@ pub fn replace(replaced: &Path, replacement: &Path) -> crate::Result<()> {
 /// disk (`MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).
 pub fn move_over(from: &Path, to: &Path) -> crate::Result<()> {
     use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
-    // SAFETY: both paths are NUL-terminated wide strings that outlive the call.
-    unsafe {
-        MoveFileExW(
-            &HSTRING::from(from.as_os_str()),
-            &HSTRING::from(to.as_os_str()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    }
+    retry_busy(|| {
+        // SAFETY: both paths are NUL-terminated wide strings that outlive
+        // the call.
+        unsafe {
+            MoveFileExW(
+                &HSTRING::from(from.as_os_str()),
+                &HSTRING::from(to.as_os_str()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    })
     .map_err(win("MoveFileExW"))
+}
+
+/// Runs `op` again, a few times over about a third of a second, while it
+/// fails because another program has one of the files open. A file just
+/// written is often opened for a moment by an antivirus scanner or the
+/// search indexer, which makes a replacement fail with "access denied" or a
+/// sharing violation; neither leaves anything changed, so trying again is
+/// safe. Any other error, or the last one, is returned as is.
+fn retry_busy(mut op: impl FnMut() -> windows::core::Result<()>) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED};
+    use windows::core::HRESULT;
+    let busy = [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_REMOVE_REPLACED];
+    let mut wait = std::time::Duration::from_millis(20);
+    for _ in 0..4 {
+        match op() {
+            Err(e) if busy.iter().any(|c| e.code() == HRESULT::from_win32(c.0)) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            done => return done,
+        }
+    }
+    op()
 }
 
 /// Makes a new shortcut at `path` to `target`.

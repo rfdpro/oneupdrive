@@ -18,7 +18,8 @@
 //! `.c9r` file, or `dir.c9r`) is moved into it under its If-Match, and the
 //! old entry, by then holding nothing but its name, is removed. The
 //! decrypted item then has a new ID (the new entry's); the executor records
-//! it. An interruption leaves either the old entry whole and a new one
+//! it, having written the move ahead (`Cloud::moves_keep_ids`), so a crash
+//! before that record doesn't read as a deletion. An interruption leaves either the old entry whole and a new one
 //! without content (shown as a problem; the retry uses it), or the new
 //! entry whole and the old one without content (removed by the retry or
 //! reported).
@@ -26,7 +27,7 @@
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, RwLock};
 
-use oneup_exec::{Cloud, CloudError, VersionMark};
+use oneup_exec::{Cloud, CloudError, Replaced, Source, VersionMark};
 use oneup_store::{Kind, RemoteRow, Store};
 use oneup_sync::{RemoteId, RemotePre};
 use oneup_vault::content::{Decryptor, Encryptor, encrypted_size};
@@ -64,6 +65,10 @@ impl<T: Read> Read for Hashed<T> {
         Ok(n)
     }
 }
+
+/// Read in place (see [`Source`]): the encryption reads its source as it
+/// goes, and a vault runs one operation at a time.
+impl<T: Read + Send> Source for Hashed<T> {}
 
 impl<T: Write> Write for Hashed<T> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -208,7 +213,7 @@ impl<C: Cloud> VaultCloud<C> {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> Result<(RemoteRow, Hash), CloudError> {
         let plain = u64::try_from(size).map_err(other)?;
         let enc_size = i64::try_from(encrypted_size(plain)).map_err(other)?;
@@ -246,7 +251,7 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         name: &str,
         replace: Option<&RemotePre>,
         size: i64,
-        src: &mut (dyn Read + Send),
+        src: &mut dyn Source,
     ) -> Result<(RemoteRow, Option<Hash>), CloudError> {
         if let Some(old) = replace {
             // A new version of the file's encrypted contents.
@@ -303,6 +308,12 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
     /// made in several requests, which two uploads into one folder could
     /// interleave.
     fn concurrent(&self) -> bool {
+        false
+    }
+
+    /// A move that changes an entry's shape rebuilds it under a new ID
+    /// (see the module docs).
+    fn moves_keep_ids(&self) -> bool {
         false
     }
 
@@ -416,11 +427,60 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         Err(CloudError::Other("rules don't remove items from a vault".into()))
     }
 
+    /// From the encrypted entry itself: it's in vault folder `parent` under
+    /// `name` if OneDrive has its entry in that folder's storage folder
+    /// under the name `name` encrypts to there, in the shape that name
+    /// takes, and still carrying the item. A short-name file's entry is its
+    /// own `.c9r` file (one read). A long-name file's is a `.c9s` folder
+    /// that must still hold its `contents.c9r`, and a folder's a `.c9r` or
+    /// `.c9s` folder that must still hold its `dir.c9r` (two reads: the
+    /// entry, then its contents): a move that changed the entry's shape
+    /// can leave the old entry behind holding only its name, which isn't
+    /// the item any more. A folder's ID never changes, so neither do these;
+    /// nothing is decrypted. An item or folder this cloud doesn't know:
+    /// can't tell.
+    async fn is_at(&self, id: &RemoteId, parent: &str, name: &str) -> Result<Option<bool>, CloudError> {
+        let (Ok(n), Ok(p)) = (self.node(&id.0), self.node(parent)) else { return Ok(None) };
+        let Some(dir_id) = p.dir_id else { return Ok(None) };
+        // No storage folder yet: nothing is in that folder.
+        let Some(storage) = p.storage else { return Ok(Some(false)) };
+        let enc = names::encrypt_name(&self.vault.key, name, &dir_id).map_err(other)?;
+        let stored = Stored::of(enc, self.vault.threshold);
+        let payload = match (n.kind, &stored) {
+            (NodeKind::File, Stored::Full(_)) => None,
+            (NodeKind::File, Stored::Short { .. }) => Some(CONTENTS_FILE),
+            (NodeKind::Dir, _) => Some(DIR_FILE),
+            (NodeKind::Root, _) => return Ok(None),
+        };
+        let Some(entry) = self.inner.item(id).await? else { return Ok(Some(false)) };
+        let kind = if payload.is_some() { Kind::Folder } else { Kind::File };
+        if entry.kind != kind
+            || entry.parent_id.as_deref() != Some(storage.as_str())
+            || entry.name != stored.stored_name()
+        {
+            return Ok(Some(false));
+        }
+        let Some(file) = payload else { return Ok(Some(true)) };
+        let inside = self.inner.children(id).await?;
+        Ok(Some(inside.iter().any(|c| c.kind == Kind::File && c.name.eq_ignore_ascii_case(file))))
+    }
+
     /// Not offered: an encrypted folder's entries aren't the vault's items,
     /// so a folder too large for OneDrive to move at once can't be moved in
     /// parts here (the move is reported as failed).
     async fn children(&self, _: &RemoteId) -> Result<Vec<RemoteRow>, CloudError> {
         Err(CloudError::Other("a vault folder can't be moved in parts".into()))
+    }
+
+    /// Not offered: a rewind restores OneDrive's items, and a vault's are
+    /// its encrypted files, not the vault's items.
+    async fn versions(&self, _: &RemoteId) -> Result<Vec<VersionMark>, CloudError> {
+        Err(CloudError::Other("a vault can't be rewound".into()))
+    }
+
+    /// Not offered (see [`Self::versions`]).
+    async fn restore(&self, _: &RemoteId, _: &RemoteId, _: &str) -> Result<RemoteRow, CloudError> {
+        Err(CloudError::Other("a vault can't be rewound".into()))
     }
 
     // OneDrive versions the encrypted contents; these address them.
@@ -431,10 +491,23 @@ impl<C: Cloud> Cloud for VaultCloud<C> {
         self.inner.version_mark(&RemotePre { id: RemoteId(content), etag: pre.etag.clone() }, enc).await
     }
 
-    async fn replaced_other(&self, id: &RemoteId, mark: &VersionMark) -> Result<Option<VersionMark>, CloudError> {
+    async fn uploaded_version(&self, id: &RemoteId, etag: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
+        let content = self.node(&id.0)?.content.ok_or(CloudError::Changed)?;
+        self.inner.uploaded_version(&RemoteId(content), etag).await
+    }
+
+    async fn replaced_other(
+        &self,
+        id: &RemoteId,
+        mark: &VersionMark,
+        ours: &VersionMark,
+    ) -> Result<Replaced, CloudError> {
         let content = self.node(&id.0)?.content.ok_or(CloudError::Changed)?;
         // Its size is the encrypted file's; decrypting checks the content.
-        Ok(self.inner.replaced_other(&RemoteId(content), mark).await?.map(|v| VersionMark { size: None, ..v }))
+        Ok(match self.inner.replaced_other(&RemoteId(content), mark, ours).await? {
+            Replaced::Other(v) => Replaced::Other(VersionMark { size: None, ..v }),
+            r => r,
+        })
     }
 
     async fn download_version(

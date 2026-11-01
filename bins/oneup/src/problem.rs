@@ -17,6 +17,9 @@ use std::path::Path;
 
 use oneup_ipc::Problem;
 
+use crate::l10n::Locale;
+use crate::t_key;
+
 /// In the data folder: why the agent stopped (JSON), until it starts again.
 pub const STOPPED_FILE: &str = "agent-stopped.json";
 
@@ -57,59 +60,77 @@ impl Kind {
         }
     }
 
-    /// Title, what happened, and what to do.
-    fn words(self) -> (&'static str, &'static str, &'static str) {
+    /// Title, what happened, and what to do, in English: the agent keeps
+    /// and passes them so (`--json` stays the same everywhere); [`shown`]
+    /// says them in the reader's language.
+    pub fn words(self) -> (&'static str, &'static str, &'static str) {
         match self {
             Kind::Setup => (
-                "Nothing to sync yet",
-                "No folder is set up to sync with OneDrive.",
-                "Open Settings and set up a folder.",
+                t_key!("Nothing to sync yet"),
+                t_key!("No folder is set up to sync with OneDrive."),
+                t_key!("Open Settings and set up a folder."),
             ),
             Kind::Offline => (
-                "Can't reach OneDrive",
-                "Changes wait on this PC and in OneDrive until the connection is back.",
-                "Check your internet connection. Syncing resumes by itself.",
+                t_key!("Can't reach OneDrive"),
+                t_key!("Changes wait on this PC and in OneDrive until the connection is back."),
+                t_key!("Check your internet connection. Syncing resumes by itself."),
             ),
             Kind::SignIn => (
-                "Sign-in needed",
-                "OneDrive no longer accepts OneUpDrive's sign-in. Nothing syncs until you sign in again.",
-                "Open Settings > Accounts and select Sign in.",
+                t_key!("Sign-in needed"),
+                t_key!("OneDrive no longer accepts OneUpDrive's sign-in. Nothing syncs until you sign in again."),
+                t_key!("Open Settings > Accounts and select Sign in."),
             ),
             Kind::CloudFull => (
-                "OneDrive is full",
-                "Uploads wait until there's room in OneDrive. Downloads go on.",
-                "Free up space in OneDrive (its recycle bin counts too), or get more storage.",
+                t_key!("OneDrive is full"),
+                t_key!("Uploads wait until there's room in OneDrive. Downloads go on."),
+                t_key!("Free up space in OneDrive (its recycle bin counts too), or get more storage."),
             ),
             Kind::DiskFull => (
-                "This PC's disk is full",
-                "Downloads can't finish until there's room on the disk.",
-                "Free up space on the disk, or turn on Files On-Demand (Settings > Files) so files download only when opened.",
+                t_key!("This PC's disk is full"),
+                t_key!("Downloads can't finish until there's room on the disk."),
+                t_key!(
+                    "Free up space on the disk, or turn on Files On-Demand (Settings > Files) so files download only when opened."
+                ),
             ),
             Kind::Folder => (
-                "Synced folder unavailable",
-                "The synced folder was moved, renamed or removed, or another sync app took it over. \
-                 OneUpDrive stopped so nothing changes by mistake.",
-                "Put the folder back where it was, then start OneUpDrive from its icon. To sync another folder, \
-                 stop syncing this one in Settings > Files and set up again.",
+                t_key!("Synced folder unavailable"),
+                t_key!(
+                    "The synced folder was moved, renamed or removed, or another sync app took it over. \
+                 OneUpDrive stopped so nothing changes by mistake."
+                ),
+                t_key!(
+                    "Put the folder back where it was, then start OneUpDrive from its icon. To sync another folder, \
+                 stop syncing this one in Settings > Files and set up again."
+                ),
             ),
             Kind::Records => (
-                "Sync records need repair",
-                "OneUpDrive found a mistake in its own records of what's synced. It changes nothing until \
-                 that's fixed, so your files are safe.",
-                "Install the latest update: repairs come with updates. If this lasts, copy the details and report it.",
+                t_key!("Sync records need repair"),
+                t_key!(
+                    "OneUpDrive found a mistake in its own records of what's synced. It changes nothing until \
+                 that's fixed, so your files are safe."
+                ),
+                t_key!(
+                    "Install the latest update: repairs come with updates. If this lasts, copy the details and report it."
+                ),
             ),
             Kind::OneDrive => (
-                "OneDrive isn't responding",
-                "OneDrive answered with errors. This is usually temporary.",
-                "Nothing to do. If it lasts for hours, check OneDrive's service status.",
+                t_key!("OneDrive isn't responding"),
+                t_key!("OneDrive answered with errors. This is usually temporary."),
+                t_key!("Nothing to do. If it lasts for hours, check OneDrive's service status."),
             ),
             Kind::Other => (
-                "Sync problem",
-                "Something went wrong while syncing.",
-                "If it keeps happening, copy the details and report it.",
+                t_key!("Sync problem"),
+                t_key!("Something went wrong while syncing."),
+                t_key!("If it keeps happening, copy the details and report it."),
             ),
         }
     }
+}
+
+/// A problem's title, what happened and what to do, in `loc`'s language
+/// (the agent records them in English).
+pub fn shown(p: &Problem, loc: &Locale) -> (String, String, String) {
+    (loc.message(&p.title, &[]), loc.message(&p.detail, &[]), loc.message(&p.action, &[]))
 }
 
 /// Which kind `e` is, from the errors in its chain.
@@ -257,6 +278,55 @@ pub fn load_stopped(data_dir: &Path) -> Option<Problem> {
 /// Forgets why the agent last stopped (it's starting again).
 pub fn clear_stopped(data_dir: &Path) {
     let _ = std::fs::remove_file(data_dir.join(STOPPED_FILE));
+    // Normally gone already: the launcher removes it ([`start_requested`]).
+    // Left over, it no longer counts ([`stale_stop_note`]), and `oneup
+    // problems` says so; the agent syncs all the same.
+    if let Err(e) = start_requested(data_dir) {
+        tracing::warn!(
+            error = %e,
+            "couldn't delete {ASKED_FILE} in this agent's data folder; it's ignored from now on, \
+             delete it by hand (`oneup problems` shows where)"
+        );
+    }
+}
+
+/// In the data folder: the agent was asked to stop (the `stop` call: `oneup
+/// stop`, the icon, the settings window, locking a vault; or a pair added
+/// without starting it), until a start is asked for. An extra pair or vault
+/// that isn't running without it should be (it starts with the main
+/// agent), so the problems list names it.
+pub const ASKED_FILE: &str = "agent-stopped-as-asked";
+
+/// A start was asked for (`launch::start_agent`, before anything else, so
+/// a start that then fails leaves the agent listed as not running): the
+/// last stop no longer explains why it isn't running. A note that can't be
+/// removed is an error, so the start fails rather than leave a stale one.
+pub fn start_requested(data_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(data_dir.join(ASKED_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Notes that the agent was asked to stop (our own file).
+pub fn note_asked_to_stop(data_dir: &Path) -> std::io::Result<()> {
+    crate::ownfile::write(&data_dir.join(ASKED_FILE), b"")
+}
+
+/// Whether the agent was last asked to stop (and hasn't started since).
+pub fn asked_to_stop(data_dir: &Path) -> bool {
+    data_dir.join(ASKED_FILE).is_file() && !stale_stop_note(data_dir)
+}
+
+/// Whether the note that the agent was asked to stop is older than its
+/// last start (the pipe's name, written at every start), so left over from
+/// before it: the start couldn't delete it. It doesn't count then.
+pub fn stale_stop_note(data_dir: &Path) -> bool {
+    let modified = |f: &str| std::fs::metadata(data_dir.join(f)).and_then(|m| m.modified()).ok();
+    match (modified(ASKED_FILE), modified(oneup_ipc::PIPE_FILE)) {
+        (Some(note), Some(started)) => note < started,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

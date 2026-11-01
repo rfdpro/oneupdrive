@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 thiserror = "2"
+tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
@@ -21,6 +22,7 @@ features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_Memory",
+    "Win32_System_Threading",
 ]
 
 [dev-dependencies]

@@ -6,45 +6,70 @@
 //! tools must stay separate from the agent.
 
 pub mod accounts;
+#[cfg(windows)]
+pub mod appleftovers;
 pub mod apps;
 pub mod autopause;
 pub mod backoff;
 pub mod busy;
 pub mod carryover;
+pub mod cloudbin;
 pub mod config;
+pub mod conflicts;
 pub mod control;
 #[cfg(windows)]
+pub mod databases;
+#[cfg(windows)]
 pub mod datafolders;
+pub mod duplicates;
+pub mod events;
 pub mod filetree;
 pub mod flow;
+#[cfg(windows)]
+pub mod hooks;
 #[cfg(windows)]
 pub mod identity;
 #[cfg(windows)]
 pub mod install;
 #[cfg(windows)]
 pub mod item;
+pub mod l10n;
 pub mod launch;
+pub mod link;
 pub mod moveover;
+pub mod netusage;
+pub mod network;
 #[cfg(windows)]
 pub mod officeint;
 pub mod officeopen;
 pub mod ondemand;
 pub mod ownfile;
+pub mod pace;
 pub mod pairs;
+pub mod pinrules;
 pub mod priority;
 pub mod problem;
+#[cfg(windows)]
+pub mod problems;
 pub mod prune;
 #[cfg(windows)]
 pub mod recyclebin;
+pub mod repair_names;
 pub mod resolve;
+pub mod restores;
+pub mod rewind;
 pub mod rulefiles;
+pub mod safetywindow;
+pub mod search;
 pub mod settingsapi;
 pub mod setup;
+pub mod sharing;
 #[cfg(windows)]
 pub mod shellstatus;
 pub mod shortcuts;
 pub mod space;
 pub mod stoplist;
+pub mod suggest;
 pub mod sync;
 #[cfg(windows)]
 pub mod syncroot;

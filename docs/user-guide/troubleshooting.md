@@ -3,6 +3,9 @@
 OneUpDrive tells you about a problem in plain words, says whether it deals with it by itself, and what you can do. Your files are never changed by guesswork while a problem lasts.
 
 ## Where problems show
+
+If a folder exists in OneDrive but is missing on this PC, run `oneup problems` and `oneup unsynced`. A missing item with no recorded deletion waits for your decision: `oneup unsynced resolve PATH` shows the choices. OneUpDrive does not delete a cloud copy just because a local scan did not find it. Excluded folders stay in OneDrive; check `oneup rules` too.
+
 * **The icon** turns red. Its menu says "Problem: …" (or "Stopped: …" if the problem stopped OneUpDrive), with **Error details…**.
 * **A notification**, for a problem that needs you (sign-in, a full disk…) straight away, and for one that usually clears by itself (no connection, OneDrive errors) once it has lasted about 15 minutes.
 * **The settings window** shows a red card above every page: what happened, what to do, when OneUpDrive tries again, and:
@@ -14,9 +17,34 @@ OneUpDrive tells you about a problem in plain words, says whether it deals with 
 * **The activity log** (settings window, **Activity**) notes when a problem began and when it cleared.
 * `oneup status` prints the same, with the technical text last.
 
+### Everything that needs you
+(A **safety stop**, where OneUpDrive stops and asks before many deletions or changes, isn't a problem: answer it from the icon's **Review …**, see [When OneUpDrive waits for you](tray-icon.md#when-oneupdrive-waits-for-you) and [Safety stop](syncing.md#safety-stop).)
+
+`oneup problems` lists, in one place, everything waiting for you, for the main folder and every other folder pair and vault, most pressing first:
+
+* nothing set up yet, or not signed in;
+* OneUpDrive not running, or stopped by a problem; another folder pair or a vault that should run with it but doesn't (not one you stopped, nor a locked vault);
+* a problem below (its kind: sign-in needed, OneDrive full, disk full…);
+* safety stops and a full version store, with the code to answer them;
+* pauses, yours or by itself, and paused folders;
+* items that can't sync, and items that failed and wait to be tried again;
+* excluded items still in OneDrive;
+* files changed on both sides in the last 7 days whose second copy is still there (OneDrive's version kept the name; compare the two and delete the one you don't need). The newest 100 are listed; a line says when there are more, or when older ones weren't checked.
+* a file whose upload may have gone over an edit someone made in OneDrive at the same moment, when OneUpDrive couldn't find that edit to keep it as a copy (look for it in the file's version history on the OneDrive website). Listed for 14 days.
+
+Each line says what to do. `oneup problems --json` gives the same for scripts: each item's `kind`, `title`, `detail`, `action`, the `code` an answer takes, the `pair` (none for the main folder) and its `data_dir`, and `more_conflicts` when not all files changed on both sides are listed (`conflicts_not_checked` when older ones weren't looked at). It works whether or not OneUpDrive is running. The settings window shows the same list at the top of its **Activity** page.
+
 OneUpDrive tries again by itself after a minute, then waits twice as long each time, up to 30 minutes. Once it has synced again, the next problem starts over at a minute. Fixing the cause and selecting **Retry now** is quicker.
 
 ## The problems
+
+### A deleted folder remains in OneDrive
+
+OneUpDrive removes a folder from OneDrive only when it is empty. Excluded files can keep it there; `oneup unsynced` lists the folder as not empty. It waits for a change to that folder, even while other files are being retried. Review what remains on the OneDrive website before deleting it there. OneUpDrive picks up that deletion through OneDrive's change feed.
+
+### A pinned file changed in OneDrive
+
+Cloud edits update files marked **Always keep on this device** too. The file keeps that setting, and OneUpDrive downloads the new version automatically.
 
 <a id="setup"></a>
 ### Nothing to sync yet

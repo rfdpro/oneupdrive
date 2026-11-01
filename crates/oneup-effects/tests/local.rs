@@ -71,10 +71,70 @@ fn approve_with(policy: &Policy, op: Op) -> Approved {
     r.approved.into_iter().next().unwrap()
 }
 
-/// A recycle the user chose to discard (an overflow batch of one).
+/// A recovery step the user asked for: its key approved, as the agent
+/// approves a queued restore (`oneup_app::restores`).
+fn approve_asked(op: Op) -> Approved {
+    let keys = oneup_gate::rewind_keys(std::slice::from_ref(&op), &[String::new()]);
+    let cx = Context { synced_items: 1_000_000, approved: &keys, ..Context::default() };
+    let r = review_in(&Policy::default(), &cx, vec![op]);
+    assert!(r.withheld.is_empty() && r.breakers.is_empty(), "{:?}", r.breakers);
+    r.approved.into_iter().next().unwrap()
+}
+
+/// A copy set aside is taken only from where the approval saw it: renamed
+/// since (same ID, size and last-write time), it stays.
+#[test]
+fn a_copy_set_aside_is_taken_only_from_where_it_was_shown() {
+    let r = Root::new("aside-where");
+    let fs = r.fs();
+    std::fs::write(r.p("a.txt"), b"changed here").unwrap();
+    let local = pre(&r.p("a.txt"));
+    let step = |at: &str| Op::rewind(1, oneup_sync::rewind::Step::SetAside { local: local.clone(), at: at.into() });
+    std::fs::rename(r.p("a.txt"), r.p("b.txt")).unwrap();
+    assert!(matches!(fs.recycle(&approve_asked(step("/a.txt")), None), Err(Error::Changed)));
+    assert!(r.p("b.txt").exists(), "left where it went");
+    assert!(matches!(fs.recycle(&approve_asked(step("/B.TXT")), None), Ok(Done::Recycled { kept: Some(_) })));
+    assert!(!r.p("b.txt").exists(), "taken from where it is, as named");
+}
+
+/// A recycling that follows a rewind takes the copy only from where the
+/// approval saw it (the token's path), checked on the handle that moves it.
+#[test]
+fn a_rewinds_recycling_here_is_taken_only_from_where_it_was() {
+    let r = Root::new("follow-where");
+    let fs = r.fs();
+    std::fs::create_dir(r.p("docs")).unwrap();
+    std::fs::write(r.p("docs/n.txt"), b"new since").unwrap();
+    let op = Op::RecycleLocal { sid: 1, local: pre(&r.p("docs/n.txt")) };
+    let paths = vec!["/docs/n.txt".to_string()];
+    let f = oneup_gate::Follow::of_at(&op, &paths[0]).unwrap();
+    let rewound = [oneup_gate::follow_key(&f)];
+    let cx = Context { synced_items: 1_000_000, rewound: &rewound, paths: &paths, ..Context::default() };
+    let a = review_in(&Policy::default(), &cx, vec![op]).approved.into_iter().next().unwrap();
+    assert_eq!(a.at(), Some("/docs/n.txt"));
+    std::fs::rename(r.p("docs"), r.p("docs-keep")).unwrap();
+    assert!(matches!(fs.recycle(&a, None), Err(Error::Changed)));
+    assert!(r.p("docs-keep/n.txt").exists(), "left where it went");
+}
+
+/// Puts kept item `slot` back at `to` (or where it came from), as a
+/// restore asked for and approved: bound to the item and the folder as
+/// found now.
+fn restore(fs: &LocalFs, slot: &str, to: Option<&str>) -> Result<String, Error> {
+    let t = fs.kept_target(slot, to)?;
+    let step = oneup_sync::rewind::Step::RestoreKept { slot: slot.into(), item: t.item, dir: t.dir, name: t.name };
+    fs.restore_approved(&approve_asked(Op::rewind(0, step)))
+}
+
+/// A recycle the user chose to discard (an overflow batch of one), of an
+/// item OneDrive reported deleted.
 fn approve_discard(op: Op) -> Approved {
     let p = Policy::default();
-    let cx = Context { synced_items: 1_000_000, room: Some(0), ..Context::default() };
+    let reported = match &op {
+        Op::RecycleLocal { sid, .. } => vec![*sid],
+        _ => Vec::new(),
+    };
+    let cx = Context { synced_items: 1_000_000, room: Some(0), cloud_deleted: &reported, ..Context::default() };
     let fingerprint = review_in(&p, &cx, vec![op.clone()]).overflow.unwrap().fingerprint;
     let decisions = [Decision { fingerprint, choice: Choice::Discard }];
     let r = review_in(&p, &Context { decisions: &decisions, ..cx }, vec![op]);
@@ -273,7 +333,7 @@ fn partly_downloaded_placeholders_change_without_being_read() {
         link: Link::Existing(1),
     };
     let v = oneup_effects::Version { identity: new.clone(), modified: 0 };
-    let replaced = fs.replace_placeholder(&approve(replace), &v, Some(&old.hash));
+    let replaced = fs.replace_placeholder(&approve(replace), &v, Some(&old.hash), None);
     // A cloud deletion, kept or discarded: removed, nothing kept.
     let removed = fs.apply(&approve(Op::RecycleLocal { sid: 2, local: pre(&r.p(names[1])) }));
     let discard = approve_discard(Op::RecycleLocal { sid: 3, local: pre(&r.p(names[2])) });
@@ -424,23 +484,56 @@ fn kept_items_are_listed_restored_without_replacing_and_pruned() {
     assert_eq!(slots[0].bytes, 5);
 
     // Back where it came from; the slot is gone.
-    assert_eq!(fs.restore(&slots[0].id, None).unwrap(), "docs\\a.txt");
+    assert_eq!(restore(&fs, &slots[0].id, None).unwrap(), "docs\\a.txt");
     assert_eq!(std::fs::read(r.p("docs/a.txt")).unwrap(), b"first");
     assert_eq!(fs.versions().unwrap().len(), 1);
 
     // The name is taken meanwhile: restored beside it, nothing replaced.
     std::fs::write(r.p("b.txt"), b"new bee").unwrap();
-    assert_eq!(fs.restore(&slots[1].id, None).unwrap(), "b (restored 1).txt");
+    assert_eq!(restore(&fs, &slots[1].id, None).unwrap(), "b (restored 1).txt");
     assert_eq!(std::fs::read(r.p("b.txt")).unwrap(), b"new bee");
     assert_eq!(std::fs::read(r.p("b (restored 1).txt")).unwrap(), b"bee");
 
     // Never into OneUpDrive's own folder, never outside, never a bad slot.
     fs.apply(&approve(Op::RecycleLocal { sid: 1, local: pre(&r.p("b.txt")) })).unwrap();
     let id = fs.versions().unwrap()[0].id.clone();
-    assert!(matches!(fs.restore(&id, Some(".oneup\\x.txt")), Err(Error::BadName)));
-    assert!(matches!(fs.restore(&id, Some("..\\x.txt")), Err(Error::BadName)));
-    assert!(matches!(fs.restore("..", None), Err(Error::BadName)));
-    assert!(matches!(fs.restore(&id, Some("missing\\x.txt")), Err(Error::Changed)));
+    assert!(matches!(restore(&fs, &id, Some(".oneup\\x.txt")), Err(Error::BadName)));
+    assert!(matches!(restore(&fs, &id, Some("..\\x.txt")), Err(Error::BadName)));
+    assert!(matches!(restore(&fs, "..", None), Err(Error::BadName)));
+    assert!(matches!(restore(&fs, &id, Some("missing\\x.txt")), Err(Error::Changed)));
+
+    // Bound to what was chosen: the kept item by its ID and stamp, the
+    // folder by its ID. A kept file changed since, or a folder swapped for
+    // another of the same name, isn't acted on.
+    std::fs::create_dir(r.p("dest")).unwrap();
+    let step = |t: &oneup_effects::KeptTarget| {
+        Op::rewind(
+            0,
+            oneup_sync::rewind::Step::RestoreKept {
+                slot: id.clone(),
+                item: t.item.clone(),
+                dir: t.dir,
+                name: t.name.clone(),
+            },
+        )
+    };
+    let t = fs.kept_target(&id, Some("dest\\x.txt")).unwrap();
+    let kept = r.p(&format!(".oneup/versions/{id}/b.txt"));
+    std::fs::write(&kept, b"changed in the store").unwrap();
+    assert!(matches!(fs.restore_approved(&approve_asked(step(&t))), Err(Error::Changed)), "item changed");
+    let t = fs.kept_target(&id, Some("dest\\x.txt")).unwrap();
+    std::fs::rename(r.p("dest"), r.p("dest-was")).unwrap();
+    std::fs::create_dir(r.p("dest")).unwrap();
+    // The folder chosen, wherever it is now; never another of its name.
+    assert_eq!(fs.restore_approved(&approve_asked(step(&t))).unwrap(), "dest-was\\x.txt");
+    assert!(!r.p("dest/x.txt").exists());
+    assert_eq!(std::fs::read(r.p("dest-was/x.txt")).unwrap(), b"changed in the store");
+    // Once done, the same step finds nothing to act on.
+    assert!(fs.restore_approved(&approve_asked(step(&t))).is_err());
+    // Kept again, as it was, for what follows.
+    std::fs::write(r.p("dest-was/x.txt"), b"bee").unwrap();
+    std::fs::rename(r.p("dest-was/x.txt"), r.p("b.txt")).unwrap();
+    fs.apply(&approve(Op::RecycleLocal { sid: 1, local: pre(&r.p("b.txt")) })).unwrap();
 
     // Pruning: a preview removes nothing; by size, oldest first.
     std::fs::write(r.p("c.txt"), b"0123456789").unwrap();
@@ -505,7 +598,7 @@ fn the_version_store_is_measured_once_per_slot() {
     keep("b.txt", b"0123456789");
     assert_eq!(bytes(), [("a.txt".to_string(), 5), ("b.txt".to_string(), 10)]);
     let a = fs.versions().unwrap()[0].id.clone();
-    fs.restore(&a, None).unwrap();
+    restore(&fs, &a, None).unwrap();
     assert_eq!(bytes(), [("b.txt".to_string(), 10)]);
     assert_eq!(std::fs::read_to_string(&cache).unwrap().lines().count(), 1);
     fs.prune_versions(Some(i64::MAX), None, false).unwrap();
@@ -649,19 +742,85 @@ fn a_save_in_place_during_an_upload_read_goes_through_and_fails_the_read() {
     assert!(!src.unchanged());
 }
 
+/// A save by renaming a new file over the one being read goes through,
+/// however the program renames: with POSIX semantics (Rust's), or
+/// `MoveFileEx` from another program (`cmd`'s `move /y`), which fails while
+/// any other handle on the file is open. The read then fails, so the
+/// upload is cancelled before it commits.
 #[test]
-fn a_save_by_rename_during_an_upload_read_goes_through_and_the_read_keeps_its_version() {
+fn a_save_by_rename_during_an_upload_read_goes_through_and_fails_the_read() {
     let r = Root::new("read-renamed");
     let fs = r.fs();
+    for classic in [false, true] {
+        std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+        let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
+        let mut head = [0u8; 4];
+        src.read_exact(&mut head).unwrap();
+        std::fs::write(r.p("f.tmp"), b"new").unwrap();
+        if classic {
+            let out = std::process::Command::new("cmd.exe")
+                .current_dir(&r.dir)
+                .args(["/c", "move", "/y", "f.tmp", "f.bin"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "the save must not fail: {out:?}");
+        } else {
+            std::fs::rename(r.p("f.tmp"), r.p("f.bin")).unwrap();
+        }
+        assert_eq!(std::fs::read(r.p("f.bin")).unwrap(), b"new");
+        let err = src.read_to_string(&mut String::new()).unwrap_err();
+        assert!(oneup_effects::ChangedMeanwhile::is(&err), "{err}");
+        assert!(!src.unchanged());
+    }
+}
+
+/// In a Files On-Demand folder the placeholder checks (is all of it
+/// here, does its identity vouch for it) go through the read's own handle,
+/// so no other handle is ever open, and they queue nothing on its
+/// completion port. A save by `MoveFileEx` during the read goes through.
+#[test]
+fn on_demand_reads_hold_one_handle_and_saves_go_through() {
+    let r = Root::new("read-on-demand");
+    drop(r.fs());
+    oneup_cfapi::provider::register(&r.dir, b"token-1").unwrap();
+    let fs = r.fs();
+    assert!(fs.on_demand());
+    let ignored = win::ignored_completions();
     std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let Done::Hashed { size, .. } = fs.apply(&approve(Op::Hash(pre(&r.p("f.bin"))))).unwrap() else { panic!() };
+    assert_eq!(size, 18);
     let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
+    let mut head = [0u8; 4];
+    src.read_exact(&mut head).unwrap();
     std::fs::write(r.p("f.tmp"), b"new").unwrap();
-    std::fs::rename(r.p("f.tmp"), r.p("f.bin")).unwrap();
-    let mut s = String::new();
-    src.read_to_string(&mut s).unwrap();
-    assert_eq!(s, "some bytes to hash");
-    drop(src);
-    assert_eq!(std::fs::read(r.p("f.bin")).unwrap(), b"new");
+    let out = std::process::Command::new("cmd.exe")
+        .current_dir(&r.dir)
+        .args(["/c", "move", "/y", "f.tmp", "f.bin"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the save must not fail: {out:?}");
+    let err = src.read_to_string(&mut String::new()).unwrap_err();
+    assert!(oneup_effects::ChangedMeanwhile::is(&err), "{err}");
+    drop((src, fs));
+    assert_eq!(win::ignored_completions(), ignored, "nothing but our own requests on the port");
+    oneup_cfapi::provider::unregister(&r.dir).unwrap();
+}
+
+/// A file planned as an ordinary one that has become placeholder-like
+/// since (marked offline, as an archiver does; same size and time) is
+/// refused on the handle opened to read it, before any byte is read.
+#[test]
+fn a_file_that_became_offline_since_planning_is_refused_before_reading() {
+    let r = Root::new("read-offline");
+    let fs = r.fs();
+    std::fs::write(r.p("f.bin"), b"some bytes to hash").unwrap();
+    let (hash, upload) = (approve(Op::Hash(pre(&r.p("f.bin")))), upload_of(&r.p("f.bin")));
+    let st = std::process::Command::new("attrib").arg("+O").arg(r.p("f.bin")).status().unwrap();
+    assert!(st.success());
+    assert!(matches!(fs.apply(&hash), Err(Error::NotOrdinary)));
+    assert!(matches!(fs.open_upload(&upload), Err(Error::NotOrdinary)));
+    let Op::Upload { local, .. } = upload.op() else { panic!() };
+    assert_eq!(fs.sample(local, 64), None);
 }
 
 #[test]
@@ -806,4 +965,66 @@ fn rotation_makes_room_by_removing_the_oldest() {
     // More than the whole cap: nothing is removed for nothing.
     assert!(fs.make_room(&rotate, 26).unwrap().is_empty());
     assert_eq!(fs.versions().unwrap().len(), 1);
+}
+
+/// With a locator, items are found by path where the state database has
+/// them, never opened by ID; a path leading to another item is never acted
+/// on: the item is then found by ID.
+#[test]
+fn items_are_found_where_the_store_has_them_and_only_there() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let r = Root::new("locate");
+    let mut fs = r.fs();
+    let paths: Arc<Mutex<HashMap<LocalId, String>>> = Arc::default();
+    let known = Arc::clone(&paths);
+    fs.set_locator(Box::new(move |id| known.lock().unwrap().get(&id).cloned()));
+    std::fs::create_dir(r.p("sub")).unwrap();
+    std::fs::write(r.p("f.bin"), b"the planned file").unwrap();
+    std::fs::write(r.p("other.bin"), b"another file!!!!").unwrap();
+    let (f, other) = (id(&r.p("f.bin")), id(&r.p("other.bin")));
+    let hash = |fs: &LocalFs| match fs.apply(&approve(Op::Hash(pre(&r.p("f.bin"))))).unwrap() {
+        Done::Hashed { hash, .. } => hash,
+        _ => panic!(),
+    };
+
+    paths.lock().unwrap().insert(f, "/f.bin".into());
+    assert_eq!(hash(&fs), qxh(b"the planned file"));
+    let mut src = fs.open_upload(&upload_of(&r.p("f.bin"))).unwrap();
+    src.read_to_string(&mut String::new()).unwrap();
+    drop(src);
+    assert!(fs.is_present(f) && fs.presence(f) == Some(true));
+    assert_eq!(fs.name_of(f).as_deref(), Some("f.bin"));
+    assert_eq!(fs.opened_by_id(), 0, "found where the store has it");
+
+    // The store is behind: its path leads to another file of the same size.
+    paths.lock().unwrap().insert(f, "/other.bin".into());
+    assert_eq!(hash(&fs), qxh(b"the planned file"), "the planned file, not the one at the path");
+    assert_eq!(fs.opened_by_id(), 1);
+    let sub = id(&r.p("sub"));
+    let mv = fs.apply(&approve(Op::MoveLocal {
+        sid: 1,
+        local: pre(&r.p("f.bin")),
+        to: sub,
+        parent: 0,
+        name: "f.bin".into(),
+    }));
+    assert!(mv.is_ok(), "{mv:?}");
+    assert!(r.p("sub/f.bin").exists() && r.p("other.bin").exists() && !r.p("f.bin").exists());
+    assert_eq!(std::fs::read(r.p("other.bin")).unwrap(), b"another file!!!!");
+    assert_eq!(fs.name_of(other).as_deref(), Some("other.bin"));
+
+    // Paths that aren't one name per level are no hint; a path to nothing
+    // isn't taken for the item being gone.
+    for bad in ["/../f.bin", "/sub/./f.bin", r"/sub\f.bin"] {
+        paths.lock().unwrap().insert(f, bad.into());
+        let before = fs.opened_by_id();
+        assert_eq!(fs.name_of(f).as_deref(), Some("f.bin"), "{bad}");
+        assert_eq!(fs.opened_by_id(), before + 1, "{bad}");
+    }
+    paths.lock().unwrap().insert(f, "/f.bin".into());
+    assert_eq!(fs.presence(f), Some(true));
+    std::fs::remove_file(r.p("sub/f.bin")).unwrap();
+    paths.lock().unwrap().insert(f, "/sub/f.bin".into());
+    assert_eq!(fs.presence(f), Some(false));
 }

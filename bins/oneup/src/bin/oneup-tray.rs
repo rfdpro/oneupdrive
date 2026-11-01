@@ -42,6 +42,8 @@ mod win {
         failure: Option<String>,
         /// An update downloaded and checked, ready to install.
         update: Option<oneup_app::updates::Ready>,
+        /// `[search]` changed: take up its hotkey.
+        search_changed: bool,
     }
 
     enum Do {
@@ -90,12 +92,20 @@ mod win {
             }
         }
         let icon = Tray::new()?;
-        let shared = Arc::new(Mutex::new(Shared { view: View::Connecting, failure: None, update: None }));
+        let shared =
+            Arc::new(Mutex::new(Shared { view: View::Connecting, failure: None, update: None, search_changed: false }));
         {
             let (dir, shared, waker) = (dir.clone(), Arc::clone(&shared), icon.waker());
             std::thread::Builder::new()
                 .name("updates".into())
                 .spawn(move || look_for_updates(&dir, &shared, &waker))
+                .context("starting a thread")?;
+        }
+        {
+            let (dir, shared, waker) = (dir.clone(), Arc::clone(&shared), icon.waker());
+            std::thread::Builder::new()
+                .name("search settings".into())
+                .spawn(move || follow_search_settings(&dir, &shared, &waker))
                 .context("starting a thread")?;
         }
         let (tx, rx) = mpsc::unbounded_channel();
@@ -118,13 +128,16 @@ mod win {
             look: None,
             shared: Arc::clone(&shared),
             update: None,
+            hotkey: String::new(),
         };
+        ui.set_hotkey();
         ui.refresh(&shared);
         while let Some(e) = icon.next() {
             match e {
                 Event::Wake => ui.refresh(&shared),
                 Event::Select { x, y } | Event::Menu { x, y } => ui.menu(x, y),
                 Event::NotificationClicked => ui.review_first(),
+                Event::Hotkey => ui.show_list("find"),
                 Event::Exit => break,
             }
         }
@@ -141,6 +154,20 @@ mod win {
         shared: Arc<Mutex<Shared>>,
         /// The version of an update ready to install (announced once).
         update: Option<String>,
+        /// The search hotkey held now (`[search] hotkey`; empty: none).
+        hotkey: String,
+    }
+
+    /// Waits for `[search]` to change (`oneup_app::tray::settings_changed`)
+    /// and tells the icon's thread, which holds the hotkey.
+    fn follow_search_settings(dir: &Path, shared: &Mutex<Shared>, waker: &Waker) {
+        let Ok(signal) = oneup_sys::signal::Signal::new(&tray::settings_signal(dir)) else { return };
+        loop {
+            if signal.wait(Duration::from_secs(24 * 3600)) {
+                shared.lock().unwrap_or_else(|e| e.into_inner()).search_changed = true;
+                waker.wake();
+            }
+        }
     }
 
     /// Starts the agent and the remembered vaults that aren't running.
@@ -159,6 +186,32 @@ mod win {
         });
     }
 
+    /// The automatic update download, in a process of its own (`oneup
+    /// updates --fetch`), ended at once if Windows reports a change to a
+    /// network where background transfers don't go. Whether it finished.
+    fn download_by_itself(dir: &Path) -> bool {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let Ok(exe) = oneup_app::launch::sibling("oneup.exe") else { return false };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--data-dir").arg(dir).args(["updates", "--fetch"]).creation_flags(CREATE_NO_WINDOW);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let changes = tx.clone();
+        let _watch = oneup_sys::network::watch(move || drop(changes.send(oneup_app::updates::Heard::Changed))).ok();
+        let stop = || !oneup_app::updates::may_download_by_itself_now(dir);
+        match oneup_app::updates::run_stoppable(cmd, tx, rx, stop) {
+            Ok(oneup_app::updates::Ran::Finished(ok)) => ok,
+            Ok(oneup_app::updates::Ran::Stopped) => {
+                tracing::info!("the update download stopped: the network changed to one it doesn't go on");
+                false
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "the update download couldn't run");
+                false
+            }
+        }
+    }
+
     /// A few minutes after starting, then daily, or at once when the
     /// settings window's "Check now" asks: download and check an update
     /// (`oneup_app::updates`), and tell the icon's thread. The daily check
@@ -174,9 +227,16 @@ mod win {
         };
         let mut asked = wait(Duration::from_secs(150));
         loop {
-            let auto = oneup_app::config::load_updates(dir).is_ok_and(|u| u.auto);
+            // By itself only where background transfers may go (not on a
+            // metered network, with a data budget, or offline), and stopped
+            // if the network changes to one of those meanwhile; asked,
+            // always, and never stopped.
+            let auto = oneup_app::config::load_updates(dir).is_ok_and(|u| u.auto)
+                && oneup_app::updates::may_download_by_itself_now(dir);
+            let fetched = !asked && auto && download_by_itself(dir);
             let found = match oneup_app::updates::manager(dir) {
-                Ok(Some(um)) if auto || asked => oneup_app::updates::check(um),
+                // What the download left is used; nothing is fetched again.
+                Ok(Some(um)) if asked || fetched => oneup_app::updates::check(um),
                 _ => Ok(None),
             };
             match found {
@@ -197,11 +257,36 @@ mod win {
             shared.lock().unwrap_or_else(|e| e.into_inner())
         }
 
+        /// Holds the search hotkey `[search]` names (none if it names none),
+        /// and says so once if another program holds it.
+        fn set_hotkey(&mut self) {
+            let wanted = oneup_app::config::load_search(&self.dir).map(|s| s.hotkey).unwrap_or_default();
+            if wanted == self.hotkey {
+                return;
+            }
+            let keys = oneup_app::search::Hotkey::parse(&wanted).ok().map(|h| (h.modifiers(), h.key));
+            match self.icon.set_hotkey(keys) {
+                Ok(()) => self.hotkey = wanted,
+                Err(_) => {
+                    self.hotkey.clear();
+                    let _ = self.icon.notify(
+                        "Search hotkey unavailable",
+                        &format!("Another program uses {wanted}. Choose other keys in Settings, Search."),
+                        Kind::Warning,
+                    );
+                }
+            }
+        }
+
         fn refresh(&mut self, shared: &Mutex<Shared>) {
-            let (view, failure, update) = {
+            let (view, failure, update, search_changed) = {
                 let mut s = Self::lock(shared);
-                (s.view.clone(), s.failure.take(), s.update.as_ref().map(|r| r.version.clone()))
+                let changed = std::mem::take(&mut s.search_changed);
+                (s.view.clone(), s.failure.take(), s.update.as_ref().map(|r| r.version.clone()), changed)
             };
+            if search_changed {
+                self.set_hotkey();
+            }
             let auto = oneup_app::config::load_updates(&self.dir).is_ok_and(|u| u.auto);
             if update.is_some() && self.update.is_none() {
                 self.update.clone_from(&update);
@@ -293,7 +378,7 @@ mod win {
         }
 
         /// Opens the settings window on one of the Activity page's lists
-        /// (`activity`, `unsynced`, `excluded` or `stops`).
+        /// (`activity`, `unsynced`, `excluded` or `stops`), or another page.
         fn show_list(&self, page: &str) {
             if let Err(e) = oneup_app::launch::start_settings_on(&self.dir, page) {
                 self.icon.ask("OneUpDrive", &format!("{e:#}"), Kind::Error, Buttons::Ok);
@@ -321,6 +406,11 @@ mod win {
                     }
                 }
                 id::SYNC_NOW => self.send(Do::Call(Call::SyncNow)),
+                id::ALLOW_DATA => self.send(Do::Call(Call::AllowData { mb: oneup_app::netusage::ALLOW_MB })),
+                id::OFFLINE => {
+                    let offline = status.as_ref().and_then(|s| s.network.as_ref()).is_some_and(|n| n.offline);
+                    self.send(Do::Call(Call::Offline { on: !offline }));
+                }
                 id::RESUME => self.send(Do::Call(Call::Resume { direction: Direction::Both })),
                 c if (id::PAUSE..id::PAUSE + tray::PAUSES.len() as u32).contains(&c) => {
                     let minutes = tray::PAUSES[(c - id::PAUSE) as usize].1;
@@ -353,6 +443,7 @@ mod win {
                     self.send(Do::Call(Call::Stop));
                 }
                 id::UPDATE => self.install_update(),
+                id::SEARCH => self.show_list("find"),
                 id::SETTINGS | id::STATUS => {
                     if let Err(e) = oneup_app::launch::start_settings(&self.dir) {
                         self.icon.ask("OneUpDrive", &format!("{e:#}"), Kind::Error, Buttons::Ok);
@@ -386,7 +477,16 @@ mod win {
             let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
             let earlier =
                 if st.recent > 0 { format!(", on top of {} in the last 15 minutes", st.recent) } else { String::new() };
-            let text = if st.kind == "content" {
+            // A removal is approved only with its paths in view.
+            let removal = (st.kind == "removal").then(|| oneup_app::duplicates::approval_text(&self.dir, &st.code, 10));
+            if removal == Some(None) {
+                let why = "The list of what goes isn't ready yet. Try again in a moment.";
+                self.icon.ask("OneUpDrive", why, Kind::Info, Buttons::Ok);
+                return;
+            }
+            let text = if let Some(Some(text)) = removal {
+                text
+            } else if st.kind == "content" {
                 format!(
                     "{} changed files{earlier} look encrypted, possibly by ransomware.\n\n\
                      They weren't uploaded. Open a few. If they don't open, choose Not now, disconnect this PC \
@@ -397,14 +497,18 @@ mod win {
                 format!(
                     "{} of {} synced items {side} would be deleted, overwritten or moved{earlier}.\n\n\
                      Nothing changes until you decide. If you didn't expect this, check the files first.",
-                    st.count, st.synced_items
+                    st.items(),
+                    st.synced_items
                 )
             };
             const GO: i32 = 100;
             const SHOW: i32 = 101;
             const LATER: i32 = 102;
-            let go =
-                if st.kind == "content" { "Upload them\nThey open fine." } else { "Go ahead\nMake these changes now." };
+            let go = match st.kind.as_str() {
+                "content" => "Upload them\nThey open fine.",
+                "removal" => "Remove\nRemove the copies listed.",
+                _ => "Go ahead\nMake these changes now.",
+            };
             let choices = [
                 (GO, go),
                 (SHOW, "Show the files\nEach item and what would happen to it."),

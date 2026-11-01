@@ -185,6 +185,7 @@ async fn a_long_name_upload_cut_short_can_be_sent_again() {
             Err(std::io::Error::other("changed while read"))
         }
     }
+    impl oneup_exec::Source for CutShort {}
     let mut s = setup();
     s.refresh().await;
     let root = RemoteId(s.vault.root.clone());
@@ -195,4 +196,172 @@ async fn a_long_name_upload_cut_short_can_be_sent_again() {
     s.refresh().await;
     let got = decrypted(&s.pairs, &s.vc, &s.vault.root).await;
     assert_eq!(got.get(&format!("/{long}")), Some(&Some(b"saved".to_vec())), "{got:?}");
+}
+
+/// Keys that don't sign the vault's configuration (remembered keys of a
+/// vault since replaced in OneDrive, or another vault's) stop the view
+/// before anything is read or written with them.
+#[tokio::test]
+async fn keys_that_dont_sign_the_vaults_configuration_are_refused() {
+    let mut s = setup();
+    s.refresh().await;
+    let other = oneup_vaultsync::Vault {
+        key: std::sync::Arc::new(oneup_vault::key::Masterkey::generate().unwrap()),
+        ..s.vault.clone()
+    };
+    let mut cache = oneup_vaultsync::project::Cache::default();
+    assert!(matches!(project(&s.src, &other, &mut cache).await, Err(oneup_vaultsync::Error::WrongKeys)));
+
+    // The vault replaced in OneDrive: a new configuration, signed with new
+    // keys, as a new version of the file.
+    let cfg_id = {
+        let st = s.cloud.0.lock().unwrap();
+        st.child(&s.vault.root, oneup_vault::config::FILE).unwrap()
+    };
+    let new_key = oneup_vault::key::Masterkey::generate().unwrap();
+    let row = {
+        let mut st = s.cloud.0.lock().unwrap();
+        let e = st.bump();
+        let it = st.items.get_mut(&cfg_id).unwrap();
+        it.content = oneup_vault::config::Config::new().unwrap().sign(&new_key).unwrap().into_bytes();
+        it.etag = e;
+        st.row(&cfg_id)
+    };
+    s.listing.lock().unwrap().write(|o| o.upsert_item(&row, false)).unwrap();
+    assert!(matches!(project(&s.src, &s.vault, &mut cache).await, Err(oneup_vaultsync::Error::WrongKeys)));
+
+    // No configuration at all: refused too.
+    s.listing.lock().unwrap().write(|o| o.delete_subtree(&cfg_id).map(|_| ())).unwrap();
+    assert!(project(&s.src, &s.vault, &mut cache).await.is_err());
+}
+
+/// Entries the view now refuses (an authentic name that is a path, a
+/// long-name folder that doesn't match its `name.c9s`) are reported, and
+/// their rows stay: their encrypted items are still listed, and absence
+/// from the view is never taken as a deletion.
+#[tokio::test]
+async fn refused_entries_keep_their_rows_and_produce_no_deletions() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let bad = ["..", "a/b", "", "nul\0byte"];
+    let long = format!("{}.txt", "long name ".repeat(25));
+    for i in 0..bad.len() {
+        s.vc.upload(&root, &format!("f{i}.txt"), None, 1, &mut &b"x"[..]).await.unwrap();
+    }
+    s.vc.upload(&root, &long, None, 4, &mut &b"long"[..]).await.unwrap();
+    let base = s.refresh().await;
+    assert_eq!(base.changed, bad.len() + 1);
+    let ids: Vec<String> = (0..bad.len()).map(|i| s.id(&format!("/f{i}.txt")).0).collect();
+    let long_id = s.id(&format!("/{long}")).0;
+    let before: Vec<RemoteRow> = s.pairs.read(|o| o.all_items()).unwrap().into_iter().map(|(r, _)| r).collect();
+
+    // Renamed at the storage level, by someone holding the key: each file
+    // to the encryption of a refused name, the long name's folder to a
+    // name its name.c9s doesn't hash to.
+    let rename = |s: &Setup, id: &str, name: &str| {
+        let row = {
+            let mut st = s.cloud.0.lock().unwrap();
+            let e = st.bump();
+            let it = st.items.get_mut(id).unwrap();
+            it.name = name.to_string();
+            it.etag = e;
+            st.row(id)
+        };
+        s.listing.lock().unwrap().write(|o| o.upsert_item(&row, false)).unwrap();
+    };
+    for (id, name) in ids.iter().zip(bad) {
+        rename(&s, id, &oneup_vault::names::encrypt_name(&s.vault.key, name, "").unwrap());
+    }
+    rename(&s, &long_id, &oneup_vault::names::shortened("someone else's name.c9r"));
+
+    let mut cache = oneup_vaultsync::project::Cache::default();
+    let p = project(&s.src, &s.vault, &mut cache).await.unwrap();
+    assert_eq!(p.problems.len(), bad.len() + 1, "{:?}", p.problems);
+    let said = |what: &str| p.problems.iter().filter(|m| m.contains(what)).count();
+    assert_eq!(said("isn't a valid file name"), bad.len(), "{:?}", p.problems);
+    assert_eq!(said("doesn't belong to its folder"), 1, "{:?}", p.problems);
+    assert!(
+        p.problems.iter().all(|m| !m.contains("a/b") && !m.contains(long.as_str())),
+        "no decrypted names: {:?}",
+        p.problems
+    );
+    let applied = apply(&mut s.pairs, &s.src, &p).unwrap();
+    assert_eq!((applied.removed, applied.kept), (0, bad.len() + 1));
+    // Every row is still there, unchanged: nothing for the planner to read
+    // as a deletion.
+    let after: Vec<RemoteRow> = s.pairs.read(|o| o.all_items()).unwrap().into_iter().map(|(r, _)| r).collect();
+    assert_eq!(after, before);
+}
+
+/// Where a vault item is, read from its encrypted entry in OneDrive, not
+/// from the last projection: what lets a move here that follows one in the
+/// vault check OneDrive still has the item there (`Cloud::is_at`), so a
+/// projection behind OneDrive can't undo a rename made here since.
+#[tokio::test]
+async fn a_vault_item_is_where_its_encrypted_entry_is() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = format!("{}.txt", "a long name ".repeat(20));
+    let a = RemoteId(s.vc.mkdir(&root, "A").await.unwrap().id);
+    let b = RemoteId(s.vc.mkdir(&root, "B").await.unwrap().id);
+    s.vc.upload(&a, "x.txt", None, 1, &mut &b"x"[..]).await.unwrap();
+    s.vc.upload(&a, &long, None, 1, &mut &b"l"[..]).await.unwrap();
+    s.vc.upload(&b, "z.txt", None, 1, &mut &b"z"[..]).await.unwrap();
+    s.refresh().await;
+    let (x, l) = (s.id("/A/x.txt"), s.id(&format!("/A/{long}")));
+    let at = |id: &RemoteId, dir: &RemoteId, name: &str| {
+        let (id, dir, name) = (id.clone(), dir.0.clone(), name.to_string());
+        let vc = &s.vc;
+        async move { vc.is_at(&id, &dir, &name).await.unwrap() }
+    };
+    assert_eq!(at(&x, &a, "x.txt").await, Some(true));
+    assert_eq!(at(&l, &a, &long).await, Some(true), "a long name, by its .c9s entry");
+    assert_eq!(at(&x, &b, "x.txt").await, Some(false), "another folder");
+    assert_eq!(at(&x, &a, "y.txt").await, Some(false), "another name");
+    assert_eq!(at(&x, &RemoteId("unknown".into()), "x.txt").await, None, "a folder the vault doesn't know");
+
+    // Moved through the vault: where it went, not where it was.
+    let moved = s.vc.move_item(&s.pre("/A/x.txt"), &b, "y.txt").await.unwrap();
+    let x = RemoteId(moved.id);
+    assert_eq!(at(&x, &a, "x.txt").await, Some(false));
+    assert_eq!(at(&x, &b, "y.txt").await, Some(true));
+
+    // Moved in OneDrive behind the projection's back (another device):
+    // the entry says so before any projection does.
+    let elsewhere = s.cloud.0.lock().unwrap().items[&s.id("/B/z.txt").0].parent.clone();
+    let a_storage = s.cloud.0.lock().unwrap().items[&l.0].parent.clone();
+    assert_ne!(elsewhere, a_storage);
+    s.cloud.0.lock().unwrap().items.get_mut(&l.0).unwrap().parent = elsewhere.clone();
+    assert_eq!(at(&l, &a, &long).await, Some(false));
+}
+
+/// Every entry shape is where it is only while it still carries the item:
+/// an entry left behind by a move that changed its shape, holding only its
+/// name, isn't the item. A long-name file without its `contents.c9r`, a
+/// folder (short or long name) without its `dir.c9r`.
+#[tokio::test]
+async fn a_vault_entry_without_its_contents_is_not_the_item() {
+    let mut s = setup();
+    s.refresh().await;
+    let root = RemoteId(s.vault.root.clone());
+    let long = |w: &str| format!("{w} long name ").repeat(20);
+    let a = RemoteId(s.vc.mkdir(&root, "A").await.unwrap().id);
+    s.vc.upload(&a, &long("file"), None, 1, &mut &b"l"[..]).await.unwrap();
+    s.vc.mkdir(&a, "Dir").await.unwrap();
+    s.vc.mkdir(&a, &long("dir")).await.unwrap();
+    s.refresh().await;
+    for (name, payload) in [(long("file"), "contents.c9r"), ("Dir".into(), "dir.c9r"), (long("dir"), "dir.c9r")] {
+        let id = s.id(&format!("/A/{name}"));
+        assert_eq!(s.vc.is_at(&id, &a.0, &name).await.unwrap(), Some(true), "{name}");
+        // What carries it moves out (a move that changed the entry's shape,
+        // whose old entry stayed).
+        {
+            let mut c = s.cloud.0.lock().unwrap();
+            let inside = c.child(&id.0, payload).unwrap_or_else(|| panic!("{name}: no {payload}"));
+            c.items.get_mut(&inside).unwrap().parent = Some(root.0.clone());
+        }
+        assert_eq!(s.vc.is_at(&id, &a.0, &name).await.unwrap(), Some(false), "{name}: only a shell is left");
+    }
 }

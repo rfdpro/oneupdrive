@@ -45,6 +45,7 @@ oneup-exec = { path = "../../crates/oneup-exec" }
 oneup-gate = { path = "../../crates/oneup-gate" }
 oneup-graph = { path = "../../crates/oneup-graph" }
 oneup-hash = { path = "../../crates/oneup-hash" }
+oneup-hooks = { path = "../../crates/oneup-hooks" }
 oneup-ipc = { path = "../../crates/oneup-ipc" }
 oneup-local = { path = "../../crates/oneup-local" }
 oneup-ntfs = { path = "../../crates/oneup-ntfs" }
@@ -71,6 +72,14 @@ time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# The sharing audit's tests run against an in-memory OneDrive's sharing.
+oneup-effects = { path = "../../crates/oneup-effects", features = ["fake"] }
+# Simulated time for the agent's waits (tests only).
+tokio = { version = "1", features = ["test-util"] }
+# Databases of older versions, to check other folders' are only read.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [lints]
 workspace = true

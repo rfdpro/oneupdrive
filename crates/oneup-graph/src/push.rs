@@ -89,9 +89,9 @@ impl Graph {
     }
 }
 
-/// What one text frame means to us.
+/// What one text frame means to us ([`classify`]).
 #[derive(Debug, Clone, PartialEq)]
-enum Frame {
+pub enum Frame {
     /// Engine.IO open; the server pings every `ping` and gives up after
     /// `ping + timeout` without a pong.
     Open {
@@ -111,7 +111,11 @@ enum Frame {
     Other,
 }
 
-fn classify(text: &str) -> Frame {
+/// Reads one Engine.IO text frame as the server sent it. Pure and total:
+/// any text gives a [`Frame`] (unknown or malformed frames are
+/// [`Frame::Other`], an open packet with unreadable JSON gets the protocol's
+/// default timings), which is what lets the fuzz target call it directly.
+pub fn classify(text: &str) -> Frame {
     let mut chars = text.chars();
     match chars.next() {
         Some('0') => {
@@ -148,8 +152,15 @@ fn ws_error(e: tokio_tungstenite::tungstenite::Error) -> Error {
 /// subscription is live and `changed` for every notification. Returns
 /// `Ok` when the server closes the channel normally (the caller asks for a
 /// new endpoint and reconnects), `Err` on a failure, including a server
-/// that goes silent for longer than its own ping deadline.
-pub async fn listen(ep: &Endpoint, mut joined: impl FnMut(), mut changed: impl FnMut()) -> Result<()> {
+/// that goes silent for longer than its own ping deadline. Every message
+/// each way counts on `graph` (and its data budget), as its requests do.
+pub async fn listen(
+    ep: &Endpoint,
+    graph: &crate::Graph,
+    mut joined: impl FnMut(),
+    mut changed: impl FnMut(),
+) -> Result<()> {
+    let sent = |n: usize| graph.count_other(n as u64, 0);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
     let (mut ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ep.ws_url.as_str()))
         .await
@@ -163,6 +174,7 @@ pub async fn listen(ep: &Endpoint, mut joined: impl FnMut(), mut changed: impl F
             Ok(None) => return Ok(()),
             Ok(Some(m)) => m.map_err(ws_error)?,
         };
+        graph.count_other(0, msg.len() as u64);
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => return Ok(()),
@@ -172,9 +184,14 @@ pub async fn listen(ep: &Endpoint, mut joined: impl FnMut(), mut changed: impl F
         match classify(text.as_str()) {
             Frame::Open { ping, timeout } => {
                 silence = ping + timeout;
-                ws.send(Message::text(ep.join_frame())).await.map_err(ws_error)?;
+                let join = ep.join_frame();
+                sent(join.len());
+                ws.send(Message::text(join)).await.map_err(ws_error)?;
             }
-            Frame::Ping => ws.send(Message::text("3")).await.map_err(ws_error)?,
+            Frame::Ping => {
+                sent(1);
+                ws.send(Message::text("3")).await.map_err(ws_error)?;
+            }
             Frame::Joined => joined(),
             Frame::Event => changed(),
             Frame::Refused => return Err(Error::Push("the push channel refused the subscription".into())),

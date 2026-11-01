@@ -22,14 +22,14 @@ pub struct LocalId(pub u128);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RemoteId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     File,
     Folder,
 }
 
 /// One Synced row: what both sides last agreed on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Base {
     pub sid: Sid,
     /// Agreed parent; `None` only for [`ROOT`].
@@ -120,6 +120,12 @@ pub trait Trees {
     fn base(&self, sid: Sid) -> Result<Option<Base>, Self::Error>;
     /// Synced rows whose agreed parent is `sid`.
     fn base_children(&self, sid: Sid) -> Result<Vec<Base>, Self::Error>;
+    /// Synced rows whose agreed parent is `parent` and whose name is `name`
+    /// as Windows compares names ([`same_name`]). The default reads every
+    /// child; a backend with an index on names reads only the matches.
+    fn base_named(&self, parent: Sid, name: &str) -> Result<Vec<Base>, Self::Error> {
+        Ok(self.base_children(parent)?.into_iter().filter(|b| same_name(&b.name, name)).collect())
+    }
     fn base_by_local(&self, id: LocalId) -> Result<Option<Base>, Self::Error>;
     fn base_by_remote(&self, id: &RemoteId) -> Result<Option<Base>, Self::Error>;
 
@@ -172,6 +178,17 @@ pub trait Trees {
         Ok(false)
     }
 
+    /// Whether local folder `id` has a file named `name` (as Windows
+    /// compares names). The default reads the folder; a backend with an
+    /// index on names overrides it, so one lookup costs one lookup.
+    fn local_has_file(&self, id: LocalId, name: &str) -> Result<bool, Self::Error> {
+        self.any_local_child(id, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, name)))
+    }
+    /// [`Self::local_has_file`] for a cloud folder.
+    fn remote_has_file(&self, id: &RemoteId, name: &str) -> Result<bool, Self::Error> {
+        self.any_remote_child(id, &mut |c| Ok(c.kind == NodeKind::File && same_name(&c.name, name)))
+    }
+
     /// Whether Synced folder `sid` has any child rows.
     fn has_base_children(&self, sid: Sid) -> Result<bool, Self::Error> {
         self.any_base_child(sid, &mut |_| Ok(true))
@@ -203,6 +220,16 @@ pub fn fold(name: &str) -> String {
     name.chars().map(fold_char).collect()
 }
 
+/// Whether `a` and `b` are one name (or path), as [`fold`] compares them,
+/// without building either folded string.
+pub fn same_name(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        // What the fold does to ASCII, without a character at a time.
+        return a.eq_ignore_ascii_case(b);
+    }
+    a.chars().map(fold_char).eq(b.chars().map(fold_char))
+}
+
 /// [`fold`] for one character.
 pub fn fold_char(c: char) -> char {
     let mut up = c.to_uppercase();
@@ -228,7 +255,9 @@ pub fn strip_folded_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// A Synced row's local side as it is now. A detached row is "deleted":
-/// the executor itself removed the link, which is evidence.
+/// the executor itself removed the link, which is evidence. (Only a
+/// conflict copy detaches a row, renaming the file aside, so the planner
+/// brings the cloud's side back rather than deleting it: `merge::local_gone`.)
 pub fn local_of<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Seen<LocalNode>, T::Error> {
     match b.local {
         Some(id) => t.local(id),
@@ -277,6 +306,24 @@ mod tests {
         assert_eq!(strip_folded_prefix("/\u{212A}/a", "/k"), None, "the Kelvin sign isn't k");
         assert_eq!(strip_folded_prefix("/a", "/a/b"), None);
         assert_eq!(strip_folded_prefix("/a", ""), Some("/a"));
+    }
+
+    #[test]
+    fn same_name_agrees_with_comparing_folded_names() {
+        for (a, b) in [
+            ("Report.DOCX", "report.docx"),
+            ("ΟΔΟΣ", "οδος"),
+            ("οδος", "οδοσ"),
+            ("\u{212A}it", "kit"),
+            ("İx", "ix"),
+            ("ß", "SS"),
+            ("a", "ab"),
+            ("", ""),
+        ] {
+            assert_eq!(same_name(a, b), fold(a) == fold(b), "{a} {b}");
+        }
+        assert!(same_name("ΟΔΟΣ", "οδος"));
+        assert!(!same_name("\u{212A}it", "kit"), "the Kelvin sign isn't k");
     }
 
     #[test]

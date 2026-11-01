@@ -72,6 +72,34 @@ pub async fn answer(data_dir: &Path, code: u64, answer: Answer) -> Result<()> {
     }
 }
 
+/// `oneup offline on|off`.
+pub async fn offline(data_dir: &Path, on: bool) -> Result<()> {
+    match call(data_dir, Call::Offline { on }).await {
+        Ok(_) if on => {
+            println!("Working offline: changes wait until `oneup offline off`; files you open still download.");
+            Ok(())
+        }
+        Ok(_) => {
+            println!("Back online: what waited syncs now.");
+            Ok(())
+        }
+        Err(ClientError::NotRunning) => Err(not_running("there's nothing to take offline")),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `oneup network allow-more`: `mb` more this month on the data budget.
+pub async fn allow_data(data_dir: &Path, mb: u64) -> Result<()> {
+    match call(data_dir, Call::AllowData { mb }).await {
+        Ok(_) => {
+            println!("Allowed {mb} MB more this month on this network.");
+            Ok(())
+        }
+        Err(ClientError::NotRunning) => Err(not_running("there is no budget in use to add to")),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn sync_now(data_dir: &Path, first: Option<String>) -> Result<()> {
     let c = match &first {
         Some(path) => Call::SyncFirst { path: path.clone() },
@@ -272,9 +300,61 @@ fn print_status(s: &Status) {
         println!("  paused            {what}{until}  (`oneup resume`)");
     }
     if let Some(why) = &s.auto_pause {
+        let why = oneup_app::autopause::said(why, s.auto_pause_hours.as_deref(), oneup_app::l10n::current());
         println!("  paused by itself  {why}; resumes when that ends (`oneup settings` to change this)");
     }
-    println!("  OneDrive changes  {}", if s.push { "notified as they happen" } else { "checked on a timer" });
+    if let Some(n) = &s.network
+        && !n.profile.is_empty()
+    {
+        let name = if n.name.is_empty() { "this network" } else { n.name.as_str() };
+        let metered = if n.metered { ", metered" } else { "" };
+        let profile = match n.profile.as_str() {
+            "own" => "its own settings",
+            "metered" => "the metered profile",
+            _ => "the default profile",
+        };
+        println!("  network           {name}{metered}: {} ({profile}; `oneup network`)", n.transfer);
+    }
+    if s.network.as_ref().is_some_and(|n| n.offline) {
+        println!("  offline           your choice; changes wait  (`oneup offline` lists them, `oneup offline off`)");
+    }
+    if s.network.as_ref().is_some_and(|n| n.link == "poor") {
+        println!("  connection        poor: fewer requests at once, smaller upload pieces, longer waits");
+    }
+    if let Some(d) = s.network.as_ref().and_then(|n| n.data.as_ref()) {
+        let budget = if d.budget > 0 { format!(" of {}", size(d.budget)) } else { String::new() };
+        let reached = if d.reached { "; used up (`oneup network allow-more`)" } else { "" };
+        println!(
+            "  data this month   {}{budget}: {} up, {} down{reached}",
+            size(d.up + d.down),
+            size(d.up),
+            size(d.down)
+        );
+    }
+    if let Some(w) = s.network.as_ref().and_then(|n| n.waiting.as_ref()) {
+        println!(
+            "  waiting           {} files ({}): {}  (`oneup network waiting` lists them)",
+            w.count,
+            size(w.bytes),
+            w.why
+        );
+    }
+    let interval = s.network.as_ref().map_or(0, |n| n.interval_min);
+    println!(
+        "  OneDrive changes  {}",
+        match (s.push, interval) {
+            (true, _) => "notified as they happen",
+            (false, 0) => "checked on a timer",
+            (false, _) => "checked with each pass",
+        }
+    );
+    if interval > 0 {
+        let next = s.network.as_ref().and_then(|n| n.next_ms).map(|t| format!("; next in {}", remaining(t)));
+        println!(
+            "  sync interval     every {interval} min{}  (`oneup settings --sync-interval`)",
+            next.unwrap_or_default()
+        );
+    }
     if let Some(c) = s.checked_ms {
         println!("  last check        {}", ago(c));
     }
@@ -299,6 +379,13 @@ fn print_status(s: &Status) {
             remaining(r.next_ms)
         );
     }
+    for d in &s.databases {
+        let label = if d.why == "live" { "database" } else { "waiting" };
+        println!("  {label:<17} {}: {}", d.path, oneup_app::databases::detail(d));
+    }
+    if s.databases_more > 0 {
+        println!("  waiting           {} more databases (`oneup activity` lists them)", s.databases_more);
+    }
     for st in &s.safety_stops {
         let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
         let earlier =
@@ -306,7 +393,9 @@ fn print_status(s: &Status) {
         println!(
             "  SAFETY STOP       {} items {side} would be deleted, overwritten or moved{earlier} ({} are synced).\n                    \
              If that's what you meant: `oneup approve {}`",
-            st.count, st.synced_items, st.code
+            st.items(),
+            st.synced_items,
+            st.code
         );
     }
     if let Some(o) = &s.overflow

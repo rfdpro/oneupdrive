@@ -3,13 +3,14 @@
 //! OneDrive item, its versions (list, open a copy, restore one), and
 //! sharing links.
 //!
-//! Restoring a version changes the file in OneDrive: the old version is
-//! downloaded and sent as a new version, conditional on the file's current
-//! eTag (`If-Match`), and checked by its hash. The version it replaces
-//! stays in the history. (Graph's own `restoreVersion` ignores `If-Match`
-//! on OneDrive Personal, measured with `oneup dev-remote restore-check`,
-//! so it isn't used.) This PC gets the restored content by
-//! syncing, through the safety gate as any change from OneDrive. Opening a version writes a copy outside the synced
+//! Restoring a version is asked of the agent (`crate::restores`): its
+//! next round downloads the old version and sends it as a new version,
+//! conditional on the eTag the file had when asked (`If-Match`), and checks
+//! it by its hash. The version it replaces stays in the history. (Graph's
+//! own `restoreVersion` ignores `If-Match` on OneDrive Personal, measured
+//! with `oneup dev-remote restore-check`, so it isn't used.) This PC gets
+//! the restored content by syncing, through the safety gate as any change
+//! from OneDrive. Opening a version writes a copy outside the synced
 //! folder. Nothing here works inside an encrypted vault (OneDrive's
 //! versions and links there are of encrypted files).
 
@@ -57,7 +58,7 @@ impl Item {
             let row = store
                 .read(|o| o.local_children(id))?
                 .into_iter()
-                .find(|c| c.name.eq_ignore_ascii_case(part))
+                .find(|c| oneup_sync::same_name(&c.name, part))
                 .with_context(|| format!("/{rel} isn't known to OneUpDrive yet"))?;
             folder = row.kind != oneup_store::LocalKind::File;
             id = row.file_id;
@@ -149,62 +150,19 @@ pub async fn open_version(path: &Path, version: &str, label: &str) -> Result<Pat
     Ok(to)
 }
 
-/// Makes version `version` the file's current one in OneDrive (see the
-/// module docs).
-pub async fn restore_version(path: &Path, version: &str) -> Result<()> {
-    use oneup_exec::Cloud as _;
+/// Asks the agent to make version `version` the file's current one in
+/// OneDrive (see the module docs). Returns the data folder, whose agent
+/// the caller nudges.
+pub fn restore_version(path: &Path, version: &str) -> Result<PathBuf> {
     let it = Item::at(path)?;
     crate::setup::require_test_account(&it.dir)?;
     if it.folder {
         bail!("folders have no versions");
     }
-    let graph = it.graph()?;
-    let now = graph.item(&it.remote).await?.context("it's no longer in OneDrive")?;
-    let etag = now.e_tag.clone().context("OneDrive gave no version tag")?;
-    let parent = now.parent_id().context("it has no folder in OneDrive")?.to_string();
-    let name = now.name.clone().context("it has no name in OneDrive")?;
-    // Downloaded into the data folder (OneUpDrive's own), never the synced one.
-    let staged = it.dir.join(format!("restore-{}.tmp", std::process::id()));
-    let result = async {
-        let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&staged)?;
-        let mut hashing = HashingWrite { inner: &mut f, hash: oneup_hash::QuickXorHash::new() };
-        let len = graph.download_version(&it.remote, version, &mut hashing).await?;
-        let hash = hashing.hash.finalize();
-        std::io::Seek::rewind(&mut f)?;
-        let size = i64::try_from(len)?;
-        let pre = oneup_sync::RemotePre { id: oneup_sync::RemoteId(it.remote.clone()), etag };
-        let cloud = oneup_exec::GraphCloud::new(Arc::clone(&graph));
-        let (row, _) = cloud.upload(&oneup_sync::RemoteId(parent), &name, Some(&pre), size, &mut f).await.map_err(
-            |e| match e {
-                oneup_exec::CloudError::Changed => anyhow::anyhow!("it changed in OneDrive meanwhile; look again"),
-                e => anyhow::anyhow!("{e}"),
-            },
-        )?;
-        if row.qxh != Some(hash) || row.size != size {
-            bail!("OneDrive's copy doesn't match the version sent; look at the file's versions again");
-        }
-        Ok(())
-    }
-    .await;
-    let _ = std::fs::remove_file(&staged);
-    result
-}
-
-/// Hashes what's written through it.
-struct HashingWrite<'a> {
-    inner: &'a mut std::fs::File,
-    hash: oneup_hash::QuickXorHash,
-}
-
-impl std::io::Write for HashingWrite<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.hash.update(&buf[..n]);
-        Ok(n)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
+    let mut store = crate::setup::open_store(&it.dir, 1024)?;
+    let id = oneup_sync::RemoteId(it.remote.clone());
+    crate::restores::version(&mut store, &id, version, &format!("/{}", it.rel))?;
+    Ok(it.dir)
 }
 
 /// The Office program for a file name (Microsoft's Office URI schemes),

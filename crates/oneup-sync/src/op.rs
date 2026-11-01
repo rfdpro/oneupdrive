@@ -7,9 +7,10 @@
 //! again, from fresh state, in the next round.
 
 use crate::model::{Base, Hash, LocalId, NodeKind, RemoteId, Sid};
+use crate::rewind::Step;
 
 /// A local item must still be exactly this when the operation runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalPre {
     pub id: LocalId,
     /// `(size, last-write time)` for files. `None` for folders, whose
@@ -18,14 +19,14 @@ pub struct LocalPre {
 }
 
 /// A cloud item must still have this eTag when the operation runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RemotePre {
     pub id: RemoteId,
     pub etag: String,
 }
 
 /// How a created or transferred item is recorded in the Synced tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Link {
     /// A new Synced row.
     New,
@@ -35,7 +36,7 @@ pub enum Link {
 }
 
 /// Why an item is left alone and reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HoldReason {
     /// Gone from one side without evidence of deletion. Never acted on.
     MissingWithoutEvidence,
@@ -48,6 +49,58 @@ pub enum HoldReason {
     OneWay,
 }
 
+/// The copy that stays when a duplicate is removed ([`Op::RemoveCopy`]):
+/// it must still be exactly this when the removal runs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Keep {
+    /// A file in OneDrive, by ID and eTag.
+    Remote(RemotePre),
+    /// A file only on this PC, by ID and stamp.
+    Local(LocalPre),
+}
+
+impl Keep {
+    /// The item it is, on its side.
+    pub fn item(&self) -> Vacates {
+        match self {
+            Keep::Remote(r) => Vacates::Remote(r.id.clone()),
+            Keep::Local(l) => Vacates::Local(l.id),
+        }
+    }
+}
+
+/// The folders a copy is in ([`Op::RemoveCopy`]), each by ID and name: its
+/// own first, then each one above, up to its tree's root (the synced
+/// folder here, the drive's root in OneDrive), which isn't listed. With
+/// the copy's name, the full path the user was shown ([`Up::path`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Up<I>(pub Vec<(I, String)>);
+
+impl<I> Default for Up<I> {
+    fn default() -> Self {
+        Up(Vec::new())
+    }
+}
+
+impl<I> Up<I> {
+    /// The path of `name` in these folders from the root: "/A/B/name".
+    pub fn path(&self, name: &str) -> String {
+        let mut p = String::new();
+        for (_, n) in self.0.iter().rev() {
+            p.push('/');
+            p.push_str(n);
+        }
+        p.push('/');
+        p.push_str(name);
+        p
+    }
+
+    /// The folders' IDs.
+    pub fn ids(&self) -> impl Iterator<Item = &I> {
+        self.0.iter().map(|(id, _)| id)
+    }
+}
+
 /// A folder on one side, used to describe where an operation needs a free name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Dir {
@@ -55,7 +108,7 @@ pub enum Dir {
     Remote(RemoteId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Op {
     // ------------------------------------------------ bookkeeping (no I/O
     // on user content)
@@ -174,6 +227,29 @@ pub enum Op {
         sid: Sid,
         local: LocalPre,
     },
+    /// Remove a duplicate copy the user chose (`oneup_exec::dupes`); never
+    /// planned by the reconciler. OneDrive's copy (`remote`) goes to its
+    /// recycle bin under `If-Match`, then the copy here (`local`) to the
+    /// version store, its content checked against `hash` under an exclusive
+    /// handle. Each only where the user was shown it: named `name`, in
+    /// folder `local_dir` here and `remote_dir` in OneDrive, at the full
+    /// path its folders `local_up` and `remote_up` make ([`Up`]), so a
+    /// folder above it moved or renamed meanwhile leaves it alone. `sid`:
+    /// the Synced row linking both (a synced file). Runs only while `keep`,
+    /// a copy of the same content that stays, is still there as chosen:
+    /// checked just before acting.
+    RemoveCopy {
+        sid: Option<Sid>,
+        remote: Option<RemotePre>,
+        remote_dir: Option<RemoteId>,
+        remote_up: Up<RemoteId>,
+        local: Option<LocalPre>,
+        local_dir: Option<LocalId>,
+        local_up: Up<LocalId>,
+        name: String,
+        hash: Hash,
+        keep: Keep,
+    },
     /// Free the content of a placeholder the user set to "Free up space"
     /// (Files On-Demand), keeping the placeholder. Never planned by the
     /// reconciler. Only if its content still hashes to `hash` and that is
@@ -188,15 +264,30 @@ pub enum Op {
     /// rows at and below it, deepest first, dropped *before* the deletion so
     /// that re-including the item later uploads the local copy instead of
     /// reading the cloud deletion as one to bring to this PC. `items`: how
-    /// many items it holds, at least 1 (what the circuit breakers count).
-    /// `keep`: the local copy, deepest first, every item of which must still
-    /// be here with all its content, or nothing is done: a cloud copy is
-    /// only removed once it's here.
+    /// many items it holds, at least 1 (what the circuit breakers count);
+    /// `exact`: whether that's all of them. A folder never listed in full
+    /// (skipped by name, or holding one that was) has only a lower bound,
+    /// and deleting it deletes everything in it, so the safety gate always
+    /// stops for it. `keep`: the local copy, deepest first, every item of
+    /// which must still be here with all its content, or nothing is done: a
+    /// cloud copy is only removed once it's here.
     PruneRemote {
         remote: RemotePre,
         forget: Vec<Sid>,
         items: u64,
+        exact: bool,
         keep: Vec<LocalPre>,
+    },
+
+    /// One step of rewinding a folder to an earlier moment (never
+    /// planned by the reconciler, see [`crate::rewind`]). It changes
+    /// OneDrive (or sets this PC's copy aside) and leaves the Synced tree
+    /// alone, so the next round brings this PC along. `sid`: the Synced
+    /// item it concerns (for a restore, the record the item had).
+    Rewind {
+        sid: Sid,
+        /// Boxed: the largest step would make every operation larger.
+        step: Box<Step>,
     },
 
     /// Leave alone and report.
@@ -223,6 +314,12 @@ impl Op {
             }
             Op::MoveLocal { to, name, .. } => Some((Dir::Local(*to), name)),
             Op::RenameLocal { dir, name, .. } | Op::ConflictCopy { dir, name, .. } => Some((Dir::Local(*dir), name)),
+            Op::Rewind { step, .. } => match &**step {
+                Step::Restore { to, name, .. } | Step::Reset { place: Some((to, name)), .. } => {
+                    Some((Dir::Remote(to.clone()), name))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -250,10 +347,21 @@ impl Op {
             | Op::RenameLocal { local, .. }
             | Op::ConflictCopy { local, .. }
             | Op::RecycleLocal { local, .. } => Some(Vacates::Local(local.id)),
+            // OneDrive's copy goes first; one only here, from this PC.
+            Op::RemoveCopy { remote: Some(r), .. } => Some(Vacates::Remote(r.id.clone())),
+            Op::RemoveCopy { local: Some(l), .. } => Some(Vacates::Local(l.id)),
+            Op::RemoveCopy { .. } => None,
             Op::MoveRemote { remote, .. }
             | Op::RenameRemote { remote, .. }
             | Op::DeleteRemote { remote, .. }
             | Op::PruneRemote { remote, .. } => Some(Vacates::Remote(remote.id.clone())),
+            Op::Rewind { step, .. } => match &**step {
+                Step::SetAside { local, .. } | Step::Discard { local, .. } => Some(Vacates::Local(local.id)),
+                Step::Reset { remote, place: Some(_), .. } | Step::Remove { remote, .. } => {
+                    Some(Vacates::Remote(remote.id.clone()))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -268,6 +376,7 @@ impl Op {
             | Op::ConflictCopy { .. }
             | Op::MoveRemote { .. }
             | Op::RenameRemote { .. } => self.vacates(),
+            Op::Rewind { step, .. } if matches!(&**step, Step::Reset { place: Some(_), .. }) => self.vacates(),
             _ => None,
         }
     }
@@ -297,6 +406,17 @@ impl Op {
             Op::RenameLocal { local, .. } => (None, l(local), None),
             Op::PruneRemote { remote, .. } | Op::RenameRemote { remote, .. } => (None, None, r(remote)),
             Op::Dehydrate { local, .. } => (None, l(local), None),
+            Op::RemoveCopy { sid, remote, local, .. } => {
+                (*sid, local.as_ref().and_then(l), remote.as_ref().and_then(r))
+            }
+            Op::Rewind { sid, step } => match &**step {
+                Step::Restore { id, .. } => (Some(*sid), None, Some(id.clone())),
+                Step::Reset { remote, .. } | Step::Remove { remote, .. } => (Some(*sid), None, r(remote)),
+                Step::SetAside { local, .. } | Step::Discard { local, .. } => (Some(*sid), l(local), None),
+                Step::Forget => (Some(*sid), None, None),
+                Step::RestoreKept { .. } => (None, None, None),
+                Step::RevertTo { remote, .. } => (None, None, r(remote)),
+            },
             Op::Hold { sid, local, remote, .. } => (*sid, *local, remote.clone()),
         }
     }
@@ -304,16 +424,38 @@ impl Op {
     /// Whether the operation changes anything on this PC: content, names or
     /// places (bookkeeping and hashing don't).
     pub fn changes_local(&self) -> bool {
-        matches!(
-            self,
-            Op::Download { .. }
-                | Op::MkdirLocal { .. }
-                | Op::MoveLocal { .. }
-                | Op::RenameLocal { .. }
-                | Op::ConflictCopy { .. }
-                | Op::RecycleLocal { .. }
-                | Op::Dehydrate { .. }
-        )
+        match self {
+            Op::Rewind { step, .. } => {
+                matches!(
+                    &**step,
+                    Step::SetAside { .. } | Step::Forget | Step::Discard { .. } | Step::RestoreKept { .. }
+                )
+            }
+            _ => matches!(
+                self,
+                Op::Download { .. }
+                    | Op::MkdirLocal { .. }
+                    | Op::MoveLocal { .. }
+                    | Op::RenameLocal { .. }
+                    | Op::ConflictCopy { .. }
+                    | Op::RecycleLocal { .. }
+                    | Op::RemoveCopy { local: Some(_), .. }
+                    | Op::Dehydrate { .. }
+            ),
+        }
+    }
+
+    /// A rewind step for Synced item `sid`.
+    pub fn rewind(sid: Sid, step: Step) -> Op {
+        Op::Rewind { sid, step: Box::new(step) }
+    }
+
+    /// The rewind step this operation is, if it is one.
+    pub fn rewind_step(&self) -> Option<&Step> {
+        match self {
+            Op::Rewind { step, .. } => Some(step),
+            _ => None,
+        }
     }
 
     /// Whether the operation changes anything (bookkeeping included); holds

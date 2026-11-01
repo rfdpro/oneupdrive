@@ -7,12 +7,14 @@ While OneUpDrive runs, its icon (a blue cloud lifted one step above its base) si
 |---|---|
 | Blue icon | Up to date |
 | Blue icon, dark blue badge with a ring | Syncing |
-| Grey icon, pause badge | Paused, by you or by itself (on a metered connection, with battery saver on, during a game or presentation, in quiet hours) |
+| Grey icon, pause badge | Paused, by you or by itself (on a metered connection, with battery saver on, during a game or presentation, in quiet hours, with a network's data budget used up, or waiting for the internet) |
 | Blue icon, yellow **!** | Needs your review: something waits for your decision |
 | Blue icon, red **!** | A problem: OneUpDrive retries by itself, or stopped (see [When something goes wrong](troubleshooting.md)) |
 | Faded grey icon | OneUpDrive isn't running |
 
-Point at the icon to see the same in words, for example "OneUpDrive: Paused: battery saver is on".
+Point at the icon to see the same in words, for example "OneUpDrive: Paused: battery saver is on". Screen readers read the same words.
+
+From the keyboard: Win+B goes to the taskbar corner, the arrow keys to the icon, and Enter, Space or the menu key opens its menu.
 
 "Up to date · 12 items failed" (in the tooltip; the menu shows **Sync failure: 12 items**) means everything else is synced, and 12 items need you to change something before they can be (see [What can't sync](syncing.md#what-cant-sync)). The icon stays blue: trying again wouldn't help, so OneUpDrive isn't stuck on them.
 
@@ -32,12 +34,15 @@ Below it, grouped:
 * **Open folder**: your synced folder in File Explorer.
 * **Sync now**: check both sides for changes straight away.
 * **Pause** for 30 minutes, 2 hours, 8 hours or until you resume, and **Resume**.
+* **Work offline** and **Go back online**: see [Slow and metered connections](slow-and-metered-networks.md#work-offline).
+* **Allow 500 MB more**, when a network's monthly data budget is used up (a notification tells you when it is).
 * **Recent activity**: what OneUpDrive did lately, on the settings window's [Activity page](settings-window.md#activity).
 * **Error details…** appears with a problem ("Problem: …" or "Stopped: …" at the top): it opens the settings window's problem card, with what happened, what to do, **Retry now** and **Copy details**. See [When something goes wrong](troubleshooting.md).
 * **Review …** and **Possibly encrypted: … files** appear when something needs your review (below).
 * **Excluded, in OneDrive: …** appears when excluded items still have copies in OneDrive: **Show list**, or **Remove or keep…** (below).
 * **Sync failure: … items** appears when some items can't sync until you change them: it opens the Activity page, which lists each one and why.
 * **Install update …** when an update is ready.
+* **Search**: find any file in your OneDrive by name, on the settings window's [Search page](search.md).
 * **Settings**: the [settings window](settings-window.md).
 * **Stop OneUpDrive**, or **Start OneUpDrive** when it isn't running.
 * **Hide icon**: syncing carries on. Starting OneUpDrive from the Start menu brings it back.
@@ -45,8 +50,8 @@ Below it, grouped:
 ## When OneUpDrive waits for you
 It shows a notification once when it needs a decision. Click the notification, or the matching menu entry:
 * **Files may be encrypted** (the ransomware guard): edited files look encrypted, the way ransomware leaves them. They were **not** uploaded. Open a few: if they don't open, choose **Not now**, disconnect the PC from the network and get help; OneDrive still has the good versions. If they open fine (you really did convert them), **Upload them**.
-* **A safety stop:** many files would be deleted, overwritten or moved at once. Nothing changes until you answer. **Show the files** shows every item and what would happen to it on the Activity page (pressing Enter does this too), then asks again. **Go ahead** carries them out, and the icon stops saying it's waiting at once, even if a large batch takes a while. **Not now** leaves everything as it is, and OneUpDrive keeps waiting.
-* **The version store is full:** files removed in OneDrive don't fit in the room kept for copies on this PC. **Yes** removes them here and keeps copies anyway, **No** removes them without a copy (you're asked once more), **Cancel** decides later. Until then they stay on your PC, untouched.
+* **A safety stop:** many files would be deleted, overwritten or moved at once. Nothing changes until you answer. **Show the files** shows every item and what would happen to it on the Activity page (pressing Enter does this too), then asks again. **Go ahead** carries out exactly the items listed, and the icon stops saying it's waiting at once, even if a large batch takes a while. Anything else that comes up later gets its own stop. **Not now** leaves everything as it is, and OneUpDrive keeps waiting.
+* **The version store is full:** files removed in OneDrive don't fit in the room for kept copies on this PC (**Safety → Kept copies**). **Yes** removes them here and keeps copies anyway, **No** removes them without a copy (you're asked once more), **Cancel** decides later. Until then they stay on your PC, untouched.
 * **Left-out items still in OneDrive**:
   * **Delete from OneDrive** first downloads anything that isn't fully on your PC, then deletes them from OneDrive: they go to OneDrive's recycle bin (kept there for 30 days, less if it fills up) and are no longer on your other devices or on the web. The copies on your PC stay. You're then asked whether to do this automatically from now on.
   * **Keep in OneDrive** (what Enter chooses) leaves them there for good: a change made in OneDrive still comes to this PC, but nothing you change here is sent. You aren't asked about these items again, also after a restart. Items you exclude later are asked about anew.
@@ -55,6 +60,6 @@ It shows a notification once when it needs a decision. Click the notification, o
 It also tells you if OneUpDrive stopped when nobody asked it to. Pausing by itself (a game, battery saver) only changes the icon, since that comes and goes often.
 
 ## Starting and hiding it
-The icon starts with OneUpDrive, from the Start menu or at sign-in (**General → Start OneUpDrive when I sign in**). One icon shows per synced folder pair. **General → Show the OneUpDrive icon** turns it off for good.
+The icon starts with OneUpDrive, from the Start menu or at sign-in (**General → Start with Windows**). One icon shows per account. **General → Show the icon in the taskbar corner** turns it off for good.
 
 The icon is only a window onto the background agent: closing it, or the icon crashing, never stops or changes syncing.

@@ -31,8 +31,8 @@ use anyhow::{Context, Result, bail};
 use oneup_effects::LocalFs;
 use oneup_exec::{Cloud, Executor, GraphCloud, Report, Skip, link_roots};
 use oneup_gate::{
-    Approval, Approved, Breaker, BreakerKind, Choice, Context as GateContext, Decision, Fingerprint, OldCopy, Overflow,
-    OverflowOutcome, Recent, Side, Withheld, is_mass_sensitive, review_in, store_bytes,
+    Approval, Approved, Breaker, BreakerKind, Choice, Context as GateContext, Decision, Fingerprint, ItemKey, OldCopy,
+    Overflow, OverflowOutcome, Recent, Side, Withheld, is_mass_sensitive, review_in, store_bytes,
 };
 use oneup_graph::Graph;
 use oneup_ipc::Progress;
@@ -101,6 +101,46 @@ pub struct Controls {
     /// The pause as it changes while a round runs (the agent's; `None`:
     /// nothing pauses mid-round).
     pub live: Option<Arc<crate::control::LivePause>>,
+    /// What the network's profile lets through (`crate::network`).
+    pub net: crate::network::Policy,
+}
+
+/// Before a kept file of `size` bytes downloads (`pinrules::fetch_pass`):
+/// unless `paused` (a pause, or a network that holds contents, which stops
+/// the pass), a file larger than the data budget has left
+/// (`net.budget_left`, less what this pass already let through, `allowed`)
+/// waits, not started, while smaller ones may go; otherwise `rest`
+/// decides (the pause, then the disk and the pass's share), and what it
+/// lets through counts.
+pub(crate) fn pin_may(
+    net: &crate::network::Policy,
+    paused: bool,
+    allowed: &std::sync::atomic::AtomicU64,
+    size: u64,
+    rest: impl FnOnce() -> std::result::Result<(), oneup_exec::placement::Stop>,
+) -> std::result::Result<(), oneup_exec::placement::Stop> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !paused
+        && let Some(left) = net.budget_left
+        && left.saturating_sub(allowed.load(Relaxed)) < size
+    {
+        return Err(oneup_exec::placement::Stop::Budget);
+    }
+    rest()?;
+    allowed.fetch_add(size, Relaxed);
+    Ok(())
+}
+
+/// What the network lets the executor download besides a round's planned
+/// operations (an edit an upload went over, `Executor::set_may_fetch`):
+/// the agent's policy as it changes mid-round, or the round's.
+fn may_fetch(c: &Controls) -> oneup_exec::FetchCheck {
+    use crate::network::Way;
+    let (fixed, live) = (c.net.clone(), c.live.clone());
+    Arc::new(move |bytes| match &live {
+        Some(l) => l.allows(Way::Down, bytes),
+        None => fixed.allows(Way::Down, bytes),
+    })
 }
 
 /// Who the messages are for: `oneup sync` takes answers on its next run,
@@ -169,10 +209,8 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
     // A new pairing of the OneDrive app's old folder keeps the choices made
     // there (`crate::carryover`), before anything is listed or planned.
     let mut carried = false;
-    if !opts.dry_run
-        && store.read(|o| o.meta_get(KEY_LOCAL))?.is_none()
-        && let Some(said) = crate::carryover::apply(&opts.data_dir, &mut store, &opts.local, &opts.remote)?
-    {
+    let new_pair = !opts.dry_run && store.read(|o| o.meta_get(KEY_LOCAL))?.is_none();
+    if new_pair && let Some(said) = crate::carryover::apply(&opts.data_dir, &mut store, &opts.local, &opts.remote)? {
         println!("{said}");
         carried = true;
     }
@@ -180,6 +218,11 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
     if carried {
         // Paired now: the app's choices are used.
         crate::carryover::mark_applied(&opts.data_dir)?;
+    }
+    if new_pair && let Some(said) = crate::appleftovers::after_move_over(&opts.data_dir, &opts.local) {
+        // The OneDrive app's folder is OneUpDrive's now: what the app left
+        // in the registry goes.
+        println!("{said}");
     }
     if opts.pair_only {
         println!("Ready: the background agent does the syncing from here.");
@@ -195,10 +238,16 @@ pub async fn run(mut store: Store, graph: Arc<Graph>, rules: ExcludeSet, opts: &
             &mut Recent::default(),
             opts.max_rounds,
             &|_| {},
+            None,
         )
         .await?;
     if let Some(o) = &out.overflow {
         print_overflow(o, &store, Asker::Sync)?;
+    }
+    if out.end != End::Stopped {
+        // Removing chosen duplicates, or a rewind waiting for its approval,
+        // waits without stopping the rest.
+        print_breakers(&out.breakers, Asker::Sync);
     }
     match out.end {
         End::Stopped => {
@@ -326,6 +375,7 @@ async fn prepare(
     let first_use = store.read(|o| o.meta_get(KEY_MARKER))?.is_none();
     let mut fs = LocalFs::open(Path::new(&root.path), root.volume_serial, root.root_file_id, &token, first_use)
         .context("opening the sync folder")?;
+    locate_from(&mut fs, &store)?;
     store.write(|o| o.meta_set(KEY_MARKER, "1"))?;
     if opts.on_demand && !fs.on_demand() {
         // Before any round, so nothing is downloaded in full on the way.
@@ -397,8 +447,24 @@ pub fn open_paired(store: &Store) -> Result<LocalFs> {
     }
     let token = store.read(|o| o.meta_get(KEY_TOKEN))?.context("pairing token missing")?;
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
-    LocalFs::open(Path::new(&root.path), root.volume_serial, root.root_file_id, &token, false)
-        .context("opening the sync folder")
+    let mut fs = LocalFs::open(Path::new(&root.path), root.volume_serial, root.root_file_id, &token, false)
+        .context("opening the sync folder")?;
+    locate_from(&mut fs, store)?;
+    Ok(fs)
+}
+
+/// Lets the effects find items where the Local tree has them
+/// (`LocalFs::set_locator`), through a database connection of their own:
+/// they run on the executor's tasks, which don't hold the engine's.
+fn locate_from(fs: &mut LocalFs, store: &Store) -> Result<()> {
+    if let Some(reader) = store.reopen(256)? {
+        let reader = std::sync::Mutex::new(reader);
+        fs.set_locator(Box::new(move |id| {
+            let reader = reader.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            reader.read(|o| o.local_path_of(id.0)).ok().flatten()
+        }));
+    }
+    Ok(())
 }
 
 /// The executor stopped a round because something is fundamentally wrong
@@ -456,6 +522,8 @@ pub struct Outcome {
     /// of a file that keeps changing ([`crate::busy`]), or one that failed
     /// ([`crate::backoff`]). The caller runs a round then.
     pub held_until: Option<std::time::Instant>,
+    /// File contents the network's profile holds back (`crate::network`).
+    pub waiting: Option<crate::network::Waiting>,
 }
 
 /// Everything a round needs besides the database: the executor (with the
@@ -491,6 +559,201 @@ pub struct Engine {
     full: std::sync::Mutex<Option<Full>>,
     /// The store's invariants were checked once this run ([`Engine::remote`]).
     verified: std::sync::atomic::AtomicBool,
+    /// Safety stops raised lately, and the lists the user approved.
+    stops: std::sync::Mutex<Stops>,
+    /// Where what the rounds did goes as events (the agent's; none for
+    /// `oneup sync`).
+    events: std::sync::OnceLock<Arc<crate::events::Feed>>,
+    /// Databases the last round held back (`crate::databases`).
+    db_waits: std::sync::Mutex<(Vec<oneup_ipc::DatabaseNote>, u64)>,
+    /// Files that shouldn't sync while in use, seen since the agent
+    /// started, until excluded or kept syncing (at most
+    /// [`crate::databases::MAX_LIVE`]).
+    db_live: std::sync::Mutex<Vec<oneup_ipc::DatabaseNote>>,
+    /// Whether applying pin rules or downloading what they keep has work
+    /// left ([`Engine::pins_pending`]; the walk's own state is in the store).
+    pin_more: std::sync::atomic::AtomicBool,
+    /// A rewind's steps this round, with the paths its stop shows for
+    /// them (`crate::rewind`), for the stop's saved list.
+    rewind_lines: std::sync::Mutex<Vec<(Op, String)>>,
+    /// Items a finished rewind changed in OneDrive: this PC following them
+    /// was approved with it, until a sequence of rounds settles.
+    rewound: std::sync::Mutex<Vec<ItemKey>>,
+}
+
+/// What stop `i` of `review` lists this round: exactly the operations its
+/// items key (with its folders still to come, `Breaker::later`), not every
+/// operation held for its side.
+#[cfg(test)]
+fn stop_ops(review: &oneup_gate::Review, i: usize) -> Vec<&Op> {
+    stop_ops_old(review, i).into_iter().map(|(op, _)| op).collect()
+}
+
+/// What stop `i` of `review` lists this round (exactly the operations its
+/// items key, not every operation held for its side), each with what
+/// approving it does to a file's old copy.
+fn stop_ops_old(review: &oneup_gate::Review, i: usize) -> Vec<(&Op, OldCopy)> {
+    review
+        .lists
+        .get(i)
+        .map(|l| {
+            l.iter()
+                .filter_map(|&w| {
+                    let (op, _) = review.withheld.get(w)?;
+                    Some((op, review.withheld_old.get(w).copied().unwrap_or(OldCopy::Keep)))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Records the agent's safety window with a call's counts added
+/// ([`Engine::rounds`]).
+pub type Keep = dyn Fn(&mut Store, Recent) -> Result<()> + Send + Sync;
+
+/// `executed` plus what `approved` may carry out that the safety window
+/// counts: recorded before a round runs.
+fn reserved(executed: Recent, approved: &[Approved], suspicious: &[LocalId]) -> Recent {
+    let mut r = executed;
+    for op in approved.iter().map(Approved::op) {
+        r.add_op(op, suspicious);
+    }
+    r
+}
+
+/// Safety stops an engine raised, and what the user approved of them.
+///
+/// Approving a stop approves its list, item by item (`oneup_gate::ItemKey`):
+/// the rounds after the answer run whatever of it they plan, and the
+/// folders it lists to empty level by level. The list's folders were marked
+/// for planning when it was raised, so the round after the answer plans all
+/// of it, even for a stop a full pass raised.
+#[derive(Debug, Default)]
+struct Stops {
+    /// The stops raised lately, newest last (at most [`STOPS_KEPT`]): an
+    /// answer can come for one a later round already replaced.
+    raised: Vec<Breaker>,
+    /// Items on the lists approved, sorted, until a sequence of rounds
+    /// settles (everything on them done, or no longer planned).
+    approved: Vec<ItemKey>,
+    /// Of those, the ones whose operations the last round planned but
+    /// didn't run (held as a file that keeps changing, paused, waiting for
+    /// a decision or a retry, skipped): kept when the rounds settle, until
+    /// they run or are no longer planned.
+    waiting: Vec<ItemKey>,
+    /// Approval codes taken in by this call of the rounds: an approval
+    /// answers one raising of a stop, so a code isn't taken again in the
+    /// call; the caller drops it from its answers afterwards
+    /// ([`Engine::spent_answers`]), and a later raising of the same stop
+    /// needs (and takes) a new approval.
+    spent: Vec<u64>,
+    /// Of those, the ones the caller hasn't dropped yet.
+    to_drop: Vec<u64>,
+}
+
+/// Stops remembered for an answer at most.
+const STOPS_KEPT: usize = 8;
+
+impl Stops {
+    /// The user's approval codes not used yet.
+    fn live(&self, codes: &[u64]) -> Vec<u64> {
+        codes.iter().copied().filter(|c| !self.spent.contains(c)).collect()
+    }
+
+    /// Takes in the user's approvals (`codes`): the lists of stops raised
+    /// here become approved, and their codes are spent.
+    fn answer(&mut self, codes: &[u64]) -> Vec<Breaker> {
+        let codes = self.live(codes);
+        let (taken, kept): (Vec<Breaker>, Vec<Breaker>) =
+            std::mem::take(&mut self.raised).into_iter().partition(|b| codes.contains(&b.fingerprint.0));
+        self.raised = kept;
+        for b in &taken {
+            self.approve(b);
+        }
+        taken
+    }
+
+    /// A list approved (by a code this engine raised, or one the gate
+    /// matched): its items are approved and its code is spent. A rewind's
+    /// items aren't: its approval is its job's (`crate::rewind`), taken
+    /// only if the list planned again at the answer has the same code, so
+    /// none of a list that changed since runs.
+    fn approve(&mut self, b: &Breaker) {
+        if b.kind != BreakerKind::Rewind {
+            self.approved.extend(&b.items);
+        }
+        self.approved.sort_unstable();
+        self.approved.dedup();
+        let code = b.fingerprint.0;
+        if !self.spent.contains(&code) {
+            self.spent.push(code);
+            self.to_drop.push(code);
+        }
+    }
+
+    /// Code `code` was taken in by something other than a raised stop's
+    /// list (a rewind's approval, `crate::rewind`): spent like one.
+    fn spend(&mut self, code: u64) {
+        if !self.spent.contains(&code) {
+            self.spent.push(code);
+            self.to_drop.push(code);
+        }
+    }
+
+    /// A call of the rounds begins: the caller has dropped the codes the
+    /// last one took in.
+    fn begin(&mut self) {
+        self.spent.clear();
+    }
+
+    /// A round ran: of the operations on approved lists (`listed`, with
+    /// the keys they matched), those in `done` ran, and their keys go; the
+    /// rest wait.
+    fn round_ended(&mut self, listed: Vec<(Op, Vec<ItemKey>)>, done: &[Op]) {
+        if listed.is_empty() {
+            self.waiting.clear();
+            return;
+        }
+        let mut by_op: std::collections::HashMap<String, Vec<ItemKey>> = std::collections::HashMap::new();
+        for (op, keys) in listed {
+            by_op.entry(format!("{op:?}")).or_default().extend(keys);
+        }
+        let mut ran: Vec<ItemKey> = Vec::new();
+        for op in done {
+            if let Some(keys) = by_op.remove(&format!("{op:?}")) {
+                ran.extend(keys);
+            }
+        }
+        ran.sort_unstable();
+        self.approved.retain(|k| ran.binary_search(k).is_err());
+        self.waiting = by_op.into_values().flatten().collect();
+        self.waiting.sort_unstable();
+        self.waiting.dedup();
+    }
+
+    /// A sequence of rounds settled: no stop stands, and of what was
+    /// approved, only what still waits stays approved.
+    fn settled(&mut self) {
+        let waiting = &self.waiting;
+        self.approved.retain(|k| waiting.binary_search(k).is_ok());
+        self.raised.clear();
+    }
+
+    /// Remembers stops a round raised. Returns the Synced items of those
+    /// not seen before, whose folders the caller marks for planning.
+    fn raise(&mut self, breakers: &[Breaker]) -> Vec<oneup_sync::Sid> {
+        let mut mark = Vec::new();
+        for b in breakers {
+            if self.raised.iter().any(|r| r.fingerprint == b.fingerprint) {
+                continue;
+            }
+            mark.extend(&b.sids);
+            self.raised.push(b.clone());
+        }
+        let over = self.raised.len().saturating_sub(STOPS_KEPT);
+        self.raised.drain(..over);
+        mark
+    }
 }
 
 /// OneDrive refused an upload for want of room: uploads wait until it has
@@ -538,6 +801,74 @@ pub struct CloudFull {
     pub remaining: Option<i64>,
 }
 
+/// At most this long applying pin rules after a settled round; the rest
+/// waits for the next one ([`Engine::pins_pending`]).
+const PIN_SLICE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Drops from `ops` (freeing operations) the files a pin rule keeps, and
+/// sets their pin back. Returns how many.
+/// Drops from `ops` (freeing operations) the files a folder above keeps
+/// (`pinrules::kept_by_folder_above`), unless freed by name. Returns how
+/// many.
+fn keep_by_folder(store: &Store, ops: &mut Vec<Op>) -> Result<usize> {
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in std::mem::take(ops) {
+        let row = match &op {
+            Op::Dehydrate { local, .. } => store.read(|o| o.local_get(local.id.0))?,
+            _ => None,
+        };
+        match row {
+            Some(row)
+                if crate::pinrules::kept_by_folder_above(store, &row)?
+                    && !crate::pinrules::freed_by_name(store, &row)? =>
+            {
+                kept += 1;
+            }
+            _ => out.push(op),
+        }
+    }
+    *ops = out;
+    Ok(kept)
+}
+
+fn keep_pinned(
+    store: &mut Store,
+    pinner: &mut dyn crate::pinrules::Pinner,
+    pins: &oneup_rules::PinSet,
+    ops: &mut Vec<Op>,
+) -> Result<usize> {
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in std::mem::take(ops) {
+        let path = match &op {
+            Op::Dehydrate { local, .. } => store.read(|o| o.local_path_of(local.id.0))?.map(|p| (local.id.0, p)),
+            _ => None,
+        };
+        match path {
+            Some((id, p)) if crate::pinrules::kept_by_rule(store, pins, id, &p)? => {
+                // Freed by name ("Free up space" on the file itself): the
+                // person's choice wins, and the rule leaves it freed.
+                let row = store.read(|o| o.local_get(id))?;
+                if let Some(row) = row
+                    && crate::pinrules::freed_by_name(store, &row)?
+                {
+                    store.write(|o| o.pin_released_add(id))?;
+                    out.push(op);
+                    continue;
+                }
+                kept += 1;
+                if !crate::pinrules::pin_back(store, pinner, id, &crate::filetree::clean(&p))? {
+                    tracing::debug!("a file a pin rule keeps couldn't be pinned again now");
+                }
+            }
+            _ => out.push(op),
+        }
+    }
+    *ops = out;
+    Ok(kept)
+}
+
 /// Excluded folders looked at per pass ([`Engine::clear_excluded_marks`]);
 /// more wait for the next settled round.
 const MARK_LIMIT: usize = 5_000;
@@ -573,17 +904,17 @@ impl Engine {
         data_dir: &Path,
         vault: Option<Arc<crate::vaultpair::VaultRemote>>,
     ) -> Self {
-        // Uploads hold up to a fragment in memory; the profile bounds it.
-        let memory = crate::config::load_agent(data_dir).map(|a| a.memory).unwrap_or_default();
+        // Uploads hold up to a fragment in memory; the profile bounds it,
+        // unless [agent] sets it.
+        let agent = crate::config::load_agent(data_dir).unwrap_or_default();
         let timings = Arc::new(oneup_exec::Timings::default());
-        let plain = GraphCloud::with_memory(Arc::clone(&graph), oneup_exec::UploadMemory::for_profile(&memory))
-            .timed(Arc::clone(&timings));
+        let plain = GraphCloud::with_memory(Arc::clone(&graph), agent.upload_memory()).timed(Arc::clone(&timings));
         let cloud = match &vault {
             Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
             None => crate::vaultpair::PairCloud::Plain(plain),
         };
         let exec = Executor::new(fs, cloud, rules.clone()).timed(Arc::clone(&timings));
-        exec.set_parallel(oneup_exec::Parallel::for_profile(&memory));
+        exec.set_parallel(agent.parallel());
         Self {
             exec,
             timings,
@@ -599,7 +930,90 @@ impl Engine {
             backoff: std::sync::atomic::AtomicBool::new(false),
             full: std::sync::Mutex::new(None),
             verified: std::sync::atomic::AtomicBool::new(false),
+            stops: std::sync::Mutex::default(),
+            events: std::sync::OnceLock::new(),
+            db_waits: std::sync::Mutex::default(),
+            db_live: std::sync::Mutex::default(),
+            pin_more: std::sync::atomic::AtomicBool::new(false),
+            rewind_lines: std::sync::Mutex::default(),
+            rewound: std::sync::Mutex::default(),
         }
+    }
+
+    /// The databases held back by the last round, and the files warned
+    /// about (`crate::databases`), for the status.
+    /// The notes, and how many more databases were held back than they
+    /// list (at most [`crate::databases::MAX_WAITS`] are).
+    pub fn database_notes(&self) -> (Vec<oneup_ipc::DatabaseNote>, u64) {
+        let (waits, more) = self.db_waits.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let live = self.db_live.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        ([waits, live].concat(), more)
+    }
+
+    /// After a round: notes the databases it held back, and warns (once)
+    /// about each file it sent or fetched that shouldn't sync while in use,
+    /// unless the user keeps it syncing. A warning goes once the rules
+    /// exclude the file or the user keeps it.
+    fn note_databases(
+        &self,
+        store: &mut Store,
+        planned: &[(Op, Line)],
+        report: &Report,
+        keep: &[String],
+        rules: &RuleSet,
+    ) -> Result<()> {
+        // Looked up by operation once: a large round has many.
+        let paths: std::collections::HashMap<&Op, &str> = planned.iter().map(|(o, l)| (o, l.path.as_str())).collect();
+        let path_of = |op: &Op| paths.get(op).map(|p| (*p).to_string());
+        let found = crate::databases::Found::of(report);
+        *self.db_waits.lock().unwrap_or_else(|p| p.into_inner()) = crate::databases::held_notes(report, &paths);
+        let mut new = Vec::new();
+        {
+            let mut live = self.db_live.lock().unwrap_or_else(|p| p.into_inner());
+            live.retain(|n| {
+                !crate::databases::kept_syncing(keep, &n.path) && !rules.excludes(n.path.trim_start_matches('/'), false)
+            });
+            let ops = report.done.iter().chain(report.skipped.iter().map(|(op, _)| op));
+            for op in ops {
+                let (Some(format), Some(path)) = (crate::databases::live_format(&found, op), path_of(op)) else {
+                    continue;
+                };
+                if crate::databases::kept_syncing(keep, &path)
+                    || live.iter().any(|n| oneup_sync::same_name(&n.path, &path))
+                    || live.len() >= crate::databases::MAX_LIVE
+                {
+                    continue;
+                }
+                let n = crate::databases::live_note(path, format);
+                new.push(n.clone());
+                live.push(n);
+            }
+        }
+        for n in new {
+            let e = ActivityEntry {
+                path: n.path.clone(),
+                ..notice(ActivityOutcome::Note, "database", crate::databases::detail(&n))
+            };
+            self.log_once(store, format!("live {}", n.path), e)?;
+        }
+        Ok(())
+    }
+
+    fn stops_lock(&self) -> std::sync::MutexGuard<'_, Stops> {
+        self.stops.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Approval codes this engine has used since this was last asked: the
+    /// caller drops them from the answers it passes in (`oneupd`'s control
+    /// state), so they can't approve anything again.
+    pub fn spent_answers(&self) -> Vec<u64> {
+        std::mem::take(&mut self.stops_lock().to_drop)
+    }
+
+    /// What the rounds do goes to `feed` as events, as it goes to the
+    /// activity log.
+    pub fn publish_events(&self, feed: Arc<crate::events::Feed>) {
+        let _ = self.events.set(feed);
     }
 
     /// Holds the uploads of the files `busy` says keep changing.
@@ -700,6 +1114,19 @@ impl Engine {
     /// The cloud for serving Files On-Demand downloads: the same view of
     /// OneDrive as the executor's (decrypting, for a vault pair).
     pub fn hydration_cloud(&self) -> crate::vaultpair::PairCloud {
+        // Opening a file is the user's own action: never stopped by the
+        // data budget.
+        let plain = GraphCloud::new(Arc::clone(&self.graph)).unbudgeted();
+        match &self.vault {
+            Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
+            None => crate::vaultpair::PairCloud::Plain(plain),
+        }
+    }
+
+    /// The cloud OneUpDrive's own hydrations (files set to always stay on
+    /// this device) go through: on the data budget
+    /// (`oneup_exec::hydrate::Hydrator::with_ours`).
+    pub fn pinning_cloud(&self) -> crate::vaultpair::PairCloud {
         let plain = GraphCloud::new(Arc::clone(&self.graph));
         match &self.vault {
             Some(v) => crate::vaultpair::PairCloud::Vault(v.cloud(plain)),
@@ -810,14 +1237,16 @@ impl Engine {
             .await?;
         }
         let ready: Vec<_> = found.into_iter().filter(crate::prune::Candidate::ready).collect();
-        Ok(crate::prune::counted(&self.graph, ready).await?.iter().map(crate::prune::Candidate::op).collect())
+        Ok(crate::prune::counted(self.graph.as_ref(), ready).await?.iter().map(crate::prune::Candidate::op).collect())
     }
 
     /// Files On-Demand placement after a round (`oneup_exec::placement`):
     /// pinned files are downloaded, files set to free up space are freed
     /// through the gate. Nothing while changes to this PC are paused.
-    pub async fn placement(&self, mut store: Store, controls: &Controls) -> Result<Store> {
-        if !self.exec.local().on_demand() || controls.pause_local {
+    pub async fn placement(&self, mut store: Store, controls: &(dyn Fn() -> Controls + Send + Sync)) -> Result<Store> {
+        if !self.exec.local().on_demand() || controls().pause_local {
+            // Nothing more soon: resuming wakes the agent anyway.
+            self.pin_more.store(false, std::sync::atomic::Ordering::Relaxed);
             return Ok(store);
         }
         let root = store.read(|o| o.local_root())?.context("no local scan")?;
@@ -833,12 +1262,121 @@ impl Engine {
                 )],
             )?;
         }
-        let fetched = oneup_exec::placement::fetch_pinned(&store, Path::new(&root.path)).await?;
-        if !fetched.is_empty() {
+        // Pin rules ([rules] pin): set on what they match, before anything
+        // is fetched or freed, so this pass already downloads them.
+        let pins = crate::config::load_rules(&self.data_dir, &store)?.pin_set();
+        let mut pinner = crate::pinrules::FsPinner(PathBuf::from(&root.path));
+        let pass = tokio::task::block_in_place(|| {
+            crate::pinrules::apply(&mut store, &mut pinner, &pins, PIN_SLICE, now_ms())
+        })?;
+        let mut notes = Vec::new();
+        if pass.pinned > 0 {
+            notes.push(notice(
+                ActivityOutcome::Note,
+                "keep",
+                format!("{} item(s) kept on this PC by pin rules", pass.pinned),
+            ));
+        }
+        if pass.unpinned > 0 {
+            let detail = format!("{} item(s) no longer kept on this PC: their pin rule was removed", pass.unpinned);
+            notes.push(notice(ActivityOutcome::Note, "keep", detail));
+        }
+        if pass.released > 0 {
+            let detail = format!(
+                "{} file(s) freed on request: no longer kept on this PC by pin rules until kept again",
+                pass.released
+            );
+            notes.push(notice(ActivityOutcome::Note, "keep", detail));
+        }
+        if pass.repinned > 0 {
+            let detail = format!(
+                "{} item(s) kept on this PC by pin rules, though a folder above was set to free up space",
+                pass.repinned
+            );
+            notes.push(notice(ActivityOutcome::Note, "keep", detail));
+        }
+        log_activity(&mut store, notes)?;
+        // Downloads keep to a pause that comes meanwhile, leave free space
+        // alone (nothing when it can't be read), take a share per pass, and
+        // keep the rules' items to what was approved.
+        let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
+        let total = oneup_sys::disk::total_bytes(Path::new(&root.path)).ok();
+        let reserve = crate::pinrules::reserve(total, space.low_disk_percent);
+        let limit = std::sync::Mutex::new(crate::pinrules::FetchLimit::new(reserve, std::time::Instant::now()));
+        // What this pass let through, against the data budget's remainder.
+        let allowed = std::sync::atomic::AtomicU64::new(0);
+        let root_path = PathBuf::from(&root.path);
+        // Whether a file is on this PC by now, from its attributes alone
+        // (never its content): a reservation a crash left is settled by it.
+        let on_pc = |store: &Store| -> Result<std::collections::HashSet<u128>> {
+            let mut v = std::collections::HashSet::new();
+            let Some(list) = store.read(|o| o.meta_get(crate::pinrules::KEY_RESERVED))? else { return Ok(v) };
+            for id in list.split(',').filter_map(|i| i.split_once(':')).filter_map(|(id, _)| id.parse::<u128>().ok()) {
+                if let Some(p) = store.read(|o| o.local_path_of(id))? {
+                    let full = p.split('/').filter(|x| !x.is_empty()).fold(root_path.clone(), |f, x| f.join(x));
+                    let here = std::fs::symlink_metadata(&full)
+                        .is_ok_and(|m| std::os::windows::fs::MetadataExt::file_attributes(&m) & 0x0040_0000 == 0);
+                    if here {
+                        v.insert(id);
+                    }
+                }
+            }
+            Ok(v)
+        };
+        let here = on_pc(&store)?;
+        crate::pinrules::settle(&mut store, &[], &|id| here.contains(&id))?;
+        // A file this pass won't download (past the rules' budget, or its
+        // identity unreadable now) is passed over; a pause, the disk or the
+        // pass's share stops the pass.
+        let fetched = tokio::task::block_in_place(|| {
+            crate::pinrules::fetch_pass(
+                &mut store,
+                &mut pinner,
+                &mut |size| {
+                    // Kept files download only where the network lets every
+                    // file's contents through (`crate::network`), asked again
+                    // before each: a change of network applies from the next.
+                    let c = controls();
+                    let paused =
+                        c.pause_local || c.net.transfer != crate::network::Transfer::Everything || c.net.offline;
+                    pin_may(&c.net, paused, &allowed, size, || {
+                        let free = crate::pinrules::free_space(&root_path);
+                        let mut l = limit.lock().unwrap_or_else(|p| p.into_inner());
+                        l.may(size, paused, free, std::time::Instant::now())
+                    })
+                },
+                &mut |rel| oneup_exec::placement::fetch_one_blocking(&root_path, rel),
+            )
+        })?;
+        // What wasn't tried goes back to the budget; a download that was
+        // tried counts, finished or not (bytes may have come), so failures
+        // can't go past the approval again and again.
+        let done: Vec<u128> = fetched.done.iter().map(|d| d.1).chain(fetched.attempted.iter().copied()).collect();
+        crate::pinrules::settle(&mut store, &done, &|_| false)?;
+        use oneup_exec::placement::Stop;
+        // Past the budget: asked once the pass got that far.
+        if matches!(fetched.stopped, None | Some(Stop::Share))
+            && let Some((_, size)) = fetched.blocked
+        {
+            crate::pinrules::wait_for_go_ahead(&mut store, size)?;
+            let e = notice(
+                ActivityOutcome::Waiting,
+                "keep",
+                "pin rules wait for your go-ahead to download more (oneup rules --allow-downloads)".into(),
+            );
+            self.log_once(&mut store, "pins waiting".into(), e)?;
+        }
+        // Soon again when only the pass's share stopped it (or the batch was
+        // full); a pause, the disk or a question waits for an event instead
+        // (resuming, settings, the agent's own checks), never a short timer.
+        let more_fetch = fetched.more && matches!(fetched.stopped, None | Some(Stop::Share));
+        self.pin_more.store(pass.more || more_fetch, std::sync::atomic::Ordering::Relaxed);
+        if !fetched.done.is_empty() {
             let at_ms = now_ms();
             let log: Vec<ActivityEntry> = fetched
+                .done
                 .into_iter()
-                .map(|path| ActivityEntry {
+                .map(|(path, _, _)| ActivityEntry {
                     seq: 0,
                     at_ms,
                     outcome: ActivityOutcome::Done,
@@ -851,7 +1389,23 @@ impl Engine {
             log_activity(&mut store, log)?;
         }
         let mut ops = oneup_exec::placement::free_ops(&store)?;
-        let note = self.space_policy(&mut store, Path::new(&root.path), &mut ops)?;
+        // A folder above that keeps it (the user's pin) wins over "Free up
+        // space" chosen on a folder above; on the file itself, it's freed.
+        let kept = keep_by_folder(&store, &mut ops)?;
+        if kept > 0 {
+            let detail = format!("{kept} item(s) kept on this PC by a folder above, though set to free up space");
+            log_activity(&mut store, vec![notice(ActivityOutcome::Note, "keep", detail)])?;
+        }
+        // A pin rule wins over "Free up space" chosen in File Explorer: the
+        // file isn't freed and gets its pin back.
+        if !pins.is_empty() {
+            let kept = keep_pinned(&mut store, &mut pinner, &pins, &mut ops)?;
+            if kept > 0 {
+                let detail = format!("{kept} item(s) kept on this PC by pin rules, though set to free up space");
+                log_activity(&mut store, vec![notice(ActivityOutcome::Note, "keep", detail)])?;
+            }
+        }
+        let note = self.space_policy(&mut store, Path::new(&root.path), &pins, &mut ops)?;
         if ops.is_empty() {
             return Ok(store);
         }
@@ -870,6 +1424,12 @@ impl Engine {
             return Err(Halted(why).into());
         }
         Ok(store)
+    }
+
+    /// Whether applying pin rules has work left for another pass soon (a
+    /// walk after the rules changed, or many changes).
+    pub fn pins_pending(&self) -> bool {
+        self.pin_more.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Files On-Demand: turns synced files and folders that are already
@@ -956,7 +1516,13 @@ impl Engine {
     /// The automatic space policies (`crate::space`): adds what they free
     /// now to `ops`, and says why. Files not used for a while are looked
     /// for at most hourly; a low disk, at every pass.
-    fn space_policy(&self, store: &mut Store, root: &Path, ops: &mut Vec<Op>) -> Result<Option<String>> {
+    fn space_policy(
+        &self,
+        store: &mut Store,
+        root: &Path,
+        pins: &oneup_rules::PinSet,
+        ops: &mut Vec<Op>,
+    ) -> Result<Option<String>> {
         const KEY_LAST: &str = "space.last_ms";
         let space = crate::config::kept(&self.data_dir, crate::config::load_space(&self.data_dir))?;
         if space.free_unused_days == 0 && !space.free_when_low {
@@ -973,7 +1539,8 @@ impl Engine {
         if !low && now - last < 3_600_000 {
             return Ok(None);
         }
-        let sel = crate::space::select(store, &space, disk, now, &|rel| crate::space::last_access(root, rel))?;
+        let kept = |rel: &str| pins.pins(rel, false);
+        let sel = crate::space::select(store, &space, disk, now, &|rel| crate::space::last_access(root, rel), &kept)?;
         store.write(|o| o.meta_set(KEY_LAST, &now.to_string()))?;
         if sel.ops.is_empty() {
             return Ok(None);
@@ -1054,36 +1621,43 @@ impl Engine {
 
     /// Saves what each tripped stop holds back ([`crate::stoplist`]), once
     /// per stop: the agent plans again at every wake-up while one stands.
-    fn save_stop_lists(&self, store: &Store, review: &oneup_gate::Review, suspicious: &[LocalId]) {
+    fn save_stop_lists(&self, store: &Store, review: &oneup_gate::Review) {
         let codes: Vec<String> = review.breakers.iter().map(|b| format!("{:016x}", b.fingerprint.0)).collect();
         crate::stoplist::keep_only(&self.data_dir, &codes);
-        for (b, code) in review.breakers.iter().zip(&codes) {
+        for (i, (b, code)) in review.breakers.iter().zip(&codes).enumerate() {
             if crate::stoplist::path(&self.data_dir, code).exists() {
                 continue;
             }
-            let held: Vec<&Op> = review
-                .withheld
-                .iter()
-                .filter(|(op, w)| {
-                    *w == Withheld::Breaker(b.side)
-                        && match b.kind {
-                            BreakerKind::Mass => is_mass_sensitive(op),
-                            BreakerKind::Suspicious => oneup_gate::is_suspicious(op, suspicious),
-                        }
-                })
-                .map(|(op, _)| op)
-                .collect();
+            let held = stop_ops_old(review, i);
+            // A rewind's steps are listed where its plan names them.
+            let rewind = self.rewind_lines.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let shown = |o: &Ops<'_>, op: &Op, old: OldCopy| {
+                let mut l = describe_as(o, op, old);
+                if let Some((_, p)) = rewind.iter().find(|(r, _)| r == op) {
+                    l.path.clone_from(p);
+                }
+                l
+            };
             let lines = store.read(|o| {
                 Ok(held
                     .iter()
+                    .map(
+                        |&(op, old)| {
+                            if b.kind == BreakerKind::Removal { removal_line(o, op) } else { shown(o, op, old) }
+                        },
+                    )
+                    .chain(b.later.iter().map(|op| {
+                        if op.rewind_step().is_some() { shown(o, op, OldCopy::Keep) } else { later_line(o, op) }
+                    }))
                     .take(crate::stoplist::MAX_LINES)
-                    .map(|op| describe(o, op).to_string())
+                    .map(|l| l.to_string())
                     .collect::<Vec<_>>())
             });
             let header = format!("OneUpDrive safety stop {code}: {}. Nothing has been changed yet.", breaker_what(b));
+            let total = held.len() + b.later.len();
             let saved = lines
                 .map_err(anyhow::Error::from)
-                .and_then(|l| Ok(crate::stoplist::write(&self.data_dir, code, &header, &l, held.len())?));
+                .and_then(|l| Ok(crate::stoplist::write(&self.data_dir, code, &header, &l, total)?));
             if let Err(e) = saved {
                 tracing::warn!(error = %e, "can't save the list of what a safety stop holds back");
             }
@@ -1116,6 +1690,11 @@ impl Engine {
     /// ends the call in an error.
     /// `controls` is asked again before every round, so a pause or a
     /// `sync-now PATH` that arrives meanwhile counts from the next round.
+    /// `keep` (the agent's) records the safety window durably with this
+    /// call's counts added: before a round changes anything, with what it
+    /// may carry out reserved, and again with what it did. A round whose
+    /// reservation can't be recorded doesn't run (the call fails), so a
+    /// crash never forgets what ran.
     #[allow(clippy::too_many_arguments)]
     pub async fn rounds(
         &self,
@@ -1126,6 +1705,7 @@ impl Engine {
         executed: &mut Recent,
         max_rounds: usize,
         progress: &(dyn Fn(Option<Progress>) + Send + Sync),
+        keep: Option<&Keep>,
     ) -> Result<(Store, Outcome)> {
         let mut out = Outcome {
             end: End::Unsettled,
@@ -1134,10 +1714,15 @@ impl Engine {
             overflow: None,
             breakers: Vec::new(),
             held_until: None,
+            waiting: None,
         };
         let mut scope = first;
         let mut changed_rounds = 0;
-        self.check_room(&mut store).await?;
+        // Offline (the user's choice): OneDrive isn't asked anything.
+        if !controls().net.offline {
+            self.check_room(&mut store).await?;
+        }
+        self.stops_lock().begin();
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
             out.held_until = None;
@@ -1152,15 +1737,32 @@ impl Engine {
             let settings = crate::config::kept(&self.data_dir, crate::config::load_agent(&self.data_dir))?;
             let capped = crate::autopause::caps_apply(&settings, crate::autopause::local_minute_of_day());
             let cap = |kib: u64| if capped { kib.saturating_mul(1024) } else { 0 };
-            self.graph.upload.set(cap(settings.upload_kib));
-            self.graph.download.set(cap(settings.download_kib));
+            // The network's profile may set its own (`crate::network`).
+            let (up, down) = controls.net.caps.unwrap_or((settings.upload_kib, settings.download_kib));
+            self.graph.upload.set(cap(up));
+            self.graph.download.set(cap(down));
             let pruning = self.update_pruning(&store)?;
             store = observe(store, &pruning).await?;
-            store = self.remote(store, &pruning).await?;
+            if !controls.net.offline {
+                store = self.remote(store, &pruning).await?;
+            }
+            // A vault move a crash cut short, recorded where it went before
+            // the plan reads its old ID's removal as a deletion.
+            let settled = self.exec.settle_moves(&mut store)?;
+            if settled != oneup_exec::Settled::default() {
+                let oneup_exec::Settled { relinked, held, waiting, .. } = settled;
+                tracing::info!(relinked, held, waiting, "settled moves an earlier round cut short");
+            }
             let user_rules = self.load_rules(&mut store)?;
-            // Changed rules: every folder is planned again, from the
+            // Databases: what counts as one, and whether they wait
+            // (`[databases]`, read every round like the rest).
+            let db_settings = crate::config::kept(&self.data_dir, crate::config::load_databases(&self.data_dir))?;
+            let databases = db_settings.databases()?;
+            // Changed rules, or database patterns (they decide which working
+            // files are parked): every folder is planned again, from the
             // database (rules.md § Changing rules without a rescan).
-            let fingerprint = user_rules.fingerprint();
+            let fingerprint = planning_fingerprint(&user_rules, &databases);
+            self.exec.set_databases(databases);
             let rules_changed = store.read(|o| o.meta_get(KEY_RULES))?.as_deref() != Some(fingerprint.as_str());
             if rules_changed {
                 scope = Scope::All;
@@ -1173,6 +1775,11 @@ impl Engine {
             // "Can't tell" counts as here: nothing is noted gone on a doubt.
             let mut chosen = crate::resolve::apply_queued(&mut store, backup, &|id| fs.presence(id) != Some(false))?;
             log_activity(&mut store, std::mem::take(&mut chosen.log))?;
+            // Duplicates the user chose to remove (`crate::duplicates`): the
+            // gate holds them as a stop of their own until approved.
+            let paused = controls.pause_local || controls.pause_remote;
+            let (removal, log) = crate::duplicates::for_round(&self.data_dir, &mut store, backup, paused)?;
+            log_activity(&mut store, log)?;
             // What happens to OneDrive's copies of excluded items.
             let mode = crate::config::load_rules(&self.data_dir, &store)?.cloud;
             let mut extra = match mode {
@@ -1200,10 +1807,100 @@ impl Engine {
                 }
             };
             extra.extend(chosen.ops.iter().map(|(op, _)| op.clone()));
-            let modes = Modes { pull: mode != crate::config::CloudCopies::Keep, extra };
+            let removal_ops = removal.as_ref().map(|r| r.plan.ops.clone()).unwrap_or_default();
+            // Conflicts the user answered (`crate::conflicts`): their
+            // steps join the round, approved by the answer.
+            let conflicts = crate::conflicts::queued(&mut store)?;
+            log_activity(&mut store, conflicts.log.clone())?;
+            extra.extend(conflicts.ops.iter().cloned());
+            // Restores the user asked for (`crate::restores`): the same.
+            let restores = crate::restores::queued(&store)?;
+            extra.extend(restores.ops.iter().cloned());
+            // A rewind under way (`crate::rewind`): its steps for this round.
+            let mut rewinding = store.read(crate::rewind::load)?;
+            let mut steps = match &rewinding {
+                Some(j) => match store.read(|o| Ok(crate::rewind::steps(o, &user_rules, j)))? {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        // Can't be planned any more (the history pruned, say):
+                        // it ends, and says why.
+                        let folder = j.folder.clone();
+                        store.write(|o| o.meta_delete(crate::rewind::KEY))?;
+                        let entry = ActivityEntry {
+                            path: folder,
+                            ..notice(ActivityOutcome::Failed, "rewind", format!("ended: {e:#}"))
+                        };
+                        log_activity(&mut store, vec![entry])?;
+                        rewinding = None;
+                        None
+                    }
+                },
+                None => None,
+            };
+            // Stops approved since the last round: their lists are approved.
+            // Codes already used approve nothing again.
+            let (listed, controls) = {
+                let mut stops = self.stops_lock();
+                let taken = stops.answer(&controls.answers.approve);
+                // The rewind's stop: its approval binds the steps it showed,
+                // planned again now; a list that changed meanwhile has
+                // another code and needs a new answer.
+                if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref())
+                    && j.approval.is_none()
+                    && let Some((code, all)) = &s.preview
+                    && (taken.iter().any(|b| b.fingerprint.0 == *code)
+                        || stops.live(&controls.answers.approve).contains(code))
+                {
+                    j.approval = Some(oneup_sync::rewind::Job::approve(all));
+                    stops.spend(*code);
+                }
+                let mut c = controls.clone();
+                c.answers.approve = stops.live(&c.answers.approve);
+                (stops.approved.clone(), c)
+            };
+            if let Some(j) = &rewinding
+                && j.approval.is_some()
+                && steps.as_ref().is_some_and(|s| s.preview.is_some())
+            {
+                store.write(|o| crate::rewind::save(o, j))?;
+                steps = Some(store.read(|o| Ok(crate::rewind::steps(o, &user_rules, j)))??);
+                let entry = ActivityEntry {
+                    path: j.folder.clone(),
+                    ..notice(ActivityOutcome::Note, "rewind", "approved".into())
+                };
+                log_activity(&mut store, vec![entry])?;
+            }
+            if let Some(s) = &steps {
+                *self.rewind_lines.lock().unwrap_or_else(|p| p.into_inner()) =
+                    s.ops.iter().cloned().zip(s.paths.iter().cloned()).chain(s.later.iter().cloned()).collect();
+            }
+            let rewound = self.rewound.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let modes = Modes {
+                pull: mode != crate::config::CloudCopies::Keep,
+                extra,
+                rewind: steps.clone(),
+                answered: conflicts.ops.iter().chain(&restores.ops).cloned().collect(),
+                rewound,
+                removal: removal_ops,
+            };
+            let controls = &controls;
             let t = std::time::Instant::now();
-            let Planned { review, problems, upto, suspicious, policy, synced, planning } =
-                plan_round(&store, Some(self.exec.local()), scope, controls, window, &user_rules, modes)?;
+            let Planned { mut review, problems, upto, suspicious, policy, synced, planning } =
+                plan_round(&store, Some(self.exec.local()), scope, controls, window, &user_rules, modes, &listed)?;
+            // Approved by their codes (`oneup sync --approve`): their lists
+            // stay approved for the folders they empty in later rounds.
+            for b in &review.answered {
+                self.stops_lock().approve(b);
+                // The rewind's, approved by its code in this very round.
+                if b.kind == BreakerKind::Rewind
+                    && let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref())
+                    && let Some((code, all)) = &s.preview
+                    && *code == b.fingerprint.0
+                {
+                    j.approval = Some(oneup_sync::rewind::Job::approve(all));
+                    store.write(|o| crate::rewind::save(o, j))?;
+                }
+            }
             // Said, so a slow start can be told from a slow round (one
             // can take minutes on a large folder).
             if scope == Scope::All || t.elapsed().as_secs() >= 10 {
@@ -1213,21 +1910,41 @@ impl Engine {
             scope = Scope::Dirty;
             out.totals.problems = problems;
             if !review.breakers.is_empty() {
-                // Nothing at all runs in a tripped round, not even the side
-                // that didn't trip: the user should see the whole picture
-                // first. The marks stay, so the next try plans it all again.
                 for b in &review.breakers {
-                    let detail = format!("{}; nothing was changed (code {:016x})", breaker_what(b), b.fingerprint.0);
+                    // A rewind waiting for its approval holds only its own
+                    // steps (the gate withholds them): the rest syncs, and a
+                    // change in the folder changes its list, so an approval
+                    // given for the list before isn't taken (`crate::rewind`).
+                    let what =
+                        if b.kind == BreakerKind::Rewind { "the rest syncs meanwhile" } else { "nothing was changed" };
+                    let detail = format!("{}; {what} (code {:016x})", breaker_what(b), b.fingerprint.0);
                     let e = notice(ActivityOutcome::Waiting, "safety stop", detail);
                     self.log_once(&mut store, format!("stop {:x}", b.fingerprint.0), e)?;
                 }
-                self.save_stop_lists(&store, &review, &suspicious);
+                // Every round while it stands, and the one after the answer,
+                // plans all of its list: a full pass's stop would otherwise
+                // shrink to what the marks cover (a new code, or none).
+                let mark = self.stops_lock().raise(&review.breakers);
+                if !mark.is_empty() {
+                    store.write(|o| o.dirty_mark_synced(&mark))?;
+                }
+                self.save_stop_lists(&store, &review);
+            }
+            if review.breakers.iter().any(|b| !matches!(b.kind, BreakerKind::Removal | BreakerKind::Rewind)) {
+                // Nothing at all runs in a tripped round, not even the side
+                // that didn't trip: the user should see the whole picture
+                // first. The marks stay, so the next try plans it all again.
                 out.breakers = review.breakers;
                 out.end = End::Stopped;
                 return Ok((store, out));
             }
-            // No stop stands: their lists go.
-            crate::stoplist::keep_only(&self.data_dir, &[]);
+            // Removing chosen duplicates, or a rewind, waits for its own
+            // approval and holds nothing else back. Otherwise no stop
+            // stands: their lists go.
+            if review.breakers.is_empty() {
+                crate::stoplist::keep_only(&self.data_dir, &[]);
+            }
+            out.breakers.clone_from(&review.breakers);
             out.totals.held = review.withheld.iter().filter(|(_, w)| *w == Withheld::Held).count();
             // Held only for want of evidence, but in the user's Recycle Bin:
             // deleted by the user (`crate::recyclebin`); planned again.
@@ -1260,6 +1977,9 @@ impl Engine {
                 let (outcome, what) = match o.outcome {
                     OverflowOutcome::Held => (ActivityOutcome::Waiting, "waiting for your decision".to_string()),
                     OverflowOutcome::KeptByPolicy => (ActivityOutcome::Note, "kept anyway (your setting)".into()),
+                    OverflowOutcome::DiscardedByPolicy => {
+                        (ActivityOutcome::Note, "removed without a local copy (your setting)".into())
+                    }
                     OverflowOutcome::Decided(Choice::Keep) => (ActivityOutcome::Note, "kept, as you chose".into()),
                     OverflowOutcome::Decided(Choice::Discard) => {
                         (ActivityOutcome::Note, "removed without a local copy, as you chose".into())
@@ -1298,6 +2018,9 @@ impl Engine {
                         if chosen.ops.iter().any(|(op, _)| op == a.op()) {
                             l.note = "as you chose".into();
                         }
+                        if oneup_gate::is_removal(a.op()) {
+                            l = removal_line(o, a.op());
+                        }
                         let l = if on_demand { on_demand_line(a.op(), l) } else { l };
                         (a, l)
                     })
@@ -1320,8 +2043,64 @@ impl Engine {
             };
             let (planned, failing, retry_at) = store.read(|o| self.hold_failed(o, planned))?;
             out.held_until = earliest(until, retry_at);
+            // File contents the network's profile doesn't let through wait
+            // for another network (`crate::network`). Their folders stay
+            // marked too, so a round on such a network plans them again.
+            let (planned, for_network, budget_left) =
+                store.read(|o| hold_for_network(o, &controls.net, planned, on_demand))?;
             let mut later: Vec<Op> = waiting.iter().map(|(op, _)| op.clone()).collect();
             later.extend(no_room.iter().chain(&failing).map(|(a, _)| a.op().clone()));
+            later.extend(for_network.iter().map(|(a, _, _)| a.op().clone()));
+            // Offline, the gate holds every change to OneDrive (as paused):
+            // they're the queue too, with what they'd send.
+            let queued: Vec<(String, u64, crate::network::Way)> = if controls.net.offline {
+                store.read(|o| {
+                    let mut v = Vec::new();
+                    for (op, w) in &review.withheld {
+                        if !matches!(w, Withheld::Paused(_)) {
+                            continue;
+                        }
+                        let size = match op {
+                            Op::Download { remote, .. } => {
+                                o.get_item(&remote.id.0)?.and_then(|r| u64::try_from(r.size).ok())
+                            }
+                            _ => None,
+                        };
+                        let (way, bytes) = crate::network::content(op, on_demand, |_| size)
+                            .map_or((crate::network::Way::Up, 0), |(w, b)| (w, b.unwrap_or(0)));
+                        v.push((describe(o, op).path, bytes, way));
+                    }
+                    Ok(v)
+                })?
+            } else {
+                Vec::new()
+            };
+            let held_here = (!for_network.is_empty() || !queued.is_empty()).then(|| {
+                // The profile's choice, or else the budget, held them.
+                let why = if for_network.iter().any(|(_, _, (way, b))| !controls.net.allows(*way, Some(*b))) {
+                    controls.net.why()
+                } else {
+                    controls.net.why_budget()
+                };
+                let mut w = crate::network::Waiting { why, ..Default::default() };
+                for (_, l, (way, bytes)) in &for_network {
+                    w.add(l.path.clone(), *bytes, *way);
+                }
+                for (path, bytes, way) in &queued {
+                    w.add(path.clone(), *bytes, *way);
+                }
+                w
+            });
+            if let Some(w) = &held_here {
+                let detail = format!("{} files ({}): {}", w.count, crate::versions::size(w.bytes), w.why);
+                self.log_once(
+                    &mut store,
+                    format!("net wait {}", w.why),
+                    notice(ActivityOutcome::Waiting, "network", detail),
+                )?;
+            }
+            out.waiting = held_here.clone();
+            crate::network::save_waiting(&mut store, held_here)?;
             let wait = waiting.iter().filter(|(op, _)| matches!(op, Op::Upload { .. })).map(|(_, l)| {
                 let detail = "changing often; sent once it's left alone for a moment".to_string();
                 ActivityEntry {
@@ -1334,6 +2113,10 @@ impl Engine {
                 }
             });
             log_activity(&mut store, wait.collect())?;
+            // A recycling that follows a rewind, with the path it's covered at:
+            // its follow-up goes once it ran.
+            let ats: Vec<(Op, String)> =
+                planned.iter().filter_map(|(a, _)| a.at().map(|at| (a.op().clone(), at.to_string()))).collect();
             let (approved, planned): (Vec<Approved>, Vec<(Op, Line)>) = planned
                 .into_iter()
                 .map(|(a, l)| {
@@ -1341,6 +2124,13 @@ impl Engine {
                     (a, (op, l))
                 })
                 .unzip();
+            let listed_ops = std::mem::take(&mut review.listed);
+            if let Some(keep) = keep {
+                // Counted before anything runs: a crash mid-round must not
+                // forget what it may have done.
+                keep(&mut store, reserved(*executed, &approved, &suspicious))
+                    .context("can't record the safety window, so nothing was changed")?;
+            }
             let bytes_total = store.read(|o| transfer_bytes(o, &approved, on_demand))?;
             let (approvals, decisions) = (controls.answers.approvals(), controls.answers.decisions());
             let follower = Follower {
@@ -1351,16 +2141,26 @@ impl Engine {
                     synced_items: synced,
                     recent: window,
                     approvals: &approvals,
+                    approved: &listed,
+                    pending: &[],
+                    paths: &[],
+                    pending_paths: &[],
                     decisions: &decisions,
                     room: None,
                     suspicious: &[],
+                    rewound: &[],
+                    // What follows mid-round keeps every copy it removes.
+                    cloud_deleted: &[],
                 },
                 order: &order,
                 on_demand,
+                net: &controls.net,
+                budget_left: std::sync::Mutex::new(budget_left),
                 taken: std::sync::Mutex::default(),
                 items: std::sync::atomic::AtomicU64::new(0),
                 bytes: std::sync::atomic::AtomicU64::new(0),
             };
+            self.exec.set_may_fetch(Some(may_fetch(controls)));
             let report = self
                 .run_reported(&mut store, approved, n, bytes_total, progress, controls.live.as_deref(), &follower)
                 .await;
@@ -1371,16 +2171,52 @@ impl Engine {
             let deferred = deferred || !report.not_run.is_empty();
             // Counted before anything below can fail: what ran must reach
             // the caller's safety window even if this call ends in an error.
-            executed.suspicious += report.done.iter().filter(|op| oneup_gate::is_suspicious(op, &suspicious)).count();
-            for op in report.done.iter().filter(|op| is_mass_sensitive(op)) {
-                match Side::changed_by(op) {
-                    Some(Side::Local) => executed.local += 1,
-                    Some(Side::Remote) => executed.remote += 1,
-                    None => {}
+            for op in &report.done {
+                executed.add_op(op, &suspicious);
+            }
+            // Approved changes that ran are done with; those that wait stay.
+            self.stops_lock().round_ended(listed_ops, &report.done);
+            crate::resolve::ran(&mut store, &chosen.ops, &report)?;
+            if let Some(r) = &removal {
+                let log = crate::duplicates::ran(&mut store, r, &report)?;
+                log_activity(&mut store, log)?;
+            }
+
+            crate::conflicts::ran(&mut store, &conflicts, &report)?;
+            crate::restores::ran(&mut store, &restores, &report)?;
+            // However busy the folder, the history keeps to its limits.
+            crate::rewind::keep_history(&mut store, now_ms(), false)?;
+            if let (Some(j), Some(s)) = (rewinding.as_mut(), steps.as_ref()) {
+                let finished = store.write(|o| Ok(crate::rewind::ran(o, j, s, &report, &ats, now_ms())))??;
+                if finished {
+                    // Its follow-ups here stay approved until they ran, or
+                    // the rounds settle.
+                    let mut rw = self.rewound.lock().unwrap_or_else(|p| p.into_inner());
+                    rw.extend(j.approval.iter().flat_map(|a| a.follows.iter().map(|k| ItemKey(*k))));
                 }
             }
-            crate::resolve::ran(&mut store, &chosen.ops, &report)?;
+            {
+                let mut rw = self.rewound.lock().unwrap_or_else(|p| p.into_inner());
+                if !rw.is_empty() {
+                    let ran = oneup_gate::follow_keys_done(&report.done, &ats);
+                    rw.retain(|k| !ran.contains(k));
+                }
+            }
             let mut log = print_round(n, &planned, &report);
+            self.note_databases(&mut store, &planned, &report, &db_settings.keep_syncing, &user_rules)?;
+            for name in &report.kept_later {
+                let detail = format!("an edit made in OneDrive that an earlier upload went over, kept as {name}");
+                println!("  {detail}");
+                log.push(notice(ActivityOutcome::Done, "keep", detail));
+            }
+            for name in &report.rescues_given_up {
+                let detail = format!(
+                    "{name}: an upload may have gone over an edit made in OneDrive, which its version history \
+                     doesn't show; look there"
+                );
+                println!("  {detail}");
+                log.push(notice(ActivityOutcome::Failed, "keep", detail));
+            }
             if !report.not_run.is_empty() {
                 let detail = format!("{} operations wait until sync resumes", report.not_run.len());
                 println!("  {detail}");
@@ -1389,6 +2225,9 @@ impl Engine {
             if let Some(why) = &report.halted {
                 log.push(notice(ActivityOutcome::Failed, "stopped", why.clone()));
             }
+            if let Some(feed) = self.events.get() {
+                feed.push(crate::events::from_activity(&log));
+            }
             // A database that fails can't take the log either; the halt
             // below still reports it.
             let logged = log_activity(&mut store, log);
@@ -1396,6 +2235,9 @@ impl Engine {
                 return Err(Halted(why).into());
             }
             logged?;
+            if let Some(keep) = keep {
+                keep(&mut store, *executed).context("can't record the safety window")?;
+            }
             // Failures wait their turn; what was done is through with them.
             let failures = if self.backs_off() {
                 store.write(|o| crate::backoff::record(o, &report, now_ms()))?
@@ -1409,7 +2251,7 @@ impl Engine {
                 self.found_full(&mut store).await?;
             }
             out.totals.add(&report);
-            let (clean, mut end) = settle(&report, failures.waiting, &mut changed_rounds);
+            let (_, mut end) = settle(&report, failures.waiting, &mut changed_rounds);
             if recycled > 0 && matches!(end, Some(End::Settled)) {
                 end = None; // another round, to carry the deletions out
             }
@@ -1424,11 +2266,7 @@ impl Engine {
                 // Kept for what's tried again later: skips unless only a
                 // change can end them, failures, uploads OneDrive had no
                 // room for, and what waited.
-                let mut retried = Touched::default();
-                let skipped = report.skipped.iter().filter(|(_, s)| !clean || *s == Skip::CloudFull);
-                for op in skipped.map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)).chain(&later) {
-                    retried.add(op);
-                }
+                let retried = retry_marks(&report, &later);
                 store.write(|o| {
                     o.dirty_clear_except(upto, &retried.local, &retried.remote, &retried.synced)?;
                     o.meta_set(KEY_RULES, &fingerprint)?;
@@ -1439,6 +2277,14 @@ impl Engine {
                 })?;
             }
             if let Some(end) = end {
+                if end == End::Settled {
+                    // Everything approved ran, or no longer applies.
+                    self.stops_lock().settled();
+                    self.rewound.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                    // A first sync has settled: from now on, the history of
+                    // what's synced is kept, for rewinds, to its limits.
+                    crate::rewind::keep_history(&mut store, now_ms(), true)?;
+                }
                 out.end = end;
                 return Ok((store, out));
             }
@@ -1522,7 +2368,7 @@ impl Engine {
         let mut found: Vec<(String, U)> = problems.iter().map(|(p, w)| (p.clone(), U::from(*w))).collect();
         // A synced item that can't sync any more (a refused name, too
         // large) is held as missing on one side; why is the problem's.
-        found.extend(held.into_iter().filter(|(p, _)| !problems.iter().any(|(q, _)| q.eq_ignore_ascii_case(p))));
+        found.extend(held.into_iter().filter(|(p, _)| !problems.iter().any(|(q, _)| oneup_sync::same_name(q, p))));
         let mut done: Vec<String> = Vec::new();
         // The report keeps the planned order (see `print_round`): one pass.
         let (mut d, mut s) = (report.done.iter().peekable(), report.skipped.iter().peekable());
@@ -1618,6 +2464,22 @@ impl Engine {
 /// different code). `fs`: the sync folder, to see how much room its version
 /// store has (only listed when the plan would add to it; without it, the
 /// store is taken to have no limit, which only a first dry run does).
+/// `approved`: items on lists the user approved (sorted).
+/// The fingerprint a round plans with: the rules', and the database
+/// patterns' (`oneup_plan::park` parks SQLite's working files by them), so
+/// a change to either plans every folder again. Without database patterns,
+/// the rules' alone, as before there were any.
+fn planning_fingerprint(rules: &RuleSet, databases: &oneup_rules::database::Databases) -> String {
+    let d = databases.fingerprint();
+    if d.is_empty() {
+        return rules.fingerprint();
+    }
+    // FNV-1a: short enough to keep in `meta`.
+    let h = d.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{} databases {h:016x}", rules.fingerprint())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn plan_round<'a>(
     store: &Store,
     fs: Option<&LocalFs>,
@@ -1626,6 +2488,7 @@ fn plan_round<'a>(
     recent: Recent,
     rules: &'a RuleSet,
     modes: Modes,
+    approved: &[ItemKey],
 ) -> Result<Planned<'a>> {
     let approvals = controls.answers.approvals();
     let decisions = controls.answers.decisions();
@@ -1635,20 +2498,50 @@ fn plan_round<'a>(
         ..crate::versions::policy(store)?
     };
     let synced = store.read(|o| o.synced_stats())?.items.max(0) as u64;
-    let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?);
-    let (ops, problems, upto) = store.read(|o| {
+    // Databases as the executor has them (`[databases]`): their SQLite
+    // working files are parked beside them.
+    let databases = fs.map(LocalFs::databases).unwrap_or_default();
+    let planning = Planning::new(rules, modes.pull, crate::flow::get(store)?, databases);
+    let Modes { extra, rewind, answered, rewound: done_rewound, removal, .. } = modes;
+    let (ops, problems, upto, mut pending) = store.read(|o| {
         let dirty = o.dirty_scope()?;
         let folders = match scope {
             Scope::All => all_folders(&Parked::with_rules(o, &planning.hide))?,
             Scope::Dirty => dirty.folders,
         };
         let (mut ops, problems) = planning.plan(o, folders)?;
-        add_extra(&mut ops, modes.extra);
+        // The folders its deletions empty, for a stop to list with them.
+        // What a folder holds is read unfiltered: an excluded or parked
+        // item keeps it from being emptied.
+        let parked = Parked::with_rules(o, &planning.hide).with_databases(&planning.databases);
+        let pending = oneup_sync::pending_deletes(&parked, o, &ops, planning.flow)?;
+        // A rewind's items are the rewind's once it's approved: what the
+        // planner would do to them (send an edit the rewind sets aside, say)
+        // waits for it. Before, they sync as ever, and a change changes the
+        // rewind's list (and code), so the approval covers what's shown.
+        if let Some(r) = rewind.as_ref().filter(|r| r.preview.is_none()) {
+            let theirs = |op: &Op| {
+                let (s, l, rm) = op.subjects();
+                r.ops.iter().any(|st| {
+                    let (ss, sl, srm) = st.subjects();
+                    (s.is_some() && s == ss) || (l.is_some() && l == sl) || (rm.is_some() && rm == srm)
+                })
+            };
+            ops.retain(|op| !op.is_action() || !theirs(op));
+        }
+        add_extra(&mut ops, extra);
+        // Removing chosen duplicates waits for a round whose plan doesn't
+        // touch what it removes or keeps (`oneup_exec::dupes::touched`):
+        // the plan's own deletion of the copy that stays, or a move of one
+        // that goes, could otherwise run in the same round.
+        if !oneup_exec::dupes::touched(&ops, &removal) {
+            ops.extend(removal.iter().cloned());
+        }
         let problems = problems
             .into_iter()
             .map(|(id, name, why)| Ok((o.local_path_of(id.0)?.unwrap_or(name), why)))
             .collect::<oneup_store::Result<Vec<_>>>()?;
-        Ok((ops, problems, dirty.upto))
+        Ok((ops, problems, dirty.upto, pending))
     })?;
     let room = match fs {
         Some(fs) if store_bytes(&policy, &ops) > 0 => fs.room(&crate::versions::trim_settings(store)?)?,
@@ -1658,13 +2551,64 @@ fn plan_round<'a>(
         Some(fs) if policy.max_suspicious > 0 => judge_content(fs, &ops),
         _ => Vec::new(),
     };
+    // The paths a stop's list shows are part of what an approval covers.
+    // A removal the user chose always is (`oneup_gate::always_stops`).
+    // Read only when something could trip or a list is approved (a
+    // rewind's or an answered conflict's steps are always a list).
+    let mut ops = ops;
+    let steps_at = ops.len();
+    // A recycling that follows a rewind is covered only at its path.
+    let listed_steps = rewind.is_some() || !answered.is_empty() || !done_rewound.is_empty();
+    if let Some(r) = &rewind {
+        ops.extend(r.ops.iter().cloned());
+    }
+    let (mut paths, mut pending_paths) = if listed_steps
+        || oneup_gate::may_stop(&policy, &ops, &pending, recent, !approved.is_empty(), !suspicious.is_empty())
+    {
+        store.read(|o| Ok((stop_paths(o, &ops), stop_paths(o, &pending))))?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut approved = approved.to_vec();
+    let mut rewound = done_rewound;
+    if let Some(r) = &rewind {
+        // Shown where the rewind's plan names them: where they were then.
+        paths.truncate(steps_at);
+        paths.extend(r.paths.iter().cloned());
+        for (op, p) in &r.later {
+            pending.push(op.clone());
+            pending_paths.push(p.clone());
+        }
+        approved.extend(r.keys.iter().copied());
+        rewound.extend(r.rewound.iter().copied());
+    }
+    if !answered.is_empty() {
+        let (o, p): (Vec<Op>, Vec<String>) = ops
+            .iter()
+            .zip(&paths)
+            .filter(|(op, _)| answered.contains(op))
+            .map(|(op, p)| (op.clone(), p.clone()))
+            .unzip();
+        approved.extend(oneup_gate::rewind_keys(&o, &p));
+    }
+    approved.sort_unstable();
+    approved.dedup();
+    rewound.sort_unstable();
+    rewound.dedup();
+    let cloud_deleted = store.read(|o| oneup_exec::resolve::cloud_deleted(o, ops.iter().chain(&pending)))?;
     let cx = GateContext {
         synced_items: synced,
         recent,
         approvals: &approvals,
+        approved: &approved,
+        pending: &pending,
+        paths: &paths,
+        pending_paths: &pending_paths,
         decisions: &decisions,
         room,
         suspicious: &suspicious,
+        rewound: &rewound,
+        cloud_deleted: &cloud_deleted,
     };
     let review = review_in(&policy, &cx, ops);
     Ok(Planned { review, problems, upto, suspicious, policy, synced, planning })
@@ -1705,12 +2649,20 @@ struct Planning<'a> {
     hide: RuleSet,
     judge: Option<&'a RuleSet>,
     flow: oneup_sync::Flow,
+    /// What counts as a database (`oneup_plan::park`: SQLite's working
+    /// files beside one are parked).
+    databases: oneup_rules::database::Databases,
 }
 
 impl<'a> Planning<'a> {
-    fn new(rules: &'a RuleSet, pull: bool, flow: oneup_sync::Flow) -> Self {
+    fn new(
+        rules: &'a RuleSet,
+        pull: bool,
+        flow: oneup_sync::Flow,
+        databases: oneup_rules::database::Databases,
+    ) -> Self {
         let hide = if pull { rules.upload_only() } else { rules.clone() };
-        Self { hide, judge: pull.then_some(rules), flow }
+        Self { hide, judge: pull.then_some(rules), flow, databases }
     }
 
     /// The plan for `folders`, and the items parking kept out of it.
@@ -1720,7 +2672,7 @@ impl<'a> Planning<'a> {
         o: &Ops<'_>,
         folders: Vec<oneup_sync::Sid>,
     ) -> oneup_store::Result<(Vec<Op>, Vec<(LocalId, String, Why)>)> {
-        let p = Parked::with_rules(o, &self.hide);
+        let p = Parked::with_rules(o, &self.hide).with_databases(&self.databases);
         let mut ops = plan_flow(&p, folders, self.flow)?;
         if let Some(rules) = self.judge {
             let judge = Parked::with_rules(o, rules);
@@ -1749,6 +2701,11 @@ struct Follower<'a> {
     cx: GateContext<'a>,
     order: &'a crate::priority::Priority,
     on_demand: bool,
+    /// What the network lets through (`crate::network`).
+    net: &'a crate::network::Policy,
+    /// What's left of the month's data budget after what the round and
+    /// earlier new folders took (`None`: no budget).
+    budget_left: std::sync::Mutex<Option<u64>>,
     /// What it took in, described, in the order it was taken in.
     taken: std::sync::Mutex<Vec<(Op, Line)>>,
     /// How many operations, and the bytes their transfers add up to.
@@ -1792,6 +2749,13 @@ impl Follower<'_> {
             .into_iter()
             .filter(|(a, _)| !(full && matches!(a.op(), Op::Upload { .. } | Op::MkdirRemote { .. })));
         let (planned, _, _) = self.engine.hold_failed(o, planned.collect())?;
+        // What waits for another network stays in the new folders, whose
+        // marks bring it to the next round.
+        let mut left = self.budget_left.lock().unwrap_or_else(|p| p.into_inner());
+        let net = crate::network::Policy { budget_left: *left, ..self.net.clone() };
+        let (planned, _, after) = hold_for_network(o, &net, planned, self.on_demand)?;
+        *left = after;
+        drop(left);
         let (approved, lines): (Vec<Approved>, Vec<(Op, Line)>) = planned
             .into_iter()
             .take(room)
@@ -1839,8 +2803,21 @@ struct Modes {
     /// `pull` or `prune`: bring them here, never send them
     /// (`Parked::sends_excluded`).
     pull: bool,
-    /// `prune`: their removal, added to the plan for the gate.
+    /// `prune`: their removal, added to the plan for the gate; and the
+    /// renames and removals the user chose.
     extra: Vec<Op>,
+    /// The removal of duplicates the user chose, added unless the plan
+    /// touches what it removes or keeps.
+    removal: Vec<Op>,
+    /// A rewind's steps (`crate::rewind::steps`): added to the plan, and
+    /// what the planner would do to the same items waits for them.
+    rewind: Option<crate::rewind::Steps>,
+    /// Of `extra`, the steps of conflicts the user answered and of restores
+    /// they asked for: the answer approves them (`oneup_exec::recover`).
+    answered: Vec<Op>,
+    /// What this PC is to do to follow a finished rewind (see
+    /// [`Engine::rewound`]).
+    rewound: Vec<ItemKey>,
 }
 
 /// One round's reviewed plan.
@@ -1877,9 +2854,9 @@ async fn dry_run(
     let fs = if first { None } else { open_paired(&store).ok() };
     let controls = Controls { answers: answers.clone(), ..Controls::default() };
     let pull = crate::config::load_rules(data_dir, &store)?.cloud != crate::config::CloudCopies::Keep;
-    let modes = Modes { pull, extra: Vec::new() };
+    let modes = Modes { pull, ..Modes::default() };
     let Planned { review, problems, .. } =
-        plan_round(&store, fs.as_ref(), Scope::All, &controls, Recent::default(), &user_rules, modes)?;
+        plan_round(&store, fs.as_ref(), Scope::All, &controls, Recent::default(), &user_rules, modes, &[])?;
     println!("Dry run: nothing is changed. The first round would do:");
     let limit = limit.unwrap_or(usize::MAX);
     let mut totals = std::collections::BTreeMap::<&str, u64>::new();
@@ -1893,16 +2870,27 @@ async fn dry_run(
                 shown += 1;
             }
         }
-        for (op, why) in &review.withheld {
+        for (w, (op, why)) in review.withheld.iter().enumerate() {
             *totals.entry(withheld_label(*why)).or_default() += 1;
             if shown < limit {
-                println!("  [{}] {}", withheld_label(*why), describe(o, op));
+                let old = review.withheld_old.get(w).copied().unwrap_or(OldCopy::Keep);
+                println!("  [{}] {}", withheld_label(*why), describe_as(o, op, old));
+                shown += 1;
+            }
+        }
+        // A stop's folders to delete once emptied, in later rounds.
+        let needs = withheld_label(Withheld::Breaker(Side::Remote));
+        for op in review.breakers.iter().flat_map(|b| &b.later) {
+            *totals.entry(needs).or_default() += 1;
+            if shown < limit {
+                println!("  [{needs}] {}", later_line(o, op));
                 shown += 1;
             }
         }
         Ok(())
     })?;
-    let all = review.approved.len() + review.withheld.len();
+    let later: usize = review.breakers.iter().map(|b| b.later.len()).sum();
+    let all = review.approved.len() + review.withheld.len() + later;
     if all == 0 {
         println!("  nothing: both sides agree");
     } else {
@@ -2151,6 +3139,18 @@ struct Line {
     note: String,
 }
 
+/// The activity log's action for a conflict copy (`Op::ConflictCopy`: this
+/// PC's version renamed, OneDrive's taking its name), and its note. The
+/// problems list (`crate::problems`) finds the copies by these.
+pub const CONFLICT_ACTION: &str = "keep both";
+const CONFLICT_NOTE: &str = "changed on both sides";
+
+/// The name a conflict copy got, in the folder of the entry's path, from
+/// its activity-log detail.
+pub fn conflict_copy_name(detail: &str) -> Option<&str> {
+    detail.strip_prefix("-> ")?.strip_suffix(CONFLICT_NOTE)?.strip_suffix("; ")
+}
+
 impl Line {
     fn new(action: &'static str, path: String, note: &str) -> Self {
         Self { action, path, folder: false, to: None, note: note.into() }
@@ -2225,21 +3225,63 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
         }
         Op::MoveLocal { local, to, name, .. } => moved("move", lp(local.id.0), join(&lp(to.0), name), "on this PC"),
         Op::RenameLocal { local, name, .. } => moved("rename", lp(local.id.0), name.clone(), "freeing the name"),
-        Op::ConflictCopy { local, name, .. } => {
-            moved("keep both", lp(local.id.0), name.clone(), "changed on both sides")
-        }
+        Op::ConflictCopy { local, name, .. } => moved(CONFLICT_ACTION, lp(local.id.0), name.clone(), CONFLICT_NOTE),
         Op::DeleteRemote { remote, .. } => Line::new("delete", rp(&remote.id), "to OneDrive's recycle bin"),
         Op::Dehydrate { local, .. } => Line::new("free up", lp(local.id.0), ""),
-        Op::PruneRemote { remote, .. } => {
-            Line::new("prune", rp(&remote.id), "excluded; to OneDrive's recycle bin, kept here")
+        Op::PruneRemote { remote, items, exact, .. } => {
+            let n = if *exact { format!("{items} items") } else { format!("at least {items} items") };
+            Line {
+                folder: *items > 1 || !*exact,
+                ..Line::new("prune", rp(&remote.id), &format!("excluded, {n}; to OneDrive's recycle bin, kept here"))
+            }
         }
         Op::RecycleLocal { local, .. } if dropped => {
             Line::new("remove", lp(local.id.0), "no copy kept, as you chose; in OneDrive's recycle bin")
         }
         Op::RecycleLocal { local, .. } => Line::new("recycle", lp(local.id.0), "to .oneup\\versions"),
+        Op::RemoveCopy { .. } => removal_line(o, op),
         Op::Pair { local, .. } => Line::new("in sync", lp(local.id.0), ""),
         Op::Hash(p) => Line::new("check", lp(p.id.0), "comparing contents"),
         Op::Record(_) | Op::Forget(_) => Line::new("bookkeeping", String::new(), ""),
+        Op::Rewind { sid, step } => {
+            use oneup_sync::rewind::Step;
+            let synced = || o.synced_get(*sid).ok().flatten().and_then(|b| b.remote).map(|r| rp(&r));
+            match &**step {
+                // A rewind's, or one the user asked for (`crate::restores`).
+                Step::Restore { to, name, .. } => {
+                    Line::new("restore", join(&rp(to), name), "from OneDrive's recycle bin")
+                }
+                Step::RestoreKept { dir, name, .. } => {
+                    Line::new("restore", join(&lp(dir.0), name), r"from .oneup\versions, never over anything")
+                }
+                Step::RevertTo { remote, .. } => {
+                    Line::new("revert", rp(&remote.id), "an old version from OneDrive's history becomes current")
+                }
+                Step::Reset { remote, place: Some((to, name)), content, .. } => moved(
+                    "move back",
+                    rp(&remote.id),
+                    join(&rp(to), name),
+                    if content.is_some() { "rewind; old version from OneDrive's history" } else { "rewind" },
+                ),
+                Step::Reset { remote, .. } => {
+                    Line::new("revert", rp(&remote.id), "rewind; old version from OneDrive's history")
+                }
+                Step::Remove { remote, .. } => Line::new("remove", rp(&remote.id), "rewind; to OneDrive's recycle bin"),
+                Step::SetAside { local, .. } => {
+                    Line::new("set aside", lp(local.id.0), "rewind; to .oneup\\versions, OneDrive's copy comes back")
+                }
+                Step::Discard { local, .. } => Line::new(
+                    "remove",
+                    lp(local.id.0),
+                    "the copy you didn't keep; to .oneup\\versions, OneDrive's copy to its recycle bin",
+                ),
+                Step::Forget => Line::new(
+                    "restore",
+                    synced().unwrap_or_else(|| "(item)".into()),
+                    "rewind; OneDrive's copy comes back",
+                ),
+            }
+        }
         Op::Hold { local, remote, reason, .. } => {
             // Held for being missing on one side: the side that still has
             // it names it (the local row is often the one gone).
@@ -2275,6 +3317,63 @@ fn transfer_bytes(o: &Ops<'_>, approved: &[Approved], on_demand: bool) -> oneup_
         total += u64::try_from(size).unwrap_or(0);
     }
     Ok(total)
+}
+
+/// The path a stop's list shows for each of `ops` (what [`describe`] says),
+/// for the gate's item keys; empty for what no stop lists.
+fn stop_paths(o: &Ops<'_>, ops: &[Op]) -> Vec<String> {
+    ops.iter()
+        .map(|op| {
+            if oneup_gate::is_removal(op) {
+                removal_line(o, op).path
+            } else if is_mass_sensitive(op) {
+                describe(o, op).path
+            } else {
+                String::new()
+            }
+        })
+        .collect()
+}
+
+/// The path a removal stop's list shows for `op` ([`removal_line`]), part
+/// of its key: a preview works out the stop's code with it. It's the path
+/// the operation carries ([`oneup_sync::Up`]), the one the executor checks
+/// the copy is still at, so an approval names exactly where it acts.
+pub(crate) fn removal_path(o: &Ops<'_>, op: &Op) -> oneup_store::Result<String> {
+    Ok(match op {
+        Op::RemoveCopy { remote: Some(_), remote_up, name, .. } => remote_up.path(name),
+        Op::RemoveCopy { local: Some(_), local_up, name, .. } => local_up.path(name),
+        _ => describe(o, op).path,
+    })
+}
+
+/// [`describe`] for removing a duplicate the user chose, as its stop's list
+/// shows it (and its key holds the path): a cloud copy by its full OneDrive
+/// path, since it may be outside the synced folder.
+fn removal_line(o: &Ops<'_>, op: &Op) -> Line {
+    match op {
+        Op::RemoveCopy { remote: Some(_), local, .. } => {
+            let path = removal_path(o, op).unwrap_or_else(|_| "(OneDrive item)".into());
+            let note = if local.is_some() {
+                "duplicate, as you chose; to OneDrive's recycle bin, the copy here to .oneup\\versions"
+            } else {
+                "duplicate, as you chose; to OneDrive's recycle bin"
+            };
+            Line::new("remove", path, note)
+        }
+        Op::RemoveCopy { local: Some(_), .. } => {
+            let path = removal_path(o, op).unwrap_or_else(|_| "(local item)".into());
+            Line::new("remove", path, "duplicate, as you chose; to .oneup\\versions")
+        }
+        _ => describe(o, op),
+    }
+}
+
+/// A folder a stop lists to delete once the deletions on its list emptied
+/// it (`oneup_gate::Breaker::later`).
+fn later_line(o: &Ops<'_>, op: &Op) -> Line {
+    let l = describe(o, op);
+    Line { folder: true, note: format!("{}, once empty", l.note), ..l }
 }
 
 fn describe_approved(o: &Ops<'_>, a: &Approved) -> Line {
@@ -2318,6 +3417,15 @@ struct Touched {
     synced: Vec<oneup_sync::Sid>,
 }
 
+fn retry_marks(report: &Report, later: &[Op]) -> Touched {
+    let mut retried = Touched::default();
+    let skipped = report.skipped.iter().filter(|(_, s)| !waits_for_a_change(*s));
+    for op in skipped.map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op)).chain(later) {
+        retried.add(op);
+    }
+    retried
+}
+
 impl Touched {
     fn add(&mut self, op: &Op) {
         let (local, remote, synced) = (&mut self.local, &mut self.remote, &mut self.synced);
@@ -2334,6 +3442,11 @@ impl Touched {
             }
             Op::Forget(sid) => synced.push(*sid),
             Op::Hash(l) | Op::Dehydrate { local: l, .. } => local.push(l.id),
+            Op::RemoveCopy { sid, local: l, remote: r, .. } => {
+                synced.extend(*sid);
+                local.extend(l.as_ref().map(|l| l.id));
+                remote.extend(r.as_ref().map(|r| r.id.clone()));
+            }
             Op::Upload { local: l, to, parent, replace, .. } => {
                 local.push(l.id);
                 remote.push(to.clone());
@@ -2381,6 +3494,12 @@ impl Touched {
             Op::PruneRemote { remote: r, keep, .. } => {
                 remote.push(r.id.clone());
                 local.extend(keep.iter().map(|l| l.id));
+            }
+            Op::Rewind { sid, .. } => {
+                let (_, l, r) = op.subjects();
+                synced.push(*sid);
+                local.extend(l);
+                remote.extend(r);
             }
             Op::Hold { sid, local: l, remote: r, .. } => {
                 synced.extend(*sid);
@@ -2446,7 +3565,7 @@ fn waits_for_a_change(s: Skip) -> bool {
     matches!(s, Skip::Refused | Skip::NameTaken | Skip::NotEmpty)
 }
 
-fn skip_label(s: Skip) -> &'static str {
+pub(crate) fn skip_label(s: Skip) -> &'static str {
     match s {
         Skip::Changed => "changed meanwhile; retrying",
         Skip::Busy => "open in another program; retrying",
@@ -2455,6 +3574,7 @@ fn skip_label(s: Skip) -> &'static str {
         Skip::ContentMismatch => "content didn't match; retrying",
         Skip::Refused => "special item or invalid name; retried when it changes",
         Skip::CloudFull => "OneDrive is full; sent once there's room",
+        Skip::Database => "a database not ready to sync; retrying",
     }
 }
 
@@ -2481,6 +3601,7 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
         log.push(ActivityEntry { seq: 0, at_ms, outcome, action: line.action.into(), path: line.path.clone(), detail });
     };
     println!("Round {n}:");
+    let found = crate::databases::Found::of(r);
     let mut done = r.done.iter().peekable();
     let mut skipped = r.skipped.iter().peekable();
     let mut failed = r.failed.iter().peekable();
@@ -2498,7 +3619,7 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
                 println!("  ok    {line}  ({COPIED})");
                 entry(line, ActivityOutcome::Done, Some(COPIED.into()));
             } else if let Some((_, copy)) = r.kept_theirs.iter().find(|(o, _)| o == op) {
-                let why = format!("it changed in OneDrive during the upload; that version is kept as {copy}");
+                let why = format!("{KEPT_THEIRS}; that version is kept as {copy}");
                 println!("  ok    {line}  ({why})");
                 entry(line, ActivityOutcome::Done, Some(why));
             } else if let Some((_, why)) = r.theirs_not_kept.iter().find(|(o, _)| o == op) {
@@ -2515,8 +3636,17 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
                 }
             }
         } else if let Some((_, s)) = skipped.next_if(|(o, _)| o == op) {
-            println!("  skip  {line}  ({})", skip_label(*s));
-            entry(line, ActivityOutcome::Skipped, Some(skip_label(*s).into()));
+            match crate::databases::skip_detail(&found, op).filter(|_| *s == Skip::Database) {
+                // Waiting, not failing: it goes once the database is ready.
+                Some(why) => {
+                    println!("  wait  {line}  ({why})");
+                    entry(line, ActivityOutcome::Waiting, Some(why));
+                }
+                None => {
+                    println!("  skip  {line}  ({})", skip_label(*s));
+                    entry(line, ActivityOutcome::Skipped, Some(skip_label(*s).into()));
+                }
+            }
         } else if let Some((_, m)) = failed.next_if(|(o, _)| o == op) {
             println!("  FAIL  {line}  ({m})");
             entry(line, ActivityOutcome::Failed, Some(m.clone()));
@@ -2527,11 +3657,68 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
     log
 }
 
+/// An upload went over an edit made in OneDrive meanwhile, which was kept
+/// next to it: a conflict (`crate::events`).
+pub const KEPT_THEIRS: &str = "it changed in OneDrive during the upload";
+
 const KEPT_INSTEAD: &str =
     "its old copy was kept in .oneup\\versions after all: it differed from the version OneDrive has";
 
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// What the network's profile holds back (`crate::network::Policy`): the
+/// transfers of file contents it doesn't let through, with which way each
+/// goes and its size; everything else goes, in order. Also what's left of
+/// the data budget after what goes.
+#[allow(clippy::type_complexity)]
+fn hold_for_network(
+    o: &Ops<'_>,
+    net: &crate::network::Policy,
+    planned: Vec<(Approved, Line)>,
+    on_demand: bool,
+) -> oneup_store::Result<(Vec<(Approved, Line)>, Vec<(Approved, Line, (crate::network::Way, u64))>, Option<u64>)> {
+    if net.transfer == crate::network::Transfer::Everything && net.budget_left.is_none() && !net.offline {
+        return Ok((planned, Vec::new(), None));
+    }
+    // What the round may still transfer of the month's data budget.
+    let mut left = net.budget_left;
+    let (mut go, mut held) = (Vec::new(), Vec::new());
+    for (a, l) in planned {
+        let mut size = None;
+        if let Op::Download { remote, .. } = a.op()
+            && !on_demand
+        {
+            size = o.get_item(&remote.id.0)?.and_then(|r| u64::try_from(r.size).ok());
+        }
+        match crate::network::content(a.op(), on_demand, |_| size) {
+            Some((way, bytes)) if !net.allows(way, bytes) => held.push((a, l, (way, bytes.unwrap_or(0)))),
+            Some((way, bytes)) => {
+                let bytes = bytes.unwrap_or(0);
+                // A large replacement may go over an edit made in OneDrive
+                // as it commits; keeping that edit downloads its version
+                // and uploads it again. It starts only if the budget has
+                // room for that too, so the edit can be kept at once.
+                let need = match a.op() {
+                    Op::Upload { replace: Some(_), .. } if bytes > oneup_graph::client::SIMPLE_UPLOAD_MAX as u64 => {
+                        bytes.saturating_mul(3)
+                    }
+                    _ => bytes,
+                };
+                match &mut left {
+                    Some(n) if *n < need => held.push((a, l, (way, bytes))),
+                    Some(n) => {
+                        *n -= need;
+                        go.push((a, l));
+                    }
+                    None => go.push((a, l)),
+                }
+            }
+            None => go.push((a, l)),
+        }
+    }
+    Ok((go, held, left))
 }
 
 /// Splits `items` into those that go now and those `until` holds back,
@@ -2619,6 +3806,11 @@ fn notice(outcome: ActivityOutcome, action: &str, detail: String) -> ActivityEnt
 /// Adds entries to the activity log. A skip or failure that repeats what
 /// the item's last entry says (a file open for an hour, retried every few
 /// minutes) isn't added again.
+/// Notes something in the activity log.
+pub fn note(store: &mut Store, action: &str, detail: String) -> Result<()> {
+    log_activity(store, vec![notice(ActivityOutcome::Note, action, detail)])
+}
+
 fn log_activity(store: &mut Store, entries: Vec<ActivityEntry>) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -2658,12 +3850,18 @@ pub fn breaker_what(b: &Breaker) -> String {
         Side::Remote => "in OneDrive",
     };
     match b.kind {
-        BreakerKind::Mass => format!("{} items {side} would be deleted, overwritten or moved", b.count),
+        BreakerKind::Mass => format!(
+            "{}{} items {side} would be deleted, overwritten or moved",
+            if b.at_least { "at least " } else { "" },
+            b.count
+        ),
+        BreakerKind::Removal => format!("removing the duplicates you chose: {} changes", b.count),
         BreakerKind::Suspicious => format!(
             "{} files would replace their OneDrive copy with content that doesn't look like their type \
              (as when files are encrypted by ransomware)",
             b.count
         ),
+        BreakerKind::Rewind => format!("a rewind would make {} changes; it waits for your approval", b.count),
     }
 }
 
@@ -2676,6 +3874,18 @@ pub fn print_breakers(breakers: &[Breaker], asker: Asker) {
             n => format!(", on top of {n} done in the last few minutes"),
         };
         let code = format!("{:016x}", b.fingerprint.0);
+        if b.kind == BreakerKind::Removal {
+            // Sync goes on meanwhile: only the removal waits.
+            let how = match asker {
+                Asker::Sync => format!("run `oneup sync` again with --approve {code}"),
+                Asker::Agent => format!("run `oneup approve {code}`"),
+            };
+            println!(
+                "  Safety stop: {}.\n  Nothing was removed yet. If the list is what you chose, {how}",
+                breaker_what(b)
+            );
+            continue;
+        }
         let how = match asker {
             Asker::Sync => format!(
                 "See the list with `oneup sync --dry-run`. If it's what you meant, run `oneup sync` again with \
@@ -2715,13 +3925,18 @@ pub fn print_overflow(o: &Overflow, store: &Store, asker: Asker) -> Result<()> {
              {discard}  remove them from this PC without a local copy. OneDrive's recycle bin usually \
              still has them for up to 30 days, but empties sooner when it is full. (A file that differs from \
              the version OneDrive has is kept anyway.)\n  \
-             To decide this automatically from now on: `oneup versions --set-overflow keep`, or \
+             To decide this automatically from now on: `oneup versions --set-overflow keep` (or `discard`), or \
              `--set-rotate on` to make room by removing the oldest kept items."
         ),
         OverflowOutcome::KeptByPolicy => println!(
             "  Version store over its limit: {n} files ({bytes}) deleted or replaced in OneDrive were kept \
              although it had room for {room} (your setting: keep). It shrinks once they are {days} days old; \
              see `oneup versions` to free space sooner."
+        ),
+        OverflowOutcome::DiscardedByPolicy => println!(
+            "  Version store full: {n} files ({bytes}) deleted in OneDrive didn't fit (room for {room}) and were \
+             removed from this PC without a local copy (your setting: discard). Any that differed from the \
+             version OneDrive has were kept."
         ),
         OverflowOutcome::Decided(Choice::Keep) => println!(
             "  Kept as you chose: {n} files ({bytes}) in the version store, which had room for {room}. \
@@ -2784,6 +3999,36 @@ impl Totals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the executor may download besides the round's operations
+    /// follows the network as it changes mid-round: nothing while working
+    /// offline or on a network that moves only the files the user opens.
+    #[test]
+    fn keeping_an_edit_downloads_only_what_the_network_lets_through() {
+        use crate::network::{Policy, Transfer};
+        let c = crate::control::Control::new(None, "L".into(), "/R".into(), Answers::default());
+        let check = may_fetch(&c.controls());
+        assert!(check(Some(10)), "everything goes");
+        c.set_policy(Policy { transfer: Transfer::Opened, ..Policy::default() });
+        assert!(!check(Some(10)), "only files the user opens");
+        c.set_policy(Policy::default());
+        assert!(check(Some(10)));
+        oneup_ipc::Handler::handle(&c, oneup_ipc::Call::Offline { on: true }).unwrap();
+        assert!(!check(Some(10)), "working offline");
+        // A one-shot run: the policy it started with.
+        let fixed = Controls { net: Policy { offline: true, ..Policy::default() }, ..Controls::default() };
+        assert!(!may_fetch(&fixed)(None));
+        assert!(may_fetch(&Controls::default())(None));
+    }
+
+    /// The problems list reads conflict copies' names back from the log.
+    #[test]
+    fn a_conflict_copys_name_is_read_back_from_its_log_entry() {
+        let name = "a (conflict; this PC).txt";
+        let line = Line { to: Some(name.into()), ..Line::new(CONFLICT_ACTION, "/docs/a.txt".into(), CONFLICT_NOTE) };
+        assert_eq!(conflict_copy_name(&line.detail()), Some(name));
+        assert_eq!(conflict_copy_name("-> b.txt; renamed"), None);
+    }
 
     /// After the journal lost track (simulated: the saved position moved
     /// before its oldest record), the same folder is looked through again
@@ -2893,6 +4138,459 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A rewind's stop answered approves none of its items by itself: the
+    /// rewind's job takes the approval only if its list, planned again, has
+    /// the code (`crate::rewind`), so a list that changed after it was
+    /// shown runs none of its steps.
+    #[test]
+    fn a_rewind_stop_answered_approves_no_items_by_itself() {
+        let ops = vec![Op::rewind(1, oneup_sync::rewind::Step::Forget)];
+        let breakers = oneup_gate::review(&oneup_gate::Policy::default(), 100, &[], ops).breakers;
+        assert_eq!(breakers[0].kind, BreakerKind::Rewind);
+        let mut s = Stops::default();
+        s.raise(&breakers);
+        let taken = s.answer(&[breakers[0].fingerprint.0]);
+        assert_eq!(taken.len(), 1, "the code is taken in (and spent)");
+        assert!(s.approved.is_empty(), "{:?}", s.approved);
+    }
+
+    /// A stop's list folders are marked once while it stands; approving its
+    /// code approves its items, for the rounds until they settle.
+    #[test]
+    fn an_approved_stop_approves_its_list_and_its_folders_are_marked_once() {
+        let ops: Vec<Op> = (0..30u64)
+            .map(|i| Op::RecycleLocal {
+                sid: i,
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+            })
+            .collect();
+        let breakers = oneup_gate::review(&oneup_gate::Policy::default(), 100, &[], ops).breakers;
+        let code = breakers[0].fingerprint.0;
+        let mut s = Stops::default();
+        assert_eq!(s.raise(&breakers), (0..30).collect::<Vec<_>>());
+        assert!(s.raise(&breakers).is_empty(), "marked once while it stands");
+        s.answer(&[code ^ 1]);
+        assert!(s.approved.is_empty(), "another code approves nothing");
+        s.answer(&[code]);
+        assert_eq!(s.approved, breakers[0].items);
+        assert!(s.raised.is_empty());
+        // At most a few stops are remembered for an answer.
+        for i in 0..20u64 {
+            let mut b = breakers[0].clone();
+            b.fingerprint = oneup_gate::Fingerprint(i);
+            s.raise(&[b]);
+        }
+        assert_eq!(s.raised.len(), STOPS_KEPT);
+    }
+
+    /// An approval code is used once: after its list ran and the rounds
+    /// settled, the same items coming back (a file restored, then
+    /// rewritten suspiciously again: an upload's key has no content stamp)
+    /// trip the stop again instead of riding on the old answer.
+    #[test]
+    fn an_approval_code_is_used_once() {
+        let uploads: Vec<Op> = (1..=25u64)
+            .map(|i| Op::Upload {
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+                to: RemoteId("root".into()),
+                parent: 0,
+                name: format!("f{i}.docx"),
+                replace: Some(oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() }),
+                link: oneup_sync::Link::Existing(i),
+            })
+            .collect();
+        let bad: Vec<LocalId> = (1..=25).map(LocalId).collect();
+        let p = oneup_gate::Policy::default();
+        let review = |stops: &Stops, given: &[u64]| {
+            let approvals: Vec<Approval> = stops
+                .live(given)
+                .into_iter()
+                .flat_map(|f| [Side::Local, Side::Remote].map(|side| Approval { side, fingerprint: Fingerprint(f) }))
+                .collect();
+            let cx = GateContext {
+                synced_items: 100_000,
+                suspicious: &bad,
+                approvals: &approvals,
+                approved: &stops.approved,
+                ..GateContext::default()
+            };
+            review_in(&p, &cx, uploads.clone())
+        };
+        let mut s = Stops::default();
+        let r = review(&s, &[]);
+        let code = r.breakers[0].fingerprint.0;
+        s.raise(&r.breakers);
+        // The user approves; the agent's answers keep the code meanwhile.
+        let given = [code];
+        s.answer(&given);
+        assert!(review(&s, &given).breakers.is_empty(), "approved: they run");
+        assert_eq!(std::mem::take(&mut s.to_drop), [code], "the caller drops the code");
+        s.settled();
+        assert!(s.approved.is_empty() && s.raised.is_empty());
+        let r = review(&s, &given);
+        assert_eq!(r.breakers.len(), 1, "back again: a new stop");
+        assert!(r.answered.is_empty());
+        // That new raising takes a new approval (the caller dropped the code
+        // after the call; the user gives it again).
+        s.begin();
+        assert_eq!(review(&s, &[]).breakers.len(), 1);
+        s.raise(&r.breakers);
+        s.answer(&given);
+        assert!(review(&s, &[]).breakers.is_empty(), "approved again");
+
+        // The same when the gate matched the code (`oneup sync --approve`).
+        let mut s = Stops::default();
+        let r = review(&s, &given);
+        assert_eq!(r.answered.len(), 1);
+        s.approve(&r.answered[0]);
+        s.settled();
+        assert_eq!(review(&s, &given).breakers.len(), 1);
+    }
+
+    /// An approved change that waits (a file that keeps changing, a pause)
+    /// stays approved when the rounds settle, until it runs; then it's done
+    /// with. One that's no longer planned goes when they settle.
+    #[test]
+    fn an_approved_change_that_waits_stays_approved_until_it_runs() {
+        let uploads: Vec<Op> = (1..=25u64)
+            .map(|i| Op::Upload {
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+                to: RemoteId("root".into()),
+                parent: 0,
+                name: format!("f{i}.docx"),
+                replace: Some(oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() }),
+                link: oneup_sync::Link::Existing(i),
+            })
+            .collect();
+        let bad: Vec<LocalId> = (1..=25).map(LocalId).collect();
+        for paused in [false, true] {
+            let p = oneup_gate::Policy { pause_remote: paused, ..oneup_gate::Policy::default() };
+            let review = |stops: &Stops| {
+                let cx = GateContext {
+                    synced_items: 100_000,
+                    suspicious: &bad,
+                    approved: &stops.approved,
+                    ..GateContext::default()
+                };
+                review_in(&p, &cx, uploads.clone())
+            };
+            let mut s = Stops::default();
+            let r = review(&s);
+            s.raise(&r.breakers);
+            s.answer(&[r.breakers[0].fingerprint.0]);
+            // Approved; held back (busy: after the gate; paused: by it):
+            // nothing ran, and the rounds settle.
+            let r = review(&s);
+            assert!(r.breakers.is_empty(), "paused {paused}");
+            assert_eq!(r.listed.len(), 25);
+            s.round_ended(r.listed, &[]);
+            s.settled();
+            // A later call: still approved, though no code is given.
+            s.begin();
+            let r = review(&s);
+            assert!(r.breakers.is_empty(), "paused {paused}: still approved");
+            // It runs (the pause over); then it's done with.
+            s.round_ended(r.listed, &uploads);
+            s.settled();
+            assert!(s.approved.is_empty());
+            assert_eq!(review(&s).breakers.len(), 1, "back again: a new stop");
+        }
+        // Approved, then no longer planned (the file restored): gone at settling.
+        let p = oneup_gate::Policy::default();
+        let cx = GateContext { synced_items: 100_000, suspicious: &bad, ..GateContext::default() };
+        let r = review_in(&p, &cx, uploads.clone());
+        let mut s = Stops::default();
+        s.raise(&r.breakers);
+        s.answer(&[r.breakers[0].fingerprint.0]);
+        s.round_ended(Vec::new(), &[]);
+        s.settled();
+        assert!(s.approved.is_empty());
+    }
+
+    /// With a mass stop and a content-guard stop together, and parts of each
+    /// approved earlier, the list saved for each stop is exactly what its
+    /// code approves.
+    #[test]
+    fn each_saved_stop_list_is_what_its_code_approves() {
+        let mut ops: Vec<Op> = (1..=25u64)
+            .map(|i| Op::Upload {
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+                to: RemoteId("root".into()),
+                parent: 0,
+                name: format!("f{i}.docx"),
+                replace: Some(oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() }),
+                link: oneup_sync::Link::Existing(i),
+            })
+            .collect();
+        ops.extend((100..130u64).map(|i| Op::DeleteRemote {
+            sid: i,
+            remote: oneup_sync::RemotePre { id: RemoteId(format!("r{i}")), etag: "e".into() },
+        }));
+        let bad: Vec<LocalId> = (1..=25).map(LocalId).collect();
+        let mut approved: Vec<ItemKey> =
+            ops[..12].iter().map(|o| oneup_gate::item_key(BreakerKind::Suspicious, o, "")).collect();
+        approved.extend(ops[12..25].iter().map(|o| oneup_gate::item_key(BreakerKind::Mass, o, "")));
+        approved.sort_unstable();
+        let cx = GateContext { synced_items: 300, suspicious: &bad, approved: &approved, ..GateContext::default() };
+        let r = review_in(&oneup_gate::Policy::default(), &cx, ops);
+        assert_eq!(r.breakers.len(), 2);
+        for (i, b) in r.breakers.iter().enumerate() {
+            let mut shown: Vec<ItemKey> =
+                stop_ops(&r, i).into_iter().map(|op| oneup_gate::item_key(b.kind, op, "")).collect();
+            shown.sort_unstable();
+            assert_eq!(shown, b.items, "{:?}", b.kind);
+        }
+    }
+
+    /// A pruned folder counts as everything in it wherever the safety
+    /// window and the stops count: it makes the round read the paths its
+    /// list shows, its approval runs it, and the window records all of it.
+    #[test]
+    fn a_pruned_folder_counts_as_everything_in_it() {
+        let p = oneup_gate::Policy::default();
+        let prune = Op::PruneRemote {
+            remote: oneup_sync::RemotePre { id: RemoteId("big".into()), etag: "e".into() },
+            forget: vec![7],
+            items: 1000,
+            exact: true,
+            keep: Vec::new(),
+        };
+        assert!(oneup_gate::may_stop(&p, std::slice::from_ref(&prune), &[], Recent::default(), false, false));
+        let shown = vec!["/node_modules/".to_string()];
+        let cx = GateContext { synced_items: 100_000, paths: &shown, ..GateContext::default() };
+        let b = review_in(&p, &cx, vec![prune.clone()]).breakers.remove(0);
+        assert_eq!(b.count, 1000);
+        let cx = GateContext { approved: &b.items, ..cx };
+        let r = review_in(&p, &cx, vec![prune.clone()]);
+        assert!(r.breakers.is_empty(), "approved where it was shown");
+        let reserve = reserved(Recent::default(), &r.approved, &[]);
+        assert_eq!(reserve.remote, 1000);
+        let mut store = Store::open_in_memory().unwrap();
+        crate::safetywindow::SafetyWindow::default().save_with(&mut store, reserve, 0).unwrap();
+        let (mut w, _) = crate::safetywindow::SafetyWindow::load(&store, 1).unwrap();
+        assert_eq!(w.recent(1).remote, 1000);
+        let mut done = Recent::default();
+        done.add_op(&prune, &[]);
+        assert_eq!(done.remote, 1000);
+    }
+
+    /// A removal of unknown size (a folder never listed in full, of which
+    /// 10 items are known) goes through a round as the engine plans it:
+    /// it raises a stop whose list is keyed with the path it shows, so
+    /// approving it works the first time (from the agent's list, or by its
+    /// code as `oneup sync --approve` does), and a move of a folder above it
+    /// between `status` and `approve` makes it a stop of its own again.
+    /// A restore the user asked for joins the round as a planned step that
+    /// the answer approves; without the answer the gate stops it. Done, it
+    /// leaves the queue and the log says so.
+    #[test]
+    fn a_restore_asked_for_runs_as_an_approved_step_of_the_round() {
+        use oneup_store::RemoteRow;
+        let row = |id: &str, parent: &str, name: &str, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                o.upsert_item(
+                    &RemoteRow { parent_id: None, kind: Kind::Root, ..row("root", "", "", Kind::Root) },
+                    false,
+                )?;
+                o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+                o.upsert_item(&row("f", "top", "a.txt", Kind::File), false)?;
+                oneup_exec::link_roots(o, 1, "top").map(|_| ())
+            })
+            .unwrap();
+        crate::restores::version(&mut store, &RemoteId("f".into()), "v1", "/a.txt").unwrap();
+        assert!(crate::restores::version(&mut store, &RemoteId("f".into()), "v1", "/a.txt").is_err(), "once");
+        let q = crate::restores::queued(&store).unwrap();
+        assert_eq!(q.ops.len(), 1);
+        let rules = RuleSet::new(&[] as &[&str], &[] as &[&str]).unwrap();
+        let round = |answered: Vec<Op>| {
+            let modes = Modes { pull: true, extra: q.ops.clone(), answered, ..Modes::default() };
+            let controls = Controls::default();
+            plan_round(&store, None, Scope::All, &controls, Recent::default(), &rules, modes, &[]).unwrap().review
+        };
+        let r = round(Vec::new());
+        assert!(r.breakers.iter().any(|b| b.kind == BreakerKind::Rewind), "unanswered: a stop");
+        assert!(!r.approved.iter().any(|a| a.op() == &q.ops[0]));
+        let r = round(q.ops.clone());
+        assert!(r.breakers.is_empty(), "{:?}", r.breakers);
+        assert!(r.approved.iter().any(|a| a.op() == &q.ops[0]), "approved by the answer");
+
+        // Not run (a pause): it waits. Run: done with, and logged.
+        crate::restores::ran(&mut store, &q, &oneup_exec::Report::default()).unwrap();
+        assert_eq!(store.read(crate::restores::waiting).unwrap().len(), 1);
+        let report = oneup_exec::Report { done: q.ops.clone(), ..Default::default() };
+        crate::restores::ran(&mut store, &q, &report).unwrap();
+        assert!(store.read(crate::restores::waiting).unwrap().is_empty());
+        let log = store.read(|o| o.activity_recent(None, 10)).unwrap();
+        assert!(log.iter().any(|e| e.action == "restore" && e.path == "/a.txt"));
+    }
+
+    /// A removal of unknown size (a folder never listed in full, of which
+    /// 10 items are known) goes through a round as the engine plans it:
+    /// it raises a stop whose list is keyed with the path it shows, so
+    /// approving it works the first time (from the agent's list, or by its
+    /// code as `oneup sync --approve` does), and a move of a folder above it
+    /// between `status` and `approve` makes it a stop of its own again.
+    /// A round whose only change is removing one chosen duplicate, far
+    /// below every limit, still stops for it, keyed with the path its list
+    /// shows (the full OneDrive path), and the preview's code is the stop's.
+    /// Moved meanwhile, the same copy is another list.
+    #[test]
+    fn a_chosen_removal_is_keyed_where_it_is_shown_in_a_round() {
+        use oneup_store::RemoteRow;
+        let row = |id: &str, parent: &str, name: &str, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind,
+            size: if kind == Kind::File { 2 << 20 } else { 0 },
+            etag: Some(format!("e-{id}")),
+            qxh: (kind == Kind::File).then_some([7; 20]),
+            mtime_ms: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                o.upsert_item(&RemoteRow { parent_id: None, ..row("root", "", "", Kind::Root) }, false)?;
+                o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+                o.upsert_item(&row("old", "root", "Old", Kind::Folder), false)?;
+                o.upsert_item(&row("keep", "top", "a.jpg", Kind::File), false)?;
+                o.upsert_item(&row("dup", "old", "a.jpg", Kind::File), false)?;
+                oneup_exec::link_roots(o, 1, "top").map(|_| ())
+            })
+            .unwrap();
+        let chosen = oneup_exec::dupes::Chosen {
+            copy: oneup_exec::dupes::CopyId::Cloud { id: RemoteId("dup".into()), etag: "e-dup".into() },
+            size: 2 << 20,
+            hash: [7; 20],
+        };
+        let plan = store.read(|o| oneup_exec::dupes::plan(o, std::slice::from_ref(&chosen), &[])).unwrap();
+        assert_eq!(plan.ops.len(), 1);
+        let rules = RuleSet::default();
+        let round = |store: &Store, removal: Vec<Op>| {
+            let modes = Modes { removal, ..Modes::default() };
+            plan_round(store, None, Scope::All, &Controls::default(), Recent::default(), &rules, modes, &[])
+                .unwrap()
+                .review
+        };
+        let r = round(&store, plan.ops.clone());
+        assert_eq!(r.breakers.len(), 1);
+        let b = &r.breakers[0];
+        assert_eq!(b.kind, BreakerKind::Removal);
+        let at = |path: &str| oneup_gate::item_key(BreakerKind::Removal, &plan.ops[0], path);
+        assert_eq!(b.items, [at("/Old/a.jpg")], "keyed with the path the list shows");
+        let preview = store.read(|o| crate::duplicates::code(o, &plan)).unwrap();
+        assert_eq!(format!("{:016x}", b.fingerprint.0), preview);
+        // `Old` renamed: the copy is shown elsewhere, another list.
+        store
+            .write(|o| {
+                o.upsert_item(&RemoteRow { name: "Older".into(), ..row("old", "root", "", Kind::Folder) }, false)
+                    .map(|_| ())
+            })
+            .unwrap();
+        // Each round works the choice out again: the path is the one the
+        // operation carries, the one the executor checks it's still at.
+        let again = store.read(|o| oneup_exec::dupes::plan(o, std::slice::from_ref(&chosen), &[])).unwrap();
+        let r = round(&store, again.ops.clone());
+        assert_eq!(r.breakers[0].items, [oneup_gate::item_key(BreakerKind::Removal, &again.ops[0], "/Older/a.jpg")]);
+        assert_ne!(r.breakers[0].fingerprint, b.fingerprint);
+    }
+
+    #[test]
+    fn a_removal_of_unknown_size_is_approved_where_it_was_shown() {
+        use oneup_store::RemoteRow;
+        let row = |id: &str, parent: &str, name: &str, kind: Kind| RemoteRow {
+            id: id.into(),
+            parent_id: Some(parent.into()),
+            name: name.into(),
+            kind,
+            size: 1,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                o.upsert_item(
+                    &RemoteRow { parent_id: None, kind: Kind::Root, ..row("root", "", "", Kind::Root) },
+                    false,
+                )?;
+                o.upsert_item(&row("top", "root", "Sync", Kind::Folder), false)?;
+                o.upsert_item(&row("other", "top", "Other", Kind::Folder), false)?;
+                o.upsert_item(&row("app", "top", "App", Kind::Folder), false)?;
+                // Skipped by name when listing: nothing inside was ever seen.
+                o.upsert_item(&row("nm", "app", "node_modules", Kind::Folder), true)?;
+                oneup_exec::link_roots(o, 1, "top").map(|_| ())
+            })
+            .unwrap();
+        // As found and counted: 10 direct children, all OneDrive tells.
+        let prune = Op::PruneRemote {
+            remote: oneup_sync::RemotePre { id: RemoteId("nm".into()), etag: "e".into() },
+            forget: Vec::new(),
+            items: 10,
+            exact: false,
+            keep: Vec::new(),
+        };
+        let rules = RuleSet::new(&["dev"], &[] as &[&str]).unwrap();
+        let round = |store: &Store, approved: &[ItemKey], codes: Vec<u64>| {
+            let controls =
+                Controls { answers: Answers { approve: codes, ..Answers::default() }, ..Controls::default() };
+            let modes = Modes { pull: true, extra: vec![prune.clone()], ..Modes::default() };
+            plan_round(store, None, Scope::All, &controls, Recent::default(), &rules, modes, approved).unwrap().review
+        };
+
+        let r = round(&store, &[], Vec::new());
+        assert_eq!(r.breakers.len(), 1, "10 known items, but it may hold any number");
+        let b = r.breakers[0].clone();
+        assert!(b.at_least);
+        let shown = store.read(|o| Ok(stop_ops(&r, 0).into_iter().map(|op| describe(o, op).path).collect::<Vec<_>>()));
+        assert_eq!(shown.unwrap(), ["/App/node_modules"]);
+        let at = |path: &str| oneup_gate::item_key(BreakerKind::Mass, &prune, path);
+        assert_eq!(b.items, [at("/App/node_modules")], "keyed with the path the list shows");
+
+        // Approved the first time, from the agent's list or by the code.
+        let r = round(&store, &b.items, Vec::new());
+        assert!(r.breakers.is_empty() && r.approved.len() == 1, "{:?}", r.breakers);
+        let r = round(&store, &[], vec![b.fingerprint.0]);
+        assert!(r.breakers.is_empty() && r.approved.len() == 1);
+        assert_eq!(r.answered.len(), 1);
+
+        // `App` moved into `Other` between `status` and `approve`.
+        store.write(|o| o.upsert_item(&row("app", "other", "App", Kind::Folder), false).map(|_| ())).unwrap();
+        let r = round(&store, &b.items, Vec::new());
+        assert_eq!(r.breakers.len(), 1, "the same folder elsewhere isn't what was approved");
+        assert!(r.approved.is_empty());
+        assert_eq!(r.breakers[0].items, [at("/Other/App/node_modules")]);
+        let r = round(&store, &[], vec![b.fingerprint.0]);
+        assert_eq!(r.breakers.len(), 1, "nor does the old code approve it");
+    }
+
+    /// What a round may carry out is counted for the safety window before
+    /// it runs, and recorded (`Keep`).
+    #[test]
+    fn a_round_reserves_what_it_may_carry_out() {
+        let ops: Vec<Op> = (0..30u64)
+            .map(|i| Op::RecycleLocal {
+                sid: i,
+                local: oneup_sync::LocalPre { id: LocalId(u128::from(i)), stamp: Some((1, 1)) },
+            })
+            .collect();
+        let approved = oneup_gate::review(&oneup_gate::Policy::default(), 1_000_000, &[], ops).approved;
+        let before = Recent { local: 5, remote: 1, suspicious: 0 };
+        assert_eq!(reserved(before, &approved, &[]), Recent { local: 35, remote: 1, suspicious: 0 });
+    }
+
     #[test]
     fn remote_paths_are_normalized_and_the_drive_top_follows_the_release() {
         assert_eq!(normalize_remote("Sync//Test/").unwrap(), "/Sync/Test");
@@ -2954,6 +4652,23 @@ mod tests {
         // would back off; the marks stay all the same (`rounds`).
         let paused = Report { not_run: vec![op()], ..Report::default() };
         assert_eq!(settle(&paused, 0, &mut 0), (true, Some(End::Settled)));
+    }
+
+    #[test]
+    fn a_retry_does_not_keep_unrelated_nonempty_folders_scheduled() {
+        let report = Report {
+            skipped: vec![
+                (Op::Forget(1), Skip::NotEmpty),
+                (Op::Forget(2), Skip::Changed),
+                (Op::Forget(3), Skip::Refused),
+                (Op::Forget(4), Skip::NameTaken),
+                (Op::Forget(5), Skip::CloudFull),
+                (Op::Forget(6), Skip::Busy),
+            ],
+            failed: vec![(Op::Forget(7), "offline".into())],
+            ..Report::default()
+        };
+        assert_eq!(retry_marks(&report, &[Op::Forget(8)]).synced, vec![2, 5, 6, 7, 8]);
     }
 
     /// A pair's OneDrive folder is found with names compared as Windows
@@ -3182,6 +4897,119 @@ mod tests {
         assert!(!round(&mut s, &[]).contains(&d), "after which d is done");
     }
 
+    /// On a network whose profile holds file contents back, only the
+    /// transfers it doesn't let through wait (with their sizes, for
+    /// `oneup status`); folders, moves and placeholders go, in order.
+    #[test]
+    fn the_network_holds_back_only_the_contents_it_doesnt_let_through() {
+        use crate::network::{Policy, Transfer, Way};
+        use oneup_store::{Kind, RemoteRow};
+        use oneup_sync::{Link, LocalPre, RemotePre};
+        let mut s = Store::open_in_memory().unwrap();
+        let big = RemoteRow {
+            id: "big".into(),
+            parent_id: None,
+            name: "film.mp4".into(),
+            kind: Kind::File,
+            size: 20_000_000,
+            etag: Some("e".into()),
+            qxh: None,
+            mtime_ms: None,
+        };
+        s.write(|o| o.upsert_item(&big, false)).unwrap();
+        let up = |id: u128, size: i64| Op::Upload {
+            local: LocalPre { id: LocalId(id), stamp: Some((size, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: format!("f{id}"),
+            replace: None,
+            link: Link::New,
+        };
+        let down = Op::Download {
+            remote: RemotePre { id: RemoteId("big".into()), etag: "e".into() },
+            to: LocalId(1),
+            parent: 1,
+            name: "film.mp4".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let mkdir = Op::MkdirRemote {
+            local: LocalPre { id: LocalId(9), stamp: None },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "d".into(),
+            link: Link::New,
+        };
+        let ops = vec![up(1, 5_000_000), up(2, 50_000_000), down, mkdir];
+        let run_as = |transfer, on_demand, budget_left, offline| {
+            let review = review_in(&oneup_gate::Policy::default(), &GateContext::default(), ops.clone());
+            let planned: Vec<(Approved, Line)> =
+                review.approved.into_iter().map(|a| (a, Line::new("x", "/p".into(), ""))).collect();
+            let net = Policy { transfer, small_bytes: 10_000_000, budget_left, offline, ..Policy::default() };
+            let (go, held, _) = s.read(|o| hold_for_network(o, &net, planned, on_demand)).unwrap();
+            let names = |v: Vec<Op>| -> Vec<String> {
+                v.iter()
+                    .map(|op| match op {
+                        Op::Upload { name, .. } | Op::Download { name, .. } | Op::MkdirRemote { name, .. } => {
+                            name.clone()
+                        }
+                        _ => "?".into(),
+                    })
+                    .collect()
+            };
+            let sizes: Vec<(Way, u64)> = held.iter().map(|(_, _, w)| *w).collect();
+            (
+                names(go.into_iter().map(|(a, _)| a.op().clone()).collect()),
+                names(held.into_iter().map(|(a, _, _)| a.op().clone()).collect()),
+                sizes,
+            )
+        };
+        let run_within = |transfer, on_demand, budget_left| run_as(transfer, on_demand, budget_left, false);
+        let run = |transfer, on_demand| run_within(transfer, on_demand, None);
+        let (go, held, _) = run(Transfer::Everything, false);
+        assert_eq!((go.len(), held.len()), (4, 0));
+        // A data budget: the round's transfers stay within what's left,
+        // in order; what doesn't fit waits, and the rest still goes.
+        let (go, held, _) = run_within(Transfer::Everything, false, Some(30_000_000));
+        assert_eq!((go, held), (vec!["f1".to_string(), "film.mp4".into(), "d".into()], vec!["f2".to_string()]));
+        let (go, held, _) = run_within(Transfer::Everything, false, Some(0));
+        assert_eq!((go, held.len()), (vec!["d".to_string()], 3), "used up: no contents at all");
+        // A large replacement needs room to keep an edit it may go over
+        // too (its version down and up again): three times its size.
+        let replace = Op::Upload {
+            local: LocalPre { id: LocalId(7), stamp: Some((8_000_000, 0)) },
+            to: RemoteId("p".into()),
+            parent: 1,
+            name: "big.bin".into(),
+            replace: Some(RemotePre { id: RemoteId("b".into()), etag: "e".into() }),
+            link: Link::New,
+        };
+        let one = |left| {
+            let review = review_in(&oneup_gate::Policy::default(), &GateContext::default(), vec![replace.clone()]);
+            let planned: Vec<(Approved, Line)> =
+                review.approved.into_iter().map(|a| (a, Line::new("x", "/p".into(), ""))).collect();
+            let net = Policy { budget_left: Some(left), ..Policy::default() };
+            let (go, _, _) = s.read(|o| hold_for_network(o, &net, planned, false)).unwrap();
+            go.len()
+        };
+        assert_eq!(one(20_000_000), 0, "8 MB to send, but no room to keep an edit it may go over");
+        assert_eq!(one(24_000_000), 1);
+        // Working offline: no contents either way, whatever the profile
+        // (the gate holds the rest of OneDrive's side).
+        let (go, held, _) = run_as(Transfer::Everything, false, None, true);
+        assert_eq!((go, held.len()), (vec!["d".to_string()], 3));
+        let (go, held, sizes) = run(Transfer::Small, false);
+        assert_eq!((go, held), (vec!["f1".to_string(), "d".into()], vec!["f2".to_string(), "film.mp4".into()]));
+        assert_eq!(sizes, [(Way::Up, 50_000_000), (Way::Down, 20_000_000)]);
+        let (go, held, _) = run(Transfer::Metadata, false);
+        assert_eq!((go, held.len()), (vec!["d".to_string()], 3));
+        let (go, held, _) = run(Transfer::Opened, false);
+        assert_eq!((go, held), (vec!["f1".to_string(), "f2".into(), "d".into()], vec!["film.mp4".to_string()]));
+        // With Files On-Demand the download is a placeholder: it goes.
+        let (go, _, _) = run(Transfer::Metadata, true);
+        assert_eq!(go, ["film.mp4", "d"]);
+    }
+
     #[test]
     fn held_items_wait_in_order_and_the_earliest_time_is_kept() {
         let t = std::time::Instant::now();
@@ -3242,6 +5070,21 @@ mod tests {
         ];
         add_extra(&mut ops, extra);
         assert_eq!(&ops[2..], [rename(6, "free.txt")]);
+    }
+
+    /// A change to the database patterns alone (no other event) plans
+    /// every folder again: they decide which working files are parked.
+    #[test]
+    fn database_patterns_are_part_of_the_planning_fingerprint() {
+        use oneup_rules::database::Databases;
+        let rules = RuleSet::default();
+        let none = Databases::default();
+        let ledger = Databases::new(true, &[], &["*.ledger"]).unwrap();
+        let finance = Databases::new(true, &["finance"], &[]).unwrap();
+        assert_eq!(planning_fingerprint(&rules, &none), rules.fingerprint(), "unchanged without patterns");
+        let all = [&none, &ledger, &finance].map(|d| planning_fingerprint(&rules, d));
+        assert!(all[0] != all[1] && all[1] != all[2] && all[0] != all[2], "{all:?}");
+        assert_eq!(planning_fingerprint(&rules, &ledger), planning_fingerprint(&rules, &ledger.clone()));
     }
 
     #[test]

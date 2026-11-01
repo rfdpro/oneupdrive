@@ -1,6 +1,8 @@
 # cargo-about configuration for THIRD-PARTY-NOTICES.txt (see packaging/about.hbs).
 # Regenerate after changing dependencies:
 #   cargo about generate -c packaging/about.toml packaging/about.hbs -o THIRD-PARTY-NOTICES.txt
+# `accepted` must match `allow` in deny.toml exactly (same entries, same
+# order); CI fails if they differ. Change both together.
 accepted = [
     "MIT",
     "Apache-2.0",

@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MNS_CHECKORBMP, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SM_CXSMICON, SetForegroundWindow, SetMenuInfo, SetMenuItemInfoW, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
-    WM_ENDSESSION, WM_NULL, WNDCLASSW, WS_OVERLAPPED,
+    WM_ENDSESSION, WM_HOTKEY, WM_NULL, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -43,6 +43,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 /// [`Waker::wake`] posts this.
 const WM_WAKE: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
+/// The one key combination a tray holds ([`Tray::set_hotkey`]).
+const HOTKEY_ID: i32 = 1;
 /// Selected with the keyboard (not in the bindings by name).
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -65,6 +67,8 @@ pub enum Event {
     /// Time to go: Windows is signing out or shutting down, or another
     /// program asked the window to close (`taskkill`, an installer).
     Exit,
+    /// The key combination set with [`Tray::set_hotkey`] was pressed.
+    Hotkey,
 }
 
 /// A menu entry. IDs must not be 0.
@@ -175,6 +179,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
         }
         WM_WAKE => {
             push(Event::Wake);
+            LRESULT(0)
+        }
+        WM_HOTKEY if wp.0 == HOTKEY_ID as usize => {
+            push(Event::Hotkey);
             LRESULT(0)
         }
         WM_ENDSESSION => {
@@ -423,6 +431,27 @@ impl Tray {
     /// is the id Enter chooses. Returns the chosen id, or `None` when closed.
     pub fn choose(&self, title: &str, text: &str, kind: Kind, choices: &[(i32, &str)], default: i32) -> Option<i32> {
         choose(self.hwnd, title, text, kind, choices, default)
+    }
+
+    /// Makes a key combination raise [`Event::Hotkey`] from anywhere, in
+    /// place of the one set before; `None` removes it. `modifiers` are
+    /// Windows' `MOD_ALT` (1), `MOD_CONTROL` (2), `MOD_SHIFT` (4) and
+    /// `MOD_WIN` (8); `key` a virtual-key code. Fails if another program
+    /// holds the combination.
+    pub fn set_hotkey(&self, keys: Option<(u32, u32)>) -> std::io::Result<()> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+        };
+        // SAFETY: our own window, on the thread that made it; failing to
+        // remove a combination that wasn't set is harmless.
+        unsafe {
+            let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+            if let Some((modifiers, key)) = keys {
+                RegisterHotKey(Some(self.hwnd), HOTKEY_ID, HOT_KEY_MODIFIERS(modifiers) | MOD_NOREPEAT, key)
+                    .map_err(|e| io("RegisterHotKey", e))?;
+            }
+        }
+        Ok(())
     }
 
     /// Waits for the next event. `None`: the loop is over ([`Tray::quit`]).
@@ -744,6 +773,22 @@ mod tests {
         unsafe { DestroyMenu(m).unwrap() };
         // The dot always; the symbol too where the icon font is installed.
         assert!(!art.made.borrow().is_empty());
+    }
+
+    /// A combination can be set, changed and removed; one another
+    /// program (here: a second tray) holds is refused.
+    #[test]
+    fn a_hotkey_is_held_by_one_tray_at_a_time() {
+        // Ctrl+Alt+Shift+Win+F24: no keyboard sends it by accident.
+        let keys = Some((0xF, 0x87));
+        let a = Tray::new().unwrap();
+        a.set_hotkey(keys).unwrap();
+        a.set_hotkey(keys).unwrap();
+        let b = Tray::new().unwrap();
+        assert!(b.set_hotkey(keys).is_err(), "taken");
+        a.set_hotkey(None).unwrap();
+        b.set_hotkey(keys).unwrap();
+        b.set_hotkey(None).unwrap();
     }
 
     #[test]

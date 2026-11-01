@@ -57,6 +57,8 @@ pub(crate) struct Claims {
     pub unknown: bool,
     /// An upload large enough to hold a fragment in memory.
     pub large: bool,
+    /// It reads a whole file to hash it (`Op::Hash`).
+    pub hash: bool,
 }
 
 impl Claims {
@@ -87,6 +89,7 @@ impl Claims {
         self.alone |= other.alone;
         self.unknown |= other.unknown;
         self.large |= other.large;
+        self.hash |= other.hash;
     }
 }
 
@@ -101,6 +104,7 @@ pub(crate) struct Held {
     pub units: usize,
     pub alone: usize,
     pub large: usize,
+    pub hashes: usize,
 }
 
 fn add(map: &mut HashMap<Key, usize>, keys: &[Key]) {
@@ -137,6 +141,7 @@ impl Held {
         self.units += 1;
         self.alone += usize::from(c.alone);
         self.large += usize::from(c.large);
+        self.hashes += usize::from(c.hash);
     }
 
     pub fn remove(&mut self, c: &Claims) {
@@ -146,6 +151,13 @@ impl Held {
         self.units -= 1;
         self.alone -= usize::from(c.alone);
         self.large -= usize::from(c.large);
+        self.hashes -= usize::from(c.hash);
+    }
+
+    /// Whether `c`, which conflicts with nothing held, may start under
+    /// `limits`: each kind that has its own limit keeps to it.
+    pub fn has_room(&self, c: &Claims, limits: Parallel) -> bool {
+        !(c.large && self.large >= limits.large_uploads) && !(c.hash && self.hashes >= limits.hashes)
     }
 }
 
@@ -157,11 +169,20 @@ pub struct Parallel {
     /// Of those, uploads larger than one request (above 4 MiB), each of
     /// which holds a fragment in memory (`UploadMemory`).
     pub large_uploads: usize,
+    /// Of those, files being read whole to hash them (`Op::Hash`, on a
+    /// blocking thread: `crate::blocking`). Not set by the memory profile:
+    /// it's disk and CPU, not memory (`[agent] hash_files_at_once`).
+    pub hashes: usize,
 }
 
 impl Parallel {
     /// One operation at a time.
-    pub const ONE: Self = Self { ops: 1, large_uploads: 1 };
+    pub const ONE: Self = Self { ops: 1, large_uploads: 1, hashes: 1 };
+
+    /// Files hashed at once unless set otherwise: one, as before hashing
+    /// had a limit of its own; on a spinning disk, more seek against each
+    /// other.
+    pub const HASHES: usize = 1;
 
     /// The memory profile's limits. Small transfers wait mostly on the
     /// network, so several at once is where the time goes; large uploads
@@ -169,9 +190,9 @@ impl Parallel {
     /// 10, 40 or 60 MiB), so fewer of them run together.
     pub fn for_profile(name: &str) -> Self {
         match name {
-            "minimal" => Self { ops: 4, large_uploads: 1 },
-            "performance" => Self { ops: 16, large_uploads: 4 },
-            _ => Self { ops: 8, large_uploads: 2 },
+            "minimal" => Self { ops: 4, large_uploads: 1, hashes: Self::HASHES },
+            "performance" => Self { ops: 16, large_uploads: 4, hashes: Self::HASHES },
+            _ => Self { ops: 8, large_uploads: 2, hashes: Self::HASHES },
         }
     }
 
@@ -187,7 +208,7 @@ impl Parallel {
 
     /// At least one of each, whatever was set.
     pub(crate) fn at_least_one(self) -> Self {
-        Self { ops: self.ops.max(1), large_uploads: self.large_uploads.max(1) }
+        Self { ops: self.ops.max(1), large_uploads: self.large_uploads.max(1), hashes: self.hashes.max(1) }
     }
 }
 
@@ -245,7 +266,7 @@ mod tests {
             assert_eq!(start, p.ops, "{profile}");
             assert!(most > start && most <= 32, "{profile}");
         }
-        assert_eq!(Parallel { ops: 0, large_uploads: 0 }.requests(), (1, 2));
+        assert_eq!(Parallel { ops: 0, large_uploads: 0, hashes: 0 }.requests(), (1, 2));
     }
 
     #[test]
@@ -261,5 +282,26 @@ mod tests {
         h.remove(&b);
         assert!(!h.conflicts(&folder));
         assert_eq!((h.units, h.large, h.alone), (0, 0, 0));
+    }
+
+    /// Hashing and large uploads each keep to their own limit; anything
+    /// else only to the number of operations.
+    #[test]
+    fn hashing_keeps_to_its_own_limit() {
+        let limits = Parallel { ops: 8, large_uploads: 1, hashes: 2 };
+        let hash = |n: u128| {
+            let mut c = claims(&[n], &[], &[]);
+            c.hash = true;
+            c
+        };
+        let (a, b, c) = (hash(1), hash(2), hash(3));
+        let mut h = held(&[&a]);
+        assert!(h.has_room(&b, limits));
+        h.add(&b);
+        assert!(!h.has_room(&c, limits), "two hash at once");
+        assert!(h.has_room(&claims(&[4], &[], &[]), limits), "other work goes on");
+        h.remove(&a);
+        assert!(h.has_room(&c, limits));
+        assert_eq!(h.hashes, 1);
     }
 }

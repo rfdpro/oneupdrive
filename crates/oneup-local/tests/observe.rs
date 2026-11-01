@@ -164,6 +164,7 @@ fn observed_tree_matches_a_fresh_scan_and_evidence_is_exact() {
         total.records += ch.records;
         total.deleted += ch.deleted;
         total.evidence += ch.evidence;
+        total.opened_by_id += ch.opened_by_id;
         total.dirty.extend(ch.dirty);
         observed = view(obs.store());
         if observed == expected && total.evidence == 3 {
@@ -176,6 +177,7 @@ fn observed_tree_matches_a_fresh_scan_and_evidence_is_exact() {
     assert_eq!(observed["/node_modules"].1, Skip::Excluded);
     assert!(!observed.contains_key("/node_modules/pkg"), "nothing stored below an excluded folder");
     assert!(total.records > 0 && total.dirty.contains(&root_id));
+    assert_eq!(total.opened_by_id, 0, "every item read from its folder's listing, none opened");
 
     let store = obs.into_store();
     store
@@ -299,4 +301,174 @@ fn an_unpopulated_placeholder_folder_from_the_journal_is_not_listed() {
     let listed = std::fs::read_dir(&t.0).unwrap().map(Result::unwrap).find(|e| e.file_name() == "unpop").unwrap();
     use std::os::windows::fs::MetadataExt;
     assert_ne!(listed.metadata().unwrap().file_attributes() & RECALL, 0, "still unpopulated");
+}
+
+/// Saves by renaming a new file over the old one, by another program
+/// (`cmd`'s `move /y`, which fails while any handle on the file is open),
+/// all go through while the observer reads the folder over and over: it
+/// reads items from their folder's listing and never opens them.
+#[test]
+fn saves_by_rename_go_through_while_the_observer_reads() {
+    let t = Tmp::new("saves");
+    t.file("doc.txt", b"v0");
+    t.file("other.txt", b"o");
+    let store = scan(&t.0);
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let (mut rounds, mut by_id) = (0u32, 0u64);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) || rounds == 0 {
+                by_id += obs.catch_up().unwrap().opened_by_id;
+                rounds += 1;
+            }
+            (obs, rounds, by_id)
+        })
+    };
+    let mut failed = Vec::new();
+    for i in 0..30 {
+        let body = format!("v{}", i + 1);
+        t.file("doc.tmp", body.as_bytes());
+        let out = std::process::Command::new("cmd.exe")
+            .current_dir(&t.0)
+            .args(["/c", "move", "/y", "doc.tmp", "doc.txt"])
+            .output()
+            .unwrap();
+        if !out.status.success() || std::fs::read(t.at("doc.txt")).unwrap() != body.as_bytes() {
+            failed.push((i, String::from_utf8_lossy(&out.stdout).into_owned()));
+            let _ = std::fs::remove_file(t.at("doc.tmp"));
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (mut obs, rounds, mut by_id) = reader.join().unwrap();
+    assert!(failed.is_empty(), "saves failed: {failed:?}");
+    assert!(rounds > 1, "the observer read meanwhile");
+
+    // Then an Office-style save (the old file moved aside, the new one
+    // renamed in, the old one deleted) and a rename that changes only the
+    // case: every item is still read from the listing.
+    t.file("~tmp1.tmp", b"office");
+    std::fs::rename(t.at("other.txt"), t.at("~old.tmp")).unwrap();
+    std::fs::rename(t.at("~tmp1.tmp"), t.at("other.txt")).unwrap();
+    std::fs::remove_file(t.at("~old.tmp")).unwrap();
+    std::fs::rename(t.at("doc.txt"), t.at("Doc.txt")).unwrap();
+    let expected = view(&scan(&t.0));
+    let mut observed = View::new();
+    for _ in 0..50 {
+        by_id += obs.catch_up().unwrap().opened_by_id;
+        observed = view(obs.store());
+        if observed == expected {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observed, expected);
+    assert!(observed.contains_key("/Doc.txt"), "the new case");
+    assert_eq!(by_id, 0);
+}
+
+/// An item with a new name in a folder too large to list whole is the one
+/// case read by opening it by ID; the tree still comes out right.
+#[test]
+fn a_new_name_in_a_large_folder_is_read_by_id() {
+    let t = Tmp::new("large");
+    for i in 0..=oneup_local::observe::LIST_WHOLE_MAX {
+        t.file(&format!("big/f{i:05}"), b"");
+    }
+    let store = scan(&t.0);
+    t.file("big/new.txt", b"n");
+    std::fs::write(t.at("big/f00000"), b"edited").unwrap();
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+    let expected = view(&scan(&t.0));
+    let (mut observed, mut by_id) = (View::new(), 0);
+    for _ in 0..50 {
+        by_id += obs.catch_up().unwrap().opened_by_id;
+        observed = view(obs.store());
+        if observed == expected {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(by_id, 1, "the new name only; the edited file is found by its stored name");
+}
+
+/// A folder the store has as small but that has filled since (thousands
+/// of files at once) isn't listed whole: the listing stops past the bound,
+/// and its new items are read one by one, as in any large folder.
+#[test]
+fn a_folder_that_filled_since_its_scan_is_not_listed_whole() {
+    let t = Tmp::new("filled");
+    std::fs::create_dir_all(t.at("grow")).unwrap();
+    let store = scan(&t.0);
+    let n = oneup_local::observe::LIST_WHOLE_MAX + 50;
+    for i in 0..n {
+        t.file(&format!("grow/f{i:05}"), b"");
+    }
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+    let expected = view(&scan(&t.0));
+    let (mut observed, mut by_id) = (View::new(), 0);
+    for _ in 0..50 {
+        by_id += obs.catch_up().unwrap().opened_by_id;
+        observed = view(obs.store());
+        if observed == expected {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(by_id, n as u64, "none found by listing the whole folder");
+}
+
+/// A file a program keeps open for writing across a catch-up: its folder's
+/// listing may still show the size and time from before the writes until
+/// the program closes it. Its close record brings the row up to date.
+#[test]
+fn a_file_written_across_a_catch_up_is_right_after_its_writer_closes_it() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    let t = Tmp::new("writer");
+    t.file("docs/log.txt", b"start\r\n");
+    let store = scan(&t.0);
+    let docs = id_of(&view(&store), "/docs");
+    let mut obs = Observer::open(store, Config::new(ExcludeSet::dev())).unwrap();
+
+    // Another program (not this test's executable) appends and keeps the
+    // file open until told to close it.
+    let script = format!(
+        "$f = [IO.File]::Open('{}', 'Open', 'ReadWrite', 'ReadWrite'); [void]$f.Seek(0, 'End'); \
+         $b = [byte[]]::new(5000); $f.Write($b, 0, $b.Length); $f.Flush(); \
+         [Console]::Out.WriteLine('written'); [Console]::Out.Flush(); [void][Console]::In.ReadLine(); $f.Close()",
+        t.at("docs/log.txt").display()
+    );
+    let mut writer = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(writer.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    assert_eq!(line.trim(), "written");
+    std::thread::sleep(Duration::from_millis(200));
+    obs.catch_up().unwrap();
+    let during = view(obs.store())["/docs/log.txt"].2;
+
+    writer.stdin.take().unwrap().write_all(b"\r\n").unwrap();
+    assert!(writer.wait().unwrap().success());
+    let expected = view(&scan(&t.0));
+    assert_eq!(expected["/docs/log.txt"].2, 7 + 5000);
+    let (mut observed, mut dirty) = (View::new(), false);
+    for _ in 0..50 {
+        let ch = obs.catch_up().unwrap();
+        dirty |= ch.dirty.contains(&docs);
+        observed = view(obs.store());
+        if observed == expected && dirty {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("size stored while the writer had it open: {during}");
+    assert_eq!(observed, expected, "as a fresh scan sees it");
+    assert!(dirty, "the folder is planned again after the close");
 }
