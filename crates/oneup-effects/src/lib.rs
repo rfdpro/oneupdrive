@@ -44,6 +44,7 @@
 //! the executor's crash tests also stop them half done.
 
 pub mod name;
+pub mod settings;
 pub mod sharing;
 pub mod versions;
 

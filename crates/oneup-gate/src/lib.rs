@@ -81,6 +81,7 @@ use oneup_sync::{Link, LocalId, Op, Sid};
 
 pub mod content;
 pub mod release;
+pub mod settings;
 pub mod sharing;
 
 /// The side an operation changes.

@@ -79,8 +79,34 @@ enum Cmd {
     Plan(PlanArgs),
     /// Show what the background agent is doing, and what the local mirror and the last scan contain
     Status(ProfileArg),
-    /// List everything that needs your attention: safety stops, sync
-    /// failures, problems, pauses, conflicts (this folder, its pairs and vaults)
+    /// Review and change initial one-sided file choices
+    SetupFiles {
+        #[arg(long, default_value="local", value_parser=["local","cloud","missing"])]
+        side: String,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long, value_enum, requires = "path")]
+        sync: Option<Toggle>,
+        /// Record that a missing online-only item is no longer needed
+        #[arg(long, requires = "path", conflicts_with = "sync")]
+        acknowledge: bool,
+        /// Rebuild the missing-item report from the current checked metadata
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Review, import or publish portable settings in OneDrive
+    SharedSettings {
+        #[arg(default_value="review", value_parser=["review","import","publish","disable"])]
+        action: String,
+        #[arg(long)]
+        code: Option<String>,
+        /// Publish future local changes automatically
+        #[arg(long)]
+        automatic: bool,
+    },
+    /// List everything that needs your attention: failures, pauses and safety stops
     Problems {
         /// As JSON, for scripts
         #[arg(long)]
@@ -971,6 +997,9 @@ struct SyncArgs {
     /// to the background agent (`oneup start`)
     #[arg(long, conflicts_with = "dry_run")]
     pair_only: bool,
+    /// Review one-sided items before first sync; local-only items wait for selection
+    #[arg(long)]
+    review_initial: bool,
     /// Use Files On-Demand from the start: OneDrive's files arrive
     /// online-only (see `oneup on-demand`)
     #[arg(long, conflicts_with = "dry_run")]
@@ -1781,6 +1810,85 @@ async fn run() -> Result<()> {
             status(&cli, p.memory_profile)
         }
         Cmd::Problems { json } => oneup_app::problems::show(&data_dir(&cli)?, *json).await,
+        Cmd::SetupFiles { side, after, path, sync, acknowledge, refresh } => {
+            let dir = data_dir(&cli)?;
+            let side = match side.as_str() {
+                "local" => "l",
+                "cloud" => "r",
+                _ => "m",
+            };
+            if *refresh {
+                if side != "m" {
+                    bail!("--refresh requires --side missing");
+                }
+                oneup_app::initial::collect_missing(&dir)?;
+            }
+            if *acknowledge && side != "m" {
+                bail!("--acknowledge requires --side missing");
+            }
+            if sync.is_some() && side == "m" {
+                bail!("use --acknowledge for missing items");
+            }
+            if let Some(path) = path {
+                let selected = if *acknowledge { true } else { sync.context("choose --sync or --acknowledge")?.on() };
+                let store = setup::open_store(&dir, 1024)?;
+                let path = format!("/{}", path.trim_matches('/'));
+                let key = store
+                    .read(|o| match side {
+                        "l" => {
+                            Ok(oneup_app::resolve::local_at(o, &path)?.map(|l| oneup_store::initial::local_key(l.0)))
+                        }
+                        "r" => Ok(oneup_app::resolve::remote_at(o, &path)?.map(|r| format!("r:{}", r.0))),
+                        _ => o.initial_key_at(side, &path),
+                    })?
+                    .context("item not in initial choices")?;
+                drop(store);
+                oneup_app::initial::select(&dir, &key, selected)?;
+                agent::nudge(&dir).await;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&oneup_app::initial::page(&dir, side, after.as_deref().unwrap_or(""))?)?
+            );
+            Ok(())
+        }
+        Cmd::SharedSettings { action, code, automatic } => {
+            let dir = data_dir(&cli)?;
+            if action == "disable" {
+                return oneup_app::shared_settings::disable(&dir);
+            }
+            setup::require_test_account(&dir)?;
+            let http = http()?;
+            let auth = auth(&cli, &http)?;
+            let graph = Graph::new(http, auth, oneup_graph::Aimd::new(2, 4));
+            match action.as_str() {
+                "review" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&oneup_app::shared_settings::preview(&dir, &graph).await?)?
+                ),
+                "import" => {
+                    oneup_app::shared_settings::import(
+                        &dir,
+                        &graph,
+                        code.as_deref().context("review first, then pass --code")?,
+                        *automatic,
+                    )
+                    .await?;
+                    agent::nudge(&dir).await;
+                }
+                "publish" => {
+                    oneup_app::shared_settings::publish(
+                        &dir,
+                        &graph,
+                        code.as_deref().context("review first, then pass --code")?,
+                        *automatic,
+                    )
+                    .await?
+                }
+                _ => bail!("unknown shared settings action"),
+            }
+            Ok(())
+        }
         Cmd::Pause { folder: Some(f), .. } => {
             rules::pause_folder(&data_dir(&cli)?, &open_store(&cli, MemoryProfile::Balanced)?, f, true).await
         }
@@ -2611,6 +2719,7 @@ async fn run() -> Result<()> {
                 dry_run: args.dry_run,
                 preview_limit: args.limit,
                 pair_only: args.pair_only,
+                review_initial: args.review_initial,
                 on_demand: args.on_demand,
                 max_rounds: args.max_rounds.max(1),
                 answers: sync::Answers {

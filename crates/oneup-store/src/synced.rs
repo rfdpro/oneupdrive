@@ -211,7 +211,7 @@ fn fix_base((kind, mut b): (i64, Base)) -> Result<Base> {
 const LOCAL_NODE: &str = "SELECT i.file_id, i.parent_id, i.name, i.kind, i.size, i.mtime, h.qxh
      FROM local_item i
      LEFT JOIN local_hash h ON h.file_id = i.file_id AND h.size = i.size AND h.mtime = i.mtime";
-const LOCAL_SYNCABLE: &str = "i.skip = 0 AND i.name_lossy = 0";
+const LOCAL_SYNCABLE: &str = "i.skip = 0 AND i.name_lossy = 0 AND NOT EXISTS (SELECT 1 FROM initial_choice c WHERE c.key = 'l:' || lower(hex(i.file_id)) AND c.selected = 0)";
 /// A local file the OneDrive app left standing in for a package in the
 /// matching cloud folder: `<notebook>.url` for a OneNote notebook,
 /// `<vault>.lnk` for the Personal Vault. Packages never sync, so their
@@ -242,7 +242,7 @@ fn local_node(r: &Row<'_>) -> rusqlite::Result<LocalNode> {
 /// Cloud items the reconciler may see: files, folders and the root.
 /// Excluded folders and packages (OneNote notebooks) are filtered out.
 const REMOTE_NODE: &str = "SELECT id, parent_id, name, kind, size, etag, qxh FROM remote_item";
-const REMOTE_SYNCABLE: &str = "is_excluded = 0";
+const REMOTE_SYNCABLE: &str = "is_excluded = 0 AND NOT EXISTS (SELECT 1 FROM initial_choice c WHERE c.key = 'r:' || remote_item.id AND c.selected = 0)";
 
 /// The children lists the reconciler reads ([`Trees`]), each from a parent
 /// index.

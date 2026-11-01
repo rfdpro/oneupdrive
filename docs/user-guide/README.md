@@ -6,6 +6,7 @@ Welcome! This guide is for everyone, not just developers.
 
 **Start here**
 * [Getting started](getting-started.md): installing, setting up, what you'll need
+* [Settings on another PC](shared-settings.md): reviewing portable settings and choosing initial files
 * [Words used in this guide](glossary.md): what "online-only", "safety stop" and "folder pair" mean
 * [The settings window](settings-window.md): every setting, page by page
 * [The OneUpDrive icon](tray-icon.md): status at a glance, pausing, and the questions OneUpDrive asks you

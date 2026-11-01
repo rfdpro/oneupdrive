@@ -2,6 +2,8 @@
 
 This page explains how OneUpDrive works in plain terms. Each section links to the detailed design.
 
+Setup records one-sided file choices separately from deletion evidence. Portable preferences can be reviewed and shared through a versioned file in OneDrive ([shared-settings.md](shared-settings.md)).
+
 ## The pieces
 * **`oneupd`**: the background agent. It runs in your user session without admin rights, does all the syncing, and is the Files On-Demand provider. One agent runs per data folder (an account, an extra folder pair or a vault).
 * **`oneup`**: the command-line tool (status, pause, explain, …). It's a *separate program* on purpose: Windows treats file writes by the provider's own program specially, so user-facing tools must never share its executable. It talks to the running agent through a private channel that only you can open ([control-api.md](control-api.md)).

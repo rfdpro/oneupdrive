@@ -56,6 +56,8 @@ Because working files never travel, the executor has no rules of its own for the
 Outlook data files and virtual disks (`Format::never_live`) are written for as long as their program runs, and each copy is gigabytes: they sync only while closed, which may be seldom. The agent notes each one it sends or holds back (`databases::live_note`, in the status and once in the activity log) and offers to exclude it (`oneup databases --exclude PATH`, the window's **Exclude**: a rule for that one file in `[rules] exclude`) or to keep syncing it without the note (`--keep-syncing`, `[databases] keep_syncing`). Nothing is excluded without the user's say. Warnings are kept in memory, at most 100, and dropped once the file is excluded or kept.
 
 ## Where it shows
+`Skip::Database` settles the round without entering the agent's retry loop. Its dirty marks remain, so a change or the ordinary cloud check reconsiders it, including a program closing a file without changing its contents. Consistency checks remain mandatory. Waiting databases appear in the problems list as `waiting_database`.
+
 * **Activity log**: a `waiting` entry for each database held back, saying why and which program ("KeePass database open in KeePass; sent once it's closed").
 * **Status** (`Status::databases`, `oneup_ipc::DatabaseNote`: path, format, why `wal`/`journal`/`open`/`behind`/`live`, programs, direction `up`/`down`, the sentence): `oneup status`, the window's **Files → Exclude → Databases**. Warnings also go to the problems list (`live_database`).
 * **`oneup explain PATH`**: what the file is by its name and the patterns (it isn't read), whether it waits now (from the running agent), or that it may be a working file beside a database.

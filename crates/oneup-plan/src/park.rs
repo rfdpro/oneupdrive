@@ -190,6 +190,10 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
     }
 
     fn local_excluded(&self, n: &LocalNode) -> Result<bool, T::Error> {
+        if oneup_sync::same_name(&n.name, "oneup.settings") && n.parent == self.inner.base(ROOT)?.and_then(|r| r.local)
+        {
+            return Ok(true);
+        }
         let (Some(rules), Some(p)) = (self.rules, n.parent) else { return Ok(false) };
         let pd = self.local_dir(rules, p)?;
         Ok(pd.excluded || rules.excludes_child(&pd.path, &n.name, n.kind == NodeKind::Folder))
@@ -405,6 +409,9 @@ impl<'a, T: Trees + ?Sized> Parked<'a, T> {
     fn remote_parked(&self, n: &RemoteNode) -> Result<bool, T::Error> {
         if n.parent.is_none() {
             return Ok(false);
+        }
+        if oneup_sync::same_name(&n.name, "oneup.settings") && n.parent.as_ref() == self.top()? {
+            return Ok(true);
         }
         if is_local_by_nature(&n.name) {
             return Ok(true);

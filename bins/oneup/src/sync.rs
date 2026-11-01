@@ -81,6 +81,7 @@ pub struct Options {
     /// Record the pair and open the folder, and leave the syncing to the
     /// background agent (the settings window's setup).
     pub pair_only: bool,
+    pub review_initial: bool,
     /// Make the folder OneUpDrive's Files On-Demand folder before the first
     /// round, so OneDrive's files arrive online-only.
     pub on_demand: bool,
@@ -303,7 +304,11 @@ async fn prepare(
     // Once paired, listing follows the rules as they are now (config.toml),
     // not the choice made at the first sync.
     let rules = if first {
-        rules
+        if crate::config::read_doc(&opts.data_dir)?.is_some() {
+            crate::config::load_rules(&opts.data_dir, &store)?.rule_set()?.pruning()
+        } else {
+            rules
+        }
     } else {
         let (set, _) = crate::rulefiles::load(&opts.data_dir, &store, &mut crate::rulefiles::Cache::default())?;
         set.pruning()
@@ -363,6 +368,11 @@ async fn prepare(
             crate::moveover::note_app_folder(o, &local)?;
             o.meta_set(KEY_TOKEN, &token)
         })?;
+    }
+
+    if opts.review_initial && store.read(|o| o.meta_get(KEY_MARKER))?.is_none() {
+        let (set, _) = crate::rulefiles::load(&opts.data_dir, &store, &mut crate::rulefiles::Cache::default())?;
+        crate::initial::collect(&mut store, &set)?;
     }
 
     if opts.dry_run {
@@ -1700,7 +1710,7 @@ impl Engine {
         &self,
         mut store: Store,
         first: Scope,
-        controls: &(dyn Fn() -> Controls + Send + Sync),
+        controls_now: &(dyn Fn() -> Controls + Send + Sync),
         recent: Recent,
         executed: &mut Recent,
         max_rounds: usize,
@@ -1719,14 +1729,14 @@ impl Engine {
         let mut scope = first;
         let mut changed_rounds = 0;
         // Offline (the user's choice): OneDrive isn't asked anything.
-        if !controls().net.offline {
+        if !controls_now().net.offline {
             self.check_room(&mut store).await?;
         }
         self.stops_lock().begin();
         for n in 1..=max_rounds.max(1) {
             out.rounds = n;
             out.held_until = None;
-            let controls = &controls();
+            let controls = &controls_now();
             if controls.pause_local && controls.pause_remote && n > 1 {
                 // Paused meanwhile: nothing more now; the caller sees why.
                 out.end = End::Settled;
@@ -1761,7 +1771,11 @@ impl Engine {
             // Changed rules, or database patterns (they decide which working
             // files are parked): every folder is planned again, from the
             // database (rules.md § Changing rules without a rescan).
-            let fingerprint = planning_fingerprint(&user_rules, &databases);
+            let fingerprint = format!(
+                "{}:{}",
+                planning_fingerprint(&user_rules, &databases),
+                store.read(|o| o.meta_get("initial.revision"))?.unwrap_or_default()
+            );
             self.exec.set_databases(databases);
             let rules_changed = store.read(|o| o.meta_get(KEY_RULES))?.as_deref() != Some(fingerprint.as_str());
             if rules_changed {
@@ -2275,6 +2289,15 @@ impl Engine {
                     }
                     Ok(())
                 })?;
+            }
+            // User files go first. A pause or network change may have
+            // arrived during their transfers, so ask for the controls again.
+            let current = controls_now();
+            if !current.pause_remote
+                && current.net.allows(crate::network::Way::Up, Some(1024 * 1024))
+                && !crate::versions::policy(&store)?.panic
+            {
+                crate::shared_settings::background(&self.data_dir, &self.graph).await;
             }
             if let Some(end) = end {
                 if end == End::Settled {
@@ -3524,7 +3547,12 @@ fn settle(report: &Report, waiting: usize, changed_rounds: &mut usize) -> (bool,
     // uploads OneDrive had no room for, are left to later rounds, which hold
     // them (the caller keeps their marks): nothing to retry now.
     let failed = report.failed.len() > waiting;
-    let clean = report.skipped.iter().all(|(_, s)| waits_for_a_change(*s) || *s == Skip::CloudFull) && !failed;
+    // Databases can stay open or retain a WAL indefinitely. Keep their
+    // marks for the next change or ordinary cloud check, without keeping
+    // the agent in its retry loop. Their consistency checks still run.
+    let clean =
+        report.skipped.iter().all(|(_, s)| waits_for_a_change(*s) || matches!(s, Skip::CloudFull | Skip::Database))
+            && !failed;
     if !report.is_idle() {
         *changed_rounds = 0;
         return (clean, None);
@@ -3574,7 +3602,7 @@ pub(crate) fn skip_label(s: Skip) -> &'static str {
         Skip::ContentMismatch => "content didn't match; retrying",
         Skip::Refused => "special item or invalid name; retried when it changes",
         Skip::CloudFull => "OneDrive is full; sent once there's room",
-        Skip::Database => "a database not ready to sync; retrying",
+        Skip::Database => "waiting for a consistent database",
     }
 }
 
@@ -4624,6 +4652,13 @@ mod tests {
         assert_eq!(start_scope(&s).unwrap(), Scope::All, "another version may plan differently");
         s.write(|o| o.meta_set(KEY_FULL_PASS, env!("CARGO_PKG_VERSION"))).unwrap();
         assert_eq!(start_scope(&s).unwrap(), Scope::Dirty);
+    }
+
+    #[test]
+    fn database_waits_settle_but_keep_the_item_scheduled() {
+        let report = Report { skipped: vec![(Op::Forget(42), Skip::Database)], ..Report::default() };
+        assert_eq!(settle(&report, 0, &mut 0), (true, Some(End::Settled)));
+        assert_eq!(retry_marks(&report, &[]).synced, vec![42]);
     }
 
     #[test]

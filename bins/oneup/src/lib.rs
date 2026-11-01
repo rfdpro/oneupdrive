@@ -29,6 +29,7 @@ pub mod flow;
 pub mod hooks;
 #[cfg(windows)]
 pub mod identity;
+pub mod initial;
 #[cfg(windows)]
 pub mod install;
 #[cfg(windows)]
@@ -63,6 +64,8 @@ pub mod safetywindow;
 pub mod search;
 pub mod settingsapi;
 pub mod setup;
+pub mod setup_preview;
+pub mod shared_settings;
 pub mod sharing;
 #[cfg(windows)]
 pub mod shellstatus;
