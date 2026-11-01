@@ -669,6 +669,18 @@
             flex-wrap: wrap;
             align-items: center;
         }
+
+        #shared-settings>.actions {
+            margin-top: 16px;
+            margin-bottom: 16px;
+        }
+
+        #shared-settings>.ck {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
         
         .field {
             display: flex;
@@ -2092,7 +2104,7 @@
                             <b>Exclude</b>
                             <div class="field"><select id="setup-preset" aria-label="Exclude">
           <option value="dev">Developer folders (node_modules, .venv, target, build caches…)</option>
-          <option value="none">Nothing</option><option value="imported" id="setup-imported" hidden>Imported exclusions</option></select></div>
+          <option value="none">Nothing</option><option value="imported" id="setup-imported" hidden>Saved exclusions</option></select></div>
                             <p class="note">Change it later in Files &gt; Exclude.</p>
                         </div>
                     </div>
@@ -2530,6 +2542,8 @@
                     <div class="label"><b>Get previews</b><small>New features sooner, more bugs</small></div><label class="toggle"><input type="checkbox" id="upd-preview" aria-label="Get preview versions"><span></span></label></div>
                 <div class="row">
                     <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
+                <div class="row">
+                    <div class="label"><b>Run setup again</b></div><button class="btn" id="setup-rerun" aria-label="Open setup">Open</button></div>
             </div>
             <details class="sect" id="advanced">
             <summary><svg aria-hidden="true"><use href="#i-chev"/></svg><h3>Advanced</h3></summary>
@@ -3085,6 +3099,7 @@
             $$(".page").forEach(p => p.classList.toggle("on", p.id === page));
             $("#main").classList.toggle("wide", page === "files");
             $("#agent").hidden = page === "setup";
+            $(page === "setup" ? "#setup-shared-slot" : "#general-shared-slot").append($("#shared-settings"));
             clearInterval(appsTimer);
             appsTimer = null;
             if (page === "apps") {
@@ -8278,16 +8293,37 @@
         };
         // ---- first-run setup
         let firstFill = true;
+        let setupReopened = false;
+
+        $("#setup-rerun").onclick = () => {
+            setupReopened = true;
+            MV.mode = "new";
+            MV.app = null;
+            MV.check = null;
+            if (snap.pair.local) {
+                $("#setup-local").value = snap.pair.local;
+                $("#setup-remote").value = snap.pair.remote || "/";
+                $("#setup-imported").hidden = false;
+                $("#setup-preset").value = "imported";
+                $("#setup-ondemand").checked = !!snap.pair.on_demand;
+                $("#setup-autostart").checked = !!snap.autostart;
+            }
+            stale();
+            $("#preview-card").hidden = true;
+            $("#setup-choices").hidden = true;
+            setupState(snap);
+            show("setup");
+            $("#setup-local").focus();
+        };
 
         function setupState(s) {
             const need = !s.pair.local;
-            $(need ? "#setup-shared-slot" : "#general-shared-slot").append($("#shared-settings"));
             if (!s.signed_in) sharedDiscovered = false;
             if (need && s.signed_in && !sharedDiscovered) {
                 sharedDiscovered = true;
                 reviewSharedSettings();
             }
-            $("#nav-setup").hidden = !need;
+            $("#nav-setup").hidden = !(need || setupReopened);
             if (need && firstFill) {
                 show("setup");
                 if (!$("#setup-local").value && s.suggested_local) $("#setup-local").value = s.suggested_local;

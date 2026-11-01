@@ -300,7 +300,21 @@ const DRIVER: &str = r##"<script>
     check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore && restore.outerHTML);
     restore.focus(); restore.click(); await sleep(300);
     check("restoring keeps focus in the list as it reloads", document.querySelector("#rc-bin").contains(document.activeElement), at());
-    document.querySelector("#nav-setup").click();
+    document.querySelector("#nav-open-settings").click();
+    document.querySelector('nav button[data-page="general"]').click(); await sleep(300);
+    const sharedDescription = document.querySelector("#shared-settings>.note").getBoundingClientRect();
+    const sharedActions = document.querySelector("#shared-settings>.actions").getBoundingClientRect();
+    const sharedAutomatic = document.querySelector("#shared-settings>.ck").getBoundingClientRect();
+    check("shared settings have space around their action row", sharedActions.top - sharedDescription.bottom >= 16
+      && sharedAutomatic.top - sharedActions.bottom >= 16, "");
+    const beforeSetupCalls = HOST_CALLS.length;
+    document.querySelector("#setup-rerun").focus(); document.activeElement.click(); await sleep(100);
+    check("Updates reopens setup and focuses the current local folder", document.querySelector("#setup").classList.contains("on")
+      && document.activeElement.id === "setup-local" && document.activeElement.value === "C:\\Sync", at());
+    check("reopening retains saved exclusions and needs another preview", document.querySelector("#setup-preset").value === "imported"
+      && document.querySelector("#start-btn").disabled, "");
+    check("reopening makes no host mutations", HOST_CALLS.slice(beforeSetupCalls).every(m => !["setup_start", "setup_select", "sign_out", "stop"].includes(m.op)), "");
+    check("setup contains the shared settings controls", document.querySelector("#setup-shared-slot #shared-settings"), "");
     document.querySelector("#preview-btn").click(); await sleep(300);
     check("setup shows the first preview page", document.querySelector("#preview").textContent === "First page\n", "");
     check("setup has another page", !document.querySelector("#preview-next").disabled, "");
