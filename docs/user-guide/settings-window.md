@@ -17,6 +17,8 @@ Everything about what syncs, in one place.
 * **Duplicates**: files with the same content, the groups that free the most space first, each copy marked where it is (and when it's in a vault, another folder pair, outside the synced folder or excluded); **Hash** compares files only on this PC too; tick copies and **Remove** to preview and hand the removal to OneUpDrive, then **Approve** it. See [Duplicates](files-on-demand.md#duplicates).
 * **Exclude**: everything that keeps things from syncing, each with a way to undo it: the ready-made lists (developer folders, temporary files, system clutter), what you excluded yourself, exceptions, paused folders (and **Pause a folder…**) and `.oneupignore` files. **Suggestions** lists the largest and busiest folders, each with **Exclude**. With Files On-Demand, **Always on this PC** lists your pin rules (see [Files On-Demand](files-on-demand.md#always-keeping-files-by-rule)). When OneDrive still has excluded items, **Still in OneDrive** offers **Remove from OneDrive**. **Databases**: **Wait for programs to close databases**, the database presets, your own database patterns (**Add**, **Remove**), the databases waiting now and why, and Outlook data files and virtual disks with **Exclude** and **Keep syncing** (see [Databases](databases.md)). **Rules as text** has your rules as lines like a `.gitignore` file, the sync order as text, and what happens to OneDrive's copies of excluded items. See [Choosing what syncs](excluding-files.md).
 
+Switching synced folders shows only that folder's files and settings, even when a previous folder is still loading.
+
 On the right, the details of what you selected:
 
 * **Share**, beside the name: point at it (or select it) for **Get link for viewers** or **Get link for editors** (the link is copied).
@@ -39,6 +41,8 @@ Which programs changed and opened files in your synced folder, over the last day
 * Counts are kept for 90 days, and the latest 5,000 files used, all on this PC only. **Track which programs use my files** turns it off.
 
 ## Activity
+Warnings appear above the lists, with space between each notice and the list controls. **Check for an older edit in OneDrive** means an upload finished, but OneUpDrive could not check whether it overlapped another cloud edit. Syncing continues. On OneDrive, right-click the file and select **Version history**; save any older edit you need, then select **Dismiss**. Dismissal is remembered for that incident; a later incident appears again. Active sync waits and safety stops stay visible until resolved.
+
 At the top, while anything needs you: one line per item, with what to do (the same list as `oneup problems`, see [When something goes wrong](troubleshooting.md#everything-that-needs-you)).
 
 Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the box to show only the items whose name or folder matches; **Refresh** reads the list again (it also follows syncing by itself). With more than one synced folder, choose which one at the top right.

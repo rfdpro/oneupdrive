@@ -51,7 +51,7 @@ pub struct Facts {
     pub conflicts_more: More,
     /// Files whose upload may have gone over an edit in OneDrive that its
     /// version history never showed (`oneup_exec::rescues_given_up`).
-    pub edits_not_found: Vec<String>,
+    pub edits_not_found: Vec<(String, i64)>,
     /// An extra pair or vault that should be running: the main agent runs
     /// (it starts them), it wasn't asked to stop, and for a vault its keys
     /// are remembered (`launch::start_others`).
@@ -106,6 +106,8 @@ pub struct Item {
     pub action: String,
     /// The code an answer takes (`oneup approve`, `keep`, `discard`).
     pub code: Option<String>,
+    /// Acknowledges only this completed version-history check.
+    pub dismiss_code: Option<String>,
     /// The data folder it's about (commands for a pair take it as
     /// `--data-dir`).
     pub data_dir: PathBuf,
@@ -120,6 +122,7 @@ impl Item {
             detail: detail.into(),
             action: action.into(),
             code: None,
+            dismiss_code: None,
             data_dir: PathBuf::new(),
         }
     }
@@ -132,6 +135,7 @@ impl Item {
             "detail": self.detail,
             "action": self.action,
             "code": self.code,
+            "dismiss_code": self.dismiss_code,
             "data_dir": self.data_dir,
         })
     }
@@ -251,17 +255,20 @@ pub fn collect_in(f: &Facts, now_ms: i64, loc: &Locale) -> Vec<Item> {
             t_in!(loc, "Compare the two and delete the one you don't need."),
         ));
     }
-    for name in &f.edits_not_found {
-        out.push(Item::new(
-            "edit_not_found",
-            t_in!(loc, "Older cloud version could not be verified"),
-            t_in!(
-                loc,
-                "{name}: OneUpDrive could not verify whether an upload replaced another cloud edit. Automatic version-history checks have stopped.",
-                name = name.as_str()
-            ),
-            t_in!(loc, "Review the file's version history on OneDrive."),
-        ));
+    for (name, at_ms) in &f.edits_not_found {
+        out.push(Item {
+            dismiss_code: Some(edit_code(name, *at_ms)),
+            ..Item::new(
+                "edit_not_found",
+                t_in!(loc, "Check for an older edit in OneDrive"),
+                t_in!(
+                    loc,
+                    "{name}: the upload finished, but repeated version-history checks could not confirm whether it replaced another cloud edit. Syncing continues.",
+                    name = name.as_str()
+                ),
+                t_in!(loc, "On OneDrive, right-click the file and select Version history. Save any older edit you need, then dismiss this notice."),
+            )
+        });
     }
     if f.stale_note {
         out.push(Item::new(
@@ -570,14 +577,65 @@ async fn status(dir: &Path) -> Result<Status, ClientError> {
 /// What the store records: what can't sync, and the conflict copies of the
 /// last [`CONFLICT_DAYS`] still in the synced folder. Unreadable: nothing
 /// (the rest of the list still helps).
-fn from_store(dir: &Path) -> (Option<Unsynced>, (Vec<Conflict>, More), Vec<String>) {
+type StoreFacts = (Option<Unsynced>, (Vec<Conflict>, More), Vec<(String, i64)>);
+
+fn from_store(dir: &Path) -> StoreFacts {
     let Ok(store) = crate::setup::open_store(dir, 1024) else { return (None, (Vec::new(), More::No), Vec::new()) };
     let unsynced = crate::unsynced::load(&store).ok().and_then(|r| crate::unsynced::count(&r));
     let since = crate::control::now_ms() - CONFLICT_DAYS * 24 * 3600 * 1000;
     let root = crate::sync::pairing(&store).ok().map(|p| p.local);
     let conflicts = conflicts(&store, since, CONFLICTS_MAX, |c| root.as_deref().is_none_or(|r| copy_exists(r, c)));
     let edits = store.read(oneup_exec::rescues_given_up).unwrap_or_default();
-    (unsynced, conflicts, edits.into_iter().map(|(name, _)| name).collect())
+    let dismissed = store.read(dismissed_edits).unwrap_or_default();
+    (unsynced, conflicts, edits.into_iter().filter(|(name, at)| !dismissed.contains(&edit_code(name, *at))).collect())
+}
+
+/// UI acknowledgments do not alter the executor's rescue records.
+const DISMISSED_EDITS: &str = "ui.dismissed_edits";
+const DISMISSED_MAX: usize = 1024;
+
+fn edit_code(name: &str, at_ms: i64) -> String {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(at_ms.to_le_bytes());
+    hash.update(name.as_bytes());
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn dismissed_edits(o: &oneup_store::Ops<'_>) -> oneup_store::Result<Vec<String>> {
+    Ok(o.meta_get(DISMISSED_EDITS)?.and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default())
+}
+
+fn dismiss_edit_in(store: &mut oneup_store::Store, code: &str) -> oneup_store::Result<bool> {
+    store.write(|o| {
+        let current: Vec<_> =
+            oneup_exec::rescues_given_up(o)?.into_iter().map(|(name, at)| edit_code(&name, at)).collect();
+        if !current.iter().any(|c| c == code) {
+            return Ok(false);
+        }
+        let mut dismissed = dismissed_edits(o)?;
+        // Drop acknowledgments once the executor expires their incidents.
+        dismissed.retain(|c| current.contains(c));
+        if !dismissed.iter().any(|c| c == code) {
+            if dismissed.len() >= DISMISSED_MAX {
+                return Ok(false);
+            }
+            dismissed.push(code.to_string());
+        }
+        o.meta_set(DISMISSED_EDITS, &json!(dismissed).to_string())?;
+        Ok(true)
+    })
+}
+
+/// Acknowledge a completed check in a configured data folder. The host
+/// validates the folder against its own list before calling this.
+pub fn dismiss_edit(dir: &Path, code: &str) -> anyhow::Result<()> {
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    anyhow::ensure!(
+        dismiss_edit_in(&mut store, code)?,
+        "This notice has changed or the dismissal limit was reached. Refresh Activity."
+    );
+    Ok(())
 }
 
 /// The newest `max` conflict copies logged since `since_ms` that are
@@ -730,10 +788,55 @@ mod tests {
     /// given up is listed, by name.
     #[test]
     fn an_edit_not_found_in_the_version_history_is_listed() {
-        let f = Facts { edits_not_found: vec!["notes.txt".into()], ..facts(View::NotRunning) };
+        let f = Facts { edits_not_found: vec![("notes.txt".into(), 123)], ..facts(View::NotRunning) };
         let items = collect(&f, 0);
         let item = items.iter().find(|i| i.kind == "edit_not_found").expect("listed");
         assert!(item.detail.starts_with("notes.txt: "), "{}", item.detail);
+    }
+
+    fn rescue_record(name: &str, at_ms: i64) -> String {
+        json!({"id":"r1", "mark":{"id":"v1","modified_ms":1,"size":3},
+            "theirs":null, "parent":0, "to":name, "name":name, "etag":"old",
+            "ours_etag":"new", "ours":null, "tries":20, "given_up_ms":at_ms})
+        .to_string()
+    }
+
+    #[test]
+    fn dismissal_survives_reopen_and_only_hides_the_reviewed_incident() {
+        let dir = std::env::temp_dir().join(format!(
+            "oneup-dismiss-edit-{}-{}",
+            std::process::id(),
+            crate::control::now_ms()
+        ));
+        let key = "exec.rescue.r1.v1";
+        let record = rescue_record("notes.txt", 123);
+        {
+            let mut store = crate::setup::open_store(&dir, 1024).expect("store");
+            store.write(|o| o.meta_set(key, &record)).expect("incident");
+        }
+        let code = edit_code("notes.txt", 123);
+        assert_eq!(from_store(&dir).2, [("notes.txt".into(), 123)]);
+        dismiss_edit(&dir, &code).expect("dismiss");
+        dismiss_edit(&dir, &code).expect("idempotent");
+        assert!(from_store(&dir).2.is_empty());
+        {
+            let mut store = crate::setup::open_store(&dir, 1024).expect("reopen");
+            assert_eq!(store.read(|o| o.meta_get(key)).expect("record"), Some(record));
+            // An incident for the same file at a later time needs its own review.
+            store.write(|o| o.meta_set(key, &rescue_record("notes.txt", 456))).expect("new incident");
+            assert!(!dismiss_edit_in(&mut store, &code).expect("stale code"));
+        }
+        assert_eq!(from_store(&dir).2, [("notes.txt".into(), 456)]);
+        dismiss_edit(&dir, &edit_code("notes.txt", 456)).expect("review new incident");
+        {
+            let store = crate::setup::open_store(&dir, 1024).expect("reopen");
+            assert_eq!(
+                store.read(dismissed_edits).expect("acknowledgments"),
+                [edit_code("notes.txt", 456)],
+                "expired acknowledgment pruned"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("remove test folder");
     }
 
     #[test]
@@ -1104,6 +1207,7 @@ mod tests {
                 "detail": "d",
                 "action": "a",
                 "code": "ab",
+                "dismiss_code": null,
                 "data_dir": "",
             })
         );

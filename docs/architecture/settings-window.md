@@ -31,7 +31,7 @@ The window is one per data folder. When it's already open, a new `oneup-settings
 * `--page NAME` opens a page; `--page item --item PATH` selects that file and opens its Versions (Explorer's Version history and Share commands), `itemwhy` and `itemactivity` its Why and Recent activity. Old page names (`folders`, `syncing`, `storage`, `vaults`) open the Files page.
 
 ## The Activity page
-At the top, while anything needs the user, a card lists it (`problems`, as `oneup problems` builds it: [control-api.md § The problems list](control-api.md#the-problems-list)), read each time the page opens.
+At the top, while anything needs the user, separate cards list it (`problems`, as `oneup problems` builds it: [control-api.md § The problems list](control-api.md#the-problems-list)), read each time the page opens.
 
 Everything the tray and Explorer used to show in a console or Notepad opens here (page id `lists`), one tab each, selected by `launch::start_settings_on(dir, page)` with `--page activity`, `unsynced`, `excluded` or `stops`:
 * **Recent**: `activity_log` (`settingsapi::activity`, up to 20,000 entries, more on request);
@@ -81,7 +81,7 @@ Target: WCAG 2.2 AA, by keyboard and with a screen reader (Narrator, NVDA), in l
 
 **The tray** uses Windows' own menu, notifications, message boxes and task dialogs, which Narrator reads and the keyboard reaches (Win+B, the arrow keys to the icon, then Enter, Space or the menu key for the menu; Esc closes it and cancels a task dialog). Its labels are text, not pictures; the status dot sits beside a word.
 
-**Left:** the Apps chart's per-day numbers show only on hover (the table has the totals); an empty table header (the Activity list's outcome column); the tree's 14 px boxes are below the 24 px target size (each row is the target too: a click selects it, Space ticks); vault passwords are asked with `prompt()`, which doesn't hide what's typed; the navigation keeps its width at 320 px. What only a person can check: a pass with Narrator and NVDA through each page, and each contrast theme by eye.
+**Left:** the Apps chart's per-day numbers show only on hover (the table has the totals); an empty table header (the Activity list's outcome column); the tree's 14 px boxes are below the 24 px target size (each row is the target too: a click selects it, Space ticks); the navigation keeps its width at 320 px. What only a person can check: a pass with Narrator and NVDA through each page, and each contrast theme by eye.
 
 ## The window in the taskbar
 The settings window sets its own AppUserModelID (`OneUpDrive.Settings`, through the window's property store) and its big and small icons (`WM_SETICON`). With only the package identity, the taskbar would show the package's logo on a grey plate and treat a click on the button as launching the package's app rather than bringing the window forward. The program is a Windows-subsystem program in every build.
@@ -94,3 +94,7 @@ The icon is drawn in code (`tray::mark`, `tray::render`): a cloud cut along a ch
 The Files details panel's **History** section opens from **View history** in the Files context menu or Explorer (`shell-verb history`, `--page itemhistory --item PATH`). It combines path-scoped activity, local kept copies, cloud versions for a live file and recorded cloud recycle-bin entries. A folder includes descendant paths, with a separator boundary to exclude similarly named siblings. These are records at a path, not a promise of continuous identity across renames or path reuse.
 
 Activity uses `item_history` and keyset pagination by sequence number, 100 entries per request. Reads use the activity indexes and the bounded retained log, without enumerating the sync tree. Local-copy and recycle-bin lists reuse the existing recovery listings and restore commands; cloud versions reuse the existing version list and restore flow. Rewind from a main-folder history opens the existing preview and approval flow. The history view adds no mutation path.
+
+Completed upload-history checks that could not verify an overlapping edit can be acknowledged from Activity. `dismiss_problem` validates the data folder against configured folders and the incident against current rescue records. UI acknowledgments in `ui.dismissed_edits` are scoped to the file name and check completion time, bounded and pruned on dismissal; they never remove or modify executor rescue records. A later incident for the same file remains visible. Active waits and safety stops cannot be dismissed.
+
+Vault credential entry uses a modal password form for unlock, recovery-key access, Windows Hello enrollment and password changes. New passwords require matching confirmation and at least eight Unicode characters. Cancel and Esc send no request. Fields clear on every exit. A queued close event from an earlier use cannot clear a reopened form or move its focus. Passwords still cross the WebView bridge as JavaScript strings, as described in [vault-crypto-review.md](vault-crypto-review.md).

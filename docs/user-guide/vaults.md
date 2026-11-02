@@ -17,6 +17,8 @@ In the settings window, **Files → Add → Create an encrypted vault**: a new f
 The new vault is a standard Cryptomator vault: Cryptomator's apps on your phone or another computer open it with the same password.
 
 ## The recovery key, and changing the password
+The settings window hides typed passwords and recovery keys. New passwords need at least eight characters and matching confirmation. **Cancel** or Esc closes password entry without sending a request. **Remember the password on this PC** is off until you choose it.
+
 The **recovery key** is a long line of letters and numbers starting with `OUD1-`, shown when you create a vault and any time after with **Recovery key…** (or `oneup vault recovery-key Private`). With it you can set a new password if you forget yours. Print it or write it down, and keep it somewhere safe: **anyone who has it can read the vault**. It's OneUpDrive's own, so Cryptomator's apps don't read it, but the vault itself stays a normal Cryptomator vault.
 
 **Change password…** (on the vault's tab) sets a new password with the current one, or with the recovery key (`oneup vault change-password Private`, add `--recovery-key` to use it). Nothing is re-encrypted; Cryptomator's apps and other PCs use the new password from then on. OneDrive keeps the vault's previous key file in its version history.

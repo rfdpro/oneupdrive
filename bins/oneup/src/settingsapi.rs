@@ -287,9 +287,15 @@ pub fn largest(dir: &Path, n: usize) -> Result<Vec<Large>> {
         .map(|(path, size)| {
             let inside = match (&local, &remote) {
                 (Some(l), Some(r)) => {
-                    oneup_sync::strip_folded_prefix(&path, r).filter(|rest| rest.starts_with('/')).map(|rest| {
-                        rest.split('/').filter(|p| !p.is_empty()).fold(std::path::PathBuf::from(l), |p, x| p.join(x))
-                    })
+                    // The whole drive is stored as `/`; stripping that
+                    // slash would also strip the item boundary below.
+                    oneup_sync::strip_folded_prefix(&path, r.trim_end_matches('/'))
+                        .filter(|rest| rest.starts_with('/'))
+                        .map(|rest| {
+                            rest.split('/')
+                                .filter(|p| !p.is_empty())
+                                .fold(std::path::PathBuf::from(l), |p, x| p.join(x))
+                        })
                 }
                 _ => None,
             };
@@ -1248,6 +1254,48 @@ pub fn duplicates_cancel(dir: &Path) -> Result<Value> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn largest_files_locate_whole_drive_and_subfolder_pairs() {
+        use oneup_store::{Kind, RemoteRow};
+        let dir = std::env::temp_dir().join(format!("oneup-largest-{}-{}", std::process::id(), crate::sync::now_ms()));
+        let local = dir.join("Synced");
+        std::fs::create_dir_all(local.join("Docs")).unwrap();
+        std::fs::write(local.join("Docs/report.txt"), b"report").unwrap();
+        let mut store = crate::setup::open_store(&dir, 1024).unwrap();
+        let row = |id: &str, parent: Option<&str>, name: &str, kind| RemoteRow {
+            id: id.into(),
+            parent_id: parent.map(Into::into),
+            name: name.into(),
+            kind,
+            size: 6,
+            etag: None,
+            qxh: None,
+            mtime_ms: None,
+        };
+        store
+            .write(|o| {
+                o.meta_set(crate::sync::KEY_LOCAL, &local.to_string_lossy())?;
+                o.meta_set(crate::sync::KEY_REMOTE, "/")?;
+                o.upsert_item(&row("r", None, "", Kind::Root), false)?;
+                o.upsert_item(&row("d", Some("r"), "Docs", Kind::Folder), false)?;
+                o.upsert_item(&row("f", Some("d"), "report.txt", Kind::File), false)
+            })
+            .unwrap();
+        let found = largest(&dir, 10).unwrap();
+        assert_eq!(found[0].state, LargeState::Here);
+        assert_eq!(found[0].local, Some(local.join("Docs/report.txt")));
+        std::fs::write(local.join("report.txt"), b"report").unwrap();
+        store.write(|o| o.meta_set(crate::sync::KEY_REMOTE, "/docs")).unwrap();
+        let found = largest(&dir, 10).unwrap();
+        assert_eq!(found[0].state, LargeState::Here);
+        assert_eq!(found[0].local, Some(local.join("report.txt")));
+        store.write(|o| o.meta_set(crate::sync::KEY_REMOTE, "/Doc")).unwrap();
+        assert_eq!(largest(&dir, 10).unwrap()[0].state, LargeState::NotSynced);
+        drop(store);
+        assert!(dir.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn an_item_is_nested_under_a_folder_listed_for_the_same_reason_as_names_compare() {

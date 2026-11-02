@@ -33,6 +33,8 @@ A unit is finished without its contents only when its folder is gone by its ID. 
 | `meta` | Rules fingerprint and other settings |
 | `remote_name`, `search_queue` | The name index for search, and the changes waiting to reach it (`remote_item.sk` keys an item's entry; [search.md](search.md)) |
 
+The **Largest files** list reads the first rows of `remote_file_size`, a partial index on file size and ID for files only. It includes files of every size whether or not OneDrive supplied their hashes, orders equal sizes by ID, and needs neither a full-tree scan nor a sort. SQLite updates the index with each changed file; an upgrade builds it once from the existing mirror without changing any items.
+
 **Invariants**, checked by `oneup verify` and in every test:
 1. at most one root;
 2. every stored non-root item's parent is stored and **not** excluded;
