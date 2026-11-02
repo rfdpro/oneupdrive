@@ -58,11 +58,13 @@ oneup-sys = { path = "../../crates/oneup-sys" }
 oneup-vault = { path = "../../crates/oneup-vault" }
 oneup-vaultsync = { path = "../../crates/oneup-vaultsync" }
 rpassword = "7"
-# Installing and updating (MIT); rustls for its downloads.
-velopack = "1"
+# Installing and updating (MIT); rustls for its downloads. The prerelease is
+# the first on zip 9, which fixes the zip 8 advisories. Pinned: move it to the
+# next stable release, together with vpk in .github/workflows/release.yml.
+velopack = "=1.3.39-g8d2844f"
 # One cryptography backend for rustls in the whole process (setup::tls).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 zeroize = "1"
 reqwest = "0.13"
 serde_json = "1"
@@ -80,6 +82,8 @@ oneup-effects = { path = "../../crates/oneup-effects", features = ["fake"] }
 tokio = { version = "1", features = ["test-util"] }
 # Databases of older versions, to check other folders' are only read.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Update packages to read in the update tests.
+tempfile = "3"
 
 [lints]
 workspace = true

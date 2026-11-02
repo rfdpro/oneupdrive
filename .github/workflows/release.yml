@@ -20,8 +20,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "9.0.x"
+      # The same version as the velopack crate (bins/oneup/Cargo.toml).
       - name: Velopack packer
-        run: dotnet tool install -g vpk
+        run: dotnet tool install -g vpk --version 1.3.39-g8d2844f
 
       # As in ci.yml: one test at a time, desktop-only checks skipped.
       - name: Test
