@@ -11,20 +11,7 @@ yanked = "deny"
 # Each entry names the advisory, why it doesn't reach OneUpDrive, and what
 # removes it. cargo-deny warns when an entry no longer matches anything;
 # delete it then.
-ignore = [
-    # zip 8 (direct, and velopack 1.2 requires ^8.6; the fix is zip 9). All
-    # advisories are in `ZipArchive::extract` / `ZipStreamReader::extract`.
-    # Neither we (updates.rs) nor velopack (bundle.rs)
-    # call those: both read single entries with `by_name`/`by_index` into a
-    # path they chose. Drop these when velopack moves to zip 9.
-    { id = "RUSTSEC-2026-0367", reason = "zip extract() only; not called (see comment)" },
-    { id = "RUSTSEC-2026-0368", reason = "zip extract() only; not called (see comment)" },
-    { id = "RUSTSEC-2026-0369", reason = "zip extract() only; not called (see comment)" },
-    { id = "RUSTSEC-2026-0429", reason = "zip extract() symlink-size allocation only; neither updates.rs nor velopack bundle.rs calls extract(); remove when velopack moves to zip 9" },
-    # derivative is unmaintained (no vulnerability). A proc-macro used by
-    # velopack at build time; nothing of it ships. Drop when velopack does.
-    { id = "RUSTSEC-2024-0388", reason = "build-time proc-macro of velopack; unmaintained, not vulnerable" },
-]
+ignore = []
 
 [licenses]
 version = 2

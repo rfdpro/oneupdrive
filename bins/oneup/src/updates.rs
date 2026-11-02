@@ -145,7 +145,7 @@ pub fn check(um: UpdateManager) -> Result<Option<Ready>> {
         _ => return Ok(None),
     };
     um.download_updates(&info, None).context("downloading the update")?;
-    let package = packages_dir()?.join(&info.TargetFullRelease.FileName);
+    let package = packages_dir()?.join(local_package_name(&info.TargetFullRelease.FileName));
     if let Err(e) = verify(&package) {
         // Ours, just downloaded: never left to be applied by anyone.
         let _ = std::fs::remove_file(&package);
@@ -162,24 +162,23 @@ fn packages_dir() -> Result<PathBuf> {
     Ok(root.join("packages"))
 }
 
+/// The name Velopack stores a feed entry under: the last path segment, with
+/// characters Windows forbids replaced. Verifying any other path would check
+/// a different file from the one applied. Velopack's own function is private.
+fn local_package_name(feed_name: &str) -> String {
+    let last = feed_name.rsplit(['/', '\\']).next().unwrap_or("");
+    last.chars()
+        .map(|c| if matches!(c, '"' | '<' | '>' | '|' | ':' | '*' | '?') || c < ' ' { '_' } else { c })
+        .collect()
+}
+
 /// The package's `oneupd.exe` must be signed by the running program's
 /// publisher.
 fn verify(package: &Path) -> Result<()> {
     let mine = oneup_sys::authenticode::signer(&std::env::current_exe()?)?
         .context("this copy of OneUpDrive isn't signed, so it doesn't install updates by itself")?;
-    let file = std::fs::File::open(package).with_context(|| format!("opening {}", package.display()))?;
-    let mut zip = zip::ZipArchive::new(file).context("reading the update package")?;
-    let name = (0..zip.len())
-        .filter_map(|i| zip.name_for_index(i).map(str::to_string))
-        .find(|n| n.replace('\\', "/").to_lowercase().ends_with("/oneupd.exe"))
-        .context("the update package has no oneupd.exe")?;
     let tmp = package.with_extension("verify.exe");
-    {
-        let mut entry = zip.by_name(&name)?;
-        let mut out = std::fs::File::create(&tmp)?;
-        // At most 256 MiB (it's a few MiB).
-        std::io::copy(&mut (&mut entry).take(256 << 20), &mut out)?;
-    }
+    copy_oneupd(package, &tmp)?;
     let theirs = oneup_sys::authenticode::signer(&tmp);
     let _ = std::fs::remove_file(&tmp);
     match theirs? {
@@ -187,6 +186,22 @@ fn verify(package: &Path) -> Result<()> {
         Some(s) => bail!("the update is signed by {s}, not by {mine}; it wasn't installed"),
         None => bail!("the update isn't signed; it wasn't installed"),
     }
+}
+
+/// Copies the package's `oneupd.exe` to `to`. An entry whose name can't be
+/// decoded is never the one we look for.
+fn copy_oneupd(package: &Path, to: &Path) -> Result<()> {
+    let file = std::fs::File::open(package).with_context(|| format!("opening {}", package.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("reading the update package")?;
+    let name = (0..zip.len())
+        .filter_map(|i| zip.name_for_index(i).and_then(Result::ok).map(std::borrow::Cow::into_owned))
+        .find(|n| n.replace('\\', "/").to_lowercase().ends_with("/oneupd.exe"))
+        .context("the update package has no oneupd.exe")?;
+    let mut entry = zip.by_name(&name)?;
+    let mut out = std::fs::File::create(to)?;
+    // At most 256 MiB (it's a few MiB).
+    std::io::copy(&mut (&mut entry).take(256 << 20), &mut out)?;
+    Ok(())
 }
 
 /// Applies `ready` and restarts the tray with `args` (this process exits).
@@ -198,6 +213,48 @@ pub fn apply(ready: Ready, args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_package_checked_is_the_one_velopack_applies() {
+        use super::local_package_name as name;
+        assert_eq!(name("App-1.0.0-full.nupkg"), "App-1.0.0-full.nupkg");
+        assert_eq!(name("../../App-1.0.0-full.nupkg"), "App-1.0.0-full.nupkg");
+        assert_eq!(name("..\\..\\App-1.0.0-full.nupkg"), "App-1.0.0-full.nupkg");
+        assert_eq!(name("https://example.com/r/App-1.0.0-full.nupkg"), "App-1.0.0-full.nupkg");
+        assert_eq!(name("App:1.0?.nupkg"), "App_1.0_.nupkg");
+    }
+
+    /// Writes a package with these entries; returns the folder that holds it.
+    fn package(entries: &[(&str, &[u8])]) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("App-full.nupkg");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(*name, deflated).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn oneupd_is_read_from_the_update_package() {
+        let (dir, path) = package(&[("lib/app/oneup.exe", b"other"), ("lib/app/OneUpd.exe", b"the agent")]);
+        let out = dir.path().join("verify.exe");
+        super::copy_oneupd(&path, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"the agent");
+    }
+
+    #[test]
+    fn a_package_without_oneupd_is_refused() {
+        let (dir, path) = package(&[("lib/app/oneup.exe", b"other"), ("notoneupd.exe", b"no")]);
+        let out = dir.path().join("verify.exe");
+        let err = super::copy_oneupd(&path, &out).unwrap_err();
+        assert!(err.to_string().contains("no oneupd.exe"), "{err:#}");
+        assert!(!out.exists());
+    }
+
     /// The daily check holds back like background work: not on a metered
     /// network, with a data budget, or offline.
     #[test]

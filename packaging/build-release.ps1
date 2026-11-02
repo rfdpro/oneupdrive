@@ -4,9 +4,10 @@
   update packages, optionally signed and published to GitHub Releases.
 
 .DESCRIPTION
-  Needs: Rust (stable, MSVC), the .NET SDK and Velopack's packer
-  (`dotnet tool install -g vpk`). Used by .github/workflows/release.yml;
-  works the same on a developer's PC.
+  Needs: Rust (stable, MSVC), the .NET SDK and Velopack's packer, the same
+  version as the velopack crate in bins/oneup/Cargo.toml
+  (`dotnet tool install -g vpk --version 1.3.39-g8d2844f`). Used by
+  .github/workflows/release.yml; works the same on a developer's PC.
 
   Output in target\package\releases: OneUpDrive.App-<channel>-Setup.exe (the
   installer), the full and delta update packages, and the release feed.
