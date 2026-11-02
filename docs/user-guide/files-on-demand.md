@@ -50,6 +50,8 @@ On the **Files** page, in the folder's settings (nothing selected), under **Free
 From the command line: `oneup space --free-unused-days 30`, `oneup space --free-when-low on --low-disk-percent 10`, `oneup space` to show.
 
 ## Your largest files
+The largest-files list includes files even when OneDrive has not supplied a content hash. Files of the same size have a stable order.
+
 On the **Files** page, select **Size** above the list to sort by it: a folder's size is everything inside it, so the biggest are at the top. **Exclude → Suggestions** lists the largest folders in your OneDrive. In a terminal, `oneup largest --count 20` lists the biggest files and whether each is on this PC. To make one online-only, right-click it and choose **Free up space**.
 
 ## Duplicates

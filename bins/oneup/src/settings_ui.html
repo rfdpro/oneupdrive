@@ -821,6 +821,24 @@
             max-width: 1000px;
         }
 
+        #attn {
+            display: grid;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        #attn .row {
+            align-items: flex-start;
+        }
+
+        #attn .label {
+            overflow-wrap: anywhere;
+        }
+
+        #attn .note {
+            margin: 8px 0 0;
+        }
+
         .ls-bar {
             display: flex;
             gap: 8px;
@@ -2245,7 +2263,7 @@
         <section class="page" id="lists">
             <h2>Activity</h2>
             <!-- Everything that needs you, as `oneup problems` lists it -->
-            <div class="card" id="attn" hidden></div>
+            <div id="attn" hidden></div>
             <div class="ls-bar">
                 <div class="seg" id="ls-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="log" aria-pressed="true">Recent</button>
@@ -2757,6 +2775,17 @@
                 <div class="field" id="sx-date-box"><input type="date" id="sx-date" aria-label="Last day"></div>
             </div>
             <div class="df"><span class="muted" id="sx-busy"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="sx-go"></button></div>
+        </form>
+    </dialog>
+    <dialog id="dlg-secret" aria-labelledby="secret-title">
+        <form method="dialog">
+            <div class="dh"><h3 id="secret-title"></h3></div>
+            <div class="db">
+                <div class="field"><label for="secret-password" id="secret-label">Password</label><input type="password" id="secret-password" autocomplete="current-password" spellcheck="false" autofocus></div>
+                <div class="field" id="secret-confirm-box" hidden><label for="secret-confirm">Confirm new password</label><input type="password" id="secret-confirm" autocomplete="new-password" spellcheck="false"></div>
+                <label class="ck" id="secret-remember-box" hidden><input type="checkbox" id="secret-remember">Remember the password on this PC</label>
+            </div>
+            <div class="df"><button class="btn" type="button" id="secret-cancel" value="cancel">Cancel</button><button class="btn primary" id="secret-go" value="ok">Continue</button></div>
         </form>
     </dialog>
     <dialog id="dlg-recovery" aria-labelledby="dlg-recovery-t">
@@ -3381,12 +3410,15 @@
         }), e.target.checked ? tr("Starts with Windows") : tr("Won't start with Windows")).catch(() => e.target.checked = !e.target.checked);
 
         // Needs attention: one row per item of `oneup problems`.
+        let attentionSeq = 0;
         async function loadAttention() {
+            const seq = ++attentionSeq;
             const box = $("#attn");
             try {
                 const r = await call("problems");
+                if (seq !== attentionSeq) return;
                 box.replaceChildren(...r.problems.map(p => el("div", {
-                    className: "row"
+                    className: "card row"
                 }, el("div", {
                     className: "label"
                 }, el("b", {
@@ -3397,9 +3429,19 @@
                 }), el("p", {
                     className: "note",
                     textContent: p.action
-                })))));
+                })), p.dismiss_code ? smallBtn(tr("Dismiss"), async e => {
+                    const button = e.currentTarget;
+                    button.disabled = true;
+                    try {
+                        await run(call("dismiss_problem", {data_dir: p.data_dir, code: p.dismiss_code}));
+                        await loadAttention();
+                    } catch {
+                        button.disabled = false;
+                    }
+                }) : null)));
                 box.hidden = !r.problems.length;
             } catch {
+                if (seq !== attentionSeq) return;
                 box.hidden = true;
             }
         }
@@ -3880,7 +3922,10 @@
             L.root = e.target.value;
             loadList(true);
         };
-        $("#ls-refresh").onclick = () => loadList(false);
+        $("#ls-refresh").onclick = () => {
+            loadAttention();
+            loadList(false);
+        };
         $("#ls-outcome").onchange = () => renderList();
         let filterTimer = 0;
         $("#ls-filter").oninput = () => {
@@ -5457,10 +5502,14 @@
                     children: null
                 });
             }
+            const nodes = F.nodes;
             await loadChildren("");
-            F.rs = await call("snapshot", {
+            if (F.root !== r || F.nodes !== nodes) return;
+            const rs = await call("snapshot", {
                 root: r.id
             }).catch(() => null);
+            if (F.root !== r || F.nodes !== nodes) return;
+            F.rs = rs;
             setView(F.view, true);
         }
         function stepsTo(rel) {
@@ -5482,15 +5531,19 @@
         async function loadChildren(rel) {
             const n = F.nodes.get(rel);
             if (!n) return;
+            const nodes = F.nodes, root = F.root.id;
+            // A reply for a previous folder must never populate the current tree.
+            const current = () => F.nodes === nodes && F.nodes.get(rel) === n;
             n.loading = true;
             if (F.view === "all") renderTree();
             const steps = stepsTo(rel);
             try {
                 const r = await call("tree", {
-                    root: F.root.id,
+                    root,
                     rel,
                     steps
                 });
+                if (!current()) return;
                 n.untracked = r.untracked;
                 n.more = r.more;
                 n.error = null;
@@ -5505,18 +5558,19 @@
                     return crel;
                 });
             } catch (e) {
+                if (!current()) return;
                 n.error = e.message;
                 n.children = [];
             } finally {
                 n.loading = false;
             }
-            const root = F.root.id;
+            if (!current()) return;
             call("tree_sizes", {
                 root,
                 rel,
                 steps
             }).then(t => {
-                if (!F.root || F.root.id !== root) return;
+                if (!current()) return;
                 for (const c of n.children || []) {
                     const cn = F.nodes.get(c);
                     if (!cn || !cn.folder) continue;
@@ -6246,6 +6300,7 @@
             const showModal = HTMLDialogElement.prototype.showModal,
                 close = HTMLDialogElement.prototype.close;
             const giveBack = d => {
+                if (d.open) return;
                 const back = d.back;
                 d.back = null;
                 if (!back || (document.activeElement !== document.body && !d.contains(document.activeElement))) return;
@@ -6271,7 +6326,8 @@
             picked: new Map(),
             root: null,
             stale: false,
-            stop: null
+            stop: null,
+            seq: 0
         };
         const copiesText = n => tr("{n, plural, one {# copy} other {# copies}}", {
             n
@@ -6282,18 +6338,21 @@
         })).join("; ");
 
         async function loadDupes(more) {
+            const root = F.root.id, nodes = F.nodes, seq = ++D.seq;
             const r = await call("duplicates", {
-                root: F.root.id,
-                after: more && D.page && D.page.next || ""
+                root,
+                after: more && D.root === root && D.page && D.page.next || ""
             });
-            if (!more || D.root !== F.root.id) {
+            if (F.nodes !== nodes || F.root.id !== root || seq !== D.seq) return false;
+            if (!more || D.root !== root) {
                 D.groups = [];
                 D.picked.clear();
             }
-            D.root = F.root.id;
+            D.root = root;
             D.page = r;
             D.stale = false;
             D.groups.push(...r.page);
+            return true;
         }
 
         // The approval waits on the agent's status: shown when it comes.
@@ -6306,14 +6365,16 @@
         }
 
         async function renderDupes(reload) {
+            const nodes = F.nodes;
             if (reload) {
                 if (!D.page || D.root !== F.root.id) $("#tree").replaceChildren(el("div", {
                     className: "msg",
                     textContent: tr("Looking…")
                 }));
                 try {
-                    await loadDupes(false);
+                    if (!await loadDupes(false)) return;
                 } catch (e) {
+                    if (F.nodes !== nodes) return;
                     $("#tree").replaceChildren(el("div", {
                         className: "msg",
                         textContent: e.message
@@ -6449,7 +6510,7 @@
                 className: "btn small",
                 textContent: tr("More"),
                 onclick: async() => {
-                    await run(loadDupes(true));
+                    if (!await run(loadDupes(true))) return;
                     renderDupes(false);
                 }
             })));
@@ -7104,6 +7165,7 @@
                 b.setAttribute("aria-pressed", String(v === value));
                 b.onclick = () => {
                     if (v === value) return;
+                    value = v;
                     $$("button", s).forEach(x => x.setAttribute("aria-pressed", String(x === b)));
                     onpick(v);
                 };
@@ -7812,13 +7874,67 @@
             ]);
         }
 
+        function vaultSecret(title, {label = tr("Password"), confirmation = false, allowEmpty = false, remember = false, action = tr("Continue")} = {}) {
+            const d = $("#dlg-secret"), form = $("form", d), password = $("#secret-password"), confirm = $("#secret-confirm");
+            if (d.open) return Promise.resolve(null);
+            $("#secret-title").textContent = title;
+            $("#secret-label").textContent = label;
+            $("#secret-go").textContent = action;
+            $("#secret-confirm-box").hidden = !confirmation;
+            $("#secret-remember-box").hidden = !remember;
+            password.value = confirm.value = "";
+            password.required = !allowEmpty;
+            password.minLength = confirmation ? 8 : 0;
+            password.autocomplete = confirmation ? "new-password" : "current-password";
+            confirm.required = confirmation;
+            confirm.disabled = !confirmation;
+            password.setCustomValidity("");
+            confirm.setCustomValidity("");
+            $("#secret-remember").checked = false;
+            return new Promise(resolve => {
+                let answer = null;
+                const validate = () => {
+                    password.setCustomValidity(confirmation && Array.from(password.value).length < 8 ? tr("Use at least 8 characters") : "");
+                    confirm.setCustomValidity(confirmation && password.value !== confirm.value ? tr("The passwords don't match") : "");
+                };
+                password.oninput = confirm.oninput = validate;
+                form.onsubmit = e => {
+                    e.preventDefault();
+                    validate();
+                    if (!form.reportValidity()) return;
+                    answer = {password: password.value, remember: remember && $("#secret-remember").checked};
+                    d.close();
+                    finish();
+                };
+                const cancel = e => {
+                    e.preventDefault();
+                    d.close();
+                    finish();
+                };
+                const closed = () => { if (!d.open) finish(); };
+                const finish = () => {
+                    // Remove secrets from the controls on every exit, including Esc.
+                    password.value = confirm.value = "";
+                    $("#secret-remember").checked = false;
+                    form.onsubmit = password.oninput = confirm.oninput = null;
+                    $("#secret-cancel").onclick = null;
+                    d.removeEventListener("close", closed);
+                    d.removeEventListener("cancel", cancel);
+                    resolve(answer);
+                };
+                $("#secret-cancel").onclick = cancel;
+                d.addEventListener("close", closed);
+                d.addEventListener("cancel", cancel);
+                d.showModal();
+                password.focus();
+            });
+        }
+
         function vaultSection(r) {
             const body = [];
-            const askPw = () => r.remembered ? "" : prompt(r.hello ? tr("Password of the vault \"{name}\" (leave empty to use Windows Hello)", {
+            const askPw = async() => r.remembered ? "" : (await vaultSecret(tr("Password of the vault \"{name}\"", {
                 name: r.name
-            }) : tr("Password of the vault \"{name}\"", {
-                name: r.name
-            }));
+            }), {allowEmpty: r.hello, label: r.hello ? tr("Password (leave empty to use Windows Hello)") : tr("Password")}))?.password ?? null;
             body.push(opt(r.running ? tr("Unlocked") : tr("Locked"), r.running ? "" : tr("Unlock to see and sync its files."),
                 el("button", {
                     className: "btn small" + (r.running ? "" : " primary"),
@@ -7831,9 +7947,7 @@
             if (snap && (snap.hello_available || r.hello)) body.push(opt(tr("Unlock with Windows Hello"), tr("Face, fingerprint or PIN."), toggleEl(r.hello, tr("Unlock with Windows Hello"), async(v, i) => {
                 let p = "";
                 if (v && !r.remembered) {
-                    p = prompt(tr("Password of the vault \"{name}\":", {
-                        name: r.name
-                    }));
+                    p = (await vaultSecret(tr("Password of the vault \"{name}\"", {name: r.name})))?.password ?? null;
                     if (p === null) {
                         i.checked = false;
                         return;
@@ -7854,7 +7968,7 @@
                     className: "btn small",
                     textContent: tr("Recovery key…"),
                     onclick: async() => {
-                        const p = askPw();
+                        const p = await askPw();
                         if (p === null) return;
                         showRecovery(await run(call("vault_recovery", {
                             name: r.name,
@@ -7866,18 +7980,20 @@
                     className: "btn small",
                     textContent: tr("Change password…"),
                     onclick: async() => {
-                        const how = prompt(tr("Current password or recovery key (empty if remembered or using Windows Hello):"));
-                        if (how === null) return;
-                        const isKey = /^\s*oud1/i.test(how);
-                        const n1 = prompt(tr("New password (8+ characters):"));
-                        if (!n1) return;
-                        const n2 = prompt(tr("Confirm new password:"));
-                        if (n1 !== n2) return toast(tr("The passwords don't match"), true);
+                        const current = await vaultSecret(tr("Change password"), {
+                            label: tr("Current password or recovery key (empty if remembered or using Windows Hello)"), allowEmpty: true
+                        });
+                        if (!current) return;
+                        const how = current.password, isKey = /^\s*oud1/i.test(how);
+                        const next = await vaultSecret(tr("Change password"), {
+                            label: tr("New password (8+ characters)"), confirmation: true, action: tr("Update")
+                        });
+                        if (!next) return;
                         await run(call("vault_password", {
                             name: r.name,
                             password: isKey ? "" : how,
                             recovery: isKey ? how : "",
-                            new: n1
+                            new: next.password
                         }), tr("Password changed"));
                     }
                 }),
@@ -7978,7 +8094,7 @@
             };
         }
 
-        function unlockVault(r) {
+        async function unlockVault(r) {
             if (r.remembered) return run(call("vault_unlock", {
                 name: r.name
             }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
@@ -7989,15 +8105,14 @@
                     hello: true
                 }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
             }
-            const pw = prompt(tr("Password of the vault \"{name}\":", {
-                name: r.name
-            }));
-            if (!pw) return;
-            const remember = confirm(tr("Remember the password on this PC?"));
+            const secret = await vaultSecret(tr("Password of the vault \"{name}\"", {name: r.name}), {
+                remember: true, action: tr("Unlock")
+            });
+            if (!secret) return;
             run(call("vault_unlock", {
                 name: r.name,
-                password: pw,
-                remember
+                password: secret.password,
+                remember: secret.remember
             }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
         }
 

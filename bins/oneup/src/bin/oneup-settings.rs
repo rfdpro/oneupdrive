@@ -1048,6 +1048,14 @@ mod win {
                     .collect();
                 Ok(json!({ "problems": all }))
             }
+            "dismiss_problem" => {
+                let requested = PathBuf::from(text(args, "data_dir"));
+                let facts = oneup_app::problems::gather(dir).await;
+                let configured =
+                    facts.iter().find(|f| f.dir == requested).ok_or_else(|| anyhow::anyhow!("Unknown data folder"))?;
+                oneup_app::problems::dismiss_edit(&configured.dir, &text(args, "code"))?;
+                Ok(Value::Null)
+            }
             "save" => {
                 let section = args.get("section").and_then(Value::as_str).unwrap_or_default();
                 settingsapi::save(dir, section, args.get("value").unwrap_or(&Value::Null))?;

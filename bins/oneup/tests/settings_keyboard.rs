@@ -88,7 +88,7 @@ window.chrome = {webview: {
     let v = HOST_ANSWERS[m.op];
     if (typeof v === "function") v = v(m.args);
     if (v === undefined) v = {};
-    setTimeout(() => HOST_LISTENERS.forEach(f => f({data: {id: m.id, ok: v}})), 1);
+    Promise.resolve(v).then(answer => setTimeout(() => HOST_LISTENERS.forEach(f => f({data: {id: m.id, ok: answer}})), 1));
   },
   addEventListener(type, f) { HOST_LISTENERS.push(f); }
 }};
@@ -111,6 +111,35 @@ const DRIVER: &str = r##"<script>
   const row = rel => document.querySelector(`#tree [data-rel="${rel}"]`);
   try {
     await sleep(600);
+    // Notifications have independent spacing and only reviewed incidents can be dismissed.
+    const savedProblems = HOST_ANSWERS.problems;
+    HOST_ANSWERS.problems = {problems: [
+      {kind:"live_database", title:"Database waiting: /" + "long-path/".repeat(30), detail:"Database has pending changes.", action:"Close the program."},
+      {kind:"edit_not_found", title:"Review cloud version history", detail:"An overlapping cloud edit could not be checked.", action:"Review versions, then dismiss.", data_dir:"C:\\Data", dismiss_code:"incident-1"}
+    ]};
+    show("lists"); await loadAttention();
+    const notices = document.querySelectorAll("#attn > .card");
+    const activityTabs = document.querySelector("#ls-tabs");
+    check("notifications have separate cards and space before list controls", notices.length === 2 && notices[1].getBoundingClientRect().top - notices[0].getBoundingClientRect().bottom >= 9 && activityTabs.getBoundingClientRect().top - notices[1].getBoundingClientRect().bottom >= 15, notices.length);
+    check("long notification paths stay inside their card", notices[0].querySelector(".label").scrollWidth <= notices[0].querySelector(".label").clientWidth + 1, notices[0].scrollWidth);
+    check("only version-review notices have Dismiss", document.querySelectorAll("#attn button").length === 1, document.querySelectorAll("#attn button").length);
+    HOST_ANSWERS.dismiss_problem = () => { HOST_ANSWERS.problems = {problems: [HOST_ANSWERS.problems.problems[0]]}; return null; };
+    document.querySelector("#attn button").click(); await sleep(100);
+    const dismissal = HOST_CALLS.filter(m => m.op === "dismiss_problem").pop();
+    check("Dismiss acknowledges exactly this incident and leaves active waits", dismissal?.args.code === "incident-1" && dismissal.args.data_dir === "C:\\Data" && document.querySelectorAll("#attn > .card").length === 1, JSON.stringify(dismissal));
+    HOST_ANSWERS.problems = {problems: []};
+    document.querySelector("#ls-refresh").click(); await sleep(100);
+    check("Activity Refresh also refreshes notifications", document.querySelector("#attn").hidden, document.querySelector("#attn").textContent);
+    let oldAttention;
+    HOST_ANSWERS.problems = () => new Promise(resolve => oldAttention = resolve);
+    const pendingAttention = loadAttention();
+    HOST_ANSWERS.problems = {problems: []};
+    await loadAttention();
+    oldAttention({problems: [{title:"Old notice", detail:"Dismissed", action:"Review"}]});
+    await pendingAttention;
+    check("a stale reply cannot resurrect a dismissed notification", document.querySelector("#attn").hidden && !document.querySelector("#attn").children.length, document.querySelector("#attn").textContent);
+    HOST_ANSWERS.problems = savedProblems;
+    show("files"); await sleep(200);
     const tree = document.querySelector("#tree");
     check("the tree has its rows", tree.querySelectorAll("[role=treeitem][data-rel]").length === 4, tree.querySelectorAll("[data-rel]").length);
     check("one tab stop in the tree", tree.querySelectorAll("[tabindex='0']").length === 1, tree.querySelectorAll("[tabindex='0']").length);
@@ -335,6 +364,94 @@ const DRIVER: &str = r##"<script>
     check("automatic publication needs opt-in", !document.querySelector("#shared-auto").checked, "");
     document.querySelector("#shared-import").click(); await sleep(500);
     check("import binds the reviewed document", HOST_CALLS.some(m=>m.op==="shared_settings_import" && m.args.code==="reviewed-settings" && !m.args.automatic), "");
+
+    // Switching folders while the old folder's replies are still in flight.
+    const savedTree = HOST_ANSWERS.tree, savedSnapshot = HOST_ANSWERS.snapshot;
+    let oldTree;
+    HOST_ANSWERS.tree = a => a.root === "main" ? new Promise(resolve => oldTree = resolve)
+      : {items:[{name:"photo.jpg",folder:false,state:"synced",here:true}],more:0};
+    const pendingTree = selectRoot("main");
+    await sleep(50);
+    await selectRoot("pair:Photos");
+    oldTree({items:[{name:"stale.txt",folder:false,state:"synced",here:true}],more:0});
+    await pendingTree;
+    check("a previous folder's listing cannot populate the selected folder", F.root.id === "pair:Photos"
+      && F.nodes.has("photo.jpg") && !F.nodes.has("stale.txt"), [...F.nodes.keys()]);
+    HOST_ANSWERS.tree = savedTree;
+    let oldSnapshot;
+    HOST_ANSWERS.snapshot = a => a && a.root === "main" ? new Promise(resolve => oldSnapshot = resolve)
+      : {...savedSnapshot(a), marker:"photos"};
+    const pendingSnapshot = selectRoot("main");
+    await sleep(50);
+    await selectRoot("pair:Photos");
+    oldSnapshot({...savedSnapshot({root:"main"}), marker:"stale"});
+    await pendingSnapshot;
+    check("a previous folder's settings cannot replace the selected folder's settings", F.rs.marker === "photos", F.rs.marker);
+    HOST_ANSWERS.snapshot = savedSnapshot;
+    let oldDuplicates;
+    HOST_ANSWERS.duplicates = a => a.root === "main" ? new Promise(resolve => oldDuplicates = resolve)
+      : {page:[{marker:"photos"}],next:null};
+    await selectRoot("main");
+    const pendingDuplicates = loadDupes(false);
+    await sleep(50);
+    await selectRoot("pair:Photos");
+    await loadDupes(false);
+    oldDuplicates({page:[{marker:"stale"}],next:null});
+    await pendingDuplicates;
+    check("a previous folder's duplicates cannot replace the selected folder's results", D.root === "pair:Photos"
+      && D.groups.length === 1 && D.groups[0].marker === "photos", JSON.stringify(D.groups));
+    const orders = [];
+    const orderControl = seg([["first","First"],["normal","Normal"],["last","Last"]], "normal", v => orders.push(v));
+    const orderButtons = orderControl.querySelectorAll("button");
+    orderButtons[0].click(); orderButtons[1].click(); orderButtons[1].click();
+    check("sync order can return to its original selection without reopening details", orders.join(",") === "first,normal"
+      && orderButtons[1].getAttribute("aria-pressed") === "true", orders);
+    // Vault credentials use masked fields, clear on close, and never send a cancelled action.
+    const focusBack = document.createElement("button"); document.body.append(focusBack); focusBack.focus();
+    const secretDialog = document.querySelector("#dlg-secret"), secretInput = document.querySelector("#secret-password");
+    const secretConfirm = document.querySelector("#secret-confirm"), secretForm = secretDialog.querySelector("form");
+    const secretSubmit = document.querySelector("#secret-go");
+    const enterSecret = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", {bubbles:true})); };
+    const vaultBefore = HOST_CALLS.filter(m=>m.op.startsWith("vault_")).length;
+    const cancelledUnlock = unlockVault({name:"Test vault"});
+    check("vault unlock uses a focused masked field and unchecked remember option", secretDialog.open && secretInput.type === "password"
+      && document.activeElement === secretInput && !document.querySelector("#secret-remember").checked, secretDialog.open);
+    check("Enter submits the vault action rather than Cancel", secretForm.querySelector(":default") === secretSubmit, "");
+    enterSecret(secretInput, "test-only-secret"); secretDialog.requestClose(); await sleep(50); await cancelledUnlock;
+    check("Esc cancels vault unlock, clears credentials and restores focus", !secretInput.value && document.activeElement === focusBack
+      && HOST_CALLS.filter(m=>m.op.startsWith("vault_")).length === vaultBefore, "");
+    const confirmation = vaultSecret("Test confirmation", {confirmation:true});
+    enterSecret(secretInput, "short"); enterSecret(secretConfirm, "short"); secretForm.requestSubmit(secretSubmit);
+    check("short new passwords stay in the dialog", secretDialog.open && !secretInput.checkValidity(), secretDialog.open);
+    enterSecret(secretInput, "new-test-password"); enterSecret(secretConfirm, "different-password"); secretForm.requestSubmit(secretSubmit);
+    check("new passwords must match and both fields are masked", secretDialog.open && !secretConfirm.checkValidity() && secretConfirm.type === "password", secretDialog.open);
+    enterSecret(secretConfirm, "new-test-password"); secretForm.requestSubmit(secretSubmit); await sleep(50);
+    const confirmedSecret = await confirmation;
+    check("confirmed passwords return once and both controls clear", confirmedSecret?.password === "new-test-password" && !secretInput.value && !secretConfirm.value, "");
+    const allowHello = vaultSecret("Test Hello", {allowEmpty:true}); secretForm.requestSubmit(secretSubmit); await sleep(50);
+    check("Windows Hello can still use an empty password", (await allowHello)?.password === "", "");
+    const vaultControls = vaultSection({name:"Test vault", remembered:false, hello:false, running:false});
+    document.body.append(vaultControls);
+    const passwordButton = [...vaultControls.querySelectorAll("button")].find(b=>b.textContent.startsWith("Change password"));
+    HOST_ANSWERS.vault_password = null;
+    passwordButton.click(); await sleep(30);
+    enterSecret(secretInput, "oud1-test-recovery-key"); secretForm.requestSubmit(secretSubmit); await sleep(30);
+    enterSecret(secretInput, "new-test-password"); enterSecret(secretConfirm, "new-test-password"); secretForm.requestSubmit(secretSubmit); await sleep(50);
+    const passwordChange = HOST_CALLS.filter(m=>m.op === "vault_password").pop();
+    check("password change preserves recovery-key routing and sends only after confirmation", passwordChange?.args.recovery === "oud1-test-recovery-key"
+      && passwordChange.args.password === "" && passwordChange.args.new === "new-test-password", "");
+    passwordButton.click(); await sleep(30); secretDialog.querySelector("button[value=cancel]").click(); await sleep(30);
+    check("Cancel ignores validation and sends no password change", !secretDialog.open && HOST_CALLS.filter(m=>m.op === "vault_password").length === 1, "");
+    HOST_ANSWERS.vault_unlock = null;
+    const acceptedUnlock = unlockVault({name:"Test vault"});
+    enterSecret(secretInput, "test-only-secret"); document.querySelector("#secret-remember").checked = true;
+    secretForm.requestSubmit(secretSubmit); await sleep(50); await acceptedUnlock; await sleep(30);
+    const unlockCall = HOST_CALLS.filter(m=>m.op === "vault_unlock").pop();
+    check("unlock keeps explicit remember choice and clears its field", unlockCall?.args.remember === true
+      && unlockCall.args.password === "test-only-secret" && !secretInput.value, "");
+    await unlockVault({name:"Test vault", hello:true});
+    check("Windows Hello unlock bypasses password entry", !secretDialog.open && HOST_CALLS.filter(m=>m.op === "vault_unlock").pop()?.args.hello === true, "");
+    vaultControls.remove(); focusBack.remove();
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }

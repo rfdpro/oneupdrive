@@ -9,6 +9,8 @@
 //!   OneUpDrive saw being opened (one row each, replaced in place).
 //! * `local_by_age`: the files whose content is here and could be freed,
 //!   oldest first, for the automatic space policies.
+//! * `remote_file_size`: all cloud files by size, including files whose
+//!   hash OneDrive hasn't supplied, for the largest-files list.
 
 use rusqlite::{OptionalExtension as _, params};
 
@@ -32,6 +34,16 @@ CREATE INDEX local_by_age ON local_item(mtime, file_id)
     WHERE kind = 0 AND (attributes & 1024) != 0 AND (attributes & 4194304) = 0
       AND (attributes & 524288) = 0 AND (attributes & 1048576) = 0;
 ";
+
+pub(crate) const MIGRATE_V27: &str = "
+CREATE INDEX IF NOT EXISTS remote_file_size ON remote_item(size, id) WHERE kind = 0;
+";
+
+fn largest_files_sql() -> String {
+    format!(
+        "SELECT {ITEM_COLS} FROM remote_item INDEXED BY remote_file_size WHERE kind = 0 ORDER BY size DESC, id DESC LIMIT ?1"
+    )
+}
 
 /// v10 -> v11: which files each program used, latest first, bounded
 /// ([`APP_FILES_KEEP`]): the counts alone said which programs, never what
@@ -244,25 +256,16 @@ impl Ops<'_> {
     }
 
     /// The `limit` largest files in OneDrive (that the mirror lists),
-    /// largest first. Uses the index of files of 1 MiB or more; a drive
-    /// with fewer than `limit` of those is small enough to read whole.
+    /// largest first, by ID for equal sizes. Reads the first rows of the
+    /// file-size index, without requiring hashes or scanning smaller files.
     pub fn remote_largest(&self, limit: usize) -> Result<Vec<RemoteRow>> {
-        let query = |sql: &str| -> Result<Vec<RemoteRow>> {
-            let rows = self
-                .c
-                .prepare_cached(sql)?
-                .query_map([limit as i64], RemoteRow::from_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows.into_iter().map(fix_kind).collect()
-        };
-        let big = query(&format!(
-            "SELECT {ITEM_COLS} FROM remote_item INDEXED BY remote_item_copyable
-             WHERE kind = 0 AND size >= 1048576 AND qxh IS NOT NULL ORDER BY size DESC LIMIT ?1"
-        ))?;
-        if big.len() >= limit {
-            return Ok(big);
-        }
-        query(&format!("SELECT {ITEM_COLS} FROM remote_item WHERE kind = 0 ORDER BY size DESC LIMIT ?1"))
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self
+            .c
+            .prepare_cached(&largest_files_sql())?
+            .query_map([limit], RemoteRow::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(fix_kind).collect()
     }
 }
 
@@ -271,6 +274,84 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::Store;
+
+    #[test]
+    fn largest_files_read_the_size_index_without_sorting() {
+        let s = Store::open_in_memory().unwrap();
+        let plan = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", largest_files_sql()))
+            .unwrap()
+            .query_map([10], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(plan.contains("USING INDEX remote_file_size"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "no full sort: {plan}");
+    }
+
+    #[test]
+    fn upgrading_existing_files_adds_the_size_index_and_preserves_rows() {
+        use crate::Kind;
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.upsert_item(
+                &RemoteRow {
+                    id: "unhashed".into(),
+                    parent_id: None,
+                    name: "report".into(),
+                    kind: Kind::File,
+                    size: 100,
+                    etag: Some("version".into()),
+                    qxh: None,
+                    mtime_ms: Some(7),
+                },
+                false,
+            )
+        })
+        .unwrap();
+        let before = s.read(|o| o.remote_largest(10)).unwrap();
+        s.conn.execute_batch("DROP INDEX remote_file_size; PRAGMA user_version = 26;").unwrap();
+        crate::migrate(&mut s.conn).unwrap();
+        assert_eq!(crate::user_version(&s.conn).unwrap(), 27);
+        assert_eq!(s.read(|o| o.remote_largest(10)).unwrap(), before);
+        crate::migrate(&mut s.conn).unwrap();
+        assert_eq!(s.read(|o| o.remote_largest(10)).unwrap(), before);
+    }
+
+    #[test]
+    fn largest_files_include_unhashed_files_and_small_files() {
+        use crate::Kind;
+        let mut s = Store::open_in_memory().unwrap();
+        let file = |id: &str, size, qxh| RemoteRow {
+            id: id.into(),
+            parent_id: None,
+            name: id.into(),
+            kind: Kind::File,
+            size,
+            etag: None,
+            qxh,
+            mtime_ms: None,
+        };
+        s.write(|o| {
+            o.upsert_item(&file("hashed-a", 2_000_000, Some([1; 20])), false)?;
+            o.upsert_item(&file("hashed-b", 3_000_000, Some([2; 20])), false)?;
+            o.upsert_item(&file("unhashed", 4_000_000, None), false)?;
+            o.upsert_item(&file("small", 12, None), false)?;
+            o.upsert_item(&RemoteRow { kind: Kind::Folder, ..file("folder", 5_000_000, None) }, false)
+        })
+        .unwrap();
+        let ids = |rows: Vec<RemoteRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(s.read(|o| o.remote_largest(2)).unwrap()), ["unhashed", "hashed-b"]);
+        assert_eq!(ids(s.read(|o| o.remote_largest(10)).unwrap()), ["unhashed", "hashed-b", "hashed-a", "small"]);
+        assert!(s.read(|o| o.remote_largest(0)).unwrap().is_empty());
+        assert_eq!(s.read(|o| o.remote_largest(usize::MAX)).unwrap().len(), 4);
+        s.write(|o| o.upsert_item(&file("hashed-a", 3_000_000, Some([1; 20])), false)).unwrap();
+        assert_eq!(ids(s.read(|o| o.remote_largest(3)).unwrap()), ["unhashed", "hashed-b", "hashed-a"]);
+        s.write(|o| o.upsert_item(&file("hashed-b", 1, None), false)).unwrap();
+        assert_eq!(ids(s.read(|o| o.remote_largest(10)).unwrap()), ["unhashed", "hashed-a", "small", "hashed-b"]);
+    }
 
     #[test]
     fn app_use_adds_up_and_ages_out() {
