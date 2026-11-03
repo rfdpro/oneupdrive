@@ -50,8 +50,7 @@ fn identity() {
             }
         }
         // Beside a development package, if there is one: another publisher is
-        // another family. The tray then moves the folders over, as this runs
-        // under a time limit (`move_off_development_package`).
+        // another family. That one stays until `oneup move-identity` is run.
         IdentityStep::AddPackage => {
             if let Err(e) = crate::identity::add_installed() {
                 tracing::warn!(error = %format!("{e:#}"), "no identity package");
@@ -81,38 +80,6 @@ fn identity_step(development_installed: Option<bool>, release_build: bool) -> Id
     }
 }
 
-/// Moves this user's folders off a development identity package, if a signed
-/// build finds one. Called by the tray before it starts syncing, so an
-/// interrupted or refused move is tried again at every start: having the
-/// package is the only record needed. In `oneup.exe`, which has the signed
-/// package's identity: registering a folder needs it, and the tray runs without.
-pub fn move_off_development_package() {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    if !crate::identity::is_release_build() {
-        return;
-    }
-    let dev = oneup_sys::identity::installed()
-        .is_ok_and(|all| all.iter().any(|p| p.publisher == crate::identity::PUBLISHER_DEV));
-    if !dev {
-        return;
-    }
-    let Ok(exe) = crate::launch::sibling("oneup.exe") else { return };
-    let ran = std::process::Command::new(exe)
-        .arg("move-identity")
-        .stdin(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    match ran {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => tracing::warn!(
-            error = %String::from_utf8_lossy(&out.stderr).trim(),
-            "the development identity package was left in place"
-        ),
-        Err(e) => tracing::warn!(error = %e, "the development identity package was left in place"),
-    }
-}
-
 /// What [`move_identity`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum MovedIdentity {
@@ -121,12 +88,32 @@ pub enum MovedIdentity {
     /// Every folder is the signed package's, and the development one is gone.
     Moved { folders: usize },
     /// The development package stays: `blocked` folders are still its own,
-    /// or can't be told. Nothing is lost; the next start tries again.
+    /// or can't be told. Nothing is lost.
     Kept { blocked: usize },
+}
+
+/// OneUpDrive's programs: any could register a folder, connect to one or
+/// start something that does.
+const OUR_PROGRAMS: &[&str] =
+    &["oneupd.exe", "oneupd-start.exe", "oneup-tray.exe", "oneup-settings.exe", "oneup-open.exe", "oneup.exe"];
+
+/// Refuses while any other of OneUpDrive's programs runs, of any copy.
+fn only_this_program_running() -> anyhow::Result<()> {
+    for name in OUR_PROGRAMS {
+        let others = oneup_sys::processes::named(name)?;
+        anyhow::ensure!(
+            others.iter().all(|p| p.pid == std::process::id()),
+            "{name} is running. Stop OneUpDrive first."
+        );
+    }
+    Ok(())
 }
 
 /// Moves this user's folders from the development identity package to the
 /// signed one this program runs with, then removes the development package.
+/// By hand, and only on a PC that ran a development build (`oneup
+/// move-identity`): no release does this by itself, as nothing but a
+/// developer's PC has that package.
 ///
 /// In this order, because the order decides what happens to the files:
 /// removing a package first makes Windows drop its sync roots and delete
@@ -137,12 +124,13 @@ pub enum MovedIdentity {
 /// an install does). The package goes only when a complete list of the
 /// shell's records, read back, shows that it owns nothing.
 ///
-/// A folder moves only under its data folder's lock, held until the package
-/// is gone. Registering through the shell while an agent is connected leaves
-/// a registration Windows drops when it disconnects
-/// (docs/architecture/files-on-demand.md), and only the lock proves that no
-/// agent is running: an agent can sync without answering on its pipe. A folder
-/// whose data folder can't be found or locked stays, and so does the package.
+/// Nothing else of ours may run meanwhile. Registering through the shell
+/// while an agent is connected leaves a registration Windows drops when it
+/// disconnects (docs/architecture/files-on-demand.md), and a development
+/// copy registering a folder after the last look would put it back under
+/// the package being removed. Each folder's data-folder lock is held too,
+/// until the package is gone: a folder whose data folder can't be found or
+/// locked stays, and so does the package.
 pub async fn move_identity() -> anyhow::Result<MovedIdentity> {
     use anyhow::{Context as _, bail};
     let own = oneup_sys::identity::package_name().context("this program has no package identity")?;
@@ -154,33 +142,21 @@ pub async fn move_identity() -> anyhow::Result<MovedIdentity> {
     let Some(dev) = installed.iter().find(|p| p.publisher == crate::identity::PUBLISHER_DEV) else {
         return Ok(MovedIdentity::NothingToDo);
     };
+    only_this_program_running()?;
     let sid = oneup_sys::pipe::current_user_sid()?;
     let dev_owned = |r: &oneup_cfapi::shell::UserRoot| r.owner.as_deref() == Some(dev.family.as_str());
     let folders: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid)?.into_iter().filter(dev_owned).collect();
 
-    // Which data folder each is, and stop those agents.
     let candidates = data_dirs();
-    let of_folder: Vec<Option<PathBuf>> = folders
-        .iter()
-        .map(|f| {
-            let root = f.root.as_deref()?;
-            let (_, token) = oneup_cfapi::provider::registration(root)?;
-            let token = String::from_utf8(token).ok()?;
-            candidates.iter().find(|d| pair_token(d).as_deref() == Some(token.as_str())).cloned()
-        })
-        .collect();
-    let dirs: Vec<PathBuf> = of_folder.iter().flatten().cloned().collect();
-    let mut running = Vec::new();
-    for d in &dirs {
-        if oneup_ipc::connect(d).await.is_ok() {
-            running.push(d.clone());
-        }
-    }
-    stop_agents(&dirs, Duration::from_secs(120)).await;
-
     let mut locks = Vec::new();
     let mut moved = 0;
-    for (folder, dir) in folders.iter().zip(&of_folder) {
+    for folder in &folders {
+        let token = folder
+            .root
+            .as_deref()
+            .and_then(oneup_cfapi::provider::registration)
+            .and_then(|(_, token)| String::from_utf8(token).ok());
+        let dir = token.and_then(|t| candidates.iter().find(|d| pair_token(d).as_deref() == Some(t.as_str())));
         let Some(dir) = dir else {
             tracing::warn!("a folder of the development package has no data folder here");
             continue;
@@ -199,26 +175,19 @@ pub async fn move_identity() -> anyhow::Result<MovedIdentity> {
         locks.push(lock);
     }
 
-    // Read back, not assumed from the above.
+    // Read back, not assumed from the above, and last: nothing may have
+    // started since the first look.
+    crate::identity::stop_shell_surrogate();
+    only_this_program_running()?;
     let owners: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid)?.into_iter().map(|r| r.owner).collect();
-    let outcome = if crate::identity::may_remove(&dev.family, &owners) {
-        crate::identity::stop_shell_surrogate();
-        oneup_sys::identity::remove_one(&dev.full_name)?;
-        remove_development_files();
-        MovedIdentity::Moved { folders: moved }
-    } else {
+    if !crate::identity::may_remove(&dev.family, &owners) {
         let blocked = owners.iter().filter(|o| o.as_deref().is_none_or(|o| o == dev.family)).count();
-        MovedIdentity::Kept { blocked }
-    };
-    drop(locks);
-    // The agents this stopped. The tray that ran this starts its own; another
-    // account's has no reason to.
-    for d in &running {
-        if let Err(e) = crate::launch::start_agent(d) {
-            tracing::warn!(error = %format!("{e:#}"), "an agent wasn't started again");
-        }
+        return Ok(MovedIdentity::Kept { blocked });
     }
-    Ok(outcome)
+    oneup_sys::identity::remove_one(&dev.full_name)?;
+    remove_development_files();
+    drop(locks);
+    Ok(MovedIdentity::Moved { folders: moved })
 }
 
 /// The pair token in `dir`'s database, only read: it may be another build's.

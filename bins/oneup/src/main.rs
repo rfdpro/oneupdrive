@@ -823,8 +823,8 @@ enum Cmd {
         repair: bool,
     },
     /// Moves this user's folders from the development identity package to
-    /// the signed one, then removes the development one (run by the tray
-    /// before it starts syncing)
+    /// the signed one, then removes the development one (once, by hand, with
+    /// OneUpDrive stopped, on a PC that ran a development build)
     #[command(hide = true)]
     MoveIdentity,
     /// Developers only: register (or with --remove, unregister) a temp

@@ -75,7 +75,6 @@ mod win {
         // From the Start menu, at sign-in and after an update: syncing
         // starts too (and the vaults whose keys are remembered).
         if plain || std::env::args_os().any(|a| a == "--start") {
-            oneup_app::install::move_off_development_package();
             start_all(&dir);
         }
         if plain && !oneup_app::settingsapi::needs_setup(&dir) {
