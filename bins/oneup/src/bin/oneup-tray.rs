@@ -333,16 +333,7 @@ mod win {
             }
             // Installs by itself while nothing syncs and no vault would be
             // locked by the restart.
-            let idle = match &self.view {
-                View::NotRunning | View::Stopped(_) => true,
-                View::Running(s) => {
-                    matches!(s.activity, oneup_ipc::Activity::Idle)
-                        && s.safety_stops.is_empty()
-                        && !s.overflow.as_ref().is_some_and(|o| o.waiting)
-                }
-                _ => false,
-            };
-            if auto && self.update.is_some() && idle && !self.vault_needs_password() {
+            if auto && self.update.is_some() && tray::may_install_now(&self.view) && !self.vault_needs_password() {
                 self.install_update();
             }
         }
