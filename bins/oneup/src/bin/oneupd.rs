@@ -449,11 +449,30 @@ async fn run(args: Args) -> Result<()> {
 
 /// The pause before retrying after an error, given the last one (`pause`):
 /// back to the first when the failed attempt got going first (a sequence of
-/// rounds finished, which clears the standing problem, so `recovered`), or
+/// rounds finished or OneDrive accepted a new sign-in, either of which clears
+/// the standing problem, so `recovered`), or
 /// ran longer than the longest pause. Otherwise one blip after days of
 /// syncing would cost the longest pause left over from earlier ones.
 fn error_pause(pause: Duration, recovered: bool, ran: Duration) -> Duration {
     if recovered || ran >= ERROR_MAX { ERROR_FIRST } else { pause }
+}
+
+/// "Sign-in needed" ends once OneDrive answers: the pass that would end it
+/// can take minutes on a large drive, and says nothing about the sign-in until
+/// it finishes. If this fails, the pass reports what's wrong.
+async fn end_sign_in_problem(dir: &Path, graph: &Graph, control: &Control) {
+    let sign_in = control.problem().is_some_and(|p| p.kind == problem::Kind::SignIn.code());
+    if sign_in && graph.drive().await.is_ok() {
+        control.resolve_problem();
+        note_resolved(dir, control);
+    }
+}
+
+fn note_resolved(dir: &Path, control: &Control) {
+    if let Some(p) = control.take_resolved() {
+        println!("oneupd: resolved: {}", p.title);
+        note_problem(dir, &p, true);
+    }
 }
 
 /// Notes a problem beginning or clearing in the activity log; best effort.
@@ -696,6 +715,7 @@ async fn agent(
             // Not yet: changes collect meanwhile.
             wait
         } else {
+            end_sign_in_problem(dir, graph, control).await;
             control.set_activity(if scope == Scope::All { Activity::Starting } else { Activity::Syncing });
             let started = Instant::now();
             pacer.started(started);
@@ -762,10 +782,7 @@ async fn agent(
             });
             let offer = engine.offer();
             let new = control.record(now, last, &out.breakers, out.overflow.as_ref(), offer.as_ref());
-            if let Some(p) = control.take_resolved() {
-                println!("oneupd: resolved: {}", p.title);
-                note_problem(dir, &p, true);
-            }
+            note_resolved(dir, control);
             if new.new_stops {
                 sync::print_breakers(&out.breakers, Asker::Agent);
             }

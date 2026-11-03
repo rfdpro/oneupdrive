@@ -527,6 +527,20 @@ impl Control {
         self.lock().problem.clone()
     }
 
+    /// The problem being retried is over, before a pass finishes to show it.
+    pub fn resolve_problem(&self) {
+        let mut s = self.lock();
+        self.resolve(&mut s);
+        self.publish(&mut s);
+    }
+
+    fn resolve(&self, s: &mut Shared) {
+        if let Some(p) = s.problem.take() {
+            self.events.push(vec![New::about_sync(EventKind::Resolved, format!("{}: {}", p.kind, p.title))]);
+            s.resolved = Some(p);
+        }
+    }
+
     /// The problem that cleared since this was last asked, if one did.
     pub fn take_resolved(&self) -> Option<oneup_ipc::Problem> {
         self.lock().resolved.take()
@@ -605,10 +619,7 @@ impl Control {
                 || overflow.as_ref().is_some_and(|o| o.waiting && &o.code == c)
                 || prune_offer.as_ref().is_some_and(|o| &o.code == c)
         });
-        if let Some(p) = s.problem.take() {
-            self.events.push(vec![New::about_sync(EventKind::Resolved, format!("{}: {}", p.kind, p.title))]);
-            s.resolved = Some(p);
-        }
+        self.resolve(&mut s);
         if new_stops {
             // What and where, never the code that approves it.
             self.events.push(
@@ -841,6 +852,27 @@ mod tests {
 
     fn rec(new_stops: bool, new_overflow: bool) -> Recorded {
         Recorded { new_stops, new_overflow, new_offer: false }
+    }
+
+    #[test]
+    fn a_problem_can_end_before_the_pass_does() {
+        let c = control(None);
+        c.set_problem(Some(oneup_ipc::Problem {
+            kind: "signin".into(),
+            title: "Sign-in needed".into(),
+            detail: String::new(),
+            action: String::new(),
+            technical: String::new(),
+            since_ms: 0,
+            attempts: 1,
+            retry_ms: None,
+        }));
+        c.resolve_problem();
+        assert!(c.problem().is_none() && c.snapshot().problem.is_none());
+        assert_eq!(c.take_resolved().map(|p| p.kind).as_deref(), Some("signin"));
+        // The pass finishing afterwards reports nothing more.
+        c.record(1, None, &[], None, None);
+        assert!(c.take_resolved().is_none());
     }
 
     #[test]
