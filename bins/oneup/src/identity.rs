@@ -214,23 +214,29 @@ pub fn add_installed() -> Result<bool> {
     Ok(true)
 }
 
-/// Removes the package; `false` if it wasn't there.
-pub fn remove() -> Result<bool> {
-    Ok(oneup_sys::identity::remove()?)
+/// What [`remove_unowned`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removed {
+    pub removed: usize,
+    /// Packages left in place, as folders are registered with them.
+    pub kept: usize,
 }
 
-/// [`remove`], refused while a folder is registered with the package.
-pub fn remove_unless_in_use() -> Result<bool> {
+/// Removes every identity package that owns no folder of this user's.
+/// Without a complete list of the folders, removes nothing.
+pub fn remove_unowned() -> Result<Removed> {
     let sid = oneup_sys::pipe::current_user_sid()?;
-    let owners: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid).into_iter().map(|r| r.owner).collect();
+    let owners: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid)?.into_iter().map(|r| r.owner).collect();
+    let mut done = Removed::default();
     for package in oneup_sys::identity::installed()? {
-        anyhow::ensure!(
-            may_remove(&package.family, &owners),
-            "a folder is registered with this package, and removing it would delete the folder's online-only files; \
-             turn Files On-Demand off for that folder first"
-        );
+        if may_remove(&package.family, &owners) {
+            oneup_sys::identity::remove_one(&package.full_name)?;
+            done.removed += 1;
+        } else {
+            done.kept += 1;
+        }
     }
-    remove()
+    Ok(done)
 }
 
 #[cfg(test)]

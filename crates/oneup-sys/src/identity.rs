@@ -135,21 +135,3 @@ pub fn remove_one(full_name: &str) -> crate::Result<()> {
     let name = windows::core::HSTRING::from(full_name);
     deploy("removing the identity package", pm.RemovePackageAsync(&name).and_then(|op| op.join()))
 }
-
-/// Removes the identity package for this user; `false` if it wasn't there.
-pub fn remove() -> crate::Result<bool> {
-    use windows::Management::Deployment::PackageManager;
-    let err = |source| crate::Error::Win32 { op: "removing the identity package", source };
-    let pm = PackageManager::new().map_err(err)?;
-    let mut found = Vec::new();
-    for p in pm.FindPackagesByUserSecurityId(&windows::core::HSTRING::new()).map_err(err)? {
-        let id = p.Id().map_err(err)?;
-        if id.Name().map_err(err)? == PACKAGE {
-            found.push(id.FullName().map_err(err)?);
-        }
-    }
-    for full in &found {
-        deploy("removing the identity package", pm.RemovePackageAsync(full).and_then(|op| op.join()))?;
-    }
-    Ok(!found.is_empty())
-}

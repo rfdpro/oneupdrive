@@ -823,8 +823,8 @@ enum Cmd {
         repair: bool,
     },
     /// Moves this user's folders from the development identity package to
-    /// the signed one, then removes the development one (run by the install
-    /// hook; run it again if that left the package in place)
+    /// the signed one, then removes the development one (run by the tray
+    /// before it starts syncing)
     #[command(hide = true)]
     MoveIdentity,
     /// Developers only: register (or with --remove, unregister) a temp
@@ -1973,10 +1973,11 @@ async fn run() -> Result<()> {
                     ),
                 }
             } else if *remove {
-                println!(
-                    "{}",
-                    if oneup_app::identity::remove_unless_in_use()? { "Removed." } else { "Wasn't registered." }
-                );
+                let done = oneup_app::identity::remove_unowned()?;
+                if done.kept > 0 {
+                    bail!("A folder is registered with this package. Turn Files On-Demand off for it first.");
+                }
+                println!("{}", if done.removed > 0 { "Removed." } else { "Wasn't registered." });
             } else {
                 println!("{}", oneup_sys::identity::package_name().unwrap_or_else(|| "no package identity".into()));
             }

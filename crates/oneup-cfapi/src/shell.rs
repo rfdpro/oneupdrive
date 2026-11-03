@@ -128,10 +128,12 @@ fn norm(p: &str) -> String {
 
 /// The shell IDs registered under our provider name (`OneUpDrive!...`)
 /// and their folders, for every user listed.
-pub struct OurRoot {
+/// A folder registered with the shell for this user, by any program.
+pub struct UserRoot {
     /// The shell's ID.
     pub id: String,
-    pub root: std::path::PathBuf,
+    /// `None` if the shell's record doesn't say.
+    pub root: Option<std::path::PathBuf>,
     /// The package family that registered it; `None` if that can't be told.
     pub owner: Option<String>,
 }
@@ -141,45 +143,108 @@ fn family_of(aumid: &str) -> Option<&str> {
     aumid.split_once('!').map(|(family, _)| family).filter(|f| !f.is_empty())
 }
 
-/// The folders registered as OneUpDrive's for this user. Windows removes a
-/// package's sync roots with the package, and the online-only files in them
-/// (measured), so what must not go with a package has to be found here first.
-pub fn roots_of_user(user_sid: &str) -> Vec<OurRoot> {
-    let marker = format!("!{user_sid}!");
-    our_roots()
-        .into_iter()
-        .filter(|(id, _)| id.contains(&marker))
-        .map(|(id, root)| {
-            let owner = application_id(&id).as_deref().and_then(family_of).map(str::to_owned);
-            OurRoot { id, root: root.into(), owner }
-        })
-        .collect()
+/// Whether a record's ID (`Provider!<user>!<account>`) isn't another user's.
+/// An ID that names no user counts as this user's: only what is certainly
+/// someone else's is left out.
+fn is_users(id: &str, user_sid: &str) -> bool {
+    id.split('!').find(|part| part.starts_with("S-1-")).is_none_or(|sid| sid.eq_ignore_ascii_case(user_sid))
 }
 
-/// The `AUMID` value of the shell's record `id`.
-fn application_id(id: &str) -> Option<String> {
-    use windows::Win32::Foundation::ERROR_SUCCESS;
+/// Every folder registered with the shell for this user, whichever program
+/// registered it, complete or an error. Windows removes a package's sync
+/// roots with the package and deletes their online-only files (measured), so
+/// deciding that a package owns nothing takes the whole list: a record that
+/// can't be read is an error here, never a shorter list.
+pub fn roots_of_user(user_sid: &str) -> Result<Vec<UserRoot>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegEnumKeyExW, RegOpenKeyExW,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    const BASE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager";
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let failed = |what, code: windows::Win32::Foundation::WIN32_ERROR| Error::Win {
+        what,
+        source: windows::core::Error::from(code.to_hresult()),
+    };
+    let base = wide(BASE);
+    let mut h = HKEY::default();
+    // SAFETY: a NUL-terminated key path; `h` receives the opened key.
+    let opened = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(base.as_ptr()), None, KEY_READ, &mut h) };
+    if opened == ERROR_FILE_NOT_FOUND {
+        return Ok(Vec::new()); // no sync roots on this PC at all
+    }
+    if opened != ERROR_SUCCESS {
+        return Err(failed("opening the shell's sync root records", opened));
+    }
+    let mut ids = Vec::new();
+    let mut ended = ERROR_SUCCESS;
+    for i in 0.. {
+        let mut name = [0u16; 512];
+        let mut len = name.len() as u32;
+        // SAFETY: `name` is writable for `len` characters; `h` is open.
+        let r = unsafe { RegEnumKeyExW(h, i, Some(PWSTR(name.as_mut_ptr())), &mut len, None, None, None, None) };
+        if r != ERROR_SUCCESS {
+            ended = r;
+            break;
+        }
+        ids.push(String::from_utf16_lossy(&name[..len as usize]));
+    }
+    // SAFETY: closes the key opened above.
+    unsafe {
+        let _ = RegCloseKey(h);
+    }
+    if ended != ERROR_NO_MORE_ITEMS {
+        return Err(failed("listing the shell's sync root records", ended));
+    }
+    let mut out = Vec::new();
+    for id in ids.into_iter().filter(|id| is_users(id, user_sid)) {
+        let record = format!(r"{BASE}\{id}");
+        let aumid = read_string(&record, "AUMID").map_err(|e| failed("reading a sync root record", e))?;
+        let root = read_string(&format!(r"{record}\UserSyncRoots"), user_sid)
+            .map_err(|e| failed("reading a sync root record", e))?;
+        let owner = aumid.as_deref().and_then(family_of).map(str::to_owned);
+        out.push(UserRoot { id, root: root.map(Into::into), owner });
+    }
+    Ok(out)
+}
+
+/// A string value under `HKEY_LOCAL_MACHINE`; `None` if it isn't there.
+fn read_string(key: &str, value: &str) -> std::result::Result<Option<String>, windows::Win32::Foundation::WIN32_ERROR> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
     use windows::core::PCWSTR;
 
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let key = wide(&format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}"));
-    let value = wide("AUMID");
-    let mut buf = [0u16; 512];
-    let mut size = (buf.len() * 2) as u32;
-    // SAFETY: both strings are NUL-terminated; `buf` is writable for `size` bytes.
-    let r = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            PCWSTR(key.as_ptr()),
-            PCWSTR(value.as_ptr()),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut size),
-        )
-    };
-    (r == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)]))
+    let (key, value) = (wide(key), wide(value));
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let mut size = (buf.len() * 2) as u32;
+        // SAFETY: both strings are NUL-terminated; `buf` is writable for `size` bytes.
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(value.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut size),
+            )
+        };
+        if r == ERROR_MORE_DATA {
+            buf.resize((size as usize).div_ceil(2) + 1, 0);
+            continue;
+        }
+        if r == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if r != ERROR_SUCCESS {
+            return Err(r);
+        }
+        return Ok(Some(String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)])));
+    }
 }
 
 fn our_roots() -> Vec<(String, String)> {
@@ -260,6 +325,20 @@ fn our_roots() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_what_is_certainly_another_users_is_left_out() {
+        assert!(is_users("OneUpDrive!S-1-5-21-1!abc", "S-1-5-21-1"));
+        assert!(is_users("OneUpDrive!s-1-5-21-1!abc", "S-1-5-21-1"));
+        assert!(!is_users("OneUpDrive!S-1-5-21-2!abc", "S-1-5-21-1"));
+        assert!(is_users("SomeProvider", "S-1-5-21-1"), "names no user");
+    }
+
+    /// Whatever this PC has registered, the list is complete or an error.
+    #[test]
+    fn the_inventory_reads_without_error() {
+        assert!(roots_of_user("S-1-5-21-0").is_ok());
+    }
 
     #[test]
     fn the_owner_is_the_family_in_the_application_id() {
