@@ -128,6 +128,60 @@ fn norm(p: &str) -> String {
 
 /// The shell IDs registered under our provider name (`OneUpDrive!...`)
 /// and their folders, for every user listed.
+pub struct OurRoot {
+    /// The shell's ID.
+    pub id: String,
+    pub root: std::path::PathBuf,
+    /// The package family that registered it; `None` if that can't be told.
+    pub owner: Option<String>,
+}
+
+/// The package family in an application ID (`Family!App`).
+fn family_of(aumid: &str) -> Option<&str> {
+    aumid.split_once('!').map(|(family, _)| family).filter(|f| !f.is_empty())
+}
+
+/// The folders registered as OneUpDrive's for this user. Windows removes a
+/// package's sync roots with the package, and the online-only files in them
+/// (measured), so what must not go with a package has to be found here first.
+pub fn roots_of_user(user_sid: &str) -> Vec<OurRoot> {
+    let marker = format!("!{user_sid}!");
+    our_roots()
+        .into_iter()
+        .filter(|(id, _)| id.contains(&marker))
+        .map(|(id, root)| {
+            let owner = application_id(&id).as_deref().and_then(family_of).map(str::to_owned);
+            OurRoot { id, root: root.into(), owner }
+        })
+        .collect()
+}
+
+/// The `AUMID` value of the shell's record `id`.
+fn application_id(id: &str) -> Option<String> {
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    use windows::core::PCWSTR;
+
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let key = wide(&format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}"));
+    let value = wide("AUMID");
+    let mut buf = [0u16; 512];
+    let mut size = (buf.len() * 2) as u32;
+    // SAFETY: both strings are NUL-terminated; `buf` is writable for `size` bytes.
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(key.as_ptr()),
+            PCWSTR(value.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    (r == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)]))
+}
+
 fn our_roots() -> Vec<(String, String)> {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
@@ -206,6 +260,13 @@ fn our_roots() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_owner_is_the_family_in_the_application_id() {
+        assert_eq!(family_of("OneUpDrive.Sync_g97pqcxf32cxg!OneUpDrive"), Some("OneUpDrive.Sync_g97pqcxf32cxg"));
+        assert_eq!(family_of("!OneUpDrive"), None);
+        assert_eq!(family_of("no separator"), None);
+    }
 
     #[test]
     fn paths_compare_as_windows_compares_them() {

@@ -822,6 +822,11 @@ enum Cmd {
         #[arg(long)]
         repair: bool,
     },
+    /// Moves this user's folders from the development identity package to
+    /// the signed one, then removes the development one (run by the install
+    /// hook; run it again if that left the package in place)
+    #[command(hide = true)]
+    MoveIdentity,
     /// Developers only: register (or with --remove, unregister) a temp
     /// folder with the Windows shell, to try Explorer integration
     #[command(hide = true)]
@@ -1929,6 +1934,15 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::MoveIdentity => {
+            use oneup_app::install::MovedIdentity;
+            match oneup_app::install::move_identity().await? {
+                MovedIdentity::NothingToDo => println!("No development package."),
+                MovedIdentity::Moved { folders } => println!("Moved {folders} folders. Development package removed."),
+                MovedIdentity::Kept { blocked } => bail!("{blocked} folders not moved. Development package kept."),
+            }
+            Ok(())
+        }
         Cmd::DevShellRoot { folder, remove } => {
             let sid = oneup_sys::pipe::current_user_sid()?;
             let id = oneup_cfapi::shell::root_id(&sid, "devtoken00000000");
@@ -1959,7 +1973,10 @@ async fn run() -> Result<()> {
                     ),
                 }
             } else if *remove {
-                println!("{}", if oneup_app::identity::remove()? { "Removed." } else { "Wasn't registered." });
+                println!(
+                    "{}",
+                    if oneup_app::identity::remove_unless_in_use()? { "Removed." } else { "Wasn't registered." }
+                );
             } else {
                 println!("{}", oneup_sys::identity::package_name().unwrap_or_else(|| "no package identity".into()));
             }

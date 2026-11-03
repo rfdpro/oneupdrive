@@ -82,21 +82,6 @@ pub fn register_unsigned(manifest: &std::path::Path, programs: &std::path::Path)
     deploy("registering the identity package", go())
 }
 
-/// The publisher of the identity package installed for this user, if
-/// there is one.
-pub fn installed_publisher() -> crate::Result<Option<String>> {
-    use windows::Management::Deployment::PackageManager;
-    let err = |source| crate::Error::Win32 { op: "looking for the identity package", source };
-    let pm = PackageManager::new().map_err(err)?;
-    for p in pm.FindPackagesByUserSecurityId(&windows::core::HSTRING::new()).map_err(err)? {
-        let id = p.Id().map_err(err)?;
-        if id.Name().map_err(err)? == PACKAGE {
-            return Ok(Some(id.Publisher().map_err(err)?.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 /// Where the identity package installed for this user reads its manifest
 /// from, if it's installed and that can be told.
 pub fn installed_location() -> crate::Result<Option<std::path::PathBuf>> {
@@ -110,6 +95,45 @@ pub fn installed_location() -> crate::Result<Option<std::path::PathBuf>> {
         }
     }
     Ok(None)
+}
+
+/// An identity package installed for this user. One per publisher: packages
+/// with different publishers are different families, and live side by side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub full_name: String,
+    pub family: String,
+    pub publisher: String,
+}
+
+/// The identity packages installed for this user.
+pub fn installed() -> crate::Result<Vec<Installed>> {
+    use windows::Management::Deployment::PackageManager;
+    let err = |source| crate::Error::Win32 { op: "looking for the identity package", source };
+    let pm = PackageManager::new().map_err(err)?;
+    let mut found = Vec::new();
+    for p in pm.FindPackagesByUserSecurityId(&windows::core::HSTRING::new()).map_err(err)? {
+        let id = p.Id().map_err(err)?;
+        if id.Name().map_err(err)? == PACKAGE {
+            found.push(Installed {
+                full_name: id.FullName().map_err(err)?.to_string(),
+                family: id.FamilyName().map_err(err)?.to_string(),
+                publisher: id.Publisher().map_err(err)?.to_string(),
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// Removes one identity package. Windows removes the package's sync roots
+/// with it, and the online-only files in them: the caller must have proved
+/// it owns none.
+pub fn remove_one(full_name: &str) -> crate::Result<()> {
+    use windows::Management::Deployment::PackageManager;
+    let err = |source| crate::Error::Win32 { op: "removing the identity package", source };
+    let pm = PackageManager::new().map_err(err)?;
+    let name = windows::core::HSTRING::from(full_name);
+    deploy("removing the identity package", pm.RemovePackageAsync(&name).and_then(|op| op.join()))
 }
 
 /// Removes the identity package for this user; `false` if it wasn't there.

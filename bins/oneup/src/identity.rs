@@ -24,6 +24,27 @@ pub const MSIX: &str = "OneUpDrive.Sync.msix";
 /// What development builds use as publisher (the programs' manifests say
 /// the same, `bins/oneup/build.rs`).
 pub const PUBLISHER_DEV: &str = "CN=OneUpDrive Development";
+/// The publisher this build's programs name in their manifests, when the
+/// build was given one (`packaging/build-release.ps1`).
+const BUILT_PUBLISHER: Option<&str> = option_env!("ONEUP_PUBLISHER");
+
+/// Whether this build's programs belong to a signed package, not the
+/// development one.
+pub fn is_release_build() -> bool {
+    is_signed_publisher(BUILT_PUBLISHER)
+}
+
+fn is_signed_publisher(built: Option<&str>) -> bool {
+    built.is_some_and(|p| !p.is_empty() && p != PUBLISHER_DEV)
+}
+
+/// Whether the package family `family` can be removed, given the owner of
+/// each of this user's folders. Removing a package takes its sync roots
+/// with it, and Windows then deletes their online-only files (measured).
+/// An owner that can't be told counts as this one.
+pub fn may_remove(family: &str, owners: &[Option<String>]) -> bool {
+    owners.iter().all(|o| o.as_deref().is_some_and(|o| o != family))
+}
 
 /// `1.2.3` (or `1.2.3-beta.4`) as a package version, `1.2.3.0`.
 pub fn package_version(v: &str) -> String {
@@ -167,7 +188,7 @@ const STOP_SURROGATE: &str = "Get-Process -Name dllhost -ErrorAction SilentlyCon
 
 /// Stops Explorer's COM surrogates serving `oneup_shell.dll`, and waits.
 /// Best effort: only our extension's surrogates, which hold no data.
-fn stop_shell_surrogate() {
+pub(crate) fn stop_shell_surrogate() {
     use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let stopped = std::process::Command::new("powershell.exe")
@@ -198,8 +219,39 @@ pub fn remove() -> Result<bool> {
     Ok(oneup_sys::identity::remove()?)
 }
 
+/// [`remove`], refused while a folder is registered with the package.
+pub fn remove_unless_in_use() -> Result<bool> {
+    let sid = oneup_sys::pipe::current_user_sid()?;
+    let owners: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid).into_iter().map(|r| r.owner).collect();
+    for package in oneup_sys::identity::installed()? {
+        anyhow::ensure!(
+            may_remove(&package.family, &owners),
+            "a folder is registered with this package, and removing it would delete the folder's online-only files; \
+             turn Files On-Demand off for that folder first"
+        );
+    }
+    remove()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_another_publisher_is_a_signed_build() {
+        assert!(super::is_signed_publisher(Some("CN=Jane Doe, O=Jane Doe")));
+        assert!(!super::is_signed_publisher(Some(super::PUBLISHER_DEV)));
+        assert!(!super::is_signed_publisher(Some("")));
+        assert!(!super::is_signed_publisher(None));
+    }
+
+    #[test]
+    fn a_package_goes_only_when_it_provably_owns_no_folder() {
+        let (dev, signed) = (Some("dev_1".to_string()), Some("signed_2".to_string()));
+        assert!(super::may_remove("dev_1", &[]));
+        assert!(super::may_remove("dev_1", &[signed.clone(), signed.clone()]));
+        assert!(!super::may_remove("dev_1", &[signed.clone(), dev]));
+        assert!(!super::may_remove("dev_1", &[signed, None]), "an unknown owner may be this one");
+    }
+
     #[test]
     fn versions_and_publishers_fill_the_manifest() {
         assert_eq!(super::package_version("1.2.3"), "1.2.3.0");
