@@ -65,14 +65,14 @@ Same OneDrive cloud with a lighter, faster, and more careful engine that syncs w
 
 **You'll need** Windows 10 (1809 or newer) or Windows 11, 64-bit, and a **personal** Microsoft account with OneDrive.
 
-1. Download `OneUpDrive.App-stable-Setup.exe` from the [releases page](https://github.com/rfdpro/oneupdrive/releases/latest).
+1. Download the installer from the [releases page](https://github.com/rfdpro/oneupdrive/releases/latest): `OneUpDrive.App-stable-Setup.exe`, or `OneUpDrive.App-preview-Setup.exe` for a preview.
 2. Run it. It installs for you alone, with no administrator rights.
 3. Sign in, choose your folders and what to leave out. A preview shows what the first sync would do, and nothing changes until you select **Start syncing**.
 
 Switching from the OneDrive app? Read [Moving over from the OneDrive app](docs/user-guide/migrating-from-onedrive.md) first.
 
 > [!IMPORTANT]
-> Releases aren't code-signed yet, so Windows SmartScreen may warn you when you run the installer. Signed releases and updates are coming soon.
+> Releases are code-signed. Windows SmartScreen may still warn you when you run the installer, because the publisher is new.
 
 Want to build it yourself? See [Development in CONTRIBUTING.md](CONTRIBUTING.md#development).
 

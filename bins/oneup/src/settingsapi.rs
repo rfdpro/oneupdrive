@@ -140,7 +140,10 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "max_percent": policy.max_percent,
             "content_guard": policy.max_suspicious,
         },
-        "updates": { "auto": updates.auto, "channel": updates.channel },
+        "updates": {
+            "auto": updates.auto,
+            "channel": if crate::updates::previews_wanted(&updates) { "preview" } else { "stable" },
+        },
         "onedrive_app": {
             "folders": config::load_onedrive_app(dir)?.folders,
             "top_files": config::load_onedrive_app(dir)?.top_files,
@@ -666,7 +669,7 @@ pub fn updates_with(mut u: config::Updates, v: &Value) -> Result<config::Updates
         if c != "stable" && c != "preview" {
             bail!("channel: stable or preview");
         }
-        u.channel = c.to_string();
+        u.channel = Some(c.to_string());
     }
     Ok(u)
 }
@@ -1430,7 +1433,7 @@ mod tests {
         assert_eq!((c.content_guard, c.max_changes, c.max_percent), (Some(0), Some(500), None));
         assert!(safety_changes(&json!({ "max_changes": -1 })).is_err());
         let u = updates_with(config::Updates::default(), &json!({ "channel": "preview", "auto": false })).unwrap();
-        assert_eq!((u.channel.as_str(), u.auto), ("preview", false));
+        assert_eq!((u.channel.as_deref(), u.auto), (Some("preview"), false));
         assert!(updates_with(config::Updates::default(), &json!({ "channel": "nightly" })).is_err());
         let r = rules_with(Rules::default(), &json!({ "paused": ["\\Big\\Videos\\", "", "/Work/"] })).unwrap();
         assert_eq!(r.paused, vec!["Big/Videos".to_string(), "Work".into()]);

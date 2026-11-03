@@ -1616,14 +1616,14 @@ fn updates_cmd(dir: &Path, auto: Option<bool>, channel: Option<&str>, check: boo
             u.auto = a;
         }
         if let Some(c) = channel {
-            u.channel = c.to_string();
+            u.channel = Some(c.to_string());
         }
         oneup_app::config::save_updates(dir, &u)?;
     }
     println!(
         "Updates: {}; {}.",
         if u.auto { "installed by themselves" } else { "installed when you choose" },
-        if u.channel == "preview" { "preview versions too" } else { "stable versions only" }
+        if oneup_app::updates::previews_wanted(&u) { "preview versions too" } else { "stable versions only" }
     );
     if check {
         let Some(um) = oneup_app::updates::manager(dir)? else {

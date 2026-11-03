@@ -4,7 +4,8 @@
 //!
 //! * The release feed is the GitHub repository this build was made for
 //!   (`ONEUP_UPDATE_REPO` at build time), or `[updates] repo`. `stable` sees
-//!   releases, `preview` pre-releases too. Not installed with the installer
+//!   releases, `preview` pre-releases too; with no choice made, a copy follows
+//!   the channel its package was built for. Not installed with the installer
 //!   (a developer build), or no repository: no updates.
 //! * **An update is installed only if its programs are signed by the same
 //!   publisher as the running one** (Authenticode, `oneup_sys::
@@ -20,11 +21,75 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use velopack::sources::GithubSource;
-use velopack::{UpdateCheck, UpdateInfo, UpdateManager};
+use velopack::bundle::Manifest;
+use velopack::locator::{self, LocationContext};
+use velopack::sources::{GithubSource, UpdateSource};
+use velopack::{Error as VelopackError, UpdateCheck, UpdateInfo, UpdateManager, VelopackAsset, VelopackAssetFeed};
 
 /// The repository releases come from, set when the release is built.
 pub const BUILT_FOR: Option<&str> = option_env!("ONEUP_UPDATE_REPO");
+
+const STABLE: &str = "stable";
+const PREVIEW: &str = "preview";
+
+/// Every release publishes one feed file, `releases.<channel>.json`, while
+/// Velopack reads only the file of the one channel it's given. This source
+/// reads the channels this copy wants and merges them, so a preview copy
+/// also sees stable releases.
+struct ChannelFeeds<S> {
+    source: S,
+    previews: bool,
+}
+
+impl<S: UpdateSource> UpdateSource for ChannelFeeds<S> {
+    fn get_release_feed(
+        &self,
+        _channel: &str,
+        app: &Manifest,
+        staged_user_id: &str,
+    ) -> Result<VelopackAssetFeed, VelopackError> {
+        let channels: &[&str] = if self.previews { &[STABLE, PREVIEW] } else { &[STABLE] };
+        let mut merged = Vec::new();
+        for channel in channels {
+            let feed = self.source.get_release_feed(channel, app, staged_user_id)?;
+            merged.extend(usable_from(channel, &app.channel, feed.Assets));
+        }
+        Ok(VelopackAssetFeed { Assets: merged })
+    }
+
+    fn download_release_entry(
+        &self,
+        asset: &VelopackAsset,
+        local_file: &Path,
+        progress_sender: Option<std::sync::mpsc::Sender<i16>>,
+    ) -> Result<(), VelopackError> {
+        self.source.download_release_entry(asset, local_file, progress_sender)
+    }
+}
+
+/// What a copy of `installed` channel can use from `channel`'s feed. A delta
+/// is built against the previous release of its own channel: from any other
+/// channel it wouldn't apply to what's installed, and Velopack chooses deltas
+/// by version alone. Without one it takes the full package.
+fn usable_from(channel: &str, installed: &str, assets: Vec<VelopackAsset>) -> Vec<VelopackAsset> {
+    assets.into_iter().filter(|a| channel == installed || !a.Type.eq_ignore_ascii_case("Delta")).collect()
+}
+
+/// Whether this copy wants pre-releases: the choice in `[updates]`, else
+/// what it was installed from.
+pub fn previews_wanted(cfg: &crate::config::Updates) -> bool {
+    wants_previews(cfg.channel.as_deref(), installed_channel().as_deref())
+}
+
+fn wants_previews(chosen: Option<&str>, installed: Option<&str>) -> bool {
+    chosen.or(installed) == Some(PREVIEW)
+}
+
+/// The channel the running copy's package was built for; `None` for a
+/// developer build.
+fn installed_channel() -> Option<String> {
+    locator::auto_locate_app_manifest(LocationContext::FromCurrentExe).ok().map(|l| l.get_manifest_channel())
+}
 
 /// An update downloaded and checked, ready to apply.
 pub struct Ready {
@@ -53,7 +118,8 @@ pub fn manager(data_dir: &Path) -> Result<Option<UpdateManager>> {
     if repo.is_empty() || url_parts(repo).is_none() {
         return Ok(None);
     }
-    let source = GithubSource::new(repo, None, cfg.channel == "preview");
+    let previews = previews_wanted(&cfg);
+    let source = ChannelFeeds { source: GithubSource::new(repo, None, previews), previews };
     // Fails when this copy wasn't installed (a developer build).
     Ok(UpdateManager::new(source, None, None).ok())
 }
@@ -213,6 +279,162 @@ pub fn apply(ready: Ready, args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use velopack::locator::VelopackLocatorConfig;
+    use velopack::sources::UpdateSource;
+    use velopack::{UpdateCheck, UpdateManager, VelopackAsset, VelopackAssetFeed};
+
+    use super::ChannelFeeds;
+
+    fn asset(version: &str, kind: &str, channel: &str) -> VelopackAsset {
+        VelopackAsset {
+            PackageId: "OneUpDrive.App".into(),
+            Version: version.into(),
+            Type: kind.into(),
+            FileName: format!("OneUpDrive.App-{version}-{channel}-{}.nupkg", kind.to_lowercase()),
+            ..Default::default()
+        }
+    }
+
+    /// Releases as GitHub serves them: a channel's file, and only if the
+    /// source's pre-release filter lets its release through.
+    #[derive(Clone)]
+    struct Releases {
+        previews: bool,
+        stable: Vec<VelopackAsset>,
+        preview: Vec<VelopackAsset>,
+    }
+
+    impl UpdateSource for Releases {
+        fn get_release_feed(
+            &self,
+            channel: &str,
+            _app: &velopack::bundle::Manifest,
+            _staged_user_id: &str,
+        ) -> Result<VelopackAssetFeed, velopack::Error> {
+            let assets = match channel {
+                "stable" => self.stable.clone(),
+                "preview" if self.previews => self.preview.clone(),
+                _ => Vec::new(),
+            };
+            Ok(VelopackAssetFeed { Assets: assets })
+        }
+
+        fn download_release_entry(
+            &self,
+            _asset: &VelopackAsset,
+            _local_file: &std::path::Path,
+            _progress_sender: Option<std::sync::mpsc::Sender<i16>>,
+        ) -> Result<(), velopack::Error> {
+            Ok(())
+        }
+    }
+
+    /// What Velopack itself offers a copy of `version` installed from
+    /// `installed`, with `chosen` in `[updates]`.
+    fn offered(
+        chosen: Option<&str>,
+        installed: &str,
+        version: &str,
+        stable: &[VelopackAsset],
+        preview: &[VelopackAsset],
+    ) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("current")).unwrap();
+        std::fs::create_dir_all(root.join("packages")).unwrap();
+        std::fs::write(root.join("Update.exe"), b"").unwrap();
+        std::fs::write(
+            root.join("current").join("sq.version"),
+            format!(
+                "<?xml version=\"1.0\"?><package><metadata><id>OneUpDrive.App</id>\
+                 <version>{version}</version><channel>{installed}</channel>\
+                 <mainExe>oneup-tray.exe</mainExe></metadata></package>"
+            ),
+        )
+        .unwrap();
+        let config = VelopackLocatorConfig {
+            RootAppDir: root.into(),
+            UpdateExePath: root.join("Update.exe"),
+            PackagesDir: root.join("packages"),
+            ManifestPath: root.join("current").join("sq.version"),
+            CurrentBinaryDir: root.join("current"),
+            IsPortable: false,
+        };
+        let previews = super::wants_previews(chosen, Some(installed));
+        let source = ChannelFeeds {
+            source: Releases { previews, stable: stable.to_vec(), preview: preview.to_vec() },
+            previews,
+        };
+        let um = UpdateManager::new(source, None, Some(config)).unwrap();
+        match um.check_for_updates().unwrap() {
+            UpdateCheck::UpdateAvailable(info) => Some(info.TargetFullRelease.Version.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_copy_follows_its_channel_until_a_choice_is_made() {
+        use super::wants_previews as wants;
+        assert!(wants(None, Some("preview")));
+        assert!(!wants(None, Some("stable")));
+        assert!(!wants(None, None));
+        assert!(wants(Some("preview"), Some("stable")));
+        assert!(!wants(Some("stable"), Some("preview")));
+    }
+
+    #[test]
+    fn a_preview_copy_gets_previews_with_no_choice_made() {
+        let preview = [asset("0.2.0-beta.2", "Full", "preview")];
+        let got = offered(None, "preview", "0.2.0-beta.1", &[], &preview);
+        assert_eq!(got.as_deref(), Some("0.2.0-beta.2"));
+    }
+
+    #[test]
+    fn a_preview_copy_moves_on_to_the_stable_release() {
+        let stable = [asset("0.2.0", "Full", "stable")];
+        let preview = [asset("0.2.0-beta.2", "Full", "preview")];
+        let got = offered(None, "preview", "0.2.0-beta.2", &stable, &preview);
+        assert_eq!(got.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn a_stable_copy_gets_previews_only_when_chosen() {
+        let stable = [asset("0.2.0", "Full", "stable")];
+        let preview = [asset("0.3.0-beta.1", "Full", "preview")];
+        assert_eq!(offered(None, "stable", "0.2.0", &stable, &preview), None);
+        let got = offered(Some("preview"), "stable", "0.2.0", &stable, &preview);
+        assert_eq!(got.as_deref(), Some("0.3.0-beta.1"));
+    }
+
+    #[test]
+    fn a_preview_copy_set_to_stable_ignores_previews_and_never_goes_back() {
+        let stable = [asset("0.1.9", "Full", "stable")];
+        let preview = [asset("0.2.0-beta.2", "Full", "preview")];
+        assert_eq!(offered(Some("stable"), "preview", "0.2.0-beta.1", &stable, &preview), None);
+    }
+
+    #[test]
+    fn saving_other_settings_makes_no_channel_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut u = crate::config::Updates { auto: false, ..Default::default() };
+        crate::config::save_updates(dir.path(), &u).unwrap();
+        assert_eq!(crate::config::load_updates(dir.path()).unwrap().channel, None);
+
+        u.channel = Some("stable".into());
+        crate::config::save_updates(dir.path(), &u).unwrap();
+        assert_eq!(crate::config::load_updates(dir.path()).unwrap().channel.as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn deltas_only_come_from_the_installed_channel() {
+        use super::usable_from;
+        let assets = vec![asset("0.2.0", "Full", "stable"), asset("0.2.0", "Delta", "stable")];
+        assert_eq!(usable_from("stable", "stable", assets.clone()).len(), 2);
+        let other = usable_from("stable", "preview", assets);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].Type, "Full");
+    }
+
     #[test]
     fn the_package_checked_is_the_one_velopack_applies() {
         use super::local_package_name as name;
