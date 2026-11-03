@@ -1,6 +1,6 @@
 [package]
 name = "oneup"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 publish = false
 description = "OneUpDrive command-line tool"
 edition.workspace = true
@@ -61,7 +61,7 @@ rpassword = "7"
 # Installing and updating (MIT); rustls for its downloads. The prerelease is
 # the first on zip 9, which fixes the zip 8 advisories. Pinned: move it to the
 # next stable release, together with vpk in .github/workflows/release.yml.
-velopack = "=1.3.39-g8d2844f"
+velopack = { version = "=1.3.39-g8d2844f", features = ["public-utils"] }
 # One cryptography backend for rustls in the whole process (setup::tls).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }

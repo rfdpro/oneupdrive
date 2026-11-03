@@ -797,8 +797,9 @@ pub fn save_space(data_dir: &Path, s: &Space) -> Result<()> {
 pub struct Updates {
     /// Download and install updates by themselves.
     pub auto: bool,
-    /// `stable`, or `preview` for pre-releases too.
-    pub channel: String,
+    /// `stable`, or `preview` for pre-releases too. `None`: as the installed
+    /// package was built (`crate::updates::previews_wanted`).
+    pub channel: Option<String>,
     /// The GitHub repository releases come from (`https://github.com/owner/repo`);
     /// empty: the one this build was made for.
     pub repo: String,
@@ -806,7 +807,7 @@ pub struct Updates {
 
 impl Default for Updates {
     fn default() -> Self {
-        Self { auto: true, channel: "stable".into(), repo: String::new() }
+        Self { auto: true, channel: None, repo: String::new() }
     }
 }
 
@@ -822,7 +823,7 @@ pub fn load_updates(data_dir: &Path) -> Result<Updates> {
         if c != "stable" && c != "preview" {
             bail!("{FILE}: updates.channel must be \"stable\" or \"preview\"");
         }
-        u.channel = c.to_string();
+        u.channel = Some(c.to_string());
     }
     if let Some(r) = t.get("repo") {
         u.repo = r.as_str().with_context(|| format!("{FILE}: updates.repo must be a string"))?.to_string();
@@ -831,12 +832,17 @@ pub fn load_updates(data_dir: &Path) -> Result<Updates> {
 }
 
 pub fn save_updates(data_dir: &Path, u: &Updates) -> Result<()> {
-    save(
+    save_or_remove(
         data_dir,
         "updates",
-        "# OneUpDrive updating itself: auto = true/false, channel = \"stable\" or \"preview\".
+        "# OneUpDrive updating itself: auto = true/false, channel = \"stable\" or \"preview\"
+# (left out: the channel this copy was installed from).
 ",
-        vec![("auto", value(u.auto)), ("channel", value(u.channel.as_str())), ("repo", value(u.repo.as_str()))],
+        vec![
+            ("auto", Some(value(u.auto))),
+            ("channel", u.channel.as_deref().map(value)),
+            ("repo", Some(value(u.repo.as_str()))),
+        ],
     )
 }
 
