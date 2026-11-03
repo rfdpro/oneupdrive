@@ -38,6 +38,22 @@ pub enum Look {
     Off,
 }
 
+/// Whether a downloaded update may install by itself as far as the agent goes.
+pub fn may_install_now(v: &View) -> bool {
+    match v {
+        View::NotRunning | View::Stopped(_) => true,
+        View::Running(s) => {
+            // Retrying too: nothing moves meanwhile, whatever is wrong (a
+            // refused sign-in, say) may be what the update fixes, and the
+            // update stops the agent at a safe point first.
+            matches!(s.activity, Activity::Idle | Activity::Retrying)
+                && s.safety_stops.is_empty()
+                && !s.overflow.as_ref().is_some_and(|o| o.waiting)
+        }
+        _ => false,
+    }
+}
+
 pub fn look(v: &View) -> Look {
     if matches!(v, View::Stopped(_)) {
         return Look::Problem;
@@ -862,6 +878,20 @@ mod tests {
 
     fn up(s: Status) -> View {
         View::Running(Box::new(s))
+    }
+
+    #[test]
+    fn an_update_installs_by_itself_only_while_nothing_moves_or_waits() {
+        assert!(may_install_now(&View::NotRunning));
+        assert!(may_install_now(&up(status(Activity::Idle))));
+        // A refused sign-in looks like this, and the update may be the fix.
+        assert!(may_install_now(&up(status(Activity::Retrying))));
+        assert!(!may_install_now(&up(status(Activity::Syncing))));
+        assert!(!may_install_now(&up(status(Activity::WaitingForYou))));
+        assert!(!may_install_now(&View::Connecting));
+        let mut stopped = status(Activity::Retrying);
+        stopped.safety_stops.push(stop("x"));
+        assert!(!may_install_now(&up(stopped)), "a safety stop is the person's to answer first");
     }
 
     fn stop(code: &str) -> SafetyStop {
