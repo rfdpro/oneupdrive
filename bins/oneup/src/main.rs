@@ -823,10 +823,18 @@ enum Cmd {
         repair: bool,
     },
     /// Moves this user's folders from the development identity package to
-    /// the signed one, then removes the development one (once, by hand, with
-    /// OneUpDrive stopped, on a PC that ran a development build)
+    /// the signed one, then removes the development one (run by the tray on
+    /// a PC that ran a development build)
     #[command(hide = true)]
-    MoveIdentity,
+    MoveIdentity {
+        /// Stop OneUpDrive first, start the icon afterwards, and report a
+        /// failure in a window: the tray's way of running this
+        #[arg(long)]
+        then_start: bool,
+        /// The icon's arguments
+        #[arg(last = true)]
+        tray_args: Vec<std::ffi::OsString>,
+    },
     /// Developers only: register (or with --remove, unregister) a temp
     /// folder with the Windows shell, to try Explorer integration
     #[command(hide = true)]
@@ -1934,12 +1942,16 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::MoveIdentity => {
+        Cmd::MoveIdentity { then_start: true, tray_args } => {
+            oneup_app::install::move_then_start(tray_args).await;
+            Ok(())
+        }
+        Cmd::MoveIdentity { .. } => {
             use oneup_app::install::MovedIdentity;
             match oneup_app::install::move_identity().await? {
                 MovedIdentity::NothingToDo => println!("No development package."),
                 MovedIdentity::Moved { folders } => println!("Moved {folders} folders. Development package removed."),
-                MovedIdentity::Kept { blocked } => bail!("{blocked} folders not moved. Development package kept."),
+                MovedIdentity::Kept { why } => bail!("{}", MovedIdentity::kept_message(&why)),
             }
             Ok(())
         }

@@ -65,13 +65,26 @@ mod win {
         let dir = data_dir()?;
         // From the Start menu (no arguments): the settings window opens (or
         // comes to the front), whether or not the icon is already showing.
-        let plain = std::env::args_os().len() == 1;
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let after_move = args.iter().any(|a| a == oneup_app::install::AFTER_MOVE);
+        let plain = args.iter().all(|a| a == oneup_app::install::AFTER_MOVE);
         let Some(_instance) = oneup_sys::tray::single_instance(&tray::instance_name(&dir))? else {
             if plain {
                 oneup_app::launch::start_settings(&dir)?;
             }
             return Ok(()); // Already showing for this data folder.
         };
+        // First start after an install or update, on a PC with a development
+        // package to leave: the move needs this program gone, and starts it
+        // again when done. Tried once per start, so never a loop.
+        let installed = plain || args.iter().any(|a| a == "--after-update");
+        if installed
+            && !after_move
+            && oneup_app::install::move_is_due()
+            && oneup_app::launch::start_identity_move(&args).is_ok()
+        {
+            return Ok(());
+        }
         // From the Start menu, at sign-in and after an update: syncing
         // starts too (and the vaults whose keys are remembered).
         if plain || std::env::args_os().any(|a| a == "--start") {

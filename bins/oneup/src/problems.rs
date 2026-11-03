@@ -554,7 +554,7 @@ async fn facts(dir: &Path, pair: Option<String>) -> Facts {
     let (unsynced, (conflicts, conflicts_more), edits_not_found) =
         if set_up { from_store(dir) } else { (None, (Vec::new(), More::No), Vec::new()) };
     Facts {
-        signed_in: dir.join("token.dpapi").exists(),
+        signed_in: oneup_graph::usable_sign_in(&dir.join("token.dpapi")),
         paused_folders: crate::config::paused_folders(dir),
         pair,
         dir: dir.to_path_buf(),

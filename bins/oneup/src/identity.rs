@@ -28,6 +28,11 @@ pub const PUBLISHER_DEV: &str = "CN=OneUpDrive Development";
 /// build was given one (`packaging/build-release.ps1`).
 const BUILT_PUBLISHER: Option<&str> = option_env!("ONEUP_PUBLISHER");
 
+/// The publisher this build's programs were made for, if it was given one.
+pub fn built_publisher() -> Option<&'static str> {
+    BUILT_PUBLISHER.filter(|p| !p.is_empty())
+}
+
 /// Whether this build's programs belong to a signed package, not the
 /// development one.
 pub fn is_release_build() -> bool {

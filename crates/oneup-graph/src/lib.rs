@@ -21,7 +21,7 @@ pub mod model;
 pub mod push;
 pub mod throttle;
 
-pub use auth::{Auth, DpapiFileStore, TokenStore};
+pub use auth::{Auth, DpapiFileStore, TokenStore, usable_sign_in};
 pub use client::{Graph, NetStats};
 pub use limiter::Aimd;
 pub use model::{Drive, DriveItem, FileVersion, ItemSharing, Page, Permission, SharedFolder, SharedItem};

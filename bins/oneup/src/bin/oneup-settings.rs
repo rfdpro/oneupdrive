@@ -659,7 +659,14 @@ mod win {
                 if flag(args, "shared") {
                     a.push("--shared-folders".into());
                 }
-                Ok(Value::from(oneup(a).await?))
+                let out = Value::from(oneup(a).await?);
+                // Agents waiting to try again try now: this sign-in is theirs too.
+                for d in std::iter::once(dir.to_path_buf()).chain(oneup_app::launch::children(dir)) {
+                    if let Ok(mut c) = oneup_ipc::connect(&d).await {
+                        let _ = c.call(&oneup_ipc::Call::SyncNow).await;
+                    }
+                }
+                Ok(out)
             }
             "activity" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
