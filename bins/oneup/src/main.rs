@@ -1973,6 +1973,7 @@ async fn run() -> Result<()> {
                     ),
                 }
             } else if *remove {
+                oneup_app::install::only_this_program_running()?;
                 let done = oneup_app::identity::remove_unowned()?;
                 if done.kept > 0 {
                     bail!("A folder is registered with this package. Turn Files On-Demand off for it first.");

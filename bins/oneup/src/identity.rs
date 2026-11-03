@@ -114,7 +114,7 @@ fn without_version(manifest: &str) -> String {
 pub fn dev_is_current(programs: &Path) -> bool {
     let stage = stage_dir(programs);
     let plain = |p: &Path| p.to_string_lossy().trim_start_matches(r"\\?\").trim_end_matches('\\').to_lowercase();
-    let registered = oneup_sys::identity::installed_location().ok().flatten();
+    let registered = oneup_sys::identity::installed_location(PUBLISHER_DEV).ok().flatten();
     if registered.is_none_or(|r| plain(&r) != plain(&stage)) {
         return false;
     }
@@ -226,9 +226,11 @@ pub struct Removed {
 /// Without a complete list of the folders, removes nothing.
 pub fn remove_unowned() -> Result<Removed> {
     let sid = oneup_sys::pipe::current_user_sid()?;
-    let owners: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid)?.into_iter().map(|r| r.owner).collect();
     let mut done = Removed::default();
     for package in oneup_sys::identity::installed()? {
+        // Read for each package, right before it goes: another copy may have
+        // moved a folder to this package since the last one.
+        let owners: Vec<_> = oneup_cfapi::shell::roots_of_user(&sid)?.into_iter().map(|r| r.owner).collect();
         if may_remove(&package.family, &owners) {
             oneup_sys::identity::remove_one(&package.full_name)?;
             done.removed += 1;

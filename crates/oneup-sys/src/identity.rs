@@ -82,14 +82,15 @@ pub fn register_unsigned(manifest: &std::path::Path, programs: &std::path::Path)
     deploy("registering the identity package", go())
 }
 
-/// Where the identity package installed for this user reads its manifest
-/// from, if it's installed and that can be told.
-pub fn installed_location() -> crate::Result<Option<std::path::PathBuf>> {
+/// Where the identity package of `publisher` installed for this user reads
+/// its manifest from, if it's installed and that can be told.
+pub fn installed_location(publisher: &str) -> crate::Result<Option<std::path::PathBuf>> {
     use windows::Management::Deployment::PackageManager;
     let err = |source| crate::Error::Win32 { op: "looking for the identity package", source };
     let pm = PackageManager::new().map_err(err)?;
     for p in pm.FindPackagesByUserSecurityId(&windows::core::HSTRING::new()).map_err(err)? {
-        if p.Id().and_then(|id| id.Name()).map_err(err)? == PACKAGE {
+        let id = p.Id().map_err(err)?;
+        if id.Name().map_err(err)? == PACKAGE && id.Publisher().map_err(err)? == publisher {
             // A package whose folder is gone has no location to give.
             return Ok(p.InstalledPath().ok().map(|s| std::path::PathBuf::from(s.to_string())));
         }

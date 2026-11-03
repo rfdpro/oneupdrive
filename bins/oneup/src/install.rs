@@ -98,7 +98,7 @@ const OUR_PROGRAMS: &[&str] =
     &["oneupd.exe", "oneupd-start.exe", "oneup-tray.exe", "oneup-settings.exe", "oneup-open.exe", "oneup.exe"];
 
 /// Refuses while any other of OneUpDrive's programs runs, of any copy.
-fn only_this_program_running() -> anyhow::Result<()> {
+pub fn only_this_program_running() -> anyhow::Result<()> {
     for name in OUR_PROGRAMS {
         let others = oneup_sys::processes::named(name)?;
         anyhow::ensure!(
