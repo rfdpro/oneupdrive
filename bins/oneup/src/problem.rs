@@ -146,7 +146,13 @@ pub fn classify(e: &anyhow::Error) -> Kind {
         } else if let Some(r) = c.downcast_ref::<reqwest::Error>() {
             (r.is_connect() || r.is_timeout() || r.is_request()).then_some(Kind::Offline)
         } else if let Some(r) = c.downcast_ref::<oneup_remote::Error>() {
-            matches!(r, oneup_remote::Error::Inconsistent(_)).then_some(Kind::Records)
+            // Transparent variants: what they wrap isn't in the chain itself.
+            match r {
+                oneup_remote::Error::Graph(g) => graph_kind(g),
+                oneup_remote::Error::Store(s) => store_kind(s),
+                oneup_remote::Error::Inconsistent(_) => Some(Kind::Records),
+                _ => None,
+            }
         } else if let Some(s) = c.downcast_ref::<oneup_store::Error>() {
             store_kind(s)
         } else if let Some(x) = c.downcast_ref::<oneup_effects::Error>() {
@@ -344,6 +350,8 @@ mod tests {
         let records = err(oneup_remote::Error::Inconsistent("synced: 1 rows whose parent is missing".into()));
         assert_eq!(classify(&records), Kind::Records);
         assert_eq!(classify(&err(oneup_graph::Error::NotSignedIn)), Kind::SignIn);
+        // How syncing reports it: through the remote layer.
+        assert_eq!(classify(&err(oneup_remote::Error::Graph(oneup_graph::Error::NotSignedIn))), Kind::SignIn);
         assert_eq!(classify(&err(crate::sync::NotPaired)), Kind::Setup);
         let status = |status, body: &str| oneup_graph::Error::Status { status, what: "x".into(), body: body.into() };
         assert_eq!(classify(&err(status(401, ""))), Kind::SignIn);

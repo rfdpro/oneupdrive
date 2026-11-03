@@ -582,6 +582,48 @@ pub mod user_registry {
         check("RegSetKeyValueW", r)
     }
 
+    /// Sets value `name` of key `key` to text, as registry type `kind`
+    /// (`REG_SZ` is 1, `REG_EXPAND_SZ` 2).
+    pub fn set_as(key: &str, name: &str, value: &str, kind: u32) -> std::io::Result<()> {
+        let data: Vec<u16> = value.encode_utf16().chain([0]).collect();
+        // SAFETY: the strings are NUL-terminated and outlive the call; `data`
+        // is `cbdata` bytes long.
+        let r = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                &HSTRING::from(key),
+                &HSTRING::from(name),
+                kind,
+                Some(data.as_ptr().cast::<c_void>()),
+                (data.len() * 2) as u32,
+            )
+        };
+        check("RegSetKeyValueW", r)
+    }
+
+    /// Tells running programs the user's environment variables changed, so
+    /// that Explorer hands new ones to what it starts next.
+    pub fn announce_environment_change() {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+        };
+        let what = HSTRING::from("Environment");
+        // SAFETY: `what` is NUL-terminated and outlives the call, which
+        // returns before it's dropped; a hung window is skipped.
+        let _ = unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST as HWND,
+                WM_SETTINGCHANGE,
+                WPARAM(0),
+                LPARAM(what.as_ptr() as isize),
+                SMTO_ABORTIFHUNG,
+                500,
+                None,
+            )
+        };
+    }
+
     /// String value `name` of key `key`, if there is one.
     pub fn get(key: &str, name: &str) -> std::io::Result<Option<String>> {
         let (k, n) = (HSTRING::from(key), HSTRING::from(name));

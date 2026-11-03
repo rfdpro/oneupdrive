@@ -39,6 +39,8 @@ After setup, the window opens this section by itself if it finds any.
 Command line: `oneup shortcuts` lists, `--fix` updates, `--undo` restores. `--from "D:\OneDrive"` names the old folder if it wasn't `%USERPROFILE%\OneDrive`.
 
 ## Updates
+Installing puts `oneup` on your `PATH`. Open a new terminal to use it.
+
 **Updates install themselves, on a signed installation.** (A copy you built yourself isn't signed: it doesn't install updates by itself, and you install each new version yourself.) About once a day OneUpDrive looks for a new release (not on a metered network, one with a data budget, or while working offline: see [Slow and metered connections](slow-and-metered-networks.md)), downloads it in the background and checks that it's signed by the same publisher as the copy you have; anything else is thrown away. It installs the update when nothing is syncing (pausing syncing around it) and tells you; **Install update…** in the icon's menu does it straight away. In the settings window, **General** has **Check now**, **Install updates automatically** (turn it off and an update found is installed only when you choose **Install update…**) and **Get previews**. **Get previews** starts on if you used the preview installer. With it on, you get both previews and stable releases; with it off, stable releases only. If you never changed it, a preview copy turns it off when it moves to a stable release. From the command line: `oneup updates` shows the choice, `--auto on|off` and `--channel stable|preview` change it, and `--check` looks now.
 
 ## Uninstalling

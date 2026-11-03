@@ -35,6 +35,23 @@ pub trait TokenStore: Send + Sync {
     fn load(&self) -> Result<Option<String>>;
     fn save(&self, refresh_token: &str) -> Result<()>;
     fn clear(&self) -> Result<()>;
+    /// Remembers whether the sign-in service refused the stored token, for
+    /// what shows the sign-in state without asking the service.
+    fn note_refused(&self, _refused: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether the token file at `path` holds a sign-in that hasn't been refused.
+/// A refused token stays in its file: another build, with another client ID,
+/// gets the same refusal for a token that's still good for the build it came
+/// from.
+pub fn usable_sign_in(path: &std::path::Path) -> bool {
+    path.is_file() && !refused_note(path).exists()
+}
+
+fn refused_note(path: &std::path::Path) -> PathBuf {
+    path.with_extension("refused")
 }
 
 /// Refresh token in a file, encrypted with DPAPI for the current Windows user.
@@ -76,14 +93,30 @@ impl TokenStore for DpapiFileStore {
         let tmp = self.path.with_extension("tmp");
         std::fs::write(&tmp, sealed)?;
         std::fs::rename(&tmp, &self.path)?;
+        // The token is what counts: the note only affects what's shown.
+        let _ = self.note_refused(false);
         Ok(())
     }
 
     fn clear(&self) -> Result<()> {
         match std::fs::remove_file(&self.path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
         }
+        let _ = self.note_refused(false);
+        Ok(())
+    }
+
+    fn note_refused(&self, refused: bool) -> Result<()> {
+        let note = refused_note(&self.path);
+        if refused {
+            std::fs::write(note, b"")?;
+        } else if let Err(e) = std::fs::remove_file(note)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
+        }
+        Ok(())
     }
 }
 
@@ -204,14 +237,30 @@ impl Auth {
                 format!("asked to wait {} s before the next request", wait.as_secs()),
             ));
         }
-        let t = self
+        let answer = self
             .token_request(&[
                 ("grant_type", "refresh_token"),
                 ("client_id", &self.client_id),
                 ("refresh_token", &rt),
                 ("scope", &self.scope),
             ])
-            .await?;
+            .await;
+        // Not if another process signed in meanwhile: that's a new token, and
+        // the refusal was for the old one. Only a note: the error says it all.
+        match &answer {
+            Err(Error::NotSignedIn) if self.store.load().is_ok_and(|now| now.as_deref() == Some(rt.as_str())) => {
+                let _ = self.store.note_refused(true);
+                // Signed in between the look and the note: it isn't refused.
+                if !self.store.load().is_ok_and(|now| now.as_deref() == Some(rt.as_str())) {
+                    let _ = self.store.note_refused(false);
+                }
+            }
+            Ok(_) => {
+                let _ = self.store.note_refused(false);
+            }
+            _ => {}
+        }
+        let t = answer?;
         let token = t.access_token.clone();
         *guard = Some(self.accept(t)?);
         Ok(token)
@@ -460,6 +509,13 @@ mod tests {
         let store = DpapiFileStore::new(dir.join("token.dpapi"));
         assert_eq!(store.load().unwrap(), None);
         store.save("rt-123").unwrap();
+        assert!(usable_sign_in(&dir.join("token.dpapi")));
+        store.note_refused(true).unwrap();
+        assert!(!usable_sign_in(&dir.join("token.dpapi")), "still there, but refused");
+        assert_eq!(store.load().unwrap().as_deref(), Some("rt-123"), "kept");
+        store.save("rt-123").unwrap();
+        assert!(usable_sign_in(&dir.join("token.dpapi")), "a new sign-in counts again");
+        store.note_refused(true).unwrap();
         assert_eq!(store.load().unwrap().as_deref(), Some("rt-123"));
         assert_ne!(std::fs::read(dir.join("token.dpapi")).unwrap(), b"rt-123");
         store.clear().unwrap();

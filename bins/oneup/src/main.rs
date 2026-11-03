@@ -822,6 +822,19 @@ enum Cmd {
         #[arg(long)]
         repair: bool,
     },
+    /// Moves this user's folders from the development identity package to
+    /// the signed one, then removes the development one (run by the tray on
+    /// a PC that ran a development build)
+    #[command(hide = true)]
+    MoveIdentity {
+        /// Stop OneUpDrive first, start the icon afterwards, and report a
+        /// failure in a window: the tray's way of running this
+        #[arg(long)]
+        then_start: bool,
+        /// The icon's arguments
+        #[arg(last = true)]
+        tray_args: Vec<std::ffi::OsString>,
+    },
     /// Developers only: register (or with --remove, unregister) a temp
     /// folder with the Windows shell, to try Explorer integration
     #[command(hide = true)]
@@ -1929,6 +1942,19 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::MoveIdentity { then_start: true, tray_args } => {
+            oneup_app::install::move_then_start(tray_args).await;
+            Ok(())
+        }
+        Cmd::MoveIdentity { .. } => {
+            use oneup_app::install::MovedIdentity;
+            match oneup_app::install::move_identity().await? {
+                MovedIdentity::NothingToDo => println!("No development package."),
+                MovedIdentity::Moved { folders } => println!("Moved {folders} folders. Development package removed."),
+                MovedIdentity::Kept { why } => bail!("{}", MovedIdentity::kept_message(&why)),
+            }
+            Ok(())
+        }
         Cmd::DevShellRoot { folder, remove } => {
             let sid = oneup_sys::pipe::current_user_sid()?;
             let id = oneup_cfapi::shell::root_id(&sid, "devtoken00000000");
@@ -1959,7 +1985,12 @@ async fn run() -> Result<()> {
                     ),
                 }
             } else if *remove {
-                println!("{}", if oneup_app::identity::remove()? { "Removed." } else { "Wasn't registered." });
+                oneup_app::install::only_this_program_running()?;
+                let done = oneup_app::identity::remove_unowned()?;
+                if done.kept > 0 {
+                    bail!("A folder is registered with this package. Turn Files On-Demand off for it first.");
+                }
+                println!("{}", if done.removed > 0 { "Removed." } else { "Wasn't registered." });
             } else {
                 println!("{}", oneup_sys::identity::package_name().unwrap_or_else(|| "no package identity".into()));
             }

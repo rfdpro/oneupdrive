@@ -104,6 +104,34 @@ pub fn start_tray_with(data_dir: &Path, more: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Starts the icon with exactly `args`, data folder included if it needs one.
+#[cfg(windows)]
+pub fn start_tray_args(args: &[std::ffi::OsString]) -> Result<()> {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let mut cmd = std::process::Command::new(sibling("oneup-tray.exe")?);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    spawn_outside_job(&mut cmd, CREATE_NEW_PROCESS_GROUP).context("starting oneup-tray")?;
+    Ok(())
+}
+
+/// Starts the hidden `oneup move-identity --then-start`, which ends with
+/// starting the icon again with `tray_args`.
+#[cfg(windows)]
+pub fn start_identity_move(tray_args: &[std::ffi::OsString]) -> Result<()> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(sibling("oneup.exe")?);
+    cmd.args(["move-identity", "--then-start", "--"])
+        .args(tray_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    spawn_outside_job(&mut cmd, CREATE_NO_WINDOW).context("starting oneup")?;
+    Ok(())
+}
+
 /// Starts `cmd` outside the caller's Windows job, if it's in one that
 /// allows that (and as usual otherwise). A program Explorer started for
 /// OneUpDrive's commands or status flyout runs in the job of the package's

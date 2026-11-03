@@ -47,7 +47,7 @@ pub fn read(dir: &Path) -> Option<Account> {
     Some(Account {
         dir: dir.to_path_buf(),
         name,
-        signed_in: dir.join("token.dpapi").is_file(),
+        signed_in: oneup_graph::usable_sign_in(&dir.join("token.dpapi")),
         test_account: dir.join("test-account.txt").is_file(),
         default,
     })

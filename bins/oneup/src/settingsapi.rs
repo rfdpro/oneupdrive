@@ -60,8 +60,9 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "data_dir": shown(&dir.to_string_lossy()),
         "test_account": crate::test_account::load(dir)?.is_some(),
-        // The stored sign-in only; nothing is sent anywhere to find out.
-        "signed_in": dir.join("token.dpapi").exists(),
+        // The stored sign-in, unless it was refused; nothing is sent anywhere
+        // to find out.
+        "signed_in": oneup_graph::usable_sign_in(&dir.join("token.dpapi")),
         "setup": setup,
         // A folder of its own, apart from the OneDrive app's (`%USERPROFILE%\OneDrive`).
         "whole_drive": crate::sync::WHOLE_DRIVE_ALLOWED,
