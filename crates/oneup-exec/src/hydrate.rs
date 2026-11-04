@@ -26,7 +26,7 @@ use oneup_cfapi::provider::{self, Cancel, Fetch, Provider};
 use oneup_store::{ActivityEntry, ActivityOutcome, AppFile, AppUse, Store, UseKind};
 use oneup_sync::{RemoteId, RemotePre};
 
-use crate::cloud::{Cloud, Hashing};
+use crate::cloud::{Cloud, CloudError, Hashing};
 
 /// Transfer chunks: a multiple of 4 KiB, as Cloud Files requires.
 const CHUNK: usize = 1 << 20;
@@ -34,8 +34,10 @@ const CHUNK: usize = 1 << 20;
 /// The same refusal of the same file goes in the activity log at most this
 /// often: each pass asks again for a file set to stay on this device.
 const FAILURE_REPEAT_MS: i64 = 3_600_000;
-/// How many refusals are remembered for that. Forgetting one only logs it again.
+/// How many refusals an hour are logged: more say nothing until one's hour is up.
 const FAILURES_KEPT: usize = 1_024;
+/// How many refusals [`Hydrator::refused`] keeps, the latest.
+const REFUSED_KEPT: usize = 64;
 
 /// What a refused request reports to the caller (for tests and logs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +66,8 @@ pub struct Hydrator<C> {
     /// Called when a program's open found a placeholder out of date: wakes
     /// the agent so a round updates it.
     on_stale: Box<dyn Fn() + Send + Sync>,
-    /// When each recent refusal was logged, by path and reason.
-    failures_logged: Mutex<HashMap<(String, String), i64>>,
+    /// Which refusals were logged lately.
+    failures_logged: Mutex<RecentFailures>,
     running: Mutex<HashMap<i64, tokio::task::AbortHandle>>,
     seq: AtomicU64,
     /// Refusals so far (for tests).
@@ -113,7 +115,7 @@ impl<C: Cloud + 'static> Hydrator<C> {
             root: volume_relative(sync_root),
             rt,
             on_stale,
-            failures_logged: Mutex::new(HashMap::new()),
+            failures_logged: Mutex::new(RecentFailures::default()),
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
@@ -147,7 +149,13 @@ impl<C: Cloud + 'static> Hydrator<C> {
                 if why == Refusal::NotCurrent && !ours {
                     (self.on_stale)();
                 }
-                self.refused.lock().unwrap_or_else(|p| p.into_inner()).push(why);
+                {
+                    let mut refused = self.refused.lock().unwrap_or_else(|p| p.into_inner());
+                    if refused.len() == REFUSED_KEPT {
+                        refused.remove(0);
+                    }
+                    refused.push(why);
+                }
                 fetch.fail(provider::NOT_IN_SYNC);
                 self.log_failure(&path, format!("{why:?}"));
             }
@@ -195,7 +203,11 @@ impl<C: Cloud + 'static> Hydrator<C> {
         let cloud = self.cloud_for(asked_by_us(fetch.process.as_ref(), std::process::id()));
         let (len, hash) = {
             let mut w = Hashing::new(&mut file);
-            let received = cloud.download(&pre, &mut w).await.map_err(|_| Refusal::Download)?;
+            // Changed: OneDrive is ahead of the Remote tree, so a round has news.
+            let received = cloud.download(&pre, &mut w).await.map_err(|e| match e {
+                CloudError::Changed => Refusal::NotCurrent,
+                _ => Refusal::Download,
+            })?;
             // The identity's hash is the cloud's (see `cloud`).
             (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
         };
@@ -248,19 +260,10 @@ impl<C: Cloud + 'static> Hydrator<C> {
     /// Logs a refusal, unless the same one was logged within the last
     /// [`FAILURE_REPEAT_MS`].
     fn log_failure(&self, path: &str, detail: String) {
-        let now = now_ms();
-        {
-            let mut logged = self.failures_logged.lock().unwrap_or_else(|p| p.into_inner());
-            if logged.len() >= FAILURES_KEPT {
-                logged.clear();
-            }
-            let last = logged.entry((path.to_string(), detail.clone())).or_insert(i64::MIN);
-            if now.saturating_sub(*last) < FAILURE_REPEAT_MS {
-                return;
-            }
-            *last = now;
+        let due = self.failures_logged.lock().unwrap_or_else(|p| p.into_inner()).due(path, &detail, now_ms());
+        if due {
+            self.log(ActivityOutcome::Failed, path, detail);
         }
-        self.log(ActivityOutcome::Failed, path, detail);
     }
 
     fn log(&self, outcome: ActivityOutcome, path: &str, detail: String) {
@@ -281,6 +284,30 @@ impl<C> Hydrator<C> {
             (Some(c), true) => c,
             _ => &self.cloud,
         }
+    }
+}
+
+/// When each recent refusal was logged, by path and reason.
+#[derive(Default)]
+struct RecentFailures(HashMap<(String, String), i64>);
+
+impl RecentFailures {
+    /// Whether this refusal goes in the log now. Full of refusals still in
+    /// their hour, a new one doesn't: emptying the list instead would log
+    /// every failing file again each pass.
+    fn due(&mut self, path: &str, detail: &str, now: i64) -> bool {
+        let key = (path.to_string(), detail.to_string());
+        if self.0.get(&key).is_some_and(|last| now.saturating_sub(*last) < FAILURE_REPEAT_MS) {
+            return false;
+        }
+        if self.0.len() >= FAILURES_KEPT && !self.0.contains_key(&key) {
+            self.0.retain(|_, last| now.saturating_sub(*last) < FAILURE_REPEAT_MS);
+            if self.0.len() >= FAILURES_KEPT {
+                return false;
+            }
+        }
+        self.0.insert(key, now);
+        true
     }
 }
 
@@ -352,6 +379,20 @@ mod tests {
     use super::*;
 
     /// Who asked decides the cloud, before anything is downloaded: this
+    /// More refusals than are remembered don't start the log over each pass.
+    #[test]
+    fn a_refusal_is_logged_once_an_hour_however_many_files_fail() {
+        let mut f = RecentFailures::default();
+        let path = |n: usize| format!("/f{n}");
+        let logged =
+            |f: &mut RecentFailures, n: usize, now| (0..n).filter(|i| f.due(&path(*i), "NotCurrent", now)).count();
+        assert_eq!(logged(&mut f, FAILURES_KEPT + 5, 0), FAILURES_KEPT);
+        assert_eq!(logged(&mut f, FAILURES_KEPT + 5, 1_000), 0, "the next pass adds nothing");
+        assert!(!f.due(&path(0), "Download", 1_000), "the list is full");
+        assert_eq!(logged(&mut f, FAILURES_KEPT + 5, FAILURE_REPEAT_MS), FAILURES_KEPT, "their hour is up");
+        assert!(f.0.len() <= FAILURES_KEPT);
+    }
+
     /// process (a file set to stay here) the budgeted one, a program
     /// opening the file the other.
     #[test]
@@ -365,7 +406,7 @@ mod tests {
             root: String::new(),
             rt: rt.handle().clone(),
             on_stale: Box::new(|| {}),
-            failures_logged: Mutex::new(HashMap::new()),
+            failures_logged: Mutex::new(RecentFailures::default()),
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),

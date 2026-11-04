@@ -120,7 +120,7 @@ impl Why {
     pub fn label(self) -> &'static str {
         match self {
             Why::Special => "a hard link or other item OneDrive can't hold",
-            Why::NameTaken => "an item on this PC that isn't synced has this name; move or rename it",
+            Why::NameTaken => "another item that isn't synced has this name; move or rename it",
             Why::InvalidName => "OneDrive doesn't allow this name; rename it",
             Why::TooLarge => "over OneDrive's 250 GB limit",
             Why::GoneHere => "missing here with no recorded deletion; delete it in OneDrive or restore it",

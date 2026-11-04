@@ -16,7 +16,7 @@ version 1 | cloud item ID | eTag | size | QuickXorHash (20 bytes)
 
 Invariant 13: before a single byte is transferred, the identity must match the placeholder's own size, the size and hash of the Remote tree's current version of that item, and finally the downloaded content's size and hash. The identity's eTag can be older than the item's: moves and renames change the eTag, not the content, and they don't rewrite the placeholder.
 
-A refused request from a program wakes the agent, so a round can update the placeholder. One from OneUpDrive's own pass over files set to always keep doesn't: the pass asks again each time. The activity log says the same refusal of a file at most once an hour.
+A request from a program refused as out of date wakes the agent, so a round can update the placeholder. One from OneUpDrive's own pass over files set to always keep doesn't: the pass asks again each time. The activity log says the same refusal of a file at most once an hour, and at most 1,024 refusals an hour.
 
 ## What changes in the engine
 The reconciler stays as it is. It plans *what* should happen, and on-demand mode changes *how* the executor does it. Each local item the Local tree reports is one of: an ordinary file, a hydrated placeholder, or a dehydrated placeholder. Placeholders of **our** sync root are exempt from the "another provider's placeholder" parking (they're ours, and their content is known by identity).
@@ -47,8 +47,8 @@ Cloud updates preserve **Always keep on this device**. Windows refuses dehydrati
 
 `Hydrator<C: Cloud>` (`Serve` is its `Provider`), connected by `oneupd` while the pair is on demand.
 1. The callback hands over the identity, the requested range, and the requesting process. It answers on a tokio task: the Cloud Files callback thread is never blocked on the network.
-2. Check: the identity decodes; its size equals the placeholder's; the Remote tree's current version of the item (eTag, size, hash, read through the hydrator's own database connection) equals the identity's. Otherwise **fail** the request (`STATUS_CLOUD_FILE_NOT_IN_SYNC`) and wake the agent, so the next round updates the placeholder.
-3. Download the whole file into `<data folder>\hydration` (never into the sync folder), hashing as it goes. Size and QuickXorHash must equal the identity's, or fail the request.
+2. Check: the identity decodes; its size equals the placeholder's; the Remote tree's current version of the item (size and hash, read through the hydrator's own database connection) equals the identity's. Otherwise **fail** the request (`STATUS_CLOUD_FILE_NOT_IN_SYNC`) and, for a program's request, wake the agent, so the next round updates the placeholder.
+3. Download the whole file into `<data folder>\hydration` (never into the sync folder), hashing as it goes, under the Remote tree's eTag. If OneDrive is ahead of that, fail and wake as above. Size and QuickXorHash must equal the identity's, or fail the request.
 4. Transfer from the staging file with `CfExecute(TRANSFER_DATA)` in 1 MiB chunks (with progress), then delete the staging file.
 
 Whole-file hydration (the `FULL` policy) keeps every hydrated file complete and verified. Streaming ranges straight from Graph would start sooner on huge files, but would put unverified bytes into the file.

@@ -246,7 +246,7 @@ Give the path inside the synced folder (as above), or the file's full path on yo
 2026-10-06 23:53:53  ok    recycle     /activity-test.txt  (to .oneup\versions)
 ```
 
-It works whether or not `oneupd` is running. The log keeps the latest 50,000 entries and lives in your data folder, so nobody else sees it. It records names and folders, never what's inside your files. A file that's skipped again and again (say, it stays open in another program) is listed once, not every time it's retried.
+It works whether or not `oneupd` is running. The log keeps the latest 50,000 entries and lives in your data folder, so nobody else sees it. It records names and folders, never what's inside your files. A file that can't be opened or downloaded is listed once an hour at most, however often it's tried. A file that's skipped again and again (say, it stays open in another program) is listed once, not every time it's retried.
 
 ## Getting a file back
 Files that sync removed from your PC are kept in `.oneup\versions` inside your synced folder (and replaced files too, if you turned that on). In the settings window: the folder's **Kept on this PC**, on the Files page with nothing selected, with **Restore** beside each.

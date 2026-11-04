@@ -8886,3 +8886,23 @@ async fn on_demand_our_own_download_adds_no_open_line() {
     drop(s);
     drop(od);
 }
+
+/// Moved again in OneDrive and not yet known here: the download finds OneDrive
+/// ahead of the Remote tree, which wakes the agent as any other out-of-date
+/// open does. The next round has the news, and the file opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_an_open_that_finds_onedrive_ahead_wakes_the_agent() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cloud = Fake::new();
+    cloud.add("a.txt", Some(b"same content"));
+    let (od, mut s) = on_demand_sync("ondemand-ahead", &cloud);
+    s.quiesce().await;
+    cloud.rename("a.txt", "b.txt");
+    assert_eq!(app_read(&s.p("a.txt")), None, "the Remote tree has the old eTag");
+    assert!(od.stale_wakes.load(Relaxed) > 0);
+    assert!(od.hydrator.refused.lock().unwrap().contains(&oneup_exec::hydrate::Refusal::NotCurrent));
+    s.quiesce().await;
+    assert_eq!(app_read(&s.p("b.txt")).as_deref(), Some(&b"same content"[..]));
+    drop(s);
+    drop(od);
+}
