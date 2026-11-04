@@ -724,13 +724,15 @@ async fn send_from<S: Session>(
 }
 
 /// Which upload a kept session is for: the same file name in the same
-/// folder, replacing the same version (or none), of the same size.
+/// folder, replacing the same version (or none), of the same size, with the
+/// same file time (a session keeps the one it was started with).
 #[derive(Clone, PartialEq, Eq)]
 struct KeptKey {
     parent: String,
     name: String,
     replace: Option<(String, String)>,
     total: u64,
+    modified_ms: Option<i64>,
 }
 
 /// An upload session the network cut off, with where it ended.
@@ -978,17 +980,18 @@ impl Cloud for GraphCloud {
             self.timings.record("upload: one request", started);
             item
         } else {
+            // New files only: a session replacing a file with a time ended in
+            // `Changed` (measured by `oneup cloud-check`).
+            let modified_ms = modified_ms.filter(|_| replace.is_none());
             let key = KeptKey {
                 parent: parent.0.clone(),
                 name: name.to_string(),
                 replace: replace.map(|(id, e)| (id.to_string(), e.to_string())),
                 total,
+                modified_ms,
             };
             let graph = &self.graph;
             let open = || async move {
-                // New files only: a session replacing a file with a time ends
-                // in `Changed` (measured by `oneup cloud-check`).
-                let modified_ms = modified_ms.filter(|_| replace.is_none());
                 let url = graph.upload_session(&parent.0, name, replace, modified_ms).await.map_err(map)?;
                 Ok((url.clone(), GraphSession { graph, url }))
             };
@@ -1693,7 +1696,13 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let kept = Resumer::default();
         let sizer = std::sync::Mutex::new(Sizer::new(8 * UNIT));
-        let key = KeptKey { parent: "P".into(), name: "f.bin".into(), replace: None, total: content.len() as u64 };
+        let key = KeptKey {
+            parent: "P".into(),
+            name: "f.bin".into(),
+            replace: None,
+            total: content.len() as u64,
+            modified_ms: None,
+        };
         let mut tries = 0;
         let item = loop {
             tries += 1;
@@ -1730,7 +1739,13 @@ mod tests {
         content: &[u8],
         t0: tokio::time::Instant,
     ) -> Result<DriveItem, CloudError> {
-        let key = KeptKey { parent: "P".into(), name: "f.bin".into(), replace: None, total: content.len() as u64 };
+        let key = KeptKey {
+            parent: "P".into(),
+            name: "f.bin".into(),
+            replace: None,
+            total: content.len() as u64,
+            modified_ms: None,
+        };
         let open = || async {
             let mut st = state.lock().unwrap();
             st.created += 1;
@@ -1771,6 +1786,112 @@ mod tests {
     /// session; unchanged, it goes on and sends only the rest. Both where
     /// the session was known to be, and where the fragment in flight ended
     /// (its answer lost).
+    /// What the upload paths ask OneDrive for: a new file's session has the file
+    /// time; a one-request upload and a replacing session don't, and nothing
+    /// sets it afterwards.
+    #[tokio::test]
+    async fn only_a_new_files_session_carries_the_file_time() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const ITEM: &str = r#"{"id":"F","name":"f.bin","size":1,"eTag":"E","cTag":"C",
+            "file":{"hashes":{"quickXorHash":"AAAAAAAAAAAAAAAAAAAAAAAAAAA="}}}"#;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let (log, up) = (Arc::clone(&seen), format!("{base}/session"));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else { return };
+                let mut req = Vec::new();
+                let mut buf = vec![0u8; 1 << 16];
+                let (head, body) = loop {
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    req.extend_from_slice(&buf[..n]);
+                    let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        if n == 0 {
+                            break (String::new(), String::new());
+                        }
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&req[..end]).to_ascii_lowercase();
+                    let len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if req.len() >= end + 4 + len || n == 0 {
+                        let body = if len < 4096 {
+                            String::from_utf8_lossy(&req[end + 4..]).into_owned()
+                        } else {
+                            String::new()
+                        };
+                        break (head, body);
+                    }
+                };
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let range = head.lines().find_map(|l| l.strip_prefix("content-range: bytes ")).map(str::to_string);
+                log.lock().unwrap().push((line.clone(), body));
+                let (status, answer) = if line.contains("createuploadsession") {
+                    ("200 OK", format!(r#"{{"uploadUrl":"{up}"}}"#))
+                } else if let Some(r) = range {
+                    let (span, total) = r.split_once('/').unwrap();
+                    let last: u64 = span.split_once('-').unwrap().1.parse().unwrap();
+                    if last + 1 == total.parse::<u64>().unwrap() {
+                        ("201 Created", ITEM.to_string())
+                    } else {
+                        ("202 Accepted", format!(r#"{{"nextExpectedRanges":["{}-"]}}"#, last + 1))
+                    }
+                } else {
+                    ("200 OK", ITEM.to_string())
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+                let _ = s.shutdown().await;
+            }
+        });
+
+        let cloud = GraphCloud::new(Arc::new(Graph::for_tests(&base, 4).await));
+        let parent = RemoteId("P".into());
+        let old = RemotePre { id: RemoteId("F".into()), etag: "E".into() };
+        let large = vec![7u8; SIMPLE_UPLOAD_MAX + 1];
+        let small = [7u8; 100];
+        let when = Some(1_600_000_000_000);
+        let sessions = |log: &Mutex<Vec<(String, String)>>| {
+            let mut log = log.lock().unwrap();
+            let all = std::mem::take(&mut *log);
+            assert!(all.iter().all(|(line, _)| !line.starts_with("patch")), "nothing set afterwards: {all:?}");
+            all.into_iter().filter(|(line, _)| line.contains("createuploadsession")).map(|(_, b)| b).collect::<Vec<_>>()
+        };
+
+        let mut src = &large[..];
+        cloud.upload_at(&parent, "f.bin", None, large.len() as i64, &mut src, when).await.unwrap();
+        let bodies = sessions(&seen);
+        assert!(bodies.len() == 1 && bodies[0].contains("2020-09-13T12:26:40Z"), "{bodies:?}");
+
+        let mut src = &large[..];
+        cloud.upload_at(&parent, "f.bin", Some(&old), large.len() as i64, &mut src, when).await.unwrap();
+        let bodies = sessions(&seen);
+        assert!(bodies.len() == 1 && !bodies[0].contains("fileSystemInfo"), "{bodies:?}");
+
+        let mut src = &small[..];
+        cloud.upload_at(&parent, "f.bin", None, small.len() as i64, &mut src, when).await.unwrap();
+        assert!(sessions(&seen).is_empty(), "one request");
+    }
+
+    /// A session keeps the time it was started with: a different one starts anew.
+    #[test]
+    fn a_kept_session_is_only_for_the_same_file_time() {
+        let key = |modified_ms| KeptKey { parent: "P".into(), name: "f".into(), replace: None, total: 9, modified_ms };
+        let kept = Resumer::default();
+        let reached = Reached { next: 0, prefix: [0; 20], then: None };
+        kept.keep(Kept { key: key(Some(1)), url: "u".into(), reached });
+        assert!(kept.take(&key(Some(2))).is_none());
+        assert!(kept.take(&key(None)).is_none());
+        assert!(kept.take(&key(Some(1))).is_some());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_kept_upload_goes_on_only_if_everything_sent_is_still_the_file() {
         let c: Vec<u8> = (0..12 * UNIT).map(|i| (i % 251) as u8).collect();

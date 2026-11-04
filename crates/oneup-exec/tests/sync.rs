@@ -8937,10 +8937,10 @@ async fn on_demand_an_open_that_finds_onedrive_ahead_wakes_the_agent() {
     drop(od);
 }
 
-/// An upload hands OneDrive the file's own last-write time, new or replacing,
-/// so another PC shows when it was changed and not when it was uploaded.
+/// The executor passes each upload the file's own last-write time, checked on
+/// the handle it reads. What goes to OneDrive is `GraphCloud`'s to decide.
 #[tokio::test]
-async fn an_upload_keeps_the_file_time() {
+async fn an_upload_is_given_the_file_time() {
     let cloud = Fake::new();
     let mut s = Sync::new("upload-keeps-time", cloud.clone());
     let p = s.p("dated.txt");

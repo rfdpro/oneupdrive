@@ -2765,12 +2765,12 @@ fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
 }
 
-/// Unix milliseconds as a Windows FILETIME (now if unknown).
 /// A file time (100 ns since 1601) as milliseconds since 1970.
 fn unix_ms(filetime: i64) -> i64 {
     filetime.saturating_sub(116_444_736_000_000_000) / 10_000
 }
 
+/// Unix milliseconds as a Windows FILETIME (now if unknown).
 fn filetime(ms: Option<i64>) -> i64 {
     let ms = ms.unwrap_or_else(now_ms);
     ms.saturating_mul(10_000).saturating_add(116_444_736_000_000_000)
