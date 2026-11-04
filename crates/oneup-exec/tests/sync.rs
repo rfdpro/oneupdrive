@@ -8878,7 +8878,7 @@ async fn on_demand_a_refused_open_wakes_the_agent_only_for_a_program_and_is_logg
     assert!(refused >= 3);
     od.served(refused).await;
 
-    let log = s.obs.store().read(|o| o.activity_recent(Some("/a.txt"), 20)).unwrap();
+    let log = s.obs.store().read(|o| o.activity_recent(None, 20)).unwrap();
     let failed = log.iter().filter(|e| e.action == "open" && e.outcome == oneup_store::ActivityOutcome::Failed).count();
     assert_eq!(failed, 1, "{log:?}");
     drop(s);
@@ -8896,7 +8896,7 @@ async fn on_demand_our_own_download_adds_no_open_line() {
     assert!(oneup_exec::placement::fetch_one(&root, "/kept.txt").await);
     assert_eq!(placeholder(&s.p("kept.txt")).on_disk, 9);
     od.served(1).await;
-    let log = s.obs.store().read(|o| o.activity_recent(Some("/kept.txt"), 20)).unwrap();
+    let log = s.obs.store().read(|o| o.activity_recent(None, 20)).unwrap();
     assert!(log.iter().all(|e| e.action != "open"), "{log:?}");
     drop(s);
     drop(od);
