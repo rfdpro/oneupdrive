@@ -189,6 +189,11 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
     if folder.kind != NodeKind::Folder {
         return Ok(Vec::new());
     }
+    // Waits for its parent to link it to the folder made again: its children
+    // aren't deleted, they're in the new folder, which only the next round sees.
+    if under_remade_folder(t, &folder)? {
+        return Ok(Vec::new());
+    }
     let local = local_of(t, &folder)?;
     let remote = remote_of(t, &folder)?;
     let local_dir = local.present().filter(|n| n.kind == NodeKind::Folder).map(|n| n.id);
@@ -229,21 +234,67 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
     let mut base_kids = t.base_children(sid)?;
     base_kids.sort_by_key(|b| b.sid);
     let mut adopted: HashMap<Sid, LocalNode> = HashMap::new();
+    let mut remade = HashMap::new();
     for b in &base_kids {
         if b.kind == NodeKind::File && matches!(local_of(t, b)?, Seen::Deleted) {
             let key = fold(&b.name);
             if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::File && fold(&n.name) == key) {
                 adopted.insert(b.sid, new_local.remove(i));
             }
+        } else if may_be_remade(t, b)?.is_some() {
+            let key = fold(&b.name);
+            if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::Folder && fold(&n.name) == key) {
+                remade.insert(b.sid, new_local.remove(i).id);
+            }
         }
     }
 
     for b in base_kids {
+        if let Some(id) = remade.remove(&b.sid) {
+            cx.out.push(Op::Record(Base { local: Some(id), ..b }));
+            continue;
+        }
         let adopted = adopted.remove(&b.sid);
         decide_synced(&mut cx, b, adopted)?;
     }
     decide_new(&mut cx, new_local, new_remote)?;
     Ok(cx.out)
+}
+
+/// A Synced folder deleted here while the cloud's is still where it was: the
+/// local folder it would be made again in, if it's made again there. A new
+/// folder of its name there is the same folder, deleted and made again (as
+/// build tools do). Like an atomic save, it keeps its Synced row and its cloud
+/// item. Deletions under it still need their own evidence.
+fn may_be_remade<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Option<LocalId>, T::Error> {
+    if b.kind != NodeKind::Folder || b.local.is_none() || !matches!(local_of(t, b)?, Seen::Deleted) {
+        return Ok(None);
+    }
+    let Some(parent) = b.parent else { return Ok(None) };
+    let Some(parent_row) = t.base(parent)? else { return Ok(None) };
+    let Seen::Present(dir) = local_of(t, &parent_row)? else { return Ok(None) };
+    let Seen::Present(r) = remote_of(t, b)? else { return Ok(None) };
+    let same_place = r.kind == NodeKind::Folder && remote_loc(t, &r)? == Some((parent, b.name.clone()));
+    Ok(same_place.then_some(dir.id))
+}
+
+/// Whether Synced folder `b` is, or is under, a folder made again that its
+/// parent links this round. Every folder between is deleted here too. Costs a
+/// lookup only for a folder deleted here.
+fn under_remade_folder<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<bool, T::Error> {
+    let mut at = b.clone();
+    while matches!(local_of(t, &at)?, Seen::Deleted) {
+        if let Some(dir) = may_be_remade(t, &at)? {
+            for n in t.local_children_named(dir, &at.name)? {
+                if n.kind == NodeKind::Folder && t.base_by_local(n.id)?.is_none() {
+                    return Ok(true);
+                }
+            }
+        }
+        let Some(parent) = at.parent.and_then(|p| t.base(p).transpose()).transpose()? else { break };
+        at = parent;
+    }
+    Ok(false)
 }
 
 fn hold(b: &Base, reason: HoldReason) -> Op {

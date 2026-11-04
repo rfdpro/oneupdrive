@@ -8956,3 +8956,58 @@ async fn an_upload_is_given_the_file_time() {
     s.settle().await;
     assert_eq!(cloud.0.lock().unwrap().upload_times.get("dated.txt"), Some(&Some(1_600_000_060_000)));
 }
+
+/// A build tool deletes its output folder and makes it again. That's the same
+/// folder: nothing gets a conflict name, the cloud folder and its files keep
+/// their IDs (and so their version history), and what the new build dropped
+/// goes while what it added comes.
+#[tokio::test]
+async fn everyday_a_folder_deleted_and_made_again_is_the_same_folder() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rebuild", cloud.clone());
+    write(&s.p("site/index.html"), b"home v1");
+    write(&s.p("site/same.css"), b"unchanged");
+    write(&s.p("site/old.html"), b"dropped by the new build");
+    write(&s.p("site/nested/a.js"), b"a v1");
+    write(&s.p("keep.txt"), b"not part of the build");
+    s.settle().await;
+    let id_of = |path: &str| resolve(&cloud.0.lock().unwrap(), path);
+    let (site, nested, index) = (id_of("site"), id_of("site/nested"), id_of("site/index.html"));
+
+    std::fs::remove_dir_all(s.p("site")).unwrap();
+    write(&s.p("site/index.html"), b"home v2");
+    write(&s.p("site/same.css"), b"unchanged");
+    write(&s.p("site/new.html"), b"added by the new build");
+    write(&s.p("site/nested/a.js"), b"a v2");
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there, "both sides agree");
+    assert!(!names(&there).iter().any(|n| n.contains("(conflict")), "{:?}", names(&there));
+    assert_eq!(there["/site/index.html"].as_deref(), Some(&b"home v2"[..]));
+    assert_eq!(there["/site/new.html"].as_deref(), Some(&b"added by the new build"[..]));
+    assert_eq!(there["/keep.txt"].as_deref(), Some(&b"not part of the build"[..]));
+    assert!(!there.contains_key("/site/old.html"), "the new build dropped it");
+    assert_eq!((id_of("site"), id_of("site/nested")), (site, nested), "the same cloud folders");
+    assert_eq!(id_of("site/index.html"), index, "an edit keeps the file's version history");
+}
+
+/// Made again while it was moved in OneDrive: not the same folder any more. The
+/// move wins as it does for a deleted folder, and the new one is a new folder.
+#[tokio::test]
+async fn everyday_a_folder_made_again_after_a_move_in_onedrive_stays_apart() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rebuild-moved", cloud.clone());
+    write(&s.p("site/index.html"), b"home");
+    s.settle().await;
+
+    cloud.rename("site", "elsewhere");
+    std::fs::remove_dir_all(s.p("site")).unwrap();
+    write(&s.p("site/new.html"), b"new build");
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there, "both sides agree");
+    assert_eq!(there["/site/new.html"].as_deref(), Some(&b"new build"[..]));
+    assert!(names(&there).iter().all(|n| !n.contains("(conflict")), "{:?}", names(&there));
+}

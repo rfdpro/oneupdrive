@@ -495,6 +495,21 @@ impl<T: Trees + ?Sized> Trees for Parked<'_, T> {
         })
     }
 
+    fn local_children_named(&self, id: LocalId, name: &str) -> Result<Vec<LocalNode>, T::Error> {
+        if let Some(rules) = self.rules
+            && self.local_dir(rules, id)?.excluded
+        {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for n in self.inner.local_children_named(id, name)? {
+            if !self.local_excluded(&n)? && !self.local_parked(&n) && !self.local_companion(&n)? {
+                out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>, T::Error> {
         if let Some(rules) = self.rules
             && self.local_dir(rules, id)?.excluded

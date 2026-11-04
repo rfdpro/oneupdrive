@@ -132,6 +132,12 @@ pub trait Trees {
     fn local(&self, id: LocalId) -> Result<Seen<LocalNode>, Self::Error>;
     fn remote(&self, id: &RemoteId) -> Result<Seen<RemoteNode>, Self::Error>;
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>, Self::Error>;
+    /// [`Self::local_children`] named `name` as Windows compares names
+    /// ([`same_name`]). The default reads every child; a backend that can
+    /// keep them out of memory reads only the matches.
+    fn local_children_named(&self, id: LocalId, name: &str) -> Result<Vec<LocalNode>, Self::Error> {
+        Ok(self.local_children(id)?.into_iter().filter(|n| same_name(&n.name, name)).collect())
+    }
     fn remote_children(&self, id: &RemoteId) -> Result<Vec<RemoteNode>, Self::Error>;
 
     /// Whether `f` holds for any of [`Self::base_children`], stopping at the

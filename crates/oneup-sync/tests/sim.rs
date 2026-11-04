@@ -1076,7 +1076,7 @@ impl World {
         let files: Vec<u128> = self.local.iter().filter(|(_, it)| it.kind == NodeKind::File).map(|(i, _)| *i).collect();
         let items: Vec<u128> = self.local.keys().copied().filter(|i| *i != LOCAL_ROOT).collect();
         let name = rng.pick(NAMES).unwrap_or("a");
-        match rng.below(7) {
+        match rng.below(8) {
             0 | 1 => {
                 let Some(p) = rng.pick(&folders) else { return };
                 if self.l_child(p, name).is_none() {
@@ -1119,6 +1119,37 @@ impl World {
                     && let Some(it) = self.local.get_mut(&i)
                 {
                     it.parent = Some(to);
+                }
+            }
+            6 => {
+                // A build tool: the folder deleted and made again (new IDs),
+                // holding some of the same names and some new ones.
+                let Some(f) = rng.pick(&folders) else { return };
+                let (Some(parent), folder_name) = (self.local[&f].parent, self.local[&f].name.clone()) else { return };
+                let mut kept: Vec<String> = self
+                    .local
+                    .values()
+                    .filter(|it| it.parent == Some(f) && it.kind == NodeKind::File)
+                    .map(|it| it.name.clone())
+                    .collect();
+                kept.sort();
+                for id in self.l_subtree(f) {
+                    if let Some(it) = self.local.remove(&id) {
+                        if it.kind == NodeKind::File {
+                            self.local_bin.push(it.content);
+                        }
+                        self.local_gone.insert(id);
+                        self.unread.push(id);
+                    }
+                }
+                let new = self.l_create(parent, &folder_name, NodeKind::Folder, 0);
+                for n in kept.iter().filter(|_| rng.chance(70)) {
+                    let c = self.content();
+                    self.l_create(new, n, NodeKind::File, c);
+                }
+                if self.l_child(new, name).is_none() {
+                    let c = self.content();
+                    self.l_create(new, name, NodeKind::File, c);
                 }
             }
             _ => {
