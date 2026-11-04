@@ -117,7 +117,7 @@ async fn measure(graph: &Graph, top: &str, session_mib: usize, rounds: u32) -> R
         for r in 0..rounds {
             let data = content(total, ((units as u64) << 16) | u64::from(r));
             let t = Instant::now();
-            let url = graph.upload_session(top, &format!("session-{units}-{r}.bin"), None).await?;
+            let url = graph.upload_session(top, &format!("session-{units}-{r}.bin"), None, None).await?;
             let opened = t.elapsed().as_secs_f64();
             let mut start = 0usize;
             let mut per = Vec::new();

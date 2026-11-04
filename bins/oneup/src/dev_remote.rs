@@ -149,7 +149,7 @@ pub async fn run(graph: Arc<Graph>, cmd: &DevRemote) -> Result<()> {
             let tag = now.e_tag.clone().unwrap_or_default();
             let total = mib * 1024 * 1024;
             let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
-            let url = graph.upload_session(&dir.id, "probe.txt", Some((&up.id, &tag))).await?;
+            let url = graph.upload_session(&dir.id, "probe.txt", Some((&up.id, &tag)), None).await?;
             // 10 MiB fragments, a multiple of 320 KiB.
             let frag = 32 * 320 * 1024;
             let mut start = 0;

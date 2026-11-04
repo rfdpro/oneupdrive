@@ -492,7 +492,16 @@ impl Graph {
     /// conditions) and returns its pre-authenticated upload URL. Graph
     /// checks `If-Match` here only, not when the last fragment commits the
     /// upload: a replacing upload re-checks the eTag itself before then.
-    pub async fn upload_session(&self, parent: &str, name: &str, replace: Option<(&str, &str)>) -> Result<String> {
+    ///
+    /// `modified_ms`: for a new file, its last-write time, kept as OneDrive's
+    /// `fileSystemInfo`.
+    pub async fn upload_session(
+        &self,
+        parent: &str,
+        name: &str,
+        replace: Option<(&str, &str)>,
+        modified_ms: Option<i64>,
+    ) -> Result<String> {
         let (url, behavior) = match replace {
             Some((id, _)) => (format!("{}/items/{}/createUploadSession", self.drive_url(), encode_id(id)), "replace"),
             None => (
@@ -505,7 +514,7 @@ impl Graph {
                 "fail",
             ),
         };
-        let body = serde_json::json!({ "item": { "@microsoft.graph.conflictBehavior": behavior } });
+        let body = session_body(behavior, modified_ms);
         let req =
             Req { json: Some(&body), if_match: replace.map(|(_, tag)| tag), ..Req::new(reqwest::Method::POST, &url) };
         let s: crate::model::UploadSession = self.json(&req).await?;
@@ -808,6 +817,31 @@ impl Graph {
 /// than replace or rename anything.
 fn restore_body(parent: &str, name: &str) -> serde_json::Value {
     serde_json::json!({ "parentReference": { "id": parent }, "name": name })
+}
+
+/// A last-write time as OneDrive's `fileSystemInfo`. None outside 1980 to a
+/// day from now: it would be a file's bad clock, and a time OneDrive refused
+/// would fail the upload session that carried it.
+fn file_system_info(modified_ms: i64) -> Option<serde_json::Value> {
+    const FROM_1980_MS: i64 = 315_532_800_000;
+    const DAY_MS: i64 = 86_400_000;
+    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp().saturating_mul(1_000);
+    if !(FROM_1980_MS..=now_ms.saturating_add(DAY_MS)).contains(&modified_ms) {
+        return None;
+    }
+    let when = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(modified_ms) * 1_000_000)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()?;
+    Some(serde_json::json!({ "lastModifiedDateTime": when }))
+}
+
+fn session_body(behavior: &str, modified_ms: Option<i64>) -> serde_json::Value {
+    let mut item = serde_json::json!({ "@microsoft.graph.conflictBehavior": behavior });
+    if let Some(info) = modified_ms.and_then(file_system_info) {
+        item["fileSystemInfo"] = info;
+    }
+    serde_json::json!({ "item": item })
 }
 
 impl Graph {
@@ -2095,6 +2129,20 @@ mod tests {
         let f = fragment(url).await.unwrap();
         assert!(f.item.is_none());
         assert_eq!(count.load(Relaxed), 2, "the throttled send was waited out and sent again");
+    }
+
+    /// A file's time goes along when it's one OneDrive should be told.
+    #[test]
+    fn an_upload_session_carries_a_sensible_file_time_only() {
+        let dated = session_body("fail", Some(1_600_000_000_000));
+        assert_eq!(dated["item"]["fileSystemInfo"]["lastModifiedDateTime"], "2020-09-13T12:26:40Z");
+        assert_eq!(dated["item"]["@microsoft.graph.conflictBehavior"], "fail");
+        for bad in [None, Some(-1), Some(0), Some(i64::MAX)] {
+            let plain = session_body("replace", bad);
+            assert_eq!(plain, serde_json::json!({ "item": { "@microsoft.graph.conflictBehavior": "replace" } }));
+        }
+        let soon = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000 + 3_600_000;
+        assert!(file_system_info(soon).is_some(), "a clock a little ahead is fine");
     }
 
     /// A restore asks for nothing to be replaced: its body names the folder

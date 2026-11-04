@@ -109,7 +109,7 @@ async fn steps(graph: &Graph, cloud: &GraphCloud, top: &RemoteRow) -> Result<()>
     upload(cloud, &RemoteId(b2.id.clone()), "inside.bin", None, &content(10, 9)).await?;
     let b2 = refetch(graph, &b2).await?;
     let r = cloud.batch(&[Meta::Delete { pre: pre(&b2) }, Meta::Delete { pre: pre(&b1) }]).await;
-    ensure!(matches!(r[0], Err(CloudError::Changed)), "batched delete of a non-empty folder: {:?}", r[0]);
+    ensure!(matches!(r[0], Err(CloudError::NotEmpty)), "batched delete of a non-empty folder: {:?}", r[0]);
     ensure!(matches!(r[1], Ok(MetaDone::Deleted)), "batched delete: {:?}", r[1]);
     ensure!(graph.item(&b2.id).await?.is_some() && graph.item(&b1.id).await?.is_none(), "batched deletes went wrong");
     step("batched create, rename and delete; refuse a taken name, a stale eTag and a non-empty folder");
@@ -166,6 +166,20 @@ async fn steps(graph: &Graph, cloud: &GraphCloud, top: &RemoteRow) -> Result<()>
     )?;
     step("replace small and large; refuse stale eTags");
 
+    // File times: an upload session for a new file carries them. Replacing it
+    // asks for none, and adds one version as any upload does.
+    let large3 = content(SIMPLE_UPLOAD_MAX + 13, 6);
+    let d2 = upload_dated(cloud, &top_id, "dated-large.bin", None, &large3).await.map_err(other)?;
+    ensure!(d2.mtime_ms == Some(FILE_TIME), "the file time wasn't kept: {:?}", d2.mtime_ms);
+    let before = graph.versions(&d2.id).await?;
+    let large4 = content(SIMPLE_UPLOAD_MAX + 17, 8);
+    let d4 = upload_dated(cloud, &top_id, "dated-large.bin", Some(&pre(&d2)), &large4).await.map_err(other)?;
+    ensure!(d4.id == d2.id, "replacing changed the item");
+    let after = graph.versions(&d4.id).await?;
+    println!("  versions {} -> {}; file time then {:?}", before.len(), after.len(), d4.mtime_ms);
+    ensure!(after.len() == before.len() + 1, "versions went {} -> {}", before.len(), after.len());
+    step("a new file's time kept through an upload session");
+
     // Move + rename; stale eTag and taken name refused.
     let sub_id = RemoteId(sub.id.clone());
     expect(cloud.move_item(&pre(&a), &sub_id, "moved.bin").await, "moving with a stale eTag", is_changed)?;
@@ -177,7 +191,7 @@ async fn steps(graph: &Graph, cloud: &GraphCloud, top: &RemoteRow) -> Result<()>
 
     // Deletes: a folder with contents is refused, a stale eTag is refused.
     let sub_now = refetch(graph, &sub).await?;
-    expect(cloud.delete(&pre(&sub_now)).await, "deleting a folder that has contents", is_changed)?;
+    expect(cloud.delete(&pre(&sub_now)).await, "deleting a folder that has contents", is_not_empty)?;
     expect(cloud.delete(&pre(&a2)).await, "deleting with a stale eTag", is_changed)?;
     cloud.delete(&pre(&moved)).await.map_err(other)?;
     let sub_now = refetch(graph, &sub).await?;
@@ -209,6 +223,21 @@ async fn upload(
     Ok(row)
 }
 
+/// A last-write time for the file-time checks: 2020, far from any upload.
+const FILE_TIME: i64 = 1_600_000_000_000;
+
+async fn upload_dated(
+    cloud: &GraphCloud,
+    parent: &RemoteId,
+    name: &str,
+    replace: Option<&RemotePre>,
+    bytes: &[u8],
+) -> Result<RemoteRow, CloudError> {
+    let mut src = bytes;
+    let (row, _) = cloud.upload_at(parent, name, replace, bytes.len() as i64, &mut src, Some(FILE_TIME)).await?;
+    Ok(row)
+}
+
 fn expect<T>(r: Result<T, CloudError>, what: &str, ok: fn(&CloudError) -> bool) -> Result<()> {
     match r {
         Err(e) if ok(&e) => Ok(()),
@@ -225,6 +254,10 @@ fn is_taken(e: &CloudError) -> bool {
 fn is_taken_any(e: &CloudError) -> bool {
     matches!(e, CloudError::NameTaken | CloudError::Changed)
 }
+fn is_not_empty(e: &CloudError) -> bool {
+    matches!(e, CloudError::NotEmpty)
+}
+
 fn is_changed(e: &CloudError) -> bool {
     matches!(e, CloudError::Changed)
 }

@@ -1951,7 +1951,10 @@ impl<C: Cloud> Executor<C> {
                             store.write_ahead(|o| Ok::<_, Fail>(o.meta_set_ahead(&r.key(), &r.to_json())?)).await?;
                             self.crash_point()?;
                         }
-                        let uploaded = self.cloud.upload(to, name, replace.as_ref(), size, &mut src).await;
+                        let uploaded = self
+                            .cloud
+                            .upload_at(to, name, replace.as_ref(), size, &mut src, Some(unix_ms(mtime)))
+                            .await;
                         let (row, sent) = match uploaded {
                             Err(CloudError::Io(e)) if oneup_effects::ChangedMeanwhile::is(&e) => {
                                 return Err(Fail::Skip(Skip::Changed));
@@ -2760,6 +2763,11 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+}
+
+/// A file time (100 ns since 1601) as milliseconds since 1970.
+fn unix_ms(filetime: i64) -> i64 {
+    filetime.saturating_sub(116_444_736_000_000_000) / 10_000
 }
 
 /// Unix milliseconds as a Windows FILETIME (now if unknown).
