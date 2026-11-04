@@ -14,7 +14,9 @@ Every cloud file and folder in the pair has a **placeholder** here. A placeholde
 version 1 | cloud item ID | eTag | size | QuickXorHash (20 bytes)
 ```
 
-Invariant 13: before a single byte is transferred, the identity must match the placeholder's own size, the Remote tree's current version of that item, and finally the downloaded content's size and hash.
+Invariant 13: before a single byte is transferred, the identity must match the placeholder's own size, the size and hash of the Remote tree's current version of that item, and finally the downloaded content's size and hash. The identity's eTag can be older than the item's: moves and renames change the eTag, not the content, and they don't rewrite the placeholder.
+
+A refused request from a program wakes the agent, so a round can update the placeholder. One from OneUpDrive's own pass over files set to always keep doesn't: the pass asks again each time. The activity log says the same refusal of a file at most once an hour.
 
 ## What changes in the engine
 The reconciler stays as it is. It plans *what* should happen, and on-demand mode changes *how* the executor does it. Each local item the Local tree reports is one of: an ordinary file, a hydrated placeholder, or a dehydrated placeholder. Placeholders of **our** sync root are exempt from the "another provider's placeholder" parking (they're ours, and their content is known by identity).

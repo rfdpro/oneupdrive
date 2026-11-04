@@ -31,6 +31,12 @@ use crate::cloud::{Cloud, Hashing};
 /// Transfer chunks: a multiple of 4 KiB, as Cloud Files requires.
 const CHUNK: usize = 1 << 20;
 
+/// The same refusal of the same file goes in the activity log at most this
+/// often: each pass asks again for a file set to stay on this device.
+const FAILURE_REPEAT_MS: i64 = 3_600_000;
+/// How many refusals are remembered for that. Forgetting one only logs it again.
+const FAILURES_KEPT: usize = 1_024;
+
 /// What a refused request reports to the caller (for tests and logs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -55,9 +61,11 @@ pub struct Hydrator<C> {
     /// without the drive), to log paths relative to it.
     root: String,
     rt: tokio::runtime::Handle,
-    /// Called when a placeholder turned out to be out of date: wakes the
-    /// agent so a round updates it.
+    /// Called when a program's open found a placeholder out of date: wakes
+    /// the agent so a round updates it.
     on_stale: Box<dyn Fn() + Send + Sync>,
+    /// When each recent refusal was logged, by path and reason.
+    failures_logged: Mutex<HashMap<(String, String), i64>>,
     running: Mutex<HashMap<i64, tokio::task::AbortHandle>>,
     seq: AtomicU64,
     /// Refusals so far (for tests).
@@ -105,6 +113,7 @@ impl<C: Cloud + 'static> Hydrator<C> {
             root: volume_relative(sync_root),
             rt,
             on_stale,
+            failures_logged: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
@@ -117,29 +126,30 @@ impl<C: Cloud + 'static> Hydrator<C> {
         // The content arrives by writes the program tracker would otherwise
         // count as a program's (`oneup_cfapi::ours`).
         oneup_cfapi::ours::note(u128::from(fetch.file_id as u64));
+        // OneUpDrive itself (a file set to always keep on this device): no
+        // program used it, and the pass that asked logs what it got.
+        let ours = asked_by_us(fetch.process.as_ref(), std::process::id());
         match self.hydrate(&fetch).await {
             Ok(n) => {
                 let who = fetch.process.as_ref().map(|p| image_name(&p.image)).unwrap_or_default();
                 let file_id = fetch.file_id;
-                // Asked for by OneUpDrive itself (a file set to always keep on
-                // this device): no program used it.
-                let ours = fetch.process.as_ref().is_some_and(|p| p.pid == std::process::id());
                 fetch.complete();
-                if ours {
-                    self.log(ActivityOutcome::Done, &path, format!("{n} bytes, kept on this device"));
-                } else {
+                if !ours {
                     self.log(ActivityOutcome::Done, &path, format!("{n} bytes, opened by {who}"));
                     self.note_use(file_id, who, n, &path);
                 }
             }
             Err(why) => {
                 tracing::debug!(?why, "a hydration was refused");
-                if why == Refusal::NotCurrent {
+                // Not for our own request: the pass asks again each time, so
+                // it would wake the agent each time, with nothing to update
+                // if the agent's own record doesn't call for it.
+                if why == Refusal::NotCurrent && !ours {
                     (self.on_stale)();
                 }
                 self.refused.lock().unwrap_or_else(|p| p.into_inner()).push(why);
                 fetch.fail(provider::NOT_IN_SYNC);
-                self.log(ActivityOutcome::Failed, &path, format!("{why:?}"));
+                self.log_failure(&path, format!("{why:?}"));
             }
         }
         self.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
@@ -155,24 +165,33 @@ impl<C: Cloud + 'static> Hydrator<C> {
             store.read(|o| o.get_item(&id.item)).map_err(|_| Refusal::NotCurrent)?
         };
         let current = current.ok_or(Refusal::NotCurrent)?;
-        if current.etag.as_deref() != Some(id.etag.as_str()) || current.size != id.size || current.qxh != Some(id.hash)
-        {
+        // Size and hash say which content this is. The eTag doesn't: a move or
+        // rename gives the item a new one and leaves the placeholder's as it
+        // was. What's downloaded must still have this size and hash.
+        if current.size != id.size || current.qxh != Some(id.hash) {
             return Err(Refusal::NotCurrent);
         }
+        let etag = current.etag.ok_or(Refusal::NotCurrent)?;
 
         let staged =
             Staged(self.staging.join(format!("{}-{}.hydrating", std::process::id(), self.seq.fetch_add(1, Relaxed))));
-        self.download_and_transfer(fetch, &id, &staged.0).await
+        self.download_and_transfer(fetch, &id, etag, &staged.0).await
     }
 
-    async fn download_and_transfer(&self, fetch: &Fetch, id: &Identity, path: &PathBuf) -> Result<u64, Refusal> {
+    async fn download_and_transfer(
+        &self,
+        fetch: &Fetch,
+        id: &Identity,
+        etag: String,
+        path: &PathBuf,
+    ) -> Result<u64, Refusal> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)
             .map_err(|_| Refusal::Download)?;
-        let pre = RemotePre { id: RemoteId(id.item.clone()), etag: id.etag.clone() };
+        let pre = RemotePre { id: RemoteId(id.item.clone()), etag };
         let cloud = self.cloud_for(asked_by_us(fetch.process.as_ref(), std::process::id()));
         let (len, hash) = {
             let mut w = Hashing::new(&mut file);
@@ -224,6 +243,24 @@ impl<C: Cloud + 'static> Hydrator<C> {
     fn relative(&self, path: &str) -> String {
         let rel = path.strip_prefix(self.root.as_str()).unwrap_or(path);
         format!("/{}", rel.trim_start_matches(['\\', '/']).replace('\\', "/"))
+    }
+
+    /// Logs a refusal, unless the same one was logged within the last
+    /// [`FAILURE_REPEAT_MS`].
+    fn log_failure(&self, path: &str, detail: String) {
+        let now = now_ms();
+        {
+            let mut logged = self.failures_logged.lock().unwrap_or_else(|p| p.into_inner());
+            if logged.len() >= FAILURES_KEPT {
+                logged.clear();
+            }
+            let last = logged.entry((path.to_string(), detail.clone())).or_insert(i64::MIN);
+            if now.saturating_sub(*last) < FAILURE_REPEAT_MS {
+                return;
+            }
+            *last = now;
+        }
+        self.log(ActivityOutcome::Failed, path, detail);
     }
 
     fn log(&self, outcome: ActivityOutcome, path: &str, detail: String) {
@@ -328,6 +365,7 @@ mod tests {
             root: String::new(),
             rt: rt.handle().clone(),
             on_stale: Box::new(|| {}),
+            failures_logged: Mutex::new(HashMap::new()),
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
