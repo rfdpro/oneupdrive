@@ -606,10 +606,10 @@ impl World {
                 }
                 if let Op::ConflictCopy { sid, .. } = op {
                     // As the executor: its own file, or what an atomic save
-                    // left in its place.
+                    // left in its place (also once a conflict copy detached it).
                     let Some(b) = self.bases.get(sid) else { return false };
                     let same_file = b.local == Some(local.id);
-                    let took_over = b.local.is_some_and(|old| !self.local.contains_key(&old.0))
+                    let took_over = b.local.is_none_or(|old| !self.local.contains_key(&old.0))
                         && self.local[&local.id.0].name.to_lowercase() == b.name.to_lowercase();
                     if !same_file && !took_over {
                         return false;

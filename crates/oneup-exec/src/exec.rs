@@ -2771,11 +2771,13 @@ fn now_ms() -> i64 {
 }
 
 /// Whether local file `id` is what an atomic save left in place of Synced row
-/// `b`'s: `b`'s file is gone, and `id` has its name in its folder. The planner
-/// treats it as `b`'s file (`merge::plan_folder`).
+/// `b`'s: `b`'s file is gone (or an earlier conflict copy detached it), and `id`
+/// has its name in its folder. The planner treats it as `b`'s file
+/// (`merge::plan_folder`).
 fn took_over_row(o: &oneup_store::Ops<'_>, b: &Base, id: LocalId) -> Result<bool, Fail> {
-    let Some(old) = b.local else { return Ok(false) };
-    if o.local_get(old.0)?.is_some() {
+    if let Some(old) = b.local
+        && o.local_get(old.0)?.is_some()
+    {
         return Ok(false);
     }
     let Some(now) = o.local_get(id.0)? else { return Ok(false) };
