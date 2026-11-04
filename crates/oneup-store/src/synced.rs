@@ -270,12 +270,6 @@ fn base_children_sql() -> String {
 fn local_children_sql() -> String {
     format!("{LOCAL_NODE} WHERE i.parent_id = ?1 AND i.kind IN (0, 1) AND {LOCAL_SYNCABLE} AND NOT {STAND_IN}")
 }
-fn local_children_named_sql() -> String {
-    format!(
-        "{LOCAL_NODE} WHERE i.parent_id = ?1 AND length(i.name) = ?2 AND oneup_fold(i.name) = ?3
-         AND i.kind IN (0, 1) AND {LOCAL_SYNCABLE} AND NOT {STAND_IN}"
-    )
-}
 fn remote_children_sql() -> String {
     format!("{REMOTE_NODE} WHERE parent_id = ?1 AND kind IN (0, 1) AND {REMOTE_SYNCABLE}")
 }
@@ -760,13 +754,6 @@ impl Trees for Ops<'_> {
         Ok(if gone { Seen::Deleted } else { Seen::Missing })
     }
 
-    fn local_children_named(&self, id: LocalId, name: &str) -> Result<Vec<LocalNode>> {
-        let mut st = self.c.prepare_cached(&local_children_named_sql())?;
-        let params = rusqlite::params![&blob(id.0)[..], crate::char_count(name), oneup_sync::fold(name)];
-        let v = st.query_map(params, local_node)?.collect::<rusqlite::Result<_>>()?;
-        Ok(v)
-    }
-
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>> {
         let mut st = self.c.prepare_cached(&local_children_sql())?;
         let v = st.query_map([blob(id.0)], local_node)?.collect::<rusqlite::Result<_>>()?;
@@ -854,44 +841,6 @@ pub(crate) mod tests {
     /// siblings whose names have letters other than ASCII, the lookups'
     /// plans read neither the folder's other children nor the table, and
     /// a name written before the upgrade is found as one written after.
-    /// By name as Windows compares names, and only what `local_children` lists.
-    #[test]
-    fn local_children_named_finds_what_local_children_lists() {
-        use crate::{LocalKind, LocalRow, Skip};
-        let mut s = Store::open_in_memory().unwrap();
-        let row = |file_id, parent_id, name: &str, kind, skip: Skip| LocalRow {
-            file_id,
-            parent_id,
-            name: name.into(),
-            name_lossy: false,
-            kind,
-            size: 0,
-            mtime: 0,
-            attributes: 0,
-            reparse_tag: 0,
-            skip,
-        };
-        s.write(|o| {
-            o.local_put(&row(1, None, "", LocalKind::Root, Skip::None)).map(drop)?;
-            o.local_put(&row(2, Some(1), "Build", LocalKind::Folder, Skip::None)).map(drop)?;
-            o.local_put(&row(3, Some(1), "other", LocalKind::Folder, Skip::None)).map(drop)?;
-            o.local_put(&row(4, Some(1), "buildx", LocalKind::File, Skip::None)).map(drop)?;
-            o.local_put(&row(5, Some(1), "BUILD2", LocalKind::Folder, Skip::Excluded)).map(drop)
-        })
-        .unwrap();
-        let named = |n: &str| {
-            s.read(|o| Trees::local_children_named(o, LocalId(1), n))
-                .unwrap()
-                .into_iter()
-                .map(|x| x.id.0)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(named("build"), [2]);
-        assert_eq!(named("BUILD"), [2]);
-        assert!(named("missing").is_empty());
-        assert!(named("build2").is_empty(), "a skipped item isn't listed");
-    }
-
     #[test]
     fn a_child_is_found_by_its_name_without_reading_its_siblings() {
         let mut s = Store::open_in_memory().unwrap();

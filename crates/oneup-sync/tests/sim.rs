@@ -605,9 +605,17 @@ impl World {
                     return false;
                 }
                 if let Op::ConflictCopy { sid, .. } = op {
-                    match self.base_mut(*sid) {
-                        Some(b) => b.local = None,
-                        None => return false,
+                    // As the executor: its own file, or what an atomic save
+                    // left in its place.
+                    let Some(b) = self.bases.get(sid) else { return false };
+                    let same_file = b.local == Some(local.id);
+                    let took_over = b.local.is_some_and(|old| !self.local.contains_key(&old.0))
+                        && self.local[&local.id.0].name.to_lowercase() == b.name.to_lowercase();
+                    if !same_file && !took_over {
+                        return false;
+                    }
+                    if let Some(b) = self.base_mut(*sid) {
+                        b.local = None;
                     }
                 }
                 if let Some(it) = self.local.get_mut(&local.id.0) {

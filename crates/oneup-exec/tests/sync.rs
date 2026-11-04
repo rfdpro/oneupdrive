@@ -9011,3 +9011,103 @@ async fn everyday_a_folder_made_again_after_a_move_in_onedrive_stays_apart() {
     assert_eq!(there["/site/new.html"].as_deref(), Some(&b"new build"[..]));
     assert!(names(&there).iter().all(|n| !n.contains("(conflict")), "{:?}", names(&there));
 }
+
+/// What the new build left out goes from OneDrive, nested folders too, though
+/// planning them waited for the folder to be linked.
+#[tokio::test]
+async fn everyday_a_folder_made_again_without_a_nested_folder_loses_it_in_onedrive() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rebuild-dropped", cloud.clone());
+    write(&s.p("site/dropped/deeper/old.txt"), b"old");
+    write(&s.p("site/keep.txt"), b"keep");
+    s.settle().await;
+    std::fs::remove_dir_all(s.p("site")).unwrap();
+    write(&s.p("site/keep.txt"), b"keep");
+    s.settle().await;
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert!(!there.keys().any(|k| k.contains("dropped")), "{:?}", names(&there));
+}
+
+/// Files edited in OneDrive meanwhile aren't lost: one the new build also has
+/// is a conflict (it finishes, rather than being retried for ever), and one it
+/// doesn't comes back, as for any file deleted here and changed in OneDrive.
+#[tokio::test]
+async fn everyday_a_folder_made_again_keeps_edits_made_in_onedrive_meanwhile() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rebuild-cloud", cloud.clone());
+    write(&s.p("site/both.txt"), b"v1");
+    write(&s.p("site/cloud.txt"), b"v1");
+    s.settle().await;
+    std::fs::remove_dir_all(s.p("site")).unwrap();
+    write(&s.p("site/both.txt"), b"local edit");
+    cloud.edit("site/both.txt", b"remote edit");
+    cloud.edit("site/cloud.txt", b"remote after local deletion");
+    cloud.add("site/new.txt", Some(b"new in cloud"));
+    s.settle().await;
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    for kept in [&b"local edit"[..], b"remote edit", b"remote after local deletion", b"new in cloud"] {
+        assert!(there.values().any(|c| c.as_deref() == Some(kept)), "lost {kept:?}: {:?}", names(&there));
+    }
+}
+
+/// An atomic save over a file edited in OneDrive is a conflict that finishes:
+/// the executor takes the new file for the Synced row's, as the planner does.
+#[tokio::test]
+async fn an_atomic_save_over_an_edit_in_onedrive_keeps_both_and_finishes() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("atomic-save-conflict", cloud.clone());
+    write(&s.p("doc.txt"), b"v1");
+    s.settle().await;
+    let tmp = s.p("doc.txt.tmp");
+    write(&tmp, b"saved here");
+    std::fs::remove_file(s.p("doc.txt")).unwrap();
+    std::fs::rename(&tmp, s.p("doc.txt")).unwrap();
+    cloud.edit("doc.txt", b"saved there");
+    s.settle().await;
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(there["/doc.txt"].as_deref(), Some(&b"saved there"[..]));
+    assert_eq!(there["/doc (conflict 1).txt"].as_deref(), Some(&b"saved here"[..]));
+}
+
+/// Moved aside and replaced isn't made again: the moved folder keeps its cloud
+/// item under its new name.
+#[tokio::test]
+async fn a_folder_moved_aside_and_replaced_stays_apart() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("rebuild-moved-aside", cloud.clone());
+    write(&s.p("build/a.txt"), b"original");
+    s.settle().await;
+    let old = resolve(&cloud.0.lock().unwrap(), "build");
+    std::fs::rename(s.p("build"), s.p("build.old")).unwrap();
+    write(&s.p("build/b.txt"), b"new folder");
+    s.settle().await;
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(there["/build.old/a.txt"].as_deref(), Some(&b"original"[..]));
+    assert_eq!(there["/build/b.txt"].as_deref(), Some(&b"new folder"[..]));
+    assert_eq!(resolve(&cloud.0.lock().unwrap(), "build.old"), old);
+}
+
+/// A rebuild that drops many files still meets the safety stop: linking the
+/// folder only keeps its record, and each deletion is still counted.
+#[tokio::test]
+async fn a_folder_made_again_empty_still_trips_the_safety_stop() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("rebuild-breaker", cloud.clone());
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        write(&s.p(&format!("site/{name}")), name.as_bytes());
+    }
+    s.settle().await;
+    std::fs::remove_dir_all(s.p("site")).unwrap();
+    std::fs::create_dir(s.p("site")).unwrap();
+    s.policy.max_count = 1;
+    s.stops.allowed = true;
+    s.round().await;
+    s.round().await;
+    assert!(!s.stops.raised.is_empty(), "deletions wait for approval");
+    let there = cloud.tree();
+    assert!(["/site/a.txt", "/site/b.txt", "/site/c.txt"].iter().all(|k| there.contains_key(*k)));
+}

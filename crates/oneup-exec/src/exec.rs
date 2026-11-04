@@ -1837,8 +1837,13 @@ impl<C: Cloud> Executor<C> {
             Op::Record(b) => {
                 store
                     .write(|o| {
-                        need(o.synced_get(b.sid)?.is_some())?;
+                        let Some(was) = o.synced_get(b.sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                         o.synced_put(b)?;
+                        // A folder deleted and made again: what's under it
+                        // waited for this, and this round clears its marks.
+                        if b.kind == NodeKind::Folder && was.local != b.local {
+                            o.dirty_mark_folders_under(b.sid)?;
+                        }
                         Ok(())
                     })
                     .await
@@ -2281,7 +2286,7 @@ impl<C: Cloud> Executor<C> {
                 store
                     .write_ahead(|o| {
                         let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
-                        need(b.local == Some(local.id))?;
+                        need(b.local == Some(local.id) || took_over_row(o, &b, local.id)?)?;
                         o.synced_put(&Base { local: None, ..b })?;
                         let p = Pending::Detached { sid: *sid, local: local.id, name: name.clone() };
                         Ok(o.meta_set_ahead(&pending_of(local.id), &p.encode())?)
@@ -2763,6 +2768,22 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+}
+
+/// Whether local file `id` is what an atomic save left in place of Synced row
+/// `b`'s: `b`'s file is gone, and `id` has its name in its folder. The planner
+/// treats it as `b`'s file (`merge::plan_folder`).
+fn took_over_row(o: &oneup_store::Ops<'_>, b: &Base, id: LocalId) -> Result<bool, Fail> {
+    let Some(old) = b.local else { return Ok(false) };
+    if o.local_get(old.0)?.is_some() {
+        return Ok(false);
+    }
+    let Some(now) = o.local_get(id.0)? else { return Ok(false) };
+    let folder = match b.parent {
+        Some(p) => o.synced_get(p)?.and_then(|f| f.local),
+        None => None,
+    };
+    Ok(folder.is_some_and(|f| now.parent_id == Some(f.0)) && oneup_sync::same_name(&now.name, &b.name))
 }
 
 /// A file time (100 ns since 1601) as milliseconds since 1970.

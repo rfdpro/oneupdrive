@@ -11,7 +11,7 @@
 //! Names chosen here (conflict copies) are only a first guess. The resolve
 //! pass ([`crate::resolve`]) is the authority on whether a name is free.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::Flow;
 use crate::model::{
@@ -189,11 +189,6 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
     if folder.kind != NodeKind::Folder {
         return Ok(Vec::new());
     }
-    // Waits for its parent to link it to the folder made again: its children
-    // aren't deleted, they're in the new folder, which only the next round sees.
-    if under_remade_folder(t, &folder)? {
-        return Ok(Vec::new());
-    }
     let local = local_of(t, &folder)?;
     let remote = remote_of(t, &folder)?;
     let local_dir = local.present().filter(|n| n.kind == NodeKind::Folder).map(|n| n.id);
@@ -241,7 +236,7 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
             if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::File && fold(&n.name) == key) {
                 adopted.insert(b.sid, new_local.remove(i));
             }
-        } else if may_be_remade(t, b)?.is_some() {
+        } else if may_be_remade(t, b)? {
             let key = fold(&b.name);
             if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::Folder && fold(&n.name) == key) {
                 remade.insert(b.sid, new_local.remove(i).id);
@@ -261,38 +256,36 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
     Ok(cx.out)
 }
 
-/// A Synced folder deleted here while the cloud's is still where it was: the
-/// local folder it would be made again in, if it's made again there. A new
-/// folder of its name there is the same folder, deleted and made again (as
-/// build tools do). Like an atomic save, it keeps its Synced row and its cloud
-/// item. Deletions under it still need their own evidence.
-fn may_be_remade<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<Option<LocalId>, T::Error> {
+/// Whether Synced folder `b` is deleted here while the cloud's is still where
+/// it was. A new folder of its name in the same place is then the same folder,
+/// deleted and made again (as build tools do). Like an atomic save, it keeps its
+/// Synced row and its cloud item. Deletions under it still need their own evidence.
+fn may_be_remade<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<bool, T::Error> {
     if b.kind != NodeKind::Folder || b.local.is_none() || !matches!(local_of(t, b)?, Seen::Deleted) {
-        return Ok(None);
+        return Ok(false);
     }
-    let Some(parent) = b.parent else { return Ok(None) };
-    let Some(parent_row) = t.base(parent)? else { return Ok(None) };
-    let Seen::Present(dir) = local_of(t, &parent_row)? else { return Ok(None) };
-    let Seen::Present(r) = remote_of(t, b)? else { return Ok(None) };
-    let same_place = r.kind == NodeKind::Folder && remote_loc(t, &r)? == Some((parent, b.name.clone()));
-    Ok(same_place.then_some(dir.id))
+    let Some(parent) = b.parent else { return Ok(false) };
+    let Seen::Present(r) = remote_of(t, b)? else { return Ok(false) };
+    Ok(r.kind == NodeKind::Folder && remote_loc(t, &r)? == Some((parent, b.name.clone())))
 }
 
-/// Whether Synced folder `b` is, or is under, a folder made again that its
-/// parent links this round. Every folder between is deleted here too. Costs a
-/// lookup only for a folder deleted here.
-fn under_remade_folder<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<bool, T::Error> {
-    let mut at = b.clone();
-    while matches!(local_of(t, &at)?, Seen::Deleted) {
-        if let Some(dir) = may_be_remade(t, &at)? {
-            for n in t.local_children_named(dir, &at.name)? {
-                if n.kind == NodeKind::Folder && t.base_by_local(n.id)?.is_none() {
-                    return Ok(true);
-                }
-            }
+/// Whether Synced folder `sid` is, or is under, one of the folders in `remade`
+/// that a parent's plan links this round. Every folder between is deleted here
+/// too. Its contents aren't deleted, they're in the new folder, which only the
+/// next round sees: `Op::Record` marks them to be planned then.
+pub(crate) fn under_remade<T: Trees + ?Sized>(t: &T, sid: Sid, remade: &HashSet<Sid>) -> Result<bool, T::Error> {
+    let mut at = t.base(sid)?;
+    while let Some(b) = at {
+        if !matches!(local_of(t, &b)?, Seen::Deleted) {
+            return Ok(false);
         }
-        let Some(parent) = at.parent.and_then(|p| t.base(p).transpose()).transpose()? else { break };
-        at = parent;
+        if remade.contains(&b.sid) {
+            return Ok(true);
+        }
+        at = match b.parent {
+            Some(p) => t.base(p)?,
+            None => None,
+        };
     }
     Ok(false)
 }

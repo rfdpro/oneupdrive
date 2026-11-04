@@ -79,9 +79,25 @@ pub fn plan_flow<T: Trees + ?Sized>(
             reason: HoldReason::MissingWithoutEvidence,
         }]);
     }
-    let mut ops = Vec::new();
+    let mut plans = Vec::new();
+    let mut remade = std::collections::HashSet::new();
     for sid in folders {
-        ops.extend(merge::plan_folder(t, sid, flow)?);
+        let plan = merge::plan_folder(t, sid, flow)?;
+        for op in &plan {
+            if let Op::Record(b) = op
+                && b.kind == NodeKind::Folder
+                && t.base(b.sid)?.is_some_and(|now| now.local != b.local)
+            {
+                remade.insert(b.sid);
+            }
+        }
+        plans.push((sid, plan));
+    }
+    let mut ops = Vec::new();
+    for (sid, plan) in plans {
+        if remade.is_empty() || !merge::under_remade(t, sid, &remade)? {
+            ops.extend(plan);
+        }
     }
     let ops = resolve::resolve(t, ops, flow == Flow::Backup)?;
     if flow == Flow::TwoWay {
