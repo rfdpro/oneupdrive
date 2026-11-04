@@ -3395,6 +3395,17 @@ impl OnDemand {
     }
 }
 
+impl OnDemand {
+    /// Waits until `n` requests have been answered and logged.
+    async fn served(&self, n: u64) {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while self.hydrator.served.load(std::sync::atomic::Ordering::Relaxed) < n {
+            assert!(std::time::Instant::now() < until, "only some requests were served");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+}
+
 impl Drop for OnDemand {
     fn drop(&mut self) {
         self.conn.take();
@@ -8863,6 +8874,9 @@ async fn on_demand_a_refused_open_wakes_the_agent_only_for_a_program_and_is_logg
     assert_eq!(app_read(&p), None, "a program's");
     assert!(od.stale_wakes.load(Relaxed) > 0, "a program's wakes the agent");
     assert_eq!(app_read(&p), None);
+    let refused = od.hydrator.refused.lock().unwrap().len() as u64;
+    assert!(refused >= 3);
+    od.served(refused).await;
 
     let log = s.obs.store().read(|o| o.activity_recent(Some("/a.txt"), 20)).unwrap();
     let failed = log.iter().filter(|e| e.action == "open" && e.outcome == oneup_store::ActivityOutcome::Failed).count();
@@ -8881,6 +8895,7 @@ async fn on_demand_our_own_download_adds_no_open_line() {
     let root = s.p("");
     assert!(oneup_exec::placement::fetch_one(&root, "/kept.txt").await);
     assert_eq!(placeholder(&s.p("kept.txt")).on_disk, 9);
+    od.served(1).await;
     let log = s.obs.store().read(|o| o.activity_recent(Some("/kept.txt"), 20)).unwrap();
     assert!(log.iter().all(|e| e.action != "open"), "{log:?}");
     drop(s);

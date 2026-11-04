@@ -72,6 +72,9 @@ pub struct Hydrator<C> {
     seq: AtomicU64,
     /// Refusals so far (for tests).
     pub refused: Mutex<Vec<Refusal>>,
+    /// Requests answered and logged so far (for tests: Windows lets the
+    /// requester go on before the log is written).
+    pub served: AtomicU64,
 }
 
 impl<C: Cloud + 'static> Hydrator<C> {
@@ -119,6 +122,7 @@ impl<C: Cloud + 'static> Hydrator<C> {
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
+            served: AtomicU64::new(0),
         }))
     }
 
@@ -161,6 +165,7 @@ impl<C: Cloud + 'static> Hydrator<C> {
             }
         }
         self.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        self.served.fetch_add(1, Relaxed);
     }
 
     async fn hydrate(&self, fetch: &Fetch) -> Result<u64, Refusal> {
@@ -410,6 +415,7 @@ mod tests {
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
+            served: AtomicU64::new(0),
         };
         let me = std::process::id();
         let proc = |pid| provider::Process { pid, image: "x.exe".into() };
