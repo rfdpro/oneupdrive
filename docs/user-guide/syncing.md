@@ -137,7 +137,7 @@ If it can't reach OneDrive, it waits and tries again, longer each time.
 A **safety stop** (see below) doesn't end `oneupd`: it changes nothing and waits for your answer. Neither do files deleted in OneDrive that don't fit in the version store: `oneupd` leaves them alone, keeps syncing everything else, and tells you once (see [When the version store is full](#when-the-version-store-is-full)). `oneup status` shows both, with their codes.
 
 ## File dates on your other PCs
-A new file over 4 MiB keeps its date on your other PCs. Smaller new files and edited files show when they were uploaded, so a date there can be later than the file's date on the PC that sent it.
+A new file over 4 MiB usually keeps its date on your other PCs. New files of 4 MiB or less and edited files show when they were uploaded, so a date there can be later than the file's date on the PC that sent it. So can a date from before 1980, or a new file OneDrive copied from one it already has instead of receiving it.
 
 ## Nothing is lost
 * **Edited on both sides?** You get both. Your PC's copy is renamed to `name (conflict 1).ext` and uploaded, and the OneDrive version keeps the original name.

@@ -1780,12 +1780,6 @@ mod tests {
         assert_eq!(st.wire, c.len() as u64, "nothing sent twice");
     }
 
-    /// Two tries through a kept session, the file changed in between inside
-    /// what was sent already: the second try re-reads and hashes everything
-    /// sent so far, finds the change, sends nothing more and cancels the
-    /// session; unchanged, it goes on and sends only the rest. Both where
-    /// the session was known to be, and where the fragment in flight ended
-    /// (its answer lost).
     /// What the upload paths ask OneDrive for: a new file's session has the file
     /// time; a one-request upload and a replacing session don't, and nothing
     /// sets it afterwards.
@@ -1892,6 +1886,12 @@ mod tests {
         assert!(kept.take(&key(Some(1))).is_some());
     }
 
+    /// Two tries through a kept session, the file changed in between inside
+    /// what was sent already: the second try re-reads and hashes everything
+    /// sent so far, finds the change, sends nothing more and cancels the
+    /// session; unchanged, it goes on and sends only the rest. Both where
+    /// the session was known to be, and where the fragment in flight ended
+    /// (its answer lost).
     #[tokio::test(start_paused = true)]
     async fn a_kept_upload_goes_on_only_if_everything_sent_is_still_the_file() {
         let c: Vec<u8> = (0..12 * UNIT).map(|i| (i % 251) as u8).collect();
