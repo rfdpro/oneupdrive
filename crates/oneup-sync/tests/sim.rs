@@ -609,8 +609,11 @@ impl World {
                     // left in its place (also once a conflict copy detached it).
                     let Some(b) = self.bases.get(sid) else { return false };
                     let same_file = b.local == Some(local.id);
+                    let folder = b.parent.and_then(|p| self.bases.get(&p)).and_then(|f| f.local);
+                    let now = &self.local[&local.id.0];
                     let took_over = b.local.is_none_or(|old| !self.local.contains_key(&old.0))
-                        && self.local[&local.id.0].name.to_lowercase() == b.name.to_lowercase();
+                        && folder.is_some_and(|f| now.parent == Some(f.0))
+                        && oneup_sync::same_name(&now.name, &b.name);
                     if !same_file && !took_over {
                         return false;
                     }

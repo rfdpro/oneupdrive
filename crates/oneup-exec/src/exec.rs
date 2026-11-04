@@ -2286,8 +2286,12 @@ impl<C: Cloud> Executor<C> {
                 store
                     .write_ahead(|o| {
                         let Some(b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
-                        need(b.local == Some(local.id) || took_over_row(o, &b, local.id)?)?;
-                        o.synced_put(&Base { local: None, ..b })?;
+                        let same_file = b.local == Some(local.id);
+                        need(same_file || took_over_row(o, &b, local.id)?)?;
+                        // Undone later, the row links this file: the stamp it
+                        // holds is the old file's, and mustn't vouch for this one.
+                        let local_mtime = if same_file { b.local_mtime } else { STAMP_UNKNOWN };
+                        o.synced_put(&Base { local: None, local_mtime, ..b })?;
                         let p = Pending::Detached { sid: *sid, local: local.id, name: name.clone() };
                         Ok(o.meta_set_ahead(&pending_of(local.id), &p.encode())?)
                     })

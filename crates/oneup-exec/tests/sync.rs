@@ -9111,3 +9111,38 @@ async fn a_folder_made_again_empty_still_trips_the_safety_stop() {
     let there = cloud.tree();
     assert!(["/site/a.txt", "/site/b.txt", "/site/c.txt"].iter().all(|k| there.contains_key(*k)));
 }
+
+/// The conflict copy of a replaced file finds it held open, and is undone. The
+/// file then has the old one's size and time, which mustn't pass for "unchanged":
+/// that would replace it with OneDrive's edit. Both are kept once it's let go.
+#[tokio::test]
+async fn a_replaced_file_found_busy_by_its_conflict_copy_still_keeps_both() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let cloud = Fake::new();
+    let mut s = Sync::new("atomic-save-busy", cloud.clone());
+    let p = s.p("doc.txt");
+    write(&p, b"base!");
+    s.settle().await;
+    let when = std::fs::metadata(&p).unwrap().modified().unwrap();
+    let tmp = s.p("doc.txt.tmp");
+    write(&tmp, b"mine!");
+    std::fs::File::options().write(true).open(&tmp).unwrap().set_modified(when).unwrap();
+    std::fs::remove_file(&p).unwrap();
+    std::fs::rename(&tmp, &p).unwrap();
+    cloud.edit("doc.txt", b"theirs");
+
+    // The first round hashes it, which a file held open would stop too.
+    let first = s.round().await;
+    assert!(first.done.iter().any(|d| matches!(d, Op::Hash(_))), "{first:?}");
+    let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&p).unwrap();
+    let busy = s.round().await;
+    assert!(busy.skipped.iter().any(|(op, _)| matches!(op, Op::ConflictCopy { .. })), "{busy:?}");
+    s.round().await;
+    drop(held);
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(there["/doc.txt"].as_deref(), Some(&b"theirs"[..]));
+    assert_eq!(there["/doc (conflict 1).txt"].as_deref(), Some(&b"mine!"[..]), "{:?}", names(&there));
+}
