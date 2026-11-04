@@ -26,10 +26,18 @@ use oneup_cfapi::provider::{self, Cancel, Fetch, Provider};
 use oneup_store::{ActivityEntry, ActivityOutcome, AppFile, AppUse, Store, UseKind};
 use oneup_sync::{RemoteId, RemotePre};
 
-use crate::cloud::{Cloud, Hashing};
+use crate::cloud::{Cloud, CloudError, Hashing};
 
 /// Transfer chunks: a multiple of 4 KiB, as Cloud Files requires.
 const CHUNK: usize = 1 << 20;
+
+/// The same refusal of the same file goes in the activity log at most this
+/// often: each pass asks again for a file set to stay on this device.
+const FAILURE_REPEAT_MS: i64 = 3_600_000;
+/// How many refusals an hour are logged: more say nothing until one's hour is up.
+const FAILURES_KEPT: usize = 1_024;
+/// How many refusals [`Hydrator::refused`] keeps, the latest.
+const REFUSED_KEPT: usize = 64;
 
 /// What a refused request reports to the caller (for tests and logs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,13 +63,18 @@ pub struct Hydrator<C> {
     /// without the drive), to log paths relative to it.
     root: String,
     rt: tokio::runtime::Handle,
-    /// Called when a placeholder turned out to be out of date: wakes the
-    /// agent so a round updates it.
+    /// Called when a program's open found a placeholder out of date: wakes
+    /// the agent so a round updates it.
     on_stale: Box<dyn Fn() + Send + Sync>,
+    /// Which refusals were logged lately.
+    failures_logged: Mutex<RecentFailures>,
     running: Mutex<HashMap<i64, tokio::task::AbortHandle>>,
     seq: AtomicU64,
     /// Refusals so far (for tests).
     pub refused: Mutex<Vec<Refusal>>,
+    /// Requests answered and logged so far (for tests: Windows lets the
+    /// requester go on before the log is written).
+    pub served: AtomicU64,
 }
 
 impl<C: Cloud + 'static> Hydrator<C> {
@@ -105,9 +118,11 @@ impl<C: Cloud + 'static> Hydrator<C> {
             root: volume_relative(sync_root),
             rt,
             on_stale,
+            failures_logged: Mutex::new(RecentFailures::default()),
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
+            served: AtomicU64::new(0),
         }))
     }
 
@@ -117,32 +132,40 @@ impl<C: Cloud + 'static> Hydrator<C> {
         // The content arrives by writes the program tracker would otherwise
         // count as a program's (`oneup_cfapi::ours`).
         oneup_cfapi::ours::note(u128::from(fetch.file_id as u64));
+        // OneUpDrive itself (a file set to always keep on this device): no
+        // program used it, and the pass that asked logs what it got.
+        let ours = asked_by_us(fetch.process.as_ref(), std::process::id());
         match self.hydrate(&fetch).await {
             Ok(n) => {
                 let who = fetch.process.as_ref().map(|p| image_name(&p.image)).unwrap_or_default();
                 let file_id = fetch.file_id;
-                // Asked for by OneUpDrive itself (a file set to always keep on
-                // this device): no program used it.
-                let ours = fetch.process.as_ref().is_some_and(|p| p.pid == std::process::id());
                 fetch.complete();
-                if ours {
-                    self.log(ActivityOutcome::Done, &path, format!("{n} bytes, kept on this device"));
-                } else {
+                if !ours {
                     self.log(ActivityOutcome::Done, &path, format!("{n} bytes, opened by {who}"));
                     self.note_use(file_id, who, n, &path);
                 }
             }
             Err(why) => {
                 tracing::debug!(?why, "a hydration was refused");
-                if why == Refusal::NotCurrent {
+                // Not for our own request: the pass asks again each time, so
+                // it would wake the agent each time, with nothing to update
+                // if the agent's own record doesn't call for it.
+                if why == Refusal::NotCurrent && !ours {
                     (self.on_stale)();
                 }
-                self.refused.lock().unwrap_or_else(|p| p.into_inner()).push(why);
+                {
+                    let mut refused = self.refused.lock().unwrap_or_else(|p| p.into_inner());
+                    if refused.len() == REFUSED_KEPT {
+                        refused.remove(0);
+                    }
+                    refused.push(why);
+                }
                 fetch.fail(provider::NOT_IN_SYNC);
-                self.log(ActivityOutcome::Failed, &path, format!("{why:?}"));
+                self.log_failure(&path, format!("{why:?}"));
             }
         }
         self.running.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        self.served.fetch_add(1, Relaxed);
     }
 
     async fn hydrate(&self, fetch: &Fetch) -> Result<u64, Refusal> {
@@ -155,28 +178,41 @@ impl<C: Cloud + 'static> Hydrator<C> {
             store.read(|o| o.get_item(&id.item)).map_err(|_| Refusal::NotCurrent)?
         };
         let current = current.ok_or(Refusal::NotCurrent)?;
-        if current.etag.as_deref() != Some(id.etag.as_str()) || current.size != id.size || current.qxh != Some(id.hash)
-        {
+        // Size and hash say which content this is. The eTag doesn't: a move or
+        // rename gives the item a new one and leaves the placeholder's as it
+        // was. What's downloaded must still have this size and hash.
+        if current.size != id.size || current.qxh != Some(id.hash) {
             return Err(Refusal::NotCurrent);
         }
+        let etag = current.etag.ok_or(Refusal::NotCurrent)?;
 
         let staged =
             Staged(self.staging.join(format!("{}-{}.hydrating", std::process::id(), self.seq.fetch_add(1, Relaxed))));
-        self.download_and_transfer(fetch, &id, &staged.0).await
+        self.download_and_transfer(fetch, &id, etag, &staged.0).await
     }
 
-    async fn download_and_transfer(&self, fetch: &Fetch, id: &Identity, path: &PathBuf) -> Result<u64, Refusal> {
+    async fn download_and_transfer(
+        &self,
+        fetch: &Fetch,
+        id: &Identity,
+        etag: String,
+        path: &PathBuf,
+    ) -> Result<u64, Refusal> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)
             .map_err(|_| Refusal::Download)?;
-        let pre = RemotePre { id: RemoteId(id.item.clone()), etag: id.etag.clone() };
+        let pre = RemotePre { id: RemoteId(id.item.clone()), etag };
         let cloud = self.cloud_for(asked_by_us(fetch.process.as_ref(), std::process::id()));
         let (len, hash) = {
             let mut w = Hashing::new(&mut file);
-            let received = cloud.download(&pre, &mut w).await.map_err(|_| Refusal::Download)?;
+            // Changed: OneDrive is ahead of the Remote tree, so a round has news.
+            let received = cloud.download(&pre, &mut w).await.map_err(|e| match e {
+                CloudError::Changed => Refusal::NotCurrent,
+                _ => Refusal::Download,
+            })?;
             // The identity's hash is the cloud's (see `cloud`).
             (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
         };
@@ -226,6 +262,15 @@ impl<C: Cloud + 'static> Hydrator<C> {
         format!("/{}", rel.trim_start_matches(['\\', '/']).replace('\\', "/"))
     }
 
+    /// Logs a refusal, unless the same one was logged within the last
+    /// [`FAILURE_REPEAT_MS`].
+    fn log_failure(&self, path: &str, detail: String) {
+        let due = self.failures_logged.lock().unwrap_or_else(|p| p.into_inner()).due(path, &detail, now_ms());
+        if due {
+            self.log(ActivityOutcome::Failed, path, detail);
+        }
+    }
+
     fn log(&self, outcome: ActivityOutcome, path: &str, detail: String) {
         let path = self.relative(path);
         let e = ActivityEntry { seq: 0, at_ms: now_ms(), outcome, action: "open".into(), path, detail };
@@ -244,6 +289,30 @@ impl<C> Hydrator<C> {
             (Some(c), true) => c,
             _ => &self.cloud,
         }
+    }
+}
+
+/// When each recent refusal was logged, by path and reason.
+#[derive(Default)]
+struct RecentFailures(HashMap<(String, String), i64>);
+
+impl RecentFailures {
+    /// Whether this refusal goes in the log now. Full of refusals still in
+    /// their hour, a new one doesn't: emptying the list instead would log
+    /// every failing file again each pass.
+    fn due(&mut self, path: &str, detail: &str, now: i64) -> bool {
+        let key = (path.to_string(), detail.to_string());
+        if self.0.get(&key).is_some_and(|last| now.saturating_sub(*last) < FAILURE_REPEAT_MS) {
+            return false;
+        }
+        if self.0.len() >= FAILURES_KEPT && !self.0.contains_key(&key) {
+            self.0.retain(|_, last| now.saturating_sub(*last) < FAILURE_REPEAT_MS);
+            if self.0.len() >= FAILURES_KEPT {
+                return false;
+            }
+        }
+        self.0.insert(key, now);
+        true
     }
 }
 
@@ -315,6 +384,20 @@ mod tests {
     use super::*;
 
     /// Who asked decides the cloud, before anything is downloaded: this
+    /// More refusals than are remembered don't start the log over each pass.
+    #[test]
+    fn a_refusal_is_logged_once_an_hour_however_many_files_fail() {
+        let mut f = RecentFailures::default();
+        let path = |n: usize| format!("/f{n}");
+        let logged =
+            |f: &mut RecentFailures, n: usize, now| (0..n).filter(|i| f.due(&path(*i), "NotCurrent", now)).count();
+        assert_eq!(logged(&mut f, FAILURES_KEPT + 5, 0), FAILURES_KEPT);
+        assert_eq!(logged(&mut f, FAILURES_KEPT + 5, 1_000), 0, "the next pass adds nothing");
+        assert!(!f.due(&path(0), "Download", 1_000), "the list is full");
+        assert_eq!(logged(&mut f, FAILURES_KEPT + 5, FAILURE_REPEAT_MS), FAILURES_KEPT, "their hour is up");
+        assert!(f.0.len() <= FAILURES_KEPT);
+    }
+
     /// process (a file set to stay here) the budgeted one, a program
     /// opening the file the other.
     #[test]
@@ -328,9 +411,11 @@ mod tests {
             root: String::new(),
             rt: rt.handle().clone(),
             on_stale: Box::new(|| {}),
+            failures_logged: Mutex::new(RecentFailures::default()),
             running: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),
             refused: Mutex::new(Vec::new()),
+            served: AtomicU64::new(0),
         };
         let me = std::process::id();
         let proc = |pid| provider::Process { pid, image: "x.exe".into() };

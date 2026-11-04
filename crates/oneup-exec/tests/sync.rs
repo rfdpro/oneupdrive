@@ -3363,6 +3363,8 @@ struct OnDemand {
     path: PathBuf,
     conn: Option<provider::Connection>,
     hydrator: Arc<Hydrator<Fake>>,
+    /// How many times the agent was woken about an out-of-date placeholder.
+    stale_wakes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OnDemand {
@@ -3374,6 +3376,8 @@ impl OnDemand {
     fn with_ours(path: &Path, db: &Path, cloud: &Fake, ours: Option<Fake>) -> Self {
         provider::register(path, b"test-token").unwrap();
         let staging = PathBuf::from(format!("{}.staging", path.display()));
+        let stale_wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wakes = Arc::clone(&stale_wakes);
         let h = Hydrator::with_ours(
             cloud.clone(),
             ours,
@@ -3381,11 +3385,24 @@ impl OnDemand {
             staging,
             path,
             tokio::runtime::Handle::current(),
-            Box::new(|| {}),
+            Box::new(move || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
         )
         .unwrap();
         let conn = provider::connect(path, Arc::new(Serve(Arc::clone(&h)))).unwrap();
-        Self { path: path.to_path_buf(), conn: Some(conn), hydrator: h }
+        Self { path: path.to_path_buf(), conn: Some(conn), hydrator: h, stale_wakes }
+    }
+}
+
+impl OnDemand {
+    /// Waits until `n` requests have been answered and logged.
+    async fn served(&self, n: u64) {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while self.hydrator.served.load(std::sync::atomic::Ordering::Relaxed) < n {
+            assert!(std::time::Instant::now() < until, "only some requests were served");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -8787,4 +8804,120 @@ async fn a_new_database_isnt_placed_beside_an_older_wal() {
     let r = s.round().await;
     assert!(!s.p("app.db").exists(), "not placed beside a -wal with changes: {r:?}");
     assert!(db_waits(&r, "app.db").iter().any(|(w, _)| *w == oneup_effects::Wait::Wal), "{r:?}");
+}
+
+/// An online-only file moved or renamed on another PC still opens here: a new
+/// eTag with the same content doesn't make the placeholder out of date.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_an_online_only_file_moved_in_onedrive_still_opens() {
+    let cloud = Fake::new();
+    cloud.add("sub", None);
+    cloud.add("r.txt", Some(b"renamed there"));
+    cloud.add("m.txt", Some(b"moved there"));
+    let (od, mut s) = on_demand_sync("ondemand-cloud-move-open", &cloud);
+    s.quiesce().await;
+
+    cloud.rename("r.txt", "r2.txt");
+    cloud.mv("m.txt", "sub");
+    s.quiesce().await;
+
+    let (renamed, moved) = (s.p("r2.txt"), s.p("sub").join("m.txt"));
+    assert_eq!(placeholder(&renamed).on_disk, 0, "still online-only");
+    assert_eq!(placeholder(&moved).on_disk, 0, "still online-only");
+    assert_eq!(app_read(&renamed).as_deref(), Some(&b"renamed there"[..]));
+    assert_eq!(app_read(&moved).as_deref(), Some(&b"moved there"[..]));
+    assert!(od.hydrator.refused.lock().unwrap().is_empty());
+
+    // Opened after its move, it still takes the next edit made in OneDrive.
+    cloud.edit("r2.txt", b"edited after the move");
+    s.quiesce().await;
+    assert_eq!(placeholder(&renamed).on_disk, 0);
+    assert_eq!(app_read(&renamed).as_deref(), Some(&b"edited after the move"[..]));
+    drop(s);
+    drop(od);
+}
+
+/// The same for a rename made here: OneDrive's answer has a new eTag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_an_online_only_file_moved_here_still_opens() {
+    let cloud = Fake::new();
+    cloud.add("big.txt", Some(b"renamed here"));
+    let (od, mut s) = on_demand_sync("ondemand-local-move-open", &cloud);
+    s.quiesce().await;
+    app_cmd(&format!("ren \"{}\" \"disc.txt\"", s.p("big.txt").display()));
+    s.quiesce().await;
+    let p = s.p("disc.txt");
+    assert_eq!(placeholder(&p).on_disk, 0, "still online-only");
+    assert_eq!(app_read(&p).as_deref(), Some(&b"renamed here"[..]));
+    drop(s);
+    drop(od);
+}
+
+/// Refused because the content really changed: a program's open wakes the
+/// agent to update the placeholder, OneUpDrive's own request doesn't (its pass
+/// asks again each time, and would wake the agent each time). The activity log
+/// says it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_refused_open_wakes_the_agent_only_for_a_program_and_is_logged_once() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cloud = Fake::new();
+    cloud.add("a.txt", Some(b"version one"));
+    let (od, mut s) = on_demand_sync("ondemand-refused", &cloud);
+    s.quiesce().await;
+    let p = s.p("a.txt");
+    cloud.edit("a.txt", b"version two, longer");
+    s.cloud.pull(s.obs.store_mut());
+
+    let root = s.p("");
+    assert!(!oneup_exec::placement::fetch_one(&root, "/a.txt").await, "our own request");
+    assert_eq!(od.stale_wakes.load(Relaxed), 0, "our own request wakes nothing");
+    assert_eq!(app_read(&p), None, "a program's");
+    assert!(od.stale_wakes.load(Relaxed) > 0, "a program's wakes the agent");
+    assert_eq!(app_read(&p), None);
+    let refused = od.hydrator.refused.lock().unwrap().len() as u64;
+    assert!(refused >= 3);
+    od.served(refused).await;
+
+    let log = s.obs.store().read(|o| o.activity_recent(None, 20)).unwrap();
+    let failed = log.iter().filter(|e| e.action == "open" && e.outcome == oneup_store::ActivityOutcome::Failed).count();
+    assert_eq!(failed, 1, "{log:?}");
+    drop(s);
+    drop(od);
+}
+
+/// OneUpDrive's own download is the pass's to log ("always kept"), once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_our_own_download_adds_no_open_line() {
+    let cloud = Fake::new();
+    cloud.add("kept.txt", Some(b"kept here"));
+    let (od, mut s) = on_demand_sync("ondemand-own-open", &cloud);
+    s.quiesce().await;
+    let root = s.p("");
+    assert!(oneup_exec::placement::fetch_one(&root, "/kept.txt").await);
+    assert_eq!(placeholder(&s.p("kept.txt")).on_disk, 9);
+    od.served(1).await;
+    let log = s.obs.store().read(|o| o.activity_recent(None, 20)).unwrap();
+    assert!(log.iter().all(|e| e.action != "open"), "{log:?}");
+    drop(s);
+    drop(od);
+}
+
+/// Moved again in OneDrive and not yet known here: the download finds OneDrive
+/// ahead of the Remote tree, which wakes the agent as any other out-of-date
+/// open does. The next round has the news, and the file opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_an_open_that_finds_onedrive_ahead_wakes_the_agent() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let cloud = Fake::new();
+    cloud.add("a.txt", Some(b"same content"));
+    let (od, mut s) = on_demand_sync("ondemand-ahead", &cloud);
+    s.quiesce().await;
+    cloud.rename("a.txt", "b.txt");
+    assert_eq!(app_read(&s.p("a.txt")), None, "the Remote tree has the old eTag");
+    assert!(od.stale_wakes.load(Relaxed) > 0);
+    assert!(od.hydrator.refused.lock().unwrap().contains(&oneup_exec::hydrate::Refusal::NotCurrent));
+    s.quiesce().await;
+    assert_eq!(app_read(&s.p("b.txt")).as_deref(), Some(&b"same content"[..]));
+    drop(s);
+    drop(od);
 }
