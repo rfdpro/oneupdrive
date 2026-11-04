@@ -119,6 +119,23 @@ pub trait Cloud: Send + Sync {
         src: &mut dyn Source,
     ) -> impl Future<Output = Result<(RemoteRow, Option<Hash>), CloudError>> + Send;
 
+    /// [`Cloud::upload`], with the file's last-write time for OneDrive to
+    /// keep where the upload can carry it, so another PC shows it too. Over
+    /// Graph: a new file sent in an upload session. Setting a time afterwards
+    /// adds a version to the file's history (measured), so nothing does.
+    fn upload_at(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+        replace: Option<&RemotePre>,
+        size: i64,
+        src: &mut dyn Source,
+        modified_ms: Option<i64>,
+    ) -> impl Future<Output = Result<(RemoteRow, Option<Hash>), CloudError>> + Send {
+        let _ = modified_ms;
+        self.upload(parent, name, replace, size, src)
+    }
+
     /// Before replacing file `pre` with `size` bytes: the version it holds
     /// now, if the replacement can commit without its precondition being
     /// checked then. Graph checks an upload session's `If-Match` only when

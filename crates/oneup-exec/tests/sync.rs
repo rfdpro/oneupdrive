@@ -78,6 +78,8 @@ struct State {
     history: BTreeMap<String, Vec<(u64, i64, i64)>>,
     /// Each file's last replacing upload: the eTag it left, and its version.
     last_upload: BTreeMap<String, (u64, u64)>,
+    /// The last-write times uploads asked OneDrive to keep, by name.
+    upload_times: BTreeMap<String, Option<i64>>,
     /// The history doesn't list the newest version for this many more
     /// looks (Graph's history can lag behind a commit).
     history_lag: u32,
@@ -678,6 +680,19 @@ impl Cloud for Fake {
         let done = self.download_now(pre, out);
         self.answer().await;
         done
+    }
+
+    async fn upload_at(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+        replace: Option<&RemotePre>,
+        size: i64,
+        src: &mut dyn Source,
+        modified_ms: Option<i64>,
+    ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
+        self.0.lock().unwrap().upload_times.insert(name.to_string(), modified_ms);
+        self.upload(parent, name, replace, size, src).await
     }
 
     async fn upload(
@@ -8920,4 +8935,24 @@ async fn on_demand_an_open_that_finds_onedrive_ahead_wakes_the_agent() {
     assert_eq!(app_read(&s.p("b.txt")).as_deref(), Some(&b"same content"[..]));
     drop(s);
     drop(od);
+}
+
+/// An upload hands OneDrive the file's own last-write time, new or replacing,
+/// so another PC shows when it was changed and not when it was uploaded.
+#[tokio::test]
+async fn an_upload_keeps_the_file_time() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("upload-keeps-time", cloud.clone());
+    let p = s.p("dated.txt");
+    std::fs::write(&p, b"first").unwrap();
+    let when = std::time::UNIX_EPOCH + Duration::from_millis(1_600_000_000_000);
+    std::fs::File::options().write(true).open(&p).unwrap().set_modified(when).unwrap();
+    s.settle().await;
+    assert_eq!(cloud.0.lock().unwrap().upload_times.get("dated.txt"), Some(&Some(1_600_000_000_000)));
+
+    std::fs::write(&p, b"second").unwrap();
+    let later = when + Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&p).unwrap().set_modified(later).unwrap();
+    s.settle().await;
+    assert_eq!(cloud.0.lock().unwrap().upload_times.get("dated.txt"), Some(&Some(1_600_000_060_000)));
 }

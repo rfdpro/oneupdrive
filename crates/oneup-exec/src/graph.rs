@@ -954,6 +954,18 @@ impl Cloud for GraphCloud {
         size: i64,
         src: &mut dyn Source,
     ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
+        self.upload_at(parent, name, replace, size, src, None).await
+    }
+
+    async fn upload_at(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+        replace: Option<&RemotePre>,
+        size: i64,
+        src: &mut dyn Source,
+        modified_ms: Option<i64>,
+    ) -> Result<(RemoteRow, Option<[u8; 20]>), CloudError> {
         let total = u64::try_from(size).map_err(|_| CloudError::Other("negative size".into()))?;
         let replace = replace.map(|p| (p.id.0.as_str(), p.etag.as_str()));
         let started = Instant::now();
@@ -974,7 +986,10 @@ impl Cloud for GraphCloud {
             };
             let graph = &self.graph;
             let open = || async move {
-                let url = graph.upload_session(&parent.0, name, replace).await.map_err(map)?;
+                // New files only: a session replacing a file with a time ends
+                // in `Changed` (measured by `oneup cloud-check`).
+                let modified_ms = modified_ms.filter(|_| replace.is_none());
+                let url = graph.upload_session(&parent.0, name, replace, modified_ms).await.map_err(map)?;
                 Ok((url.clone(), GraphSession { graph, url }))
             };
             let item =

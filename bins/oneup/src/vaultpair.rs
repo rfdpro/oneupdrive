@@ -449,6 +449,22 @@ impl Cloud for PairCloud {
         }
     }
 
+    async fn upload_at(
+        &self,
+        parent: &RemoteId,
+        name: &str,
+        replace: Option<&RemotePre>,
+        size: i64,
+        src: &mut dyn oneup_exec::Source,
+        modified_ms: Option<i64>,
+    ) -> Result<(RemoteRow, Option<Hash>), CloudError> {
+        match self {
+            PairCloud::Plain(c) => c.upload_at(parent, name, replace, size, src, modified_ms).await,
+            // What's in OneDrive is a vault's encrypted file; its time says nothing.
+            PairCloud::Vault(c) => c.upload(parent, name, replace, size, src).await,
+        }
+    }
+
     async fn uploaded_version(&self, id: &RemoteId, etag: Option<&str>) -> Result<Option<VersionMark>, CloudError> {
         match self {
             PairCloud::Plain(c) => c.uploaded_version(id, etag).await,
