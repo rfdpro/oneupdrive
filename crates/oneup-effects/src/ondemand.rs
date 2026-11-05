@@ -188,6 +188,44 @@ impl LocalFs {
         Ok((h, entry, path))
     }
 
+    /// Opens folder `id` to make it a placeholder: attribute access only,
+    /// sharing everything, after proving it's that folder (file ID), inside
+    /// the sync folder, and ordinary or ours. A folder has no content for a
+    /// share-none handle to protect, and a program whose current folder it
+    /// is (a console) holds a handle that refuses one (measured).
+    fn open_folder_ours(&self, id: LocalId) -> Result<(win::Handle, PathBuf)> {
+        let id = FileId(id.0);
+        let path = {
+            let probe = self.volume().open_attributes(id, self.hint(id).as_deref()).map_err(|_| Error::Changed)?;
+            long(&win::final_path(&probe)?)
+        };
+        let h = win::open_path_for_attributes(&path)?;
+        if win::file_id(&h)?.1 != id {
+            return Err(Error::Changed);
+        }
+        let entry = win::stat_handle(&h, id)?.ok_or(Error::Changed)?;
+        check_placeholder(&entry, None, true)?;
+        if !self.is_inside_pub(&path) {
+            return Err(Error::Outside);
+        }
+        Ok((h, path))
+    }
+
+    /// Whether the item at `path` may become a placeholder: it's directly in
+    /// the sync folder, or its folder is a placeholder. Windows hides our
+    /// placeholders from other programs, but not in the listing of an
+    /// ordinary folder: there they show as reparse points, which Go programs
+    /// (Docker's build context) take for special files and won't read
+    /// (measured).
+    fn in_placeholder_folder(&self, path: &std::path::Path) -> Result<bool> {
+        let Some(dir) = path.parent() else { return Ok(false) };
+        let h = win::open_path_for_attributes(dir)?;
+        if win::file_id(&h)?.1 == FileId(self.root_id().0) {
+            return Ok(true);
+        }
+        Ok(provider::info(&h.as_file()).map_err(placeholder_error)?.is_some())
+    }
+
     /// For an approved new-file [`Op::Download`] or [`Op::MkdirLocal`]: a
     /// dehydrated placeholder (in sync) instead of downloaded content.
     pub fn place_placeholder(&self, a: &Approved, v: &Version) -> Result<Done> {
@@ -390,9 +428,11 @@ impl LocalFs {
             } else {
                 x.mark_in_sync(&identity).map_err(placeholder_error)?;
             }
-        } else {
+        } else if self.in_placeholder_folder(&path)? {
             x.convert(&identity).map_err(placeholder_error)?;
         }
+        // Otherwise it stays ordinary until its folder is a placeholder
+        // (`convert_folder`, then the leftovers pass).
         drop(x);
         let h = win::open_path_for_placeholder(&path, pre.stamp.is_none())?;
         win::stat_handle(&h, FileId(pre.id.0))?.ok_or(Error::Changed)
@@ -538,11 +578,19 @@ impl LocalFs {
     /// placeholder that keeps its content, in sync with `v`. Only if, under a
     /// share-none handle, it is still the planned stamp (for a file, the
     /// caller checked that the hash recorded for that stamp is the synced
-    /// version's). Already a placeholder: nothing to do.
+    /// version's; `stamp: None` is a folder). Already a placeholder: nothing
+    /// to do. Only inside a placeholder folder or directly in the sync
+    /// folder: otherwise [`Error::FolderNotPlaceholder`], tried again later.
     pub fn convert_in_sync(&self, pre: &LocalPre, v: &Version) -> Result<()> {
-        let (h, _, _) = self.open_ours(pre)?;
+        if pre.stamp.is_none() {
+            return self.convert_folder_only(pre.id, v);
+        }
+        let (h, _, path) = self.open_ours(pre)?;
         if provider::info(&h.as_file()).map_err(placeholder_error)?.is_some() {
             return Ok(());
+        }
+        if !self.in_placeholder_folder(&path)? {
+            return Err(Error::FolderNotPlaceholder);
         }
         Exclusive::from_file(h.into_file()).convert(&v.identity.encode()).map_err(placeholder_error)
     }
@@ -554,12 +602,21 @@ impl LocalFs {
         // A folder an earlier build marked excluded, synced now (the rules
         // changed): its pin is cleared first.
         self.unmark_excluded_folder(id.0)?;
-        let pre = LocalPre { id, stamp: None };
-        let (h, _, _) = self.open_ours(&pre)?;
+        self.convert_folder_only(id, v)
+    }
+
+    /// Folder `id` becomes a placeholder in sync, if its own folder is one
+    /// (or it's directly in the sync folder). Nothing of its content
+    /// changes, so no share-none handle is needed ([`Self::open_folder_ours`]).
+    fn convert_folder_only(&self, id: LocalId, v: &Version) -> Result<()> {
+        let (h, path) = self.open_folder_ours(id)?;
         if provider::info(&h.as_file()).map_err(placeholder_error)?.is_some() {
             return Ok(());
         }
-        Exclusive::from_file(h.into_file()).convert(&v.identity.encode()).map_err(placeholder_error)
+        if !self.in_placeholder_folder(&path)? {
+            return Err(Error::FolderNotPlaceholder);
+        }
+        provider::convert_folder(&h.as_file(), &v.identity.encode()).map_err(placeholder_error)
     }
 
     /// Clears a mark left by a pre-release build that marked excluded

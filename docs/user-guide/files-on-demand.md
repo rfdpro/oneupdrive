@@ -81,4 +81,5 @@ Name copies in OneDrive by their OneDrive path, and files only on this PC by the
 
 ## Good to know
 * A file is only ever filled with the exact version it stands for. If it changed in OneDrive and the change hasn't arrived yet, opening it fails once instead of showing the wrong content; OneUpDrive then catches up, usually within seconds.
+* Developer tools such as Docker read files kept on this PC like any other file. If a Docker build in the folder fails with "invalid file request", run `oneup stop`, then `oneup start`: OneUpDrive then finishes setting up the folder, and the build works.
 * File Explorer's navigation-pane entry, status icons and right-click menu: see [File Explorer](explorer.md).

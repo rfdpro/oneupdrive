@@ -3670,6 +3670,89 @@ async fn on_demand_files_already_here_become_placeholders_in_sync() {
     drop(od);
 }
 
+/// A new folder that a console has as its current folder (which refuses
+/// share-none and delete access) still becomes a placeholder before the
+/// files sent from it do. A placeholder file in an ordinary folder shows as
+/// a reparse point in that folder's listing, even to programs Windows hides
+/// placeholders from, and Docker's build then refuses it ("invalid file
+/// request").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_new_folder_in_use_becomes_a_placeholder_before_its_files() {
+    let cloud = Fake::new();
+    let (od, mut s) = on_demand_sync("ondemand-cwd", &cloud);
+    s.quiesce().await;
+    let dir = s.p("proj");
+    std::fs::create_dir(&dir).unwrap();
+    let started = std::env::temp_dir().join(format!("oneup-exec-cwd-{}.started", std::process::id()));
+    let _ = std::fs::remove_file(&started);
+    let mut console = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg(format!("type nul >\"{}\" & ping -n 120 127.0.0.1 >nul", started.display()))
+        .current_dir(&dir)
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if started.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(&started);
+    // What the console's current folder refuses: delete access (measured).
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let held = std::fs::OpenOptions::new().access_mode(DELETE).share_mode(3).custom_flags(BACKUP_SEMANTICS).open(&dir);
+    assert!(held.is_err(), "the console holds its folder");
+    write(&dir.join("Dockerfile"), b"FROM scratch\n");
+    write(&dir.join("a.txt"), b"a\n");
+    s.quiesce().await;
+    let folder = provider::info(&provider::open(&dir).unwrap()).unwrap();
+    let file = provider::info(&provider::open(&dir.join("a.txt")).unwrap()).unwrap();
+    let _ = console.kill();
+    let _ = console.wait();
+    assert!(folder.as_ref().is_some_and(|i| i.in_sync), "the folder in use is a placeholder: {folder:?}");
+    assert!(file.as_ref().is_some_and(|i| i.in_sync && i.on_disk == 2), "{file:?}");
+    assert_eq!(cloud.tree().get("/proj/a.txt"), Some(&Some(b"a\n".to_vec())));
+    drop(s);
+    drop(od);
+}
+
+/// An item becomes a placeholder only directly in the sync folder or inside
+/// a placeholder folder; until its folder is one, it stays ordinary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_nothing_becomes_a_placeholder_inside_an_ordinary_folder() {
+    let cloud = Fake::new();
+    let (od, mut s) = on_demand_sync("ondemand-plainparent", &cloud);
+    s.quiesce().await;
+    write(&s.p("loose/inner/x.txt"), b"x");
+    s.obs.catch_up().unwrap();
+    let version = |item: &str, size: i64, hash: [u8; 20]| oneup_effects::Version {
+        identity: oneup_cfapi::identity::Identity { item: item.into(), etag: "e1".into(), size, hash },
+        modified: 0,
+    };
+    let fs = s.exec.local();
+    let file = s.local_id("loose/inner/x.txt");
+    let row = s.obs.store().read(|o| o.local_get(file.0)).unwrap().unwrap();
+    let file = LocalPre { id: file, stamp: Some((row.size, row.mtime)) };
+    let inner = LocalPre { id: s.local_id("loose/inner"), stamp: None };
+    let loose = LocalPre { id: s.local_id("loose"), stamp: None };
+    let r = fs.convert_in_sync(&file, &version("X", 1, qxh(b"x")));
+    assert!(matches!(r, Err(oneup_effects::Error::FolderNotPlaceholder)), "{r:?}");
+    let r = fs.convert_in_sync(&inner, &version("I", 0, [0; 20]));
+    assert!(matches!(r, Err(oneup_effects::Error::FolderNotPlaceholder)), "{r:?}");
+    for p in [s.p("loose/inner/x.txt"), s.p("loose/inner")] {
+        assert!(provider::info(&provider::open(&p).unwrap()).unwrap().is_none(), "{} stays ordinary", p.display());
+    }
+    // Top down, each one is made a placeholder.
+    fs.convert_in_sync(&loose, &version("L", 0, [0; 20])).unwrap();
+    fs.convert_in_sync(&inner, &version("I", 0, [0; 20])).unwrap();
+    fs.convert_in_sync(&file, &version("X", 1, qxh(b"x"))).unwrap();
+    assert!(placeholder(&s.p("loose/inner/x.txt")).in_sync);
+    drop(s);
+    drop(od);
+}
+
 /// Exclusions only stop uploads (`pull`): an excluded file only in
 /// OneDrive arrives here online-only. Removing it from OneDrive waits until
 /// its content is here; then the placeholder becomes an ordinary file.

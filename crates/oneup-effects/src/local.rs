@@ -84,6 +84,10 @@ pub enum Error {
     DatabaseWaits,
     #[error("outside the sync folder")]
     Outside,
+    /// Not made a placeholder: its folder isn't one yet. Tried again once
+    /// the folder is.
+    #[error("its folder isn't a placeholder yet")]
+    FolderNotPlaceholder,
     /// The token is for an operation this layer doesn't run (a remote or
     /// bookkeeping one), or lacks a precondition it needs.
     #[error("not a local operation")]
