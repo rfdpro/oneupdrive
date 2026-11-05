@@ -250,10 +250,66 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
             continue;
         }
         let adopted = adopted.remove(&b.sid);
+        if same_file_again(&mut cx, &b, adopted.as_ref(), &mut new_remote)? {
+            continue;
+        }
         decide_synced(&mut cx, b, adopted)?;
     }
     decide_new(&mut cx, new_local, new_remote)?;
     Ok(cx.out)
+}
+
+/// A Synced file deleted in the cloud, with a new cloud file of its name in the
+/// same place (deleted and uploaded again), while this PC's file looks changed
+/// (a new last-write time is enough). If the two have the same content there's
+/// nothing to keep both of: the row takes the new item, and this returns true.
+/// Different content takes the usual way, which keeps both.
+fn same_file_again<T: Trees + ?Sized>(
+    cx: &mut Ctx<'_, T>,
+    b: &Base,
+    adopted: Option<&LocalNode>,
+    new_remote: &mut Vec<RemoteNode>,
+) -> Result<bool, T::Error> {
+    let t = cx.t;
+    if b.kind != NodeKind::File || !matches!(remote_of(t, b)?, Seen::Deleted) {
+        return Ok(false);
+    }
+    let l = match adopted {
+        Some(n) => n.clone(),
+        None => match local_of(t, b)? {
+            Seen::Present(n) => n,
+            _ => return Ok(false),
+        },
+    };
+    if local_change(b, &l) != LocalChange::Changed
+        || l.kind != NodeKind::File
+        || local_loc(t, &l)? != b.parent.map(|p| (p, b.name.clone()))
+    {
+        return Ok(false);
+    }
+    let key = fold(&b.name);
+    let Some(i) = new_remote.iter().position(|r| r.kind == NodeKind::File && fold(&r.name) == key) else {
+        return Ok(false);
+    };
+    let r = &new_remote[i];
+    if r.size != l.size || r.hash.is_none() {
+        return Ok(false);
+    }
+    match l.hash {
+        None => cx.out.push(Op::Hash(lpre(&l))),
+        Some(h) if r.hash == Some(h) => cx.out.push(Op::Record(Base {
+            local: Some(l.id),
+            local_mtime: l.mtime,
+            size: r.size,
+            hash: r.hash,
+            remote: Some(r.id.clone()),
+            remote_etag: r.etag.clone(),
+            ..b.clone()
+        })),
+        Some(_) => return Ok(false),
+    }
+    new_remote.remove(i);
+    Ok(true)
 }
 
 /// Whether Synced folder `b` is deleted here while the cloud's is still where

@@ -23,7 +23,8 @@
 //!    evidence of its deletion here;
 //! 6. rewinding (`oneup_sync::rewind`): rewinding a folder to a moment
 //!    reproduces it as it was then, and rewinding the rewind puts back what
-//!    was there before it.
+//!    was there before it;
+//! 7. changes on one side never make a conflict name.
 //!
 //! Faults: OneDrive's listing lagging behind the cloud ([`Mirror`]), and the
 //! change journal losing users' latest deletions ([`World::lose_journal`]).
@@ -137,6 +138,15 @@ struct World {
     bases: BTreeMap<Sid, Base>,
     next_sid: Sid,
     next_content: Content,
+    /// `Some`: users change only this side, so nothing can conflict.
+    only: Option<Side>,
+}
+
+/// Which side a one-sided history changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Here,
+    Cloud,
 }
 
 impl World {
@@ -165,6 +175,7 @@ impl World {
             bases: BTreeMap::new(),
             next_sid: ROOT + 1,
             next_content: 1,
+            only: None,
         };
         w.local.insert(
             LOCAL_ROOT,
@@ -751,6 +762,23 @@ impl World {
     /// while the listing lags, the mirror stores what it changed in the
     /// cloud, as the executor records the items its requests return.
     fn run(&mut self, op: &Op, planned: &World) -> bool {
+        if let Op::ConflictCopy { sid, .. } = op {
+            // As the executor asks (`Cloud::item`): an older version in a
+            // listing behind the cloud isn't a change there. The answer is
+            // stored, as the executor stores it.
+            let b = self.bases.get(sid).cloned();
+            if let Some(b) = b
+                && let Some(rid) = &b.remote
+                && let Some(now) = self.remote.get(&rid.0).cloned()
+                && Some(hash_of(now.content)) == b.hash
+            {
+                if let Some(m) = self.mirror.as_mut() {
+                    m.gone.remove(&rid.0);
+                    m.rows.insert(rid.0.clone(), now);
+                }
+                return false;
+            }
+        }
         if let Op::MoveLocal { sid, .. } = op {
             // As the executor asks (`Cloud::is_at`): only while OneDrive
             // still has the item where the listing had it, which this move
@@ -1185,7 +1213,7 @@ impl World {
             self.remote.iter().filter(|(_, it)| it.kind == NodeKind::File).map(|(i, _)| i.clone()).collect();
         let items: Vec<String> = self.remote.keys().filter(|i| *i != REMOTE_ROOT).cloned().collect();
         let name = rng.pick(NAMES).unwrap_or("a");
-        match rng.below(6) {
+        match rng.below(8) {
             0 | 1 => {
                 let Some(p) = rng.pick(&folders) else { return };
                 if self.r_child(&p, name).is_none() {
@@ -1227,6 +1255,47 @@ impl World {
                     it.etag = e;
                 }
             }
+            5 => {
+                // Another PC's build tool, or a folder deleted and uploaded
+                // again on the web: new IDs, some of the same contents.
+                let Some(f) = rng.pick(&folders) else { return };
+                let (Some(parent), folder_name) = (self.remote[&f].parent.clone(), self.remote[&f].name.clone()) else {
+                    return;
+                };
+                let mut kept: Vec<(String, Content)> = self
+                    .remote
+                    .values()
+                    .filter(|it| it.parent.as_deref() == Some(f.as_str()) && it.kind == NodeKind::File)
+                    .map(|it| (it.name.clone(), it.content))
+                    .collect();
+                kept.sort();
+                for id in self.r_subtree(&f) {
+                    if let Some(it) = self.remote.remove(&id) {
+                        if it.kind == NodeKind::File {
+                            self.remote_bin.push(it.content);
+                        }
+                        self.remote_bin_items.insert(id.clone(), it);
+                        self.remote_gone.insert(id);
+                    }
+                }
+                let new = self.r_create(&parent, &folder_name, NodeKind::Folder, 0);
+                for (n, c) in &kept {
+                    if rng.chance(70) {
+                        let c = if rng.chance(50) { *c } else { self.content() };
+                        self.r_create(&new, n, NodeKind::File, c);
+                    }
+                }
+            }
+            6 => {
+                // A file deleted and uploaded again: a new ID under its name.
+                let Some(f) = rng.pick(&files) else { return };
+                let Some(old) = self.remote.remove(&f) else { return };
+                self.remote_bin.push(old.content);
+                self.remote_bin_items.insert(f.clone(), old.clone());
+                self.remote_gone.insert(f);
+                let c = if rng.chance(50) { old.content } else { self.content() };
+                self.r_create(old.parent.as_deref().unwrap_or(REMOTE_ROOT), &old.name, NodeKind::File, c);
+            }
             _ => {
                 // Deleting a folder deletes its subtree; delta reports the
                 // folder, and the mirror records the whole subtree as gone.
@@ -1245,7 +1314,12 @@ impl World {
     }
 
     fn user(&mut self, rng: &mut Rng) {
-        if rng.chance(50) { self.user_local(rng) } else { self.user_remote(rng) }
+        match self.only {
+            Some(Side::Here) => self.user_local(rng),
+            Some(Side::Cloud) => self.user_remote(rng),
+            None if rng.chance(50) => self.user_local(rng),
+            None => self.user_remote(rng),
+        }
     }
 }
 
@@ -1391,7 +1465,14 @@ fn round_flow(w: &mut World, rng: Option<&mut Rng>, debug: bool, flow: Flow) -> 
         {
             w.user(r);
         }
-        w.run(op, &snap);
+        let ran = w.run(op, &snap);
+        // A listing behind the cloud can still show an item this PC moved
+        // away, and what's in its way moves aside. It can't make a conflict
+        // copy: the executor asks the cloud first.
+        let lagging = w.mirror.is_some() && !matches!(op, Op::ConflictCopy { .. });
+        if w.only.is_some() && ran && !lagging {
+            assert!(!format!("{op:?}").contains(" (conflict "), "a conflict name with one side changing: {op:?}");
+        }
     }
     assert_no_loop(w);
     let actions = ops.iter().filter(|o| o.is_action()).count();
@@ -1535,6 +1616,55 @@ fn random_histories_converge_without_losing_edits() {
         if let Err(e) = result {
             eprintln!("simulation failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1");
             std::panic::resume_unwind(e);
+        }
+    }
+}
+
+/// Conflict names are for changes on both sides that can't both keep a name.
+/// When only one side changes, whatever it does (deleting and making again,
+/// atomic saves, moves, kinds swapped), none may appear, however often this PC
+/// looks. With OneDrive's listing lagging, no conflict copy may.
+#[test]
+fn changes_on_one_side_never_make_a_conflict_name() {
+    let debug = std::env::var("SIM_DEBUG").is_ok();
+    for seed in seeds(200) {
+        for (side, lags) in [(Side::Here, false), (Side::Cloud, false), (Side::Here, true), (Side::Cloud, true)] {
+            let mut rng = Rng(seed.wrapping_mul(0xD6E8_FEB8_6659_FD93) | 1);
+            let mut w = World::new();
+            w.only = Some(side);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if lags {
+                    for _ in 0..3 {
+                        w.user(&mut rng);
+                    }
+                    settle(&mut w, debug);
+                    w.lag();
+                }
+                for _ in 0..25 {
+                    for _ in 0..=rng.below(5) {
+                        w.user(&mut rng);
+                    }
+                    round(&mut w, Some(&mut rng), debug);
+                }
+                let must = unsynced_edits(&w);
+                let holds = settle(&mut w, debug);
+                if debug {
+                    eprintln!(
+                        "local: {:#?}
+remote: {:#?}
+bases: {:#?}",
+                        w.local, w.remote, w.bases
+                    );
+                }
+                assert_eq!(holds, 0, "held items without any missing evidence");
+                assert_converged(&w, &must);
+            }));
+            if let Err(e) = result {
+                eprintln!(
+                    "one-sided simulation ({side:?}, lags {lags}) failed for seed {seed}; replay with SIM_SEED={seed} SIM_DEBUG=1"
+                );
+                std::panic::resume_unwind(e);
+            }
         }
     }
 }

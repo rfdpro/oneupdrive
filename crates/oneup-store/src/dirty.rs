@@ -307,7 +307,8 @@ impl Ops<'_> {
     /// evidence about them that no tree write recorded).
     /// Marks Synced folder `sid` and every Synced folder under it, with new
     /// numbers so a round under way doesn't clear them. For a folder that
-    /// changed its local ID: what's under it was waiting for that.
+    /// changed its local ID: what's under it was waiting for that, and what
+    /// was moved into one is planned with it ([`SCOPE`]).
     pub fn dirty_mark_folders_under(&self, sid: Sid) -> Result<()> {
         const UNDER: &str = "WITH RECURSIVE t(sid) AS (
                  SELECT ?2

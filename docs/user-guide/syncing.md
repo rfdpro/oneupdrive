@@ -140,6 +140,7 @@ A **safety stop** (see below) doesn't end `oneupd`: it changes nothing and waits
 A new file over 4 MiB usually keeps its date on your other PCs. New files of 4 MiB or less and edited files show when they were uploaded, so a date there can be later than the file's date on the PC that sent it. So can a date from before 1980, or a new file OneDrive copied from one it already has instead of receiving it.
 
 ## Nothing is lost
+* **Changed on one side only?** No conflict copy, whatever the change: an app replacing a file or rebuilding a folder, a file moved or deleted and uploaded again, or a file replaced by a folder of the same name. The same content on both sides is one file.
 * **Edited on both sides?** You get both. Your PC's copy is renamed to `name (conflict 1).ext` and uploaded, and the OneDrive version keeps the original name.
   * If the OneDrive edit lands in the last moment of a large upload from your PC, your PC's version keeps the original name instead and the OneDrive version arrives as `name (conflict 1).ext`. The activity log says so.
 * **Deleted on your PC?** The OneDrive copy goes to OneDrive's recycle bin, where you can restore it from the website.

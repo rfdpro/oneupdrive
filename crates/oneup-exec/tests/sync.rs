@@ -9146,3 +9146,226 @@ async fn a_replaced_file_found_busy_by_its_conflict_copy_still_keeps_both() {
     assert_eq!(there["/doc.txt"].as_deref(), Some(&b"theirs"[..]));
     assert_eq!(there["/doc (conflict 1).txt"].as_deref(), Some(&b"mine!"[..]), "{:?}", names(&there));
 }
+
+/// Planned from another folder, a move in OneDrive into a folder being rebuilt
+/// here asks for that folder to be made: the link to the new one goes first,
+/// and the move still happens though nothing else marks its folder again.
+#[tokio::test]
+async fn everyday_a_folder_made_again_while_a_file_moves_into_it_in_onedrive_keeps_its_name() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("everyday-rebuild-incoming", cloud.clone());
+    write(&s.p("older/incoming.txt"), b"incoming");
+    s.settle().await;
+    write(&s.p("newer/build/index.html"), b"old build");
+    s.settle().await;
+
+    std::fs::remove_dir_all(s.p("newer/build")).unwrap();
+    write(&s.p("newer/build/index.html"), b"new build");
+    cloud.mv("older/incoming.txt", "newer/build");
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(there["/newer/build/index.html"].as_deref(), Some(&b"new build"[..]));
+    assert_eq!(there["/newer/build/incoming.txt"].as_deref(), Some(&b"incoming"[..]));
+    assert!(names(&there).iter().all(|n| !n.contains("(conflict")), "{:?}", names(&there));
+}
+
+/// A crash in a conflict copy leaves the row detached. If the file is renamed
+/// and another takes its name while stopped, the next round is planned before
+/// what the crash left is settled: its new row for the renamed file is refused,
+/// not a halt on the row settling gave it.
+#[tokio::test]
+async fn a_conflict_copy_cut_short_then_renamed_doesnt_stop_sync() {
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("crash-detached-renamed", cloud.clone());
+    write(&s.p("doc.txt"), b"base");
+    s.settle().await;
+    write(&s.p("doc.txt"), b"mine");
+    cloud.edit("doc.txt", b"theirs");
+    let hashed = s.round().await;
+    assert!(hashed.done.iter().any(|d| matches!(d, Op::Hash(_))), "{hashed:?}");
+
+    s.exec.crash_after(Some(0));
+    let cut = s.attempt().await;
+    assert_eq!(cut.halted.as_deref(), Some(CRASHED), "{cut:?}");
+    s.exec.crash_after(None);
+    let mut s = s.restart();
+
+    std::fs::rename(s.p("doc.txt"), s.p("aside.txt")).unwrap();
+    write(&s.p("doc.txt"), b"another");
+    let next = s.attempt().await;
+    assert_eq!(next.halted, None, "{next:?}");
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    for kept in [&b"mine"[..], b"theirs", b"another"] {
+        assert!(there.values().any(|c| c.as_deref() == Some(kept)), "{:?}", names(&there));
+    }
+}
+
+/// Deleted and uploaded again elsewhere with the same content, while this PC's
+/// copy only looks changed: one file, not a conflict copy of itself.
+#[tokio::test]
+async fn a_file_uploaded_again_as_it_was_stays_one_file() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("uploaded-again-same", cloud.clone());
+    let p = s.p("notes.zip");
+    write(&p, b"same bytes");
+    s.settle().await;
+
+    let later = std::fs::metadata(&p).unwrap().modified().unwrap() + Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&p).unwrap().set_modified(later).unwrap();
+    cloud.delete("notes.zip");
+    cloud.add("notes.zip", Some(b"same bytes"));
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(names(&there).into_iter().collect::<Vec<_>>(), ["/notes.zip"], "{:?}", names(&there));
+}
+
+/// With different content there are two versions to keep.
+#[tokio::test]
+async fn a_file_uploaded_again_differently_keeps_both_with_an_edit_here() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("uploaded-again-other", cloud.clone());
+    write(&s.p("notes.txt"), b"base!");
+    s.settle().await;
+    write(&s.p("notes.txt"), b"mine!");
+    cloud.delete("notes.txt");
+    cloud.add("notes.txt", Some(b"their"));
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(there["/notes.txt"].as_deref(), Some(&b"their"[..]));
+    assert_eq!(there["/notes (conflict 1).txt"].as_deref(), Some(&b"mine!"[..]));
+}
+
+/// A plan from a listing behind the cloud can make a conflict copy of a file
+/// only this PC changed. The cloud still has the version both sides agreed on,
+/// so it's refused, and this PC's edit goes up with no conflict copy.
+#[tokio::test]
+async fn a_conflict_copy_is_refused_while_the_cloud_has_the_agreed_version() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("listing-behind-conflict", cloud.clone());
+    write(&s.p("doc.txt"), b"agreed");
+    s.settle().await;
+    write(&s.p("doc.txt"), b"my edit");
+    s.obs.catch_up().unwrap();
+    let id = s.local_id("doc.txt");
+    let sid = s.sid("doc.txt");
+    let row = s.obs.store().read(|o| o.local_get(id.0)).unwrap().unwrap();
+    let pre = LocalPre { id, stamp: Some((row.size, row.mtime)) };
+    let dir = LocalId(row.parent_id.unwrap());
+    s.extra.push(Op::ConflictCopy { sid, local: pre, dir, name: "doc (conflict 1).txt".into() });
+    let refused = s.round().await;
+    assert!(refused.skipped.iter().any(|(op, _)| matches!(op, Op::ConflictCopy { .. })), "{refused:?}");
+    s.settle().await;
+
+    let (here, there) = (local_tree(&s.dir.0), cloud.tree());
+    assert_eq!(here, there);
+    assert_eq!(names(&there).into_iter().collect::<Vec<_>>(), ["/doc.txt"]);
+    assert_eq!(there["/doc.txt"].as_deref(), Some(&b"my edit"[..]));
+}
+
+/// And it goes ahead once the cloud's version really is another.
+#[tokio::test]
+async fn a_conflict_copy_goes_ahead_when_the_cloud_changed() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("listing-current-conflict", cloud.clone());
+    write(&s.p("doc.txt"), b"agreed");
+    s.settle().await;
+    write(&s.p("doc.txt"), b"my edit");
+    cloud.edit("doc.txt", b"their edit");
+    s.settle().await;
+
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert_eq!(there["/doc.txt"].as_deref(), Some(&b"their edit"[..]));
+    assert_eq!(there["/doc (conflict 1).txt"].as_deref(), Some(&b"my edit"[..]));
+}
+
+/// A file put in a new folder of its own name: nothing conflicts, wherever it
+/// was done, and the item in the way doesn't wait for what's waiting for it.
+#[tokio::test]
+async fn a_file_put_in_a_new_folder_of_its_name_makes_no_conflict() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("wrapped-here", cloud.clone());
+    write(&s.p("report"), b"text");
+    s.settle().await;
+    std::fs::rename(s.p("report"), s.p("tmp")).unwrap();
+    std::fs::create_dir(s.p("report")).unwrap();
+    std::fs::rename(s.p("tmp"), s.p("report/report")).unwrap();
+    s.settle().await;
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert_eq!(there["/report/report"].as_deref(), Some(&b"text"[..]));
+    assert!(names(&there).iter().all(|n| !n.contains("(conflict")), "{:?}", names(&there));
+
+    let cloud = Fake::new();
+    let mut s = Sync::new("wrapped-there", cloud.clone());
+    cloud.add("report", Some(b"text"));
+    s.settle().await;
+    cloud.rename("report", "tmp");
+    cloud.add("report", None);
+    cloud.mv("tmp", "report");
+    cloud.rename("report/tmp", "report");
+    s.settle().await;
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert_eq!(there["/report/report"].as_deref(), Some(&b"text"[..]));
+    assert!(names(&there).iter().all(|n| !n.contains("(conflict")), "{:?}", names(&there));
+}
+
+/// A folder replaced by a file of its name, here or in OneDrive: the file takes
+/// the name as the folder goes, with no conflict.
+#[tokio::test]
+async fn a_folder_replaced_by_a_file_of_its_name_makes_no_conflict() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("kind-swap-here", cloud.clone());
+    write(&s.p("thing/a.txt"), b"a");
+    write(&s.p("thing/sub/b.txt"), b"b");
+    s.settle().await;
+    std::fs::remove_dir_all(s.p("thing")).unwrap();
+    write(&s.p("thing"), b"now a file");
+    s.settle().await;
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert_eq!(there["/thing"].as_deref(), Some(&b"now a file"[..]));
+    assert_eq!(names(&there).into_iter().collect::<Vec<_>>(), ["/thing"]);
+
+    let cloud = Fake::new();
+    let mut s = Sync::new("kind-swap-there", cloud.clone());
+    write(&s.p("thing/a.txt"), b"a");
+    write(&s.p("thing/sub/b.txt"), b"b");
+    s.settle().await;
+    cloud.delete_tree("thing");
+    cloud.add("thing", Some(b"now a file"));
+    s.settle().await;
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert_eq!(names(&there).into_iter().collect::<Vec<_>>(), ["/thing"]);
+}
+
+/// Another PC's rebuild reaches this PC as a new folder under the old name,
+/// with the old one gone: no conflict name here, and what's new arrives.
+#[tokio::test]
+async fn a_folder_deleted_and_uploaded_again_in_onedrive_makes_no_conflict() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("rebuilt-there", cloud.clone());
+    write(&s.p("site/index.html"), b"old");
+    write(&s.p("site/deep/page.html"), b"old page");
+    s.settle().await;
+    cloud.delete_tree("site");
+    cloud.add("site", None);
+    cloud.add("site/index.html", Some(b"new"));
+    s.settle().await;
+    let there = cloud.tree();
+    assert_eq!(local_tree(&s.dir.0), there);
+    assert_eq!(there["/site/index.html"].as_deref(), Some(&b"new"[..]));
+    assert!(names(&there).iter().all(|n| !n.contains("(conflict") && !n.contains("staging")), "{:?}", names(&there));
+    assert!(!there.contains_key("/site/deep/page.html"));
+}

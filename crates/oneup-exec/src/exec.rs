@@ -1546,7 +1546,10 @@ impl<C: Cloud> Executor<C> {
         match op {
             Op::MkdirRemote { local, to, parent, name, link } => {
                 store
-                    .write(|o| need(local_ok(o, local)? && link_ok(o, *link)? && o.synced_get(*parent)?.is_some()))
+                    .write(|o| {
+                        need(local_ok(o, local)? && link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
+                        need_unlinked(o, local.id, *link)
+                    })
                     .await?;
                 Ok(Meta::Mkdir { parent: to.clone(), name: name.clone() })
             }
@@ -1865,7 +1868,12 @@ impl<C: Cloud> Executor<C> {
 
             // ------------------------------------------------ transfers
             Op::Upload { local, to, parent, name, replace, link } => {
-                store.write(|o| need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())).await?;
+                store
+                    .write(|o| {
+                        need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
+                        need_unlinked(o, local.id, *link)
+                    })
+                    .await?;
                 // Opened here (an open and an oplock request: short); its
                 // reads run on blocking threads.
                 let mut src = OffTask::new(self.fs.open_upload(a)?, &self.jobs);
@@ -2281,6 +2289,7 @@ impl<C: Cloud> Executor<C> {
                 store.write(|o| Ok(o.local_update(&self.local_row(&entry, dir))?)).await
             }
             Op::ConflictCopy { sid, local, name, .. } => {
+                self.changed_in_cloud(store, *sid).await?;
                 // Detach first (see the crate docs): the renamed copy must
                 // never be taken for a rename of the Synced item.
                 store
@@ -2638,6 +2647,25 @@ impl<C: Cloud> Executor<C> {
             .await
     }
 
+    /// Refuses a conflict copy unless the cloud's file really differs from the
+    /// version both sides agreed on. A listing behind the cloud can show an
+    /// older version of a file this PC uploaded since. What the cloud has now
+    /// is stored, so the next round plans from it.
+    async fn changed_in_cloud(&self, store: &Db<'_>, sid: Sid) -> Res {
+        let Some(b) = store.read(|o| o.synced_get(sid))? else { return Err(Fail::Skip(Skip::Changed)) };
+        let Some(id) = &b.remote else { return Ok(()) };
+        let Some(now) = self.cloud.item(id).await? else { return Ok(()) };
+        let agreed = match (now.qxh, b.hash) {
+            (Some(now_hash), Some(hash)) => now_hash == hash && now.size == b.size,
+            _ => now.size == b.size && now.etag.as_deref() == Some(b.remote_etag.as_str()),
+        };
+        if !agreed {
+            return Ok(());
+        }
+        store.write(|o| Ok::<_, Fail>(o.upsert_item(&now, false)?)).await?;
+        Err(Fail::Skip(Skip::Changed))
+    }
+
     /// Settles every record a round that was cut short left, including
     /// one under [`PENDING`] itself, where versions that ran one operation
     /// at a time kept theirs.
@@ -2861,6 +2889,13 @@ fn link_ok(o: &Ops<'_>, link: Link) -> oneup_store::Result<bool> {
         Link::New => true,
         Link::Existing(sid) => o.synced_get(sid)?.is_some(),
     })
+}
+
+/// Refuses to give a new row to a local item that has one. Planned before a
+/// round's start settled what a cut-short round left (`recover_all`), which can
+/// link this item again: the next round plans it from what's true now.
+fn need_unlinked(o: &Ops<'_>, id: LocalId, link: Link) -> Res {
+    need(link != Link::New || o.synced_by_local(id.0)?.is_none())
 }
 
 fn link_row(o: &Ops<'_>, link: Link, b: Base) -> Res {
