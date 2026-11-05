@@ -393,7 +393,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
     let lloc = local_loc(t, &l)?;
     let rloc = remote_loc(t, &r)?;
     let lm = lloc != here;
-    let rm = rloc != here;
+    // Moved here, and stepping aside in the cloud when a crash cut that short:
+    // the cloud didn't move it anywhere, so this PC's move still goes up.
+    let rm = rloc != here && !(lm && stepped_aside(&rloc, &here));
     if cx.backup && (lm || rm) {
         // One-way: the cloud follows this PC's layout, whoever moved it.
         if lm && rm && lloc == rloc {
@@ -592,6 +594,16 @@ fn move_remote_to<T: Trees + ?Sized>(
     Ok(())
 }
 
+/// Whether `at` is the agreed location `here` under a staging name of its name:
+/// an item stepping aside (`resolve::step_aside`) whose row a crash kept from
+/// being updated. That's no move anyone asked for.
+fn stepped_aside(at: &Option<(Sid, String)>, here: &Option<(Sid, String)>) -> bool {
+    match (at, here) {
+        (Some((p, n)), Some((q, m))) => p == q && n != m && fold(real_name(n)) == fold(m),
+        _ => false,
+    }
+}
+
 /// Deleted locally (with evidence), present in the cloud.
 fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -> Result<(), T::Error> {
     if cx.backup {
@@ -606,7 +618,7 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
     // deleted, and the cloud's keeps its name. Unchanged there (the conflict
     // was planned from a listing behind the cloud), it still comes back.
     let detached = b.local.is_none();
-    if rc || rloc != here || detached {
+    if rc || (rloc != here && !stepped_aside(&rloc, &here)) || detached {
         // Changed or moved in the cloud since: that change wins over the
         // deletion. Re-create it here at the cloud's location.
         let Some((psid, name)) = rloc else { return Ok(()) };
@@ -641,7 +653,7 @@ fn remote_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode) -
     // was synced, so the cloud's recycle bin and version history hold it.
     let lc = b.kind == NodeKind::File && local_change(b, &l) == LocalChange::Changed;
     // One-way: what this PC has, the cloud gets back.
-    if lc || lloc != here || cx.backup {
+    if lc || (lloc != here && !stepped_aside(&lloc, &here)) || cx.backup {
         let Some((psid, name)) = lloc else { return Ok(()) };
         if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
             return Ok(());

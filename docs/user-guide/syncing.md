@@ -141,6 +141,7 @@ A new file over 4 MiB usually keeps its date on your other PCs. New files of 4 M
 
 ## Nothing is lost
 * **Changed on one side only?** No conflict copy, whatever the change: an app replacing a file or rebuilding a folder, a file moved or deleted and uploaded again, or a file replaced by a folder of the same name. The same content on both sides is one file.
+  * A folder like this that holds items your rules exclude stays in OneDrive, named `name.oneup-staging-1`, holding those items. Delete it on onedrive.com when you no longer need them.
 * **Edited on both sides?** You get both. Your PC's copy is renamed to `name (conflict 1).ext` and uploaded, and the OneDrive version keeps the original name.
   * If the OneDrive edit lands in the last moment of a large upload from your PC, your PC's version keeps the original name instead and the OneDrive version arrives as `name (conflict 1).ext`. The activity log says so.
 * **Deleted on your PC?** The OneDrive copy goes to OneDrive's recycle bin, where you can restore it from the website.

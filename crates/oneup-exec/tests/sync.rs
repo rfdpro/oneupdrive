@@ -9369,3 +9369,75 @@ async fn a_folder_deleted_and_uploaded_again_in_onedrive_makes_no_conflict() {
     assert!(names(&there).iter().all(|n| !n.contains("(conflict") && !n.contains("staging")), "{:?}", names(&there));
     assert!(!there.contains_key("/site/deep/page.html"));
 }
+
+/// A crash anywhere while a folder steps aside for a file taking its name, in
+/// either direction, isn't taken for a move: still only one side changed, so no
+/// conflict name.
+#[tokio::test]
+async fn a_crash_while_a_folder_steps_aside_makes_no_conflict() {
+    for here in [true, false] {
+        let mut crashed = false;
+        for n in 0..12 {
+            let cloud = Fake::new();
+            let mut s = Sync::on_disk(&format!("step-aside-crash-{here}-{n}"), cloud.clone());
+            write(&s.p("thing/child.txt"), b"child");
+            s.settle().await;
+            if here {
+                std::fs::remove_dir_all(s.p("thing")).unwrap();
+                write(&s.p("thing"), b"now a file");
+            } else {
+                cloud.delete_tree("thing");
+                cloud.add("thing", Some(b"now a file"));
+            }
+            s.exec.crash_after(Some(n));
+            let mut cut = false;
+            for _ in 0..4 {
+                cut |= s.attempt().await.halted.as_deref() == Some(CRASHED);
+                if cut {
+                    break;
+                }
+            }
+            crashed |= cut;
+            s.exec.crash_after(None);
+            let mut s = s.restart();
+            s.settle().await;
+            let there = cloud.tree();
+            assert_eq!(local_tree(&s.dir.0), there, "here {here}, crash {n}");
+            assert_eq!(there["/thing"].as_deref(), Some(&b"now a file"[..]), "here {here}, crash {n}");
+            assert_eq!(names(&there).into_iter().collect::<Vec<_>>(), ["/thing"], "here {here}, crash {n}");
+        }
+        assert!(crashed, "no crash point reached");
+    }
+}
+
+/// Moved here and stepping aside in OneDrive when a crash came: this PC's move
+/// still happens, and the staging name doesn't last.
+#[tokio::test]
+async fn a_crash_while_a_moved_file_steps_aside_keeps_the_move() {
+    for n in 0..8 {
+        let cloud = Fake::new();
+        let mut s = Sync::on_disk(&format!("step-aside-moved-crash-{n}"), cloud.clone());
+        write(&s.p("report"), b"text");
+        s.settle().await;
+        std::fs::rename(s.p("report"), s.p("tmp")).unwrap();
+        std::fs::create_dir(s.p("report")).unwrap();
+        std::fs::rename(s.p("tmp"), s.p("report/report")).unwrap();
+        s.exec.crash_after(Some(n));
+        for _ in 0..4 {
+            if s.attempt().await.halted.as_deref() == Some(CRASHED) {
+                break;
+            }
+        }
+        s.exec.crash_after(None);
+        let mut s = s.restart();
+        s.settle().await;
+        let there = cloud.tree();
+        assert_eq!(local_tree(&s.dir.0), there, "crash {n}");
+        assert_eq!(there["/report/report"].as_deref(), Some(&b"text"[..]), "crash {n}");
+        assert!(
+            names(&there).iter().all(|n| !n.contains("(conflict") && !n.contains("staging")),
+            "{:?}",
+            names(&there)
+        );
+    }
+}
