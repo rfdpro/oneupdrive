@@ -79,9 +79,37 @@ pub fn plan_flow<T: Trees + ?Sized>(
             reason: HoldReason::MissingWithoutEvidence,
         }]);
     }
+    let mut plans = Vec::new();
+    let mut remade = std::collections::HashSet::new();
+    // Linking a folder made again comes first: another folder's plan can ask
+    // for the same folder to be made ("resurrected", for something moved into
+    // it in the cloud), which would need the name the new folder has.
     let mut ops = Vec::new();
     for sid in folders {
-        ops.extend(merge::plan_folder(t, sid, flow)?);
+        let mut plan = merge::plan_folder(t, sid, flow)?;
+        let mut links = Vec::new();
+        for op in &plan {
+            if let Op::Record(b) = op
+                && b.kind == NodeKind::Folder
+                && t.base(b.sid)?.is_some_and(|now| now.local != b.local)
+            {
+                remade.insert(b.sid);
+                links.push(b.sid);
+            }
+        }
+        if !links.is_empty() {
+            let (first, rest) = plan
+                .into_iter()
+                .partition(|op| matches!(op, Op::Record(b) if b.kind == NodeKind::Folder && links.contains(&b.sid)));
+            ops.extend::<Vec<Op>>(first);
+            plan = rest;
+        }
+        plans.push((sid, plan));
+    }
+    for (sid, plan) in plans {
+        if remade.is_empty() || !merge::under_remade(t, sid, &remade)? {
+            ops.extend(plan);
+        }
     }
     let ops = resolve::resolve(t, ops, flow == Flow::Backup)?;
     if flow == Flow::TwoWay {

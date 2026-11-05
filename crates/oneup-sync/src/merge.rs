@@ -11,7 +11,7 @@
 //! Names chosen here (conflict copies) are only a first guess. The resolve
 //! pass ([`crate::resolve`]) is the authority on whether a name is free.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::Flow;
 use crate::model::{
@@ -229,21 +229,121 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
     let mut base_kids = t.base_children(sid)?;
     base_kids.sort_by_key(|b| b.sid);
     let mut adopted: HashMap<Sid, LocalNode> = HashMap::new();
+    let mut remade = HashMap::new();
     for b in &base_kids {
         if b.kind == NodeKind::File && matches!(local_of(t, b)?, Seen::Deleted) {
             let key = fold(&b.name);
             if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::File && fold(&n.name) == key) {
                 adopted.insert(b.sid, new_local.remove(i));
             }
+        } else if may_be_remade(t, b)? {
+            let key = fold(&b.name);
+            if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::Folder && fold(&n.name) == key) {
+                remade.insert(b.sid, new_local.remove(i).id);
+            }
         }
     }
 
     for b in base_kids {
+        if let Some(id) = remade.remove(&b.sid) {
+            cx.out.push(Op::Record(Base { local: Some(id), ..b }));
+            continue;
+        }
         let adopted = adopted.remove(&b.sid);
+        if same_file_again(&mut cx, &b, adopted.as_ref(), &mut new_remote)? {
+            continue;
+        }
         decide_synced(&mut cx, b, adopted)?;
     }
     decide_new(&mut cx, new_local, new_remote)?;
     Ok(cx.out)
+}
+
+/// A Synced file deleted in the cloud, with a new cloud file of its name in the
+/// same place (deleted and uploaded again), while this PC's file looks changed
+/// (a new last-write time is enough). If the two have the same content there's
+/// nothing to keep both of: the row takes the new item, and this returns true.
+/// Different content takes the usual way, which keeps both.
+fn same_file_again<T: Trees + ?Sized>(
+    cx: &mut Ctx<'_, T>,
+    b: &Base,
+    adopted: Option<&LocalNode>,
+    new_remote: &mut Vec<RemoteNode>,
+) -> Result<bool, T::Error> {
+    let t = cx.t;
+    if b.kind != NodeKind::File || !matches!(remote_of(t, b)?, Seen::Deleted) {
+        return Ok(false);
+    }
+    let l = match adopted {
+        Some(n) => n.clone(),
+        None => match local_of(t, b)? {
+            Seen::Present(n) => n,
+            _ => return Ok(false),
+        },
+    };
+    if local_change(b, &l) != LocalChange::Changed
+        || l.kind != NodeKind::File
+        || local_loc(t, &l)? != b.parent.map(|p| (p, b.name.clone()))
+    {
+        return Ok(false);
+    }
+    let key = fold(&b.name);
+    let Some(i) = new_remote.iter().position(|r| r.kind == NodeKind::File && fold(&r.name) == key) else {
+        return Ok(false);
+    };
+    let r = &new_remote[i];
+    if r.size != l.size || r.hash.is_none() {
+        return Ok(false);
+    }
+    match l.hash {
+        None => cx.out.push(Op::Hash(lpre(&l))),
+        Some(h) if r.hash == Some(h) => cx.out.push(Op::Record(Base {
+            local: Some(l.id),
+            local_mtime: l.mtime,
+            size: r.size,
+            hash: r.hash,
+            remote: Some(r.id.clone()),
+            remote_etag: r.etag.clone(),
+            ..b.clone()
+        })),
+        Some(_) => return Ok(false),
+    }
+    new_remote.remove(i);
+    Ok(true)
+}
+
+/// Whether Synced folder `b` is deleted here while the cloud's is still where
+/// it was. A new folder of its name in the same place is then the same folder,
+/// deleted and made again (as build tools do). Like an atomic save, it keeps its
+/// Synced row and its cloud item. Deletions under it still need their own evidence.
+fn may_be_remade<T: Trees + ?Sized>(t: &T, b: &Base) -> Result<bool, T::Error> {
+    if b.kind != NodeKind::Folder || b.local.is_none() || !matches!(local_of(t, b)?, Seen::Deleted) {
+        return Ok(false);
+    }
+    let Some(parent) = b.parent else { return Ok(false) };
+    let Seen::Present(r) = remote_of(t, b)? else { return Ok(false) };
+    Ok(r.kind == NodeKind::Folder && remote_loc(t, &r)? == Some((parent, b.name.clone())))
+}
+
+/// Whether Synced folder `sid` is, or is under, one of the folders in `remade`
+/// that a parent's plan links this round. Every folder between is deleted here
+/// too. Its contents aren't deleted, they're in the new folder, which only the
+/// next round sees: `Op::Record` marks them to be planned then.
+pub(crate) fn under_remade<T: Trees + ?Sized>(t: &T, sid: Sid, remade: &HashSet<Sid>) -> Result<bool, T::Error> {
+    let mut at = t.base(sid)?;
+    while let Some(b) = at {
+        if !matches!(local_of(t, &b)?, Seen::Deleted) {
+            return Ok(false);
+        }
+        if remade.contains(&b.sid) {
+            return Ok(true);
+        }
+        at = match b.parent {
+            Some(p) => t.base(p)?,
+            None => None,
+        };
+    }
+    Ok(false)
 }
 
 fn hold(b: &Base, reason: HoldReason) -> Op {
@@ -293,7 +393,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
     let lloc = local_loc(t, &l)?;
     let rloc = remote_loc(t, &r)?;
     let lm = lloc != here;
-    let rm = rloc != here;
+    // Moved here, and stepping aside in the cloud when a crash cut that short:
+    // the cloud didn't move it anywhere, so this PC's move still goes up.
+    let rm = rloc != here && !(lm && stepped_aside(&rloc, &here));
     if cx.backup && (lm || rm) {
         // One-way: the cloud follows this PC's layout, whoever moved it.
         if lm && rm && lloc == rloc {
@@ -492,6 +594,16 @@ fn move_remote_to<T: Trees + ?Sized>(
     Ok(())
 }
 
+/// Whether `at` is the agreed location `here` under a staging name of its name:
+/// an item stepping aside (`resolve::step_aside`) whose row a crash kept from
+/// being updated. That's no move anyone asked for.
+fn stepped_aside(at: &Option<(Sid, String)>, here: &Option<(Sid, String)>) -> bool {
+    match (at, here) {
+        (Some((p, n)), Some((q, m))) => p == q && n != m && fold(real_name(n)) == fold(m),
+        _ => false,
+    }
+}
+
 /// Deleted locally (with evidence), present in the cloud.
 fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -> Result<(), T::Error> {
     if cx.backup {
@@ -506,7 +618,7 @@ fn local_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, r: RemoteNode) -
     // deleted, and the cloud's keeps its name. Unchanged there (the conflict
     // was planned from a listing behind the cloud), it still comes back.
     let detached = b.local.is_none();
-    if rc || rloc != here || detached {
+    if rc || (rloc != here && !stepped_aside(&rloc, &here)) || detached {
         // Changed or moved in the cloud since: that change wins over the
         // deletion. Re-create it here at the cloud's location.
         let Some((psid, name)) = rloc else { return Ok(()) };
@@ -541,7 +653,7 @@ fn remote_gone<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode) -
     // was synced, so the cloud's recycle bin and version history hold it.
     let lc = b.kind == NodeKind::File && local_change(b, &l) == LocalChange::Changed;
     // One-way: what this PC has, the cloud gets back.
-    if lc || lloc != here || cx.backup {
+    if lc || (lloc != here && !stepped_aside(&lloc, &here)) || cx.backup {
         let Some((psid, name)) = lloc else { return Ok(()) };
         if b.kind == NodeKind::Folder && base_within(t, psid, b.sid)? {
             return Ok(());

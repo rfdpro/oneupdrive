@@ -305,6 +305,26 @@ impl Ops<'_> {
 
     /// Marks the Synced items `synced` and their folders for planning (new
     /// evidence about them that no tree write recorded).
+    /// Marks Synced folder `sid` and every Synced folder under it, with new
+    /// numbers so a round under way doesn't clear them. For a folder that
+    /// changed its local ID: what's under it was waiting for that, and what
+    /// was moved into one is planned with it ([`SCOPE`]).
+    pub fn dirty_mark_folders_under(&self, sid: Sid) -> Result<()> {
+        const UNDER: &str = "WITH RECURSIVE t(sid) AS (
+                 SELECT ?2
+                 UNION ALL
+                 SELECT s.sid FROM synced_item s JOIN t ON s.parent_sid = t.sid WHERE s.kind = 1
+             )";
+        let params = rusqlite::params![SYNCED, sid as i64];
+        self.c
+            .prepare_cached(&format!("{UNDER} DELETE FROM dirty WHERE side = ?1 AND id IN (SELECT sid FROM t)"))?
+            .execute(params)?;
+        self.c
+            .prepare_cached(&format!("{UNDER} INSERT INTO dirty(side, id) SELECT ?1, sid FROM t"))?
+            .execute(params)?;
+        Ok(())
+    }
+
     pub fn dirty_mark_synced(&self, synced: &[Sid]) -> Result<()> {
         let mut mark = self.c.prepare_cached(
             "INSERT INTO dirty(side, id) SELECT ?1, ?2 WHERE ?2 IS NOT NULL

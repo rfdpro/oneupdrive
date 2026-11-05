@@ -17,8 +17,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::merge::{STAGING, conflict_name, lpre, real_name};
-use crate::model::{LocalId, NodeKind, RemoteId, Trees, fold};
+use crate::merge::{STAGING, conflict_name, local_loc, lpre, real_name, remote_loc, rpre};
+use crate::model::{Base, LocalId, NodeKind, RemoteId, Seen, Trees, fold, local_of, remote_of};
 use crate::op::{Dir, Op, Vacates};
 
 /// The current occupants of one folder: folded name → item.
@@ -112,7 +112,7 @@ pub(crate) fn resolve<T: Trees + ?Sized>(t: &T, ops: Vec<Op>, backup: bool) -> R
     }
 
     // 2. Free names.
-    let leaving: HashSet<Vacates> = kept.iter().filter_map(Op::vacates).collect();
+    let mut leaving: HashSet<Vacates> = kept.iter().filter_map(Op::vacates).collect();
     let mut names = Names { t, occupants: BTreeMap::new(), claimed: BTreeSet::new() };
     let mut out = Vec::with_capacity(kept.len());
     for mut op in kept {
@@ -124,13 +124,32 @@ pub(crate) fn resolve<T: Trees + ?Sized>(t: &T, ops: Vec<Op>, backup: bool) -> R
         let mover = op.mover();
         let occupant = names.occupants(&dir)?.get(&key).cloned().filter(|o| Some(o) != mover.as_ref());
         let claimed = names.claimed.contains(&(dir.clone(), key));
+        let mut stays = occupant.as_ref().is_some_and(|o| !leaving.contains(o));
+        if stays
+            && !backup
+            && let Some(o) = &occupant
+            && let Some(b) = going(t, o)?
+        {
+            let busy = sids.contains(&b.sid)
+                || matches!(o, Vacates::Local(z) if locals.contains(z))
+                || matches!(o, Vacates::Remote(z) if remotes.contains(z));
+            if !busy && let Some(aside) = step_aside(&mut names, &b, o, &dir, &name)? {
+                let (s, l, r) = aside.subjects();
+                sids.extend(s);
+                locals.extend(l);
+                remotes.extend(r);
+                leaving.insert(o.clone());
+                out.push(aside);
+                stays = false;
+            }
+        }
 
         match occupant {
             None if !claimed => {
                 names.claim(dir, &name);
                 out.push(op);
             }
-            Some(o) if !leaving.contains(&o) && !claimed => {
+            Some(o) if stays && !claimed => {
                 // Taken by an item that stays.
                 let busy = Busy { locals: &locals, remotes: &remotes, backup };
                 if let Some(op) = blocked(&mut names, op, &dir, &name, o, &busy)? {
@@ -156,6 +175,70 @@ pub(crate) fn resolve<T: Trees + ?Sized>(t: &T, ops: Vec<Op>, backup: bool) -> R
         }
     }
     Ok(out)
+}
+
+/// `occupant`'s Synced row, if it's on its way out though no operation this
+/// round moves it. It's still where the row says on its own side, and on the
+/// other side it's a folder deleted (it goes once it's empty) or an item moved
+/// away (it follows once its new folder is here). The item that wants the name
+/// may be that new folder, or what's being kept from the deleted one, so waiting
+/// could last for ever: it steps aside instead ([`step_aside`]).
+fn going<T: Trees + ?Sized>(t: &T, occupant: &Vacates) -> Result<Option<Base>, T::Error> {
+    let here = |b: &Base| b.parent.map(|p| (p, b.name.clone()));
+    let is_going = |b: Base, gone: bool, there| (gone && b.kind == NodeKind::Folder || there).then_some(b);
+    Ok(match occupant {
+        Vacates::Remote(id) => match (t.base_by_remote(id)?, t.remote(id)?) {
+            (Some(b), Seen::Present(r)) if remote_loc(t, &r)? == here(&b) => match local_of(t, &b)? {
+                Seen::Deleted => is_going(b, true, false),
+                Seen::Present(l) => {
+                    let moved = local_loc(t, &l)? != here(&b);
+                    is_going(b, false, moved)
+                }
+                Seen::Missing => None,
+            },
+            _ => None,
+        },
+        Vacates::Local(id) => match (t.base_by_local(*id)?, t.local(*id)?) {
+            (Some(b), Seen::Present(l)) if local_loc(t, &l)? == here(&b) => match remote_of(t, &b)? {
+                Seen::Deleted => is_going(b, true, false),
+                Seen::Present(r) => {
+                    let moved = remote_loc(t, &r)? != here(&b);
+                    is_going(b, false, moved)
+                }
+                Seen::Missing => None,
+            },
+            _ => None,
+        },
+    })
+}
+
+/// Moves `occupant` to a staging name in `dir`, and records it there, so what
+/// it was going to do happens from that name. Should it stay after all (the
+/// deleted folder changed meanwhile), it gets its name back, or a conflict name
+/// if that's taken by then: that was a change on both sides.
+fn step_aside<T: Trees + ?Sized>(
+    names: &mut Names<'_, T>,
+    b: &Base,
+    occupant: &Vacates,
+    dir: &Dir,
+    name: &str,
+) -> Result<Option<Op>, T::Error> {
+    let t = names.t;
+    let Some(parent) = b.parent else { return Ok(None) };
+    let staged = names.staging_name(dir, name)?;
+    let op = match (occupant, dir) {
+        (Vacates::Local(id), Dir::Local(to)) => match t.local(*id)?.present() {
+            Some(n) => Op::MoveLocal { sid: b.sid, local: lpre(n), to: *to, parent, name: staged.clone() },
+            None => return Ok(None),
+        },
+        (Vacates::Remote(id), Dir::Remote(to)) => match t.remote(id)?.present() {
+            Some(n) => Op::MoveRemote { sid: b.sid, remote: rpre(n), to: to.clone(), parent, name: staged.clone() },
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    names.claim(dir.clone(), &staged);
+    Ok(Some(op))
 }
 
 /// Items with an operation this round, and the pair's flow.
