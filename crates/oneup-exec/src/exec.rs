@@ -355,7 +355,7 @@ impl From<FxError> for Fail {
         }
         match e {
             FxError::Changed => Fail::Skip(Skip::Changed),
-            FxError::Busy => Fail::Skip(Skip::Busy),
+            FxError::Busy | FxError::FolderNotPlaceholder => Fail::Skip(Skip::Busy),
             FxError::NameTaken => Fail::Skip(Skip::NameTaken),
             FxError::NotEmpty => Fail::Skip(Skip::NotEmpty),
             FxError::DatabaseWaits => Fail::Skip(Skip::Database),

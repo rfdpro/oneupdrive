@@ -843,6 +843,26 @@ pub fn revert_orphan(f: &File) -> Result<()> {
     win("CfRevertPlaceholder", unsafe { CfRevertPlaceholder(handle(f), CF_REVERT_FLAG_NONE, None) })
 }
 
+/// Turns an ordinary **folder** into a placeholder in sync with `identity`.
+/// A folder has no content to protect, so unlike a file's
+/// ([`Exclusive::convert`]) the handle needs only attribute access and may
+/// share everything: a console whose current folder it is doesn't block
+/// it (measured).
+pub fn convert_folder(f: &File, identity: &[u8]) -> Result<()> {
+    // SAFETY: the identity outlives the synchronous call.
+    let r = unsafe {
+        CfConvertToPlaceholder(
+            handle(f),
+            Some(identity.as_ptr().cast()),
+            identity.len() as u32,
+            CF_CONVERT_FLAG_MARK_IN_SYNC,
+            None,
+            None,
+        )
+    };
+    win("CfConvertToPlaceholder", r)
+}
+
 /// A file opened so no other program can open it meanwhile (share none):
 /// what every change of placeholder content goes through, after the caller
 /// verified the content through it (invariants 5 and 11).
