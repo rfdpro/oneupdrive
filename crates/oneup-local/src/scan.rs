@@ -49,6 +49,8 @@ pub enum Error {
     NotAFolder(PathBuf),
     #[error("{} is a link to another location; scan the folder it points to instead", .0.display())]
     RootIsLink(PathBuf),
+    #[error("the scanned folder is gone or was replaced")]
+    RootChanged,
     #[error(
         "can't scan {}: only folders on local NTFS or ReFS drives are supported for now ({source})",
         path.display()
@@ -164,7 +166,17 @@ fn now_ms() -> i64 {
 impl Scan {
     /// Opens `path` for scanning: resumes a matching unfinished scan, or
     /// starts a new one (discarding whatever was stored before).
-    pub fn open(mut store: Store, path: &Path, cfg: Config) -> Result<Self> {
+    pub fn open(store: Store, path: &Path, cfg: Config) -> Result<Self> {
+        Self::open_with(store, path, cfg, false)
+    }
+
+    /// Like [`Self::open`], but refuses a different root before changing
+    /// the stored tree. Automatic recovery must never adopt another folder.
+    pub fn open_existing(store: Store, path: &Path, cfg: Config) -> Result<Self> {
+        Self::open_with(store, path, cfg, true)
+    }
+
+    fn open_with(mut store: Store, path: &Path, cfg: Config, existing: bool) -> Result<Self> {
         // Before anything is looked at: otherwise Windows may disguise cloud
         // placeholders as ordinary files, in listings and on handles alike.
         oneup_cfapi::expose_placeholders()?;
@@ -196,6 +208,10 @@ impl Scan {
 
         let rules = cfg.rules.fingerprint();
         let previous = store.read(|o| o.local_root())?;
+        if existing && previous.as_ref().is_none_or(|p| p.volume_serial != volume_serial || p.root_file_id != root_id.0)
+        {
+            return Err(Error::RootChanged);
+        }
         let start = match &previous {
             None => Start::Fresh,
             Some(p) if p.volume_serial != volume_serial || p.root_file_id != root_id.0 => {

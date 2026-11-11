@@ -3223,6 +3223,12 @@ async fn observe_with(
     let cfg = oneup_local::Config::new(rules.clone());
     tokio::task::spawn_blocking(move || -> Result<Store> {
         let mut store = store;
+        // A crash or update can interrupt the first scan or a rescan.
+        // Finish its durable queue before opening the journal observer,
+        // which requires a finished scan and otherwise stops the agent.
+        if store.read(|o| Ok(o.local_root()?.is_some_and(|r| r.finished_at_ms.is_none())))? {
+            return rescan(store, cfg, Rescan::ScanUnfinished, seen);
+        }
         // Changed listing rules: adjust the stored tree instead of rescanning.
         let rules = cfg.rules.clone();
         if let Some(r) = store.write(|o| oneup_local::observe::reapply_rules(o, &rules))? {
@@ -3266,14 +3272,13 @@ fn rescan(
     why: oneup_local::observe::Rescan,
     seen: &oneup_local::observe::SeenDeletes,
 ) -> Result<Store> {
-    use oneup_local::scan::{Replaced, Start};
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
-    println!("The PC's change record can't be followed any more ({why}); looking the synced folder through again …");
+    println!("Updating the folder scan ({why}) …");
     tracing::info!(%why, "rescanning the synced folder");
-    let mut scan = oneup_local::Scan::open(store, Path::new(&root.path), cfg.clone())?;
-    if scan.start() != Start::Replaced(Replaced::Finished) {
-        bail!(Halted(format!("the synced folder can't be rescanned as it was ({:?})", scan.start())));
-    }
+    let mut scan = match oneup_local::Scan::open_existing(store, Path::new(&root.path), cfg.clone()) {
+        Err(oneup_local::scan::Error::RootChanged) => bail!(Halted("the synced folder was replaced".into())),
+        other => other?,
+    };
     let summary = scan.run()?;
     if !summary.finished {
         bail!("the rescan was interrupted");
@@ -4291,6 +4296,89 @@ mod tests {
         let line = Line { to: Some(name.into()), ..Line::new(CONFLICT_ACTION, "/docs/a.txt".into(), CONFLICT_NOTE) };
         assert_eq!(conflict_copy_name(&line.detail()), Some(name));
         assert_eq!(conflict_copy_name("-> b.txt; renamed"), None);
+    }
+
+    /// A scan interrupted after committing a batch carries on at the next
+    /// observation, including changes made in folders already listed.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn everyday_an_interrupted_scan_finishes_on_next_observation() {
+        #![allow(clippy::unwrap_used)]
+        for rescan in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("child")).unwrap();
+            std::fs::write(dir.path().join("child/a.txt"), b"a").unwrap();
+            let rules = ExcludeSet::none();
+            let cfg = oneup_local::Config::new(rules.clone());
+            let mut scan = oneup_local::Scan::open(Store::open_in_memory().unwrap(), dir.path(), cfg.clone()).unwrap();
+            if rescan {
+                assert!(scan.run().unwrap().finished);
+                scan = oneup_local::Scan::open(scan.into_store(), dir.path(), cfg).unwrap();
+            }
+            assert!(scan.step().unwrap());
+            let root = scan.root().clone();
+            assert!(root.finished_at_ms.is_none());
+            // This folder's batch is already committed: the journal must
+            // catch this create even when only the child remains queued.
+            std::fs::write(dir.path().join("b.txt"), b"made after the first batch").unwrap();
+
+            let store = observe(scan.into_store(), &rules).await.unwrap();
+            let done = store.read(|o| o.local_root()).unwrap().unwrap();
+            assert!(done.finished_at_ms.is_some());
+            assert_eq!(done.started_at_ms, root.started_at_ms, "resumes the committed scan");
+            assert_eq!(store.read(|o| o.local_stats()).unwrap().files, 2);
+            assert!(store.read(|o| o.check_invariants()).unwrap().is_empty());
+            assert!(store.read(|o| o.activity_recent(None, 5)).unwrap().iter().any(|e| e.action == "rescan"));
+        }
+    }
+
+    /// A rescan started after a deletion has no journal evidence for it.
+    /// Resuming that scan must keep it missing, never infer a deletion.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn everyday_an_interrupted_rescan_keeps_missing_files_without_evidence() {
+        #![allow(clippy::unwrap_used)]
+        use oneup_sync::{Base, LocalId, NodeKind, ROOT, RemoteId, Seen, Trees};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("child")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"keep in OneDrive").unwrap();
+        let rules = ExcludeSet::none();
+        let cfg = oneup_local::Config::new(rules.clone());
+        let mut scan = oneup_local::Scan::open(Store::open_in_memory().unwrap(), dir.path(), cfg.clone()).unwrap();
+        assert!(scan.run().unwrap().finished);
+        let mut store = scan.into_store();
+        let top = store.read(|o| o.local_root()).unwrap().unwrap().root_file_id;
+        let file = store.read(|o| o.local_named(top, "a.txt")).unwrap()[0].clone();
+        store
+            .write(|o| {
+                let base = |sid, name: &str, local, kind| Base {
+                    sid,
+                    parent: (sid != ROOT).then_some(ROOT),
+                    name: name.into(),
+                    kind,
+                    size: 0,
+                    hash: None,
+                    local: Some(LocalId(local)),
+                    local_mtime: 0,
+                    remote: Some(RemoteId(format!("r{sid}"))),
+                    remote_etag: String::new(),
+                };
+                o.synced_put(&base(ROOT, "", top, NodeKind::Folder))?;
+                o.synced_put(&base(1, "a.txt", file.file_id, NodeKind::File))
+            })
+            .unwrap();
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        let mut scan = oneup_local::Scan::open(store, dir.path(), cfg).unwrap();
+        assert!(scan.step().unwrap());
+        let store = observe(scan.into_store(), &rules).await.unwrap();
+        store
+            .read(|o| {
+                assert_eq!(o.local(LocalId(file.file_id))?, Seen::Missing);
+                assert!(o.synced_by_local(file.file_id)?.is_some());
+                assert!(o.check_invariants()?.is_empty());
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// After the journal lost track (simulated: the saved position moved

@@ -19,4 +19,6 @@ On Windows 11, if you don't see it in the first right-click menu, it's under **S
 
 The menu and the status show in folders OneUpDrive registers with Windows: those using Files On-Demand (and vaults).
 
+If Files On-Demand was enabled before Explorer integration was installed, OneUpDrive adds the folder to Explorer the next time syncing starts. The files and their download state stay as they are.
+
 These need OneUpDrive installed from its setup program, which registers it with Windows. OneUpDrive's menu code runs in a separate helper process, never inside File Explorer itself, so it can't slow down or crash Explorer.
