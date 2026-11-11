@@ -6354,7 +6354,10 @@ async fn everyday_a_hook_fires_once_per_coalesced_change() {
     s.policy = Policy { max_count: 100_000, min_count: 100_000, ..Policy::default() };
     // What it runs doesn't matter here (the benchmark below starts real
     // programs); below-normal programs on a busy PC would only slow it.
-    let (runner, fired, bad) = burst_hook(&s.dir.0, Duration::from_secs(8), Arc::new(NoProgram));
+    // Both rounds must land within the coalescing time; on a PC busy with
+    // the other tests (Cloud Files ones start programs), 8 s wasn't always
+    // enough.
+    let (runner, fired, bad) = burst_hook(&s.dir.0, Duration::from_secs(20), Arc::new(NoProgram));
     let offer = |s: &Sync, r: &Report| runner.offer(&hook_events(s, r));
     let n = 300;
     for i in 0..n {
