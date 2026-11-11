@@ -547,7 +547,7 @@ mod tests {
     fn a_page_reads_no_whole_table() {
         let mut s = Store::open_in_memory().unwrap();
         s.write(|o| o.upsert_item(&row("R", None, Kind::Root), false)).unwrap();
-        s.log_statements();
+        s.log_statements().unwrap();
         Store::take_statements();
         s.read(|o| o.shared_page(Some("A"), 10)).unwrap();
         s.write(|o| o.mark_shared_if_held("A", None)).unwrap();

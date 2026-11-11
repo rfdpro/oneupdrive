@@ -13,7 +13,7 @@ A Windows OneDrive client rebuilt from scratch in Rust.<br>
 [![Latest release](https://img.shields.io/github/v/release/rfdpro/oneupdrive?include_prereleases&label=release)](https://github.com/rfdpro/oneupdrive/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?logo=windows)](docs/user-guide/getting-started.md#what-youll-need)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
 
 [**Download**](https://github.com/rfdpro/oneupdrive/releases/latest) ·
 [User guide](docs/user-guide/README.md) ·

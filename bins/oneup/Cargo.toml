@@ -81,7 +81,7 @@ oneup-effects = { path = "../../crates/oneup-effects", features = ["fake"] }
 # Simulated time for the agent's waits (tests only).
 tokio = { version = "1", features = ["test-util"] }
 # Databases of older versions, to check other folders' are only read.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # Update packages to read in the update tests.
 tempfile = "3"
 

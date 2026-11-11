@@ -418,10 +418,10 @@ const SMALL_TABLES: &[&str] = &[
 impl Store {
     /// Test support: records every statement this connection runs from now
     /// on (as written, parameters unbound), until [`Store::take_statements`].
-    pub fn log_statements(&mut self) {
+    pub fn log_statements(&mut self) -> Result<()> {
         self.conn.trace_v2(
             rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
-            Some(|e| {
+            Some(|e: rusqlite::trace::TraceEvent<'_>| {
                 if let rusqlite::trace::TraceEvent::Stmt(_, sql) = e {
                     let mut all = STATEMENTS.lock().unwrap_or_else(|p| p.into_inner());
                     if !all.iter().any(|s| s == sql) {
@@ -429,7 +429,8 @@ impl Store {
                     }
                 }
             }),
-        );
+        )?;
+        Ok(())
     }
 
     /// The statements recorded so far (by every logging connection),
@@ -1845,7 +1846,7 @@ mod tests {
     #[test]
     fn tree_scans_are_found_with_parameters_and_aliases() {
         let mut s = Store::open_in_memory().unwrap();
-        s.log_statements();
+        s.log_statements().unwrap();
         let scans = |sql: &str| s.tree_scans(&[sql.to_string()]).unwrap();
         assert_eq!(scans("SELECT count(*) FROM remote_item WHERE size > ?1").len(), 1);
         assert_eq!(scans("SELECT 1 FROM remote_item r WHERE r.size = ?1 AND r.kind = ?2").len(), 1);

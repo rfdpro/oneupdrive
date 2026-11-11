@@ -856,7 +856,7 @@ mod tests {
     fn once_built_upkeep_reads_no_whole_table() {
         let mut s = Store::open_in_memory().unwrap();
         drive(&mut s);
-        s.log_statements();
+        s.log_statements().unwrap();
         put(&mut s, 9, 2, "new.txt", Kind::File);
         put(&mut s, 3, 1, "moved and renamed.docx", Kind::File);
         // (Removing subtrees walks them: `subtree_queries_never_scan`.)
