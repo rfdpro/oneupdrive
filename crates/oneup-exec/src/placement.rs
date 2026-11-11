@@ -21,12 +21,14 @@ use oneup_sync::{LocalId, LocalPre, Op};
 pub const BATCH: usize = 32;
 
 /// The freeing work as operations for the gate: placeholders set to free
-/// up space whose content is here and whose hash is on record.
-pub fn free_ops(store: &Store) -> oneup_store::Result<Vec<Op>> {
+/// up space whose content is here and whose hash is on record. `keyed`: a
+/// vault pair's, whose files are checked by their keyed hash
+/// ([`freeing_hash`]).
+pub fn free_ops(store: &Store, keyed: bool) -> oneup_store::Result<Vec<Op>> {
     store.read(|o| {
         let mut ops = Vec::new();
         for r in o.local_to_free(BATCH)? {
-            if let Some(hash) = o.local_hash_get(r.file_id, r.size, r.mtime)? {
+            if let Some(hash) = freeing_hash(o, r.file_id, r.size, r.mtime, keyed)? {
                 ops.push(Op::Dehydrate {
                     local: LocalPre { id: LocalId(r.file_id), stamp: Some((r.size, r.mtime)) },
                     hash,
@@ -35,6 +37,20 @@ pub fn free_ops(store: &Store) -> oneup_store::Result<Vec<Op>> {
         }
         Ok(ops)
     })
+}
+
+/// The hash an [`Op::Dehydrate`] of this stamp carries: the content's
+/// QuickXorHash, or for a cloud with a [`crate::Cloud::content_key`] (a
+/// vault pair, `keyed`), the keyed hash recorded when that content was
+/// downloaded or sent. The executor and the effects layer check it again.
+pub fn freeing_hash(
+    o: &oneup_store::Ops,
+    id: u128,
+    size: i64,
+    mtime: i64,
+    keyed: bool,
+) -> oneup_store::Result<Option<oneup_sync::Hash>> {
+    if keyed { o.content_mac_get(id, size, mtime) } else { o.local_hash_get(id, size, mtime) }
 }
 
 /// Why a pass of downloads stopped before its batch was done.

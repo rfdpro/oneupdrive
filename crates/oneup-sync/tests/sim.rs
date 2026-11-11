@@ -674,6 +674,7 @@ impl World {
             // Never planned by the reconciler (`oneup cloud prune` only).
             Op::PruneRemote { .. } => panic!("the reconciler planned a prune"),
             Op::Dehydrate { .. } => panic!("the reconciler planned a dehydration"),
+            Op::Discard { .. } => panic!("the reconciler planned a discard"),
             Op::RemoveCopy { .. } => panic!("the reconciler planned removing a chosen copy"),
             Op::Rewind { sid, step } => self.rewind_step(*sid, step),
             Op::Hold { .. } => false,

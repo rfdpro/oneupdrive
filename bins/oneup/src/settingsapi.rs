@@ -154,16 +154,47 @@ pub fn vaults_json(dir: &Path) -> Value {
             .iter()
             .map(|e| {
                 let (folder, od) = crate::vaultpair::describe(e).unwrap_or_default();
+                let lock = config::load_vault_lock(&e.dir).unwrap_or_default();
                 json!({
                     "name": e.name,
                     "remote": e.remote,
                     "local": shown(&folder.to_string_lossy()),
                     "on_demand": od,
                     "hello": e.dir.join(crate::vaultpair::HELLO_FILE).exists(),
+                    "interval_minutes": crate::pace::load(&e.dir).unwrap_or_default().minutes,
+                    "keep_unsent": lock.keep_unsent,
+                    "lock_after_idle_minutes": lock.idle_minutes,
+                    "lock_with_windows": lock.with_windows,
                 })
             })
             .collect::<Vec<_>>(),
     )
+}
+
+/// Changes a vault pair's own settings (its data folder `dir`): any of
+/// `interval_minutes` (`[sync]`), `keep_unsent`, `lock_after_idle_minutes`
+/// and `lock_with_windows` (`[vault]`); the others stay.
+pub fn set_vault_settings(dir: &Path, v: &Value) -> Result<()> {
+    let mut lock = config::load_vault_lock(dir)?;
+    if let Some(b) = v.get("keep_unsent").and_then(Value::as_bool) {
+        lock.keep_unsent = b;
+    }
+    if let Some(b) = v.get("lock_with_windows").and_then(Value::as_bool) {
+        lock.with_windows = b;
+    }
+    if let Some(n) = v.get("lock_after_idle_minutes").and_then(Value::as_u64) {
+        lock.idle_minutes = u32::try_from(n)
+            .ok()
+            .filter(|m| *m <= 7 * 24 * 60)
+            .context("lock_after_idle_minutes: 0 (never) to 10080 minutes")?;
+    }
+    config::save_vault_lock(dir, &lock)?;
+    if let Some(n) = v.get("interval_minutes").and_then(Value::as_u64) {
+        let mut i = crate::pace::load(dir)?;
+        i.minutes = crate::pace::check_minutes(n)?;
+        crate::pace::save(dir, &i)?;
+    }
+    Ok(())
 }
 
 /// The extra folder pairs (`crate::pairs`), as the window lists them
@@ -1282,7 +1313,8 @@ mod tests {
             vaults_json(&dir),
             json!([{
                 "name": "Private", "remote": "/Private", "local": local.to_string_lossy(),
-                "on_demand": false, "hello": false,
+                "on_demand": false, "hello": false, "interval_minutes": 0, "keep_unsent": true,
+                "lock_after_idle_minutes": 0, "lock_with_windows": false,
             }])
         );
         std::fs::remove_dir_all(dir).unwrap();

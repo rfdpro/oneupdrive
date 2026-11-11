@@ -113,7 +113,8 @@ impl Side {
             | Op::ConflictCopy { .. }
             | Op::RecycleLocal { .. }
             | Op::RemoveCopy { remote: None, .. }
-            | Op::Dehydrate { .. } => Some(Side::Local),
+            | Op::Dehydrate { .. }
+            | Op::Discard { .. } => Some(Side::Local),
             // A synced copy goes from both sides: OneDrive's first
             // ([`changes`] says this PC too).
             Op::RemoveCopy { remote: Some(_), .. } => Some(Side::Remote),

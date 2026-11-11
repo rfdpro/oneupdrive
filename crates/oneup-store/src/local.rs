@@ -477,6 +477,21 @@ impl Ops<'_> {
         row.map(fix_local).transpose()
     }
 
+    /// Up to `limit` files whose content was on this PC when last seen (not
+    /// online-only, not empty), after file ID `after`, in file-ID order: a
+    /// walk over the primary key a page at a time. Locking a vault pair
+    /// goes through them all.
+    pub fn local_with_content(&self, after: Option<u128>, limit: usize) -> Result<Vec<LocalRow>> {
+        let mut st = self.c.prepare_cached(&format!(
+            "SELECT {LOCAL_COLS} FROM local_item WHERE file_id > ?1 AND kind = 0 AND size > 0              AND (attributes & 4194304) = 0 ORDER BY file_id LIMIT ?2"
+        ))?;
+        // An empty blob sorts before every ID.
+        let from = after.map(|a| blob(a).to_vec()).unwrap_or_default();
+        let rows =
+            st.query_map(rusqlite::params![from, i64::try_from(limit).unwrap_or(i64::MAX)], LocalRow::from_row)?;
+        rows.map(|r| fix_local(r?)).collect()
+    }
+
     /// The stored children of a folder (unordered).
     pub fn local_children(&self, parent_id: u128) -> Result<Vec<LocalRow>> {
         let mut st = self.c.prepare_cached(&format!("SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1"))?;
@@ -712,6 +727,28 @@ mod tests {
             reparse_tag: 0,
             skip: Skip::None,
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn files_with_content_come_in_pages_in_id_order() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.write(|o| {
+            o.local_put(&row(1, None, "r", LocalKind::Root))?;
+            o.local_put(&row(2, Some(1), "d", LocalKind::Folder))?;
+            o.local_put(&row(u128::MAX - 3, Some(1), "big id", LocalKind::File))?;
+            o.local_put(&row(5, Some(1), "here", LocalKind::File))?;
+            o.local_put(&LocalRow { attributes: 4_194_304, ..row(6, Some(1), "online-only", LocalKind::File) })?;
+            o.local_put(&LocalRow { size: 0, ..row(7, Some(1), "empty", LocalKind::File) })?;
+            o.local_put(&row(9, Some(2), "deeper", LocalKind::File))
+        })
+        .unwrap();
+        let page = |after, n| {
+            s.read(|o| o.local_with_content(after, n)).unwrap().iter().map(|r| r.file_id).collect::<Vec<_>>()
+        };
+        assert_eq!(page(None, 2), [5, 9]);
+        assert_eq!(page(Some(9), 2), [u128::MAX - 3]);
+        assert!(page(Some(u128::MAX - 3), 2).is_empty());
     }
 
     fn root() -> LocalRoot {

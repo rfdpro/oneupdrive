@@ -415,9 +415,179 @@ pub fn resume_vault(
     key: oneup_vault::key::Masterkey,
 ) -> Result<(Pair, Engine)> {
     let pair = pairing(store)?;
-    let fs = open_paired(store)?;
+    let mut fs = open_paired(store)?;
+    fs.set_content_key(oneup_hash::MacKey::new(key.content_mac_key()));
+    fs.set_wipe_journal(crate::vaultlock::journal(data_dir)?);
     let vault = crate::vaultpair::VaultRemote::open(data_dir, store, Arc::clone(&graph), key)?;
     Ok((pair, Engine::with_vault(fs, graph, rules, data_dir, Some(Arc::new(vault)))))
+}
+
+impl Engine {
+    /// Clears a vault pair an unclean shutdown left unlocked, while it's
+    /// locked ([`resume_locked_vault`]): a decrypted copy that is the
+    /// synced version of the cloud's current one by the records, and that
+    /// Windows still has in sync, is overwritten and freed through the gate
+    /// (`LocalFs::set_clearing_locked`). A change not sent yet is kept, or,
+    /// with `discard`, overwritten and taken back to its synced version (a
+    /// new file deleted: [`Op::Discard`]). Folders stay.
+    pub async fn clean_locked(&self, store: &mut Store, discard: bool) -> Result<Cleaned> {
+        const PAGE: usize = 256;
+        let mut out = Cleaned::default();
+        if !self.exec.local().on_demand() {
+            return Ok(out);
+        }
+        let policy = crate::versions::policy(store)?;
+        self.exec.local().set_clearing_locked(true);
+        let mut after = None;
+        let result = async {
+            loop {
+                let page = store.read(|o| o.local_with_content(after, PAGE))?;
+                let Some(last) = page.last() else { return Ok(()) };
+                after = Some(last.file_id);
+                let mut frees = Vec::new();
+                let mut unsent = Vec::new();
+                // What the rules keep out of sync isn't the vault's: left as it is.
+                for r in page.iter().filter(|r| r.skip == oneup_store::Skip::None) {
+                    let pre = oneup_sync::LocalPre { id: LocalId(r.file_id), stamp: Some((r.size, r.mtime)) };
+                    let base = store.read(|o| {
+                        let Some(b) = o.synced_by_local(r.file_id)? else { return Ok(None) };
+                        let cloud = match &b.remote {
+                            Some(id) => o.get_item(&id.0)?.and_then(|row| row.qxh),
+                            None => None,
+                        };
+                        Ok(Some((b, cloud)))
+                    })?;
+                    match base {
+                        // Unchanged here: freed if it's the cloud's current
+                        // version; one OneDrive changed since waits for the
+                        // next unlock to bring it up to date.
+                        Some((b, cloud)) if b.size == r.size && b.local_mtime == r.mtime => match b.hash {
+                            Some(hash) if b.hash == cloud => frees.push(Op::Dehydrate { local: pre, hash }),
+                            _ => out.kept += 1,
+                        },
+                        Some((b, _)) => unsent.push(Op::Discard { local: pre, synced: Some((b.size, b.local_mtime)) }),
+                        // A file a program saved by replacing the synced
+                        // one has a new ID and no record yet: deleting it
+                        // would read as deleting the synced file. Kept.
+                        None if replaces_synced(store, r)? => out.unsent += 1,
+                        None => unsent.push(Op::Discard { local: pre, synced: None }),
+                    }
+                }
+                // Refused by the effects layer: not in sync, so changed here.
+                let review = review_in(&policy, &GateContext::default(), frees);
+                out.kept += review.withheld.len();
+                let report = self.exec.run(store, review.approved).await;
+                out.freed += report.done.len();
+                for (op, _) in &report.skipped {
+                    if let Op::Dehydrate { local, .. } = op {
+                        let synced = store.read(|o| o.synced_by_local(local.id.0))?.map(|b| (b.size, b.local_mtime));
+                        unsent.push(Op::Discard { local: local.clone(), synced });
+                    }
+                }
+                out.kept += report.failed.len() + report.not_run.len();
+                if let Some(why) = report.halted {
+                    return Err(anyhow::Error::from(Halted(why)));
+                }
+                if !discard {
+                    out.unsent += unsent.len();
+                    continue;
+                }
+                let review = review_in(&policy, &GateContext::default(), unsent);
+                out.unsent += review.withheld.len();
+                let report = self.exec.run(store, review.approved).await;
+                out.discarded += report.done.len();
+                out.unsent += report.skipped.len() + report.failed.len() + report.not_run.len();
+                if let Some(why) = report.halted {
+                    return Err(anyhow::Error::from(Halted(why)));
+                }
+            }
+        }
+        .await;
+        self.exec.local().set_clearing_locked(false);
+        result?;
+        Ok(out)
+    }
+
+    /// For [`Engine::clear_vault`]: a decrypted copy without a keyed hash
+    /// (decrypted before they were recorded) gets one now, if it is the
+    /// synced version of the cloud's current one by the records and Windows
+    /// still has it in sync (`LocalFs::keyed_hash_in_sync`). Recorded, so
+    /// the executor's check finds it.
+    fn keyed_hash_now(&self, store: &mut Store, pre: &oneup_sync::LocalPre) -> Result<Option<oneup_sync::Hash>> {
+        let Some((size, mtime)) = pre.stamp else { return Ok(None) };
+        let current = store.read(|o| {
+            let Some(b) = o.synced_by_local(pre.id.0)? else { return Ok(false) };
+            let Some(r) = &b.remote else { return Ok(false) };
+            let cloud = o.get_item(&r.0)?.and_then(|row| row.qxh);
+            Ok(cloud.is_some() && b.hash == cloud && b.size == size && b.local_mtime == mtime)
+        })?;
+        if !current {
+            return Ok(None);
+        }
+        let fs = self.exec.local();
+        let Ok(Some(mac)) = tokio::task::block_in_place(|| fs.keyed_hash_in_sync(pre)) else { return Ok(None) };
+        store.write(|o| o.content_mac_put(pre.id.0, size, mtime, &mac))?;
+        Ok(Some(mac))
+    }
+}
+
+/// Whether a Synced record has the name of local file `r` in its folder
+/// (case-insensitive, as Windows compares names): the file may be a save
+/// that replaced it, whose record follows once it's sent.
+fn replaces_synced(store: &Store, r: &oneup_store::LocalRow) -> Result<bool> {
+    let Some(parent) = r.parent_id else { return Ok(false) };
+    Ok(store.read(|o| {
+        let Some(folder) = o.synced_by_local(parent)? else { return Ok(false) };
+        Ok(o.synced_children(folder.sid)?.iter().any(|b| oneup_sync::same_name(&b.name, &r.name)))
+    })?)
+}
+
+/// What clearing a locked vault pair did ([`Engine::clean_locked`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Cleaned {
+    /// Synced copies overwritten and freed.
+    pub freed: usize,
+    /// Unsent changes overwritten and taken back (`discard`).
+    pub discarded: usize,
+    /// Unsent changes left decrypted (kept by the setting, or refused:
+    /// open in a program).
+    pub unsent: usize,
+    /// Synced copies that couldn't be cleared now.
+    pub kept: usize,
+}
+
+/// What locking a vault pair cleared ([`Engine::clear_vault`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Cleared {
+    /// Decrypted copies overwritten and freed.
+    pub freed: usize,
+    /// Copies kept, by path (the first [`Cleared::NAMED`]).
+    pub kept: Vec<String>,
+    /// How many were kept in all.
+    pub kept_count: usize,
+}
+
+impl Cleared {
+    pub const NAMED: usize = 100;
+
+    fn keep(&mut self, store: &Store, id: u128) -> Result<()> {
+        self.kept_count += 1;
+        if self.kept.len() < Self::NAMED {
+            self.kept.push(store.read(|o| o.local_path_of(id))?.unwrap_or_default());
+        }
+        Ok(())
+    }
+}
+
+/// For clearing a vault pair that an unclean shutdown left unlocked, while
+/// it's locked (`crate::vaultlock::clean_after_unclean_shutdown`): its pair
+/// opened without the vault's keys, so nothing can be decrypted, sent or
+/// downloaded; only its decrypted copies are cleared
+/// ([`Engine::clean_locked`]).
+pub fn resume_locked_vault(store: &Store, graph: Arc<Graph>, rules: ExcludeSet, data_dir: &Path) -> Result<Engine> {
+    let mut fs = open_paired(store)?;
+    fs.set_wipe_journal(crate::vaultlock::journal(data_dir)?);
+    Ok(Engine::new(fs, graph, rules, data_dir))
 }
 
 /// The recorded folder pair.
@@ -1398,7 +1568,7 @@ impl Engine {
             println!("Downloaded {} file(s) set to always keep on this device.", log.len());
             log_activity(&mut store, log)?;
         }
-        let mut ops = oneup_exec::placement::free_ops(&store)?;
+        let mut ops = oneup_exec::placement::free_ops(&store, self.vault.is_some())?;
         // A folder above that keeps it (the user's pin) wins over "Free up
         // space" chosen on a folder above; on the file itself, it's freed.
         let kept = keep_by_folder(&store, &mut ops)?;
@@ -1434,6 +1604,64 @@ impl Engine {
             return Err(Halted(why).into());
         }
         Ok(store)
+    }
+
+    /// Locking a vault pair (`crate::vaultlock`): every decrypted copy on
+    /// this PC that is the synced version is overwritten and freed, pinned
+    /// ones too (they stay pinned), through the gate and the executor, a
+    /// page at a time. A copy without a keyed hash for its stamp (an edit
+    /// not sent yet) or that the effects layer refuses (open in a program,
+    /// changed meanwhile) is kept and named. Nothing for another pair.
+    pub async fn clear_vault(&self, store: &mut Store) -> Result<Cleared> {
+        const PAGE: usize = 256;
+        let mut out = Cleared::default();
+        if self.vault.is_none() || !self.exec.local().on_demand() {
+            return Ok(out);
+        }
+        let policy = crate::versions::policy(store)?;
+        self.exec.local().set_locking(true);
+        let mut after = None;
+        let result = async {
+            loop {
+                let page = store.read(|o| o.local_with_content(after, PAGE))?;
+                let Some(last) = page.last() else { return Ok(()) };
+                after = Some(last.file_id);
+                let mut ops = Vec::new();
+                // What the rules keep out of sync isn't the vault's: left as it is.
+                for r in page.iter().filter(|r| r.skip == oneup_store::Skip::None) {
+                    let pre = oneup_sync::LocalPre { id: LocalId(r.file_id), stamp: Some((r.size, r.mtime)) };
+                    let hash = match store.read(|o| o.content_mac_get(r.file_id, r.size, r.mtime))? {
+                        Some(hash) => Some(hash),
+                        None => self.keyed_hash_now(store, &pre)?,
+                    };
+                    match hash {
+                        Some(hash) => ops.push(Op::Dehydrate { local: pre, hash }),
+                        None => out.keep(store, r.file_id)?,
+                    }
+                }
+                let review = review_in(&policy, &GateContext::default(), ops);
+                for (op, _) in &review.withheld {
+                    if let Op::Dehydrate { local, .. } = op {
+                        out.keep(store, local.id.0)?;
+                    }
+                }
+                let report = self.exec.run(store, review.approved).await;
+                out.freed += report.done.len();
+                let not_freed = report.skipped.iter().map(|(op, _)| op).chain(report.failed.iter().map(|(op, _)| op));
+                for op in not_freed.chain(&report.not_run) {
+                    if let Op::Dehydrate { local, .. } = op {
+                        out.keep(store, local.id.0)?;
+                    }
+                }
+                if let Some(why) = report.halted {
+                    return Err(anyhow::Error::from(Halted(why)));
+                }
+            }
+        }
+        .await;
+        self.exec.local().set_locking(false);
+        result?;
+        Ok(out)
     }
 
     /// Whether applying pin rules has work left for another pass soon (a
@@ -1550,7 +1778,9 @@ impl Engine {
             return Ok(None);
         }
         let kept = |rel: &str| pins.pins(rel, false);
-        let sel = crate::space::select(store, &space, disk, now, &|rel| crate::space::last_access(root, rel), &kept)?;
+        let keyed = self.vault.is_some();
+        let sel =
+            crate::space::select(store, &space, disk, now, keyed, &|rel| crate::space::last_access(root, rel), &kept)?;
         store.write(|o| o.meta_set(KEY_LAST, &now.to_string()))?;
         if sel.ops.is_empty() {
             return Ok(None);
@@ -3251,6 +3481,11 @@ fn describe_as(o: &Ops<'_>, op: &Op, old: OldCopy) -> Line {
         Op::ConflictCopy { local, name, .. } => moved(CONFLICT_ACTION, lp(local.id.0), name.clone(), CONFLICT_NOTE),
         Op::DeleteRemote { remote, .. } => Line::new("delete", rp(&remote.id), "to OneDrive's recycle bin"),
         Op::Dehydrate { local, .. } => Line::new("free up", lp(local.id.0), ""),
+        Op::Discard { local, synced } => Line::new(
+            "discard",
+            lp(local.id.0),
+            if synced.is_some() { "unsent change; back to the synced version" } else { "unsent new file" },
+        ),
         Op::PruneRemote { remote, items, exact, .. } => {
             let n = if *exact { format!("{items} items") } else { format!("at least {items} items") };
             Line {
@@ -3464,7 +3699,7 @@ impl Touched {
                 remote.extend(b.remote.clone());
             }
             Op::Forget(sid) => synced.push(*sid),
-            Op::Hash(l) | Op::Dehydrate { local: l, .. } => local.push(l.id),
+            Op::Hash(l) | Op::Dehydrate { local: l, .. } | Op::Discard { local: l, .. } => local.push(l.id),
             Op::RemoveCopy { sid, local: l, remote: r, .. } => {
                 synced.extend(*sid);
                 local.extend(l.as_ref().map(|l| l.id));

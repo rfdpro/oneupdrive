@@ -14,6 +14,9 @@
 
 use base64::Engine as _;
 
+mod keyed;
+pub use keyed::{Digest, MacKey, digest_reader};
+
 /// Width of the hash register in bits.
 const WIDTH_BITS: usize = 160;
 /// Hash output length in bytes.

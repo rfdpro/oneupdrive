@@ -1182,6 +1182,23 @@ enum VaultCmd {
     },
     /// The vaults synced with folders on this PC
     List,
+    /// Show or change a synced vault's sync interval and what locking does
+    Settings {
+        name: String,
+        /// Sync every N minutes; 0 syncs within seconds
+        #[arg(long, value_name = "MINUTES")]
+        interval: Option<u32>,
+        /// Lock after N minutes without a file opened or changed; 0 never
+        #[arg(long, value_name = "MINUTES")]
+        lock_after: Option<u32>,
+        /// Lock when Windows locks or goes to sleep
+        #[arg(long, value_enum)]
+        lock_with_windows: Option<Toggle>,
+        /// After an unclean shutdown, keep changes not synced yet,
+        /// decrypted, until the next unlock (off: discard them)
+        #[arg(long, value_enum)]
+        keep_unsent: Option<Toggle>,
+    },
     /// Start syncing a vault (asks for its password or Windows Hello)
     Unlock { name: String },
     /// Stop syncing a vault; its keys leave memory
@@ -2523,6 +2540,14 @@ async fn run() -> Result<()> {
                 vault::add(&data_dir(&cli)?, graph, remote, folder, !*full_files, !*no_start).await
             }
             VaultCmd::List => vault::list(&data_dir(&cli)?).await,
+            VaultCmd::Settings { name, interval, lock_after, lock_with_windows, keep_unsent } => vault::settings(
+                &data_dir(&cli)?,
+                name,
+                *interval,
+                *lock_after,
+                lock_with_windows.map(Toggle::on),
+                keep_unsent.map(Toggle::on),
+            ),
             VaultCmd::Hello { name, state } => {
                 let http = http()?;
                 let graph = Arc::new(Graph::new(http.clone(), auth(&cli, &http)?, Aimd::new(2, 4)));

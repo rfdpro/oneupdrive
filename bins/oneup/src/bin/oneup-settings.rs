@@ -622,6 +622,13 @@ mod win {
                 vaultpair::set_password(dir, graph(dir)?, &e, &key, &new).await?;
                 Ok(Value::Null)
             }
+            "vault_settings" => {
+                let e = vault(dir, args)?;
+                settingsapi::set_vault_settings(&e.dir, args)?;
+                // A running agent reads them at its next wake-up: now.
+                let _ = agent(&e.dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
             "vault_hello" => {
                 let e = vault(dir, args)?;
                 if flag(args, "on") {
@@ -1344,7 +1351,19 @@ mod win {
             "vault_lock" => {
                 let e = vault(dir, args)?;
                 agent(&e.dir, Call::Stop).await?;
-                Ok(Value::Null)
+                // Its decrypted files are cleared as it stops: the answer
+                // waits for that, and says what was kept.
+                let started = std::time::Instant::now();
+                while oneup_ipc::connect(&e.dir).await.is_ok() {
+                    if started.elapsed() > std::time::Duration::from_secs(300) {
+                        bail!("the vault is still locking; its files are being cleared");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Ok(match oneup_app::vaultlock::last(&e.dir) {
+                    Some((c, _)) => json!({ "freed": c.freed, "kept_count": c.kept_count, "kept": c.kept }),
+                    None => Value::Null,
+                })
             }
             "vault_unlock" => {
                 let e = vault(dir, args)?;

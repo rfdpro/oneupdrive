@@ -42,6 +42,13 @@ mod art;
 const WM_TRAY: u32 = WM_APP + 1;
 /// [`Waker::wake`] posts this.
 const WM_WAKE: u32 = WM_APP + 2;
+/// The session's state changed (`WTSRegisterSessionNotification`); with
+/// `WTS_SESSION_LOCK`, Windows was locked.
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 0x7;
+/// Power changes; with `PBT_APMSUSPEND`, the PC is going to sleep.
+const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMSUSPEND: usize = 0x4;
 const ICON_ID: u32 = 1;
 /// The one key combination a tray holds ([`Tray::set_hotkey`]).
 const HOTKEY_ID: i32 = 1;
@@ -69,6 +76,8 @@ pub enum Event {
     Exit,
     /// The key combination set with [`Tray::set_hotkey`] was pressed.
     Hotkey,
+    /// Windows was locked, or the PC is going to sleep.
+    Locking,
 }
 
 /// A menu entry. IDs must not be 0.
@@ -191,6 +200,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             }
             LRESULT(0)
         }
+        WM_WTSSESSION_CHANGE if wp.0 == WTS_SESSION_LOCK => {
+            push(Event::Locking);
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST if wp.0 == PBT_APMSUSPEND => {
+            push(Event::Locking);
+            // TRUE: the suspend may go ahead.
+            LRESULT(1)
+        }
         WM_CLOSE => {
             push(Event::Exit);
             LRESULT(0)
@@ -293,6 +311,12 @@ impl Tray {
                 None,
             )
             .map_err(|e| io("CreateWindowExW", e))?;
+            // Windows being locked ([`Event::Locking`]). Failing only means
+            // vaults set to lock with Windows don't.
+            let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
+                hwnd,
+                windows::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
+            );
             Ok(Tray {
                 hwnd,
                 icon: RefCell::new(None),

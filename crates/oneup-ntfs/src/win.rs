@@ -1,9 +1,9 @@
 //! Thin Windows FFI layer. Each function obtains a buffer from the OS and
 //! hands it to the pure parsers in [`crate::record`] / [`crate::dirent`].
 //!
-//! Only [`rename_handle`] and [`delete_handle`] modify the file system, and
-//! only through a handle the caller opened and checked; the effects layer
-//! is their one user for user content.
+//! Only [`rename_handle`], [`delete_handle`] and [`overwrite_with_zeros`]
+//! modify the file system, and only through a handle the caller opened and
+//! checked; the effects layer is their one user for user content.
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -22,7 +22,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAGS_AND_ATTRIBUTES, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_INFO,
     FILE_INFO_BY_HANDLE_CLASS, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
     FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
+    FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo, FileBasicInfo, FileDispositionInfo,
     FileDispositionInfoEx, FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileNameInfo,
     FileRenameInfo, FileStandardInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumePathNameW,
     OPEN_EXISTING, OpenFileById, SetFileInformationByHandle,
@@ -201,6 +201,62 @@ pub fn open_path_for_placeholder(path: &Path, folder: bool) -> Result<Handle> {
         | if folder { FILE_LIST_DIRECTORY.0 } else { FILE_READ_DATA.0 };
     let share = if folder { FILE_SHARE_READ | FILE_SHARE_WRITE } else { FILE_SHARE_MODE(0) };
     open_shared(path, access, share, FILE_FLAG_BACKUP_SEMANTICS)
+}
+
+/// [`open_path_for_placeholder`] for a file whose content is to be
+/// overwritten before it's freed ([`overwrite_with_zeros`]): with data-write
+/// access too, share-none.
+pub fn open_path_for_wipe(path: &Path) -> Result<Handle> {
+    let access = DELETE.0 | FILE_READ_ATTRIBUTES.0 | FILE_WRITE_ATTRIBUTES.0 | FILE_READ_DATA.0 | FILE_WRITE_DATA.0;
+    open_shared(path, access, FILE_SHARE_MODE(0), FILE_FLAG_BACKUP_SEMANTICS)
+}
+
+/// How much [`overwrite_with_zeros`] writes at a time, from the start: a
+/// process ended part-way leaves whole blocks of zeros at the start.
+pub const ZEROS_BLOCK: usize = 1 << 20;
+
+/// Overwrites the first `size` bytes of the open file with zeros and flushes
+/// them to the disk, its size and times unchanged: the times are frozen on
+/// this handle first (-1 in `FILE_BASIC_INFO`), so the file still looks like
+/// the version that was synced, and no later step reads the zeros as an
+/// edit. Where the zeros land is the file system's and the disk's business:
+/// on NTFS a file that isn't compressed or sparse is overwritten in place,
+/// but an SSD may keep the old blocks until it reuses them.
+pub fn overwrite_with_zeros(h: &Handle, size: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    // Another name for the same file (a hard link, maybe outside the synced
+    // folder) would be overwritten too: refused before a byte changes.
+    let standard: FILE_STANDARD_INFO = handle_info(h, FileStandardInfo, "FileStandardInfo")?;
+    if standard.NumberOfLinks != 1 {
+        return Err(Error::Win32 {
+            op: "overwriting a file with more than one name",
+            source: windows::core::Error::from(windows::Win32::Foundation::ERROR_ACCESS_DENIED),
+        });
+    }
+    let frozen =
+        FILE_BASIC_INFO { CreationTime: 0, LastAccessTime: -1, LastWriteTime: -1, ChangeTime: -1, FileAttributes: 0 };
+    // SAFETY: `frozen` is a valid FILE_BASIC_INFO of the stated size; zero
+    // fields mean "unchanged".
+    win("SetFileInformationByHandle(FileBasicInfo)", unsafe {
+        SetFileInformationByHandle(
+            h.raw(),
+            FileBasicInfo,
+            std::ptr::from_ref(&frozen).cast::<c_void>(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    })?;
+    let io = |e: std::io::Error| Error::Win32 { op: "overwriting with zeros", source: e.into() };
+    let mut f = h.as_file();
+    let file: &mut std::fs::File = &mut f.file;
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    let zeros = vec![0u8; ZEROS_BLOCK];
+    let mut left = size;
+    while left > 0 {
+        let n = usize::try_from(left.min(zeros.len() as u64)).unwrap_or(zeros.len());
+        file.write_all(&zeros[..n]).map_err(io)?;
+        left -= n as u64;
+    }
+    file.sync_data().map_err(io)
 }
 
 /// Opens an item with attribute access only, sharing everything: a folder

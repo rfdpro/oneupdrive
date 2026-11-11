@@ -314,7 +314,7 @@ mod tests {
         let before = s.read(|o| o.remote_largest(10)).unwrap();
         s.conn.execute_batch("DROP INDEX remote_file_size; PRAGMA user_version = 26;").unwrap();
         crate::migrate(&mut s.conn).unwrap();
-        assert_eq!(crate::user_version(&s.conn).unwrap(), 27);
+        assert_eq!(crate::user_version(&s.conn).unwrap(), crate::SCHEMA_VERSION);
         assert_eq!(s.read(|o| o.remote_largest(10)).unwrap(), before);
         crate::migrate(&mut s.conn).unwrap();
         assert_eq!(s.read(|o| o.remote_largest(10)).unwrap(), before);

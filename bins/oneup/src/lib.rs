@@ -81,5 +81,6 @@ pub mod test_account;
 pub mod tray;
 pub mod unsynced;
 pub mod updates;
+pub mod vaultlock;
 pub mod vaultpair;
 pub mod versions;

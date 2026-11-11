@@ -159,12 +159,18 @@ fn parse_code(s: &str) -> Result<u64, String> {
 /// Set by Ctrl+C; the agent checks it between rounds.
 struct Stop {
     flag: AtomicBool,
+    /// Windows is ending the session: no time for one more pass.
+    quick: AtomicBool,
     notify: Notify,
 }
 
 impl Stop {
     fn requested(&self) -> bool {
         self.flag.load(Relaxed)
+    }
+
+    fn quick(&self) -> bool {
+        self.quick.load(Relaxed)
     }
 
     /// Sleeps for `d`, or less if a stop is requested meanwhile.
@@ -302,7 +308,7 @@ async fn run(args: Args) -> Result<()> {
         }
     };
 
-    let stop = Arc::new(Stop { flag: AtomicBool::new(false), notify: Notify::new() });
+    let stop = Arc::new(Stop { flag: AtomicBool::new(false), quick: AtomicBool::new(false), notify: Notify::new() });
     {
         // `oneup stop` works like Ctrl+C: after the current round.
         let (stop, control, dir) = (Arc::clone(&stop), Arc::clone(&control), dir.clone());
@@ -338,6 +344,7 @@ async fn run(args: Args) -> Result<()> {
             };
             tracing::warn!("Windows asked oneupd to stop: {why}");
             println!("oneupd: stopping: {why}");
+            stop.quick.store(true, Relaxed);
             stop.flag.store(true, Relaxed);
             stop.notify.notify_one();
         });
@@ -389,18 +396,17 @@ async fn run(args: Args) -> Result<()> {
     let mut window: Option<SafetyWindow> = None;
     // How good the link is (`oneup_app::link`): outlives an error too.
     let mut link = oneup_app::link::Link::default();
-    loop {
+    let ended = loop {
         let started = Instant::now();
         match agent(dir, &graph, &args, &stop, &control, memory, key.as_ref(), &mut window, &mut hooks, &mut link).await
         {
             Ok(()) => {
-                println!("oneupd: stopped.");
                 end_flyout(dir, flyout);
-                return Ok(());
+                break Ok(());
             }
             Err(e) if is_permanent(&e) => {
                 end_flyout(dir, flyout);
-                return Err(e);
+                break Err(e);
             }
             Err(e) if is_busy(&e) => {
                 tracing::warn!("{e:#}");
@@ -410,8 +416,7 @@ async fn run(args: Args) -> Result<()> {
                 );
                 stop.sleep(BUSY_PAUSE).await;
                 if stop.requested() {
-                    println!("oneupd: stopped.");
-                    return Ok(());
+                    break Ok(());
                 }
             }
             Err(e) => {
@@ -436,13 +441,44 @@ async fn run(args: Args) -> Result<()> {
                     () = control.wake.notified() => println!("oneupd: trying again now, as asked"),
                 }
                 if stop.requested() {
-                    println!("oneupd: stopped.");
-                    return Ok(());
+                    break Ok(());
                 }
                 pause = (pause * 2).min(ERROR_MAX);
             }
         }
+    };
+    // A vault locks however its agent ends: its decrypted copies go.
+    if let Some(k) = &key
+        && let Err(e) = lock_vault(dir, &graph, k).await
+    {
+        tracing::error!("{e:#}");
+        println!("oneupd: the vault's decrypted files weren't all cleared: {e:#}");
     }
+    if ended.is_ok() {
+        println!("oneupd: stopped.");
+    }
+    ended
+}
+
+/// Clears a vault pair's decrypted copies as it locks (`oneup_app::vaultlock`):
+/// overwrites cut short first, then every copy that is the synced version,
+/// then the temporary copies.
+async fn lock_vault(dir: &Path, graph: &Arc<Graph>, key: &oneup_vault::key::Masterkey) -> Result<()> {
+    let mut store = setup::open_store(dir, 4 * 1024)?;
+    let rules = oneup_app::config::load_rules(dir, &store)?.rule_set()?.pruning();
+    let (_, engine) = sync::resume_vault(&store, Arc::clone(graph), rules, dir, key.clone())?;
+    oneup_app::vaultlock::finish_wipes(&mut store, engine.local())?;
+    let cleared = engine.clear_vault(&mut store).await?;
+    let root = oneup_app::vaultlock::root_of(&store)?;
+    let staged = root.map_or(0, |r| oneup_app::vaultlock::clear_staging(dir, &r));
+    oneup_app::vaultlock::record(dir, &mut store, &cleared, staged)?;
+    oneup_app::vaultlock::mark_locked(dir)?;
+    println!(
+        "oneupd: locked: {} decrypted file(s) cleared{}",
+        cleared.freed,
+        if cleared.kept_count > 0 { format!(", {} kept", cleared.kept_count) } else { String::new() }
+    );
+    Ok(())
 }
 
 /// The pause before retrying after an error, given the last one (`pause`):
@@ -580,6 +616,14 @@ async fn agent(
         Some(k) => sync::resume_vault(&store, Arc::clone(graph), rules, dir, k.clone())?,
         None => sync::resume(&store, Arc::clone(graph), rules, dir)?,
     };
+    if key.is_some() {
+        if let Err(e) = oneup_app::vaultlock::finish_wipes(&mut store, engine.local()) {
+            tracing::warn!(error = %format!("{e:#}"), "overwrites cut short are finished at the next lock");
+        }
+        // From here, decrypted copies may be on this PC until a lock clears
+        // them; if the session ends without one, the next start does.
+        oneup_app::vaultlock::mark_unlocked(dir)?;
+    }
     let root = store.read(|o| o.local_root())?.context("no local scan")?;
     let journal = Arc::new(Notify::new());
     let tracker = oneup_app::apps::Tracker::start(dir, Path::new(&root.path));
@@ -595,6 +639,8 @@ async fn agent(
     let remote = Arc::new(Notify::new());
     // Files On-Demand: serve the placeholders' content while this attempt
     // runs (files-on-demand.md § Hydration).
+    // Files opened through the vault count as use, for locking when idle.
+    let mut opened: Option<Arc<oneup_exec::hydrate::Hydrator<oneup_app::vaultpair::PairCloud>>> = None;
     let _provider = if engine.local().on_demand() {
         // Explorer's entry was brought up to date before connecting
         // (`prepare_registration`).
@@ -610,6 +656,7 @@ async fn agent(
             tokio::runtime::Handle::current(),
             Box::new(move || stale.notify_one()),
         )?;
+        opened = Some(Arc::clone(&h));
         let serve = Arc::new(oneup_exec::hydrate::Serve(h));
         Some(oneup_cfapi::provider::connect(Path::new(&root.path), serve)?)
     } else {
@@ -646,6 +693,11 @@ async fn agent(
     // transport follows it from the start of this attempt.
     apply_link(graph, link.is_poor());
     control.set_on_demand(engine.local().on_demand());
+    // A vault asked to stop runs one more pass first, to send what changed
+    // since the last one: what isn't sent stays decrypted when it locks.
+    let mut final_pass = false;
+    // When the vault was last used: a file opened or changed in it.
+    let mut used = (Instant::now(), 0u64);
     loop {
         // ---- automatic pauses (config.toml [agent]), checked at every
         // wake-up; a broken config.toml keeps the last good settings
@@ -826,6 +878,13 @@ async fn agent(
                     .await;
                     net_use.charge_now();
                     store = placed?;
+                    // A vault's overwrites a failure left are finished now,
+                    // not only at the next start.
+                    if key.is_some()
+                        && let Err(e) = oneup_app::vaultlock::finish_wipes(&mut store, engine.local())
+                    {
+                        tracing::warn!(error = %format!("{e:#}"), "overwrites left are finished later");
+                    }
                     // Removes kept copies on this PC: not while changes
                     // to it are paused.
                     if !control.controls().pause_local {
@@ -881,13 +940,45 @@ async fn agent(
             _ => next,
         };
         control.set_network(net_status(&pacer, &net, &profile, waiting.as_ref(), &usage));
+        if final_pass {
+            return Ok(());
+        }
+        // A vault locks by itself once unused for its `[vault]
+        // lock_after_idle_minutes`; the wait ends then at the latest.
+        let idle = match key {
+            Some(_) => oneup_app::config::load_vault_lock(dir).map(|v| v.idle_minutes).unwrap_or(0),
+            None => 0,
+        };
+        let idle = (idle > 0).then(|| Duration::from_secs(u64::from(idle) * 60));
+        let next = match idle {
+            Some(d) => next.min((used.0 + d).saturating_duration_since(Instant::now())),
+            None => next,
+        };
 
         // ---- wait for something to do
         let (s, w) =
             wait(store, &engine.pruning(), &journal, &remote, stop, &control.wake, next, &pacer, &net_events).await?;
         store = s;
         woke = if w == Woke::Timer && continuing { Woke::Continue } else { w };
+        let served = opened.as_ref().map_or(0, |h| h.served.load(Relaxed));
+        if w == Woke::Local || served != used.1 {
+            used = (Instant::now(), served);
+        }
+        if let Some(d) = idle
+            && used.0.elapsed() >= d
+            && !stop.requested()
+        {
+            let detail = format!("locked after {} minutes unused", d.as_secs() / 60);
+            println!("oneupd: {detail}");
+            sync::note(&mut store, "lock", detail)?;
+            stop.flag.store(true, Relaxed);
+        }
         if stop.requested() {
+            if key.is_some() && !stop.quick() {
+                final_pass = true;
+                woke = Woke::User;
+                continue;
+            }
             return Ok(());
         }
     }

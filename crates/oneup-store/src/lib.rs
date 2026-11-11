@@ -119,7 +119,11 @@ pub const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const SCHEMA_VERSION: i64 = 27;
+/// Meta keys of a vault pair's overwrites under way: `vault.wipe.<file id>`
+/// ([`Ops::wipe_pending`]).
+pub const WIPE_PREFIX: &str = "vault.wipe";
+
+const SCHEMA_VERSION: i64 = 28;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -770,7 +774,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 27] = [
+    let steps: [(i64, String); 28] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -798,6 +802,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (25, String::new()),
         (26, initial::MIGRATE_V26.into()),
         (27, usage::MIGRATE_V27.into()),
+        (28, synced::MIGRATE_V28.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1000,6 +1005,13 @@ impl Ops<'_> {
     pub fn meta_delete(&self, key: &str) -> Result<()> {
         self.c.execute("DELETE FROM meta WHERE key = ?1", [key])?;
         Ok(())
+    }
+
+    /// Whether local file `id` has an overwrite under way or cut short (a
+    /// vault pair's, `oneup_app::vaultlock`): its content may be zeros, so
+    /// nothing sends it until the record is finished.
+    pub fn wipe_pending(&self, id: u128) -> Result<bool> {
+        Ok(self.meta_get(&format!("{WIPE_PREFIX}.{id}"))?.is_some())
     }
 
     /// The entries whose key is `prefix` or starts with `prefix.`, by key.

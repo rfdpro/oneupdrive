@@ -417,6 +417,13 @@ pub enum PairCloud {
 type Hash = [u8; 20];
 
 impl Cloud for PairCloud {
+    fn content_key(&self) -> Option<oneup_hash::MacKey> {
+        match self {
+            PairCloud::Plain(c) => c.content_key(),
+            PairCloud::Vault(c) => c.content_key(),
+        }
+    }
+
     async fn download(
         &self,
         pre: &RemotePre,

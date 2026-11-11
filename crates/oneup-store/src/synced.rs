@@ -18,6 +18,10 @@
 //!   tree, and they're dropped when their row goes or is relinked.
 //! * `local_hash`: QuickXorHashes computed for exactly one (file ID, size,
 //!   mtime); a hash whose stamp no longer matches is ignored, not trusted.
+//! * `content_mac`: for a vault pair, the keyed hash (`oneup_hash::Digest`)
+//!   of the decrypted bytes a download wrote or an upload sent, for exactly
+//!   one stamp, as `local_hash`. The cloud's hash is the encrypted file's,
+//!   so this is what freeing a decrypted copy checks it against.
 //!
 //! Invariants (checked by [`Ops::check_invariants`]):
 //! 1. if any row exists, the root row exists and has no parent;
@@ -60,6 +64,17 @@ CREATE TABLE local_hash (
     size    INTEGER NOT NULL,
     mtime   INTEGER NOT NULL,
     qxh     BLOB NOT NULL
+) WITHOUT ROWID;
+";
+
+/// v27 -> v28: `content_mac` (see the module docs). `IF NOT EXISTS`: a
+/// store rolled back to an earlier version keeps the table, and upgrades again.
+pub(crate) const MIGRATE_V28: &str = "
+CREATE TABLE IF NOT EXISTS content_mac (
+    file_id BLOB PRIMARY KEY,
+    size    INTEGER NOT NULL,
+    mtime   INTEGER NOT NULL,
+    mac     BLOB NOT NULL
 ) WITHOUT ROWID;
 ";
 
@@ -597,6 +612,29 @@ impl Ops<'_> {
         let v: Option<Vec<u8>> = self
             .c
             .prepare_cached("SELECT qxh FROM local_hash WHERE file_id = ?1 AND size = ?2 AND mtime = ?3")?
+            .query_row(params![blob(id), size, mtime], |r| r.get(0))
+            .optional()?;
+        Ok(v.and_then(|b| b.try_into().ok()))
+    }
+
+    /// Stores the keyed hash of the decrypted content local file `id` got
+    /// or sent while it had exactly this `size` and `mtime` (vault pairs).
+    pub fn content_mac_put(&self, id: u128, size: i64, mtime: i64, mac: &Hash) -> Result<()> {
+        self.c
+            .prepare_cached(
+                "INSERT INTO content_mac(file_id, size, mtime, mac) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(file_id) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, mac = excluded.mac",
+            )?
+            .execute(params![blob(id), size, mtime, mac.to_vec()])?;
+        Ok(())
+    }
+
+    /// The keyed hash recorded for local file `id` if it was for exactly
+    /// this `size` and `mtime`.
+    pub fn content_mac_get(&self, id: u128, size: i64, mtime: i64) -> Result<Option<Hash>> {
+        let v: Option<Vec<u8>> = self
+            .c
+            .prepare_cached("SELECT mac FROM content_mac WHERE file_id = ?1 AND size = ?2 AND mtime = ?3")?
             .query_row(params![blob(id), size, mtime], |r| r.get(0))
             .optional()?;
         Ok(v.and_then(|b| b.try_into().ok()))
@@ -1250,6 +1288,24 @@ pub(crate) mod tests {
             assert_eq!(o.remote(&RemoteId("g".into()))?, Seen::Deleted);
             assert_eq!(o.remote(&RemoteId("f".into()))?, Seen::Missing);
             assert_eq!(o.synced_stats()?.items, 4);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_keyed_hash_counts_only_for_its_own_stamp_and_never_as_the_content_hash() {
+        let mut s = Store::open_in_memory().unwrap();
+        synced(&mut s);
+        s.write(|o| {
+            o.content_mac_put(2, 3, 9, &[5; 20])?;
+            assert_eq!(o.content_mac_get(2, 3, 9)?, Some([5; 20]));
+            assert_eq!(o.content_mac_get(2, 3, 8)?, None);
+            assert_eq!(o.content_mac_get(2, 4, 9)?, None);
+            assert_eq!(o.local_hash_get(2, 3, 9)?, None);
+            o.content_mac_put(2, 3, 10, &[6; 20])?;
+            assert_eq!(o.content_mac_get(2, 3, 9)?, None, "a new version replaces the old one's");
+            assert_eq!(o.content_mac_get(2, 3, 10)?, Some([6; 20]));
             Ok(())
         })
         .unwrap();

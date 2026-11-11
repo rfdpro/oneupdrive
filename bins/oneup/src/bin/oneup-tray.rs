@@ -151,10 +151,34 @@ mod win {
                 Event::Select { x, y } | Event::Menu { x, y } => ui.menu(x, y),
                 Event::NotificationClicked => ui.review_first(),
                 Event::Hotkey => ui.show_list("find"),
+                Event::Locking => lock_vaults_with_windows(&ui.dir),
                 Event::Exit => break,
             }
         }
         Ok(())
+    }
+
+    /// Windows was locked or is going to sleep: the unlocked vaults set to
+    /// lock with it (`[vault] lock_with_windows`) are asked to lock, each
+    /// clearing its decrypted files as it stops. Not waited for: the PC
+    /// may be about to sleep, and the next start finishes what didn't.
+    fn lock_vaults_with_windows(dir: &Path) {
+        let vaults: Vec<PathBuf> = oneup_app::vaultpair::list(dir)
+            .into_iter()
+            .filter(|v| oneup_app::config::load_vault_lock(&v.dir).is_ok_and(|s| s.with_windows))
+            .map(|v| v.dir)
+            .collect();
+        if vaults.is_empty() {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        rt.block_on(async {
+            for v in vaults {
+                if let Ok(mut c) = oneup_ipc::connect(&v).await {
+                    let _ = c.call(&oneup_ipc::Call::Stop).await;
+                }
+            }
+        });
     }
 
     struct Ui<'a> {

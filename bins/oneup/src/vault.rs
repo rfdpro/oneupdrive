@@ -360,9 +360,69 @@ pub async fn hello(main: &Path, graph: Arc<Graph>, name: &str, on: Option<bool>)
     Ok(())
 }
 
+/// `oneup vault settings`: shows the vault's settings, or changes those
+/// given (they apply from the agent's next wake-up).
+pub fn settings(
+    main: &Path,
+    name: &str,
+    interval: Option<u32>,
+    lock_after: Option<u32>,
+    with_windows: Option<bool>,
+    keep_unsent: Option<bool>,
+) -> Result<()> {
+    let e = find(main, name)?;
+    let mut v = serde_json::Map::new();
+    if let Some(n) = interval {
+        v.insert("interval_minutes".into(), n.into());
+    }
+    if let Some(n) = lock_after {
+        v.insert("lock_after_idle_minutes".into(), n.into());
+    }
+    if let Some(b) = with_windows {
+        v.insert("lock_with_windows".into(), b.into());
+    }
+    if let Some(b) = keep_unsent {
+        v.insert("keep_unsent".into(), b.into());
+    }
+    if !v.is_empty() {
+        oneup_app::settingsapi::set_vault_settings(&e.dir, &serde_json::Value::Object(v))?;
+    }
+    let lock = oneup_app::config::load_vault_lock(&e.dir)?;
+    let every = oneup_app::pace::load(&e.dir)?.minutes;
+    println!("{}", e.name);
+    println!("  sync: {}", if every == 0 { "within seconds".to_string() } else { format!("every {every} minutes") });
+    println!(
+        "  lock after: {}",
+        if lock.idle_minutes == 0 { "never".to_string() } else { format!("{} minutes unused", lock.idle_minutes) }
+    );
+    println!("  lock with Windows: {}", if lock.with_windows { "on" } else { "off" });
+    println!(
+        "  after an unclean shutdown: {}",
+        if lock.keep_unsent { "keep unsent changes until the next unlock" } else { "discard unsent changes" }
+    );
+    Ok(())
+}
+
 pub async fn lock(main: &Path, name: &str) -> Result<()> {
     let e = find(main, name)?;
+    let before = oneup_app::vaultlock::last(&e.dir).map(|l| l.1);
     crate::agent::stop(&e.dir).await?;
+    // The agent cleared the decrypted files as it stopped.
+    match oneup_app::vaultlock::last(&e.dir) {
+        Some((c, at)) if Some(at) != before => {
+            println!("Locked {}: {} decrypted file(s) cleared from this PC.", e.name, c.freed);
+            if c.kept_count > 0 {
+                println!("{} kept (not synced yet, or open in a program):", c.kept_count);
+                for p in &c.kept {
+                    println!("  {p}");
+                }
+                if c.kept_count > c.kept.len() {
+                    println!("  … and {} more (`oneup activity` lists them)", c.kept_count - c.kept.len());
+                }
+            }
+        }
+        _ => println!("Locked {}.", e.name),
+    }
     Ok(())
 }
 

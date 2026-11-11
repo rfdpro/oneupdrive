@@ -46,6 +46,8 @@ pub struct VaultCloud<C> {
     nodes: Arc<RwLock<Nodes>>,
     /// The cloud listing the encrypted items are recorded in.
     listing: Arc<Mutex<Store>>,
+    /// The key of the keyed hashes of decrypted content on this PC.
+    content_key: oneup_hash::MacKey,
 }
 
 fn other(e: impl std::fmt::Display) -> CloudError {
@@ -87,7 +89,8 @@ fn pre_of(r: &RemoteRow) -> RemotePre {
 
 impl<C: Cloud> VaultCloud<C> {
     pub fn new(inner: C, vault: Vault, nodes: Arc<RwLock<Nodes>>, listing: Arc<Mutex<Store>>) -> Self {
-        Self { inner, vault, nodes, listing }
+        let content_key = oneup_hash::MacKey::new(vault.key.content_mac_key());
+        Self { inner, vault, nodes, listing, content_key }
     }
 
     pub fn inner(&self) -> &C {
@@ -233,6 +236,12 @@ impl<C: Cloud> VaultCloud<C> {
 }
 
 impl<C: Cloud> Cloud for VaultCloud<C> {
+    /// OneDrive's hash is of the encrypted file; what's on this PC is
+    /// checked by its keyed hash.
+    fn content_key(&self) -> Option<oneup_hash::MacKey> {
+        Some(self.content_key.clone())
+    }
+
     async fn download(&self, pre: &RemotePre, out: &mut (dyn Write + Send)) -> Result<Option<Hash>, CloudError> {
         let n = self.node(&pre.id.0)?;
         let content = n.content.clone().ok_or_else(|| CloudError::Other("not a file".into()))?;

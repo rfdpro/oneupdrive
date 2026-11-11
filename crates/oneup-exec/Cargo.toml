@@ -48,6 +48,8 @@ crash-test = ["oneup-effects/crash-test"]
 test-helpers = ["dep:rusqlite"]
 
 [dev-dependencies]
+zeroize = "1"
+oneup-ntfs = { path = "../oneup-ntfs" }
 oneup-exec = { path = ".", features = ["crash-test", "test-helpers"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 oneup-cfapi = { path = "../oneup-cfapi" }

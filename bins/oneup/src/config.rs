@@ -791,6 +791,66 @@ pub fn save_space(data_dir: &Path, s: &Space) -> Result<()> {
     )
 }
 
+/// The `[vault]` section of a vault pair's own `config.toml`: what locking
+/// does (`crate::vaultlock`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultLock {
+    /// After an unclean shutdown left the vault unlocked: keep changes
+    /// that weren't sent yet, decrypted on this PC until the next unlock
+    /// sends them. Off: they're overwritten and the files go back to their
+    /// last synced version (new files are deleted) at the next sign-in.
+    pub keep_unsent: bool,
+    /// Lock after this many minutes without a file opened or changed in the
+    /// vault; 0 = never.
+    pub idle_minutes: u32,
+    /// Lock when Windows locks or goes to sleep.
+    pub with_windows: bool,
+}
+
+impl Default for VaultLock {
+    fn default() -> Self {
+        Self { keep_unsent: true, idle_minutes: 0, with_windows: false }
+    }
+}
+
+pub fn load_vault_lock(data_dir: &Path) -> Result<VaultLock> {
+    let mut v = VaultLock::default();
+    let Some(doc) = read_doc(data_dir)? else { return Ok(v) };
+    let Some(t) = section(&doc, "vault")? else { return Ok(v) };
+    let flag = |key: &str| -> Result<Option<bool>> {
+        t.get(key)
+            .map(|b| b.as_bool().with_context(|| format!("{FILE}: vault.{key} must be true or false")))
+            .transpose()
+    };
+    if let Some(b) = flag("keep_unsent")? {
+        v.keep_unsent = b;
+    }
+    if let Some(b) = flag("lock_with_windows")? {
+        v.with_windows = b;
+    }
+    if let Some(n) = number(t, "lock_after_idle_minutes")? {
+        if n > 7 * 24 * 60 {
+            bail!("{FILE}: vault.lock_after_idle_minutes must be at most 10080 (a week)");
+        }
+        v.idle_minutes = n as u32;
+    }
+    Ok(v)
+}
+
+pub fn save_vault_lock(data_dir: &Path, v: &VaultLock) -> Result<()> {
+    save(
+        data_dir,
+        "vault",
+        "# Locking this vault: its decrypted files are cleared from this PC.
+",
+        vec![
+            ("keep_unsent", value(v.keep_unsent)),
+            ("lock_after_idle_minutes", value(i64::from(v.idle_minutes))),
+            ("lock_with_windows", value(v.with_windows)),
+        ],
+    )
+}
+
 /// The `[updates]` section: OneUpDrive updating itself from its releases
 /// (`crate::updates`).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2696,7 +2696,7 @@
                 <div class="vault-field"><label for="vc-pw">Password</label><div class="field"><input type="password" id="vc-pw" placeholder="At least 8 characters" minlength="8" required></div></div>
                 <div class="vault-field"><label for="vc-pw2">Confirm password</label><div class="field"><input type="password" id="vc-pw2" required></div></div>
                 <label class="ck"><input type="checkbox" id="vc-full"><span>Keep all files on this PC<small>Otherwise they download when you open them.</small></span></label>
-                <p class="note">Your password isn't saved. After a restart, unlock to sync or download files. Downloaded files stay readable on this PC.</p>
+                <p class="note">Your password isn't saved. Locking or restarting clears the decrypted files from this PC; unlock to open them again.</p>
                 <p class="note">A standard Cryptomator vault: Cryptomator's apps open it too.</p>
                 <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
             </div>
@@ -2717,7 +2717,7 @@
                     <p class="note" id="va-local-help">Your readable files appear here. Choose a new or empty folder outside folders you already sync, so existing files aren't added to the vault.</p></div>
                 <div class="vault-field"><label for="va-pw">Password</label><div class="field"><input type="password" id="va-pw" required></div></div>
                 <label class="ck"><input type="checkbox" id="va-full"><span>Keep all files on this PC</span></label>
-                <p class="note">Your password isn't saved. After a restart, unlock to sync or download files. Downloaded files stay readable on this PC.</p>
+                <p class="note">Your password isn't saved. Locking or restarting clears the decrypted files from this PC; unlock to open them again.</p>
                 <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
             </div>
             <div class="df"><span class="muted" id="va-busy" role="status"></span><button class="btn" type="button" id="va-cancel">Cancel</button><button class="btn primary" type="submit" id="va-add">Add</button></div>
@@ -7953,15 +7953,40 @@
             const askPw = async() => (await vaultSecret(tr("Password of the vault \"{name}\"", {
                 name: r.name
             }), {allowEmpty: r.hello, label: r.hello ? tr("Password (leave empty to use Windows Hello)") : tr("Password")}))?.password ?? null;
-            body.push(opt(r.running ? tr("Unlocked") : tr("Locked"), r.running ? "" : tr("Unlock to see and sync its files."),
+            body.push(opt(r.running ? tr("Unlocked") : tr("Locked"), r.running ? tr("Locking clears its decrypted files from this PC.") : tr("Unlock to see and sync its files."),
                 el("button", {
                     className: "btn small" + (r.running ? "" : " primary"),
                     textContent: r.running ? tr("Lock") : tr("Unlock…"),
                     onclick: () => r.running ?
                         run(call("vault_lock", {
                             name: r.name
-                        }), tr("Locked")).then(() => setTimeout(openFiles, 1500)) : unlockVault(r)
+                        }), res => res && res.kept_count ? tr("Locked. {n, plural, one {# file kept} other {# files kept}}: not synced yet, or open in a program.", {
+                            n: res.kept_count
+                        }) : tr("Locked")).then(openFiles) : unlockVault(r)
                 })));
+            const setting = (k, v) => run(call("vault_settings", {name: r.name, [k]: v}), tr("Saved")).then(openFiles);
+            const minutes = (k, value, max, label) => el("input", {
+                type: "number",
+                min: "0",
+                max: String(max),
+                step: "1",
+                value: String(value ?? 0),
+                "aria-label": label,
+                onchange: e => {
+                    const n = Number(e.target.value);
+                    if (Number.isInteger(n) && n >= 0 && n <= max) setting(k, n);
+                    else e.target.value = String(value ?? 0);
+                }
+            });
+            body.push(opt(tr("Sync every (minutes)"), tr("0 to sync within seconds. Changes collect in between."),
+                minutes("interval_minutes", r.interval_minutes, 1440, tr("Sync every (minutes)"))));
+            body.push(opt(tr("Lock after (minutes unused)"), tr("0: never. Opening or changing a file counts as use."),
+                minutes("lock_after_idle_minutes", r.lock_after_idle_minutes, 10080, tr("Lock after (minutes unused)"))));
+            body.push(opt(tr("Lock with Windows"), tr("When Windows locks or goes to sleep."),
+                toggleEl(r.lock_with_windows, tr("Lock with Windows"), v => setting("lock_with_windows", v))));
+            body.push(opt(tr("Keep unsynced changes after a crash"),
+                tr("On: changes not synced when the PC crashed or lost power stay decrypted here until you unlock. Off: they're discarded."),
+                toggleEl(r.keep_unsent, tr("Keep unsynced changes after a crash"), v => setting("keep_unsent", v))));
             if (snap && (snap.hello_available || r.hello)) body.push(opt(tr("Unlock with Windows Hello"), tr("Face, fingerprint or PIN."), toggleEl(r.hello, tr("Unlock with Windows Hello"), async(v, i) => {
                 let p = "";
                 if (v) {
