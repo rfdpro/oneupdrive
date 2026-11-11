@@ -16,7 +16,7 @@ use oneup_ntfs::dirent::DirEntry;
 use oneup_ntfs::win;
 use oneup_sync::{Hash, LocalId, LocalPre, Op};
 
-use crate::local::{Done, Error, LocalFs, Result, check_placeholder, long};
+use crate::local::{Done, Error, LocalFs, Result, Wipe, WipeEnd, WipeThen, check_placeholder, long};
 
 /// The identity a pre-release build (0.1.28) gave the excluded folders it
 /// marked for File Explorer (shelved; [`LocalFs::unmark_excluded_folder`]
@@ -168,6 +168,16 @@ impl LocalFs {
     /// access when it has content here; attribute access only when it's a
     /// dehydrated placeholder (data access would download it).
     fn open_ours(&self, pre: &LocalPre) -> Result<(win::Handle, DirEntry, PathBuf)> {
+        self.open_ours_with(pre, |path| win::open_path_for_placeholder(path, pre.stamp.is_none()))
+    }
+
+    /// [`Self::open_ours`] with the handle `open` gives for one with
+    /// content (data-write access, to overwrite it: [`Self::free_up`]).
+    fn open_ours_with(
+        &self,
+        pre: &LocalPre,
+        open: impl FnOnce(&std::path::Path) -> oneup_ntfs::win::Result<win::Handle>,
+    ) -> Result<(win::Handle, DirEntry, PathBuf)> {
         if let Some(found) = self.open_if_dehydrated(pre)? {
             return Ok(found);
         }
@@ -176,7 +186,7 @@ impl LocalFs {
             let probe = self.volume().open_attributes(id, self.hint(id).as_deref()).map_err(|_| Error::Changed)?;
             long(&win::final_path(&probe)?)
         };
-        let h = win::open_path_for_placeholder(&path, pre.stamp.is_none())?;
+        let h = open(&path)?;
         if win::file_id(&h)?.1 != id {
             return Err(Error::Changed);
         }
@@ -543,11 +553,18 @@ impl LocalFs {
     /// invariant 11). Only if, read under a share-none handle, the content
     /// hashes to the op's hash, which the caller checked is the cloud's
     /// current version, and Windows still has it in sync (`VERIFY_IN_SYNC`).
-    /// Never a pinned placeholder.
+    /// For a vault pair the hash is the content's keyed hash
+    /// ([`LocalFs::set_content_key`]), and the decrypted content is
+    /// overwritten with zeros through the same handle before it's freed, so
+    /// it doesn't linger in the freed space. Never a pinned placeholder,
+    /// except while a vault pair locks ([`LocalFs::set_locking`]): then it
+    /// is freed and stays pinned.
     pub fn free_up(&self, a: &Approved) -> Result<Done> {
         let Op::Dehydrate { local, hash } = a.op() else { return Err(Error::WrongOp) };
         let Some((size, _)) = local.stamp else { return Err(Error::WrongOp) };
-        let (h, _entry, path) = self.open_ours(local)?;
+        let wipe = self.wipes();
+        let (h, _entry, path) =
+            if wipe { self.open_ours_with(local, win::open_path_for_wipe)? } else { self.open_ours(local)? };
         let info = provider::info(&h.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
         if info.on_disk == 0 {
             return Err(Error::Changed); // already free
@@ -558,20 +575,191 @@ impl LocalFs {
         // "Always keep on this device" (by the user or a pin rule) wins over
         // anything that would free it, whoever planned it and whenever the
         // pin was set: read on this share-none handle, just before acting.
-        if info.pin == provider::Pin::Pinned {
+        let key = self.content_key();
+        // Locked, without keys: in sync (checked above) is all there is.
+        let unkeyed = key.is_none() && self.clearing_locked();
+        let pinned = info.pin == provider::Pin::Pinned;
+        if pinned && !((key.is_some() && self.locking()) || unkeyed) {
             return Err(Error::Changed);
         }
-        let mut buf = vec![0u8; 1 << 20];
-        let got = oneup_hash::hash_reader(&*h.as_file(), &mut buf)?;
-        if i64::try_from(got.len()).ok() != Some(size) || got.finalize() != *hash {
-            tracing::warn!("a file to free up differs from its cloud version, so it was kept");
-            return Err(Error::Changed);
+        if !unkeyed {
+            let mut buf = vec![0u8; 1 << 20];
+            let got = oneup_hash::digest_reader(&*h.as_file(), key, &mut buf)?;
+            let content = if key.is_some() { got.mac() } else { Some(got.finalize()) };
+            if i64::try_from(got.len()).ok() != Some(size) || content != Some(*hash) {
+                tracing::warn!("a file to free up differs from its cloud version, so it was kept");
+                return Err(Error::Changed);
+            }
         }
-        oneup_cfapi::ours::note(local.id.0);
-        Exclusive::from_file(h.into_file()).dehydrate(None).map_err(placeholder_error)?;
+        if wipe {
+            // Verified: from here a crash or a failure leaves a record, the
+            // file isn't sent while it stands, and it's finished later
+            // ([`LocalFs::finish_wipe`]).
+            let stamp = local.stamp.ok_or(Error::WrongOp)?;
+            self.journal_wipe(local.id.0, Some(Wipe { stamp, then: WipeThen::Free }))?;
+            win::overwrite_with_zeros(&h, u64::try_from(size).unwrap_or(0))?;
+            // Once more if it failed: the content is zeros now.
+            let h = match self.dehydrate_kept_pin(h, local.id.0, pinned, true) {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::warn!(error = %e, "freeing an overwritten copy failed; trying again");
+                    Some(self.open_ours_with(local, win::open_path_for_wipe)?)
+                }
+            };
+            if let Some((h, _, _)) = h {
+                self.dehydrate_kept_pin(h, local.id.0, pinned, true)?;
+            }
+            if let Err(e) = self.journal_wipe(local.id.0, None) {
+                tracing::debug!(error = %e, "a finished overwrite stays recorded until it's looked at again");
+            }
+        } else {
+            self.dehydrate_kept_pin(h, local.id.0, pinned, false)?;
+        }
         let h = win::open_path_for_dehydrated(&path)?;
         let entry = win::stat_handle(&h, FileId(local.id.0))?.ok_or(Error::Changed)?;
         Ok(Done::Freed { entry })
+    }
+
+    /// The keyed hash of a vault pair's decrypted copy `pre` that Windows
+    /// still has in sync (nothing but the provider wrote it since it was
+    /// placed or sent), read under a share-none handle: for a copy decrypted
+    /// before keyed hashes were recorded, so locking can free it
+    /// ([`LocalFs::free_up`] checks it again). `None` if it isn't in sync,
+    /// isn't all here, or this isn't a vault pair. Reads only.
+    pub fn keyed_hash_in_sync(&self, pre: &LocalPre) -> Result<Option<Hash>> {
+        let (Some(key), Some((size, _))) = (self.content_key(), pre.stamp) else { return Ok(None) };
+        let (h, _, _) = self.open_ours(pre)?;
+        let Some(info) = provider::info(&h.as_file()).map_err(placeholder_error)? else { return Ok(None) };
+        if !info.in_sync || info.on_disk < size || info.on_disk == 0 {
+            return Ok(None);
+        }
+        let got = oneup_hash::digest_reader(&*h.as_file(), Some(key), &mut vec![0u8; 1 << 20])?;
+        Ok(if i64::try_from(got.len()).ok() == Some(size) { got.mac() } else { None })
+    }
+
+    /// For an approved [`Op::Discard`] (a vault left unlocked by an unclean
+    /// shutdown, whose unsent changes the user chose not to keep): the
+    /// file, opened by ID at its planned stamp under a share-none handle,
+    /// is overwritten with zeros, then a synced placeholder goes back to
+    /// its synced version, online-only ([`Exclusive::dehydrate_to_synced`]),
+    /// and a new ordinary file is deleted. Anything else (an online-only
+    /// file, a synced ordinary file, a placeholder without a synced record)
+    /// is refused before a byte changes.
+    pub fn discard(&self, a: &Approved) -> Result<Done> {
+        let Op::Discard { local, synced } = a.op() else { return Err(Error::WrongOp) };
+        let Some((size, _)) = local.stamp else { return Err(Error::WrongOp) };
+        let (h, _entry, path) = self.open_ours_with(local, win::open_path_for_wipe)?;
+        let info = provider::info(&h.as_file()).map_err(placeholder_error)?;
+        let then = match (&info, synced) {
+            // All of the edit here: a part missing can't be overwritten.
+            (Some(i), Some((synced_size, synced_mtime))) if i.on_disk >= size => {
+                WipeThen::Revert { size: *synced_size, mtime: *synced_mtime }
+            }
+            (None, None) => WipeThen::Delete,
+            _ => return Err(Error::Changed),
+        };
+        let stamp = local.stamp.ok_or(Error::WrongOp)?;
+        // Recorded first: a crash leaves zeros that are never sent, and the
+        // next start finishes the job ([`LocalFs::finish_wipe`]).
+        self.journal_wipe(local.id.0, Some(Wipe { stamp, then }))?;
+        win::overwrite_with_zeros(&h, u64::try_from(size).unwrap_or(0))?;
+        let pinned = info.is_some_and(|i| i.pin == provider::Pin::Pinned);
+        self.after_discard(h, local.id.0, then, pinned)?;
+        self.journal_wipe(local.id.0, None)?;
+        if then == WipeThen::Delete {
+            return Ok(Done::Discarded);
+        }
+        let h = win::open_path_for_dehydrated(&path)?;
+        let entry = win::stat_handle(&h, FileId(local.id.0))?.ok_or(Error::Changed)?;
+        Ok(Done::Freed { entry })
+    }
+
+    /// What follows a discard's zeros ([`LocalFs::discard`], and
+    /// [`LocalFs::finish_wipe`] after a crash): back to the synced version,
+    /// keeping a pin, or deleted.
+    fn after_discard(&self, h: win::Handle, id: u128, then: WipeThen, pinned: bool) -> Result<()> {
+        let WipeThen::Revert { size, mtime } = then else {
+            return Ok(win::delete_handle(&h)?);
+        };
+        oneup_cfapi::ours::note(id);
+        let file = h.into_file();
+        if pinned {
+            provider::set_pin(&file, provider::Pin::Unspecified).map_err(placeholder_error)?;
+        }
+        let ex = Exclusive::from_file(file);
+        let back = ex.dehydrate_to_synced(size, mtime).map_err(placeholder_error);
+        if pinned && let Err(e) = provider::set_pin(ex.file(), provider::Pin::Pinned) {
+            tracing::warn!(error = %e, "a discarded change's file lost its pin");
+        }
+        back
+    }
+
+    /// After a crash: finishes overwriting and freeing file `id`, which
+    /// [`LocalFs::free_up`] recorded as verified at `stamp` before it began
+    /// ([`LocalFs::set_wipe_journal`]). It's the synced version, or zeros
+    /// from the start where the overwrite got to, unless another program
+    /// wrote it since: its stamp must be the same, and it must still be in
+    /// sync (nothing written yet) or begin with zeros (written by us; the
+    /// in-sync state is gone). Otherwise it's kept. The record goes either
+    /// way. Needs no keys, so a locked vault's folder is cleaned too.
+    ///
+    /// A discard's record ([`WipeThen::Revert`], [`WipeThen::Delete`]) is
+    /// finished if the file still has the stamp it had: its change was being
+    /// thrown away by the user's choice, so what it holds now doesn't matter.
+    pub fn finish_wipe(&self, id: u128, wipe: Wipe) -> Result<WipeEnd> {
+        let stamp = wipe.stamp;
+        let pre = LocalPre { id: LocalId(id), stamp: Some(stamp) };
+        let opened = match self.open_ours_with(&pre, win::open_path_for_wipe) {
+            Ok(found) => Some(found),
+            Err(Error::Changed) => None,
+            Err(e) => return Err(e),
+        };
+        let end = match opened {
+            None => WipeEnd::Kept,
+            Some((h, _, _)) if wipe.then != WipeThen::Free => {
+                let pinned = provider::info(&h.as_file())
+                    .map_err(placeholder_error)?
+                    .is_some_and(|i| i.pin == provider::Pin::Pinned);
+                win::overwrite_with_zeros(&h, u64::try_from(stamp.0).unwrap_or(0))?;
+                self.after_discard(h, id, wipe.then, pinned)?;
+                WipeEnd::Freed
+            }
+            Some((h, _, _)) => {
+                let info = provider::info(&h.as_file()).map_err(placeholder_error)?.ok_or(Error::NotOrdinary)?;
+                if info.on_disk == 0 {
+                    WipeEnd::AlreadyFree
+                } else if info.in_sync || starts_with_zeros(&h, stamp.0)? {
+                    win::overwrite_with_zeros(&h, u64::try_from(stamp.0).unwrap_or(0))?;
+                    self.dehydrate_kept_pin(h, id, info.pin == provider::Pin::Pinned, true)?;
+                    WipeEnd::Freed
+                } else {
+                    tracing::warn!("a file being cleared when OneUpDrive stopped was changed since, so it was kept");
+                    WipeEnd::Kept
+                }
+            }
+        };
+        self.journal_wipe(id, None)?;
+        Ok(end)
+    }
+
+    /// Frees the content through `h` (share-none, checked by the caller),
+    /// keeping a pin: Windows won't free a pinned file, so its pin is
+    /// cleared on the same handle for the call and set again after.
+    /// `overwritten`: the caller overwrote the verified content through `h`,
+    /// which cleared its in-sync state ([`Exclusive::dehydrate_overwritten`]).
+    fn dehydrate_kept_pin(&self, h: win::Handle, id: u128, pinned: bool, overwritten: bool) -> Result<()> {
+        oneup_cfapi::ours::note(id);
+        let file = h.into_file();
+        if pinned {
+            provider::set_pin(&file, provider::Pin::Unspecified).map_err(placeholder_error)?;
+        }
+        let ex = Exclusive::from_file(file);
+        let freed = if overwritten { ex.dehydrate_overwritten() } else { ex.dehydrate(None) };
+        let freed = freed.map_err(placeholder_error);
+        if pinned && let Err(e) = provider::set_pin(ex.file(), provider::Pin::Pinned) {
+            tracing::warn!(error = %e, "a pinned file freed while its vault locked lost its pin");
+        }
+        freed
     }
 
     /// Turning Files On-Demand on: the synced item `pre` becomes a
@@ -652,6 +840,20 @@ impl LocalFs {
         let path = long(&win::final_path(&probe)?);
         Ok(self.is_inside_pub(&path).then_some(path))
     }
+}
+
+/// Whether the open file's first block of [`win::overwrite_with_zeros`]
+/// (all of a smaller file) is zeros: what an overwrite cut short leaves.
+fn starts_with_zeros(h: &win::Handle, size: i64) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let block = i64::try_from(win::ZEROS_BLOCK).unwrap_or(i64::MAX);
+    let want = usize::try_from(size.clamp(0, block)).unwrap_or(0);
+    let mut buf = vec![0u8; want];
+    let f = h.as_file();
+    let mut file: &std::fs::File = &f;
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut buf)?;
+    Ok(buf.iter().all(|b| *b == 0))
 }
 
 /// Whether a file's attributes or reparse tag mark a cloud placeholder or

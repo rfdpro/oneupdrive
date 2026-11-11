@@ -695,6 +695,15 @@
             flex: 1;
             min-width: 160px;
         }
+
+        .vault-field + .vault-field {
+            margin-top: 16px;
+        }
+
+        .vault-field > label {
+            display: block;
+            font-weight: 600;
+        }
         
         .seg {
             display: inline-flex;
@@ -2673,37 +2682,45 @@
         </form>
     </dialog>
     <dialog id="dlg-vault-new" aria-labelledby="dlg-vault-new-t">
-        <form method="dialog">
+        <form method="dialog" autocomplete="off">
             <div class="dh">
                 <h3 id="dlg-vault-new-t">Create an encrypted vault</h3>
             </div>
             <div class="db">
-                <div class="field"><input type="text" id="vc-remote" placeholder="New OneDrive folder, like /Private" aria-label="New OneDrive folder" spellcheck="false"></div>
-                <div class="field"><input type="text" id="vc-local" placeholder="Empty folder on this PC" aria-label="Empty folder on this PC" spellcheck="false"><button class="btn" type="button" id="vc-browse">Browse…</button></div>
-                <div class="field"><input type="password" id="vc-pw" placeholder="Password (8+ characters)" aria-label="Password"></div>
-                <div class="field"><input type="password" id="vc-pw2" placeholder="Confirm password" aria-label="Confirm password"></div>
+                <div class="vault-field"><label for="vc-remote">Encrypted folder in OneDrive</label>
+                    <div class="field"><input type="text" id="vc-remote" placeholder="/Private" aria-describedby="vc-remote-help" spellcheck="false" required></div>
+                    <p class="note" id="vc-remote-help">Enter a path from the top of OneDrive, such as /Private. The folder must be new or empty.</p></div>
+                <div class="vault-field"><label for="vc-local">Decrypted folder on this PC</label>
+                    <div class="field"><input type="text" id="vc-local" aria-describedby="vc-local-help" spellcheck="false" required><button class="btn" type="button" id="vc-browse">Browse…</button></div>
+                    <p class="note" id="vc-local-help">Your readable files appear here. Choose a new or empty folder outside folders you already sync, so existing files aren't added to the vault.</p></div>
+                <div class="vault-field"><label for="vc-pw">Password</label><div class="field"><input type="password" id="vc-pw" placeholder="At least 8 characters" minlength="8" required></div></div>
+                <div class="vault-field"><label for="vc-pw2">Confirm password</label><div class="field"><input type="password" id="vc-pw2" required></div></div>
                 <label class="ck"><input type="checkbox" id="vc-full"><span>Keep all files on this PC<small>Otherwise they download when you open them.</small></span></label>
-                <label class="ck"><input type="checkbox" id="vc-remember"><span>Remember the password on this PC</span></label>
+                <p class="note">Your password isn't saved. Locking or restarting clears the decrypted files from this PC; unlock to open them again.</p>
                 <p class="note">A standard Cryptomator vault: Cryptomator's apps open it too.</p>
                 <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
             </div>
-            <div class="df"><span class="muted" id="vc-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="vc-add">Create vault</button></div>
+            <div class="df"><span class="muted" id="vc-busy" role="status"></span><button class="btn" type="button" id="vc-cancel">Cancel</button><button class="btn primary" type="submit" id="vc-add">Create</button></div>
         </form>
     </dialog>
     <dialog id="dlg-vault-add" aria-labelledby="dlg-vault-add-t">
-        <form method="dialog">
+        <form method="dialog" autocomplete="off">
             <div class="dh">
                 <h3 id="dlg-vault-add-t">Add an existing vault</h3>
             </div>
             <div class="db">
-                <div class="field"><input type="text" id="va-remote" placeholder="Vault folder in OneDrive, like /Vault" aria-label="Vault folder in OneDrive" spellcheck="false"></div>
-                <div class="field"><input type="text" id="va-local" placeholder="Empty folder on this PC" aria-label="Empty folder on this PC" spellcheck="false"><button class="btn" type="button" id="va-browse">Browse…</button></div>
-                <div class="field"><input type="password" id="va-pw" placeholder="Vault password" aria-label="Vault password"></div>
+                <div class="vault-field"><label for="va-remote">Existing vault in OneDrive</label>
+                    <div class="field"><input type="text" id="va-remote" placeholder="/Private" aria-describedby="va-remote-help" spellcheck="false" required></div>
+                    <p class="note" id="va-remote-help">Enter the OneDrive path to the folder containing vault.cryptomator, such as /Private.</p></div>
+                <div class="vault-field"><label for="va-local">Decrypted folder on this PC</label>
+                    <div class="field"><input type="text" id="va-local" aria-describedby="va-local-help" spellcheck="false" required><button class="btn" type="button" id="va-browse">Browse…</button></div>
+                    <p class="note" id="va-local-help">Your readable files appear here. Choose a new or empty folder outside folders you already sync, so existing files aren't added to the vault.</p></div>
+                <div class="vault-field"><label for="va-pw">Password</label><div class="field"><input type="password" id="va-pw" required></div></div>
                 <label class="ck"><input type="checkbox" id="va-full"><span>Keep all files on this PC</span></label>
-                <label class="ck"><input type="checkbox" id="va-remember"><span>Remember the password on this PC</span></label>
+                <p class="note">Your password isn't saved. Locking or restarting clears the decrypted files from this PC; unlock to open them again.</p>
                 <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
             </div>
-            <div class="df"><span class="muted" id="va-busy" role="status"></span><button class="btn" value="cancel">Cancel</button><button class="btn primary" type="button" id="va-add">Add vault</button></div>
+            <div class="df"><span class="muted" id="va-busy" role="status"></span><button class="btn" type="button" id="va-cancel">Cancel</button><button class="btn primary" type="submit" id="va-add">Add</button></div>
         </form>
     </dialog>
     <div class="menu ctx" id="ctx" role="menu" popover></div>
@@ -2783,7 +2800,6 @@
             <div class="db">
                 <div class="field"><label for="secret-password" id="secret-label">Password</label><input type="password" id="secret-password" autocomplete="current-password" spellcheck="false" autofocus></div>
                 <div class="field" id="secret-confirm-box" hidden><label for="secret-confirm">Confirm new password</label><input type="password" id="secret-confirm" autocomplete="new-password" spellcheck="false"></div>
-                <label class="ck" id="secret-remember-box" hidden><input type="checkbox" id="secret-remember">Remember the password on this PC</label>
             </div>
             <div class="df"><button class="btn" type="button" id="secret-cancel" value="cancel">Cancel</button><button class="btn primary" id="secret-go" value="ok">Continue</button></div>
         </form>
@@ -2795,6 +2811,7 @@
             </div>
             <div class="db">
                 <p class="muted" style="margin:4px 0 0">Keep it somewhere safe. It resets a forgotten password, and anyone who has it can read the vault. Cryptomator's apps don't use it.</p>
+                <p id="recovery-error" role="status" hidden></p>
                 <pre class="out" id="recovery-text"></pre></div>
             <div class="df"><button class="btn" type="button" id="recovery-copy">Copy</button><button class="btn primary" value="ok" id="recovery-done">I've saved it</button></div>
         </form>
@@ -5343,6 +5360,7 @@
         // =====================================================================
         const F = {
             roots: [],
+            rootsRequest: 0,
             root: null,
             nodes: new Map(),
             sel: null,
@@ -5422,10 +5440,13 @@
         }
 
         async function openFiles() {
-            F.roots = await call("roots").catch(e => {
-                toast(e.message, true);
+            const request = ++F.rootsRequest;
+            const roots = await call("roots").catch(e => {
+                if (request === F.rootsRequest) toast(e.message, true);
                 return [];
             });
+            if (request !== F.rootsRequest) return;
+            F.roots = roots;
             renderRoots();
             if (!F.roots.length) {
                 $("#tree").replaceChildren(el("div", {
@@ -7874,14 +7895,13 @@
             ]);
         }
 
-        function vaultSecret(title, {label = tr("Password"), confirmation = false, allowEmpty = false, remember = false, action = tr("Continue")} = {}) {
+        function vaultSecret(title, {label = tr("Password"), confirmation = false, allowEmpty = false, action = tr("Continue")} = {}) {
             const d = $("#dlg-secret"), form = $("form", d), password = $("#secret-password"), confirm = $("#secret-confirm");
             if (d.open) return Promise.resolve(null);
             $("#secret-title").textContent = title;
             $("#secret-label").textContent = label;
             $("#secret-go").textContent = action;
             $("#secret-confirm-box").hidden = !confirmation;
-            $("#secret-remember-box").hidden = !remember;
             password.value = confirm.value = "";
             password.required = !allowEmpty;
             password.minLength = confirmation ? 8 : 0;
@@ -7890,7 +7910,6 @@
             confirm.disabled = !confirmation;
             password.setCustomValidity("");
             confirm.setCustomValidity("");
-            $("#secret-remember").checked = false;
             return new Promise(resolve => {
                 let answer = null;
                 const validate = () => {
@@ -7902,7 +7921,7 @@
                     e.preventDefault();
                     validate();
                     if (!form.reportValidity()) return;
-                    answer = {password: password.value, remember: remember && $("#secret-remember").checked};
+                    answer = {password: password.value};
                     d.close();
                     finish();
                 };
@@ -7915,7 +7934,6 @@
                 const finish = () => {
                     // Remove secrets from the controls on every exit, including Esc.
                     password.value = confirm.value = "";
-                    $("#secret-remember").checked = false;
                     form.onsubmit = password.oninput = confirm.oninput = null;
                     $("#secret-cancel").onclick = null;
                     d.removeEventListener("close", closed);
@@ -7932,21 +7950,46 @@
 
         function vaultSection(r) {
             const body = [];
-            const askPw = async() => r.remembered ? "" : (await vaultSecret(tr("Password of the vault \"{name}\"", {
+            const askPw = async() => (await vaultSecret(tr("Password of the vault \"{name}\"", {
                 name: r.name
             }), {allowEmpty: r.hello, label: r.hello ? tr("Password (leave empty to use Windows Hello)") : tr("Password")}))?.password ?? null;
-            body.push(opt(r.running ? tr("Unlocked") : tr("Locked"), r.running ? "" : tr("Unlock to see and sync its files."),
+            body.push(opt(r.running ? tr("Unlocked") : tr("Locked"), r.running ? tr("Locking clears its decrypted files from this PC.") : tr("Unlock to see and sync its files."),
                 el("button", {
                     className: "btn small" + (r.running ? "" : " primary"),
                     textContent: r.running ? tr("Lock") : tr("Unlock…"),
                     onclick: () => r.running ?
                         run(call("vault_lock", {
                             name: r.name
-                        }), tr("Locked")).then(() => setTimeout(openFiles, 1500)) : unlockVault(r)
+                        }), res => res && res.kept_count ? tr("Locked. {n, plural, one {# file kept} other {# files kept}}: not synced yet, or open in a program.", {
+                            n: res.kept_count
+                        }) : tr("Locked")).then(openFiles) : unlockVault(r)
                 })));
+            const setting = (k, v) => run(call("vault_settings", {name: r.name, [k]: v}), tr("Saved")).then(openFiles);
+            const minutes = (k, value, max, label) => el("input", {
+                type: "number",
+                min: "0",
+                max: String(max),
+                step: "1",
+                value: String(value ?? 0),
+                "aria-label": label,
+                onchange: e => {
+                    const n = Number(e.target.value);
+                    if (Number.isInteger(n) && n >= 0 && n <= max) setting(k, n);
+                    else e.target.value = String(value ?? 0);
+                }
+            });
+            body.push(opt(tr("Sync every (minutes)"), tr("0 to sync within seconds. Changes collect in between."),
+                minutes("interval_minutes", r.interval_minutes, 1440, tr("Sync every (minutes)"))));
+            body.push(opt(tr("Lock after (minutes unused)"), tr("0: never. Opening or changing a file counts as use."),
+                minutes("lock_after_idle_minutes", r.lock_after_idle_minutes, 10080, tr("Lock after (minutes unused)"))));
+            body.push(opt(tr("Lock with Windows"), tr("When Windows locks or goes to sleep."),
+                toggleEl(r.lock_with_windows, tr("Lock with Windows"), v => setting("lock_with_windows", v))));
+            body.push(opt(tr("Keep unsynced changes after a crash"),
+                tr("On: changes not synced when the PC crashed or lost power stay decrypted here until you unlock. Off: they're discarded."),
+                toggleEl(r.keep_unsent, tr("Keep unsynced changes after a crash"), v => setting("keep_unsent", v))));
             if (snap && (snap.hello_available || r.hello)) body.push(opt(tr("Unlock with Windows Hello"), tr("Face, fingerprint or PIN."), toggleEl(r.hello, tr("Unlock with Windows Hello"), async(v, i) => {
                 let p = "";
-                if (v && !r.remembered) {
+                if (v) {
                     p = (await vaultSecret(tr("Password of the vault \"{name}\"", {name: r.name})))?.password ?? null;
                     if (p === null) {
                         i.checked = false;
@@ -7981,7 +8024,7 @@
                     textContent: tr("Change password…"),
                     onclick: async() => {
                         const current = await vaultSecret(tr("Change password"), {
-                            label: tr("Current password or recovery key (empty if remembered or using Windows Hello)"), allowEmpty: true
+                            label: r.hello ? tr("Current password or recovery key (leave empty to use Windows Hello)") : tr("Current password or recovery key"), allowEmpty: r.hello
                         });
                         if (!current) return;
                         const how = current.password, isKey = /^\s*oud1/i.test(how);
@@ -8095,9 +8138,6 @@
         }
 
         async function unlockVault(r) {
-            if (r.remembered) return run(call("vault_unlock", {
-                name: r.name
-            }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
             if (r.hello) {
                 toast(tr("Confirm with Windows Hello…"));
                 return run(call("vault_unlock", {
@@ -8106,22 +8146,30 @@
                 }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
             }
             const secret = await vaultSecret(tr("Password of the vault \"{name}\"", {name: r.name}), {
-                remember: true, action: tr("Unlock")
+                action: tr("Unlock")
             });
             if (!secret) return;
             run(call("vault_unlock", {
                 name: r.name,
-                password: secret.password,
-                remember: secret.remember
+                password: secret.password
             }), tr("Unlocking…")).then(() => setTimeout(openFiles, 3000));
         }
 
-        function showRecovery(text) {
+        function showRecovery(text, startError = null) {
             $("#recovery-text").textContent = text;
+            $("#recovery-error").hidden = !startError;
+            $("#recovery-error").textContent = startError ? tr("Couldn't start syncing: {error}", {error: startError}) : "";
             $("#dlg-recovery").showModal();
         }
         $("#recovery-copy").onclick = () => navigator.clipboard.writeText($("#recovery-text").textContent).then(() => toast(tr("Copied")));
-        $("#dlg-recovery").addEventListener("close", () => $("#recovery-text").textContent = "");
+        function clearRecovery() {
+            $("#recovery-text").textContent = "";
+            $("#recovery-error").textContent = "";
+            $("#recovery-error").hidden = true;
+        }
+        $("#recovery-done").onclick = clearRecovery;
+        $("#dlg-recovery").addEventListener("cancel", clearRecovery);
+        $("#dlg-recovery").addEventListener("close", () => { if (!$("#dlg-recovery").open) clearRecovery(); });
 
         // ---- Add menu and dialogs
         $("#add-menu").addEventListener("toggle", e => {
@@ -8135,11 +8183,11 @@
             if (b.dataset.dlg === "dlg-shared") loadShared();
         });
         async function afterAdd(id) {
-            await load();
             F.want = {
                 root: id
             };
             await openFiles();
+            load().catch(e => toast(e.message, true));
         }
         $("#pa-browse").onclick = async() => {
             const p = await run(call("pick_folder"));
@@ -8289,11 +8337,19 @@
                 }, go))));
             }
         }
+        for (const [dialog, prefix] of [["dlg-vault-new", "vc"], ["dlg-vault-add", "va"]]) {
+            const d = $("#" + dialog);
+            const clear = () => { for (const input of $$("input[type=password]", d)) input.value = ""; };
+            $("#" + prefix + "-cancel").onclick = () => { clear(); d.close(); };
+            d.addEventListener("cancel", clear);
+            d.addEventListener("close", () => { if (!d.open) clear(); });
+        }
         $("#vc-browse").onclick = async() => {
             const p = await run(call("pick_folder"));
             if (p) $("#vc-local").value = p;
         };
-        $("#vc-add").onclick = async() => {
+        $("#dlg-vault-new form").onsubmit = async e => {
+            e.preventDefault();
             if ($("#vc-pw").value !== $("#vc-pw2").value) return toast(tr("The passwords don't match"), true);
             $("#vc-busy").textContent = tr("Creating the vault…");
             $("#vc-add").disabled = true;
@@ -8302,17 +8358,18 @@
                     remote: $("#vc-remote").value,
                     local: $("#vc-local").value,
                     password: $("#vc-pw").value,
-                    full: $("#vc-full").checked,
-                    remember: $("#vc-remember").checked
+                    full: $("#vc-full").checked
                 });
                 $("#vc-pw").value = "";
                 $("#vc-pw2").value = "";
                 $("#dlg-vault-new").close();
-                toast(tr("Vault \"{name}\" created and syncing", {
-                    name: r.name
-                }));
                 await afterAdd("vault:" + r.name);
-                showRecovery(r.recovery);
+                toast(r.start_error ? tr("Vault \"{name}\" created. Couldn't start syncing: {error}", {
+                    name: r.name, error: r.start_error
+                }) : tr("Vault \"{name}\" created and syncing", {
+                    name: r.name
+                }), !!r.start_error);
+                showRecovery(r.recovery, r.start_error);
             } catch (e) {
                 toast(e.message, true);
             } finally {
@@ -8324,7 +8381,8 @@
             const p = await run(call("pick_folder"));
             if (p) $("#va-local").value = p;
         };
-        $("#va-add").onclick = async() => {
+        $("#dlg-vault-add form").onsubmit = async e => {
+            e.preventDefault();
             $("#va-busy").textContent = tr("Opening the vault…");
             $("#va-add").disabled = true;
             try {
@@ -8332,15 +8390,16 @@
                     remote: $("#va-remote").value,
                     local: $("#va-local").value,
                     password: $("#va-pw").value,
-                    full: $("#va-full").checked,
-                    remember: $("#va-remember").checked
+                    full: $("#va-full").checked
                 });
                 $("#va-pw").value = "";
                 $("#dlg-vault-add").close();
-                toast(tr("Vault \"{name}\" added and syncing", {
+                await afterAdd("vault:" + r.name);
+                toast(r.start_error ? tr("Vault \"{name}\" added. Couldn't start syncing: {error}", {
+                    name: r.name, error: r.start_error
+                }) : tr("Vault \"{name}\" added and syncing", {
                     name: r.name
-                }));
-                afterAdd("vault:" + r.name);
+                }), !!r.start_error);
             } catch (e) {
                 toast(e.message, true);
             } finally {

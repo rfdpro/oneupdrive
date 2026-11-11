@@ -186,9 +186,12 @@ impl<C: Cloud + 'static> Hydrator<C> {
         }
         let etag = current.etag.ok_or(Refusal::NotCurrent)?;
 
-        let staged =
-            Staged(self.staging.join(format!("{}-{}.hydrating", std::process::id(), self.seq.fetch_add(1, Relaxed))));
-        self.download_and_transfer(fetch, &id, etag, &staged.0).await
+        let staged = Staged::new(self.staging.join(format!(
+            "{}-{}.hydrating",
+            std::process::id(),
+            self.seq.fetch_add(1, Relaxed)
+        )));
+        self.download_and_transfer(fetch, &id, etag, &staged).await
     }
 
     async fn download_and_transfer(
@@ -196,8 +199,9 @@ impl<C: Cloud + 'static> Hydrator<C> {
         fetch: &Fetch,
         id: &Identity,
         etag: String,
-        path: &PathBuf,
+        staged: &Staged,
     ) -> Result<u64, Refusal> {
+        let path = &staged.0;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -206,15 +210,18 @@ impl<C: Cloud + 'static> Hydrator<C> {
             .map_err(|_| Refusal::Download)?;
         let pre = RemotePre { id: RemoteId(id.item.clone()), etag };
         let cloud = self.cloud_for(asked_by_us(fetch.process.as_ref(), std::process::id()));
-        let (len, hash) = {
-            let mut w = Hashing::new(&mut file);
+        let key = cloud.content_key();
+        // Decrypted (a vault): overwritten before it's removed.
+        staged.1.store(key.is_some(), Relaxed);
+        let (len, hash, mac) = {
+            let mut w = Hashing::keyed(&mut file, key.as_ref());
             // Changed: OneDrive is ahead of the Remote tree, so a round has news.
             let received = cloud.download(&pre, &mut w).await.map_err(|e| match e {
                 CloudError::Changed => Refusal::NotCurrent,
                 _ => Refusal::Download,
             })?;
             // The identity's hash is the cloud's (see `cloud`).
-            (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
+            (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()), w.hash.mac())
         };
         if i64::try_from(len).ok() != Some(id.size) || hash != id.hash {
             return Err(Refusal::Mismatch);
@@ -232,7 +239,28 @@ impl<C: Cloud + 'static> Hydrator<C> {
             offset += n as i64;
             fetch.progress(id.size, offset);
         }
+        if let Some(mac) = mac {
+            self.note_content(fetch.file_id, id.size, &mac);
+        }
         Ok(len)
+    }
+
+    /// Records the keyed hash of what a hydration wrote (a cloud with a
+    /// [`crate::Cloud::content_key`]), for the placeholder's stamp, so its
+    /// decrypted copy can be freed again. Hydrating doesn't change the
+    /// stamp; a row that no longer has this size gets nothing. Best effort:
+    /// without it the copy is only kept longer.
+    fn note_content(&self, file_id: i64, size: i64, mac: &[u8; oneup_hash::HASH_LEN]) {
+        // NTFS's 64-bit file reference, as the Local tree stores it (128-bit).
+        let id = u128::from(file_id as u64);
+        let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+        let noted = store.write(|o| match o.local_get(id)? {
+            Some(row) if row.size == size => o.content_mac_put(id, row.size, row.mtime, mac),
+            _ => Ok(()),
+        });
+        if let Err(e) = noted {
+            tracing::debug!(error = %e, "a hydrated file's keyed hash wasn't recorded");
+        }
     }
 
     /// Remembers that a program used this file (at `path`) now, for the
@@ -345,12 +373,36 @@ impl<C: Cloud + 'static> Provider for Serve<C> {
 /// A download's staging file, removed when dropped: also when a cancelled
 /// fetch aborts its task mid-download, so repeated cancels of big files
 /// don't fill the disk until the next start.
-struct Staged(PathBuf);
+/// A hydration's staging file, removed when dropped (overwritten with
+/// zeros first when it holds decrypted content).
+struct Staged(PathBuf, std::sync::atomic::AtomicBool);
+
+impl Staged {
+    fn new(path: PathBuf) -> Self {
+        Self(path, std::sync::atomic::AtomicBool::new(false))
+    }
+}
 
 impl Drop for Staged {
     fn drop(&mut self) {
+        if self.1.load(Relaxed) {
+            let _ = overwrite_own(&self.0);
+        }
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Overwrites one of our own staging files with zeros, flushed.
+fn overwrite_own(p: &std::path::Path) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().write(true).open(p)?;
+    let mut left = f.metadata()?.len();
+    let zeros = vec![0u8; 1 << 20];
+    while left > 0 {
+        let n = usize::try_from(left.min(zeros.len() as u64)).unwrap_or(zeros.len());
+        f.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    f.sync_data()
 }
 
 fn fetch_key(f: &Fetch) -> i64 {
@@ -436,7 +488,7 @@ mod tests {
         let path = dir.join("1-0.hydrating");
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let (started, written) = std::sync::mpsc::channel();
-        let staged = Staged(path.clone());
+        let staged = Staged::new(path.clone());
         let task = rt.spawn(async move {
             let mut file = std::fs::File::create_new(&staged.0).unwrap();
             file.write_all(b"part of a download").unwrap();

@@ -39,6 +39,13 @@ struct Item {
 
 #[derive(Default)]
 struct State {
+    /// Keeps content transformed, as a vault keeps it encrypted ([`seal`]):
+    /// OneDrive's hashes are then of the sealed bytes, and what's on the PC
+    /// is checked by its keyed hash, with this key.
+    sealed: Option<oneup_hash::MacKey>,
+    /// What a sealed cloud's pair recorded of its overwrites
+    /// (`LocalFs::set_wipe_journal`), in order.
+    wipes: Vec<(u128, Option<oneup_effects::Wipe>)>,
     items: BTreeMap<String, Item>,
     next: u64,
     /// Deleted since the last pull (what delta would report).
@@ -323,7 +330,18 @@ impl Fake {
     fn add(&self, path: &str, content: Option<&[u8]>) -> String {
         let mut s = self.0.lock().unwrap();
         let (parent, name) = resolve_parent(&s, path);
-        s.create(&parent, &name, content.is_none(), content.unwrap_or_default().to_vec())
+        let folder = content.is_none();
+        let content = content.unwrap_or_default().to_vec();
+        let content = if s.sealed.is_some() && !folder { seal(&content) } else { content };
+        s.create(&parent, &name, folder, content)
+    }
+
+    /// A cloud keeping content sealed ([`seal`]), as a vault keeps it
+    /// encrypted.
+    fn sealed() -> Self {
+        let f = Self::new();
+        f.0.lock().unwrap().sealed = Some(oneup_hash::MacKey::new(zeroize::Zeroizing::new([9; 32])));
+        f
     }
     fn edit(&self, path: &str, content: &[u8]) {
         let id = resolve(&self.0.lock().unwrap(), path);
@@ -564,13 +582,15 @@ impl Fake {
             if it.folder {
                 return Err(CloudError::Other("not a file".into()));
             }
-            it.content.clone()
+            (it.content.clone(), s.sealed.is_some())
         };
+        let (content, sealed) = content;
+        let (content, received) = if sealed { (seal(&content), Some(qxh(&content))) } else { (content, None) };
         // In pieces, as data arrives over the network.
         for piece in content.chunks(4096) {
             out.write_all(piece)?;
         }
-        Ok(None)
+        Ok(received)
     }
 
     /// Reads an upload's `size` bytes as Graph does, through
@@ -617,6 +637,8 @@ impl Fake {
         }
         s.uploaded += content.len() as u64;
         s.sent.push((name.to_string(), content.clone()));
+        let content = if s.sealed.is_some() { seal(&content) } else { content };
+        let sent = s.sealed.is_some().then(|| qxh(&content));
         let id = match replace {
             Some(pre) => {
                 s.check(pre)?;
@@ -649,13 +671,28 @@ impl Fake {
                 s.create(&parent.0, name, false, content)
             }
         };
-        Ok((s.row(&id), None))
+        Ok((s.row(&id), sent))
     }
+}
+
+/// What a sealed [`Fake`] keeps of content, and gives back of it: every
+/// byte inverted (its own inverse), so the cloud's hash is never the
+/// content's.
+fn seal(content: &[u8]) -> Vec<u8> {
+    content.iter().map(|b| !b).collect()
 }
 
 impl Cloud for Fake {
     fn concurrent(&self) -> bool {
         true
+    }
+
+    fn content_key(&self) -> Option<oneup_hash::MacKey> {
+        self.0.lock().unwrap().sealed.clone()
+    }
+
+    fn can_copy(&self) -> bool {
+        self.0.lock().unwrap().sealed.is_none()
     }
 
     fn moves_keep_ids(&self) -> bool {
@@ -1261,6 +1298,15 @@ impl Sync {
         let rules = ExcludeSet::none();
         let root = store.read(|o| o.local_root()).unwrap().unwrap();
         let mut fs = LocalFs::open(dir, root.volume_serial, root.root_file_id, "test-token", true).unwrap();
+        if let Some(key) = cloud.content_key() {
+            fs.set_content_key(key);
+        }
+        // Used only where content is overwritten (a vault's pair).
+        let c = cloud.clone();
+        fs.set_wipe_journal(Box::new(move |id, wipe| {
+            c.0.lock().unwrap().wipes.push((id, wipe));
+            Ok(())
+        }));
         // As the app does: the effects find items where the Local tree has
         // them, through their own connection (a database on disk only).
         if let Some(reader) = store.reopen(256).unwrap() {
@@ -3810,7 +3856,8 @@ impl Sync {
     /// What the agent's placement pass does to free space: the gate, then
     /// the executor.
     async fn free_up(&mut self) -> Report {
-        let ops = oneup_exec::placement::free_ops(self.obs.store()).unwrap();
+        let keyed = self.cloud.content_key().is_some();
+        let ops = oneup_exec::placement::free_ops(self.obs.store(), keyed).unwrap();
         let r = review_in(&Policy::default(), &Context::default(), ops);
         self.exec.run(self.obs.store_mut(), r.approved).await
     }
@@ -3897,6 +3944,250 @@ async fn on_demand_a_pinned_file_is_never_freed() {
     let report = s.exec.run(s.obs.store_mut(), r.approved).await;
     assert_eq!(report.done.len(), 1, "{report:?}");
     assert_eq!(placeholder(&p).on_disk, 0);
+    drop(s);
+    drop(od);
+}
+
+/// A cloud that keeps content transformed (a vault, encrypted): OneDrive's
+/// hash is of the stored bytes, never of the file here. "Free up space"
+/// still frees a file that is the synced version, checked by the keyed hash
+/// recorded when it was downloaded or sent; an edit not sent yet is kept,
+/// and freed once it's sent. Without the keyed hash nothing is freed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_sealed_cloud_frees_files_by_their_keyed_hash() {
+    let cloud = Fake::sealed();
+    cloud.add("opened.txt", Some(b"secret notes"));
+    cloud.add("edited.txt", Some(b"draft one"));
+    let (od, mut s) = on_demand_sync("ondemand-sealed-free", &cloud);
+    s.quiesce().await;
+    let (po, pe) = (s.p("opened.txt"), s.p("edited.txt"));
+    assert_eq!(app_read(&po).as_deref(), Some(&b"secret notes"[..]), "decrypted when opened");
+    assert_eq!(app_read(&pe).as_deref(), Some(&b"draft one"[..]));
+    assert_ne!(cloud.tree()["/opened.txt"].as_deref(), Some(&b"secret notes"[..]), "kept sealed");
+
+    // QuickXorHash-based freeing has nothing to go on: the cloud's hash is
+    // of the sealed bytes.
+    for p in [&po, &pe] {
+        provider::set_pin(&provider::open(p).unwrap(), provider::Pin::Unpinned).unwrap();
+    }
+    s.obs.catch_up().unwrap();
+    let plain = oneup_exec::placement::free_ops(s.obs.store(), false).unwrap();
+    let r = review_in(&Policy::default(), &Context::default(), plain);
+    assert!(s.exec.run(s.obs.store_mut(), r.approved).await.done.is_empty());
+    assert_eq!(placeholder(&po).on_disk, 12);
+
+    // Edited here, not sent yet: only the opened file goes.
+    app_append(&pe, "plus an edit");
+    provider::set_pin(&provider::open(&pe).unwrap(), provider::Pin::Unpinned).unwrap();
+    s.obs.catch_up().unwrap();
+    let r = s.free_up().await;
+    assert_eq!(r.done.len(), 1, "{r:?}");
+    assert_eq!(placeholder(&po).on_disk, 0, "freed");
+    assert!(placeholder(&pe).on_disk > 0, "the unsent edit is kept");
+    assert_eq!(app_read(&po).as_deref(), Some(&b"secret notes"[..]), "comes back from the cloud");
+
+    // Overwritten first, each recorded before and after.
+    let id = s.local_id("opened.txt").0;
+    let wipes = std::mem::take(&mut cloud.0.lock().unwrap().wipes);
+    assert!(
+        matches!(wipes[..], [(a, Some(w)), (b, None)] if a == id && b == id && w.then == oneup_effects::WipeThen::Free),
+        "{wipes:?}"
+    );
+
+    // Sent: its keyed hash is the one recorded for what was sent.
+    s.quiesce().await;
+    let stored = cloud.tree()["/edited.txt"].clone().unwrap();
+    assert!(String::from_utf8_lossy(&seal(&stored)).contains("plus an edit"));
+    provider::set_pin(&provider::open(&pe).unwrap(), provider::Pin::Unpinned).unwrap();
+    provider::set_pin(&provider::open(&po).unwrap(), provider::Pin::Unpinned).unwrap();
+    s.obs.catch_up().unwrap();
+    let r = s.free_up().await;
+    assert_eq!(r.done.len(), 2, "{r:?}");
+    assert_eq!((placeholder(&po).on_disk, placeholder(&pe).on_disk), (0, 0));
+    drop(s);
+    drop(od);
+}
+
+/// A crash while a vault's decrypted copy was being overwritten leaves it
+/// recorded, zeros from the start, out of sync. The next start finishes it: the zeros
+/// go and the content comes back from the cloud. A file another program
+/// wrote since is kept as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_an_overwrite_cut_short_is_finished_unless_the_file_changed() {
+    let cloud = Fake::sealed();
+    cloud.add("cut.txt", Some(b"0123456789 secret"));
+    cloud.add("edited.txt", Some(b"0123456789 other"));
+    let (od, mut s) = on_demand_sync("ondemand-wipe-cut", &cloud);
+    s.quiesce().await;
+    let (pc, pe) = (s.p("cut.txt"), s.p("edited.txt"));
+    assert!(app_read(&pc).is_some() && app_read(&pe).is_some());
+    s.obs.catch_up().unwrap();
+    let stamp = |s: &Sync, name: &str| {
+        let id = s.local_id(name).0;
+        let r = s.obs.store().read(|o| o.local_get(id)).unwrap().unwrap();
+        (id, (r.size, r.mtime))
+    };
+    let (cut, cut_stamp) = stamp(&s, "cut.txt");
+    let (edited, edited_stamp) = stamp(&s, "edited.txt");
+    // As the crash left them: the first block of zeros written (all of a
+    // small file), through a handle that froze the times.
+    for (p, size) in [(&pc, cut_stamp.0), (&pe, edited_stamp.0)] {
+        let h = oneup_ntfs::win::open_path_for_wipe(p).unwrap();
+        oneup_ntfs::win::overwrite_with_zeros(&h, size as u64).unwrap();
+    }
+    assert!(!placeholder(&pc).in_sync);
+    // And another program wrote the second one since.
+    app_append(&pe, "more");
+
+    assert_eq!(
+        s.exec
+            .local()
+            .finish_wipe(cut, oneup_effects::Wipe { stamp: cut_stamp, then: oneup_effects::WipeThen::Free })
+            .unwrap(),
+        oneup_effects::WipeEnd::Freed
+    );
+    assert_eq!(placeholder(&pc).on_disk, 0);
+    assert_eq!(
+        s.exec
+            .local()
+            .finish_wipe(cut, oneup_effects::Wipe { stamp: cut_stamp, then: oneup_effects::WipeThen::Free })
+            .unwrap(),
+        oneup_effects::WipeEnd::AlreadyFree
+    );
+    assert_eq!(app_read(&pc).as_deref(), Some(&b"0123456789 secret"[..]), "the cloud's content");
+    assert_eq!(
+        s.exec
+            .local()
+            .finish_wipe(edited, oneup_effects::Wipe { stamp: edited_stamp, then: oneup_effects::WipeThen::Free })
+            .unwrap(),
+        oneup_effects::WipeEnd::Kept
+    );
+    assert!(String::from_utf8_lossy(&std::fs::read(&pe).unwrap()).contains("more"), "kept");
+    let wipes = cloud.0.lock().unwrap().wipes.clone();
+    assert_eq!(wipes, [(cut, None), (cut, None), (edited, None)], "each record goes");
+    drop(s);
+    drop(od);
+}
+
+/// Locking a vault (`oneup_app::sync::Engine::clear_vault` makes these
+/// operations): every decrypted copy that is the synced version goes, a
+/// pinned one too (it stays pinned), after the provider has disconnected,
+/// as the agent does it once its sync loop has ended. An edit not sent yet
+/// has no keyed hash and is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_locking_vault_clears_every_decrypted_copy_after_disconnecting() {
+    let cloud = Fake::sealed();
+    cloud.add("plain.txt", Some(b"opened once"));
+    cloud.add("pinned.txt", Some(b"always kept"));
+    cloud.add("draft.txt", Some(b"draft"));
+    let (mut od, mut s) = on_demand_sync("ondemand-lock-clear", &cloud);
+    s.quiesce().await;
+    let (pp, pk, pd) = (s.p("plain.txt"), s.p("pinned.txt"), s.p("draft.txt"));
+    assert!(app_read(&pp).is_some() && app_read(&pk).is_some() && app_read(&pd).is_some());
+    provider::set_pin(&provider::open(&pk).unwrap(), provider::Pin::Pinned).unwrap();
+    app_append(&pd, "unsent");
+    s.obs.catch_up().unwrap();
+    od.conn.take();
+
+    let ops: Vec<Op> = s
+        .obs
+        .store()
+        .read(|o| {
+            let mut ops = Vec::new();
+            for r in o.local_with_content(None, 100)? {
+                if let Some(hash) = o.content_mac_get(r.file_id, r.size, r.mtime)? {
+                    ops.push(Op::Dehydrate {
+                        local: LocalPre { id: LocalId(r.file_id), stamp: Some((r.size, r.mtime)) },
+                        hash,
+                    });
+                }
+            }
+            Ok(ops)
+        })
+        .unwrap();
+    assert_eq!(ops.len(), 2, "the unsent edit has no keyed hash");
+    // Not locking: the pinned one stays.
+    let r = review_in(&Policy::default(), &Context::default(), ops.clone());
+    assert_eq!(s.exec.run(s.obs.store_mut(), r.approved).await.done.len(), 1);
+    assert_eq!(placeholder(&pp).on_disk, 0);
+    assert_eq!(placeholder(&pk).on_disk, 11);
+    s.exec.local().set_locking(true);
+    s.obs.catch_up().unwrap();
+    let kid = s.local_id("pinned.txt");
+    let pinned_op: Vec<Op> =
+        ops.iter().filter(|o| matches!(o, Op::Dehydrate { local, .. } if local.id == kid)).cloned().collect();
+    let r = review_in(&Policy::default(), &Context::default(), pinned_op);
+    let report = s.exec.run(s.obs.store_mut(), r.approved).await;
+    s.exec.local().set_locking(false);
+    assert_eq!(report.done.len(), 1, "{report:?}");
+    let k = placeholder(&pk);
+    assert_eq!((k.on_disk, k.pin), (0, provider::Pin::Pinned), "freed, still pinned");
+    assert!(String::from_utf8_lossy(&std::fs::read(&pd).unwrap()).contains("unsent"), "the edit is kept");
+    drop(s);
+    drop(od);
+}
+
+/// A vault an unclean shutdown left unlocked, cleared while locked, without
+/// its keys (`oneup_app::sync::Engine::clean_locked` makes these
+/// operations): a copy Windows still has in sync is overwritten and freed;
+/// with the user's choice not to keep unsent changes, an edited file goes
+/// back to its synced version, online-only, and a new file is deleted. A
+/// copy that isn't in sync is never freed as if it were.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_demand_a_vault_left_unlocked_is_cleared_while_locked() {
+    let cloud = Fake::new();
+    cloud.add("synced.txt", Some(b"synced content"));
+    cloud.add("edited.txt", Some(b"before the edit"));
+    let (mut od, mut s) = on_demand_sync("ondemand-clean-locked", &cloud);
+    s.quiesce().await;
+    let (ps, pe, pn) = (s.p("synced.txt"), s.p("edited.txt"), s.p("new.txt"));
+    assert!(app_read(&ps).is_some() && app_read(&pe).is_some());
+    app_append(&pe, "unsent edit");
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd").raw_arg(format!("/C echo brand new>\"{}\"", pn.display())).status().unwrap();
+    s.obs.catch_up().unwrap();
+    // The agent is gone: nothing serves or syncs this folder.
+    od.conn.take();
+    s.exec.local().set_clearing_locked(true);
+
+    let row = |s: &Sync, name: &str| {
+        let id = s.local_id(name);
+        let r = s.obs.store().read(|o| o.local_get(id.0)).unwrap().unwrap();
+        let b = s.obs.store().read(|o| o.synced_by_local(id.0)).unwrap();
+        (LocalPre { id, stamp: Some((r.size, r.mtime)) }, b)
+    };
+    let (synced, b) = row(&s, "synced.txt");
+    let b = b.unwrap();
+    // Not in sync (the edit): refused, though its records say synced.
+    let (edited, eb) = row(&s, "edited.txt");
+    let eb = eb.unwrap();
+    let wrong = Op::Dehydrate {
+        local: LocalPre { stamp: Some((eb.size, eb.local_mtime)), ..edited.clone() },
+        hash: eb.hash.unwrap(),
+    };
+    let ops = vec![Op::Dehydrate { local: synced, hash: b.hash.unwrap() }, wrong];
+    let report = s.exec.run(s.obs.store_mut(), review_in(&Policy::default(), &Context::default(), ops).approved).await;
+    assert_eq!((report.done.len(), report.skipped.len()), (1, 1), "{report:?}");
+    assert_eq!(placeholder(&ps).on_disk, 0);
+    assert!(String::from_utf8_lossy(&std::fs::read(&pe).unwrap()).contains("unsent edit"), "still here");
+
+    let (new, nb) = row(&s, "new.txt");
+    assert!(nb.is_none());
+    let ops = vec![
+        Op::Discard { local: edited, synced: Some((eb.size, eb.local_mtime)) },
+        Op::Discard { local: new, synced: None },
+    ];
+    let report = s.exec.run(s.obs.store_mut(), review_in(&Policy::default(), &Context::default(), ops).approved).await;
+    assert_eq!(report.done.len(), 2, "{report:?}");
+    s.exec.local().set_clearing_locked(false);
+    assert!(!pn.exists(), "the new file is gone");
+    let e = placeholder(&pe);
+    assert_eq!((e.on_disk, e.in_sync), (0, true), "back to the synced version, online-only");
+    assert_eq!(std::fs::metadata(&pe).unwrap().len() as i64, eb.size);
+    // Unlocked again: the synced version comes back from OneDrive.
+    od.conn = Some(provider::connect(&od.path, Arc::new(Serve(Arc::clone(&od.hydrator)))).unwrap());
+    assert_eq!(app_read(&pe).as_deref(), Some(&b"before the edit"[..]));
+    assert_eq!(app_read(&ps).as_deref(), Some(&b"synced content"[..]));
     drop(s);
     drop(od);
 }
@@ -6063,7 +6354,10 @@ async fn everyday_a_hook_fires_once_per_coalesced_change() {
     s.policy = Policy { max_count: 100_000, min_count: 100_000, ..Policy::default() };
     // What it runs doesn't matter here (the benchmark below starts real
     // programs); below-normal programs on a busy PC would only slow it.
-    let (runner, fired, bad) = burst_hook(&s.dir.0, Duration::from_secs(8), Arc::new(NoProgram));
+    // Both rounds must land within the coalescing time; on a PC busy with
+    // the other tests (Cloud Files ones start programs), 8 s wasn't always
+    // enough.
+    let (runner, fired, bad) = burst_hook(&s.dir.0, Duration::from_secs(20), Arc::new(NoProgram));
     let offer = |s: &Sync, r: &Report| runner.offer(&hook_events(s, r));
     let n = 300;
     for i in 0..n {

@@ -20,6 +20,7 @@ pub fn item(op: &Op) -> Option<RetryItem<'_>> {
         Op::Upload { local, .. }
         | Op::Hash(local)
         | Op::Dehydrate { local, .. }
+        | Op::Discard { local, .. }
         | Op::MkdirRemote { local, .. }
         | Op::MoveLocal { local, .. }
         | Op::RenameLocal { local, .. }

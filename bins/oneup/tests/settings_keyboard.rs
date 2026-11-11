@@ -414,8 +414,8 @@ const DRIVER: &str = r##"<script>
     const enterSecret = (input, value) => { input.value = value; input.dispatchEvent(new Event("input", {bubbles:true})); };
     const vaultBefore = HOST_CALLS.filter(m=>m.op.startsWith("vault_")).length;
     const cancelledUnlock = unlockVault({name:"Test vault"});
-    check("vault unlock uses a focused masked field and unchecked remember option", secretDialog.open && secretInput.type === "password"
-      && document.activeElement === secretInput && !document.querySelector("#secret-remember").checked, secretDialog.open);
+    check("vault unlock uses a focused masked field without a save-password option", secretDialog.open && secretInput.type === "password"
+      && document.activeElement === secretInput && !document.querySelector("#secret-remember"), secretDialog.open);
     check("Enter submits the vault action rather than Cancel", secretForm.querySelector(":default") === secretSubmit, "");
     enterSecret(secretInput, "test-only-secret"); secretDialog.requestClose(); await sleep(50); await cancelledUnlock;
     check("Esc cancels vault unlock, clears credentials and restores focus", !secretInput.value && document.activeElement === focusBack
@@ -444,14 +444,92 @@ const DRIVER: &str = r##"<script>
     check("Cancel ignores validation and sends no password change", !secretDialog.open && HOST_CALLS.filter(m=>m.op === "vault_password").length === 1, "");
     HOST_ANSWERS.vault_unlock = null;
     const acceptedUnlock = unlockVault({name:"Test vault"});
-    enterSecret(secretInput, "test-only-secret"); document.querySelector("#secret-remember").checked = true;
+    enterSecret(secretInput, "test-only-secret");
     secretForm.requestSubmit(secretSubmit); await sleep(50); await acceptedUnlock; await sleep(30);
     const unlockCall = HOST_CALLS.filter(m=>m.op === "vault_unlock").pop();
-    check("unlock keeps explicit remember choice and clears its field", unlockCall?.args.remember === true
+    check("unlock sends no persistent-save request and clears its field", unlockCall && !Object.hasOwn(unlockCall.args, "remember")
       && unlockCall.args.password === "test-only-secret" && !secretInput.value, "");
+    const legacyUnlock = unlockVault({name:"Test vault", remembered:true});
+    check("an old remember preference never skips password entry", secretDialog.open && !secretInput.value, secretDialog.open);
+    secretDialog.requestClose(); await sleep(30); await legacyUnlock;
     await unlockVault({name:"Test vault", hello:true});
     check("Windows Hello unlock bypasses password entry", !secretDialog.open && HOST_CALLS.filter(m=>m.op === "vault_unlock").pop()?.args.hello === true, "");
     vaultControls.remove(); focusBack.remove();
+    for (const [id, prefix] of [["dlg-vault-new", "vc"], ["dlg-vault-add", "va"]]) {
+      const d = document.getElementById(id), pw = document.getElementById(prefix + "-pw");
+      check(prefix + " explains the OneDrive path and why the local folder is empty", document.getElementById(prefix + "-remote").labels.length === 1
+        && document.getElementById(prefix + "-remote-help").textContent.includes("/Private")
+        && document.getElementById(prefix + "-local").labels[0].textContent === "Decrypted folder on this PC"
+        && document.getElementById(prefix + "-local-help").textContent.includes("existing files aren't added"), "");
+      check(prefix + " has no persistent password option", !document.getElementById(prefix + "-remember"), "");
+      pw.value = "unsaved-test-password"; d.showModal();
+      check(prefix + " Enter submits the vault action", d.querySelector(":default") === document.getElementById(prefix + "-add"), "");
+      document.getElementById(prefix + "-cancel").click(); await sleep(30);
+      check(prefix + " Cancel clears its password without validation", !d.open && !pw.value, pw.value);
+    }
+    showRecovery("old-test-key");
+    document.querySelector("#dlg-recovery").close();
+    showRecovery("current-test-key");
+    document.querySelector("#dlg-recovery").dispatchEvent(new Event("close"));
+    await sleep(100);
+    check("a delayed close event cannot clear a newly shown recovery key", document.querySelector("#recovery-text").textContent === "current-test-key",
+      document.querySelector("#recovery-text").textContent);
+    document.querySelector("#recovery-done").click();
+    check("saving the recovery key clears it immediately", !document.querySelector("#dlg-recovery").open
+      && !document.querySelector("#recovery-text").textContent, document.querySelector("#recovery-text").textContent);
+    // A successful pairing must be visible before unrelated settings finish loading.
+    const savedVaultSnapshot = HOST_ANSWERS.snapshot, savedRoots = HOST_ANSWERS.roots;
+    for (const [op, prefix, dialogId, name, startError] of [
+      ["vault_create", "vc", "dlg-vault-new", "New vault", "test agent unavailable"],
+      ["vault_add", "va", "dlg-vault-add", "Existing vault", "test agent unavailable"],
+      ["vault_create", "vc", "dlg-vault-new", "Running new vault", null],
+      ["vault_add", "va", "dlg-vault-add", "Running existing vault", null]
+    ]) {
+      let previousRoots;
+      HOST_ANSWERS.roots = () => new Promise(resolve => previousRoots = resolve);
+      const previousRefresh = openFiles();
+      await sleep(30);
+      HOST_ANSWERS.roots = savedRoots;
+      const settingsReplies = [];
+      HOST_ANSWERS.snapshot = a => a?.root ? savedVaultSnapshot(a) : new Promise(resolve => settingsReplies.push(resolve));
+      HOST_ANSWERS[op] = () => {
+        HOST_ANSWERS.roots = [...savedRoots, {id:"vault:" + name, kind:"vault", name,
+          local:"C:\\Vaults\\" + name, remote:"/" + name, on_demand:true, running:!startError}];
+        return {name, recovery:"OUD1-test-recovery", start_error:startError};
+      };
+      const dialog = document.getElementById(dialogId);
+      document.getElementById(prefix + "-remote").value = "/" + name;
+      document.getElementById(prefix + "-local").value = "C:\\Vaults\\" + name;
+      document.getElementById(prefix + "-pw").value = "test-only-password";
+      if (prefix === "vc") document.querySelector("#vc-pw2").value = "test-only-password";
+      dialog.showModal();
+      document.getElementById(prefix + "-add").click();
+      await sleep(300);
+      const registration = HOST_CALLS.filter(m => m.op === op).pop();
+      check(op + " never requests persistent password storage", registration && !Object.hasOwn(registration.args, "remember"), "");
+      const selected = document.querySelector("#roots [aria-selected=true]");
+      check(op + " immediately lists and selects the registered vault", selected?.textContent.includes(name)
+        && selected.textContent.includes("locked") === !!startError, selected?.textContent);
+      check(op + " reports whether syncing started", document.querySelector("#toast").textContent.includes(startError || "and syncing")
+        && !dialog.open && !document.getElementById(prefix + "-add").disabled, document.getElementById(prefix + "-busy").textContent);
+      check(op + " clears its password after registration", !document.getElementById(prefix + "-pw").value
+        && (prefix !== "vc" || !document.querySelector("#vc-pw2").value), "");
+      if (prefix === "vc") {
+        check("creation shows the recovery key without waiting for settings", document.querySelector("#dlg-recovery").open
+          && document.querySelector("#recovery-text").textContent === "OUD1-test-recovery", document.querySelector("#recovery-text").textContent);
+        check("startup errors are visible alongside the recovery key", document.querySelector("#recovery-error").hidden === !startError
+          && (!startError || document.querySelector("#recovery-error").textContent.includes(startError)), document.querySelector("#recovery-error").textContent);
+      }
+      HOST_ANSWERS.snapshot = savedVaultSnapshot;
+      for (const resolve of settingsReplies) resolve(savedVaultSnapshot({}));
+      await sleep(100);
+      previousRoots(savedRoots);
+      await previousRefresh;
+      check(op + " keeps its tab when an older list reply arrives", document.querySelector("#roots [aria-selected=true]")?.textContent.includes(name),
+        document.querySelector("#roots").textContent);
+      if (document.querySelector("#dlg-recovery").open) document.querySelector("#dlg-recovery").close();
+    }
+    HOST_ANSWERS.roots = savedRoots;
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }

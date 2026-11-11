@@ -143,6 +143,23 @@ impl Masterkey {
         &self.keys.enc
     }
 
+    /// The key of the keyed hashes OneUpDrive keeps of a vault's decrypted
+    /// files on this PC (`oneup_hash::Digest`): they prove a file still is
+    /// the synced version before its decrypted copy is freed, without
+    /// letting anyone who reads the database test it for a known file.
+    /// Derived from the vault's keys (HMAC-SHA256 as a PRF over a fixed
+    /// label), so it outlives password changes and never meets the
+    /// encryption itself.
+    pub fn content_mac_key(&self) -> Zeroizing<[u8; 32]> {
+        let raw = self.raw();
+        let mut m =
+            <Hmac<Sha256> as Mac>::new_from_slice(raw.as_ref()).unwrap_or_else(|_| unreachable!("any key length"));
+        m.update(b"OneUpDrive local content MAC v1");
+        let mut out = Zeroizing::new([0u8; 32]);
+        out.copy_from_slice(&m.finalize().into_bytes());
+        out
+    }
+
     /// Encryption key, then MAC key: what signs the vault configuration.
     pub(crate) fn raw(&self) -> Zeroizing<[u8; 64]> {
         let mut r = Zeroizing::new([0u8; 64]);

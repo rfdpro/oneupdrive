@@ -93,6 +93,14 @@ pub enum Replaced {
 }
 
 pub trait Cloud: Send + Sync {
+    /// For a cloud that transforms content (a vault): the key of the keyed
+    /// hashes recorded of the content on this PC (`oneup_hash::Digest`),
+    /// since the cloud's own hash is of something else. Freeing a local
+    /// copy then checks it against that instead.
+    fn content_key(&self) -> Option<oneup_hash::MacKey> {
+        None
+    }
+
     /// Streams the content of file `pre.id` into `out`, provided its eTag
     /// is still `pre.etag`. `Some(hash)`: the content was transformed on
     /// the way, and `hash` is that of what OneDrive sent (see the module
@@ -364,16 +372,21 @@ pub fn read_full<R: Read + ?Sized>(src: &mut R, buf: &mut [u8]) -> std::io::Resu
     Ok(n)
 }
 
-/// Passes bytes through while computing their QuickXorHash, so content is
+/// Passes bytes through while computing their QuickXorHash (and, for a
+/// cloud with a [`Cloud::content_key`], their keyed hash), so content is
 /// verified without being read twice.
 pub(crate) struct Hashing<T> {
     pub inner: T,
-    pub hash: oneup_hash::QuickXorHash,
+    pub hash: oneup_hash::Digest,
 }
 
 impl<T> Hashing<T> {
     pub fn new(inner: T) -> Self {
-        Self { inner, hash: oneup_hash::QuickXorHash::new() }
+        Self::keyed(inner, None)
+    }
+
+    pub fn keyed(inner: T, key: Option<&oneup_hash::MacKey>) -> Self {
+        Self { inner, hash: oneup_hash::Digest::new(key) }
     }
 }
 

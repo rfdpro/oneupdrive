@@ -172,20 +172,17 @@ pub fn start_settings_on(data_dir: &Path, page: &str) -> Result<()> {
 }
 
 /// The agents that start with the main one of `main`: its extra folder
-/// pairs (`crate::pairs`), and its vaults whose keys are remembered (the
-/// others wait for their password). Those already running are left alone;
+/// pairs (`crate::pairs`). Vaults wait for an explicit unlock, including
+/// those set up for Windows Hello; one an unclean shutdown left unlocked
+/// is cleared first (`crate::vaultlock::clean_after_unclean_shutdown`). Those already running are left alone;
 /// returns the ones that failed to start, with why.
 #[cfg(windows)]
 pub async fn start_others(main: &Path) -> Vec<(String, String)> {
-    let mut dirs: Vec<(String, PathBuf)> =
+    // First, before anything else runs: vaults an unclean shutdown left
+    // unlocked lose their decrypted copies (`crate::vaultlock`).
+    let mut failed = crate::vaultlock::clean_after_unclean_shutdown(main).await;
+    let dirs: Vec<(String, PathBuf)> =
         crate::pairs::list(main).into_iter().map(|p| (format!("folder pair {}", p.name), p.dir)).collect();
-    dirs.extend(
-        crate::vaultpair::list(main)
-            .into_iter()
-            .filter(|v| v.dir.join(crate::vaultpair::KEY_FILE).exists())
-            .map(|v| (format!("vault {}", v.name), v.dir)),
-    );
-    let mut failed = Vec::new();
     for (what, dir) in dirs {
         if oneup_ipc::connect(&dir).await.is_ok() {
             continue;

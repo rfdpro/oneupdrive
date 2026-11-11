@@ -31,20 +31,6 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
     let (first, last) = config::load_priority(dir)?;
     let search = config::load_search(dir)?;
     let interval = crate::pace::load(dir)?;
-    let vaults: Vec<Value> = crate::vaultpair::list(dir)
-        .iter()
-        .map(|e| {
-            let (folder, od) = crate::vaultpair::describe(e).unwrap_or_default();
-            json!({
-                "name": e.name,
-                "remote": e.remote,
-                "local": shown(&folder.to_string_lossy()),
-                "on_demand": od,
-                "remembered": e.dir.join(crate::vaultpair::KEY_FILE).exists(),
-                "hello": e.dir.join(crate::vaultpair::HELLO_FILE).exists(),
-            })
-        })
-        .collect();
     let presets: Vec<Value> = oneup_rules::PRESETS
         .iter()
         .map(|p| json!({ "name": p.name, "summary": p.summary, "on": r.presets.iter().any(|x| x == p.name) }))
@@ -129,7 +115,7 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
             "max_gib": trim.max_gib,
             "max_percent": trim.max_percent,
         },
-        "vaults": vaults,
+        "vaults": vaults_json(dir),
         "hello_available": oneup_sys::hello::available(),
         "space": {
             "free_unused_days": space.free_unused_days,
@@ -159,6 +145,56 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "network": network_json(dir, &a)?,
         "kept_folder": local.as_deref().map(|l| shown(&Path::new(l).join(oneup_rules::ENGINE_DIR).join("versions").to_string_lossy())),
     }))
+}
+
+/// The registered vaults, independent of the main folder's settings.
+pub fn vaults_json(dir: &Path) -> Value {
+    Value::from(
+        crate::vaultpair::list(dir)
+            .iter()
+            .map(|e| {
+                let (folder, od) = crate::vaultpair::describe(e).unwrap_or_default();
+                let lock = config::load_vault_lock(&e.dir).unwrap_or_default();
+                json!({
+                    "name": e.name,
+                    "remote": e.remote,
+                    "local": shown(&folder.to_string_lossy()),
+                    "on_demand": od,
+                    "hello": e.dir.join(crate::vaultpair::HELLO_FILE).exists(),
+                    "interval_minutes": crate::pace::load(&e.dir).unwrap_or_default().minutes,
+                    "keep_unsent": lock.keep_unsent,
+                    "lock_after_idle_minutes": lock.idle_minutes,
+                    "lock_with_windows": lock.with_windows,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// Changes a vault pair's own settings (its data folder `dir`): any of
+/// `interval_minutes` (`[sync]`), `keep_unsent`, `lock_after_idle_minutes`
+/// and `lock_with_windows` (`[vault]`); the others stay.
+pub fn set_vault_settings(dir: &Path, v: &Value) -> Result<()> {
+    let mut lock = config::load_vault_lock(dir)?;
+    if let Some(b) = v.get("keep_unsent").and_then(Value::as_bool) {
+        lock.keep_unsent = b;
+    }
+    if let Some(b) = v.get("lock_with_windows").and_then(Value::as_bool) {
+        lock.with_windows = b;
+    }
+    if let Some(n) = v.get("lock_after_idle_minutes").and_then(Value::as_u64) {
+        lock.idle_minutes = u32::try_from(n)
+            .ok()
+            .filter(|m| *m <= 7 * 24 * 60)
+            .context("lock_after_idle_minutes: 0 (never) to 10080 minutes")?;
+    }
+    config::save_vault_lock(dir, &lock)?;
+    if let Some(n) = v.get("interval_minutes").and_then(Value::as_u64) {
+        let mut i = crate::pace::load(dir)?;
+        i.minutes = crate::pace::check_minutes(n)?;
+        crate::pace::save(dir, &i)?;
+    }
+    Ok(())
 }
 
 /// The extra folder pairs (`crate::pairs`), as the window lists them
@@ -1258,6 +1294,31 @@ pub fn duplicates_cancel(dir: &Path) -> Result<Value> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn registered_vaults_are_listed_even_when_main_settings_are_invalid() {
+        let dir =
+            std::env::temp_dir().join(format!("oneup-vault-list-{}-{}", std::process::id(), crate::sync::now_ms()));
+        let vault = dir.join(crate::vaultpair::VAULTS).join("Private");
+        let local = dir.join("Decrypted");
+        std::fs::create_dir_all(&vault).unwrap();
+        {
+            let mut store = crate::setup::open_store(&vault, 1024).unwrap();
+            store.write(|o| o.meta_set(crate::sync::KEY_LOCAL, &local.to_string_lossy())).unwrap();
+        }
+        std::fs::write(vault.join(crate::vaultpair::MARKER), "/Private").unwrap();
+        std::fs::write(dir.join(config::FILE), "[invalid").unwrap();
+        assert!(snapshot(&dir).is_err());
+        assert_eq!(
+            vaults_json(&dir),
+            json!([{
+                "name": "Private", "remote": "/Private", "local": local.to_string_lossy(),
+                "on_demand": false, "hello": false, "interval_minutes": 0, "keep_unsent": true,
+                "lock_after_idle_minutes": 0, "lock_with_windows": false,
+            }])
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn largest_files_locate_whole_drive_and_subfolder_pairs() {

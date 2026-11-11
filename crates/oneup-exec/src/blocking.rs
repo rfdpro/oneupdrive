@@ -17,6 +17,8 @@ use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use futures_util::future::BoxFuture;
+use oneup_hash::Digest;
+#[cfg(test)]
 use oneup_hash::QuickXorHash;
 
 use crate::cloud::{Source, read_full};
@@ -124,13 +126,18 @@ pub(crate) struct OffTask<R> {
     /// `None` while a read is under way, and after one was lost.
     src: Option<R>,
     /// What was read so far.
-    pub hash: QuickXorHash,
+    pub hash: Digest,
     jobs: Arc<Jobs>,
 }
 
 impl<R: Read + Send + 'static> OffTask<R> {
     pub fn new(src: R, jobs: &Arc<Jobs>) -> Self {
-        Self { src: Some(src), hash: QuickXorHash::new(), jobs: Arc::clone(jobs) }
+        Self::keyed(src, jobs, None)
+    }
+
+    /// Hashed with `key` too (see [`crate::Cloud::content_key`]).
+    pub fn keyed(src: R, jobs: &Arc<Jobs>, key: Option<&oneup_hash::MacKey>) -> Self {
+        Self { src: Some(src), hash: Digest::new(key), jobs: Arc::clone(jobs) }
     }
 
     /// The source, unless a read lost it.

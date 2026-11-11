@@ -527,7 +527,8 @@ fn stage(op: &Op) -> &'static str {
         | Op::RenameLocal { .. }
         | Op::ConflictCopy { .. }
         | Op::RecycleLocal { .. }
-        | Op::Dehydrate { .. } => "op: local change",
+        | Op::Dehydrate { .. }
+        | Op::Discard { .. } => "op: local change",
         Op::RemoveCopy { .. } => "op: duplicate removal",
         Op::Hash(_) => "op: hash",
         Op::Rewind { .. } => "op: rewind",
@@ -1871,12 +1872,16 @@ impl<C: Cloud> Executor<C> {
                 store
                     .write(|o| {
                         need(link_ok(o, *link)? && o.synced_get(*parent)?.is_some())?;
+                        // Being overwritten (a vault's copy): its content
+                        // may be zeros until the record is finished.
+                        need(!o.wipe_pending(local.id.0)?)?;
                         need_unlinked(o, local.id, *link)
                     })
                     .await?;
                 // Opened here (an open and an oplock request: short); its
                 // reads run on blocking threads.
-                let mut src = OffTask::new(self.fs.open_upload(a)?, &self.jobs);
+                let key = self.cloud.content_key();
+                let mut src = OffTask::keyed(self.fs.open_upload(a)?, &self.jobs, key.as_ref());
                 // A database goes only in a consistent state; a SQLite
                 // database's companions are watched with it from here on.
                 let dbs = self.databases();
@@ -1905,7 +1910,7 @@ impl<C: Cloud> Executor<C> {
                         notes.recognised = Some(format);
                         // Closed when asked; opened again (at its stamp), and
                         // its -wal and -journal watched with it again.
-                        src = OffTask::new(self.fs.open_upload(a)?, &self.jobs);
+                        src = OffTask::keyed(self.fs.open_upload(a)?, &self.jobs, key.as_ref());
                         if watch {
                             let fs = Arc::clone(&self.fs);
                             match src.with(move |s| fs.watch_database(s)).await {
@@ -2012,6 +2017,9 @@ impl<C: Cloud> Executor<C> {
                 // A read lost with its thread counts as written: nothing
                 // vouches for the file.
                 let written = !src.get().is_some_and(oneup_effects::UploadSource::unchanged);
+                // The keyed hash of what was sent, for a cloud that keeps
+                // something else (see `Cloud::content_key`).
+                let mac = src.hash.mac();
                 drop(src);
                 let local_mtime = if written { STAMP_UNKNOWN } else { mtime };
                 store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
@@ -2022,6 +2030,9 @@ impl<C: Cloud> Executor<C> {
                     .write(|o| {
                         if !written {
                             o.local_hash_put(local.id.0, size, mtime, &sent)?;
+                            if let Some(mac) = &mac {
+                                o.content_mac_put(local.id.0, size, mtime, mac)?;
+                            }
                         }
                         let b = file_base(*parent, name, size, sent, local.id, local_mtime, &row);
                         link_row(o, *link, b)
@@ -2152,17 +2163,18 @@ impl<C: Cloud> Executor<C> {
                     return Err(Fail::Skip(Skip::Changed));
                 };
                 let mut staged = self.fs.stage()?;
-                let (len, digest) = {
+                let key = self.cloud.content_key();
+                let (len, digest, mac) = {
                     let Some(file) = staged.file() else { return Err(odd()) };
                     let go = || may_run(a.op());
-                    let mut w = Hashing::new(Stoppable { inner: file, go: &go, stopped: false });
+                    let mut w = Hashing::keyed(Stoppable { inner: file, go: &go, stopped: false }, key.as_ref());
                     let received = match self.cloud.download(remote, &mut w).await {
                         // Only staged so far, which goes with `staged`.
                         Err(_) if w.inner.stopped => return Err(Fail::NotNow),
                         r => r?,
                     };
                     // In the cloud's terms (see `cloud`): what it received, if it transformed it.
-                    (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()))
+                    (w.hash.len(), received.unwrap_or_else(|| w.hash.finalize()), w.hash.mac())
                 };
                 // Verified before anything local changes: the content must be
                 // exactly what the Remote tree says this eTag holds.
@@ -2209,6 +2221,9 @@ impl<C: Cloud> Executor<C> {
                         let row = self.local_row(&entry, *to);
                         o.local_update(&row)?;
                         o.local_hash_put(row.file_id, row.size, row.mtime, &digest)?;
+                        if let Some(mac) = &mac {
+                            o.content_mac_put(row.file_id, row.size, row.mtime, mac)?;
+                        }
                         let b = file_base(*parent, name, row.size, digest, LocalId(row.file_id), row.mtime, &expected);
                         link_row(o, *link, b)
                     })
@@ -2564,11 +2579,24 @@ impl<C: Cloud> Executor<C> {
             Op::Dehydrate { local, hash } => {
                 // Only the cloud's current version is freed: its content is
                 // then exactly what OneDrive holds (`data-safety.md` invariant 1).
+                // A cloud that keeps the content transformed (a vault) hashes
+                // something else, so for it `hash` is the keyed hash recorded
+                // when this very stamp was downloaded or sent as the synced
+                // version, which must be the cloud's current one.
+                let keyed = self.cloud.content_key().is_some();
                 let current = store
                     .write(|o| {
                         let Some(b) = o.synced_by_local(local.id.0)? else { return Ok::<_, Fail>(false) };
                         let Some(r) = b.remote else { return Ok(false) };
-                        Ok(o.get_item(&r.0)?.is_some_and(|row| row.qxh == Some(*hash)) && b.hash == Some(*hash))
+                        let Some(cloud) = o.get_item(&r.0)?.and_then(|row| row.qxh) else { return Ok(false) };
+                        if !keyed {
+                            return Ok(cloud == *hash && b.hash == Some(*hash));
+                        }
+                        let Some((size, mtime)) = local.stamp else { return Ok(false) };
+                        Ok(b.hash == Some(cloud)
+                            && b.size == size
+                            && b.local_mtime == mtime
+                            && o.content_mac_get(local.id.0, size, mtime)? == Some(*hash))
                     })
                     .await?;
                 need(current)?;
@@ -2581,6 +2609,36 @@ impl<C: Cloud> Executor<C> {
                         Ok(o.local_update(&self.local_row(&entry, parent))?)
                     })
                     .await
+            }
+            Op::Discard { local, synced } => {
+                // As planned: a synced file still linked at that synced
+                // stamp, or a new file nothing links.
+                let as_planned = store
+                    .write(|o| {
+                        let base = o.synced_by_local(local.id.0)?;
+                        Ok::<_, Fail>(match (base, synced) {
+                            (Some(b), Some((size, mtime))) => b.size == *size && b.local_mtime == *mtime,
+                            (None, None) => true,
+                            _ => false,
+                        })
+                    })
+                    .await?;
+                need(as_planned)?;
+                let done = self.off_task(a, |fs, a| fs.discard(a)).await??;
+                self.crash_point()?;
+                match done {
+                    Done::Freed { entry } => {
+                        store
+                            .write(|o| {
+                                let Some(row) = o.local_get(local.id.0)? else { return Ok(()) };
+                                let parent = row.parent_id.map(LocalId).unwrap_or(self.fs.root_id());
+                                Ok(o.local_update(&self.local_row(&entry, parent))?)
+                            })
+                            .await
+                    }
+                    Done::Discarded => store.write(|o| Ok(o.local_remove_subtree(local.id.0).map(drop)?)).await,
+                    _ => Err(odd()),
+                }
             }
             Op::Rewind { sid, step } => self.rewind(store, a, *sid, step).await,
             Op::Hold { .. } => Err(Fail::Failed("a held item can't be executed".into())),

@@ -629,7 +629,7 @@ async fn an_update_reads_no_whole_table() {
     });
 
     let mut store = Store::open(&path, 1024).unwrap();
-    store.log_statements();
+    store.log_statements().unwrap();
     let m = mirror(&fake, store, rules);
     m.update().await.unwrap();
     let statements = Store::take_statements();

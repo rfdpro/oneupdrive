@@ -258,6 +258,18 @@ pub enum Op {
         local: LocalPre,
         hash: Hash,
     },
+    /// Throw away a vault's decrypted copy whose change never reached
+    /// OneDrive, after the vault was left unlocked by an unclean shutdown
+    /// and the user chose not to keep such changes (`[vaults]
+    /// keep_unsent = false`). Overwritten with zeros, then a file that was
+    /// synced goes back to its last synced version (online-only), and a new
+    /// one is deleted. Never planned by the reconciler.
+    Discard {
+        local: LocalPre,
+        /// The last synced version's size and local time, for a file that
+        /// was synced; `None` for a new one.
+        synced: Option<(i64, i64)>,
+    },
     /// Delete a cloud item the user's rules exclude, with everything in it
     /// (`oneup cloud prune`, or the `prune` setting; never planned by the
     /// reconciler). It goes to OneDrive's recycle bin. `forget`: the Synced
@@ -405,7 +417,7 @@ impl Op {
             | Op::ConflictCopy { sid, local, .. } => (Some(*sid), l(local), None),
             Op::RenameLocal { local, .. } => (None, l(local), None),
             Op::PruneRemote { remote, .. } | Op::RenameRemote { remote, .. } => (None, None, r(remote)),
-            Op::Dehydrate { local, .. } => (None, l(local), None),
+            Op::Dehydrate { local, .. } | Op::Discard { local, .. } => (None, l(local), None),
             Op::RemoveCopy { sid, remote, local, .. } => {
                 (*sid, local.as_ref().and_then(l), remote.as_ref().and_then(r))
             }
@@ -441,6 +453,7 @@ impl Op {
                     | Op::RecycleLocal { .. }
                     | Op::RemoveCopy { local: Some(_), .. }
                     | Op::Dehydrate { .. }
+                    | Op::Discard { .. }
             ),
         }
     }

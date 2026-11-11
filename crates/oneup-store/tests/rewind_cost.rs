@@ -226,7 +226,7 @@ fn one_unsynced_edit_among_a_large_folder_reads_a_handful_of_records() {
     assert!(!s.read(|o| o.dirty_scope()).unwrap().folders.is_empty(), "the root is marked");
     #[cfg(feature = "statement-log")]
     {
-        s.log_statements();
+        s.log_statements().unwrap();
         Store::take_statements();
     }
     let reads = s

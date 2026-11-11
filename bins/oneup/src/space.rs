@@ -71,12 +71,13 @@ pub fn unix_ms(filetime: i64) -> i64 {
 /// access time (Unix ms) from its path relative to the synced folder;
 /// `kept` says whether a pin rule keeps it on this PC (`crate::pinrules`),
 /// which wins over every policy here, even before the agent has set the
-/// file's pin.
+/// file's pin. `keyed`: a vault pair (`oneup_exec::placement::freeing_hash`).
 pub fn select(
     store: &mut Store,
     s: &Space,
     disk: Option<Disk>,
     now_ms: i64,
+    keyed: bool,
     accessed: &dyn Fn(&str) -> Option<i64>,
     kept: &dyn Fn(&str) -> bool,
 ) -> Result<Selection> {
@@ -113,7 +114,7 @@ pub fn select(
         for r in page {
             looked += 1;
             after = Some((r.mtime, r.file_id));
-            if let Some(op) = freeable(store, &r, cutoff, accessed, kept)? {
+            if let Some(op) = freeable(store, &r, cutoff, keyed, accessed, kept)? {
                 out.bytes += u64::try_from(r.size).unwrap_or(0);
                 out.ops.push(op);
             }
@@ -139,6 +140,7 @@ fn freeable(
     store: &Store,
     r: &LocalRow,
     cutoff: i64,
+    keyed: bool,
     accessed: &dyn Fn(&str) -> Option<i64>,
     kept: &dyn Fn(&str) -> bool,
 ) -> Result<Option<Op>> {
@@ -146,7 +148,11 @@ fn freeable(
         return Ok(None);
     }
     let (used, hash, path) = store.read(|o| {
-        Ok((o.local_used_get(r.file_id)?, o.local_hash_get(r.file_id, r.size, r.mtime)?, o.local_path_of(r.file_id)?))
+        Ok((
+            o.local_used_get(r.file_id)?,
+            oneup_exec::placement::freeing_hash(o, r.file_id, r.size, r.mtime, keyed)?,
+            o.local_path_of(r.file_id)?,
+        ))
     })?;
     if used.is_some_and(|u| u >= cutoff) {
         return Ok(None);
@@ -242,7 +248,7 @@ mod tests {
         s.write(|o| o.local_used_set(13, NOW - DAY_MS)).unwrap();
         let accessed = |p: &str| (p == "/f12").then_some(NOW - 2 * DAY_MS);
         let space = Space { free_unused_days: 30, ..Space::default() };
-        let sel = select(&mut s, &space, None, NOW, &accessed, &|_| false).unwrap();
+        let sel = select(&mut s, &space, None, NOW, false, &accessed, &|_| false).unwrap();
         assert_eq!(freed(&sel), vec![10]);
         assert_eq!(sel.why, Some(Why::Unused { days: 30 }));
     }
@@ -251,7 +257,8 @@ mod tests {
     fn nothing_happens_unless_asked() {
         let mut s = store(&[file(10, 400)]);
         let sel =
-            select(&mut s, &Space::default(), Some(Disk { free: 1, total: 1000 }), NOW, &|_| None, &|_| false).unwrap();
+            select(&mut s, &Space::default(), Some(Disk { free: 1, total: 1000 }), NOW, false, &|_| None, &|_| false)
+                .unwrap();
         assert!(sel.ops.is_empty());
     }
 
@@ -261,13 +268,13 @@ mod tests {
         let space = Space { free_when_low: true, low_disk_percent: 10, ..Space::default() };
         // 1 MB disk, 50 KB free: 100 KB is the line, 150 KB the goal.
         let disk = Disk { free: 50_000, total: 1_000_000 };
-        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &|_| false).unwrap();
+        let sel = select(&mut s, &space, Some(disk), NOW, false, &|_| None, &|_| false).unwrap();
         // Each file is 1 KB, so all three old enough go (13 is from today).
         assert_eq!(freed(&sel), vec![10, 11, 12]);
         assert_eq!(sel.why, Some(Why::LowDisk));
         // With room enough, nothing.
         let fine = Disk { free: 500_000, total: 1_000_000 };
-        assert!(select(&mut s, &space, Some(fine), NOW, &|_| None, &|_| false).unwrap().ops.is_empty());
+        assert!(select(&mut s, &space, Some(fine), NOW, false, &|_| None, &|_| false).unwrap().ops.is_empty());
     }
 
     /// A pin rule wins over every space policy: what it matches is never
@@ -281,12 +288,12 @@ mod tests {
         let kept = |p: &str| pins.pins(p, false);
         let space = Space { free_unused_days: 1, free_when_low: true, low_disk_percent: 10 };
         let disk = Disk { free: 1, total: 1_000_000 };
-        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &kept).unwrap();
+        let sel = select(&mut s, &space, Some(disk), NOW, false, &|_| None, &kept).unwrap();
         assert_eq!(freed(&sel), vec![10]);
         // Freed by name since: the rule doesn't keep it any more.
         s.write(|o| o.pin_released_add(11)).unwrap();
         s.write(|o| o.meta_delete(KEY_CURSOR)).unwrap();
-        let sel = select(&mut s, &space, Some(disk), NOW, &|_| None, &kept).unwrap();
+        let sel = select(&mut s, &space, Some(disk), NOW, false, &|_| None, &kept).unwrap();
         assert_eq!(freed(&sel), vec![10, 11]);
     }
 
@@ -299,7 +306,7 @@ mod tests {
         let mut s = store(&[file(10, 400), inside]);
         s.write(|o| o.local_put(&folder).map(|_| ())).unwrap();
         let space = Space { free_unused_days: 1, ..Space::default() };
-        let sel = select(&mut s, &space, None, NOW, &|_| None, &|_| false).unwrap();
+        let sel = select(&mut s, &space, None, NOW, false, &|_| None, &|_| false).unwrap();
         assert_eq!(freed(&sel), vec![10]);
     }
 }

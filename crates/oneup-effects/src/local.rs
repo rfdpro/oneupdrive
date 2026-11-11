@@ -141,6 +141,8 @@ pub enum Done {
     Hashed { hash: Hash, size: i64, mtime: i64 },
     /// A placeholder's content was freed; `entry` is how it is now.
     Freed { entry: DirEntry },
+    /// A new file's unsent content was overwritten and the file deleted.
+    Discarded,
 }
 
 /// A download being written into the staging folder. Dropped without being
@@ -310,6 +312,18 @@ pub struct LocalFs {
     /// cloud content arrives as placeholders (`ondemand.rs`).
     on_demand: bool,
     locator: Locate,
+    /// A vault pair's: content is checked against keyed hashes before a
+    /// copy is freed ([`LocalFs::set_content_key`]).
+    content_key: Option<oneup_hash::MacKey>,
+    /// A vault pair locking: freeing frees pinned files too
+    /// ([`LocalFs::set_locking`]).
+    locking: std::sync::atomic::AtomicBool,
+    /// A locked vault pair cleared without its keys
+    /// ([`LocalFs::set_clearing_locked`]).
+    clearing_locked: std::sync::atomic::AtomicBool,
+    /// Records, durably, that a file's verified content is being overwritten
+    /// ([`LocalFs::set_wipe_journal`]).
+    wipe_journal: Journal,
     /// What counts as a database, for the checks made under a hold
     /// ([`LocalFs::set_databases`]).
     databases: std::sync::RwLock<oneup_rules::database::Databases>,
@@ -326,6 +340,49 @@ pub struct LocalFs {
     /// See [`LocalFs::on_removing`].
     #[cfg(feature = "crash-test")]
     removing: Removing,
+}
+
+/// See [`LocalFs::set_wipe_journal`].
+pub type WipeJournal = Box<dyn Fn(u128, Option<Wipe>) -> std::io::Result<()> + Send + Sync>;
+
+/// An overwrite under way ([`LocalFs::set_wipe_journal`]): the file's stamp
+/// when it began, and what follows the zeros.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wipe {
+    pub stamp: (i64, i64),
+    pub then: WipeThen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeThen {
+    /// Freed: it was the synced version ([`LocalFs::free_up`]).
+    Free,
+    /// Back to the synced version of this size and time
+    /// ([`LocalFs::discard`]).
+    Revert { size: i64, mtime: i64 },
+    /// Deleted: a new file never synced ([`LocalFs::discard`]).
+    Delete,
+}
+
+#[derive(Default)]
+struct Journal(Option<WipeJournal>);
+
+impl std::fmt::Debug for Journal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Journal(..)" } else { "Journal(None)" })
+    }
+}
+
+/// How [`LocalFs::finish_wipe`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WipeEnd {
+    /// Overwritten and freed now.
+    Freed,
+    /// Its content was gone already.
+    AlreadyFree,
+    /// Changed since (another program wrote it, or it moved or went), so
+    /// it was left as it is.
+    Kept,
 }
 
 /// Test-only: called with a duplicate's path while [`LocalFs::remove_copy`]
@@ -405,6 +462,10 @@ impl LocalFs {
             seq: AtomicU64::new(0),
             on_demand,
             locator: Locate::default(),
+            content_key: None,
+            locking: std::sync::atomic::AtomicBool::new(false),
+            clearing_locked: std::sync::atomic::AtomicBool::new(false),
+            wipe_journal: Journal(None),
             databases: std::sync::RwLock::default(),
             #[cfg(feature = "crash-test")]
             crash: std::sync::atomic::AtomicI64::new(-1),
@@ -485,6 +546,63 @@ impl LocalFs {
     /// ([`Locator`]). Without one, every item is found by ID.
     pub fn set_locator(&mut self, locator: Locator) {
         self.locator = Locate(Some(locator));
+    }
+
+    /// For a vault pair: freeing a file checks its content's keyed hash
+    /// (`oneup_hash::Digest`), not its QuickXorHash, since the cloud's hash
+    /// is of the encrypted file (`oneup_exec::Cloud::content_key`).
+    pub fn set_content_key(&mut self, key: oneup_hash::MacKey) {
+        self.content_key = Some(key);
+    }
+
+    pub(crate) fn content_key(&self) -> Option<&oneup_hash::MacKey> {
+        self.content_key.as_ref()
+    }
+
+    /// A vault pair is locking: its decrypted copies all go, so freeing
+    /// also takes files pinned "Always keep on this device" (they stay
+    /// pinned, and come back at the next unlock). Nothing else changes.
+    pub fn set_locking(&self, on: bool) {
+        self.locking.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn locking(&self) -> bool {
+        self.locking.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A vault pair left unlocked by an unclean shutdown, cleared while
+    /// locked, without its keys: there's no keyed hash to check, so a copy
+    /// is freed only if Windows still has it in sync, which any write by
+    /// another program clears (`VERIFY_IN_SYNC` on the share-none handle),
+    /// overwritten first and pinned or not, as when locking.
+    pub fn set_clearing_locked(&self, on: bool) {
+        self.clearing_locked.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn clearing_locked(&self) -> bool {
+        self.clearing_locked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Where a vault pair records, durably and before the first zero is
+    /// written, that file `id` at `stamp` was verified as the synced version
+    /// and is being overwritten (`Some(stamp)`), and that it's done (`None`).
+    /// A record left by a crash is finished by [`LocalFs::finish_wipe`].
+    /// Without a journal nothing is overwritten (the copy is only freed).
+    pub fn set_wipe_journal(&mut self, journal: WipeJournal) {
+        self.wipe_journal = Journal(Some(journal));
+    }
+
+    /// Whether freed copies are overwritten first: a vault pair's, with a
+    /// journal for the crash in between.
+    pub(crate) fn wipes(&self) -> bool {
+        (self.content_key.is_some() || self.clearing_locked()) && self.wipe_journal.0.is_some()
+    }
+
+    pub(crate) fn journal_wipe(&self, id: u128, wipe: Option<Wipe>) -> Result<()> {
+        match &self.wipe_journal.0 {
+            Some(j) => Ok(j(id, wipe)?),
+            None => Ok(()),
+        }
     }
 
     /// How many items had to be opened by ID to be found: for tests and

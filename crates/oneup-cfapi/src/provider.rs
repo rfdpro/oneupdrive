@@ -914,6 +914,31 @@ impl Exclusive {
         win("CfUpdatePlaceholder(DEHYDRATE | VERIFY_IN_SYNC)", r)
     }
 
+    /// Frees content this handle overwrote itself, after the caller verified
+    /// it was the synced version under this same share-none handle: the
+    /// overwrite cleared the in-sync state (any write does, ours included,
+    /// measured), so it is set again in the same call instead of verified.
+    /// Never for content another program may have written.
+    pub fn dehydrate_overwritten(&self) -> Result<()> {
+        let flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC;
+        // SAFETY: a valid handle; no buffers; synchronous.
+        let r = unsafe { CfUpdatePlaceholder(handle(&self.0), None, None, 0, None, flags, None, None) };
+        win("CfUpdatePlaceholder(DEHYDRATE | MARK_IN_SYNC)", r)
+    }
+
+    /// Discards an edit never sent (after the caller overwrote it through
+    /// this share-none handle): frees the content and puts back the size
+    /// and time of the version it was synced as, whose identity the
+    /// placeholder still has, in sync. Never for an edit that may matter:
+    /// only on the user's say-so after an unclean shutdown.
+    pub fn dehydrate_to_synced(&self, size: i64, modified: i64) -> Result<()> {
+        let md = updated_metadata(&self.0, size, modified)?;
+        let flags = CF_UPDATE_FLAG_DEHYDRATE | CF_UPDATE_FLAG_MARK_IN_SYNC | CF_UPDATE_FLAG_PASSTHROUGH_FS_METADATA;
+        // SAFETY: `md` outlives the synchronous call; no identity buffer.
+        let r = unsafe { CfUpdatePlaceholder(handle(&self.0), Some(&md), None, 0, None, flags, None, None) };
+        win("CfUpdatePlaceholder(DEHYDRATE | MARK_IN_SYNC, metadata)", r)
+    }
+
     /// Marks the content in sync with a new identity (after its upload was
     /// verified), without touching the content.
     pub fn mark_in_sync(&self, identity: &[u8]) -> Result<()> {

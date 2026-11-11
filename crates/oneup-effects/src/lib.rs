@@ -62,7 +62,10 @@ pub use database::{DbState, UploadCheck, Wait, staged_format};
 #[cfg(all(windows, feature = "crash-test"))]
 pub use local::Crashed;
 #[cfg(windows)]
-pub use local::{ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource, Witnessed};
+pub use local::{
+    ChangedMeanwhile, Done, Error, LocalFs, Locator, Staged, UploadSource, Wipe, WipeEnd, WipeJournal, WipeThen,
+    Witnessed,
+};
 #[cfg(windows)]
 pub use ondemand::{EXCLUDED_MARK, Version};
 pub use oneup_ntfs::dirent::DirEntry;
