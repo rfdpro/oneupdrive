@@ -199,6 +199,96 @@ fn placeholders_hydrate_on_demand_and_dehydrate_only_safely() {
     assert_eq!(info(&pa).pin, Pin::Pinned);
 }
 
+/// Qualifies adding an existing raw Cloud Files root to Explorer without
+/// unregistering it. `ONEUP_SHELL_CLI` must name an installed `oneup.exe`
+/// with package identity. All content is temporary and served in memory.
+#[test]
+#[ignore = "needs an installed CLI with package identity (ONEUP_SHELL_CLI)"]
+fn adding_a_raw_root_to_explorer_preserves_its_files() {
+    use oneup_cfapi::shell;
+    let cli = PathBuf::from(std::env::var_os("ONEUP_SHELL_CLI").expect("ONEUP_SHELL_CLI"));
+    let token = "devtoken00000000";
+    let sid = oneup_sys::pipe::current_user_sid().unwrap();
+    let id = shell::root_id(&sid, token);
+    assert!(
+        shell::roots_of_user(&sid).unwrap().iter().all(|r| r.id != id),
+        "the reserved test registration must be unused"
+    );
+    let cloud = Arc::new(Cloud::default());
+    let base = std::env::temp_dir().join(format!("oneup-explorer-promotion-{}", std::process::id()));
+    let folder = base.join("root");
+    std::fs::create_dir_all(&folder).unwrap();
+    provider::register(&folder, token.as_bytes()).unwrap();
+    let conn = provider::connect(&folder, Arc::new(Serve(Arc::clone(&cloud)))).unwrap();
+    let mut r = Root { base, root: folder, _conn: Some(conn) };
+    let content = b"preserved across Explorer registration".to_vec();
+    let identity = identity("promotion", &content);
+    cloud.content.lock().unwrap().insert(identity.clone(), content.clone());
+    for name in ["online.txt", "pinned.txt", "edited.txt"] {
+        provider::create(
+            &r.root,
+            &[NewPlaceholder {
+                name,
+                identity: &identity,
+                size: content.len() as i64,
+                modified: 133_000_000_000_000_000,
+                folder: false,
+            }],
+        )
+        .unwrap();
+    }
+    let (online, pinned) = (r.root.join("online.txt"), r.root.join("pinned.txt"));
+    provider::set_pin(&provider::open(&pinned).unwrap(), Pin::Pinned).unwrap();
+    assert_eq!(app_read(&r.base, &pinned), Some(content.clone()));
+    let edited = r.root.join("edited.txt");
+    assert_eq!(app_read(&r.base, &edited), Some(content.clone()));
+    app_append(&edited, "unsent edit");
+    let edited_content = app_read(&r.base, &edited).unwrap();
+    assert!(!info(&edited).in_sync);
+    r._conn.take();
+
+    // The installed helper supplies package identity; it uses the same
+    // shell::register as syncroot::refresh, without touching an account.
+    struct Entry {
+        cli: PathBuf,
+        root: PathBuf,
+    }
+    impl Entry {
+        fn run(&self, remove: bool) -> std::process::Output {
+            let mut cmd = Command::new(&self.cli);
+            cmd.arg("--data-dir")
+                .arg(PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("OneUpDrive-test"))
+                .arg("dev-shell-root")
+                .arg(&self.root);
+            if remove {
+                cmd.arg("--remove");
+            }
+            cmd.output().unwrap()
+        }
+    }
+    impl Drop for Entry {
+        fn drop(&mut self) {
+            let _ = self.run(true);
+        }
+    }
+    let entry = Entry { cli, root: r.root.clone() };
+    let added = entry.run(false);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert!(shell::is_pairs_root(&r.root, token), "{}", String::from_utf8_lossy(&added.stdout));
+    assert_eq!(provider::registration(&r.root), Some((oneup_cfapi::PROVIDER_NAME.into(), token.as_bytes().to_vec())));
+    assert_eq!(info(&online).identity, identity);
+    assert_eq!(info(&online).on_disk, 0, "online-only stays online-only");
+    assert_eq!(info(&pinned).pin, Pin::Pinned);
+    assert_eq!(app_read(&r.base, &pinned), Some(content.clone()));
+    assert_eq!(app_read(&r.base, &edited), Some(edited_content));
+    assert!(!info(&edited).in_sync, "an unsent edit stays unsynced");
+    r._conn = Some(provider::connect(&r.root, Arc::new(Serve(Arc::clone(&cloud)))).unwrap());
+    assert_eq!(app_read(&r.base, &online), Some(content));
+    r._conn.take();
+    drop(entry);
+    assert!(shell::roots_of_user(&sid).unwrap().iter().all(|r| r.id != id), "temporary Explorer entry removed");
+}
+
 /// A folder registered with the shell by a program with OneUpDrive's
 /// package identity (`oneup dev-shell-root FOLDER`, set in
 /// `ONEUP_SHELL_ROOT`), served by this test binary, which has none: as the

@@ -45,4 +45,4 @@ The `CloudFiles` element must also declare thumbnail, extended-property and bann
 
 ## Limits
 * Thumbnails and extended properties: Windows keeps its own.
-* Roots registered without identity keep working, without the navigation entry, until Files On-Demand is turned off and on.
+* When package identity becomes available, the next agent start adds an existing Cloud Files root to Explorer before connecting the provider. Its provider name and full pairing token must match. It keeps the root registered throughout, preserving placeholders and pin states; Files On-Demand does not need to be turned off and on.

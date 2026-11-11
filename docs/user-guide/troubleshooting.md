@@ -116,5 +116,9 @@ When one file or folder can't be synced (OneDrive refuses it, or an error comes 
 ## Older cloud version could not be verified
 OneUpDrive could not confirm from OneDrive's version history whether an upload replaced another edit. Automatic checks for that older version have stopped; this warning does not mean that the upload is being retried. Review the file's version history on OneDrive and compare any version you need to keep.
 
+## A folder scan was interrupted
+
+If an update, shutdown or crash interrupts a folder scan, OneUpDrive resumes it when syncing starts again. It finishes the remaining folders before syncing files. Missing files without a recorded deletion wait for your decision.
+
 ## OneUpDrive stopped
 If an error stopped OneUpDrive, the icon's menu says "Stopped: …", the notification says why, and the settings window shows the problem with **Start**. Fix the cause (above), then **Start**. If OneUpDrive stopped without saying why, the end of `oneupd.log` usually does.

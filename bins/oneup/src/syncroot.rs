@@ -99,17 +99,28 @@ fn icon() -> Result<String> {
 /// showing that copy's icon, or none once it's gone. Registering again
 /// updates the registration in place (measured on a temporary folder:
 /// same navigation entry, new icon, contents and Cloud Files
-/// identity unchanged). A folder registered without the shell is left alone.
+/// identity unchanged). A Cloud Files root registered without the shell is
+/// added to Explorer once package identity is available, only if its provider
+/// and full pairing token match. Call before connecting the provider.
 pub fn refresh(root: &Path, token: &str) -> Result<bool> {
     if oneup_sys::identity::package_name().is_none() {
         return Ok(false);
     }
-    let Some(now) = oneup_cfapi::shell::registered(&shell_id(token)?) else { return Ok(false) };
+    let now = oneup_cfapi::shell::registered(&shell_id(token)?);
     // Also when the Cloud Files registration lost its identity (the pair's
     // token), as Windows has been seen to leave it: registering
     // again writes it back.
     let identity_kept = oneup_cfapi::provider::registration(root)
         .is_some_and(|(name, identity)| name == oneup_cfapi::PROVIDER_NAME && identity == token.as_bytes());
+    // No shell entry doesn't mean Files On-Demand is off: it may have
+    // been enabled before the identity package was installed.
+    let Some(now) = now else {
+        if !identity_kept {
+            return Ok(false);
+        }
+        register(root, token, "OneUpDrive")?;
+        return Ok(true);
+    };
     if identity_kept && now.icon == icon()? && now.version == env!("CARGO_PKG_VERSION") {
         return Ok(false);
     }

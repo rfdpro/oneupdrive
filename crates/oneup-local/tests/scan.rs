@@ -310,6 +310,31 @@ fn cancelled_run_stops_and_resumes() {
 }
 
 #[test]
+fn automatic_recovery_refuses_another_folder_without_changing_the_scan() {
+    let original = Tmp::new("recovery-original");
+    original.file("child/a.txt", b"a");
+    let other = Tmp::new("recovery-other");
+    other.file("b.txt", b"b");
+    let db_dir = Tmp::new("recovery-db");
+    let db = db_dir.path.join("state.db");
+    let cfg = Config::new(ExcludeSet::none());
+    let mut scan = Scan::open(Store::open(&db, 1024).unwrap(), &original.path, cfg.clone()).unwrap();
+    assert!(scan.step().unwrap());
+    let root = scan.root().clone();
+    let store = scan.into_store();
+    let before = store.read(|o| o.local_stats()).unwrap();
+    let queued = store.read(|o| o.local_next_dirs(10)).unwrap();
+    assert!(matches!(Scan::open_existing(store, &other.path, cfg), Err(Error::RootChanged)));
+
+    let store = Store::open(&db, 1024).unwrap();
+    let after = store.read(|o| o.local_root()).unwrap().unwrap();
+    assert_eq!(after.root_file_id, root.root_file_id);
+    assert_eq!(after.path, root.path);
+    assert_eq!(store.read(|o| o.local_stats()).unwrap(), before);
+    assert_eq!(store.read(|o| o.local_next_dirs(10)).unwrap(), queued);
+}
+
+#[test]
 fn a_different_folder_or_rule_set_starts_over() {
     let t1 = Tmp::new("one");
     wide_tree(&t1);
