@@ -19,7 +19,7 @@ Every program carries the icon (`packaging/oneupdrive.ico`, drawn by `tray::ico`
 ## Hooks (`oneup_app::install`, called first thing by `oneup-tray`)
 * **Install and update:** register the identity package ([explorer.md § Registering and updating the package](explorer.md#registering-and-updating-the-package)).
 * **Uninstall:** stops the agents of every account's data folder (`accounts::list`) and its vault and extra pairs, releases their Files On-Demand folders (Windows then removes only the online-only files, which are in OneDrive, and turns every other placeholder into an ordinary file with its content), and removes "start at sign-in" and the Office and Explorer registrations. The data folders stay.
-* **Start menu / sign-in / after an update:** `oneup-tray` with no arguments or with `--start` starts the agent and the vaults whose keys are remembered.
+* **Start menu / sign-in / after an update:** `oneup-tray` with no arguments or with `--start` starts the agent and extra folder pairs. Vaults stay locked until the user unlocks them with a password or opt-in Windows Hello.
 
 ## Updates (`oneup_app::updates`, driven by the tray)
 * Feed: GitHub Releases of the repository the release was built for (`ONEUP_UPDATE_REPO`, set by the workflow), or `[updates] repo`; `channel = "stable"` (releases) or `"preview"` (pre-releases too), and with no `channel` the one the installed package was built for, so saving other settings never writes a choice; `auto = true` by default.

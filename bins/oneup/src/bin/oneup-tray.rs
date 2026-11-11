@@ -86,7 +86,7 @@ mod win {
             return Ok(());
         }
         // From the Start menu, at sign-in and after an update: syncing
-        // starts too (and the vaults whose keys are remembered).
+        // starts too. Vaults wait for an explicit unlock.
         if plain || std::env::args_os().any(|a| a == "--start") {
             start_all(&dir);
         }
@@ -183,7 +183,7 @@ mod win {
         }
     }
 
-    /// Starts the agent and the remembered vaults that aren't running.
+    /// Starts the agent and extra folder pairs that aren't running.
     fn start_all(dir: &Path) {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
         // Nothing to sync yet: the settings window's setup comes first.
@@ -338,15 +338,14 @@ mod win {
             }
         }
 
-        /// An unlocked vault whose keys aren't remembered (a restart would
-        /// lock it).
+        /// An unlocked vault: a restart would lock it, even with Windows
+        /// Hello, which needs the user's approval to unlock again.
         fn vault_needs_password(&self) -> bool {
             oneup_app::vaultpair::list(&self.dir).iter().any(|v| {
-                !v.dir.join(oneup_app::vaultpair::KEY_FILE).exists()
-                    && std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(v.dir.join("sync.lock"))
-                        .is_err_and(|e| e.raw_os_error() == Some(32))
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(v.dir.join("sync.lock"))
+                    .is_err_and(|e| e.raw_os_error() == Some(32))
             })
         }
 

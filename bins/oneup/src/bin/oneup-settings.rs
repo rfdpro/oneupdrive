@@ -191,12 +191,8 @@ mod win {
         Ok(Arc::new(oneup_graph::Graph::new(http, auth, oneup_graph::Aimd::new(2, 4))))
     }
 
-    /// A vault's keys: remembered on this PC, through Windows Hello (`hello`),
-    /// or from the password in `args`.
+    /// A vault's keys: through Windows Hello or from the password in `args`.
     async fn vault_keys(dir: &Path, e: &vaultpair::Entry, args: &Value) -> Result<oneup_vault::key::Masterkey> {
-        if let Some(k) = vaultpair::load_key(&e.dir)? {
-            return Ok(k);
-        }
         let pw = args.get("password").and_then(Value::as_str).unwrap_or_default();
         if !pw.is_empty() {
             return vaultpair::keys(dir, &graph(dir)?, e, pw).await;
@@ -300,7 +296,7 @@ mod win {
                     p["id"] = Value::from(format!("pair:{name}"));
                     out.push(p);
                 }
-                for v in settingsapi::snapshot(dir)?["vaults"].as_array().cloned().unwrap_or_default() {
+                for v in settingsapi::vaults_json(dir).as_array().cloned().unwrap_or_default() {
                     let mut v = v;
                     let name = text(&v, "name");
                     let running = match root_dir(dir, &format!("vault:{name}")) {
@@ -575,18 +571,19 @@ mod win {
                     bail!("fill in the vault's OneDrive folder, a folder on this PC and the password");
                 }
                 let full = args.get("full").and_then(Value::as_bool) == Some(true);
-                let remember = args.get("remember").and_then(Value::as_bool) == Some(true);
                 let http = oneup_app::setup::http()?;
                 let auth = oneup_app::setup::auth(dir, None, &http)?;
                 let graph = Arc::new(oneup_graph::Graph::new(http, auth, oneup_graph::Aimd::new(2, 4)));
                 // It holds the database across waits, so it runs on a thread of its own.
                 let (d, rt) = (dir.to_path_buf(), tokio::runtime::Handle::current());
                 let added = tokio::task::spawn_blocking(move || {
-                    rt.block_on(vaultpair::add(&d, graph, &remote, Path::new(&local), !full, &password, remember))
+                    rt.block_on(vaultpair::add(&d, graph, &remote, Path::new(&local), !full, &password))
                 })
                 .await??;
-                drop(oneup_app::launch::start_vault_agent(&added.entry.dir, &added.key)?);
-                Ok(json!({ "name": added.entry.name }))
+                // Pairing is committed even if starting its agent fails.
+                let start_error =
+                    oneup_app::launch::start_vault_agent(&added.entry.dir, &added.key).err().map(|e| format!("{e:#}"));
+                Ok(json!({ "name": added.entry.name, "start_error": start_error }))
             }
             "vault_create" => {
                 let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
@@ -597,16 +594,17 @@ mod win {
                 if remote.is_empty() || local.is_empty() {
                     bail!("fill in the new vault's OneDrive folder and a folder on this PC");
                 }
-                let (full, remember) = (flag(args, "full"), flag(args, "remember"));
+                let full = flag(args, "full");
                 let g = graph(dir)?;
                 let (d, rt) = (dir.to_path_buf(), tokio::runtime::Handle::current());
                 let added = tokio::task::spawn_blocking(move || {
-                    rt.block_on(vaultpair::create(&d, g, &remote, Path::new(&local), !full, &password, remember))
+                    rt.block_on(vaultpair::create(&d, g, &remote, Path::new(&local), !full, &password))
                 })
                 .await??;
-                drop(oneup_app::launch::start_vault_agent(&added.entry.dir, &added.key)?);
+                let start_error =
+                    oneup_app::launch::start_vault_agent(&added.entry.dir, &added.key).err().map(|e| format!("{e:#}"));
                 let recovery = oneup_vault::recovery::recovery_key(&added.key);
-                Ok(json!({ "name": added.entry.name, "recovery": recovery.as_str() }))
+                Ok(json!({ "name": added.entry.name, "recovery": recovery.as_str(), "start_error": start_error }))
             }
             "vault_recovery" => {
                 let e = vault(dir, args)?;
@@ -1351,13 +1349,7 @@ mod win {
             "vault_unlock" => {
                 let e = vault(dir, args)?;
                 let key = match args.get("password").and_then(Value::as_str) {
-                    Some(pw) if !pw.is_empty() => {
-                        let key = vaultpair::keys(dir, &graph(dir)?, &e, pw).await?;
-                        if args.get("remember").and_then(Value::as_bool) == Some(true) {
-                            vaultpair::save_key(&e.dir, &key)?;
-                        }
-                        Some(key)
-                    }
+                    Some(pw) if !pw.is_empty() => Some(vaultpair::keys(dir, &graph(dir)?, &e, pw).await?),
                     _ if flag(args, "hello") => {
                         let d = e.dir.clone();
                         tokio::task::spawn_blocking(move || vaultpair::load_key_hello(&d)).await??
@@ -1366,7 +1358,6 @@ mod win {
                 };
                 match key {
                     Some(k) => drop(oneup_app::launch::start_vault_agent(&e.dir, &k)?),
-                    None if e.dir.join(vaultpair::KEY_FILE).exists() => drop(oneup_app::launch::start_agent(&e.dir)?),
                     None => bail!("type the vault's password"),
                 }
                 Ok(Value::Null)

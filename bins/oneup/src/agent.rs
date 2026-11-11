@@ -148,7 +148,7 @@ pub async fn start(data_dir: &Path) -> Result<()> {
     start_with(data_dir, None).await
 }
 
-/// [`start`]; for a vault pair, with its keys (else they must be remembered).
+/// [`start`]; a vault pair always needs its unlocked keys.
 pub async fn start_with(data_dir: &Path, key: Option<&oneup_vault::key::Masterkey>) -> Result<()> {
     oneup_app::setup::require_test_account(data_dir)?;
     if let Ok(s) = call(data_dir, Call::Status).await {

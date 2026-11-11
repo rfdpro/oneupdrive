@@ -1147,10 +1147,6 @@ enum VaultCmd {
         /// Keep every file decrypted on this PC instead of online-only
         #[arg(long)]
         full_files: bool,
-        /// Remember the vault's keys on this PC (protected by your Windows
-        /// sign-in), so it syncs without asking for the password
-        #[arg(long)]
-        remember: bool,
         /// Don't start syncing it now
         #[arg(long)]
         no_start: bool,
@@ -1165,12 +1161,9 @@ enum VaultCmd {
         #[arg(long)]
         full_files: bool,
         #[arg(long)]
-        remember: bool,
-        #[arg(long)]
         no_start: bool,
     },
-    /// Show a synced vault's recovery key (asks for its password unless
-    /// remembered)
+    /// Show a synced vault's recovery key (asks for its password)
     RecoveryKey { name: String },
     /// Set a new password for a synced vault, with the current password or
     /// the recovery key
@@ -1189,20 +1182,10 @@ enum VaultCmd {
     },
     /// The vaults synced with folders on this PC
     List,
-    /// Start syncing a vault (asks for its password unless remembered)
-    Unlock {
-        name: String,
-        /// Remember the keys on this PC from now on
-        #[arg(long)]
-        remember: bool,
-    },
+    /// Start syncing a vault (asks for its password or Windows Hello)
+    Unlock { name: String },
     /// Stop syncing a vault; its keys leave memory
-    Lock {
-        name: String,
-        /// Also forget remembered keys
-        #[arg(long)]
-        forget: bool,
-    },
+    Lock { name: String },
     /// Stop syncing a vault for good (the vault in OneDrive stays; so do
     /// the decrypted files on this PC that aren't online-only)
     Remove {
@@ -2534,10 +2517,10 @@ async fn run() -> Result<()> {
             VaultCmd::Put { folder, src, path } => vault::put(folder, src, path),
             VaultCmd::Mkdir { folder, path } => vault::mkdir(folder, path),
             VaultCmd::Check { folder } => vault::check(folder),
-            VaultCmd::Add { remote, folder, full_files, remember, no_start } => {
+            VaultCmd::Add { remote, folder, full_files, no_start } => {
                 let http = http()?;
                 let graph = Arc::new(Graph::new(http.clone(), auth(&cli, &http)?, Aimd::new(4, 8)));
-                vault::add(&data_dir(&cli)?, graph, remote, folder, !*full_files, *remember, !*no_start).await
+                vault::add(&data_dir(&cli)?, graph, remote, folder, !*full_files, !*no_start).await
             }
             VaultCmd::List => vault::list(&data_dir(&cli)?).await,
             VaultCmd::Hello { name, state } => {
@@ -2545,10 +2528,10 @@ async fn run() -> Result<()> {
                 let graph = Arc::new(Graph::new(http.clone(), auth(&cli, &http)?, Aimd::new(2, 4)));
                 vault::hello(&data_dir(&cli)?, graph, name, state.map(Toggle::on)).await
             }
-            VaultCmd::New { remote, folder, full_files, remember, no_start } => {
+            VaultCmd::New { remote, folder, full_files, no_start } => {
                 let http = http()?;
                 let graph = Arc::new(Graph::new(http.clone(), auth(&cli, &http)?, Aimd::new(4, 8)));
-                vault::new(&data_dir(&cli)?, graph, remote, folder, !*full_files, *remember, !*no_start).await
+                vault::new(&data_dir(&cli)?, graph, remote, folder, !*full_files, !*no_start).await
             }
             VaultCmd::RecoveryKey { name } => {
                 let http = http()?;
@@ -2560,12 +2543,12 @@ async fn run() -> Result<()> {
                 let graph = Arc::new(Graph::new(http.clone(), auth(&cli, &http)?, Aimd::new(2, 4)));
                 vault::change_password(&data_dir(&cli)?, graph, name, *recovery_key).await
             }
-            VaultCmd::Unlock { name, remember } => {
+            VaultCmd::Unlock { name } => {
                 let http = http()?;
                 let graph = Arc::new(Graph::new(http.clone(), auth(&cli, &http)?, Aimd::new(4, 8)));
-                vault::unlock(&data_dir(&cli)?, graph, name, *remember).await
+                vault::unlock(&data_dir(&cli)?, graph, name).await
             }
-            VaultCmd::Lock { name, forget } => vault::lock(&data_dir(&cli)?, name, *forget).await,
+            VaultCmd::Lock { name } => vault::lock(&data_dir(&cli)?, name).await,
             VaultCmd::Remove { name, yes } => vault::remove(&data_dir(&cli)?, name, *yes).await,
         },
         Cmd::Pair(p) => {
@@ -3911,6 +3894,17 @@ mod rules_args_tests {
 
     fn parses(args: &[&str]) -> bool {
         super::Cli::try_parse_from(std::iter::once("oneup").chain(args.iter().copied())).is_ok()
+    }
+
+    #[test]
+    fn vaults_never_offer_to_save_keys_for_automatic_unlocking() {
+        assert!(parses(&["vault", "new", "/Private", r"C:\Vault"]));
+        assert!(parses(&["vault", "add", "/Private", r"C:\Vault"]));
+        assert!(parses(&["vault", "unlock", "Private"]));
+        assert!(parses(&["vault", "hello", "Private", "on"]));
+        assert!(!parses(&["vault", "new", "/Private", r"C:\Vault", "--remember"]));
+        assert!(!parses(&["vault", "add", "/Private", r"C:\Vault", "--remember"]));
+        assert!(!parses(&["vault", "unlock", "Private", "--remember"]));
     }
 
     /// Options of `oneup rules` that do different things can't be combined:

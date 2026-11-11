@@ -46,7 +46,7 @@ A review of OneUpDrive's Cryptomator vault code against the public vault format 
 | V-15 | Low | Format: random 96-bit header nonces under one key | `crates/oneup-vault/src/content.rs:75` | Accepted |
 | V-16 | Low | scrypt working memory, HMAC/SHA-2 states and moved cipher objects aren't wiped | upstream crates; `key.rs:77`, `config.rs:78` | Open |
 | V-17 | Low | Settings window secrets travel as JSON strings (webview, pipe, `serde_json::Value`) | `bins/oneup/src/bin/oneup-settings.rs:193`, `:486` | Open |
-| V-18 | Info | DPAPI-remembered keys are readable by any program running as the user | `crates/oneup-sys/src/lib.rs:79`, `bins/oneup/src/vaultpair.rs:129` | Accepted, documented |
+| V-18 | Info | DPAPI-remembered keys are readable by any program running as the user | `crates/oneup-sys/src/lib.rs:79`, `bins/oneup/src/vaultpair.rs:129` | Removed: automatic-unlock keys are not stored |
 | V-19 | Info | The Windows Hello secret is the hash of one signature, assumed deterministic | `crates/oneup-sys/src/hello.rs:56` | Accepted; determinism needs a hand check |
 | V-20 | Low | Several stored names can decrypt to one name (padding, case, NFC/NFD) | `crates/oneup-vault/src/names.rs:67`, `crates/oneup-plan/src/folder.rs:158` | Open |
 | V-21 | Info | JWT: unknown header parameters (`crit`) ignored; `alg` chosen by the file | `crates/oneup-vault/src/config.rs:113` | Accepted |
@@ -103,8 +103,8 @@ All need an attacker of type C who can read this process's freed memory, which, 
 ### V-17 Secrets in the settings window's messages (Low, open)
 The window sends passwords and receives recovery keys as JSON over the WebView2 bridge and the control pipe; copies sit in JavaScript strings, the message buffers and `serde_json::Value`, none of which can be wiped. Inherent to a web-based window; a native password dialog would avoid it.
 
-### V-18 DPAPI-remembered keys (Info, accepted)
-`CryptProtectData` with no entropy and no prompt: any program running as the user can unprotect `vault-key.dpapi`, as it can the OneDrive refresh token. The file is the convenience the user asked for ("remember"); the user guide now says who can read it. Windows Hello (V-19) is the option that asks every time.
+### V-18 DPAPI-remembered keys (Info, removed)
+Automatic unlocking is not supported. Unwrapped vault keys stay only in the running sync agent. A `vault-key.dpapi` left by an older build is never read and is deleted at the first unlock with the password. Opt-in Windows Hello (V-19) keeps sealed keys on disk and asks for approval every time the user unlocks.
 
 ### V-19 Windows Hello secret (Info, accepted)
 The secret is SHA-256 of the signature a Windows Hello key makes over a challenge stored next to the sealed keys. This **assumes the signature is deterministic** (RSA PKCS #1 v1.5): Microsoft's `RequestSignAsync` page doesn't name the padding; Microsoft's Windows Hello sign-in samples verify these signatures as PKCS #1 v1.5 with SHA-256, and other password managers rely on the same property. It hasn't been confirmed on a PC here. **Hand check:** turn on Unlock with Windows Hello for a test vault, lock it, and unlock it with Windows Hello twice. If signatures were randomised (RSA-PSS), the second unlock would fail its integrity check and unlocking would fall back to the password: no data is at risk, only the convenience. Each signature needs the person's approval, but one approved request, for example a prompt triggered by malware the person approves, yields the secret for that blob for good. Sealing is AES-256-GCM with a random nonce and a fixed purpose label as associated data (`sealed.rs:33`); a blob from another vault pair fails, because its credential name (and so its key) differs.
@@ -142,7 +142,7 @@ V-1's check runs when the round builds its view (`project`); `VaultCloud` then u
 >
 > **In scope** (about 2,000 lines of Rust):
 > * `crates/oneup-vault`: masterkey file (scrypt, AES key wrap, `versionMac`), `vault.cryptomator` JWT verification, file header and chunk encryption (streaming encryptor and decryptor), AES-SIV names, directory IDs, name shortening, our own recovery-key encoding (`recovery.rs`) and the Windows Hello sealing of keys (`sealed.rs`).
-> * Key handling: `crates/oneup-vaultsync/src/project.rs` (keys verified against the configuration), `bins/oneup/src/vaultpair.rs` (DPAPI-remembered keys, keys passed to the agent process over a pipe), `crates/oneup-sys/src/hello.rs` and `dpapi` in `crates/oneup-sys/src/lib.rs`.
+> * Key handling: `crates/oneup-vaultsync/src/project.rs` (keys verified against the configuration), `bins/oneup/src/vaultpair.rs` (memory-only keys passed to the agent process over a pipe, opt-in Windows Hello sealing), `crates/oneup-sys/src/hello.rs` and `dpapi` in `crates/oneup-sys/src/lib.rs`.
 >
 > **Questions we'd most like answered:**
 > 1. Does anything deviate from format 8 in a way that weakens it, or that Cryptomator would reject?

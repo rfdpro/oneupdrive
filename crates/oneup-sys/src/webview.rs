@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     COREWEBVIEW2_COLOR, CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2, ICoreWebView2Controller,
-    ICoreWebView2Controller2, ICoreWebView2Environment,
+    ICoreWebView2Controller2, ICoreWebView2Environment, ICoreWebView2Settings4,
 };
 use webview2_com::{
     CoTaskMemPWSTR, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
@@ -435,6 +435,11 @@ pub fn run(opts: &Options<'_>, mut on_message: impl FnMut(String, &Poster) + 'st
         let _ = settings.SetIsStatusBarEnabled(false);
         let _ = settings.SetAreDefaultContextMenusEnabled(false);
         let _ = settings.SetIsZoomControlEnabled(false);
+        // Vault credentials must stay in memory, including the page's form fields.
+        let private = windows::core::Interface::cast::<ICoreWebView2Settings4>(&settings)
+            .map_err(|e| win("password storage settings", e))?;
+        private.SetIsPasswordAutosaveEnabled(false).map_err(|e| win("disable password saving", e))?;
+        private.SetIsGeneralAutofillEnabled(false).map_err(|e| win("disable form saving", e))?;
         let mut token = 0i64;
         let p = poster.clone();
         webview

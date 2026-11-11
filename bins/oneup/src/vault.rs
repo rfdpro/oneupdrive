@@ -205,11 +205,10 @@ pub async fn add(
     remote: &str,
     folder: &Path,
     on_demand: bool,
-    remember: bool,
     start: bool,
 ) -> Result<()> {
     let pw = password(false)?;
-    let added = vaultpair::add(main, graph, remote, folder, on_demand, &pw, remember).await?;
+    let added = vaultpair::add(main, graph, remote, folder, on_demand, &pw).await?;
     let (local, _) = vaultpair::describe(&added.entry)?;
     println!(
         "Paired the vault {} with {} as \"{}\"{}.",
@@ -218,9 +217,6 @@ pub async fn add(
         added.entry.name,
         if added.on_demand { " (files online-only until opened)" } else { " (all files kept decrypted here)" }
     );
-    if remember {
-        println!("Its keys are remembered on this PC (protected by your Windows sign-in).");
-    }
     if start {
         crate::agent::start_with(&added.entry.dir, Some(&added.key)).await?;
     } else {
@@ -247,11 +243,10 @@ pub async fn new(
     remote: &str,
     folder: &Path,
     on_demand: bool,
-    remember: bool,
     start: bool,
 ) -> Result<()> {
     let pw = password(true)?;
-    let added = vaultpair::create(main, graph, remote, folder, on_demand, &pw, remember).await?;
+    let added = vaultpair::create(main, graph, remote, folder, on_demand, &pw).await?;
     let (local, _) = vaultpair::describe(&added.entry)?;
     println!(
         "Created the vault {} in OneDrive and paired it with {} as \"{}\".",
@@ -268,12 +263,9 @@ pub async fn new(
     }
 }
 
-/// The keys of a synced vault: remembered, or from its password.
+/// The keys of a synced vault, from its password.
 async fn keys_of(main: &Path, graph: &Arc<Graph>, e: &Entry) -> Result<oneup_vault::key::Masterkey> {
-    match vaultpair::load_key(&e.dir)? {
-        Some(k) => Ok(k),
-        None => vaultpair::keys(main, graph, e, &password(false)?).await,
-    }
+    vaultpair::keys(main, graph, e, &password(false)?).await
 }
 
 pub async fn recovery_key(main: &Path, graph: Arc<Graph>, name: &str) -> Result<()> {
@@ -310,35 +302,29 @@ pub async fn list(main: &Path) -> Result<()> {
     for e in all {
         let (local, on) = vaultpair::describe(&e)?;
         let running = crate::agent::current(&e.dir).await.ok().flatten().is_some();
-        let remembered = e.dir.join(vaultpair::KEY_FILE).exists();
+        let hello = e.dir.join(vaultpair::HELLO_FILE).exists();
         println!("{}", e.name);
         println!("  OneDrive {}  <->  {}", e.remote, local.display());
         println!(
             "  {}; {}; {}",
             if on { "online-only until opened" } else { "all files here" },
             if running { "unlocked, syncing" } else { "locked" },
-            if remembered { "keys remembered on this PC" } else { "password needed to unlock" }
+            if hello { "Windows Hello or password to unlock" } else { "password needed to unlock" }
         );
     }
     Ok(())
 }
 
-pub async fn unlock(main: &Path, graph: Arc<Graph>, name: &str, remember: bool) -> Result<()> {
+pub async fn unlock(main: &Path, graph: Arc<Graph>, name: &str) -> Result<()> {
     let e = find(main, name)?;
     if crate::agent::current(&e.dir).await.ok().flatten().is_some() {
         println!("{} is already unlocked.", e.name);
         return Ok(());
     }
-    let key = match vaultpair::load_key(&e.dir)? {
+    let key = match vaultpair::load_key_hello(&e.dir)? {
         Some(k) => k,
-        None => match vaultpair::load_key_hello(&e.dir)? {
-            Some(k) => k,
-            None => vaultpair::keys(main, &graph, &e, &password(false)?).await?,
-        },
+        None => vaultpair::keys(main, &graph, &e, &password(false)?).await?,
     };
-    if remember {
-        vaultpair::save_key(&e.dir, &key)?;
-    }
     crate::agent::start_with(&e.dir, Some(&key)).await
 }
 
@@ -374,12 +360,9 @@ pub async fn hello(main: &Path, graph: Arc<Graph>, name: &str, on: Option<bool>)
     Ok(())
 }
 
-pub async fn lock(main: &Path, name: &str, forget: bool) -> Result<()> {
+pub async fn lock(main: &Path, name: &str) -> Result<()> {
     let e = find(main, name)?;
     crate::agent::stop(&e.dir).await?;
-    if forget && vaultpair::forget_key(&e.dir)? {
-        println!("Its remembered keys are gone; unlocking it needs the password again.");
-    }
     Ok(())
 }
 

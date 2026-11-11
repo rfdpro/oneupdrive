@@ -224,12 +224,10 @@ async fn run(args: Args) -> Result<()> {
     oneup_app::datafolders::record(dir);
     // A vault pair (oneup_app::vaultpair) syncs only while unlocked.
     let key = if oneup_app::vaultpair::is_vault_dir(dir) {
-        Some(if args.key_stdin {
-            oneup_app::vaultpair::key_from_stdin()?
-        } else {
-            oneup_app::vaultpair::load_key(dir)?
-                .context("this vault is locked; `oneup vault unlock` starts it with its password")?
-        })
+        if !args.key_stdin {
+            anyhow::bail!("this vault is locked; `oneup vault unlock` starts it with its password or Windows Hello");
+        }
+        Some(oneup_app::vaultpair::key_from_stdin()?)
     } else {
         None
     };

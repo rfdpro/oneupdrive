@@ -52,9 +52,9 @@ pub struct Facts {
     /// Files whose upload may have gone over an edit in OneDrive that its
     /// version history never showed (`oneup_exec::rescues_given_up`).
     pub edits_not_found: Vec<(String, i64)>,
-    /// An extra pair or vault that should be running: the main agent runs
-    /// (it starts them), it wasn't asked to stop, and for a vault its keys
-    /// are remembered (`launch::start_others`).
+    /// An extra pair that should be running: the main agent runs (it starts
+    /// them) and it wasn't asked to stop (`launch::start_others`). Vaults
+    /// always wait for the user to unlock them.
     pub expected: bool,
     /// The note that its agent was stopped on purpose is left over from
     /// before its last start (`problem::stale_stop_note`).
@@ -516,16 +516,13 @@ pub async fn gather(main: &Path) -> Vec<Facts> {
 }
 
 /// The extra pairs and vaults of `main`: name, data folder, and whether the
-/// main agent starts it (`launch::start_others`: every pair, and the vaults
-/// whose keys are remembered; a locked vault waits for its password).
+/// main agent starts it (`launch::start_others`: every pair; a locked vault
+/// waits for its password or Windows Hello).
 /// Strict: a folder that can't be read is an error, not "none", so the list
 /// can say they weren't checked rather than leave them out silently.
 fn children(main: &Path) -> std::io::Result<Vec<(String, PathBuf, bool)>> {
     let pairs = crate::pairs::list_strict(main)?.into_iter().map(|p| (p.name, p.dir, true));
-    let vaults = crate::vaultpair::list_strict(main)?.into_iter().map(|v| {
-        let remembered = v.dir.join(crate::vaultpair::KEY_FILE).exists();
-        (v.name, v.dir, remembered)
-    });
+    let vaults = crate::vaultpair::list_strict(main)?.into_iter().map(|v| (v.name, v.dir, false));
     Ok(pairs.chain(vaults).collect())
 }
 
@@ -943,9 +940,8 @@ mod tests {
     }
 
     /// An extra pair or vault that isn't running: a problem when it should
-    /// be (the main agent runs and it wasn't asked to stop, or for a vault,
-    /// its keys are remembered), not when it was stopped on purpose or is
-    /// locked. Its items carry its name.
+    /// be (the main agent runs and the extra pair wasn't asked to stop), not
+    /// when it was stopped on purpose or is a locked vault. Its items carry its name.
     #[test]
     fn a_pair_not_running_is_a_problem_only_when_it_should_be() {
         let mut f = facts(View::NotRunning);
@@ -1071,8 +1067,8 @@ mod tests {
     }
 
     /// Which extra pairs and vaults should be running, from the data
-    /// folders: a pair or a remembered vault whose agent wasn't asked to
-    /// stop; not a locked vault, nor one stopped on purpose; none while the
+    /// folders: an extra pair whose agent wasn't asked to stop; vaults always
+    /// wait for explicit unlocking; none while the
     /// main agent isn't running (starting it starts them).
     #[tokio::test]
     async fn which_pairs_and_vaults_should_be_running() {
@@ -1088,7 +1084,7 @@ mod tests {
         let stopped = child(crate::pairs::PAIRS, "Stopped", crate::pairs::MARKER);
         crate::problem::note_asked_to_stop(&stopped).unwrap_or_default();
         let remembered = child(crate::vaultpair::VAULTS, "Kept", crate::vaultpair::MARKER);
-        std::fs::write(remembered.join(crate::vaultpair::KEY_FILE), b"k").unwrap_or_default();
+        std::fs::write(remembered.join("vault-key.dpapi"), b"k").unwrap_or_default();
         child(crate::vaultpair::VAULTS, "Locked", crate::vaultpair::MARKER);
         let should = |main_runs: bool| -> Vec<String> {
             children(&main)
@@ -1098,16 +1094,16 @@ mod tests {
                 .map(|c| c.0)
                 .collect()
         };
-        assert_eq!(should(true), ["Photos", "Kept"], "not the stopped pair, nor the locked vault");
+        assert_eq!(should(true), ["Photos"], "neither stopped pairs nor vaults start automatically");
         assert!(should(false).is_empty(), "none while the main agent isn't running");
         let all = gather(&main).await;
         assert_eq!(all.len(), 5, "the main folder, two pairs and two vaults");
         assert!(all.iter().all(|f| !f.expected), "no agent runs here");
         // Starting again clears the note.
         crate::problem::clear_stopped(&stopped);
-        assert_eq!(should(true), ["Photos", "Stopped", "Kept"]);
+        assert_eq!(should(true), ["Photos", "Stopped"]);
         assert_eq!(pair.file_name(), Some(std::ffi::OsStr::new("Photos")));
-        assert!(remembered.join(crate::vaultpair::KEY_FILE).exists());
+        assert!(remembered.join("vault-key.dpapi").exists());
         let _ = std::fs::remove_dir_all(&main);
     }
 

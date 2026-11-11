@@ -9,9 +9,8 @@
 //!   (`oneup_vaultsync::project`).
 //! * Its agent is its own `oneupd` process: unlocking starts it with the
 //!   vault's keys handed over its standard input (never written to disk),
-//!   locking stops it. "Remember on this PC" keeps the keys DPAPI-protected
-//!   in the vault pair's data folder ([`KEY_FILE`]), so it can start
-//!   without asking.
+//!   locking stops it. Keys live only in the running agent, except for
+//!   the user's opt-in Windows Hello setup, which always asks for approval.
 //! * Files On-Demand by default (the decrypted files are online-only until
 //!   opened), or full files.
 //!
@@ -33,8 +32,10 @@ use zeroize::Zeroizing;
 
 /// In a vault pair's data folder: the vault's OneDrive path.
 pub const MARKER: &str = "vault-pair.txt";
-/// The vault's keys, DPAPI-protected ("remember on this PC").
-pub const KEY_FILE: &str = "vault-key.dpapi";
+/// Keys an older build kept for automatic unlocking (DPAPI). Never read:
+/// startup leaves it alone in case it's the only key left, and the first
+/// unlock with the password removes it ([`keys`]).
+const LEGACY_KEY_FILE: &str = "vault-key.dpapi";
 /// Where vault pairs' data folders are, inside the main data folder.
 pub const VAULTS: &str = "vaults";
 /// Meta keys in a vault pair's store.
@@ -125,27 +126,6 @@ pub fn new_name(main: &Path, remote: &str) -> String {
 }
 
 // ------------------------------------------------------------------ keys
-
-pub fn save_key(dir: &Path, key: &Masterkey) -> Result<()> {
-    let sealed = oneup_sys::dpapi::protect(key.export().as_ref()).context("protecting the vault's keys")?;
-    crate::ownfile::write(&dir.join(KEY_FILE), &sealed)?;
-    Ok(())
-}
-
-pub fn load_key(dir: &Path) -> Result<Option<Masterkey>> {
-    let Ok(sealed) = std::fs::read(dir.join(KEY_FILE)) else { return Ok(None) };
-    let raw = oneup_sys::dpapi::unprotect(&sealed).context("reading the remembered vault keys")?;
-    let raw: &[u8; 64] = raw.as_slice().try_into().context("the remembered vault keys are damaged")?;
-    Ok(Some(Masterkey::import(raw)))
-}
-
-pub fn forget_key(dir: &Path) -> Result<bool> {
-    match std::fs::remove_file(dir.join(KEY_FILE)) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
 
 /// The vault's keys sealed with Windows Hello's secret
 /// (`oneup_vault::sealed`, `oneup_sys::hello`): unlocking then asks for
@@ -273,10 +253,30 @@ fn keys_from_line(line: &[u8]) -> Result<Masterkey> {
 
 /// A cloud file's content (small files: the vault's key and config).
 async fn fetch(cloud: &GraphCloud, r: &RemoteRow) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+    const MAX: usize = 16 * 1024;
+    struct Small(Vec<u8>);
+    impl std::io::Write for Small {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("vault configuration is too large"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    if r.size < 0 || r.size > MAX as i64 {
+        bail!("vault configuration is too large");
+    }
+    let mut out = Small(Vec::new());
     let pre = RemotePre { id: RemoteId(r.id.clone()), etag: r.etag.clone().unwrap_or_default() };
     cloud.download(&pre, &mut out).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(out)
+    if out.0.len() as i64 != r.size {
+        bail!("vault configuration changed while downloading");
+    }
+    Ok(out.0)
 }
 
 /// Unlocks the vault whose folder is `root` in the listing `main`: its keys
@@ -679,7 +679,6 @@ pub async fn add(
     folder: &Path,
     on_demand: bool,
     password: &str,
-    remember: bool,
 ) -> Result<Added> {
     crate::setup::require_test_account(main)?;
     if is_vault_dir(main) {
@@ -749,11 +748,8 @@ pub async fn add(
         oneup_effects::LocalFs::open(Path::new(&local.path), local.volume_serial, local.root_file_id, &token, true)
             .context("opening the folder")?;
         store.write(|o| o.meta_set(crate::sync::KEY_MARKER, "1"))?;
-        if remember {
-            save_key(&dir, &key)?;
-        }
         // Last: until it's there, this isn't a vault pair.
-        std::fs::write(dir.join(MARKER), &remote)?;
+        crate::ownfile::write(&dir.join(MARKER), remote.as_bytes())?;
         Ok(())
     })();
     if let Err(e) = made {
@@ -779,7 +775,6 @@ pub async fn create(
     folder: &Path,
     on_demand: bool,
     password: &str,
-    remember: bool,
 ) -> Result<Added> {
     crate::setup::require_test_account(main)?;
     if crate::vaultpair::is_child_dir(main) {
@@ -820,7 +815,7 @@ pub async fn create(
     for part in path.split('/') {
         parent = RemoteId(cloud.mkdir(&parent, part).await.map_err(|e| anyhow::anyhow!("{part}: {e}"))?.id);
     }
-    add(main, graph, &remote, folder, on_demand, password, remember).await
+    add(main, graph, &remote, folder, on_demand, password).await
 }
 
 /// The vault's configuration (`vault.cryptomator`), read from OneDrive.
@@ -857,7 +852,7 @@ pub async fn keys_from_recovery(main: &Path, graph: &Arc<Graph>, e: &Entry, reco
 /// Locks the vault with a new password: a new `masterkey.cryptomator`
 /// wrapping the same keys, sent as a new version of the old one (If-Match;
 /// OneDrive's version history keeps the old one). Nothing else changes:
-/// files aren't re-encrypted, and keys remembered on this PC stay valid.
+/// files aren't re-encrypted, and Windows Hello keys stay valid.
 pub async fn set_password(main: &Path, graph: Arc<Graph>, e: &Entry, key: &Masterkey, password: &str) -> Result<()> {
     if password.chars().count() < 8 {
         bail!("use a password of at least 8 characters");
@@ -866,15 +861,14 @@ pub async fn set_password(main: &Path, graph: Arc<Graph>, e: &Entry, key: &Maste
     // The right vault's keys, or nothing is written.
     let token = config_token(&graph, &kids).await?;
     oneup_vault::config::Config::verify(&token, key)?;
-    let file = kids
-        .iter()
-        .find(|r| oneup_sync::same_name(&r.name, oneup_vault::key::FILE))
-        .context("the vault's masterkey.cryptomator is missing")?;
+    let key_name = oneup_vault::config::key_file(&token)?;
+    let file =
+        kids.iter().find(|r| oneup_sync::same_name(&r.name, &key_name)).context("the vault's key file is missing")?;
     let json = key.to_file(password)?;
     let pre = RemotePre { id: RemoteId(file.id.clone()), etag: file.etag.clone().unwrap_or_default() };
     let len = i64::try_from(json.len()).unwrap_or(i64::MAX);
     GraphCloud::new(graph)
-        .upload(&RemoteId(root), oneup_vault::key::FILE, Some(&pre), len, &mut json.as_slice())
+        .upload(&RemoteId(root.clone()), &key_name, Some(&pre), len, &mut json.as_slice())
         .await
         .map_err(|err| anyhow::anyhow!("saving the new password: {err}"))?;
     Ok(())
@@ -889,12 +883,23 @@ pub fn describe(e: &Entry) -> Result<(PathBuf, bool)> {
     Ok((local, on))
 }
 
-/// Re-reads the keys with `password` (for unlocking a pair that isn't
-/// remembered).
+/// Re-reads the keys with `password` to unlock a vault pair.
 pub async fn keys(main: &Path, graph: &Arc<Graph>, e: &Entry, password: &str) -> Result<Masterkey> {
     // Listed afresh: the password may have changed on another PC.
     let (_, kids) = top_items(main, graph, e).await?;
-    Ok(unlock_in(graph, kids, password).await?.0)
+    let key = unlock_in(graph, kids, password).await?.0;
+    forget_legacy_key(&e.dir);
+    Ok(key)
+}
+
+/// Removes [`LEGACY_KEY_FILE`] once the password has unlocked the vault, so
+/// the keys don't stay on disk. Best effort: it's never read either way.
+fn forget_legacy_key(dir: &Path) {
+    match std::fs::remove_file(dir.join(LEGACY_KEY_FILE)) {
+        Ok(()) => tracing::info!("saved automatic-unlock keys of an older build removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(error = %e, "saved automatic-unlock keys of an older build weren't removed"),
+    }
 }
 
 /// Removes the pair (its agent must be stopped): the folder stops being
@@ -917,6 +922,32 @@ pub fn remove(e: &Entry) -> Result<(PathBuf, bool)> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn startup_does_not_start_vaults_or_discard_legacy_recovery_keys() {
+        let temp = tempfile::Builder::new().prefix("oneup-legacy-key-recovery-").tempdir().unwrap();
+        let dir = temp.path();
+        let vault = dir.join(super::VAULTS).join("Private");
+        let local = dir.join("Decrypted");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(vault.join(super::MARKER), "/Private").unwrap();
+        std::fs::write(vault.join(super::LEGACY_KEY_FILE), b"not a valid DPAPI blob").unwrap();
+        std::fs::write(vault.join(super::HELLO_FILE), b"hello setup").unwrap();
+        std::fs::write(local.join(super::LEGACY_KEY_FILE), b"user content").unwrap();
+        assert!(crate::launch::start_others(dir).await.is_empty());
+        assert!(crate::launch::start_others(dir).await.is_empty());
+        assert_eq!(std::fs::read(vault.join(super::LEGACY_KEY_FILE)).unwrap(), b"not a valid DPAPI blob");
+        assert_eq!(std::fs::read(vault.join(super::HELLO_FILE)).unwrap(), b"hello setup");
+        assert_eq!(std::fs::read(local.join(super::LEGACY_KEY_FILE)).unwrap(), b"user content");
+        // Unlocking with the password removes it; nothing else goes.
+        super::forget_legacy_key(&vault);
+        assert!(!vault.join(super::LEGACY_KEY_FILE).exists());
+        assert_eq!(std::fs::read(vault.join(super::HELLO_FILE)).unwrap(), b"hello setup");
+        super::forget_legacy_key(&vault);
+    }
+
     #[test]
     fn a_vault_is_already_paired_under_a_name_windows_takes_for_the_same() {
         use super::same_remote;
