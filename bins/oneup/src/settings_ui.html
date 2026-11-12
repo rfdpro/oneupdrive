@@ -810,6 +810,16 @@
         #toast.error {
             border-left: 3px solid var(--bad);
         }
+
+        /* A viewport-fixed message can fall beyond a dialog's scrollport.
+           Keep it inside that scrollport while the dialog is modal. */
+        dialog #toast.show {
+            position: sticky;
+            right: auto;
+            bottom: 12px;
+            max-width: none;
+            margin: 0 12px 12px;
+        }
         
         table.list {
             width: 100%;

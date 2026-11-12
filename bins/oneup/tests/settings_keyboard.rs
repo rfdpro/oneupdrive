@@ -714,14 +714,24 @@ const DRIVER: &str = r##"<script>
     // inert and under the backdrop), on top, and back on the page after.
     const toastEl = document.querySelector("#toast");
     const onTop = el => { el.style.pointerEvents = "auto"; const r = el.getBoundingClientRect();
-      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); el.style.pointerEvents = ""; return !!hit && el.contains(hit); };
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); el.style.pointerEvents = "";
+      el._hit = hit ? hit.tagName + "#" + hit.id : "none"; return !!hit && el.contains(hit); };
     const newVault = document.querySelector("#dlg-vault-new");
+    const toastSeen = () => JSON.stringify({parent: toastEl.parentNode.id, text: toastEl.textContent,
+      viewport: [innerWidth, innerHeight], toast: toastEl.getBoundingClientRect(), dialog: newVault.getBoundingClientRect(), hit: toastEl._hit});
     for (const [id, v] of [["vc-remote", "/Private"], ["vc-local", "C:\Vaults\P"], ["vc-pw", "test-only-one"], ["vc-pw2", "test-only-two"]]) document.getElementById(id).value = v;
     newVault.showModal();
     document.querySelector("#vc-add").click(); await sleep(150);
     check("an error in a dialog shows in the dialog, on top", newVault.open && toastEl.parentNode === newVault && toastEl.classList.contains("error")
-      && toastEl.textContent === "The passwords don't match" && onTop(toastEl), toastEl.parentNode.id + ": " + toastEl.textContent);
+      && toastEl.textContent === "The passwords don't match" && onTop(toastEl), toastSeen());
     check("the message in a dialog is a status for screen readers", toastEl.getAttribute("role") === "status", toastEl.getAttribute("role"));
+    newVault.style.maxHeight = "260px";
+    await sleep(50);
+    check("an error stays visible when its dialog scrolls", onTop(toastEl), toastSeen());
+    newVault.scrollTop = newVault.scrollHeight;
+    await sleep(50);
+    check("scrolling a dialog keeps its message visible", onTop(toastEl), toastSeen());
+    newVault.style.maxHeight = "";
     document.querySelector("#vc-cancel").click(); await sleep(150);
     check("closing the dialog gives the message back to the page, still shown", !newVault.open && toastEl.parentNode === document.body
       && toastEl.classList.contains("show") && toastEl.textContent === "The passwords don't match", toastEl.parentNode.tagName + ": " + toastEl.textContent);
@@ -839,7 +849,14 @@ fn the_window_works_from_the_keyboard() {
     let dump = dir.join("dom.html");
     run.child = Some(
         Command::new(&edge)
-            .args(["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check"])
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--window-size=800,600",
+                "--force-device-scale-factor=1",
+            ])
             .arg(format!("--user-data-dir={}", dir.join("profile").display()))
             .args(["--virtual-time-budget=60000", "--dump-dom", &url])
             .stdout(Stdio::from(std::fs::File::create(&dump).expect("the output file")))
@@ -865,6 +882,11 @@ fn the_window_works_from_the_keyboard() {
         .unwrap_or_else(|| panic!("no result from the page; Edge printed {} bytes", dom.len()));
     let json = json.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
     let checks: Vec<(String, bool, String)> = serde_json::from_str(&json).expect("the checks");
+    for (name, _, seen) in
+        checks.iter().filter(|(name, _, _)| name.contains("dialog shows") || name.contains("dialog scrolls"))
+    {
+        eprintln!("{name}: {seen}");
+    }
     let failed: Vec<String> =
         checks.iter().filter(|(_, ok, _)| !ok).map(|(name, _, seen)| format!("{name} (saw: {seen})")).collect();
     assert!(checks.iter().any(|(n, ..)| n == "done"), "the checks didn't finish: {checks:?}");

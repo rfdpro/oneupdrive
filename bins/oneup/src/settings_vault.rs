@@ -130,12 +130,13 @@ mod tests {
     #[test]
     fn suggestion_uses_the_vault_name_and_never_adopts_or_creates_a_folder() {
         let p = profile();
+        let resolved = plain(&std::fs::canonicalize(p.path()).unwrap());
         let first = p.path().join("Tax records Vault");
         std::fs::create_dir(&first).unwrap();
         let second = p.path().join("Tax records Vault (2)");
         std::fs::write(&second, b"keep").unwrap();
         let next = suggest(p.path(), "/Private/Tax records", &[], |_| false).unwrap();
-        assert_eq!(next, plain(&p.path().join("Tax records Vault (3)")));
+        assert_eq!(next, resolved.join("Tax records Vault (3)"));
         assert!(!next.exists());
         assert_eq!(std::fs::read(&second).unwrap(), b"keep");
         assert_eq!(std::fs::read_dir(p.path()).unwrap().count(), 2);
@@ -144,6 +145,7 @@ mod tests {
     #[test]
     fn suggestions_stay_outside_sync_vault_provider_and_data_roots_in_both_directions() {
         let p = profile();
+        let resolved = plain(&std::fs::canonicalize(p.path()).unwrap());
         let excluded = vec![
             p.path().join("Private Vault"),
             p.path().join("Private Vault (2)").join("synced-child"),
@@ -151,7 +153,7 @@ mod tests {
             p.path().join("Private Vault (4)"),
         ];
         let next = suggest(p.path(), "/Private", &excluded, |path| path.ends_with("Private Vault (5)")).unwrap();
-        assert_eq!(next, plain(&p.path().join("Private Vault (6)")));
+        assert_eq!(next, resolved.join("Private Vault (6)"));
         assert_eq!(std::fs::read_dir(p.path()).unwrap().count(), 0);
         assert!(suggest(p.path(), "/Private", &[p.path().to_path_buf()], |_| false).is_err());
         assert!(suggest(p.path(), "/Private", &[], |path| path == p.path()).is_err());
@@ -160,9 +162,10 @@ mod tests {
     #[test]
     fn remote_names_cannot_escape_the_profile_or_form_reserved_windows_names() {
         let p = profile();
+        let resolved = plain(&std::fs::canonicalize(p.path()).unwrap());
         for remote in ["", "/..", "/CON", "/a:b*?", "/a/\\..\\"] {
             let next = suggest(p.path(), remote, &[], |_| false).unwrap();
-            assert_eq!(next.parent(), Some(plain(p.path()).as_path()));
+            assert_eq!(next.parent(), Some(resolved.as_path()));
             assert!(next.file_name().unwrap().to_string_lossy().ends_with(" Vault"));
             assert!(!next.exists());
         }
@@ -197,9 +200,12 @@ mod tests {
             .unwrap();
         assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
         let excluded = [alias.join("Private Vault").join("nested-sync")];
-        let next = suggest(&profile, "/Private", &excluded, |_| false).unwrap();
-        assert_eq!(next, plain(&profile.join("Private Vault (2)")));
-        assert!(!next.exists());
+        let resolved = plain(&std::fs::canonicalize(&profile).unwrap());
+        for path in [&profile, &alias] {
+            let next = suggest(path, "/Private", &excluded, |_| false).unwrap();
+            assert_eq!(next, resolved.join("Private Vault (2)"));
+            assert!(!next.exists());
+        }
         std::fs::remove_dir(&alias).unwrap();
     }
 }
