@@ -236,6 +236,60 @@ const DRIVER: &str = r##"<script>
     document.querySelector("#st-menu").hidePopover(); await sleep(150);
     check("closing it gives focus back to its button", document.activeElement.id === "st-btn", at());
 
+    // A waiting safety stop: Review opens its list; where to decide follows
+    // the icon in the taskbar corner, by kind, and the window approves none.
+    const stopStatus = (stops, overflow = null) => ({activity: "WaitingForYou", paused: {local: false, remote: false},
+      safety_stops: stops, overflow, version: "0.0.0"});
+    const stopOf = (kind, code) => ({kind, code, side: "local", count: 3, at_least: false, recent: 0, synced_items: 50});
+    const menuItems = () => [...document.querySelectorAll("#st-actions button")].map(b => b.textContent);
+    const stDetail = () => document.querySelector("#st-detail").textContent;
+    HOST_ANSWERS.stops = a => [{code: "c1", header: "3 files on this PC no longer look like their type.",
+      rows: [{action: "upload", path: "/Docs/a.docx", to: null, note: ""}], matching: 1, unwritten: 0}];
+    snap.agent.tray_icon = true;
+    showStatus(stopStatus([stopOf("content", "c1")]));
+    check("a waiting stop offers Review first", menuItems()[0] === "Review", menuItems());
+    check("with the icon, decisions point to its menu", stDetail().includes("Decide from the icon's menu."), stDetail());
+    const callsBeforeReview = HOST_CALLS.length;
+    document.querySelector("#st-btn").click(); await sleep(100);
+    document.querySelector("#st-actions button").click(); await sleep(300);
+    check("Review opens Activity on Safety stops", document.querySelector("#lists").classList.contains("on")
+      && document.querySelector('#ls-tabs [data-tab="stops"]').getAttribute("aria-pressed") === "true"
+      && !document.querySelector("#st-menu").matches(":popover-open"), document.querySelector(".page.on").id);
+    check("Review only reads", HOST_CALLS.slice(callsBeforeReview).every(m => m.op !== "control"), JSON.stringify(HOST_CALLS.slice(callsBeforeReview).map(m => m.op)));
+    const lsSum = () => document.querySelector("#ls-sum").textContent;
+    check("with the icon, the list points to its menu", lsSum().includes("Decide from the icon's menu."), lsSum());
+    // The icon turned off: the status and the list say how without it.
+    document.querySelector('[data-agent="tray_icon"]').checked = false;
+    document.querySelector('[data-agent="tray_icon"]').dispatchEvent(new Event("change")); await sleep(200);
+    check("turning the icon off updates the status menu", !stDetail().includes("icon's menu") && stDetail().includes("Some edited files look encrypted."), stDetail());
+    const contentSays = lsSum();
+    check("without the icon, a content stop says check and rewind before approving", !contentSays.includes("icon's menu")
+      && contentSays.indexOf("Rewind puts their folder back") >= 0
+      && contentSays.indexOf("Rewind puts their folder back") < contentSays.indexOf("oneup approve c1")
+      && contentSays.includes("Only if you changed them yourself"), contentSays);
+    for (const [kind, says] of [["mass", "If you meant these changes: oneup approve c1"], ["removal", "on the Files page, Duplicates."],
+        ["rewind", "Approve the rewind on the Recovery page."]]) {
+      showStatus(stopStatus([stopOf(kind, "c1")]));
+      await loadList(false);
+      check("without the icon, a " + kind + " stop says how to answer it", lsSum().includes(says) && !lsSum().includes("icon's menu")
+        && (kind === "mass" || !lsSum().includes("oneup approve")), lsSum());
+    }
+    // Kind not known yet: the content guard's header still says check first; nothing else offers approving.
+    showStatus(stopStatus([]));
+    await loadList(false);
+    check("a stop whose kind isn't known yet never offers approving blindly", lsSum().includes("Rewind puts their folder back")
+      && lsSum().indexOf("Rewind puts their folder back") < lsSum().indexOf("oneup approve c1"), lsSum());
+    HOST_ANSWERS.stops = [{code: "u1", header: "Something waits.", rows: [], matching: 0, unwritten: 0}];
+    await loadList(false);
+    check("an unknown stop without a header to go by offers no approval", !lsSum().includes("oneup approve"), lsSum());
+    showStatus(stopStatus([], {count: 2, bytes: 10, room: 0, code: "o1", waiting: true}));
+    check("without the icon, removed files that don't fit name the commands", stDetail().includes("oneup keep o1") && stDetail().includes("oneup discard o1")
+      && !menuItems().includes("Review"), stDetail());
+    snap.agent.tray_icon = true;
+    document.querySelector('[data-agent="tray_icon"]').checked = true;
+    showStatus(null);
+    show("files"); await sleep(200);
+
     // Settings, at the foot of the list: its pages replace the list, and Back returns.
     const before = document.querySelector(".page.on").id;
     const gear = document.querySelector("#nav-open-settings");
@@ -530,6 +584,32 @@ const DRIVER: &str = r##"<script>
       if (document.querySelector("#dlg-recovery").open) document.querySelector("#dlg-recovery").close();
     }
     HOST_ANSWERS.roots = savedRoots;
+
+    // A message over a modal dialog: in the dialog (the page beneath is
+    // inert and under the backdrop), on top, and back on the page after.
+    const toastEl = document.querySelector("#toast");
+    const onTop = el => { el.style.pointerEvents = "auto"; const r = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); el.style.pointerEvents = ""; return !!hit && el.contains(hit); };
+    const newVault = document.querySelector("#dlg-vault-new");
+    for (const [id, v] of [["vc-remote", "/Private"], ["vc-local", "C:\Vaults\P"], ["vc-pw", "test-only-one"], ["vc-pw2", "test-only-two"]]) document.getElementById(id).value = v;
+    newVault.showModal();
+    document.querySelector("#vc-add").click(); await sleep(150);
+    check("an error in a dialog shows in the dialog, on top", newVault.open && toastEl.parentNode === newVault && toastEl.classList.contains("error")
+      && toastEl.textContent === "The passwords don't match" && onTop(toastEl), toastEl.parentNode.id + ": " + toastEl.textContent);
+    check("the message in a dialog is a status for screen readers", toastEl.getAttribute("role") === "status", toastEl.getAttribute("role"));
+    document.querySelector("#vc-cancel").click(); await sleep(150);
+    check("closing the dialog gives the message back to the page, still shown", !newVault.open && toastEl.parentNode === document.body
+      && toastEl.classList.contains("show") && toastEl.textContent === "The passwords don't match", toastEl.parentNode.tagName + ": " + toastEl.textContent);
+    toast("Saved"); await sleep(50);
+    newVault.showModal(); await sleep(150);
+    check("a dialog opening over a message takes it along", toastEl.parentNode === newVault && toastEl.textContent === "Saved" && onTop(toastEl), toastEl.parentNode.tagName);
+    toast("Closing now"); newVault.close(); await sleep(150);
+    check("a message given as its dialog closes isn't lost", toastEl.parentNode === document.body && toastEl.textContent === "Closing now", toastEl.textContent);
+    toast("On the page"); await sleep(50);
+    check("with no dialog open the message stays on the page", toastEl.parentNode === document.body && toastEl.textContent === "On the page", toastEl.parentNode.tagName);
+    const busy = [...document.querySelectorAll('[id$="-busy"]')];
+    check("every busy line is a status", busy.length >= 11 && busy.every(b => b.getAttribute("role") === "status"),
+      busy.filter(b => b.getAttribute("role") !== "status").map(b => b.id));
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }

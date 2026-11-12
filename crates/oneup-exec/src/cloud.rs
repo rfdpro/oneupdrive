@@ -149,8 +149,13 @@ pub trait Cloud: Send + Sync {
     /// checked then. Graph checks an upload session's `If-Match` only when
     /// the session starts; [`Cloud::upload`] re-checks the eTag before the
     /// last fragment, which leaves a moment for an edit in OneDrive to land
-    /// first. `None`: nothing to check afterwards (a one-request upload
-    /// commits under its `If-Match`). No default, like
+    /// first. `Ok(None)` means rescue is not applicable (a one-request
+    /// upload commits under its `If-Match`), never that history is missing
+    /// or unreadable. A replacement requiring rescue must return a usable
+    /// mark or an error; the executor must not upload after an error. `size`
+    /// is the incoming content length; transforming wrappers pass their
+    /// encoded length to the inner cloud so it chooses the actual upload
+    /// method's threshold. No default, like
     /// [`Cloud::children`]: a wrapper that didn't pass it on would lose the
     /// check without any test noticing.
     fn version_mark(

@@ -564,21 +564,24 @@ mod win {
         fn review_overflow(&self, s: &Status) {
             let Some(o) = s.overflow.as_ref().filter(|o| o.waiting) else { return };
             let size = |b: u64| oneup_app::versions::size(b);
-            let text = format!(
-                "{} files ({}) were deleted in OneDrive. Their copies don't fit in the space left for kept \
-                 copies ({}). They're still on this PC, untouched.\n\n\
-                 Yes: remove them here and keep copies anyway (over the limit).\n\
-                 No: remove them here without a copy (OneDrive's recycle bin has them for a while).\n\
-                 Cancel: decide later.",
-                o.count,
-                size(o.bytes),
-                size(o.room)
-            );
-            let answer = match self.icon.ask("OneUpDrive", &text, Kind::Warning, Buttons::YesNoCancel) {
-                Reply::Yes => Answer::Keep,
-                Reply::No => {
-                    let sure = format!("Remove {} files from this PC without keeping a copy?", o.count);
-                    if self.icon.ask("OneUpDrive", &sure, Kind::Warning, Buttons::YesNo) != Reply::Yes {
+            let text = super::overflow_text(o.count, &size(o.bytes), &size(o.room));
+            const KEEP: i32 = 100;
+            const DISCARD: i32 = 101;
+            const LATER: i32 = 102;
+            let choices = [
+                (KEEP, "Keep copies\nRemove them here and keep copies, over the limit."),
+                (DISCARD, "Remove without copies\nOneDrive's recycle bin has them for a while."),
+                (LATER, "Not now\nNothing changes. Review later from this icon."),
+            ];
+            // Enter, Esc and closing the dialog all decide later.
+            let answer = match self.icon.choose("OneUpDrive", &text, Kind::Warning, &choices, LATER) {
+                Some(KEEP) => Answer::Keep,
+                Some(DISCARD) => {
+                    const REMOVE: i32 = 100;
+                    const CANCEL: i32 = 101;
+                    let sure = super::discard_question(o.count);
+                    let choices = [(REMOVE, "Remove"), (CANCEL, "Cancel")];
+                    if self.icon.choose("OneUpDrive", &sure, Kind::Warning, &choices, CANCEL) != Some(REMOVE) {
                         return;
                     }
                     Answer::Discard
@@ -753,5 +756,49 @@ mod win {
         if let Some(f) = failure {
             publish(shared, waker, |sh| sh.failure = Some(f));
         }
+    }
+}
+
+/// The question for removed files that don't fit in the space for kept
+/// copies: `count` files of `bytes`, with `room` left.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn overflow_text(count: usize, bytes: &str, room: &str) -> String {
+    if count == 1 {
+        format!(
+            "1 file ({bytes}) was deleted in OneDrive. Its copy doesn't fit in the space left for kept \
+             copies ({room}). It's still on this PC, untouched."
+        )
+    } else {
+        format!(
+            "{count} files ({bytes}) were deleted in OneDrive. Their copies don't fit in the space left for \
+             kept copies ({room}). They're still on this PC, untouched."
+        )
+    }
+}
+
+/// The second question before removing them without a copy.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn discard_question(count: usize) -> String {
+    if count == 1 {
+        "Remove 1 file from this PC without keeping a copy?".to_string()
+    } else {
+        format!("Remove {count} files from this PC without keeping a copy?")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{discard_question, overflow_text};
+
+    #[test]
+    fn the_overflow_questions_count_files_in_plain_words() {
+        let one = overflow_text(1, "2 KB", "0 B");
+        assert!(one.starts_with("1 file (2 KB) was deleted") && one.contains("It's still on this PC"), "{one}");
+        let many = overflow_text(3, "9 MB", "1 MB");
+        assert!(many.starts_with("3 files (9 MB) were deleted") && many.contains("(1 MB)"), "{many}");
+        // The buttons say what each choice does: no Yes/No mapping in the text.
+        assert!(!one.contains("Yes:") && !many.contains("No:"));
+        assert_eq!(discard_question(1), "Remove 1 file from this PC without keeping a copy?");
+        assert_eq!(discard_question(4), "Remove 4 files from this PC without keeping a copy?");
     }
 }

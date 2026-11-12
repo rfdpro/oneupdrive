@@ -38,6 +38,12 @@ OneUpDrive tries again by itself after a minute, then waits twice as long each t
 
 ## The problems
 
+### An upload is waiting for OneDrive's version history
+
+Before replacing a large file in OneDrive, OneUpDrive checks its version history so it can keep an edit made during the upload. If OneDrive cannot provide that history yet, the upload waits and is retried automatically. Other files continue syncing.
+
+**What to do:** wait for the next retry, or select **Retry now**. The existing file in OneDrive stays unchanged while the upload waits.
+
 ### A deleted folder remains in OneDrive
 
 OneUpDrive removes a folder from OneDrive only when it is empty. Excluded files can keep it there; `oneup unsynced` lists the folder as not empty. It waits for a change to that folder, even while other files are being retried. Review what remains on the OneDrive website before deleting it there. OneUpDrive picks up that deletion through OneDrive's change feed.

@@ -123,7 +123,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// ([`Ops::wipe_pending`]).
 pub const WIPE_PREFIX: &str = "vault.wipe";
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -775,7 +775,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 28] = [
+    let steps: [(i64, String); 29] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -804,6 +804,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         (26, initial::MIGRATE_V26.into()),
         (27, usage::MIGRATE_V27.into()),
         (28, synced::MIGRATE_V28.into()),
+        (
+            29,
+            "CREATE INDEX IF NOT EXISTS remote_item_ascii_name ON remote_item(parent_id, name COLLATE NOCASE);".into(),
+        ),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -936,6 +940,10 @@ const PENDING_COUNT: &str = "SELECT count(*) FROM enum_unit WHERE state = 0";
 /// can't match: that cheap check spares folding most names.
 fn remote_named_sql() -> String {
     format!("SELECT {ITEM_COLS} FROM remote_item WHERE parent_id = ?1 AND length(name) = ?2 AND oneup_fold(name) = ?3")
+}
+
+fn remote_ascii_named_sql() -> String {
+    format!("SELECT {ITEM_COLS} FROM remote_item WHERE parent_id = ?1 AND name = ?2 COLLATE NOCASE ORDER BY id LIMIT 1")
 }
 
 /// A name's length as SQLite's `length()` counts it: in characters.
@@ -1285,6 +1293,18 @@ impl Ops<'_> {
         let params = rusqlite::params![parent_id, char_count(name), oneup_sync::fold(name)];
         let rows = st.query_map(params, RemoteRow::from_row)?;
         rows.map(|r| fix_kind(r?)).collect()
+    }
+
+    /// First child by ID whose name matches with ASCII case folding.
+    /// Uses both columns of the name index, even in very wide folders.
+    /// For ASCII storage names, not Windows' Unicode name comparison.
+    pub fn remote_ascii_named(&self, parent_id: &str, name: &str) -> Result<Option<RemoteRow>> {
+        let row = self
+            .c
+            .prepare_cached(&remote_ascii_named_sql())?
+            .query_row(params![parent_id, name], RemoteRow::from_row)
+            .optional()?;
+        row.map(fix_kind).transpose()
     }
 
     /// Calls `f(id, name, is_excluded)` for every stored folder.
@@ -1980,8 +2000,46 @@ mod tests {
             let plan: Vec<String> =
                 st.query_map(rusqlite::params_from_iter(nulls), |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
             assert!(!plan.iter().any(|step| step.starts_with("SCAN")), "{sql}\n{plan:#?}");
-            assert!(plan.iter().any(|step| step.contains("_parent")), "{sql}\n{plan:#?}");
+            // SQLite may use the parent prefix of the ASCII-name index too.
+            assert!(plan.iter().any(|step| step.contains("(parent_id=?)")), "{sql}\n{plan:#?}");
         }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn ascii_storage_lookup_seeks_both_index_columns() {
+        let mut s = Store::open_in_memory().unwrap();
+        // Exercise upgrading an existing mirror as well as fresh creation.
+        s.conn.execute_batch("DROP INDEX remote_item_ascii_name; PRAGMA user_version = 28;").unwrap();
+        migrate(&mut s.conn).unwrap();
+        s.write(|o| {
+            for i in 0..10_000 {
+                o.upsert_item(&row(&format!("z{i:05}"), Some("p"), &format!("HASH{i:05}"), Kind::Folder), false)?;
+            }
+            o.upsert_item(&row("a", Some("p"), "AbC234", Kind::File), false)?;
+            o.upsert_item(&row("b", Some("p"), "aBc234", Kind::Folder), false)?;
+            o.upsert_item(&row("c", Some("q"), "ABC234", Kind::Folder), false)?;
+            o.upsert_item(&row("unicode", Some("p"), "\u{212a}", Kind::Folder), false)?;
+            Ok(())
+        })
+        .unwrap();
+        let sql = remote_ascii_named_sql();
+        let mut plan = s.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let detail: Vec<String> = plan.query_map(["p", "abc234"], |r| r.get(3)).unwrap().map(|r| r.unwrap()).collect();
+        assert!(
+            detail.iter().any(|s| s.contains("remote_item_ascii_name") && s.contains("parent_id=? AND name=?")),
+            "{detail:?}"
+        );
+        assert!(!detail.iter().any(|s| s.contains("SCAN") || s.contains("TEMP B-TREE")), "{detail:?}");
+        for name in ["abc234", "missing"] {
+            let mut st = s.conn.prepare(&sql).unwrap();
+            let found = st.query_row(["p", name], RemoteRow::from_row).optional().unwrap();
+            assert!(st.get_status(rusqlite::StatementStatus::VmStep) < 100, "lookup visited siblings");
+            assert_eq!(found.is_some(), name == "abc234");
+        }
+        let first = s.read(|o| o.remote_ascii_named("p", "ABC234")).unwrap().unwrap();
+        assert_eq!((first.id.as_str(), first.kind), ("a", Kind::File), "kind must not change first-match selection");
+        assert!(s.read(|o| o.remote_ascii_named("p", "k")).unwrap().is_none(), "ASCII folding only");
     }
 
     /// Names match as the planner compares them: per character, through
