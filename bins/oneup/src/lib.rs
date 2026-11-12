@@ -62,6 +62,8 @@ pub mod rewind;
 pub mod rulefiles;
 pub mod safetywindow;
 pub mod search;
+#[cfg(windows)]
+pub mod settings_vault;
 pub mod settingsapi;
 pub mod setup;
 pub mod setup_preview;

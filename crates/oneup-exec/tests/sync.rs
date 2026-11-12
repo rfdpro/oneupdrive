@@ -79,6 +79,10 @@ struct State {
     replaced: BTreeMap<String, u64>,
     /// Versions in the history can't be downloaded (a service error).
     versions_fail: bool,
+    /// The pre-upload version lookup failed, before any replacement is safe.
+    mark_fails: bool,
+    /// Graph may omit hashes, including after a metadata-only move.
+    omit_hashes: bool,
     /// Each file's version history, newest first: its versions' IDs (the
     /// eTag each content got), times and sizes. A rename moves the current
     /// version's time, as Graph's does (measured).
@@ -189,7 +193,7 @@ impl State {
             kind,
             size: it.content.len() as i64,
             etag: Some(it.etag.to_string()),
-            qxh: (!it.folder).then(|| qxh(&it.content)),
+            qxh: (!it.folder && !self.omit_hashes).then(|| qxh(&it.content)),
             mtime_ms: None,
         }
     }
@@ -833,6 +837,9 @@ impl Cloud for Fake {
     async fn version_mark(&self, pre: &RemotePre, _: i64) -> Result<Option<VersionMark>, CloudError> {
         self.exchange(|| -> Result<Option<VersionMark>, CloudError> {
             let s = self.0.lock().unwrap();
+            if s.mark_fails {
+                return Err(CloudError::Other("OneDrive's version history is unavailable".into()));
+            }
             s.check(pre)?;
             let newest = s.history.get(&pre.id.0).and_then(|h| h.first()).copied();
             Ok(newest.map(|(t, at, size)| VersionMark { id: t.to_string(), modified_ms: Some(at), size: Some(size) }))
@@ -1988,6 +1995,71 @@ async fn a_kept_edit_takes_the_first_conflict_name_not_taken() {
     assert_eq!(kept, ["notes (conflict 3).txt"]);
     s.settle().await;
     assert_eq!(cloud.tree()["/notes (conflict 3).txt"].as_deref(), Some(&b"theirs"[..]));
+}
+
+#[tokio::test]
+async fn a_cloud_move_keeps_a_hashless_cloud_edit_pending() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("move-hashless-edit", cloud.clone());
+    write(&s.p("notes.txt"), b"before");
+    s.settle().await;
+    cloud.edit("notes.txt", b"cloud!");
+    cloud.0.lock().unwrap().omit_hashes = true;
+    std::fs::rename(s.p("notes.txt"), s.p("renamed.txt")).unwrap();
+    let first = s.round().await;
+    assert!(first.done.iter().any(|op| matches!(op, Op::MoveRemote { .. })), "{first:?}");
+    let second = s.round().await;
+    assert!(
+        second.done.iter().any(|op| matches!(op, Op::Download { .. })),
+        "the move must not acknowledge undownloaded content: {second:?}"
+    );
+    assert_eq!(std::fs::read(s.p("renamed.txt")).unwrap(), b"cloud!");
+    s.settle().await;
+}
+
+#[tokio::test]
+async fn a_replacement_without_a_rescue_requirement_still_uploads() {
+    let cloud = Fake::new();
+    let mut s = Sync::new("mark-not-needed", cloud.clone());
+    write(&s.p("notes.txt"), b"before");
+    s.settle().await;
+    // This fake commits atomically under its precondition: no history
+    // means version_mark returns Ok(None), so no rescue is applicable.
+    cloud.0.lock().unwrap().history.clear();
+    write(&s.p("notes.txt"), b"after!");
+    s.settle().await;
+    assert_eq!(cloud.tree()["/notes.txt"].as_deref(), Some(&b"after!"[..]));
+}
+
+#[tokio::test]
+async fn a_replacement_waits_for_its_version_mark_and_records_it_before_upload() {
+    let cloud = Fake::new();
+    let mut s = Sync::on_disk("mark-waits", cloud.clone());
+    write(&s.p("notes.txt"), b"before");
+    s.settle().await;
+    write(&s.p("notes.txt"), b"after!");
+    cloud.0.lock().unwrap().mark_fails = true;
+    let before = cloud.0.lock().unwrap().uploaded;
+    let r = s.attempt().await;
+    assert_eq!(cloud.0.lock().unwrap().uploaded, before, "a failed history lookup must not upload: {r:?}");
+    assert!(!r.failed.is_empty(), "the reason must be reported: {r:?}");
+
+    cloud.0.lock().unwrap().mark_fails = false;
+    // The agent retries failed items by marking their folders again.
+    s.stops.full_next = true;
+    // Crash immediately after the durable intent and before the upload.
+    s.exec.crash_after(Some(0));
+    let r = s.attempt().await;
+    assert_eq!(r.halted.as_deref(), Some(CRASHED), "{r:?}");
+    assert_eq!(cloud.0.lock().unwrap().uploaded, before);
+    let records = s.obs.store().read(|o| o.meta_under("exec.rescue")).unwrap();
+    assert_eq!(records.len(), 1, "the intent precedes the upload");
+    let mut s = s.restart();
+    assert_eq!(s.obs.store().read(|o| o.meta_under("exec.rescue")).unwrap(), records);
+    s.stops.full_next = true;
+    s.settle().await;
+    assert_eq!(cloud.tree()["/notes.txt"].as_deref(), Some(&b"after!"[..]));
+    assert!(cloud.0.lock().unwrap().uploaded > before);
 }
 
 /// An edit an upload went over that can't be kept as a new file yet (its

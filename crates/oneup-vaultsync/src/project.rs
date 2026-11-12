@@ -8,7 +8,7 @@
 //! are in the storage folder `d/XX/…` named after the folder's ID, each
 //! entry's name decrypts with that ID, and a folder's ID is in its
 //! `dir.c9r`. The small files (`dir.c9r`, a long name's `name.c9s`) are
-//! read once per version and kept in a [`Cache`].
+//! kept in a bounded [`Cache`]; an evicted file is read again when needed.
 //!
 //! Cost: the walk reads the vault's part of the cloud listing, one row per
 //! encrypted item, every time it runs (the agent runs it when a round
@@ -34,28 +34,86 @@ use crate::{Error, Node, NodeKind, Nodes, Result, Vault};
 pub trait Source: Send + Sync {
     /// The listed children of a cloud folder.
     fn children(&self, id: &str) -> Result<Vec<RemoteRow>>;
+    /// First child by ID matching an ASCII storage name, ignoring ASCII case.
+    /// Must look up the name directly rather than listing its siblings.
+    fn child_named(&self, parent: &str, name: &str) -> Result<Option<RemoteRow>>;
     /// A listed item.
     fn item(&self, id: &str) -> Result<Option<RemoteRow>>;
     /// The content of a small file (at most a few KiB).
     fn fetch(&self, item: &RemoteRow) -> impl Future<Output = Result<Vec<u8>>> + Send;
 }
 
-/// Small files already read, by (item ID, eTag).
-#[derive(Debug, Default)]
-pub struct Cache(HashMap<(String, String), String>);
+/// Small files already read, at most one version per item ID. FIFO eviction
+/// bounds both entry overhead and retained string allocations across refreshes.
+#[derive(Debug)]
+pub struct Cache {
+    entries: HashMap<String, Cached>,
+    order: VecDeque<String>,
+    bytes: usize,
+    entry_limit: usize,
+    byte_limit: usize,
+}
+
+#[derive(Debug)]
+struct Cached {
+    etag: String,
+    text: String,
+    bytes: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self::with_limits(4096, 2 * 1024 * 1024)
+    }
+}
 
 impl Cache {
-    async fn text(&mut self, src: &impl Source, item: &RemoteRow, max: usize) -> Result<String> {
-        let key = (item.id.clone(), item.etag.clone().unwrap_or_default());
-        if let Some(t) = self.0.get(&key) {
-            return Ok(t.clone());
+    fn with_limits(entry_limit: usize, byte_limit: usize) -> Self {
+        Self { entries: HashMap::new(), order: VecDeque::new(), bytes: 0, entry_limit, byte_limit }
+    }
+
+    fn insert(&mut self, id: &str, etag: &str, text: &str) {
+        let etag = etag.to_owned();
+        let text = text.to_owned();
+        if let Some(old) = self.entries.get_mut(id) {
+            // Replacing a version keeps its FIFO position and both ID strings.
+            let ids = old.bytes - old.etag.capacity() - old.text.capacity();
+            self.bytes -= old.bytes;
+            *old = Cached { bytes: ids + etag.capacity() + text.capacity(), etag, text };
+            self.bytes += old.bytes;
+        } else {
+            let key = id.to_owned();
+            let queued = id.to_owned();
+            let bytes = key.capacity() + queued.capacity() + etag.capacity() + text.capacity();
+            self.entries.insert(key, Cached { etag, text, bytes });
+            self.order.push_back(queued);
+            self.bytes += bytes;
         }
+        while self.entries.len() > self.entry_limit || self.bytes > self.byte_limit {
+            let Some(id) = self.order.pop_front() else { break };
+            if let Some(old) = self.entries.remove(&id) {
+                self.bytes -= old.bytes;
+            }
+        }
+    }
+
+    async fn text(&mut self, src: &impl Source, item: &RemoteRow, max: usize) -> Result<String> {
         if item.size > max as i64 {
             return Err(Error::Fetch(format!("{} is too big", item.name)));
         }
+        let etag = item.etag.as_deref().unwrap_or_default();
+        if let Some(cached) = self.entries.get(&item.id).filter(|c| c.etag == etag) {
+            if cached.text.len() > max {
+                return Err(Error::Fetch(format!("{} is too big", item.name)));
+            }
+            return Ok(cached.text.clone());
+        }
         let bytes = src.fetch(item).await?;
+        if bytes.len() > max {
+            return Err(Error::Fetch(format!("{} is too big", item.name)));
+        }
         let text = String::from_utf8(bytes).map_err(|_| Error::Fetch(format!("{} isn't text", item.name)))?;
-        self.0.insert(key, text.clone());
+        self.insert(&item.id, etag, &text);
         Ok(text)
     }
 }
@@ -81,10 +139,10 @@ fn storage(src: &impl Source, vault: &Vault, d: Option<&RemoteRow>, dir_id: &str
     let path = names::dir_path(&vault.key, dir_id)?;
     let mut parts = path.split('/').skip(1); // "d"
     let (Some(a), Some(b)) = (parts.next(), parts.next()) else { return Ok(None) };
-    let Some(first) = named(&src.children(&d.id)?, a).filter(|r| r.kind == Kind::Folder).cloned() else {
+    let Some(first) = src.child_named(&d.id, a)?.filter(|r| r.kind == Kind::Folder) else {
         return Ok(None);
     };
-    Ok(named(&src.children(&first.id)?, b).filter(|r| r.kind == Kind::Folder).map(|r| r.id.clone()))
+    Ok(src.child_named(&first.id, b)?.filter(|r| r.kind == Kind::Folder).map(|r| r.id))
 }
 
 /// Works out the decrypted view (see the module docs).
@@ -187,8 +245,8 @@ pub async fn project(src: &impl Source, vault: &Vault, cache: &mut Cache) -> Res
     Ok(out)
 }
 
-/// Checks the vault's keys against its configuration (read once per
-/// version), and that names are still shortened as this pair stores them.
+/// Checks the vault's keys against its configuration, and that names are
+/// still shortened as this pair stores them.
 async fn check_keys(src: &impl Source, vault: &Vault, cache: &mut Cache, top: &[RemoteRow]) -> Result<()> {
     let item = named(top, config::FILE)
         .filter(|r| r.kind == Kind::File)
@@ -316,4 +374,103 @@ pub fn apply(store: &mut Store, src: &impl Source, p: &Projection) -> Result<App
         Ok(())
     })?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod cache_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TextSource(AtomicUsize);
+
+    impl Source for TextSource {
+        fn children(&self, _: &str) -> Result<Vec<RemoteRow>> {
+            unreachable!()
+        }
+        fn child_named(&self, _: &str, _: &str) -> Result<Option<RemoteRow>> {
+            unreachable!()
+        }
+        fn item(&self, _: &str) -> Result<Option<RemoteRow>> {
+            unreachable!()
+        }
+        async fn fetch(&self, item: &RemoteRow) -> Result<Vec<u8>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(item.etag.as_deref().unwrap_or_default().as_bytes().to_vec())
+        }
+    }
+
+    fn item(id: &str, version: &str) -> RemoteRow {
+        RemoteRow {
+            id: id.into(),
+            parent_id: None,
+            name: "dir.c9r".into(),
+            kind: Kind::File,
+            size: version.len() as i64,
+            etag: Some(version.into()),
+            qxh: None,
+            mtime_ms: None,
+        }
+    }
+
+    fn bounded(c: &Cache) {
+        assert!(c.entries.len() <= c.entry_limit);
+        assert!(c.bytes <= c.byte_limit);
+        assert_eq!(c.order.len(), c.entries.len());
+        assert_eq!(c.bytes, c.entries.values().map(|v| v.bytes).sum::<usize>());
+    }
+
+    #[tokio::test]
+    async fn versions_replace_in_place_and_eviction_refetches_correct_text() {
+        let src = TextSource(AtomicUsize::new(0));
+        let mut c = Cache::with_limits(2, 1024);
+        for v in 0..1000 {
+            let version = v.to_string();
+            assert_eq!(c.text(&src, &item("a", &version), 64).await.unwrap(), version);
+            bounded(&c);
+            assert_eq!(c.entries.len(), 1);
+        }
+        assert_eq!(src.0.load(Ordering::Relaxed), 1000);
+        assert_eq!(c.text(&src, &item("a", "999"), 64).await.unwrap(), "999");
+        assert_eq!(src.0.load(Ordering::Relaxed), 1000, "current version is cached");
+        for id in ["b", "c"] {
+            c.text(&src, &item(id, id), 64).await.unwrap();
+            bounded(&c);
+        }
+        assert!(!c.entries.contains_key("a"), "oldest entry evicted");
+        assert_eq!(c.text(&src, &item("a", "999"), 64).await.unwrap(), "999");
+        assert_eq!(src.0.load(Ordering::Relaxed), 1003);
+        bounded(&c);
+    }
+
+    #[test]
+    fn byte_budget_counts_ids_versions_and_content_and_handles_oversized_entries() {
+        let mut c = Cache::with_limits(100, 100);
+        for i in 0..1000 {
+            c.insert(&i.to_string(), "version", &"x".repeat(40));
+            bounded(&c);
+            assert!(c.entries.len() < 3, "byte limit, not entry limit, evicts");
+        }
+        c.insert("999", "replacement", &"x".repeat(200));
+        bounded(&c);
+        assert!(c.entries.is_empty());
+        for i in 0..1000 {
+            c.insert("same", &i.to_string(), "text");
+            bounded(&c);
+            assert_eq!(c.entries.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetched_and_cached_text_obey_the_callers_size_limit() {
+        let src = TextSource(AtomicUsize::new(0));
+        let mut c = Cache::default();
+        let mut r = item("a", "too long");
+        r.size = 1;
+        assert!(c.text(&src, &r, 2).await.is_err(), "actual response size checked");
+        assert!(c.entries.is_empty());
+        assert_eq!(c.text(&src, &r, 64).await.unwrap(), "too long");
+        assert!(c.text(&src, &r, 2).await.is_err(), "cache hit size checked too");
+        bounded(&c);
+    }
 }

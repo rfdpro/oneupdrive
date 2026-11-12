@@ -16,6 +16,47 @@ use oneup_vault::folder::{Dir, Folder};
 use oneup_vaultsync::{Source, apply, project};
 
 #[tokio::test]
+async fn projection_looks_up_hash_paths_without_listing_buckets() {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Indexed<'a> {
+        inner: &'a common::Listing,
+        buckets: HashSet<String>,
+        lookups: AtomicUsize,
+    }
+    impl Source for Indexed<'_> {
+        fn children(&self, id: &str) -> oneup_vaultsync::Result<Vec<RemoteRow>> {
+            assert!(!self.buckets.contains(id), "hash buckets must not be listed");
+            self.inner.children(id)
+        }
+        fn child_named(&self, parent: &str, name: &str) -> oneup_vaultsync::Result<Option<RemoteRow>> {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            self.inner.child_named(parent, name)
+        }
+        fn item(&self, id: &str) -> oneup_vaultsync::Result<Option<RemoteRow>> {
+            self.inner.item(id)
+        }
+        async fn fetch(&self, item: &RemoteRow) -> oneup_vaultsync::Result<Vec<u8>> {
+            self.inner.fetch(item).await
+        }
+    }
+    let mut s = setup();
+    s.refresh().await;
+    for i in 0..64 {
+        s.vc.mkdir(&RemoteId(s.vault.root.clone()), &format!("folder{i}")).await.unwrap();
+    }
+    s.refresh().await;
+    let d = s.src.children(&s.vault.root).unwrap().into_iter().find(|r| r.name == "d").unwrap();
+    let mut buckets: HashSet<String> = s.src.children(&d.id).unwrap().into_iter().map(|r| r.id).collect();
+    buckets.insert(d.id);
+    let src = Indexed { inner: &s.src, buckets, lookups: AtomicUsize::new(0) };
+    let p = project(&src, &s.vault, &mut Default::default()).await.unwrap();
+    assert_eq!(p.rows.len(), 65);
+    assert!(p.problems.is_empty());
+    assert_eq!(src.lookups.load(Ordering::Relaxed), 2 * 65);
+}
+
+#[tokio::test]
 async fn a_vault_kept_through_the_vault_cloud_is_a_valid_cryptomator_vault() {
     let mut s = setup();
     s.refresh().await;

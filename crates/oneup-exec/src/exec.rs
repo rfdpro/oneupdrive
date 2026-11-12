@@ -1619,7 +1619,12 @@ impl<C: Cloud> Executor<C> {
                         let Some(mut b) = o.synced_get(*sid)? else { return Err(Fail::Skip(Skip::Changed)) };
                         b.parent = Some(*parent);
                         b.name.clone_from(name);
-                        b.remote_etag = row.etag.clone().unwrap_or_default();
+                        // A move acknowledges location, not an outstanding
+                        // content edit. Preserve its agreed eTag unless the
+                        // returned content is proved to match the baseline.
+                        if b.kind == NodeKind::Folder || (b.hash.is_some() && b.hash == row.qxh && b.size == row.size) {
+                            b.remote_etag = row.etag.clone().unwrap_or_default();
+                        }
                         if renewed {
                             b.remote = Some(RemoteId(row.id.clone()));
                         }
@@ -1925,10 +1930,8 @@ impl<C: Cloud> Executor<C> {
                     Some(o) => (o.size, o.mtime),
                     None => return Err(Fail::Skip(Skip::Changed)),
                 };
-                let (row, sent, sent_len, mark) = match self
-                    .copy_instead(store, &mut src, size, to, name, replace.is_none())
-                    .await?
-                {
+                let copied = self.copy_instead(store, &mut src, size, to, name, replace.is_none()).await?;
+                let (row, sent, sent_len, mark) = match copied {
                     Some((row, hash)) => {
                         notes.copied = true;
                         (row, hash, u64::try_from(size).unwrap_or(0), None)
@@ -1936,16 +1939,7 @@ impl<C: Cloud> Executor<C> {
                     None => {
                         // What the replacement goes over, to check afterwards.
                         let mark = match replace {
-                            Some(pre) => match self.cloud.version_mark(pre, size).await {
-                                Ok(mark) => mark,
-                                Err(CloudError::Changed) => return Err(Fail::Skip(Skip::Changed)),
-                                // Not a reason to hold the upload: the eTag is
-                                // still checked before it commits.
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "a file's version history couldn't be read before its upload");
-                                    None
-                                }
-                            },
+                            Some(pre) => self.cloud.version_mark(pre, size).await?,
                             None => None,
                         };
                         // Written ahead, durably: whatever happens from here
@@ -2923,7 +2917,9 @@ fn record_moved(o: &Ops<'_>, old: &str, row: &RemoteRow) -> Res {
     o.upsert_item(row, excluded)?;
     if let Some(mut b) = o.synced_by_remote(old)?.or(o.synced_by_remote(&row.id)?) {
         b.remote = Some(RemoteId(row.id.clone()));
-        b.remote_etag = row.etag.clone().unwrap_or_default();
+        if b.kind == NodeKind::Folder || (b.hash.is_some() && b.hash == row.qxh && b.size == row.size) {
+            b.remote_etag = row.etag.clone().unwrap_or_default();
+        }
         o.synced_put(&b)?;
     }
     Ok(())
@@ -3107,6 +3103,31 @@ mod tests {
 
     fn rpre(id: &str) -> RemotePre {
         RemotePre { id: RemoteId(id.into()), etag: "e".into() }
+    }
+
+    #[test]
+    fn a_multipart_move_only_acknowledges_verified_content() {
+        for (hash, size, expected) in [(None, 1, "e"), (Some([7; 20]), 2, "e"), (Some([7; 20]), 1, "moved")] {
+            let mut store = Store::open_in_memory().unwrap();
+            let (_, a, _) = tree(&mut store);
+            store
+                .write(|o| {
+                    let mut base = o.synced_get(a)?.unwrap();
+                    base.hash = Some([7; 20]);
+                    o.synced_put(&base)?;
+                    let row = RemoteRow {
+                        etag: Some("moved".into()),
+                        qxh: hash,
+                        size,
+                        ..remote("ra", Some("rx"), "renamed.txt", Kind::File)
+                    };
+                    record_moved(o, "ra", &row).unwrap_or_else(|e| panic!("{}", fail_text(&e)));
+                    assert_eq!(o.synced_get(a)?.unwrap().remote_etag, expected);
+                    assert_eq!(o.get_item("ra")?.unwrap().etag.as_deref(), Some("moved"));
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     fn upload(id: u128, x: Sid, name: &str) -> Op {

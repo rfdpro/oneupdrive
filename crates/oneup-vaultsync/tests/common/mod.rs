@@ -208,6 +208,9 @@ pub struct Listing {
 }
 
 impl Source for Listing {
+    fn child_named(&self, parent: &str, name: &str) -> oneup_vaultsync::Result<Option<RemoteRow>> {
+        Ok(self.store.lock().unwrap().read(|o| o.remote_ascii_named(parent, name))?)
+    }
     fn children(&self, id: &str) -> oneup_vaultsync::Result<Vec<RemoteRow>> {
         let s = self.store.lock().unwrap();
         Ok(s.read(|o| o.remote_children(id))?.into_iter().map(|(r, _)| r).collect())

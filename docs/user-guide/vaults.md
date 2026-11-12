@@ -12,7 +12,13 @@ A **vault** is a folder whose files are encrypted on your PC before they reach O
 * **Your password is the key.** Forget it, and only the vault's **recovery key** (below) can open it again: not OneUpDrive, not Cryptomator, not Microsoft. Write the password down somewhere safe, and keep the recovery key too.
 
 ## Creating a vault
-In the settings window, **Files → Add → Create an encrypted vault**: a new folder in OneDrive, a new or empty folder on this PC, and a password (twice). OneUpDrive makes the vault in OneDrive and immediately selects its new tab on the **Files** page. It starts syncing and shows its **recovery key**. From the command line: `oneup vault new /Private C:\Users\me\Private`.
+In the settings window, select **Files → Add → Create an encrypted vault**. Choose **Vault location (on OneDrive)** with **Browse**, or enter a path such as `/Private`. Choose an empty folder, or open its parent and enter a **New folder name**. Browsing creates nothing.
+
+Enter a **Password** twice. **Always keep vault files on this PC (Cloud backup remains encrypted)** downloads and keeps every file decrypted here. Leave it off to download files when apps open them.
+
+The **Decrypted folder on this PC** is selected automatically: a new folder in your Windows user folder, named after the vault and outside synced folders. Review the path, or use its **Browse** button to choose a new or empty folder elsewhere. If a safe suggestion isn't available, choose the folder yourself. Nothing is created on this PC until you submit the form.
+
+Select **Create**. OneUpDrive makes the vault in OneDrive and immediately selects its new tab on the **Files** page. It starts syncing and shows its **recovery key**. From the command line: `oneup vault new /Private C:\Users\me\Private`.
 
 The new vault is a standard Cryptomator vault: Cryptomator's apps on your phone or another computer open it with the same password.
 
@@ -29,7 +35,7 @@ On the vault's tab, **Unlock with Windows Hello** lets your face, fingerprint or
 ## Syncing a vault with a folder on this PC
 OneUpDrive shows a vault in OneDrive as an ordinary folder on your PC, with its real file names. Programs open and save files there as usual: OneUpDrive decrypts what they open and encrypts what they save. You don't need Cryptomator on this PC.
 
-In the settings window, **Files → Add → Add an existing vault**: the vault's folder in OneDrive, an empty folder on this PC, the password, and whether to keep every file decrypted here. OneUpDrive immediately selects the vault's new tab on the **Files** page, with **Unlock…**, **Lock** and **Stop syncing…**.
+In the settings window, select **Files → Add → Add an existing vault**. Browse to the **Vault location (on OneDrive)** containing `vault.cryptomator`, then enter its **Password**. Review the automatically selected **Decrypted folder on this PC**, or choose a new or empty folder with **Browse**. Select **Always keep vault files on this PC (Cloud backup remains encrypted)** to keep every file decrypted here. Select **Add**. OneUpDrive immediately selects the vault's new tab on the **Files** page, with **Unlock…**, **Lock** and **Stop syncing…**.
 
 If syncing can't start after creating or adding a vault, its tab stays in the list as **locked**. Use **Unlock…** to try again. A new vault's recovery key is still shown.
 

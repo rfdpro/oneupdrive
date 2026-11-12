@@ -2155,6 +2155,46 @@ fn lid(w: &World, name: &str) -> u128 {
 }
 
 #[test]
+fn a_shared_rename_keeps_a_hashless_cloud_edit_pending() {
+    let mut w = synced();
+    let (l, r) = (lid(&w, "doc.txt"), rid(&w, "doc.txt"));
+    w.local.get_mut(&l).unwrap().name = "renamed.txt".into();
+    let etag = w.etag();
+    let remote = w.remote.get_mut(&r).unwrap();
+    remote.name = "renamed.txt".into();
+    remote.content += 3; // size_of remains the same; content differs.
+    remote.etag = etag;
+    for flow in [Flow::TwoWay, Flow::Backup] {
+        let mut store = store_of(&w);
+        store
+            .write(|o| {
+                let mut row = o.get_item(&r)?.unwrap();
+                row.qxh = None;
+                o.upsert_item(&row, false)
+            })
+            .unwrap();
+        let first = store.read(|o| plan_flow(o, all_folders(o)?, flow)).unwrap();
+        let record = first
+            .iter()
+            .find_map(|op| match op {
+                Op::Record(b) if b.remote.as_ref() == Some(&RemoteId(r.clone())) => Some(b),
+                _ => None,
+            })
+            .expect("first round records the shared location");
+        assert_eq!(record.name, "renamed.txt");
+        store.write(|o| o.synced_put(record)).unwrap();
+        let second = store.read(|o| plan_flow(o, all_folders(o)?, flow)).unwrap();
+        assert!(
+            second.iter().any(|op| match flow {
+                Flow::TwoWay => matches!(op, Op::Download { remote, .. } if remote.id.0 == r),
+                Flow::Backup => matches!(op, Op::Upload { replace: Some(remote), .. } if remote.id.0 == r),
+            }),
+            "{flow:?}: the unagreed content must still be transferred: {second:?}"
+        );
+    }
+}
+
+#[test]
 fn a_backup_sends_a_moved_and_edited_file_after_its_old_folder_was_deleted() {
     let mut w = synced();
     let (local_file, remote_file) = (lid(&w, "inner.txt"), rid(&w, "inner.txt"));

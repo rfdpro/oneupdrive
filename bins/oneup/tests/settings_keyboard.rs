@@ -77,6 +77,9 @@ const HOST_ANSWERS = {
   rewind_cancel: "", conflicts: [],
   cloud_bin: [{seq: 7, at_ms: 5000, path: "/Docs/gone.txt", folder: false, size: 3, restorable: true}],
   cloud_bin_restore: "/Docs/gone.txt",
+  vault_default_folder: a => "C:\\Users\\Test\\" + (a.remote.split(/[\\/]/).filter(Boolean).pop() || "Private") + " Vault",
+  cloud_folders: a => a.parent === "private" ? {parent:"private", folders:[], next:null}
+    : {parent:"drive", folders:[{id:"private",name:"Private"}], next:null},
   item_history: a => a.before ? [{seq: 1, at_ms: 1000, outcome: "done", action: "upload", path: "/Docs/old.txt", detail: "Older edit"}]
     : Array.from({length: 100}, (_, i) => ({seq: 101-i, at_ms: 5000, outcome: "done", action: "upload", path: "/Docs/a.txt", detail: "Saved edit"})),
   item_versions: {versions: [{id: "v1", modified_ms: 2000, size: 3, current: false}]},
@@ -88,7 +91,8 @@ window.chrome = {webview: {
     let v = HOST_ANSWERS[m.op];
     if (typeof v === "function") v = v(m.args);
     if (v === undefined) v = {};
-    Promise.resolve(v).then(answer => setTimeout(() => HOST_LISTENERS.forEach(f => f({data: {id: m.id, ok: answer}})), 1));
+    Promise.resolve(v).then(answer => setTimeout(() => HOST_LISTENERS.forEach(f => f({data:
+      answer instanceof Error ? {id: m.id, error: answer.message} : {id: m.id, ok: answer}})), 1));
   },
   addEventListener(type, f) { HOST_LISTENERS.push(f); }
 }};
@@ -235,6 +239,60 @@ const DRIVER: &str = r##"<script>
     check("Up from the first item wraps to the last", document.activeElement === st[st.length - 1], document.activeElement.textContent);
     document.querySelector("#st-menu").hidePopover(); await sleep(150);
     check("closing it gives focus back to its button", document.activeElement.id === "st-btn", at());
+
+    // A waiting safety stop: Review opens its list; where to decide follows
+    // the icon in the taskbar corner, by kind, and the window approves none.
+    const stopStatus = (stops, overflow = null) => ({activity: "WaitingForYou", paused: {local: false, remote: false},
+      safety_stops: stops, overflow, version: "0.0.0"});
+    const stopOf = (kind, code) => ({kind, code, side: "local", count: 3, at_least: false, recent: 0, synced_items: 50});
+    const menuItems = () => [...document.querySelectorAll("#st-actions button")].map(b => b.textContent);
+    const stDetail = () => document.querySelector("#st-detail").textContent;
+    HOST_ANSWERS.stops = a => [{code: "c1", header: "3 files on this PC no longer look like their type.",
+      rows: [{action: "upload", path: "/Docs/a.docx", to: null, note: ""}], matching: 1, unwritten: 0}];
+    snap.agent.tray_icon = true;
+    showStatus(stopStatus([stopOf("content", "c1")]));
+    check("a waiting stop offers Review first", menuItems()[0] === "Review", menuItems());
+    check("with the icon, decisions point to its menu", stDetail().includes("Decide from the icon's menu."), stDetail());
+    const callsBeforeReview = HOST_CALLS.length;
+    document.querySelector("#st-btn").click(); await sleep(100);
+    document.querySelector("#st-actions button").click(); await sleep(300);
+    check("Review opens Activity on Safety stops", document.querySelector("#lists").classList.contains("on")
+      && document.querySelector('#ls-tabs [data-tab="stops"]').getAttribute("aria-pressed") === "true"
+      && !document.querySelector("#st-menu").matches(":popover-open"), document.querySelector(".page.on").id);
+    check("Review only reads", HOST_CALLS.slice(callsBeforeReview).every(m => m.op !== "control"), JSON.stringify(HOST_CALLS.slice(callsBeforeReview).map(m => m.op)));
+    const lsSum = () => document.querySelector("#ls-sum").textContent;
+    check("with the icon, the list points to its menu", lsSum().includes("Decide from the icon's menu."), lsSum());
+    // The icon turned off: the status and the list say how without it.
+    document.querySelector('[data-agent="tray_icon"]').checked = false;
+    document.querySelector('[data-agent="tray_icon"]').dispatchEvent(new Event("change")); await sleep(200);
+    check("turning the icon off updates the status menu", !stDetail().includes("icon's menu") && stDetail().includes("Some edited files look encrypted."), stDetail());
+    const contentSays = lsSum();
+    check("without the icon, a content stop says check and rewind before approving", !contentSays.includes("icon's menu")
+      && contentSays.indexOf("Rewind puts their folder back") >= 0
+      && contentSays.indexOf("Rewind puts their folder back") < contentSays.indexOf("oneup approve c1")
+      && contentSays.includes("Only if you changed them yourself"), contentSays);
+    for (const [kind, says] of [["mass", "If you meant these changes: oneup approve c1"], ["removal", "on the Files page, Duplicates."],
+        ["rewind", "Approve the rewind on the Recovery page."]]) {
+      showStatus(stopStatus([stopOf(kind, "c1")]));
+      await loadList(false);
+      check("without the icon, a " + kind + " stop says how to answer it", lsSum().includes(says) && !lsSum().includes("icon's menu")
+        && (kind === "mass" || !lsSum().includes("oneup approve")), lsSum());
+    }
+    // Kind not known yet: the content guard's header still says check first; nothing else offers approving.
+    showStatus(stopStatus([]));
+    await loadList(false);
+    check("a stop whose kind isn't known yet never offers approving blindly", lsSum().includes("Rewind puts their folder back")
+      && lsSum().indexOf("Rewind puts their folder back") < lsSum().indexOf("oneup approve c1"), lsSum());
+    HOST_ANSWERS.stops = [{code: "u1", header: "Something waits.", rows: [], matching: 0, unwritten: 0}];
+    await loadList(false);
+    check("an unknown stop without a header to go by offers no approval", !lsSum().includes("oneup approve"), lsSum());
+    showStatus(stopStatus([], {count: 2, bytes: 10, room: 0, code: "o1", waiting: true}));
+    check("without the icon, removed files that don't fit name the commands", stDetail().includes("oneup keep o1") && stDetail().includes("oneup discard o1")
+      && !menuItems().includes("Review"), stDetail());
+    snap.agent.tray_icon = true;
+    document.querySelector('[data-agent="tray_icon"]').checked = true;
+    showStatus(null);
+    show("files"); await sleep(200);
 
     // Settings, at the foot of the list: its pages replace the list, and Back returns.
     const before = document.querySelector(".page.on").id;
@@ -457,15 +515,134 @@ const DRIVER: &str = r##"<script>
     vaultControls.remove(); focusBack.remove();
     for (const [id, prefix] of [["dlg-vault-new", "vc"], ["dlg-vault-add", "va"]]) {
       const d = document.getElementById(id), pw = document.getElementById(prefix + "-pw");
-      check(prefix + " explains the OneDrive path and why the local folder is empty", document.getElementById(prefix + "-remote").labels.length === 1
-        && document.getElementById(prefix + "-remote-help").textContent.includes("/Private")
-        && document.getElementById(prefix + "-local").labels[0].textContent === "Decrypted folder on this PC"
-        && document.getElementById(prefix + "-local-help").textContent.includes("existing files aren't added"), "");
+      const remote = document.getElementById(prefix + "-remote"), local = document.getElementById(prefix + "-local");
+      const edit = (input, value) => { enterSecret(input, value); input.dispatchEvent(new Event("change", {bubbles:true})); };
+      const defaultAnswer = HOST_ANSWERS.vault_default_folder;
+      const mutationCount = () => HOST_CALLS.filter(m=>m.op === "vault_create" || m.op === "vault_add").length;
+      const before = mutationCount();
+      remote.value = "/Private"; enterSecret(local, "");
+      document.querySelector(`#add-menu [data-dlg="${id}"]`).click(); await sleep(50);
+      check(prefix + " prioritizes location and password, then shows an automatic local folder", remote.labels[0].textContent === "Vault location (on OneDrive)"
+        && (remote.compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING)
+        && (document.getElementById(prefix + "-full").compareDocumentPosition(local) & Node.DOCUMENT_POSITION_FOLLOWING)
+        && local.value === "C:\\Users\\Test\\Private Vault" && document.activeElement === remote, local.value);
+      check(prefix + " distinguishes the cloud and local Browse buttons", document.getElementById(prefix + "-cloud").getAttribute("aria-label") === "Browse OneDrive folders"
+        && document.getElementById(prefix + "-browse").getAttribute("aria-label") === "Browse folders on this PC", "");
+      check(prefix + " keeps the checkbox small and accurately qualifies clearing downloads", document.getElementById(prefix + "-full").labels[0].textContent === "Always keep vault files on this PC (Cloud backup remains encrypted)"
+        && d.textContent.includes("Unless you always keep files here") && !d.textContent.includes("Experimental:"), "");
+      check(prefix + " dialog and fields fit the desktop viewport", d.getBoundingClientRect().height <= innerHeight
+        && d.scrollWidth <= d.clientWidth + 1 && [...d.querySelectorAll("input,button")].every(el=>el.getBoundingClientRect().right <= d.getBoundingClientRect().right), d.getBoundingClientRect().height);
+      d.style.width = "360px";
+      check(prefix + " narrow dialog wraps copy and keeps both Browse controls inside", d.scrollWidth <= d.clientWidth + 1
+        && [...d.querySelectorAll("input,button")].every(el=>el.getBoundingClientRect().right <= d.getBoundingClientRect().right), d.scrollWidth);
+      d.style.width = "";
       check(prefix + " has no persistent password option", !document.getElementById(prefix + "-remember"), "");
-      pw.value = "unsaved-test-password"; d.showModal();
+      edit(remote, "/Taxes"); await sleep(50);
+      check(prefix + " names the suggested local folder after the selected vault", local.value === "C:\\Users\\Test\\Taxes Vault", local.value);
+      const cancelledSuggestions = [];
+      HOST_ANSWERS.vault_default_folder = () => new Promise(resolve=>cancelledSuggestions.push(resolve));
+      edit(remote, "/Native cancel"); await sleep(20);
+      HOST_ANSWERS.pick_folder = null;
+      document.getElementById(prefix + "-browse").click(); await sleep(30);
+      cancelledSuggestions[1]("C:\\Users\\Test\\Native cancel Vault");
+      cancelledSuggestions[0]("C:\\Users\\Test\\Stale cancel Vault"); await sleep(30);
+      check(prefix + " cancelling native Browse resumes a pending automatic suggestion", local.value.endsWith("Native cancel Vault")
+        && !document.getElementById(prefix + "-local-help").textContent.includes("Selecting"), local.value);
+      const delayedDefaults = [];
+      HOST_ANSWERS.vault_default_folder = () => new Promise(resolve=>delayedDefaults.push(resolve));
+      edit(remote, "/Older"); await sleep(20); edit(remote, "/Newer"); await sleep(20);
+      delayedDefaults[1]("C:\\Users\\Test\\Newer Vault"); await sleep(20);
+      delayedDefaults[0]("C:\\Users\\Test\\Older Vault"); await sleep(30);
+      check(prefix + " ignores an older suggestion after the OneDrive location changes", local.value.endsWith("Newer Vault"), local.value);
+      edit(remote, "/Pending"); await sleep(20);
+      enterSecret(local, "D:\\My vault"); delayedDefaults[2]("C:\\Users\\Test\\Pending Vault"); await sleep(30);
+      edit(remote, "/Another"); await sleep(30);
+      check(prefix + " preserves a typed local override through pending replies and later cloud changes", local.value === "D:\\My vault" && delayedDefaults.length === 3, local.value);
+      HOST_ANSWERS.pick_folder = null;
+      document.getElementById(prefix + "-browse").focus(); document.getElementById(prefix + "-browse").click(); await sleep(30);
+      check(prefix + " cancelling local Browse preserves the path and focus", local.value === "D:\\My vault" && document.activeElement.id === prefix + "-browse", local.value);
+      HOST_ANSWERS.pick_folder = "D:\\Chosen vault";
+      document.getElementById(prefix + "-browse").click(); await sleep(30);
+      edit(remote, "/Elsewhere"); await sleep(30);
+      check(prefix + " preserves the native folder choice as an override", local.value === "D:\\Chosen vault" && delayedDefaults.length === 3, local.value);
+      HOST_ANSWERS.vault_default_folder = new Error("folder check unavailable");
+      edit(local, ""); await sleep(30);
+      check(prefix + " failed suggestions leave a required empty field and a Browse recovery", !local.value && !local.checkValidity()
+        && document.getElementById(prefix + "-local-help").textContent.includes("folder check unavailable"), local.value);
+      HOST_ANSWERS.vault_default_folder = defaultAnswer;
+      // Browsing beyond the first page and into a folder never creates anything.
+      const cloudAnswer = HOST_ANSWERS.cloud_folders;
+      HOST_ANSWERS.cloud_folders = a => a.parent === "outside" ? {parent:"outside",folders:[],next:null}
+        : a.next ? {parent:"drive",folders:[{id:"outside",name:"Outside main"}],next:null}
+        : {parent:"drive",folders:[{id:"private",name:"Private"}],next:"page-2"};
+      pw.value = "unsaved-test-password";
+      document.getElementById(prefix + "-cloud").focus();
+      document.getElementById(prefix + "-cloud").click(); await sleep(40);
+      const cloudDialog = document.querySelector("#dlg-cloud-folder");
+      check(prefix + " cloud chooser loads a bounded first page", cloudDialog.open && document.querySelectorAll("#cloud-folder-list button").length === 1
+        && !document.querySelector("#cloud-folder-more").hidden && document.querySelector("#cloud-folder-select").disabled, "");
+      document.querySelector("#cloud-folder-more").click(); await sleep(30);
+      check(prefix + " cloud paging retains one page and offers a return to the first", document.querySelectorAll("#cloud-folder-list button").length === 1
+        && !document.querySelector("#cloud-folder-first").hidden, "");
+      [...document.querySelectorAll("#cloud-folder-list button")].find(b=>b.textContent === "Outside main").click(); await sleep(30);
+      check(prefix + " cloud chooser shows empty folders without losing selection", document.querySelector("#cloud-folder-status").textContent === "No folders."
+        && !document.querySelector("#cloud-folder-select").disabled && document.querySelector("#cloud-folder-path").textContent === "/Outside main", "");
+      if (prefix === "vc") edit(document.querySelector("#cloud-folder-new"), "New vault");
+      check(prefix + " cloud chooser fits and only creation offers a new child", cloudDialog.scrollWidth <= cloudDialog.clientWidth + 1
+        && cloudDialog.getBoundingClientRect().height <= innerHeight && document.querySelector("#cloud-folder-new-field").hidden === (prefix === "va"), "");
+      cloudDialog.style.width = "360px";
+      check(prefix + " narrow cloud chooser keeps its controls inside", cloudDialog.scrollWidth <= cloudDialog.clientWidth + 1, cloudDialog.scrollWidth);
+      cloudDialog.style.width = "";
+      document.querySelector("#cloud-folder-select").click(); await sleep(50);
+      const selectedPath = prefix === "vc" ? "/Outside main/New vault" : "/Outside main";
+      check(prefix + " cloud selection updates location and the automatic folder without mutation", remote.value === selectedPath && local.value.endsWith((prefix === "vc" ? "New vault" : "Outside main") + " Vault")
+        && mutationCount() === before && pw.value === "unsaved-test-password", remote.value + ": " + local.value);
+      HOST_ANSWERS.cloud_folders = new Error("OneDrive offline");
+      document.getElementById(prefix + "-cloud").focus();
+      document.getElementById(prefix + "-cloud").click(); await sleep(30);
+      check(prefix + " cloud listing failures offer Retry", !document.querySelector("#cloud-folder-retry").hidden
+        && document.querySelector("#cloud-folder-status").textContent === "OneDrive offline", "");
+      HOST_ANSWERS.cloud_folders = cloudAnswer;
+      document.querySelector("#cloud-folder-retry").click(); await sleep(30);
+      check(prefix + " Retry restores folder navigation", document.querySelectorAll("#cloud-folder-list button").length === 1 && document.querySelector("#cloud-folder-retry").hidden, "");
+      if (prefix === "vc") {
+        edit(document.querySelector("#cloud-folder-new"), "bad/name");
+        document.querySelector("#cloud-folder-select").click(); await sleep(20);
+        check("new cloud folder names refuse slashes without closing the chooser", cloudDialog.open && !document.querySelector("#cloud-folder-new").checkValidity(), "");
+        document.querySelector("#cloud-folder-cancel").click();
+      } else cloudDialog.requestClose();
+      await sleep(30);
+      check(prefix + " cancelling cloud Browse preserves location, password and focus", remote.value === selectedPath && pw.value === "unsaved-test-password"
+        && document.activeElement.id === prefix + "-cloud", document.activeElement.id);
+      let oldCloud;
+      HOST_ANSWERS.cloud_folders = () => new Promise(resolve=>oldCloud = resolve);
+      document.getElementById(prefix + "-cloud").click(); await sleep(20);
+      cloudDialog.requestClose(); await sleep(20);
+      HOST_ANSWERS.cloud_folders = cloudAnswer;
+      document.getElementById(prefix + "-cloud").click(); await sleep(30);
+      oldCloud({parent:"old-drive",folders:[{id:"stale",name:"Stale folder"}],next:null}); await sleep(30);
+      check(prefix + " a cancelled cloud listing cannot replace a reopened chooser", !document.querySelector("#cloud-folder-list").textContent.includes("Stale folder"), document.querySelector("#cloud-folder-list").textContent);
+      cloudDialog.requestClose(); await sleep(20);
+      HOST_ANSWERS.vault_default_folder = () => new Promise(resolve=>delayedDefaults.push(resolve));
+      edit(remote, "/Closed"); await sleep(20);
       check(prefix + " Enter submits the vault action", d.querySelector(":default") === document.getElementById(prefix + "-add"), "");
       document.getElementById(prefix + "-cancel").click(); await sleep(30);
       check(prefix + " Cancel clears its password without validation", !d.open && !pw.value, pw.value);
+      HOST_ANSWERS.vault_default_folder = defaultAnswer;
+      remote.value = "/Reopened";
+      document.querySelector(`#add-menu [data-dlg="${id}"]`).click(); await sleep(40);
+      delayedDefaults[3]("C:\\Users\\Test\\Closed Vault"); await sleep(30);
+      check(prefix + " a closed dialog's suggestion cannot replace a reopened form", local.value.endsWith("Reopened Vault"), local.value);
+      const operation = prefix === "vc" ? "vault_create" : "vault_add", savedAnswer = HOST_ANSWERS[operation];
+      HOST_ANSWERS[operation] = new Error("test vault unavailable");
+      pw.value = "test-only-password";
+      if (prefix === "vc") document.querySelector("#vc-pw2").value = "test-only-password";
+      document.getElementById(prefix + "-add").click(); await sleep(50);
+      check(prefix + " failed submission keeps the form usable and preserves the chosen paths", d.open && !document.getElementById(prefix + "-add").disabled
+        && !document.getElementById(prefix + "-busy").textContent && local.value.endsWith("Reopened Vault") && pw.value === "test-only-password"
+        && document.querySelector("#toast").textContent === "test vault unavailable", "");
+      HOST_ANSWERS[operation] = savedAnswer;
+      document.getElementById(prefix + "-cancel").click(); await sleep(30);
     }
     showRecovery("old-test-key");
     document.querySelector("#dlg-recovery").close();
@@ -485,8 +662,8 @@ const DRIVER: &str = r##"<script>
       ["vault_create", "vc", "dlg-vault-new", "Running new vault", null],
       ["vault_add", "va", "dlg-vault-add", "Running existing vault", null]
     ]) {
-      let previousRoots;
-      HOST_ANSWERS.roots = () => new Promise(resolve => previousRoots = resolve);
+      const previousRootReplies = [];
+      HOST_ANSWERS.roots = () => new Promise(resolve => previousRootReplies.push(resolve));
       const previousRefresh = openFiles();
       await sleep(30);
       HOST_ANSWERS.roots = savedRoots;
@@ -499,7 +676,7 @@ const DRIVER: &str = r##"<script>
       };
       const dialog = document.getElementById(dialogId);
       document.getElementById(prefix + "-remote").value = "/" + name;
-      document.getElementById(prefix + "-local").value = "C:\\Vaults\\" + name;
+      enterSecret(document.getElementById(prefix + "-local"), "C:\\Vaults\\" + name);
       document.getElementById(prefix + "-pw").value = "test-only-password";
       if (prefix === "vc") document.querySelector("#vc-pw2").value = "test-only-password";
       dialog.showModal();
@@ -514,6 +691,8 @@ const DRIVER: &str = r##"<script>
         && !dialog.open && !document.getElementById(prefix + "-add").disabled, document.getElementById(prefix + "-busy").textContent);
       check(op + " clears its password after registration", !document.getElementById(prefix + "-pw").value
         && (prefix !== "vc" || !document.querySelector("#vc-pw2").value), "");
+      check(op + " resets the local override for the next vault", !document.getElementById(prefix + "-local").value
+        && !vaultForms.get(prefix).custom, document.getElementById(prefix + "-local").value);
       if (prefix === "vc") {
         check("creation shows the recovery key without waiting for settings", document.querySelector("#dlg-recovery").open
           && document.querySelector("#recovery-text").textContent === "OUD1-test-recovery", document.querySelector("#recovery-text").textContent);
@@ -523,13 +702,49 @@ const DRIVER: &str = r##"<script>
       HOST_ANSWERS.snapshot = savedVaultSnapshot;
       for (const resolve of settingsReplies) resolve(savedVaultSnapshot({}));
       await sleep(100);
-      previousRoots(savedRoots);
+      for (const resolve of previousRootReplies) resolve(savedRoots);
       await previousRefresh;
       check(op + " keeps its tab when an older list reply arrives", document.querySelector("#roots [aria-selected=true]")?.textContent.includes(name),
         document.querySelector("#roots").textContent);
       if (document.querySelector("#dlg-recovery").open) document.querySelector("#dlg-recovery").close();
     }
     HOST_ANSWERS.roots = savedRoots;
+
+    // A message over a modal dialog: in the dialog (the page beneath is
+    // inert and under the backdrop), on top, and back on the page after.
+    const toastEl = document.querySelector("#toast");
+    const onTop = el => { el.style.pointerEvents = "auto"; const r = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); el.style.pointerEvents = "";
+      el._hit = hit ? hit.tagName + "#" + hit.id : "none"; return !!hit && el.contains(hit); };
+    const newVault = document.querySelector("#dlg-vault-new");
+    const toastSeen = () => JSON.stringify({parent: toastEl.parentNode.id, text: toastEl.textContent,
+      viewport: [innerWidth, innerHeight], toast: toastEl.getBoundingClientRect(), dialog: newVault.getBoundingClientRect(), hit: toastEl._hit});
+    for (const [id, v] of [["vc-remote", "/Private"], ["vc-local", "C:\Vaults\P"], ["vc-pw", "test-only-one"], ["vc-pw2", "test-only-two"]]) document.getElementById(id).value = v;
+    newVault.showModal();
+    document.querySelector("#vc-add").click(); await sleep(150);
+    check("an error in a dialog shows in the dialog, on top", newVault.open && toastEl.parentNode === newVault && toastEl.classList.contains("error")
+      && toastEl.textContent === "The passwords don't match" && onTop(toastEl), toastSeen());
+    check("the message in a dialog is a status for screen readers", toastEl.getAttribute("role") === "status", toastEl.getAttribute("role"));
+    newVault.style.maxHeight = "260px";
+    await sleep(50);
+    check("an error stays visible when its dialog scrolls", onTop(toastEl), toastSeen());
+    newVault.scrollTop = newVault.scrollHeight;
+    await sleep(50);
+    check("scrolling a dialog keeps its message visible", onTop(toastEl), toastSeen());
+    newVault.style.maxHeight = "";
+    document.querySelector("#vc-cancel").click(); await sleep(150);
+    check("closing the dialog gives the message back to the page, still shown", !newVault.open && toastEl.parentNode === document.body
+      && toastEl.classList.contains("show") && toastEl.textContent === "The passwords don't match", toastEl.parentNode.tagName + ": " + toastEl.textContent);
+    toast("Saved"); await sleep(50);
+    newVault.showModal(); await sleep(150);
+    check("a dialog opening over a message takes it along", toastEl.parentNode === newVault && toastEl.textContent === "Saved" && onTop(toastEl), toastEl.parentNode.tagName);
+    toast("Closing now"); newVault.close(); await sleep(150);
+    check("a message given as its dialog closes isn't lost", toastEl.parentNode === document.body && toastEl.textContent === "Closing now", toastEl.textContent);
+    toast("On the page"); await sleep(50);
+    check("with no dialog open the message stays on the page", toastEl.parentNode === document.body && toastEl.textContent === "On the page", toastEl.parentNode.tagName);
+    const busy = [...document.querySelectorAll('[id$="-busy"]')];
+    check("every busy line is a status", busy.length >= 11 && busy.every(b => b.getAttribute("role") === "status"),
+      busy.filter(b => b.getAttribute("role") !== "status").map(b => b.id));
   } catch (e) {
     check("the driver ran to the end", false, e.message + " " + e.stack);
   }
@@ -634,7 +849,14 @@ fn the_window_works_from_the_keyboard() {
     let dump = dir.join("dom.html");
     run.child = Some(
         Command::new(&edge)
-            .args(["--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check"])
+            .args([
+                "--headless=new",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--window-size=800,600",
+                "--force-device-scale-factor=1",
+            ])
             .arg(format!("--user-data-dir={}", dir.join("profile").display()))
             .args(["--virtual-time-budget=60000", "--dump-dom", &url])
             .stdout(Stdio::from(std::fs::File::create(&dump).expect("the output file")))
@@ -660,6 +882,11 @@ fn the_window_works_from_the_keyboard() {
         .unwrap_or_else(|| panic!("no result from the page; Edge printed {} bytes", dom.len()));
     let json = json.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
     let checks: Vec<(String, bool, String)> = serde_json::from_str(&json).expect("the checks");
+    for (name, _, seen) in
+        checks.iter().filter(|(name, _, _)| name.contains("dialog shows") || name.contains("dialog scrolls"))
+    {
+        eprintln!("{name}: {seen}");
+    }
     let failed: Vec<String> =
         checks.iter().filter(|(_, ok, _)| !ok).map(|(name, _, seen)| format!("{name} (saw: {seen})")).collect();
     assert!(checks.iter().any(|(n, ..)| n == "done"), "the checks didn't finish: {checks:?}");

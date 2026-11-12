@@ -387,16 +387,7 @@ fn print_status(s: &Status) {
         println!("  waiting           {} more databases (`oneup activity` lists them)", s.databases_more);
     }
     for st in &s.safety_stops {
-        let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
-        let earlier =
-            if st.recent > 0 { format!(", on top of {} in the last 15 minutes", st.recent) } else { String::new() };
-        println!(
-            "  SAFETY STOP       {} items {side} would be deleted, overwritten or moved{earlier} ({} are synced).\n                    \
-             If that's what you meant: `oneup approve {}`",
-            st.items(),
-            st.synced_items,
-            st.code
-        );
+        println!("{}", stop_lines(st));
     }
     if let Some(o) = &s.overflow
         && o.waiting
@@ -425,6 +416,47 @@ fn print_status(s: &Status) {
         print_problem(p);
     }
     println!();
+}
+
+/// A safety stop's lines in `oneup status`, by kind: approving a content
+/// guard's stop uploads files that may be scrambled, so its way back
+/// (a rewind) comes before the approval.
+fn stop_lines(st: &oneup_ipc::SafetyStop) -> String {
+    const PAD: &str = "\n                    ";
+    let side = if st.side == "local" { "on this PC" } else { "in OneDrive" };
+    let code = &st.code;
+    match st.kind.as_str() {
+        "content" => format!(
+            "  SAFETY STOP       {} changed {} {side} {} encrypted, possibly by ransomware. Not uploaded.{PAD}\
+             Check them first. To put their folder back: `oneup rewind --before-stop {code}`{PAD}\
+             Only if you changed them yourself, to upload them: `oneup approve {code}`",
+            st.items(),
+            if st.count == 1 && !st.at_least { "file" } else { "files" },
+            if st.count == 1 && !st.at_least { "looks" } else { "look" },
+        ),
+        "removal" => format!(
+            "  SAFETY STOP       Removing the duplicates you chose ({} {}) waits for you.{PAD}\
+             To remove them: `oneup approve {code}`",
+            st.items(),
+            if st.count == 1 && !st.at_least { "copy" } else { "copies" },
+        ),
+        "rewind" => format!(
+            "  SAFETY STOP       A rewind waits for you: {} {} {side} would change.{PAD}\
+             To approve it, if its list is unchanged: `oneup rewind --approve {code}`",
+            st.items(),
+            if st.count == 1 && !st.at_least { "item" } else { "items" },
+        ),
+        _ => {
+            let earlier =
+                if st.recent > 0 { format!(", on top of {} in the last 15 minutes", st.recent) } else { String::new() };
+            format!(
+                "  SAFETY STOP       {} items {side} would be deleted, overwritten or moved{earlier} ({} are synced).{PAD}\
+                 If that's what you meant: `oneup approve {code}`",
+                st.items(),
+                st.synced_items,
+            )
+        }
+    }
 }
 
 /// A problem, as the settings window tells it: what, what to do, when it's
@@ -463,7 +495,44 @@ pub fn parse_minutes(s: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_minutes;
+    use super::{parse_minutes, stop_lines};
+
+    fn stop(kind: &str, count: usize) -> oneup_ipc::SafetyStop {
+        oneup_ipc::SafetyStop {
+            kind: kind.into(),
+            side: "local".into(),
+            count,
+            at_least: false,
+            recent: 0,
+            synced_items: 900,
+            code: "c0de".into(),
+        }
+    }
+
+    #[test]
+    fn each_kind_of_stop_says_what_it_holds_and_how_to_answer() {
+        // The content guard's: the way back first, approving last and
+        // only for changes the user made.
+        let s = stop_lines(&stop("content", 7));
+        assert!(s.contains("7 changed files on this PC look encrypted"), "{s}");
+        assert!(!s.contains("deleted, overwritten or moved"), "{s}");
+        let (rewind, approve) = (s.find("oneup rewind --before-stop c0de"), s.find("oneup approve c0de"));
+        assert!(rewind.is_some() && approve.is_some() && rewind < approve, "{s}");
+        assert!(s.contains("Only if you changed them yourself"), "{s}");
+        assert!(stop_lines(&stop("content", 1)).contains("1 changed file on this PC looks encrypted"));
+
+        let s = stop_lines(&stop("removal", 1));
+        assert!(s.contains("duplicates you chose (1 copy)") && s.contains("oneup approve c0de"), "{s}");
+        assert!(!s.contains("deleted, overwritten or moved"), "{s}");
+
+        let s = stop_lines(&stop("rewind", 3));
+        assert!(s.contains("A rewind waits") && s.contains("oneup rewind --approve c0de"), "{s}");
+        assert!(!s.contains("`oneup approve"), "{s}");
+
+        let s = stop_lines(&stop("mass", 40));
+        assert!(s.contains("40 items on this PC would be deleted, overwritten or moved (900 are synced)"), "{s}");
+        assert!(s.contains("oneup approve c0de"), "{s}");
+    }
 
     #[test]
     fn durations_parse() {

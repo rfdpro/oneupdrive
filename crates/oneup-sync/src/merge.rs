@@ -11,7 +11,7 @@
 //! Names chosen here (conflict copies) are only a first guess. The resolve
 //! pass ([`crate::resolve`]) is the authority on whether a name is free.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::Flow;
 use crate::model::{
@@ -222,6 +222,7 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
         }
     }
 
+    let mut new_local = LocalReplacements::new(new_local);
     // Atomic saves: the editor wrote a temp file and renamed it over the
     // original, so the original's file ID was deleted and a new one sits at
     // its name. That's an edit of the Synced file, not delete + create: the
@@ -231,16 +232,15 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
     let mut adopted: HashMap<Sid, LocalNode> = HashMap::new();
     let mut remade = HashMap::new();
     for b in &base_kids {
-        if b.kind == NodeKind::File && matches!(local_of(t, b)?, Seen::Deleted) {
-            let key = fold(&b.name);
-            if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::File && fold(&n.name) == key) {
-                adopted.insert(b.sid, new_local.remove(i));
-            }
-        } else if may_be_remade(t, b)? {
-            let key = fold(&b.name);
-            if let Some(i) = new_local.iter().position(|n| n.kind == NodeKind::Folder && fold(&n.name) == key) {
-                remade.insert(b.sid, new_local.remove(i).id);
-            }
+        if b.kind == NodeKind::File
+            && matches!(local_of(t, b)?, Seen::Deleted)
+            && let Some(n) = new_local.take(NodeKind::File, &b.name)
+        {
+            adopted.insert(b.sid, n);
+        } else if may_be_remade(t, b)?
+            && let Some(n) = new_local.take(NodeKind::Folder, &b.name)
+        {
+            remade.insert(b.sid, n.id);
         }
     }
 
@@ -255,9 +255,39 @@ pub(crate) fn plan_folder<T: Trees + ?Sized>(t: &T, sid: Sid, flow: Flow) -> Res
         }
         decide_synced(&mut cx, b, adopted)?;
     }
-    decide_new(&mut cx, new_local, new_remote)?;
+    decide_new(&mut cx, new_local.remaining(), new_remote)?;
     Ok(cx.out)
 }
+
+/// Atomic-save candidates in their original order. Name collisions consume
+/// the first matching ID, without repeatedly scanning or shifting siblings.
+struct LocalReplacements {
+    nodes: Vec<Option<LocalNode>>,
+    names: HashMap<(NodeKind, String), VecDeque<usize>>,
+}
+
+impl LocalReplacements {
+    fn new(nodes: Vec<LocalNode>) -> Self {
+        let mut names: HashMap<_, VecDeque<usize>> = HashMap::new();
+        for (i, n) in nodes.iter().enumerate() {
+            names.entry((n.kind, fold(&n.name))).or_default().push_back(i);
+        }
+        Self { nodes: nodes.into_iter().map(Some).collect(), names }
+    }
+
+    fn take(&mut self, kind: NodeKind, name: &str) -> Option<LocalNode> {
+        let i = self.names.get_mut(&(kind, fold(name)))?.pop_front()?;
+        self.nodes[i].take()
+    }
+
+    fn remaining(self) -> Vec<LocalNode> {
+        self.nodes.into_iter().flatten().collect()
+    }
+}
+
+#[cfg(test)]
+#[path = "replacement_tests.rs"]
+mod replacement_tests;
 
 /// A Synced file deleted in the cloud, with a new cloud file of its name in the
 /// same place (deleted and uploaded again), while this PC's file looks changed
@@ -406,7 +436,7 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
             cx.out.push(Op::Record(Base {
                 parent: Some(parent),
                 name: l.name.clone(),
-                remote_etag: r.etag.clone(),
+                remote_etag: if rc { b.remote_etag.clone() } else { r.etag.clone() },
                 ..b.clone()
             }));
             return Ok(());
@@ -459,7 +489,9 @@ fn both<T: Trees + ?Sized>(cx: &mut Ctx<'_, T>, b: &Base, l: LocalNode, r: Remot
         cx.out.push(Op::Record(Base {
             parent: Some(parent),
             name: l.name.clone(),
-            remote_etag: r.etag.clone(),
+            // This records location only. Without a cloud hash, its old
+            // agreed eTag must keep any pending content change visible.
+            remote_etag: if rc { b.remote_etag.clone() } else { r.etag.clone() },
             ..b.clone()
         }));
         return Ok(());

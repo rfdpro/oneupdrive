@@ -1043,13 +1043,16 @@ impl Cloud for GraphCloud {
         }
         // Read before the eTag check, which shows nothing was saved since:
         // the newest version is the one the upload replaces, unless the
-        // history doesn't list it yet (then its size gives it away, and
-        // nothing is checked afterwards rather than something wrong).
-        Ok(versions.into_iter().next().filter(|v| v.size.is_none_or(|s| Some(s) == now.size)).map(|v| VersionMark {
-            id: v.id,
-            modified_ms: v.modified_ms,
-            size: v.size,
-        }))
+        // history doesn't list it yet (then its size gives it away). Wait
+        // until a usable mark can be recorded before starting the session.
+        let v = versions
+            .into_iter()
+            .next()
+            .filter(|v| !v.id.is_empty() && v.size.is_some_and(|s| s >= 0 && Some(s) == now.size))
+            .ok_or_else(|| {
+                CloudError::Other("waiting for OneDrive's version history before replacing this file".into())
+            })?;
+        Ok(Some(VersionMark { id: v.id, modified_ms: v.modified_ms, size: v.size }))
     }
 
     async fn replaced_other(
@@ -1977,6 +1980,51 @@ mod tests {
 
     fn version(id: &str, modified_ms: i64, size: i64) -> FileVersion {
         FileVersion { id: id.into(), modified_ms: Some(modified_ms), size: Some(size), by: None }
+    }
+
+    #[tokio::test]
+    async fn session_replacements_wait_for_usable_history() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let history = Arc::new(Mutex::new(r#"{"value":[]}"#.to_string()));
+        let replies = Arc::clone(&history);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let body = if head.lines().next().unwrap().contains("/versions") {
+                    replies.lock().unwrap().clone()
+                } else {
+                    r#"{"id":"F","eTag":"E","size":6,"file":{}}"#.to_string()
+                };
+                let reply =
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let cloud = GraphCloud::new(Arc::new(Graph::for_tests(&base, 1).await));
+        let pre = RemotePre { id: RemoteId("F".into()), etag: "E".into() };
+        // The decision uses the incoming size, including vault encryption
+        // overhead, not the size of the old cloud version.
+        let size = SIMPLE_UPLOAD_MAX as i64 + 1;
+        assert!(cloud.version_mark(&pre, size).await.is_err(), "empty history must defer a session replacement");
+        *history.lock().unwrap() = r#"{"value":[{"id":"1.0","size":5}]}"#.into();
+        assert!(cloud.version_mark(&pre, size).await.is_err(), "a stale history must defer a session replacement");
+        *history.lock().unwrap() = r#"{"value":[{"id":"","size":6}]}"#.into();
+        assert!(cloud.version_mark(&pre, size).await.is_err(), "an unnamed version cannot be recovered");
+        *history.lock().unwrap() = r#"{"value":[{"id":"1.0"}]}"#.into();
+        assert!(
+            cloud.version_mark(&pre, size).await.is_err(),
+            "history without a size cannot be checked against the item"
+        );
+        *history.lock().unwrap() = r#"{"value":[{"id":"1.0","size":6}]}"#.into();
+        assert_eq!(cloud.version_mark(&pre, size).await.unwrap().unwrap().id, "1.0");
+        *history.lock().unwrap() = r#"{"value":[]}"#.into();
+        assert!(cloud.version_mark(&pre, SIMPLE_UPLOAD_MAX as i64).await.unwrap().is_none());
+        server.abort();
     }
 
     #[test]
