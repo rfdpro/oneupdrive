@@ -476,6 +476,34 @@ mod win {
                 let picked = tokio::task::spawn_blocking(move || p.pick_folder("Choose the folder to sync")).await??;
                 Ok(picked.map_or(Value::Null, |p| Value::from(p.to_string_lossy().into_owned())))
             }
+            "vault_default_folder" => {
+                let (main, remote) = (dir.to_path_buf(), text(args, "remote"));
+                let path =
+                    tokio::task::spawn_blocking(move || oneup_app::settings_vault::default_folder(&main, &remote))
+                        .await??;
+                Ok(Value::from(path.to_string_lossy().into_owned()))
+            }
+            "cloud_folders" => {
+                // Browse the whole drive, including vaults outside the main
+                // pair. Listing never creates a target folder.
+                let graph = graph(dir)?;
+                let id = match args.get("parent").and_then(Value::as_str).filter(|id| !id.is_empty()) {
+                    Some(id) => id.to_string(),
+                    None => graph.root().await?.id,
+                };
+                let next = args.get("next").and_then(Value::as_str);
+                if next.is_some_and(|n| !n.starts_with("https://graph.microsoft.com/v1.0/")) {
+                    bail!("invalid OneDrive folder page");
+                }
+                let page = graph.children_page(&id, next).await?;
+                let folders: Vec<_> = page
+                    .value
+                    .into_iter()
+                    .filter(|item| item.is_folder())
+                    .map(|item| json!({"id": item.id, "name": item.name}))
+                    .collect();
+                Ok(json!({"parent": id, "folders": folders, "next": page.next_link}))
+            }
             "pick_file" => {
                 let p = poster.clone();
                 let picked = tokio::task::spawn_blocking(move || p.pick_file("Choose a file or folder")).await??;

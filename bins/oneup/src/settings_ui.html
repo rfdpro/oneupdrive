@@ -704,6 +704,31 @@
             display: block;
             font-weight: 600;
         }
+
+        .vault-local {
+            border-top: 1px solid var(--line);
+            margin-top: 18px;
+            padding-top: 14px;
+        }
+
+        dialog label.vault-keep {
+            font-size: 12px;
+            margin-top: 16px;
+        }
+
+        .cloud-folders {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 240px;
+            overflow: auto;
+            margin-top: 12px;
+        }
+
+        .cloud-folders button {
+            text-align: left;
+            overflow-wrap: anywhere;
+        }
         
         .seg {
             display: inline-flex;
@@ -2687,18 +2712,15 @@
                 <h3 id="dlg-vault-new-t">Create an encrypted vault</h3>
             </div>
             <div class="db">
-                <div class="vault-field"><label for="vc-remote">Encrypted folder in OneDrive</label>
-                    <div class="field"><input type="text" id="vc-remote" placeholder="/Private" aria-describedby="vc-remote-help" spellcheck="false" required></div>
-                    <p class="note" id="vc-remote-help">Enter a path from the top of OneDrive, such as /Private. The folder must be new or empty.</p></div>
-                <div class="vault-field"><label for="vc-local">Decrypted folder on this PC</label>
-                    <div class="field"><input type="text" id="vc-local" aria-describedby="vc-local-help" spellcheck="false" required><button class="btn" type="button" id="vc-browse">Browse…</button></div>
-                    <p class="note" id="vc-local-help">Your readable files appear here. Choose a new or empty folder outside folders you already sync, so existing files aren't added to the vault.</p></div>
+                <div class="vault-field"><label for="vc-remote">Vault location (on OneDrive)</label>
+                    <div class="field"><input type="text" id="vc-remote" placeholder="/Private" spellcheck="false" required autofocus><button class="btn" type="button" id="vc-cloud" aria-label="Browse OneDrive folders">Browse…</button></div></div>
                 <div class="vault-field"><label for="vc-pw">Password</label><div class="field"><input type="password" id="vc-pw" placeholder="At least 8 characters" minlength="8" required></div></div>
                 <div class="vault-field"><label for="vc-pw2">Confirm password</label><div class="field"><input type="password" id="vc-pw2" required></div></div>
-                <label class="ck"><input type="checkbox" id="vc-full"><span>Keep all files on this PC<small>Otherwise they download when you open them.</small></span></label>
-                <p class="note">Your password isn't saved. Locking or restarting clears the decrypted files from this PC; unlock to open them again.</p>
-                <p class="note">A standard Cryptomator vault: Cryptomator's apps open it too.</p>
-                <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
+                <label class="ck vault-keep"><input type="checkbox" id="vc-full"><span>Always keep vault files on this PC (Cloud backup remains encrypted)</span></label>
+                <p class="note">Vault files are readable on this PC; the cloud backup stays encrypted. Unless you always keep files here, locking manually or with an idle timer clears synced, closed downloaded files. Unlock with your password or optional Windows Hello. Keep your password and recovery key safe; recovery options are limited.</p>
+                <div class="vault-field vault-local"><label for="vc-local">Decrypted folder on this PC</label>
+                    <div class="field"><input type="text" id="vc-local" aria-describedby="vc-local-help" spellcheck="false" required><button class="btn" type="button" id="vc-browse" aria-label="Browse folders on this PC">Browse…</button></div>
+                    <p class="note" id="vc-local-help" role="status">A new folder outside synced folders is selected automatically.</p></div>
             </div>
             <div class="df"><span class="muted" id="vc-busy" role="status"></span><button class="btn" type="button" id="vc-cancel">Cancel</button><button class="btn primary" type="submit" id="vc-add">Create</button></div>
         </form>
@@ -2709,18 +2731,31 @@
                 <h3 id="dlg-vault-add-t">Add an existing vault</h3>
             </div>
             <div class="db">
-                <div class="vault-field"><label for="va-remote">Existing vault in OneDrive</label>
-                    <div class="field"><input type="text" id="va-remote" placeholder="/Private" aria-describedby="va-remote-help" spellcheck="false" required></div>
-                    <p class="note" id="va-remote-help">Enter the OneDrive path to the folder containing vault.cryptomator, such as /Private.</p></div>
-                <div class="vault-field"><label for="va-local">Decrypted folder on this PC</label>
-                    <div class="field"><input type="text" id="va-local" aria-describedby="va-local-help" spellcheck="false" required><button class="btn" type="button" id="va-browse">Browse…</button></div>
-                    <p class="note" id="va-local-help">Your readable files appear here. Choose a new or empty folder outside folders you already sync, so existing files aren't added to the vault.</p></div>
+                <div class="vault-field"><label for="va-remote">Vault location (on OneDrive)</label>
+                    <div class="field"><input type="text" id="va-remote" placeholder="/Private" spellcheck="false" required autofocus><button class="btn" type="button" id="va-cloud" aria-label="Browse OneDrive folders">Browse…</button></div></div>
                 <div class="vault-field"><label for="va-pw">Password</label><div class="field"><input type="password" id="va-pw" required></div></div>
-                <label class="ck"><input type="checkbox" id="va-full"><span>Keep all files on this PC</span></label>
-                <p class="note">Your password isn't saved. Locking or restarting clears the decrypted files from this PC; unlock to open them again.</p>
-                <p class="note">Experimental: the encryption hasn't had an outside security review yet.</p>
+                <label class="ck vault-keep"><input type="checkbox" id="va-full"><span>Always keep vault files on this PC (Cloud backup remains encrypted)</span></label>
+                <p class="note">Vault files are readable on this PC; the cloud backup stays encrypted. Unless you always keep files here, locking manually or with an idle timer clears synced, closed downloaded files. Unlock with your password or optional Windows Hello. Keep your password and recovery key safe; recovery options are limited.</p>
+                <div class="vault-field vault-local"><label for="va-local">Decrypted folder on this PC</label>
+                    <div class="field"><input type="text" id="va-local" aria-describedby="va-local-help" spellcheck="false" required><button class="btn" type="button" id="va-browse" aria-label="Browse folders on this PC">Browse…</button></div>
+                    <p class="note" id="va-local-help" role="status">A new folder outside synced folders is selected automatically.</p></div>
             </div>
             <div class="df"><span class="muted" id="va-busy" role="status"></span><button class="btn" type="button" id="va-cancel">Cancel</button><button class="btn primary" type="submit" id="va-add">Add</button></div>
+        </form>
+    </dialog>
+    <dialog id="dlg-cloud-folder" aria-labelledby="cloud-folder-title">
+        <form method="dialog">
+            <div class="dh"><h3 id="cloud-folder-title">Choose a OneDrive folder</h3></div>
+            <div class="db">
+                <p class="note" id="cloud-folder-help"></p>
+                <div class="field"><button class="btn" type="button" id="cloud-folder-up">Up</button><b class="path" id="cloud-folder-path">/</b></div>
+                <div class="cloud-folders" id="cloud-folder-list" aria-label="OneDrive folders" role="group"></div>
+                <p class="note" id="cloud-folder-status" role="status"></p>
+                <div class="actions"><button class="btn small" type="button" id="cloud-folder-first" hidden>First</button><button class="btn small" type="button" id="cloud-folder-more" hidden>Next</button><button class="btn small" type="button" id="cloud-folder-retry" hidden>Retry</button></div>
+                <div class="vault-field" id="cloud-folder-new-field"><label for="cloud-folder-new">New folder name</label><div class="field"><input type="text" id="cloud-folder-new" spellcheck="false" aria-describedby="cloud-folder-new-help"></div>
+                    <p class="note" id="cloud-folder-new-help">Leave blank to use the selected empty folder. Nothing is created until you select Create.</p></div>
+            </div>
+            <div class="df"><button class="btn" type="button" id="cloud-folder-cancel">Cancel</button><button class="btn primary" type="submit" id="cloud-folder-select" value="select">Select</button></div>
         </form>
     </dialog>
     <div class="menu ctx" id="ctx" role="menu" popover></div>
@@ -8263,6 +8298,8 @@
             $("#add-menu").hidePopover();
             const d = $("#" + b.dataset.dlg);
             d.showModal();
+            if (b.dataset.dlg === "dlg-vault-new") openVaultForm("vc");
+            if (b.dataset.dlg === "dlg-vault-add") openVaultForm("va");
             if (b.dataset.dlg === "dlg-known") loadKnown();
             if (b.dataset.dlg === "dlg-shared") loadShared();
         });
@@ -8421,17 +8458,181 @@
                 }, go))));
             }
         }
+        // Read-only browsing: even a new child is only a path until Create.
+        let cloudFolder = null;
+        let cloudFolderRequest = 0;
+        function renderCloudFolder() {
+            const current = cloudFolder.trail.at(-1);
+            $("#cloud-folder-path").textContent = current.path;
+            $("#cloud-folder-up").disabled = cloudFolder.trail.length === 1;
+            const name = $("#cloud-folder-new").value.trim();
+            $("#cloud-folder-select").disabled = !current.id || (current.path === "/" && !name);
+        }
+        async function loadCloudFolders(more = false) {
+            const state = cloudFolder, request = ++cloudFolderRequest;
+            const current = state.trail.at(-1), next = more ? state.next : null;
+            const list = $("#cloud-folder-list");
+            // Keep only one page of siblings in memory, even in huge folders.
+            list.replaceChildren();
+            $("#cloud-folder-first").hidden = !next;
+            $("#cloud-folder-more").hidden = true;
+            $("#cloud-folder-retry").hidden = true;
+            $("#cloud-folder-status").textContent = tr("Loading…");
+            renderCloudFolder();
+            try {
+                const page = await call("cloud_folders", {parent: current.id, next});
+                if (cloudFolder !== state || request !== cloudFolderRequest) return;
+                current.id = page.parent;
+                state.next = page.next;
+                for (const folder of page.folders) {
+                    list.append(el("button", {
+                        className: "btn", type: "button", textContent: folder.name,
+                        onclick: () => {
+                            state.trail.push({id: folder.id, path: current.path.replace(/\/$/, "") + "/" + folder.name});
+                            loadCloudFolders();
+                        }
+                    }));
+                }
+                $("#cloud-folder-more").hidden = !state.next;
+                $("#cloud-folder-status").textContent = list.children.length ? "" : tr("No folders.");
+                renderCloudFolder();
+                if (document.activeElement !== $("#cloud-folder-new")) {
+                    (list.querySelector("button") || ($("#cloud-folder-select").disabled ? $("#cloud-folder-cancel") : $("#cloud-folder-select"))).focus();
+                }
+            } catch (e) {
+                if (cloudFolder !== state || request !== cloudFolderRequest) return;
+                $("#cloud-folder-status").textContent = e.message;
+                $("#cloud-folder-retry").hidden = false;
+                $("#cloud-folder-retry").onclick = () => loadCloudFolders(more);
+            }
+        }
+        function chooseCloudFolder(create) {
+            const dialog = $("#dlg-cloud-folder");
+            const state = {trail: [{id: null, path: "/"}], next: null, selected: null};
+            cloudFolder = state;
+            $("#cloud-folder-new-field").hidden = !create;
+            $("#cloud-folder-new").value = "";
+            $("#cloud-folder-new").setCustomValidity("");
+            $("#cloud-folder-help").textContent = create ? tr("Choose an empty folder, or open its parent and enter a new folder name.") : tr("Choose the vault folder containing vault.cryptomator.");
+            dialog.showModal();
+            loadCloudFolders();
+            return new Promise(resolve => {
+                const finish = () => {
+                    dialog.removeEventListener("close", closed);
+                    if (cloudFolder === state) {
+                        cloudFolder = null;
+                        ++cloudFolderRequest;
+                    }
+                    resolve(state.selected);
+                };
+                const closed = () => {
+                    if (dialog.open) return;
+                    finish();
+                };
+                state.finish = finish;
+                dialog.addEventListener("close", closed);
+            });
+        }
+        function closeCloudFolder() {
+            const state = cloudFolder;
+            $("#dlg-cloud-folder").close();
+            state?.finish();
+        }
+        $("#cloud-folder-up").onclick = () => {
+            if (cloudFolder.trail.length > 1) cloudFolder.trail.pop();
+            loadCloudFolders();
+        };
+        $("#cloud-folder-more").onclick = () => loadCloudFolders(true);
+        $("#cloud-folder-first").onclick = () => loadCloudFolders();
+        $("#cloud-folder-cancel").onclick = closeCloudFolder;
+        $("#dlg-cloud-folder").addEventListener("cancel", () => cloudFolder?.finish());
+        $("#cloud-folder-new").oninput = () => {
+            $("#cloud-folder-new").setCustomValidity("");
+            renderCloudFolder();
+        };
+        $("#dlg-cloud-folder form").onsubmit = e => {
+            if (e.submitter?.value !== "select") return;
+            e.preventDefault();
+            const input = $("#cloud-folder-new"), name = input.value.trim();
+            if (name && /[\\/]/.test(name) || name === "." || name === "..") {
+                input.setCustomValidity(tr("Enter a folder name without slashes."));
+                input.reportValidity();
+                return;
+            }
+            const path = cloudFolder.trail.at(-1).path;
+            cloudFolder.selected = name ? path.replace(/\/$/, "") + "/" + name : path;
+            closeCloudFolder();
+        };
+
+        const vaultForms = new Map(["vc", "va"].map(prefix => [prefix, {custom: false, request: 0, session: 0}]));
+        async function suggestVaultFolder(prefix) {
+            const state = vaultForms.get(prefix), dialog = prefix === "vc" ? $("#dlg-vault-new") : $("#dlg-vault-add");
+            if (state.custom || !dialog.open) return;
+            const request = ++state.request, session = state.session;
+            const remote = $("#" + prefix + "-remote").value;
+            const local = $("#" + prefix + "-local"), previous = local.value;
+            const help = $("#" + prefix + "-local-help");
+            help.textContent = tr("Selecting a new folder…");
+            try {
+                const path = await call("vault_default_folder", {remote});
+                if (!dialog.open || state.session !== session || state.request !== request || state.custom || local.value !== previous) return;
+                local.value = path;
+                help.textContent = tr("New folder. Browse to choose another new or empty folder outside synced folders.");
+            } catch (e) {
+                if (!dialog.open || state.session !== session || state.request !== request || state.custom) return;
+                // An earlier automatic choice is no longer known to be safe.
+                local.value = "";
+                help.textContent = tr("Couldn't select a folder: {error}. Use Browse or enter a new or empty folder outside synced folders.", {error: e.message});
+            }
+        }
+        function openVaultForm(prefix) {
+            ++vaultForms.get(prefix).session;
+            suggestVaultFolder(prefix);
+        }
+        function resetVaultForm(prefix) {
+            const state = vaultForms.get(prefix);
+            state.custom = false;
+            ++state.request;
+            const dialog = prefix === "vc" ? $("#dlg-vault-new") : $("#dlg-vault-add");
+            dialog.querySelector("form").reset();
+        }
         for (const [dialog, prefix] of [["dlg-vault-new", "vc"], ["dlg-vault-add", "va"]]) {
             const d = $("#" + dialog);
+            const state = vaultForms.get(prefix), local = $("#" + prefix + "-local");
             const clear = () => { for (const input of $$("input[type=password]", d)) input.value = ""; };
             $("#" + prefix + "-cancel").onclick = () => { clear(); d.close(); };
             d.addEventListener("cancel", clear);
-            d.addEventListener("close", () => { if (!d.open) clear(); });
+            d.addEventListener("close", () => {
+                if (!d.open) { clear(); ++state.session; ++state.request; }
+            });
+            local.oninput = () => {
+                state.custom = !!local.value;
+                ++state.request;
+                $("#" + prefix + "-local-help").textContent = tr("Choose a new or empty folder outside synced folders.");
+            };
+            local.onchange = () => { if (!local.value) suggestVaultFolder(prefix); };
+            $("#" + prefix + "-remote").oninput = () => { ++state.request; };
+            $("#" + prefix + "-remote").onchange = () => suggestVaultFolder(prefix);
+            $("#" + prefix + "-cloud").onclick = async() => {
+                const session = state.session;
+                const remote = $("#" + prefix + "-remote"), previous = remote.value;
+                const path = await chooseCloudFolder(prefix === "vc");
+                if (path && d.open && state.session === session && remote.value === previous) {
+                    remote.value = path;
+                    suggestVaultFolder(prefix);
+                }
+            };
+            $("#" + prefix + "-browse").onclick = async() => {
+                const session = state.session, request = ++state.request, previous = local.value;
+                const path = await run(call("pick_folder")).catch(() => null);
+                if (!d.open || state.session !== session || state.request !== request || local.value !== previous) return;
+                if (path) {
+                    state.custom = true;
+                    local.value = path;
+                    $("#" + prefix + "-local-help").textContent = tr("Choose a new or empty folder outside synced folders.");
+                } else if (!state.custom) suggestVaultFolder(prefix);
+            };
         }
-        $("#vc-browse").onclick = async() => {
-            const p = await run(call("pick_folder"));
-            if (p) $("#vc-local").value = p;
-        };
         $("#dlg-vault-new form").onsubmit = async e => {
             e.preventDefault();
             if ($("#vc-pw").value !== $("#vc-pw2").value) return toast(tr("The passwords don't match"), true);
@@ -8444,8 +8645,7 @@
                     password: $("#vc-pw").value,
                     full: $("#vc-full").checked
                 });
-                $("#vc-pw").value = "";
-                $("#vc-pw2").value = "";
+                resetVaultForm("vc");
                 $("#dlg-vault-new").close();
                 await afterAdd("vault:" + r.name);
                 toast(r.start_error ? tr("Vault \"{name}\" created. Couldn't start syncing: {error}", {
@@ -8461,10 +8661,6 @@
                 $("#vc-add").disabled = false;
             }
         };
-        $("#va-browse").onclick = async() => {
-            const p = await run(call("pick_folder"));
-            if (p) $("#va-local").value = p;
-        };
         $("#dlg-vault-add form").onsubmit = async e => {
             e.preventDefault();
             $("#va-busy").textContent = tr("Opening the vault…");
@@ -8476,7 +8672,7 @@
                     password: $("#va-pw").value,
                     full: $("#va-full").checked
                 });
-                $("#va-pw").value = "";
+                resetVaultForm("va");
                 $("#dlg-vault-add").close();
                 await afterAdd("vault:" + r.name);
                 toast(r.start_error ? tr("Vault \"{name}\" added. Couldn't start syncing: {error}", {

@@ -77,6 +77,9 @@ const HOST_ANSWERS = {
   rewind_cancel: "", conflicts: [],
   cloud_bin: [{seq: 7, at_ms: 5000, path: "/Docs/gone.txt", folder: false, size: 3, restorable: true}],
   cloud_bin_restore: "/Docs/gone.txt",
+  vault_default_folder: a => "C:\\Users\\Test\\" + (a.remote.split(/[\\/]/).filter(Boolean).pop() || "Private") + " Vault",
+  cloud_folders: a => a.parent === "private" ? {parent:"private", folders:[], next:null}
+    : {parent:"drive", folders:[{id:"private",name:"Private"}], next:null},
   item_history: a => a.before ? [{seq: 1, at_ms: 1000, outcome: "done", action: "upload", path: "/Docs/old.txt", detail: "Older edit"}]
     : Array.from({length: 100}, (_, i) => ({seq: 101-i, at_ms: 5000, outcome: "done", action: "upload", path: "/Docs/a.txt", detail: "Saved edit"})),
   item_versions: {versions: [{id: "v1", modified_ms: 2000, size: 3, current: false}]},
@@ -88,7 +91,8 @@ window.chrome = {webview: {
     let v = HOST_ANSWERS[m.op];
     if (typeof v === "function") v = v(m.args);
     if (v === undefined) v = {};
-    Promise.resolve(v).then(answer => setTimeout(() => HOST_LISTENERS.forEach(f => f({data: {id: m.id, ok: answer}})), 1));
+    Promise.resolve(v).then(answer => setTimeout(() => HOST_LISTENERS.forEach(f => f({data:
+      answer instanceof Error ? {id: m.id, error: answer.message} : {id: m.id, ok: answer}})), 1));
   },
   addEventListener(type, f) { HOST_LISTENERS.push(f); }
 }};
@@ -511,15 +515,134 @@ const DRIVER: &str = r##"<script>
     vaultControls.remove(); focusBack.remove();
     for (const [id, prefix] of [["dlg-vault-new", "vc"], ["dlg-vault-add", "va"]]) {
       const d = document.getElementById(id), pw = document.getElementById(prefix + "-pw");
-      check(prefix + " explains the OneDrive path and why the local folder is empty", document.getElementById(prefix + "-remote").labels.length === 1
-        && document.getElementById(prefix + "-remote-help").textContent.includes("/Private")
-        && document.getElementById(prefix + "-local").labels[0].textContent === "Decrypted folder on this PC"
-        && document.getElementById(prefix + "-local-help").textContent.includes("existing files aren't added"), "");
+      const remote = document.getElementById(prefix + "-remote"), local = document.getElementById(prefix + "-local");
+      const edit = (input, value) => { enterSecret(input, value); input.dispatchEvent(new Event("change", {bubbles:true})); };
+      const defaultAnswer = HOST_ANSWERS.vault_default_folder;
+      const mutationCount = () => HOST_CALLS.filter(m=>m.op === "vault_create" || m.op === "vault_add").length;
+      const before = mutationCount();
+      remote.value = "/Private"; enterSecret(local, "");
+      document.querySelector(`#add-menu [data-dlg="${id}"]`).click(); await sleep(50);
+      check(prefix + " prioritizes location and password, then shows an automatic local folder", remote.labels[0].textContent === "Vault location (on OneDrive)"
+        && (remote.compareDocumentPosition(pw) & Node.DOCUMENT_POSITION_FOLLOWING)
+        && (document.getElementById(prefix + "-full").compareDocumentPosition(local) & Node.DOCUMENT_POSITION_FOLLOWING)
+        && local.value === "C:\\Users\\Test\\Private Vault" && document.activeElement === remote, local.value);
+      check(prefix + " distinguishes the cloud and local Browse buttons", document.getElementById(prefix + "-cloud").getAttribute("aria-label") === "Browse OneDrive folders"
+        && document.getElementById(prefix + "-browse").getAttribute("aria-label") === "Browse folders on this PC", "");
+      check(prefix + " keeps the checkbox small and accurately qualifies clearing downloads", document.getElementById(prefix + "-full").labels[0].textContent === "Always keep vault files on this PC (Cloud backup remains encrypted)"
+        && d.textContent.includes("Unless you always keep files here") && !d.textContent.includes("Experimental:"), "");
+      check(prefix + " dialog and fields fit the desktop viewport", d.getBoundingClientRect().height <= innerHeight
+        && d.scrollWidth <= d.clientWidth + 1 && [...d.querySelectorAll("input,button")].every(el=>el.getBoundingClientRect().right <= d.getBoundingClientRect().right), d.getBoundingClientRect().height);
+      d.style.width = "360px";
+      check(prefix + " narrow dialog wraps copy and keeps both Browse controls inside", d.scrollWidth <= d.clientWidth + 1
+        && [...d.querySelectorAll("input,button")].every(el=>el.getBoundingClientRect().right <= d.getBoundingClientRect().right), d.scrollWidth);
+      d.style.width = "";
       check(prefix + " has no persistent password option", !document.getElementById(prefix + "-remember"), "");
-      pw.value = "unsaved-test-password"; d.showModal();
+      edit(remote, "/Taxes"); await sleep(50);
+      check(prefix + " names the suggested local folder after the selected vault", local.value === "C:\\Users\\Test\\Taxes Vault", local.value);
+      const cancelledSuggestions = [];
+      HOST_ANSWERS.vault_default_folder = () => new Promise(resolve=>cancelledSuggestions.push(resolve));
+      edit(remote, "/Native cancel"); await sleep(20);
+      HOST_ANSWERS.pick_folder = null;
+      document.getElementById(prefix + "-browse").click(); await sleep(30);
+      cancelledSuggestions[1]("C:\\Users\\Test\\Native cancel Vault");
+      cancelledSuggestions[0]("C:\\Users\\Test\\Stale cancel Vault"); await sleep(30);
+      check(prefix + " cancelling native Browse resumes a pending automatic suggestion", local.value.endsWith("Native cancel Vault")
+        && !document.getElementById(prefix + "-local-help").textContent.includes("Selecting"), local.value);
+      const delayedDefaults = [];
+      HOST_ANSWERS.vault_default_folder = () => new Promise(resolve=>delayedDefaults.push(resolve));
+      edit(remote, "/Older"); await sleep(20); edit(remote, "/Newer"); await sleep(20);
+      delayedDefaults[1]("C:\\Users\\Test\\Newer Vault"); await sleep(20);
+      delayedDefaults[0]("C:\\Users\\Test\\Older Vault"); await sleep(30);
+      check(prefix + " ignores an older suggestion after the OneDrive location changes", local.value.endsWith("Newer Vault"), local.value);
+      edit(remote, "/Pending"); await sleep(20);
+      enterSecret(local, "D:\\My vault"); delayedDefaults[2]("C:\\Users\\Test\\Pending Vault"); await sleep(30);
+      edit(remote, "/Another"); await sleep(30);
+      check(prefix + " preserves a typed local override through pending replies and later cloud changes", local.value === "D:\\My vault" && delayedDefaults.length === 3, local.value);
+      HOST_ANSWERS.pick_folder = null;
+      document.getElementById(prefix + "-browse").focus(); document.getElementById(prefix + "-browse").click(); await sleep(30);
+      check(prefix + " cancelling local Browse preserves the path and focus", local.value === "D:\\My vault" && document.activeElement.id === prefix + "-browse", local.value);
+      HOST_ANSWERS.pick_folder = "D:\\Chosen vault";
+      document.getElementById(prefix + "-browse").click(); await sleep(30);
+      edit(remote, "/Elsewhere"); await sleep(30);
+      check(prefix + " preserves the native folder choice as an override", local.value === "D:\\Chosen vault" && delayedDefaults.length === 3, local.value);
+      HOST_ANSWERS.vault_default_folder = new Error("folder check unavailable");
+      edit(local, ""); await sleep(30);
+      check(prefix + " failed suggestions leave a required empty field and a Browse recovery", !local.value && !local.checkValidity()
+        && document.getElementById(prefix + "-local-help").textContent.includes("folder check unavailable"), local.value);
+      HOST_ANSWERS.vault_default_folder = defaultAnswer;
+      // Browsing beyond the first page and into a folder never creates anything.
+      const cloudAnswer = HOST_ANSWERS.cloud_folders;
+      HOST_ANSWERS.cloud_folders = a => a.parent === "outside" ? {parent:"outside",folders:[],next:null}
+        : a.next ? {parent:"drive",folders:[{id:"outside",name:"Outside main"}],next:null}
+        : {parent:"drive",folders:[{id:"private",name:"Private"}],next:"page-2"};
+      pw.value = "unsaved-test-password";
+      document.getElementById(prefix + "-cloud").focus();
+      document.getElementById(prefix + "-cloud").click(); await sleep(40);
+      const cloudDialog = document.querySelector("#dlg-cloud-folder");
+      check(prefix + " cloud chooser loads a bounded first page", cloudDialog.open && document.querySelectorAll("#cloud-folder-list button").length === 1
+        && !document.querySelector("#cloud-folder-more").hidden && document.querySelector("#cloud-folder-select").disabled, "");
+      document.querySelector("#cloud-folder-more").click(); await sleep(30);
+      check(prefix + " cloud paging retains one page and offers a return to the first", document.querySelectorAll("#cloud-folder-list button").length === 1
+        && !document.querySelector("#cloud-folder-first").hidden, "");
+      [...document.querySelectorAll("#cloud-folder-list button")].find(b=>b.textContent === "Outside main").click(); await sleep(30);
+      check(prefix + " cloud chooser shows empty folders without losing selection", document.querySelector("#cloud-folder-status").textContent === "No folders."
+        && !document.querySelector("#cloud-folder-select").disabled && document.querySelector("#cloud-folder-path").textContent === "/Outside main", "");
+      if (prefix === "vc") edit(document.querySelector("#cloud-folder-new"), "New vault");
+      check(prefix + " cloud chooser fits and only creation offers a new child", cloudDialog.scrollWidth <= cloudDialog.clientWidth + 1
+        && cloudDialog.getBoundingClientRect().height <= innerHeight && document.querySelector("#cloud-folder-new-field").hidden === (prefix === "va"), "");
+      cloudDialog.style.width = "360px";
+      check(prefix + " narrow cloud chooser keeps its controls inside", cloudDialog.scrollWidth <= cloudDialog.clientWidth + 1, cloudDialog.scrollWidth);
+      cloudDialog.style.width = "";
+      document.querySelector("#cloud-folder-select").click(); await sleep(50);
+      const selectedPath = prefix === "vc" ? "/Outside main/New vault" : "/Outside main";
+      check(prefix + " cloud selection updates location and the automatic folder without mutation", remote.value === selectedPath && local.value.endsWith((prefix === "vc" ? "New vault" : "Outside main") + " Vault")
+        && mutationCount() === before && pw.value === "unsaved-test-password", remote.value + ": " + local.value);
+      HOST_ANSWERS.cloud_folders = new Error("OneDrive offline");
+      document.getElementById(prefix + "-cloud").focus();
+      document.getElementById(prefix + "-cloud").click(); await sleep(30);
+      check(prefix + " cloud listing failures offer Retry", !document.querySelector("#cloud-folder-retry").hidden
+        && document.querySelector("#cloud-folder-status").textContent === "OneDrive offline", "");
+      HOST_ANSWERS.cloud_folders = cloudAnswer;
+      document.querySelector("#cloud-folder-retry").click(); await sleep(30);
+      check(prefix + " Retry restores folder navigation", document.querySelectorAll("#cloud-folder-list button").length === 1 && document.querySelector("#cloud-folder-retry").hidden, "");
+      if (prefix === "vc") {
+        edit(document.querySelector("#cloud-folder-new"), "bad/name");
+        document.querySelector("#cloud-folder-select").click(); await sleep(20);
+        check("new cloud folder names refuse slashes without closing the chooser", cloudDialog.open && !document.querySelector("#cloud-folder-new").checkValidity(), "");
+        document.querySelector("#cloud-folder-cancel").click();
+      } else cloudDialog.requestClose();
+      await sleep(30);
+      check(prefix + " cancelling cloud Browse preserves location, password and focus", remote.value === selectedPath && pw.value === "unsaved-test-password"
+        && document.activeElement.id === prefix + "-cloud", document.activeElement.id);
+      let oldCloud;
+      HOST_ANSWERS.cloud_folders = () => new Promise(resolve=>oldCloud = resolve);
+      document.getElementById(prefix + "-cloud").click(); await sleep(20);
+      cloudDialog.requestClose(); await sleep(20);
+      HOST_ANSWERS.cloud_folders = cloudAnswer;
+      document.getElementById(prefix + "-cloud").click(); await sleep(30);
+      oldCloud({parent:"old-drive",folders:[{id:"stale",name:"Stale folder"}],next:null}); await sleep(30);
+      check(prefix + " a cancelled cloud listing cannot replace a reopened chooser", !document.querySelector("#cloud-folder-list").textContent.includes("Stale folder"), document.querySelector("#cloud-folder-list").textContent);
+      cloudDialog.requestClose(); await sleep(20);
+      HOST_ANSWERS.vault_default_folder = () => new Promise(resolve=>delayedDefaults.push(resolve));
+      edit(remote, "/Closed"); await sleep(20);
       check(prefix + " Enter submits the vault action", d.querySelector(":default") === document.getElementById(prefix + "-add"), "");
       document.getElementById(prefix + "-cancel").click(); await sleep(30);
       check(prefix + " Cancel clears its password without validation", !d.open && !pw.value, pw.value);
+      HOST_ANSWERS.vault_default_folder = defaultAnswer;
+      remote.value = "/Reopened";
+      document.querySelector(`#add-menu [data-dlg="${id}"]`).click(); await sleep(40);
+      delayedDefaults[3]("C:\\Users\\Test\\Closed Vault"); await sleep(30);
+      check(prefix + " a closed dialog's suggestion cannot replace a reopened form", local.value.endsWith("Reopened Vault"), local.value);
+      const operation = prefix === "vc" ? "vault_create" : "vault_add", savedAnswer = HOST_ANSWERS[operation];
+      HOST_ANSWERS[operation] = new Error("test vault unavailable");
+      pw.value = "test-only-password";
+      if (prefix === "vc") document.querySelector("#vc-pw2").value = "test-only-password";
+      document.getElementById(prefix + "-add").click(); await sleep(50);
+      check(prefix + " failed submission keeps the form usable and preserves the chosen paths", d.open && !document.getElementById(prefix + "-add").disabled
+        && !document.getElementById(prefix + "-busy").textContent && local.value.endsWith("Reopened Vault") && pw.value === "test-only-password"
+        && document.querySelector("#toast").textContent === "test vault unavailable", "");
+      HOST_ANSWERS[operation] = savedAnswer;
+      document.getElementById(prefix + "-cancel").click(); await sleep(30);
     }
     showRecovery("old-test-key");
     document.querySelector("#dlg-recovery").close();
@@ -539,8 +662,8 @@ const DRIVER: &str = r##"<script>
       ["vault_create", "vc", "dlg-vault-new", "Running new vault", null],
       ["vault_add", "va", "dlg-vault-add", "Running existing vault", null]
     ]) {
-      let previousRoots;
-      HOST_ANSWERS.roots = () => new Promise(resolve => previousRoots = resolve);
+      const previousRootReplies = [];
+      HOST_ANSWERS.roots = () => new Promise(resolve => previousRootReplies.push(resolve));
       const previousRefresh = openFiles();
       await sleep(30);
       HOST_ANSWERS.roots = savedRoots;
@@ -553,7 +676,7 @@ const DRIVER: &str = r##"<script>
       };
       const dialog = document.getElementById(dialogId);
       document.getElementById(prefix + "-remote").value = "/" + name;
-      document.getElementById(prefix + "-local").value = "C:\\Vaults\\" + name;
+      enterSecret(document.getElementById(prefix + "-local"), "C:\\Vaults\\" + name);
       document.getElementById(prefix + "-pw").value = "test-only-password";
       if (prefix === "vc") document.querySelector("#vc-pw2").value = "test-only-password";
       dialog.showModal();
@@ -568,6 +691,8 @@ const DRIVER: &str = r##"<script>
         && !dialog.open && !document.getElementById(prefix + "-add").disabled, document.getElementById(prefix + "-busy").textContent);
       check(op + " clears its password after registration", !document.getElementById(prefix + "-pw").value
         && (prefix !== "vc" || !document.querySelector("#vc-pw2").value), "");
+      check(op + " resets the local override for the next vault", !document.getElementById(prefix + "-local").value
+        && !vaultForms.get(prefix).custom, document.getElementById(prefix + "-local").value);
       if (prefix === "vc") {
         check("creation shows the recovery key without waiting for settings", document.querySelector("#dlg-recovery").open
           && document.querySelector("#recovery-text").textContent === "OUD1-test-recovery", document.querySelector("#recovery-text").textContent);
@@ -577,7 +702,7 @@ const DRIVER: &str = r##"<script>
       HOST_ANSWERS.snapshot = savedVaultSnapshot;
       for (const resolve of settingsReplies) resolve(savedVaultSnapshot({}));
       await sleep(100);
-      previousRoots(savedRoots);
+      for (const resolve of previousRootReplies) resolve(savedRoots);
       await previousRefresh;
       check(op + " keeps its tab when an older list reply arrives", document.querySelector("#roots [aria-selected=true]")?.textContent.includes(name),
         document.querySelector("#roots").textContent);
