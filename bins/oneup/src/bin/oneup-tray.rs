@@ -11,7 +11,19 @@
 #![windows_subsystem = "windows"]
 
 #[cfg(windows)]
+#[path = "../settings_window.rs"]
+mod settings_window;
+
+#[cfg(windows)]
 fn main() {
+    let mut args = std::env::args_os();
+    let program = args.next();
+    if args.next().is_some_and(|arg| arg == oneup_app::launch::SETTINGS_FALLBACK) {
+        if let Err(e) = settings_window::run(program.into_iter().chain(args)) {
+            oneup_sys::tray::error_box("OneUpDrive", &format!("Couldn't open Settings: {e:#}"));
+        }
+        return;
+    }
     // Installing, updating or uninstalling calls this program first.
     oneup_app::install::hooks();
     oneup_app::setup::tls();

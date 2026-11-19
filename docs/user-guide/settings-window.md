@@ -2,6 +2,8 @@
 
 Open it from the OneUpDrive icon's menu: **Settings**, or from OneUpDrive in the Start menu. Changes are saved as you make them, and the background agent picks them up straight away (the few that wait for a restart say so). The window follows Windows' light or dark mode and uses memory only while it's open.
 
+If Windows refuses to launch Settings because of an Explorer integration error, OneUpDrive opens the window without that integration. File Explorer's OneUpDrive commands still need a working Windows registration.
+
 ## Set up
 Shown automatically until a folder is set up: sign in, choose the folders, what to exclude and Files On-Demand, look at the preview, **Start syncing**. Reopen it from **General > Updates > Run setup again > Open**. The wizard starts with your current folders, saved exclusions, Files On-Demand and start-up preferences. Opening it preserves your account and sync state; compare the folders again before starting. See [Getting started](getting-started.md#setting-up). On a PC with the OneDrive app, it first offers **Move over from the OneDrive app** (see the [glossary](glossary.md) for unfamiliar words): your OneDrive folder stays where it is, after a check and unlinking the app. See [Moving over from the OneDrive app](migrating-from-onedrive.md#in-the-settings-window).
 

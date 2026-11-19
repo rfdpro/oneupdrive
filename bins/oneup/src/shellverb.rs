@@ -49,14 +49,7 @@ pub async fn run(verb: &str, path: &Path) -> Result<()> {
 fn item_page(dir: &Path, path: &Path, page: &str) -> Result<()> {
     // Its own main data folder's window (a pair's items show there too).
     let main = oneup_app::vaultpair::main_dir(dir);
-    std::process::Command::new(oneup_app::launch::sibling("oneup-settings.exe")?)
-        .arg("--data-dir")
-        .arg(&main)
-        .args(["--page", page, "--item"])
-        .arg(path)
-        .spawn()
-        .context("opening the settings window")?;
-    Ok(())
+    oneup_app::launch::start_settings_at(&main, page, Some(path))
 }
 
 /// Opens the item's page on onedrive.com.
