@@ -510,29 +510,6 @@ pub fn apply_profile(
     control.set_policy(policy);
 }
 
-/// Windows' network-change events, for the agent to wait on: what the
-/// handler `oneup_sys::network::watch` calls pings it, and [`Events::next`]
-/// waits for the next change.
-#[derive(Debug, Default)]
-pub struct Events {
-    notify: tokio::sync::Notify,
-}
-
-impl Events {
-    /// Windows reported a change (any thread).
-    pub fn changed(&self) {
-        self.notify.notify_one();
-    }
-
-    /// Waits for a change. At once, not after letting a burst settle:
-    /// what the old network's profile allowed must stop as soon as the new
-    /// one applies (each change of a burst is read again; that costs a
-    /// look, not a request).
-    pub async fn next(&self) {
-        self.notify.notified().await;
-    }
-}
-
 /// Why sync waits for the connection itself, if it does: a network that
 /// wants a sign-in first (a captive portal), or none at all. Retrying then
 /// only collects errors; Windows reports when that changes. A network
@@ -851,7 +828,7 @@ mod tests {
     /// The roadmap's exit test for network changes: Windows reporting a
     /// metered network (an injected event, simulated time) stops the next
     /// upload of a round under way within 10 s, and pauses sync where the
-    /// metered profile pauses. The agent reacts to [`Events::next`] by
+    /// metered profile pauses. The agent reacts to an event by
     /// reading the network and handing the profile's policy and pause to
     /// its control state, as here.
     #[tokio::test(start_paused = true)]
@@ -860,7 +837,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         let control = Arc::new(crate::control::Control::new(None, "L".into(), "/R".into(), Default::default()));
-        let events = Arc::new(Events::default());
+        let (network_changed, events) = tokio::sync::watch::channel(());
         let metered = Arc::new(AtomicBool::new(false));
         let free = Agent { pause_on_metered: false, ..Agent::default() };
         let nets = Networks {
@@ -872,12 +849,11 @@ mod tests {
         let up = Arc::new(oneup_graph::throttle::Throttle::default());
         let down = Arc::new(oneup_graph::throttle::Throttle::default());
         let react = |agent: Agent| {
-            let (control, events, metered, nets) =
-                (Arc::clone(&control), Arc::clone(&events), Arc::clone(&metered), nets.clone());
+            let (control, mut events, metered, nets) =
+                (Arc::clone(&control), events.clone(), Arc::clone(&metered), nets.clone());
             let (up, down) = (Arc::clone(&up), Arc::clone(&down));
             tokio::spawn(async move {
-                loop {
-                    events.next().await;
+                while events.changed().await.is_ok() {
                     let seen = Seen { id: Some(HOME.into()), name: "Phone".into(), metered: metered.load(Relaxed) };
                     let p = active(&agent, Interval::default(), &nets, &seen);
                     apply_profile(&control, &up, &down, &agent, &p, None, 600);
@@ -899,7 +875,7 @@ mod tests {
         assert!(check(&upload), "everything goes before the switch");
         let at = tokio::time::Instant::now();
         metered.store(true, Relaxed);
-        events.changed();
+        network_changed.send_replace(());
         while check(&upload) {
             assert!(at.elapsed() < std::time::Duration::from_secs(10), "not within 10 s");
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -913,12 +889,12 @@ mod tests {
         // With the default, metered pauses: both sides, at once.
         let task = react(Agent::default());
         metered.store(false, Relaxed);
-        events.changed();
+        network_changed.send_replace(());
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
         assert!(!control.controls().pause_remote);
         let at = tokio::time::Instant::now();
         metered.store(true, Relaxed);
-        events.changed();
+        network_changed.send_replace(());
         while !control.controls().pause_remote {
             assert!(at.elapsed() < std::time::Duration::from_secs(10), "not within 10 s");
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

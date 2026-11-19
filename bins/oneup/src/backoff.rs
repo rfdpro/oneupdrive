@@ -89,7 +89,7 @@ pub fn record(o: &Ops<'_>, report: &Report, now_ms: i64) -> oneup_store::Result<
     }
     for (op, error) in &report.failed {
         if let Some(item) = item(op) {
-            let r = o.retry_failed(item, &version(op), error, now_ms)?;
+            let r = o.retry_failed(item, &version(op), &error.message, error.connection, now_ms)?;
             out.waiting += 1;
             out.first_ms = Some(out.first_ms.map_or(r.until_ms, |f| f.min(r.until_ms)));
         }
@@ -170,9 +170,43 @@ mod tests {
 
     #[test]
     fn the_wait_is_told_plainly() {
-        let r = |failures, until_ms| Retry { version: String::new(), failures, until_ms, error: "HTTP 500".into() };
+        let r = |failures, until_ms| Retry {
+            version: String::new(),
+            failures,
+            until_ms,
+            error: "HTTP 500".into(),
+            connection: false,
+        };
         assert_eq!(describe(&r(1, 60_000), 0), "failed once; tried again in 1 min (HTTP 500)");
         assert_eq!(describe(&r(3, 4_000_000), 0), "failed 3 times in a row; tried again in 1 h 7 min (HTTP 500)");
         assert_eq!(describe(&r(2, 0), 5), "failed 2 times in a row; tried again at the next round (HTTP 500)");
+    }
+
+    #[test]
+    fn reconnect_releases_only_items_interrupted_by_the_connection() {
+        let mut store = Store::open_in_memory().unwrap();
+        let upload = upload((7, 9), "e1");
+        let download = Op::Download {
+            remote: RemotePre { id: RemoteId("download".into()), etag: "e2".into() },
+            to: LocalId(12),
+            parent: 1,
+            name: "file".into(),
+            replace: None,
+            link: Link::New,
+        };
+        let report = Report {
+            failed: vec![
+                (upload.clone(), oneup_exec::Failure { message: "network error".into(), connection: true }),
+                (download.clone(), "HTTP 500".into()),
+            ],
+            ..Report::default()
+        };
+        store.write(|o| record(o, &report, 0)).unwrap();
+        assert_eq!(
+            store.read(|o| Ok((until(o, &upload, 1)?, until(o, &download, 1)?))).unwrap(),
+            (Some(60_000), Some(60_000))
+        );
+        assert_eq!(store.write(|o| o.retry_connection_clear()).unwrap(), 1);
+        assert_eq!(store.read(|o| Ok((until(o, &upload, 1)?, until(o, &download, 1)?))).unwrap(), (None, Some(60_000)));
     }
 }

@@ -4691,7 +4691,7 @@ async fn a_case_only_rename_of_a_large_folder_is_reported() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(failed.iter().any(|(_, why)| why.contains("case")), "{failed:?}");
+    assert!(failed.iter().any(|(_, why)| why.message.contains("case")), "{failed:?}");
     assert_eq!(cloud.tree(), before, "nothing changed in OneDrive");
 }
 
@@ -7122,7 +7122,7 @@ async fn everyday_what_a_restore_brings_back_is_checked_not_assumed() {
     assert!(s.round().await.done.is_empty());
     s.stops.approve();
     let r = s.attempt().await;
-    assert!(r.failed.iter().any(|(_, why)| why.contains("as another item")), "said at once: {r:?}");
+    assert!(r.failed.iter().any(|(_, why)| why.message.contains("as another item")), "said at once: {r:?}");
     for _ in 0..10 {
         let r = s.attempt().await;
         if r.is_idle() && r.skipped.is_empty() && s.stops.rewind.as_ref().is_some_and(|r| r.done) {

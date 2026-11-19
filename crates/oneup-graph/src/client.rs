@@ -982,6 +982,9 @@ impl Graph {
             if req.auth {
                 match self.auth.access_token().await {
                     Ok(t) => rb = rb.bearer_auth(token.insert(t)),
+                    Err(Error::Http(e)) if attempt == MAX_ATTEMPTS && crate::send_connection_failure(&e) => {
+                        return Err(Error::TransportExhausted { attempts: attempt, source: e.without_url() });
+                    }
                     // The token endpoint unreachable, busy or failing isn't a
                     // refused sign-in: try again like a failed request.
                     Err(e) if e.is_transient() => {
@@ -1047,6 +1050,9 @@ impl Graph {
             let resp = match sent.map_err(|e| req.plain(e)) {
                 Ok(r) => r,
                 Err(e) if !req.retry => return Err(e.into()),
+                Err(e) if attempt == MAX_ATTEMPTS && crate::send_connection_failure(&e) => {
+                    return Err(Error::TransportExhausted { attempts: attempt, source: e.without_url() });
+                }
                 Err(e) => {
                     drop(permit);
                     self.stats.retries.fetch_add(1, Relaxed);
@@ -1101,6 +1107,9 @@ impl Graph {
             let body = match body.map_err(|e| req.plain(e)) {
                 Ok(b) => b,
                 Err(e) if !req.retry => return Err(e.into()),
+                Err(e) if attempt == MAX_ATTEMPTS => {
+                    return Err(Error::TransportExhausted { attempts: attempt, source: e.without_url() });
+                }
                 Err(e) => {
                     drop(permit);
                     self.stats.retries.fetch_add(1, Relaxed);
@@ -2375,5 +2384,25 @@ Content-Length: 50000000
     fn backoff_is_bounded() {
         assert!(backoff(1) < backoff(3));
         assert_eq!(backoff(6), backoff(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_connection_retries_keep_the_network_error() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let graph = signed_in(&base);
+
+        let error = graph.drive().await.unwrap_err();
+
+        let source = std::error::Error::source(&error).and_then(|source| source.downcast_ref::<reqwest::Error>());
+        assert!(source.is_some_and(|e| e.is_connect() && e.url().is_none()), "{error:?}");
+        assert_eq!(graph.stats.requests.load(Relaxed), u64::from(MAX_ATTEMPTS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bad_request_url_is_not_a_connection_failure() {
+        let error = signed_in("http://127.0.0.1").get::<serde_json::Value>("invalid URL").await.unwrap_err();
+        assert!(matches!(error, Error::Exhausted(_)), "{error:?}");
     }
 }

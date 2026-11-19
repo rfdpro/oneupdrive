@@ -407,6 +407,9 @@ fn map_status(a: &oneup_graph::client::BatchResp, what: String) -> CloudError {
 }
 
 fn map(e: oneup_graph::Error) -> CloudError {
+    if e.is_connection_failure() {
+        return CloudError::Connection(e.summary());
+    }
     if e.is_too_many_items() {
         return CloudError::TooManyItems;
     }
@@ -483,7 +486,9 @@ const SENDS: u32 = 5;
 /// lost (the connection or the server failed) or a send found the bytes
 /// already there (416).
 fn maybe_received(e: &oneup_graph::Error) -> bool {
-    e.is_transient() || matches!(e, oneup_graph::Error::Exhausted(_)) || e.status() == Some(416)
+    e.is_transient()
+        || matches!(e, oneup_graph::Error::Exhausted(_) | oneup_graph::Error::TransportExhausted { .. })
+        || e.status() == Some(416)
 }
 
 /// Sends `total` bytes from `src` through session `s`, in fragments
@@ -580,8 +585,13 @@ async fn send_from<S: Session>(
     // A used-up data budget keeps it too: once more is allowed (or another
     // network), it goes on from there, never from the file's first byte.
     let end = |e: &oneup_graph::Error, prefix: &oneup_hash::QuickXorHash, at: u64, have: &[u8], sent: &[u8]| {
-        let cut_off =
-            e.is_transient() || matches!(e, oneup_graph::Error::Exhausted(_) | oneup_graph::Error::OverBudget);
+        let cut_off = e.is_transient()
+            || matches!(
+                e,
+                oneup_graph::Error::Exhausted(_)
+                    | oneup_graph::Error::TransportExhausted { .. }
+                    | oneup_graph::Error::OverBudget
+            );
         (keep && cut_off).then(|| {
             let mut p = prefix.clone();
             p.update(have);
@@ -942,6 +952,9 @@ impl Cloud for GraphCloud {
         };
         fetched.map_err(|e| match e {
             oneup_graph::Error::Local(io) => CloudError::Io(io),
+            // This reads file bytes through Response::chunk. A decode
+            // error here means the response body was interrupted.
+            oneup_graph::Error::Http(ref error) if error.is_decode() => CloudError::Connection(e.summary()),
             e => map(e),
         })?;
         self.timings.record("download: content", started);

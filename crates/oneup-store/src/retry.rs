@@ -25,6 +25,8 @@ use crate::{Ops, Result};
 pub const FIRST_MS: i64 = 60_000;
 /// The longest wait.
 pub const MAX_MS: i64 = 3_600_000;
+/// Fallback when Windows misses the connection's return.
+pub const MAX_CONNECTION_MS: i64 = 120_000;
 /// How long after its time a record is kept for an item not tried again.
 pub const STALE_MS: i64 = 24 * 3_600_000;
 /// The most of an error message a record keeps (for `oneup explain`).
@@ -40,6 +42,8 @@ CREATE TABLE retry (
 ) WITHOUT ROWID;
 CREATE INDEX retry_until ON retry(until_ms);
 ";
+pub(crate) const V30_COLUMN: (&str, &str, &str) = ("retry", "connection", "INTEGER NOT NULL DEFAULT 0");
+pub(crate) const MIGRATE_V30: &str = "CREATE INDEX IF NOT EXISTS retry_connection ON retry(item) WHERE connection = 1;";
 
 /// The item an operation acts on: a file or folder on this PC, or in OneDrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +71,7 @@ pub struct Retry {
     pub until_ms: i64,
     /// Why it last failed.
     pub error: String,
+    pub connection: bool,
 }
 
 impl Retry {
@@ -99,13 +104,14 @@ impl Ops<'_> {
     pub fn retry_get(&self, item: Item<'_>) -> Result<Option<Retry>> {
         Ok(self
             .c
-            .prepare_cached("SELECT version, failures, until_ms, error FROM retry WHERE item = ?1")?
+            .prepare_cached("SELECT version, failures, until_ms, error, connection FROM retry WHERE item = ?1")?
             .query_row([item.key()], |r| {
                 Ok(Retry {
                     version: r.get(0)?,
                     failures: u32::try_from(r.get::<_, i64>(1)?).unwrap_or(u32::MAX),
                     until_ms: r.get(2)?,
                     error: r.get(3)?,
+                    connection: r.get(4)?,
                 })
             })
             .optional()?)
@@ -115,24 +121,39 @@ impl Ops<'_> {
     /// `error`, and returns when it may be tried again. Another failure of
     /// the same operation doubles the wait; a different operation starts
     /// over.
-    pub fn retry_failed(&self, item: Item<'_>, version: &str, error: &str, now_ms: i64) -> Result<Retry> {
+    pub fn retry_failed(
+        &self,
+        item: Item<'_>,
+        version: &str,
+        error: &str,
+        connection: bool,
+        now_ms: i64,
+    ) -> Result<Retry> {
         let failures = match self.retry_get(item)? {
-            Some(r) if r.version == version => r.failures.saturating_add(1),
+            Some(r) if r.version == version && r.connection == connection => r.failures.saturating_add(1),
             _ => 1,
         };
+        let wait = wait_ms(failures);
+        let wait = if connection { wait.min(MAX_CONNECTION_MS) } else { wait };
         let r = Retry {
             version: version.to_string(),
             failures,
-            until_ms: now_ms.saturating_add(wait_ms(failures)),
+            until_ms: now_ms.saturating_add(wait),
             error: bounded(error).to_string(),
+            connection,
         };
         self.c
             .prepare_cached(
-                "INSERT INTO retry(item, version, failures, until_ms, error) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(item) DO UPDATE SET version = ?2, failures = ?3, until_ms = ?4, error = ?5",
+                "INSERT INTO retry(item, version, failures, until_ms, error, connection) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(item) DO UPDATE SET version = ?2, failures = ?3, until_ms = ?4, error = ?5, connection = ?6",
             )?
-            .execute(rusqlite::params![item.key(), r.version, i64::from(r.failures), r.until_ms, r.error])?;
+            .execute(rusqlite::params![item.key(), r.version, i64::from(r.failures), r.until_ms, r.error, r.connection])?;
         Ok(r)
+    }
+
+    /// The connection returned. The dirty marks still drive ordinary planning.
+    pub fn retry_connection_clear(&self) -> Result<usize> {
+        Ok(self.c.prepare_cached("DELETE FROM retry WHERE connection = 1")?.execute([])?)
     }
 
     /// `item` synced: its failures are over.
@@ -183,17 +204,49 @@ mod tests {
     }
 
     #[test]
+    fn connection_failures_have_a_short_fallback() {
+        let mut store = Store::open_in_memory().unwrap();
+        let item = Item::Local(LocalId(1));
+        let mut at = 0;
+        for _ in 0..8 {
+            let retry = store.write(|o| o.retry_failed(item, "upload", "network error", true, at)).unwrap();
+            assert!(retry.until_ms <= at + MAX_CONNECTION_MS);
+            at = retry.until_ms;
+        }
+        let retry = store.write(|o| o.retry_failed(item, "upload", "HTTP 500", false, at)).unwrap();
+        assert_eq!(retry.until_ms, at + FIRST_MS, "a new failure cause starts at the first wait");
+        assert_eq!(store.write(|o| o.retry_connection_clear()).unwrap(), 0);
+    }
+
+    #[test]
+    fn upgrade_keeps_a_legacy_retry_deadline() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX retry_connection; ALTER TABLE retry DROP COLUMN connection; PRAGMA user_version = 29;",
+            )
+            .unwrap();
+        let item = Item::Local(LocalId(7));
+        store.conn.execute("INSERT INTO retry VALUES (?1, 'upload', 5, 9000, 'legacy')", [item.key()]).unwrap();
+
+        crate::migrate(&mut store.conn).unwrap();
+        assert_eq!(store.write(|o| o.retry_connection_clear()).unwrap(), 0);
+        assert_eq!(store.read(|o| o.retry_get(item)).unwrap().unwrap().until_ms, 9000);
+    }
+
+    #[test]
     fn failures_in_a_row_wait_longer_and_success_or_a_change_starts_over() {
         let mut s = Store::open_in_memory().unwrap();
         let file = Item::Local(LocalId(7));
-        let r = s.write(|o| o.retry_failed(file, "upload v1", "HTTP 500", 1_000)).unwrap();
+        let r = s.write(|o| o.retry_failed(file, "upload v1", "HTTP 500", false, 1_000)).unwrap();
         assert_eq!((r.failures, r.until_ms), (1, 61_000));
         assert!(r.holds("upload v1", 60_999) && !r.holds("upload v1", 61_000), "until its time");
         assert!(!r.holds("upload v2", 2_000), "the file changed: not held");
-        let r = s.write(|o| o.retry_failed(file, "upload v1", "HTTP 500", 61_000)).unwrap();
+        let r = s.write(|o| o.retry_failed(file, "upload v1", "HTTP 500", false, 61_000)).unwrap();
         assert_eq!((r.failures, r.until_ms), (2, 181_000), "twice as long");
         // The file changed (a new stamp or eTag): its first failure again.
-        let r = s.write(|o| o.retry_failed(file, "upload v2", "HTTP 500", 200_000)).unwrap();
+        let r = s.write(|o| o.retry_failed(file, "upload v2", "HTTP 500", false, 200_000)).unwrap();
         assert_eq!((r.failures, r.until_ms), (1, 260_000));
         assert_eq!(s.read(|o| o.retry_get(file)).unwrap(), Some(r));
         // Another item is unaffected, and success removes the record.
@@ -209,8 +262,8 @@ mod tests {
         let mut s = Store::open_in_memory().unwrap();
         let (a, b) = (RemoteId("a".into()), RemoteId("b".into()));
         s.write(|o| {
-            o.retry_failed(Item::Remote(&a), "download", "x", 0)?;
-            o.retry_failed(Item::Local(LocalId(1)), "upload", &"é".repeat(400), 30_000)
+            o.retry_failed(Item::Remote(&a), "download", "x", false, 0)?;
+            o.retry_failed(Item::Local(LocalId(1)), "upload", &"é".repeat(400), false, 30_000)
         })
         .unwrap();
         assert_eq!(s.read(|o| o.retry_waiting(1_000)).unwrap(), (2, Some(60_000)));
@@ -231,7 +284,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("oneup-store-retry-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut s = Store::open(&path, 1024).unwrap();
-        s.write(|o| o.retry_failed(Item::Local(LocalId(9)), "v", "x", 5)).unwrap();
+        s.write(|o| o.retry_failed(Item::Local(LocalId(9)), "v", "x", false, 5)).unwrap();
         drop(s);
         let s = Store::open(&path, 1024).unwrap();
         assert_eq!(s.read(|o| o.retry_get(Item::Local(LocalId(9)))).unwrap().map(|r| r.until_ms), Some(60_005));

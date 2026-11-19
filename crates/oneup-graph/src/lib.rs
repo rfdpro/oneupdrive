@@ -49,6 +49,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("gave up after {0} attempts")]
     Exhausted(u32),
+    /// The retry limit was reached after a connection or response read failed.
+    #[error("network error after {attempts} attempts")]
+    TransportExhausted { attempts: u32, source: reqwest::Error },
     /// Writing downloaded content locally failed.
     #[error("writing the download: {0}")]
     Local(std::io::Error),
@@ -98,6 +101,15 @@ pub(crate) async fn error_body_counted(
 }
 
 impl Error {
+    /// A request or transfer interrupted by the connection.
+    pub fn is_connection_failure(&self) -> bool {
+        match self {
+            Error::Http(e) => send_connection_failure(e) || e.is_body(),
+            Error::Stalled(..) | Error::TransportExhausted { .. } => true,
+            _ => false,
+        }
+    }
+
     /// [`Error::Status`] for a refused request, keeping at most
     /// [`MAX_ERROR_BODY`] bytes of its body (cut on a character boundary).
     pub fn refused(status: u16, what: impl Into<String>, mut body: String) -> Self {
@@ -156,7 +168,9 @@ impl Error {
                 }
             }
             Error::Http(_) | Error::Stalled(..) => "network error".into(),
-            Error::Exhausted(n) => format!("gave up after {n} attempts"),
+            Error::Exhausted(n) | Error::TransportExhausted { attempts: n, .. } => {
+                format!("gave up after {n} attempts")
+            }
             Error::OverBudget => "data budget used up".into(),
             Error::Auth(_) => "sign-in failed".into(),
             Error::NotSignedIn => "not signed in".into(),
@@ -174,6 +188,10 @@ impl Error {
             _ => false,
         }
     }
+}
+
+pub(crate) fn send_connection_failure(e: &reqwest::Error) -> bool {
+    !e.is_builder() && !e.is_redirect() && (e.is_connect() || e.is_timeout() || e.is_request())
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
