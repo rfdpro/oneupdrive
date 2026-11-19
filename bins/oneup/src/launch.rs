@@ -160,15 +160,83 @@ pub fn start_settings(data_dir: &Path) -> Result<()> {
 /// window switches to as well.
 #[cfg(windows)]
 pub fn start_settings_on(data_dir: &Path, page: &str) -> Result<()> {
+    start_settings_at(data_dir, page, None)
+}
+
+/// Opens Settings on a page, with an optional selected item.
+#[cfg(windows)]
+pub fn start_settings_at(data_dir: &Path, page: &str, item: Option<&Path>) -> Result<()> {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    let mut cmd = std::process::Command::new(sibling("oneup-settings.exe")?);
-    cmd.arg("--data-dir").arg(data_dir);
-    if !page.is_empty() {
-        cmd.arg("--page").arg(page);
+    launch_settings(|exe, mode| {
+        let mut cmd = std::process::Command::new(sibling(exe)?);
+        cmd.args(mode).arg("--data-dir").arg(data_dir);
+        if !page.is_empty() {
+            cmd.arg("--page").arg(page);
+        }
+        if let Some(item) = item {
+            cmd.arg("--item").arg(item);
+        }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        spawn_outside_job(&mut cmd, CREATE_NEW_PROCESS_GROUP)?;
+        Ok(())
+    })
+    .context("opening the settings window")
+}
+
+/// The tray can host Settings without joining the identity package.
+#[cfg(windows)]
+pub const SETTINGS_FALLBACK: &str = "--settings-fallback";
+
+#[cfg(windows)]
+fn launch_settings(mut start: impl FnMut(&str, Option<&str>) -> Result<()>) -> Result<()> {
+    // ERROR_INSTALL_FAILED. A registered sparse package whose external
+    // path is missing can fail process creation with this code.
+    const ERROR_INSTALL_FAILED: i32 = 15609;
+    match start("oneup-settings.exe", None) {
+        Err(e)
+            if e.downcast_ref::<std::io::Error>().and_then(std::io::Error::raw_os_error)
+                == Some(ERROR_INSTALL_FAILED) =>
+        {
+            start("oneup-tray.exe", Some(SETTINGS_FALLBACK)).context("starting Settings without package identity")
+        }
+        r => r,
     }
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    spawn_outside_job(&mut cmd, CREATE_NEW_PROCESS_GROUP).context("opening the settings window")?;
-    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod settings_launch_tests {
+    use super::*;
+
+    #[test]
+    fn a_package_install_error_opens_settings_without_the_package() {
+        let mut attempts = Vec::new();
+        let result = launch_settings(|exe, mode| {
+            attempts.push((exe.to_owned(), mode.map(str::to_owned)));
+            if mode.is_none() { Err(std::io::Error::from_raw_os_error(15609).into()) } else { Ok(()) }
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            attempts,
+            [("oneup-settings.exe".into(), None), ("oneup-tray.exe".into(), Some(SETTINGS_FALLBACK.into()))]
+        );
+    }
+
+    #[test]
+    fn healthy_launches_and_unrelated_errors_do_not_start_a_second_process() {
+        for code in [None, Some(5)] {
+            let mut attempts = 0;
+            let result = launch_settings(|exe, mode| {
+                attempts += 1;
+                assert_eq!((exe, mode), ("oneup-settings.exe", None));
+                match code {
+                    Some(code) => Err(std::io::Error::from_raw_os_error(code).into()),
+                    None => Ok(()),
+                }
+            });
+            assert_eq!(result.is_ok(), code.is_none());
+            assert_eq!(attempts, 1);
+        }
+    }
 }
 
 /// The agents that start with the main one of `main`: its extra folder

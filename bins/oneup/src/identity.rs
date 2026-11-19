@@ -208,14 +208,47 @@ pub(crate) fn stop_shell_surrogate() {
     }
 }
 
-/// Adds the signed package shipped next to this program, if there is one.
+/// Adds the signed package shipped next to this program when its
+/// registration or Explorer resources need an update.
 pub fn add_installed() -> Result<bool> {
     let programs = std::env::current_exe()?.parent().context("no program folder")?.to_path_buf();
     let msix = programs.join(MSIX);
     if !msix.exists() {
         return Ok(false);
     }
+    if let Some(publisher) = built_publisher()
+        && let Ok(Some((package, external))) = oneup_sys::identity::registered_locations(publisher)
+        && crate::test_account::same_dir(&programs, &external)
+        && matches!(same_identity_payload(&package, &msix), Ok(true))
+    {
+        tracing::debug!("keeping the existing Explorer identity registration");
+        return Ok(false);
+    }
     oneup_sys::identity::add(&msix, &programs)?;
+    Ok(true)
+}
+
+/// Version-only updates can leave Windows with a replacement to register at
+/// logon if an Explorer helper still uses the old package.
+fn same_identity_payload(registered: &Path, msix: &Path) -> Result<bool> {
+    use std::io::Read as _;
+
+    let mut shipped = zip::ZipArchive::new(std::fs::File::open(msix)?)?;
+    let installed = std::fs::read_to_string(registered.join("AppxManifest.xml"))?;
+    let mut manifest = String::new();
+    shipped.by_name("AppxManifest.xml")?.take(installed.len() as u64 + 64).read_to_string(&mut manifest)?;
+    if without_version(&installed) != without_version(&manifest) {
+        return Ok(false);
+    }
+    for (name, _) in ASSETS {
+        let entry = format!("Assets/{name}");
+        let installed = std::fs::read(registered.join(&entry))?;
+        let mut candidate = Vec::new();
+        shipped.by_name(&entry)?.take(installed.len() as u64 + 1).read_to_end(&mut candidate)?;
+        if installed != candidate {
+            return Ok(false);
+        }
+    }
     Ok(true)
 }
 
@@ -248,6 +281,7 @@ pub fn remove_unowned() -> Result<Removed> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
     #[test]
     fn only_another_publisher_is_a_signed_build() {
         assert!(super::is_signed_publisher(Some("CN=Jane Doe, O=Jane Doe")));
@@ -283,6 +317,35 @@ mod tests {
         assert_eq!(super::without_version(&a), super::without_version(&b));
         assert!(!super::without_version(&a).contains("0.1.21"));
         assert_ne!(super::without_version(&a), super::without_version(&super::manifest("CN=Y", "0.1.21")));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_signed_update_reuses_the_same_manifest_and_logo_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered = dir.path().join("registered");
+        let msix = dir.path().join("OneUpDrive.Sync.msix");
+        let old = super::manifest("CN=Test", "0.2.0");
+        let next = super::manifest("CN=Test", "0.2.2");
+        std::fs::create_dir_all(registered.join("Assets")).unwrap();
+        std::fs::write(registered.join("AppxManifest.xml"), old).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&msix).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("AppxManifest.xml", options).unwrap();
+        zip.write_all(next.as_bytes()).unwrap();
+        for (name, bytes) in super::ASSETS {
+            let entry = format!("Assets/{name}");
+            zip.start_file(&entry, options).unwrap();
+            zip.write_all(bytes).unwrap();
+            std::fs::write(registered.join(&entry), bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        assert!(super::same_identity_payload(&registered, &msix).unwrap());
+        std::fs::write(registered.join("Assets/StoreLogo.png"), b"new logo").unwrap();
+        assert!(!super::same_identity_payload(&registered, &msix).unwrap());
+        std::fs::write(registered.join("Assets/StoreLogo.png"), super::ASSETS[0].1).unwrap();
+        std::fs::write(registered.join("AppxManifest.xml"), "<different/>").unwrap();
+        assert!(!super::same_identity_payload(&registered, &msix).unwrap());
     }
 
     #[test]
