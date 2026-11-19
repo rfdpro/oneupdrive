@@ -300,7 +300,7 @@ pub fn graph_said(e: &oneup_graph::Error) -> String {
             }
         }
         G::Http(_) | G::Stalled(..) => t!("Network error."),
-        G::Exhausted(n) => t!("Gave up after {n} attempts.", n = *n),
+        G::Exhausted(n) | G::TransportExhausted { attempts: n, .. } => t!("Gave up after {n} attempts.", n = *n),
         G::OverBudget => t!("Data budget used up."),
         G::Auth(_) => t!("Sign-in failed."),
         G::NotSignedIn => t!("Not signed in."),

@@ -144,7 +144,8 @@ pub fn classify(e: &anyhow::Error) -> Kind {
         } else if let Some(g) = c.downcast_ref::<oneup_graph::Error>() {
             graph_kind(g)
         } else if let Some(r) = c.downcast_ref::<reqwest::Error>() {
-            (r.is_connect() || r.is_timeout() || r.is_request()).then_some(Kind::Offline)
+            (!r.is_builder() && !r.is_redirect() && (r.is_connect() || r.is_timeout() || r.is_request()))
+                .then_some(Kind::Offline)
         } else if let Some(r) = c.downcast_ref::<oneup_remote::Error>() {
             // Transparent variants: what they wrap isn't in the chain itself.
             match r {
@@ -183,10 +184,8 @@ pub fn classify(e: &anyhow::Error) -> Kind {
 fn graph_kind(g: &oneup_graph::Error) -> Option<Kind> {
     use oneup_graph::Error as G;
     match g {
-        G::Http(r) => {
-            Some(if r.is_connect() || r.is_timeout() || r.is_request() { Kind::Offline } else { Kind::OneDrive })
-        }
-        G::Stalled(..) => Some(Kind::Offline),
+        _ if g.is_connection_failure() => Some(Kind::Offline),
+        G::Http(_) => Some(Kind::OneDrive),
         G::Auth(_) | G::NotSignedIn => Some(Kind::SignIn),
         G::Status { status: 401, .. } => Some(Kind::SignIn),
         G::Status { status: 507, .. } => Some(Kind::CloudFull),

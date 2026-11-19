@@ -3917,7 +3917,7 @@ fn print_round(n: usize, planned: &[(Op, Line)], r: &Report) -> Vec<ActivityEntr
             }
         } else if let Some((_, m)) = failed.next_if(|(o, _)| o == op) {
             println!("  FAIL  {line}  ({m})");
-            entry(line, ActivityOutcome::Failed, Some(m.clone()));
+            entry(line, ActivityOutcome::Failed, Some(m.message.clone()));
         } else {
             println!("  --    {line}  (not run: the round stopped)");
         }

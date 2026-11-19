@@ -154,7 +154,7 @@ pub enum Skip {
 pub struct Report {
     pub done: Vec<Op>,
     pub skipped: Vec<(Op, Skip)>,
-    pub failed: Vec<(Op, String)>,
+    pub failed: Vec<(Op, Failure)>,
     /// Set if the round stopped early: the sync folder failed its identity
     /// check, or the state database failed.
     pub halted: Option<String>,
@@ -334,7 +334,7 @@ enum RescueEnd {
 fn fail_text(f: &Fail) -> String {
     match f {
         Fail::Skip(s) => format!("{s:?}"),
-        Fail::Failed(m) | Fail::Halt(m) => m.clone(),
+        Fail::Failed(m) | Fail::Connection(m) | Fail::Halt(m) => m.clone(),
         Fail::NotNow => "not now".into(),
     }
 }
@@ -342,9 +342,23 @@ fn fail_text(f: &Fail) -> String {
 enum Fail {
     Skip(Skip),
     Failed(String),
+    Connection(String),
     Halt(String),
     /// The caller's check refused it (see [`Report::not_run`]).
     NotNow,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct Failure {
+    pub message: String,
+    pub connection: bool,
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self { message: message.into(), connection: false }
+    }
 }
 
 impl From<FxError> for Fail {
@@ -379,6 +393,7 @@ impl From<CloudError> for Fail {
             CloudError::NameTaken => Fail::Skip(Skip::NameTaken),
             CloudError::NotEmpty => Fail::Skip(Skip::NotEmpty),
             CloudError::Full => Fail::Skip(Skip::CloudFull),
+            CloudError::Connection(m) => Fail::Connection(m),
             CloudError::Io(_) | CloudError::Other(_) | CloudError::TooManyItems => Fail::Failed(e.to_string()),
         }
     }
@@ -466,10 +481,8 @@ fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
             }
             report.skipped.push((op, s));
         }
-        Err(Fail::Failed(m)) => {
-            tracing::warn!(error = %m, "operation failed");
-            report.failed.push((op, m));
-        }
+        Err(Fail::Failed(message)) => record_failure(report, op, message, false),
+        Err(Fail::Connection(message)) => record_failure(report, op, message, true),
         Err(Fail::NotNow) => report.not_run.push(op),
         Err(Fail::Halt(m)) => {
             if m != NOT_RUN && report.halted.is_none() {
@@ -478,6 +491,11 @@ fn record(report: &mut Report, op: Op, outcome: Res, notes: Notes) {
             }
         }
     }
+}
+
+fn record_failure(report: &mut Report, op: Op, message: String, connection: bool) {
+    tracing::warn!(error = %message, "operation failed");
+    report.failed.push((op, Failure { message, connection }));
 }
 
 /// How many of the operations at the start of `ops` go to the cloud as one
@@ -1305,7 +1323,7 @@ impl<C: Cloud> Executor<C> {
         let _settle = Settle(&self.jobs);
         let db = Db::new(store);
         // Records left by a round that was cut short.
-        if let Err(Fail::Halt(m) | Fail::Failed(m)) = self.recover_all(&db).await {
+        if let Err(Fail::Halt(m) | Fail::Failed(m) | Fail::Connection(m)) = self.recover_all(&db).await {
             report.halted = Some(m);
             return report;
         }

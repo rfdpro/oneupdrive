@@ -83,8 +83,8 @@ pub use cloud::{Cloud, CloudError, Meta, MetaDone, Replaced, Source, VersionMark
 pub use exec::{BlockingHook, CRASHED};
 #[cfg(windows)]
 pub use exec::{
-    Executor, FOLLOW_MAX, FetchCheck, Follow, RESCUE_TRIES, Report, Skip, link_roots, rescues_given_up, rewind_follows,
-    rewind_mark,
+    Executor, FOLLOW_MAX, Failure, FetchCheck, Follow, RESCUE_TRIES, Report, Skip, link_roots, rescues_given_up,
+    rewind_follows, rewind_mark,
 };
 pub use graph::{GraphCloud, UploadMemory};
 pub use moving::Settled;

@@ -123,7 +123,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// ([`Ops::wipe_pending`]).
 pub const WIPE_PREFIX: &str = "vault.wipe";
 
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 
 /// v1 -> v2: orphans remember whether they arrived during catch-up. Existing
 /// orphans default to "yes", the conservative choice (their folders get
@@ -775,7 +775,7 @@ fn user_version(c: &Connection) -> Result<i64> {
 /// read outside the lock can be stale, and replaying a step fails ("table
 /// already exists").
 fn migrate(conn: &mut Connection) -> Result<()> {
-    let steps: [(i64, String); 29] = [
+    let steps: [(i64, String); 30] = [
         (1, SCHEMA_V1.into()),
         (2, MIGRATE_V2.into()),
         (3, MIGRATE_V3.into()),
@@ -808,6 +808,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
             29,
             "CREATE INDEX IF NOT EXISTS remote_item_ascii_name ON remote_item(parent_id, name COLLATE NOCASE);".into(),
         ),
+        (30, retry::MIGRATE_V30.into()),
     ];
     for (to, sql) in steps {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -824,6 +825,9 @@ fn migrate(conn: &mut Connection) -> Result<()> {
                 // under an older build, not carried out yet, may be among it.
                 // Counted as answered, those copies are kept.
                 tx.execute_batch("UPDATE remote_gone SET answered = 1;")?;
+            }
+            if to == 30 {
+                add_column(&tx, retry::V30_COLUMN)?;
             }
             tx.execute_batch(&format!("{sql} PRAGMA user_version = {to};"))?;
         }

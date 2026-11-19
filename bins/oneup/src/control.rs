@@ -117,8 +117,6 @@ pub struct Control {
     /// Pinged when the user turns working offline on or off, for a round
     /// under way (its push channel closes at once).
     pub offline_changed: Notify,
-    /// Whether the push channel is live (set by the push task).
-    pub push_up: Arc<AtomicBool>,
     /// Pinged once when a `stop` call arrives.
     pub stop: Notify,
     /// The link to OneDrive is poor (`crate::link`): retries wait longer.
@@ -141,6 +139,8 @@ struct Shared {
     local: String,
     remote: String,
     activity: Activity,
+    /// The current push task's connection flag, if a task is running.
+    push: Option<Arc<AtomicBool>>,
     checked_ms: Option<i64>,
     last: Option<LastRun>,
     stops: Vec<SafetyStop>,
@@ -245,6 +245,7 @@ impl Control {
                 local,
                 remote,
                 activity: Activity::Starting,
+                push: None,
                 checked_ms: None,
                 last: None,
                 stops: Vec::new(),
@@ -273,7 +274,6 @@ impl Control {
             offline_file,
             wake: Notify::new(),
             offline_changed: Notify::new(),
-            push_up: Arc::new(AtomicBool::new(false)),
             stop: Notify::new(),
             poor_link: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -636,6 +636,16 @@ impl Control {
         self.status(&s)
     }
 
+    pub fn set_push(&self, push: Option<Arc<AtomicBool>>) {
+        let mut s = self.lock();
+        s.push = push;
+        self.publish(&mut s);
+    }
+
+    pub fn push_up(&self) -> bool {
+        self.lock().push.as_ref().is_some_and(|up| up.load(Relaxed))
+    }
+
     /// Changes whenever the status does (for in-process watchers).
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.rev.subscribe()
@@ -655,7 +665,7 @@ impl Control {
                 s.activity
             },
             paused: s.pause,
-            push: self.push_up.load(Relaxed),
+            push: s.push.as_ref().is_some_and(|up| up.load(Relaxed)),
             checked_ms: s.checked_ms,
             last: s.last.clone(),
             safety_stops: s.stops.iter().filter(|st| !s.answered.contains(&st.code)).cloned().collect(),

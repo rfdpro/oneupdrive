@@ -46,7 +46,10 @@ pub enum CloudError {
     /// Writing the downloaded content locally failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// Anything else (network, throttling exhausted, server error).
+    /// The connection was lost or stalled.
+    #[error("{0}")]
+    Connection(String),
+    /// Anything else (throttling exhausted, server error).
     #[error("{0}")]
     Other(String),
 }
