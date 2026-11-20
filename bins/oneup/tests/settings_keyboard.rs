@@ -238,6 +238,14 @@ const DRIVER: &str = r##"<script>
     // Search uses the selected Files scope and fills the space of the details panel.
     const searchBox = document.querySelector("#q");
     const detailsToggle = document.querySelector("#details-toggle");
+    const searchBounds = document.querySelector("#search-tools").getBoundingClientRect();
+    const explorerBounds = document.querySelector("#files-pane .browser").getBoundingClientRect();
+    const toolbarBounds = document.querySelector("#files-toolbar").getBoundingClientRect();
+    check("search aligns with the explorer below the view tabs", searchBounds.top >= toolbarBounds.bottom &&
+      searchBounds.bottom <= explorerBounds.top && searchBounds.left === explorerBounds.left &&
+      searchBounds.right === explorerBounds.right, [searchBounds.left, searchBounds.right, explorerBounds.left, explorerBounds.right]);
+    check("Details fills the height of the navigation row", detailsToggle.getBoundingClientRect().height === toolbarBounds.height,
+      detailsToggle.getBoundingClientRect().height);
     detailsToggle.click();
     check("Details can be hidden while browsing", document.querySelector("#details").hidden, "");
     detailsToggle.click();

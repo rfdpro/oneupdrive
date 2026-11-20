@@ -1768,26 +1768,28 @@
             background: var(--sunk);
         }
         
-        .toolbar {
+        #files-toolbar {
             display: flex;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 8px 14px;
             flex: none;
+            align-items: stretch;
+            flex-wrap: wrap;
+            gap: 8px;
             margin-bottom: 10px;
         }
 
-        #files-toolbar {
-            display: grid;
-            grid-template-columns: auto minmax(0, 1fr) auto;
+        .file-explorer {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            min-height: 0;
+            min-width: 0;
         }
 
         .search-tools {
             display: flex;
             align-items: stretch;
             min-width: 0;
-            width: min(100%, 540px);
-            justify-self: end;
+            flex: none;
             background: var(--panel);
             border: 1px solid var(--field);
             border-radius: 8px;
@@ -1873,17 +1875,9 @@
         }
 
         #details-toggle {
-            grid-column: 3;
-            grid-row: 1;
-            justify-self: end;
-        }
-
-        @container sheet (max-width: 620px) {
-            .search-tools {
-                grid-column: 1 / -1;
-                grid-row: 2;
-                width: 100%;
-            }
+            min-height: 36px;
+            margin-inline-start: auto;
+            padding-inline: 14px;
         }
 
         #details-toggle[aria-pressed="true"] {
@@ -2136,6 +2130,7 @@
         }
         
         .browser {
+            flex: 1;
             background: var(--panel);
             border: 1px solid var(--line);
             border-radius: var(--radius);
@@ -3252,43 +3247,44 @@
                 <button class="btn" id="memory-open" hidden><svg aria-hidden="true"><use href="#i-memory"/></svg>Memory view</button>
                 <button class="btn" id="add-btn" aria-haspopup="menu" popovertarget="add-menu"><svg aria-hidden="true"><use href="#i-plus"/></svg>Add</button></div>
             <div class="roots" id="roots" role="tablist" aria-label="Synced folders"></div>
-            <!-- One command bar: the views, then search and its filters (All files only). -->
-            <div class="toolbar" id="files-toolbar">
+            <div id="files-toolbar">
                 <div class="views" role="tablist" aria-label="View">
                     <button role="tab" data-view="all" aria-selected="true">All files</button>
                     <button role="tab" data-view="out">Exclude</button>
                     <button role="tab" data-view="dupes">Duplicates</button>
                 </div>
-                <div class="search-tools" id="search-tools">
-                    <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
-                    <button id="fd-go" hidden>Search</button>
-                    <button id="search-filters-toggle" popovertarget="search-filters" aria-controls="search-filters"><svg aria-hidden="true"><use href="#i-filter"/></svg>Filters</button>
-                    <div id="search-filters" popover role="group" aria-label="Search filters">
-                        <div class="search-filter-field">
-                            <label for="search-scope">Search scope</label>
-                            <select id="search-scope" autofocus>
-                                <option value="root">Synced folder</option>
-                                <option value="drive">OneDrive</option>
-                            </select>
-                        </div>
-                        <div class="search-filter-field">
-                            <label for="search-kind">Item type</label>
-                            <select id="search-kind">
-                                <option value="">Files and folders</option>
-                                <option value="files">Files only</option>
-                                <option value="folders">Folders only</option>
-                            </select>
-                        </div>
-                        <label class="search-regex-field"><input type="checkbox" id="search-regex"> Regex</label>
-                    </div>
-                </div>
-                <button class="btn small" id="details-toggle" aria-controls="details" aria-pressed="true">Details</button>
+                <button class="btn" id="details-toggle" aria-controls="details" aria-pressed="true">Details</button>
             </div>
             <div class="pane" id="files-pane">
-                <div class="browser">
-                    <div class="cols" id="cols"></div>
-                    <div class="msg" id="fd-sum" role="status" hidden></div>
-                    <div class="tree" id="tree" role="tree" aria-label="Files"></div>
+                <div class="file-explorer">
+                    <div class="search-tools" id="search-tools">
+                        <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
+                        <button id="fd-go" hidden>Search</button>
+                        <button id="search-filters-toggle" popovertarget="search-filters" aria-controls="search-filters"><svg aria-hidden="true"><use href="#i-filter"/></svg>Filters</button>
+                        <div id="search-filters" popover role="group" aria-label="Search filters">
+                            <div class="search-filter-field">
+                                <label for="search-scope">Search scope</label>
+                                <select id="search-scope" autofocus>
+                                    <option value="root">Synced folder</option>
+                                    <option value="drive">OneDrive</option>
+                                </select>
+                            </div>
+                            <div class="search-filter-field">
+                                <label for="search-kind">Item type</label>
+                                <select id="search-kind">
+                                    <option value="">Files and folders</option>
+                                    <option value="files">Files only</option>
+                                    <option value="folders">Folders only</option>
+                                </select>
+                            </div>
+                            <label class="search-regex-field"><input type="checkbox" id="search-regex"> Regex</label>
+                        </div>
+                    </div>
+                    <div class="browser">
+                        <div class="cols" id="cols"></div>
+                        <div class="msg" id="fd-sum" role="status" hidden></div>
+                        <div class="tree" id="tree" role="tree" aria-label="Files"></div>
+                    </div>
                 </div>
                 <aside class="details" id="details" aria-label="Details"></aside>
             </div>
