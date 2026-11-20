@@ -76,14 +76,16 @@ fn palettes() -> [(&'static str, HashMap<String, String>); 2] {
 
 /// Text (4.5:1) and the parts of controls that identify them, such as a
 /// field's border or the focus ring (3:1, WCAG 1.4.11).
+/// `shell` is the navigation's background; the `-soft` tints are the
+/// InfoBars' (a problem, the Activity notices) and the outcome tags'.
 const TEXT: &[(&str, &[&str])] = &[
-    ("ink", &["canvas", "panel", "sunk", "sel"]),
-    ("muted", &["canvas", "panel", "sunk", "sel"]),
-    ("accent", &["canvas", "panel", "accent-soft"]),
+    ("ink", &["canvas", "panel", "sunk", "sel", "shell", "accent-soft", "bad-soft", "wait-soft"]),
+    ("muted", &["canvas", "panel", "sunk", "sel", "shell"]),
+    ("accent", &["canvas", "panel", "accent-soft", "shell"]),
     ("accent-ink", &["accent"]),
-    ("ok", &["canvas", "panel", "sunk"]),
-    ("wait", &["canvas", "panel", "sunk"]),
-    ("bad", &["canvas", "panel", "sunk"]),
+    ("ok", &["canvas", "panel", "sunk", "ok-soft"]),
+    ("wait", &["canvas", "panel", "sunk", "wait-soft"]),
+    ("bad", &["canvas", "panel", "sunk", "bad-soft"]),
     ("bad-ink", &["bad"]),
     ("panel", &["ok"]),
 ];
@@ -92,7 +94,7 @@ const PARTS: &[(&str, &[&str])] = &[
     ("muted", &["panel"]),
     ("accent", &["canvas", "panel", "sel"]),
     ("off", &["panel"]),
-    ("busy", &["panel"]),
+    ("busy", &["panel", "shell"]),
 ];
 
 #[test]

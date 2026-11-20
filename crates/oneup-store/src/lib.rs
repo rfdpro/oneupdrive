@@ -59,6 +59,7 @@ pub mod retry;
 mod rulefile;
 pub mod search;
 pub mod shared;
+pub mod treemap;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
 pub use dupes::{DupCursor, DupGroup, DupSummary};
@@ -1225,14 +1226,28 @@ impl Ops<'_> {
         row.map(fix_kind).transpose()
     }
 
-    /// Up to `limit` stored cloud items whose name contains `needle` (any
-    /// case), for the settings window's search (a scan of the names).
-    pub fn remote_find(&self, needle: &str, limit: usize) -> Result<Vec<RemoteRow>> {
+    /// Search on demand with bounded result memory, including for regexes.
+    pub fn remote_find_matching(
+        &self,
+        query: &crate::search::NameQuery<'_>,
+        folder: Option<bool>,
+        limit: usize,
+    ) -> Result<Vec<RemoteRow>> {
         let mut st = self.c.prepare_cached(&format!(
-            "SELECT {ITEM_COLS} FROM remote_item WHERE kind != 2 AND name LIKE ?1 ESCAPE '\\' LIMIT ?2"
+            "SELECT {ITEM_COLS} FROM remote_item
+             WHERE kind != 2 AND (?1 IS NULL OR name LIKE ?1 ESCAPE '\\')
+             AND (?2 IS NULL OR (kind = 1) = ?2) LIMIT ?3"
         ))?;
-        let rows = st.query_map(rusqlite::params![local::like_pattern(needle), limit as i64], RemoteRow::from_row)?;
-        rows.map(|r| fix_kind(r?)).collect()
+        let (pattern, sql_limit) = query.sql_args(limit);
+        let mut rows = st.query(rusqlite::params![pattern, folder, sql_limit])?;
+        let mut found = Vec::new();
+        while found.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            if query.matches(row.get::<_, String>("name")?.as_str()) {
+                found.push(fix_kind(RemoteRow::from_row(row)?)?);
+            }
+        }
+        Ok(found)
     }
 
     /// For each folder directly in cloud folder `parent_id`: the total size

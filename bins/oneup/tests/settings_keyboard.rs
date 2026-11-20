@@ -106,6 +106,7 @@ const DRIVER: &str = r##"<script>
   const out = [];
   const pre = document.createElement("pre");
   pre.id = "result";
+  pre.hidden = true;
   document.body.append(pre);
   const report = () => pre.textContent = JSON.stringify(out.concat([["no script errors", !ERRS.length, ERRS.join("; ")]]));
   const check = (name, ok, seen) => { out.push([name, !!ok, String(seen)]); report(); };
@@ -122,15 +123,19 @@ const DRIVER: &str = r##"<script>
       {kind:"edit_not_found", title:"Review cloud version history", detail:"An overlapping cloud edit could not be checked.", action:"Review versions, then dismiss.", data_dir:"C:\\Data", dismiss_code:"incident-1"}
     ]};
     show("lists"); await loadAttention();
-    const notices = document.querySelectorAll("#attn > .card");
+    const noticeGroup = document.querySelector("#attn");
     const activityTabs = document.querySelector("#ls-tabs");
-    check("notifications have separate cards and space before list controls", notices.length === 2 && notices[1].getBoundingClientRect().top - notices[0].getBoundingClientRect().bottom >= 9 && activityTabs.getBoundingClientRect().top - notices[1].getBoundingClientRect().bottom >= 15, notices.length);
+    check("Activity starts with one collapsed notice summary", !noticeGroup.open &&
+      noticeGroup.querySelector("summary").textContent === "2 sync notices" &&
+      activityTabs.getBoundingClientRect().top - noticeGroup.getBoundingClientRect().bottom >= 15, noticeGroup.textContent);
+    noticeGroup.querySelector("summary").click();
+    const notices = noticeGroup.querySelectorAll("#attn-list > .row");
     check("long notification paths stay inside their card", notices[0].querySelector(".label").scrollWidth <= notices[0].querySelector(".label").clientWidth + 1, notices[0].scrollWidth);
     check("only version-review notices have Dismiss", document.querySelectorAll("#attn button").length === 1, document.querySelectorAll("#attn button").length);
     HOST_ANSWERS.dismiss_problem = () => { HOST_ANSWERS.problems = {problems: [HOST_ANSWERS.problems.problems[0]]}; return null; };
     document.querySelector("#attn button").click(); await sleep(100);
     const dismissal = HOST_CALLS.filter(m => m.op === "dismiss_problem").pop();
-    check("Dismiss acknowledges exactly this incident and leaves active waits", dismissal?.args.code === "incident-1" && dismissal.args.data_dir === "C:\\Data" && document.querySelectorAll("#attn > .card").length === 1, JSON.stringify(dismissal));
+    check("Dismiss acknowledges exactly this incident and leaves active waits", dismissal?.args.code === "incident-1" && dismissal.args.data_dir === "C:\\Data" && document.querySelectorAll("#attn-list > .row").length === 1, JSON.stringify(dismissal));
     HOST_ANSWERS.problems = {problems: []};
     document.querySelector("#ls-refresh").click(); await sleep(100);
     check("Activity Refresh also refreshes notifications", document.querySelector("#attn").hidden, document.querySelector("#attn").textContent);
@@ -141,7 +146,7 @@ const DRIVER: &str = r##"<script>
     await loadAttention();
     oldAttention({problems: [{title:"Old notice", detail:"Dismissed", action:"Review"}]});
     await pendingAttention;
-    check("a stale reply cannot resurrect a dismissed notification", document.querySelector("#attn").hidden && !document.querySelector("#attn").children.length, document.querySelector("#attn").textContent);
+    check("a stale reply cannot resurrect a dismissed notification", document.querySelector("#attn").hidden && !document.querySelector("#attn-list").children.length, document.querySelector("#attn").textContent);
     HOST_ANSWERS.problems = savedProblems;
     show("files"); await sleep(200);
     const tree = document.querySelector("#tree");
@@ -229,6 +234,138 @@ const DRIVER: &str = r##"<script>
     check("the list isn't called a tree when it isn't one", tree.getAttribute("role") === "region", tree.getAttribute("role"));
     key("ArrowLeft"); await sleep(300);
     check("Left goes back to All files", document.activeElement.dataset.view === "all" && tree.getAttribute("role") === "tree", document.activeElement.dataset.view);
+
+    const filesNav = document.querySelector('nav [data-page="files"]');
+    filesNav.focus();
+    key("ArrowDown");
+    check("sidebar arrows move focus without switching pages", document.activeElement.dataset.page === "apps" &&
+      document.querySelector(".page.on").id === "files", at());
+    key("End");
+    check("sidebar End reaches Settings", document.activeElement.id === "nav-open-settings", at());
+    key("Home");
+    check("sidebar Home returns to Files", document.activeElement === filesNav, at());
+    key("F6");
+    check("F6 takes focus to the current page heading", document.activeElement === document.querySelector("#files h2"), at());
+    key("F6", {shiftKey: true});
+    check("Shift+F6 returns to the current page in the sidebar", document.activeElement === filesNav, at());
+
+    // Search uses the selected Files scope and fills the space of the details panel.
+    const searchBox = document.querySelector("#q");
+    const detailsToggle = document.querySelector("#details-toggle");
+    const searchBounds = document.querySelector("#search-tools").getBoundingClientRect();
+    const explorerBounds = document.querySelector("#files-pane .browser").getBoundingClientRect();
+    const toolbarBounds = document.querySelector("#files-toolbar").getBoundingClientRect();
+    check("search aligns with the explorer below the view tabs", searchBounds.top >= toolbarBounds.bottom &&
+      searchBounds.bottom <= explorerBounds.top && searchBounds.left === explorerBounds.left &&
+      searchBounds.right === explorerBounds.right, [searchBounds.left, searchBounds.right, explorerBounds.left, explorerBounds.right]);
+    check("Details fills the height of the navigation row", detailsToggle.getBoundingClientRect().height === toolbarBounds.height,
+      detailsToggle.getBoundingClientRect().height);
+    detailsToggle.click();
+    check("Details can be hidden while browsing", document.querySelector("#details").hidden, "");
+    detailsToggle.click();
+    document.querySelector('.views [data-view="out"]').focus();
+    document.activeElement.click();
+    key("f", {ctrlKey: true});
+    check("Ctrl+F opens Files search from another Files view", document.activeElement === searchBox &&
+      document.querySelector('.views [data-view="all"]').getAttribute("aria-selected") === "true", at());
+    HOST_ANSWERS.tree_find = [{rel:"Docs/inner.doc",folder:false}, {rel:"big.iso",folder:false}];
+    searchBox.value = "inner";
+    searchBox.dispatchEvent(new Event("input")); await sleep(350);
+    check("Files search finds items in the selected folder", tree.textContent.includes("inner.doc") &&
+      document.querySelector("#details").hidden && HOST_CALLS.filter(m => m.op === "tree_find").at(-1)?.args.root === "main", tree.textContent);
+    key("ArrowDown");
+    check("Down from search focuses the first result action", document.activeElement.closest(".fl")?.textContent.includes("inner.doc"), at());
+    key("ArrowDown");
+    check("Down moves to the next result", document.activeElement.closest(".fl")?.textContent.includes("big.iso"), at());
+    renderFound();
+    check("redrawing results preserves focus on the same item", document.activeElement.closest(".fl")?.textContent.includes("big.iso"), at());
+    key("Escape");
+    check("Escape from results returns to the search field with its query", document.activeElement === searchBox &&
+      searchBox.value === "inner", at());
+    const filterToggle = document.querySelector("#search-filters-toggle");
+    const filters = document.querySelector("#search-filters");
+    filterToggle.focus(); filterToggle.click(); await sleep(50);
+    const filterBounds = filters.getBoundingClientRect();
+    check("search filters open next to the field with the scope focused", filters.matches(":popover-open") &&
+      document.activeElement.id === "search-scope" && filterBounds.left >= 0 && filterBounds.right <= innerWidth, at());
+    const searchType = document.querySelector("#search-kind");
+    searchType.value = "files";
+    searchType.dispatchEvent(new Event("change"));
+    const regex = document.querySelector("#search-regex");
+    regex.click();
+    check("the filters button marks active options", filterToggle.hasAttribute("data-active"), "");
+    filters.hidePopover();
+    searchBox.focus(); key("Enter"); await sleep(100);
+    const patternCall = HOST_CALLS.filter(m => m.op === "tree_find").at(-1);
+    check("Files submits the regex and type filter together", patternCall?.args.regex && patternCall.args.folder === false, JSON.stringify(patternCall));
+    key("Escape");
+    check("Escape restores the tree and details", tree.getAttribute("role") === "tree" && !document.querySelector("#details").hidden, tree.getAttribute("role"));
+    regex.click();
+    searchType.value = "";
+    startAt("find", "");
+    check("Search shortcut focuses Files in OneDrive scope", document.activeElement === searchBox &&
+      document.querySelector("#search-scope").value === "drive" && searchBox.placeholder === "Search OneDrive" && !document.querySelector('nav [data-page="find"]'), at());
+    document.querySelector("#search-scope").value = "root";
+    document.querySelector("#search-scope").dispatchEvent(new Event("change"));
+    await sleep(300);
+
+    // Memory view reads one scope and opens locations without opening files.
+    const diskFile = {id:"11", name:"clip.mp4", bytes:800, location:"C:\\Sync\\Videos\\clip.mp4"};
+    const diskFolder = {id:"10", name:"Videos", bytes:900, folder:true, expandable:true,
+      location:"C:\\Sync\\Videos", preview:{bytes:900, other:100, items:[diskFile]}};
+    HOST_ANSWERS.memory_view = a => a.on_disk
+      ? a.folder ? diskFolder.preview : {bytes:1200, other:0, items:[diskFolder,
+          {id:"12", name:"notes.txt", bytes:300, location:"C:\\Sync\\notes.txt"}]}
+      : {bytes:5000, other:0, items:[{id:"drive-file", name:"cloud-only.bin", bytes:5000, location:"cloud-root"}]};
+    const mainTab = tabs()[0], map = document.querySelector("#memory-map");
+    mainTab.dispatchEvent(new MouseEvent("contextmenu", {bubbles:true, cancelable:true, clientX:200, clientY:100}));
+    check("Main folder context menu offers Memory view", document.activeElement.textContent === "Memory view", at());
+    document.activeElement.click(); await sleep(140);
+    check("Memory view replaces both panes and starts on disk", !document.querySelector("#memory-view").hidden &&
+      document.querySelector("#files-pane").getBoundingClientRect().width === 0 &&
+      document.querySelector('#memory-scope [data-scope="disk"]').getAttribute("aria-pressed") === "true", map.textContent);
+    const area = id => {
+      const rect = map.querySelector('[data-memory-key="item:' + id + '"]').parentElement.getBoundingClientRect();
+      return rect.width * rect.height;
+    };
+    const ratio = area("10") / area("12");
+    check("folder tiles are sized by bytes", Math.abs(ratio - 3) < .07, ratio);
+    check("large folders show nested file tiles", !!map.querySelector('.memory-children [data-memory-key="item:11"]'), map.textContent);
+    map.querySelector('[data-memory-key="item:11"]').click(); await sleep(30);
+    check("an on-disk tile reveals the file in Explorer", HOST_CALLS.filter(m => m.op === "reveal").at(-1)?.args.path === diskFile.location, "");
+    map.querySelector('[data-memory-key="folder:10"]').click(); await sleep(50);
+    check("folder zoom requests its own map", HOST_CALLS.filter(m => m.op === "memory_view").at(-1)?.args.folder === "10" &&
+      document.querySelector("#memory-path").textContent.includes("Videos"), map.textContent);
+    document.querySelector('#memory-scope [data-scope="drive"]').click(); await sleep(50);
+    const driveRequest = HOST_CALLS.filter(m => m.op === "memory_view").at(-1);
+    check("Whole drive switches scope and returns to its root", driveRequest?.args.on_disk === false &&
+      driveRequest.args.folder === null && map.textContent.includes("cloud-only.bin"), map.textContent);
+    map.querySelector(".memory-open").click(); await sleep(30);
+    check("OneDrive file tiles open the containing folder", HOST_CALLS.filter(m => m.op === "open_in_onedrive").at(-1)?.args.id === "cloud-root", "");
+    document.querySelector("#memory-back").click();
+    check("Memory view Back restores Files and its focus", document.querySelector("#memory-view").hidden &&
+      document.querySelector("#files-pane").getBoundingClientRect().width > 0 && document.activeElement === mainTab, at());
+    key("F10", {shiftKey:true});
+    check("keyboard opens the main folder context menu", document.activeElement.textContent === "Memory view", at());
+    document.querySelector("#ctx").hidePopover();
+    await sleep(50);
+    // The button beside Add opens the same map, and Back gives focus to it.
+    const memoryButton = document.querySelector("#memory-open");
+    check("Files offers a visible Memory view button with a main folder", !memoryButton.hidden && memoryButton.textContent === "Memory view", memoryButton.hidden);
+    memoryButton.focus(); memoryButton.click(); await sleep(140);
+    check("the Memory view button opens the map and hides itself", !document.querySelector("#memory-view").hidden &&
+      memoryButton.getBoundingClientRect().width === 0 && document.activeElement.id === "memory-back", at());
+    document.querySelector("#memory-back").click();
+    check("Back from the button gives focus to the button", document.querySelector("#memory-view").hidden && document.activeElement === memoryButton, at());
+
+    showStatus({ activity: "Idle", paused: {}, last: {at_ms: Date.now(), done: 3} });
+    check("the status tile's second line says when it last synced", document.querySelector("#st-sub").textContent.startsWith("Last sync ")
+      && document.querySelector("#agent").closest("nav") !== null, document.querySelector("#st-sub").textContent);
+    showStatus({ activity: "Syncing", paused: {}, problem: {kind: "network", title: "Can't reach OneDrive", detail: "", action: "", since_ms: 1, attempts: 1, technical: ""} });
+    check("a problem takes the status tile's second line", document.querySelector("#st-sub").textContent === "Can't reach OneDrive", document.querySelector("#st-sub").textContent);
+    showStatus({ activity: "Retrying", paused: {} });
+    check("routine retries read as catching up", document.querySelector("#st-btn").textContent.includes("Catching up"), "");
+    showStatus(null);
 
     // The status menu, opened by its button.
     document.querySelector("#st-btn").focus();
@@ -361,9 +498,72 @@ const DRIVER: &str = r##"<script>
       check(sel + " takes focus", document.activeElement === e, at());
     }
     check("Work offline waits for the agent to run", document.querySelector("#net-offline").disabled, "");
+    // Sharing remembers each tab and retains the continuation it showed.
+    let sharingReads = 0;
+    let sharingAccount = "fixture-account-a";
+    HOST_ANSWERS.sharing_account = () => sharingAccount;
+    HOST_ANSWERS.sharing_list = a => {
+      sharingReads++;
+      return {items:[{path: a.after ? "/second.txt" : "/first.txt", error:"", links:[{
+        kind:"Anyone with the link", access:"Can view", who:[], id:"link", code:"fixture-code"
+      }]}], next: a.after ? null : "next", checked: 1};
+    };
+    HOST_ANSWERS.sharing_with_me = {items:[], more:false};
+    show("shared"); await sleep(100);
+    document.querySelector('#sg-tabs [data-tab="with"]').click(); await sleep(100);
+    document.querySelector('#sg-tabs [data-tab="by"]').click(); await sleep(100);
+    check("returning to a Sharing tab reuses recent results", sharingReads === 1 &&
+      document.querySelector("#sg-table").textContent.includes("first.txt"), sharingReads);
+    document.querySelector("#sg-more button").click(); await sleep(100);
+    check("a cached Sharing list can continue from the next page", sharingReads === 2 &&
+      document.querySelector("#sg-table").textContent.includes("second.txt"), sharingReads);
+    document.querySelector("#sg-refresh").click(); await sleep(100);
+    check("Sharing Refresh reads from OneDrive again", sharingReads === 3 &&
+      !document.querySelector("#sg-table").textContent.includes("second.txt"), sharingReads);
+    sharingAccount = "fixture-account-b";
+    await loadSharing();
+    check("another account never uses the previous Sharing results", sharingReads === 4, sharingReads);
+
     // Recovery: focus follows the rewind's list and answers.
     window.confirm = () => true;
     document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);
+    const recoveryScroll = document.querySelector("#main");
+    const recoveryBottom = document.querySelector("#rc-bin");
+    const tallRecovery = document.createElement("div");
+    tallRecovery.style.height = "2500px";
+    recoveryBottom.before(tallRecovery);
+    recoveryScroll.scrollTop = recoveryScroll.scrollHeight;
+    window.scrollTo(0, 300);
+    check("Recovery scrolls to its last card inside the main pane", recoveryScroll.scrollTop > 0 && window.scrollY === 0 &&
+      recoveryBottom.getBoundingClientRect().bottom <= recoveryScroll.getBoundingClientRect().bottom,
+      [recoveryScroll.scrollTop, window.scrollY]);
+    show("lists");
+    check("switching away from Recovery resets the main scroll", recoveryScroll.scrollTop === 0, recoveryScroll.scrollTop);
+    tallRecovery.remove();
+    show("recovery");
+    await sleep(100);
+    HOST_ANSWERS.conflicts = Array.from({length: 26}, (_, i) => ({
+      path: "/conflict-" + i + ".txt", copy_path: "/copy-" + i + ".txt",
+      original: {size: 20}, copy: {size: 30}, original_ms: 1, copy_ms: 2
+    }));
+    HOST_ANSWERS.kept = Array.from({length: 26}, (_, i) => ({id: i, name: "kept-" + i, bytes: 20, at_ms: 1}));
+    await loadRecovery();
+    await sleep(100);
+    check("Recovery shows one page of conflicts and kept copies", document.querySelectorAll("#cf-table tbody tr").length === 25 &&
+      document.querySelectorAll("#rc-kept tbody tr").length === 25, "");
+    document.querySelector('#cf-pages [data-direction="1"]').click();
+    document.querySelector('#rc-kept [data-direction="1"]').click();
+    check("each Recovery list has its own last page", document.querySelector("#cf-table tbody").textContent.includes("conflict-25.txt") &&
+      document.querySelectorAll("#cf-table tbody tr").length === 1 &&
+      document.querySelector("#rc-kept tbody").textContent.includes("kept-25"), "");
+    document.querySelector("#cf-batch button").click();
+    await sleep(100);
+    const batch = HOST_CALLS.filter(m => m.op === "conflict_keep_batch").at(-1);
+    check("batch decisions include conflicts from every page", batch?.args.keep === "original" &&
+      batch.args.conflicts.length === 26 && batch.args.conflicts[0].path === "/conflict-0.txt", batch?.args.conflicts.length);
+    HOST_ANSWERS.conflicts = [];
+    HOST_ANSWERS.kept = [];
+    await loadRecovery();
     document.querySelector("#rw-date").value = "2026-01-01";
     document.querySelector("#rw-time").value = "10:00";
     document.querySelector("#rw-preview").focus();
@@ -394,6 +594,9 @@ const DRIVER: &str = r##"<script>
     const sharedAutomatic = document.querySelector("#shared-settings>.ck").getBoundingClientRect();
     check("shared settings have space around their action row", sharedActions.top - sharedDescription.bottom >= 16
       && sharedAutomatic.top - sharedActions.bottom >= 16, "");
+    check("Updates are in About and setup stays in General", document.querySelector("#upd-auto").closest(".page").id === "about" &&
+      document.querySelector("#upd-check").closest(".page").id === "about" &&
+      document.querySelector("#setup-rerun").closest(".page").id === "general", "");
     const beforeSetupCalls = HOST_CALLS.length;
     document.querySelector("#setup-rerun").focus(); document.activeElement.click(); await sleep(100);
     check("Updates reopens setup and focuses the current local folder", document.querySelector("#setup").classList.contains("on")
@@ -876,7 +1079,7 @@ fn the_window_works_from_the_keyboard() {
         return;
     }
     let json = dom
-        .split("<pre id=\"result\">")
+        .split("<pre id=\"result\" hidden=\"\">")
         .nth(1)
         .and_then(|r| r.split("</pre>").next())
         .unwrap_or_else(|| panic!("no result from the page; Edge printed {} bytes", dom.len()));

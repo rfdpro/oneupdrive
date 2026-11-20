@@ -53,7 +53,7 @@ impl ShellStatus {
             match s.activity {
                 Activity::Idle => ("insync", "Up to date", String::new()),
                 Activity::Paused => ("paused", "Paused", String::new()),
-                Activity::Retrying => ("syncing", "Retrying soon", String::new()),
+                Activity::Retrying => ("syncing", "Catching up", String::new()),
                 Activity::WaitingForYou => {
                     ("attention", "Needs your review", "Review it from the OneUpDrive icon's menu.".to_string())
                 }

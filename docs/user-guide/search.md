@@ -4,12 +4,16 @@ OneUpDrive can find any file or folder in your OneDrive by name, straight away, 
 
 ## Searching
 Open search in any of these ways:
-* the settings window's **Search** page;
+* the **Search by name** box in **Files**;
 * **Search** in the [OneUpDrive icon's](tray-icon.md) menu;
 * a hotkey of your choice, like Ctrl+Alt+F (none until you set one; see below);
 * `oneup find` on the command line.
 
-Type at least 3 characters of a name, in any case: `port` finds *Report.docx* and *Passport scan.pdf*. Results appear as you type. Names that match exactly come first, then names that start with what you typed, then the rest. The first 50 are listed; when there are more, add to the search to narrow it. **Too many matches. Type more.** means what you typed is too common to search through: add a few characters.
+Open **Filters** beside the search box and choose **Synced folder** to search the selected folder, including files that are still waiting to upload. Choose **OneDrive** to search the indexed drive, including files outside your synced folders. Filter either scope to **Files only** or **Folders only**. Search results use the full width. When browsing the tree, select **Details** to hide or show the right panel.
+
+In **Filters**, turn on **Regex**. Enter a pattern in the search box and press **Enter** to match names with a regular expression, such as `^report.*\.pdf$`. Regex searches can take longer on large drives.
+
+In **OneDrive** scope, type at least 3 characters of a name, in any case: `port` finds *Report.docx* and *Passport scan.pdf*. Results appear as you type. Names that match exactly come first, then names that start with what you typed, then the rest. The first 50 are listed; when there are more, add to the search to narrow it. **Too many matches. Type more.** means what you typed is too common to search through: add a few characters.
 
 Each result says where it is:
 
@@ -30,18 +34,18 @@ Beside each result:
 
 ## What search doesn't find
 * **Items inside excluded folders.** OneUpDrive never lists what's inside a folder your rules exclude (a `node_modules` folder, say), so it can't find what's in it. The excluded folder itself is found. Every result list says so.
-* **Files on this PC that haven't been uploaded yet.** Windows Search finds those.
+* **Files on this PC that haven't been uploaded yet** appear only in the **Synced folder** scope.
 * **Text inside files**, unless you turn on OneDrive's search (below).
 
 The first time OneUpDrive starts with search, it builds the search index: from a few seconds up to about a minute for the largest drives. A search made before that finishes builds the rest first, and says so.
 
 ## Searching inside files with OneDrive
-OneDrive can search the text inside your documents too. This is off until you turn it on, because it **sends what you search for to Microsoft**: on the Search page, turn on **Search inside files with OneDrive**. It runs only when you press **Search** (or Enter), never while you type, and its results are listed under **Inside files (OneDrive's search)**. Each result says where it is, as above.
+OneDrive can search the text inside your documents too. This is off until you turn it on, because it **sends what you search for to Microsoft**: in **Settings > General > Search**, turn on **Search inside files with OneDrive**. In **Files**, choose **OneDrive** and press **Search** or Enter to run it, and its results are listed under **Inside files (OneDrive's search)**. Each result says where it is, as above.
 
 On the command line, add `--onedrive` to a search, each time you want it.
 
 ## The hotkey
-On the Search page, type the keys under **Hotkey**, like `Ctrl+Alt+F`: Ctrl, Alt or Win (or several), with a letter, a digit, F1 to F24 or Space. Pressing them in any program opens the Search page. They work while OneUpDrive's icon is in the notification area. If another program already uses those keys, the icon tells you; choose others. Clear the box to have none.
+In **Settings > General > Search**, type the keys under **Hotkey**, like `Ctrl+Alt+F`: Ctrl, Alt or Win (or several), with a letter, a digit, F1 to F24 or Space. Pressing them in any program opens Files with the search box focused. They work while OneUpDrive's icon is in the notification area. If another program already uses those keys, the icon tells you; choose others. Clear the box to have none.
 
 ## On the command line
 ```

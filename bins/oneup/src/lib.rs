@@ -37,6 +37,7 @@ pub mod item;
 pub mod l10n;
 pub mod launch;
 pub mod link;
+pub mod memory_view;
 pub mod moveover;
 pub mod netusage;
 pub mod network;

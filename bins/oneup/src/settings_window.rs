@@ -320,22 +320,36 @@ mod win {
                 let local = tokio::task::spawn_blocking(move || oneup_app::pairs::unpair(&d)).await??;
                 Ok(Value::from(local.to_string_lossy().into_owned()))
             }
+            "memory_view" => {
+                let d = dir.to_path_buf();
+                let folder = args["folder"].as_str().map(str::to_owned);
+                let on_disk = args["on_disk"].as_bool().context("Choose a Memory view scope.")?;
+                tokio::task::spawn_blocking(move || oneup_app::memory_view::read(&d, on_disk, folder.as_deref()))
+                    .await?
+            }
             "tree_sizes" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
                 let steps = oneup_app::filetree::steps_from(&args["steps"])?;
                 tokio::task::spawn_blocking(move || oneup_app::filetree::sizes(&d, &rel, &steps)).await?
             }
-            // The Search page: names from the index (built first, once,
-            // with its progress told to the page), then, if asked,
-            // OneDrive's own search inside files.
             "search" => {
                 let (d, q, p) = (dir.to_path_buf(), text(args, "q"), poster.clone());
-                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                let regex = args["regex"].as_bool().unwrap_or_default();
+                let folder = args["folder"].as_bool();
+                let limit = oneup_app::search::DEFAULT_LIMIT;
+                let request = args["request"].clone();
                 tokio::task::spawn_blocking(move || -> Result<Value> {
-                    let store = oneup_app::search::open(&d, |n| {
-                        p.post(json!({ "event": "search_build", "items": n }).to_string());
-                    })?;
-                    Ok(oneup_app::search::to_json(&oneup_app::search::find(&d, &store, &q, limit)?))
+                    use oneup_app::search;
+                    let text = if regex { &q } else { search::pattern(&q)? };
+                    let query = oneup_store::search::NameQuery::new(text, regex)?;
+                    let store = if regex {
+                        oneup_app::setup::open_store(&d, 1024)?
+                    } else {
+                        search::open(&d, |n| {
+                            p.post(json!({ "event": "search_build", "items": n, "request": request }).to_string());
+                        })?
+                    };
+                    Ok(search::to_json(&search::find_matching(&d, &store, &query, folder, limit)?))
                 })
                 .await?
             }
@@ -357,7 +371,13 @@ mod win {
             }
             "tree_find" => {
                 let (d, q) = (dir.to_path_buf(), text(args, "q"));
-                tokio::task::spawn_blocking(move || oneup_app::filetree::find(&d, &q, 100)).await?
+                let regex = args["regex"].as_bool().unwrap_or_default();
+                let folder = args["folder"].as_bool();
+                tokio::task::spawn_blocking(move || {
+                    let query = oneup_store::search::NameQuery::new(&q, regex)?;
+                    oneup_app::filetree::find_matching(&d, &query, folder, 100)
+                })
+                .await?
             }
             "update_check" => {
                 let Some(um) = oneup_app::updates::manager(dir)? else {
@@ -832,6 +852,12 @@ mod win {
                 let _ = agent(dir, Call::SyncNow).await;
                 Ok(Value::Null)
             }
+            "conflict_keep_batch" => {
+                let (d, keep, listed) = (dir.to_path_buf(), text(args, "keep"), args["conflicts"].clone());
+                tokio::task::spawn_blocking(move || settingsapi::conflict_keep_batch(&d, &listed, &keep)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
             "cloud_bin" => {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::cloud_bin(&d)).await?
@@ -1267,6 +1293,11 @@ mod win {
             // One bounded page; `after` is the previous page's `next`.
             // Both tabs go through `sharing::window_tab`, which settles what
             // an earlier change left unsettled when a tab opens.
+            "sharing_account" => {
+                let account = oneup_app::accounts::signed_in_as(dir)
+                    .filter(|_| oneup_graph::usable_sign_in(&dir.join("token.dpapi")));
+                Ok(json!(account.map(|a| a.drive)))
+            }
             "sharing_list" => {
                 let after = args.get("after").and_then(Value::as_str);
                 oneup_app::sharing::window_tab_for(dir, oneup_app::sharing::Tab::ByYou, after, room(args)).await

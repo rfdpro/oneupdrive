@@ -6,62 +6,84 @@
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
     <title>OneUpDrive</title>
     <style>
-        /* Tokens: a cool canvas, navy ink, and the mark's indigo-to-azure accent. */
+        /* The window follows Windows 11's layering: a tinted shell (the
+           navigation, like Mica) and a raised content sheet with a rounded
+           corner, so the page reads as one surface on top of the frame.
+           Colours come from the mark: sky to azure to indigo. Every pair
+           the accessibility test names meets WCAG 2.2 AA in both themes. */
         
          :root {
             color-scheme: light dark;
-            --canvas: #f4f6fb;
+            --shell: #e9edf5;
+            --canvas: #f6f8fc;
             --panel: #ffffff;
-            --sunk: #eef1f8;
-            --line: #e1e5ee;
-            --line-strong: #cdd3e0;
-            --ink: #141a2e;
-            --muted: #5b6478;
+            --sunk: #eef1f7;
+            --line: #dfe4ee;
+            --line-strong: #c6cddc;
+            --ink: #111a2d;
+            --muted: #535d73;
             --faint: #8a93a6;
-            --accent: #2f5bea;
+            --accent: #2252cc;
             --accent-ink: #ffffff;
-            --accent-soft: #e6ecff;
-            --sel: #dfe7ff;
-            --ok: #18753f;
-            --busy: #2f86f6;
-            --wait: #8a560b;
-            --bad: #b83232;
+            --accent-soft: #e4ebfd;
+            --sel: #dbe5fc;
+            --ok: #12743c;
+            --ok-soft: #e3f4ea;
+            --busy: #2f7ff0;
+            --wait: #85520a;
+            --wait-soft: #fcf1de;
+            --bad: #b0292c;
             --bad-ink: #ffffff;
-            --field: #7d8699;
+            --bad-soft: #fbe9e9;
+            --field: #7b8498;
             --off: #8a93a6;
-            --hover: rgba(20, 26, 46, .045);
+            --hover: rgba(17, 26, 45, .05);
+            --press: rgba(17, 26, 45, .08);
             --radius: 8px;
-            --grid: #e8ebf2;
+            --radius-s: 5px;
+            --shadow-1: 0 1px 2px rgba(17, 26, 45, .06);
+            --shadow-pop: 0 12px 32px rgba(17, 26, 45, .16), 0 2px 6px rgba(17, 26, 45, .08);
+            --grid: #e6e9f1;
             --s1: #2a78d6;
             --s2: #eb6834;
             --s3: #1baf7a;
             --s4: #eda100;
             --s5: #e87ba4;
             --s6: #008300;
+            --display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+            --caption: "Segoe UI Variable Small", "Segoe UI", system-ui, sans-serif;
+            --mono: "Cascadia Mono", Consolas, monospace;
         }
         
         @media (prefers-color-scheme: dark) {
              :root {
-                --canvas: #12151f;
-                --panel: #1a1f2c;
-                --sunk: #151926;
+                --shell: #0f121a;
+                --canvas: #161a24;
+                --panel: #1e2330;
+                --sunk: #191d28;
                 --line: #2a3142;
-                --line-strong: #39425a;
-                --ink: #e8ecf6;
-                --muted: #a2abc0;
+                --line-strong: #3b4459;
+                --ink: #e9edf7;
+                --muted: #a4adc2;
                 --faint: #7a849b;
-                --accent: #7c9cff;
-                --accent-ink: #0d1330;
-                --accent-soft: #232c4d;
-                --sel: #26305a;
-                --ok: #5cc98a;
+                --accent: #84a5ff;
+                --accent-ink: #0b1230;
+                --accent-soft: #232e4e;
+                --sel: #273461;
+                --ok: #5fcf8f;
+                --ok-soft: #173326;
                 --busy: #6aa8ff;
                 --wait: #f0b14a;
-                --bad: #ff8f8f;
-                --bad-ink: #1a1f2c;
-                --field: #6b7590;
+                --wait-soft: #33281a;
+                --bad: #ff9191;
+                --bad-ink: #1e2330;
+                --bad-soft: #3a1f24;
+                --field: #6d7792;
                 --off: #7a849b;
-                --hover: rgba(232, 236, 246, .06);
+                --hover: rgba(233, 237, 247, .06);
+                --press: rgba(233, 237, 247, .1);
+                --shadow-1: 0 1px 2px rgba(0, 0, 0, .3);
+                --shadow-pop: 0 14px 36px rgba(0, 0, 0, .5), 0 2px 6px rgba(0, 0, 0, .3);
                 --grid: #262c3b;
                 --s1: #3987e5;
                 --s2: #d95926;
@@ -84,7 +106,7 @@
         body {
             margin: 0;
             height: 100%;
-            background: var(--canvas);
+            background: var(--shell);
             color: var(--ink);
             font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
         }
@@ -96,7 +118,8 @@
         
          :focus-visible {
             outline: 2px solid var(--accent);
-            outline-offset: 1px;
+            outline-offset: 2px;
+            border-radius: 2px;
         }
         
         @media (prefers-reduced-motion: reduce) {
@@ -105,47 +128,56 @@
                 animation: none !important;
             }
         }
-        /* Navigation */
+
+        * {
+            scrollbar-width: thin;
+            scrollbar-color: var(--line-strong) transparent;
+        }
+        /* Navigation: the shell's column. The brand, the agent's status, then
+           the pages. Icons sit beside every label so the list scans at a
+           glance; below 720 px it becomes a rail of icons, the labels kept
+           for screen readers. */
         
         nav {
-            width: 212px;
-            padding: 14px 10px;
+            width: 236px;
+            padding: 14px 10px 12px;
             flex: none;
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 1px;
+            gap: 2px;
         }
         
         .brand {
             display: flex;
             align-items: center;
             gap: 10px;
-            margin: 4px 8px 18px;
+            margin: 2px 10px 14px;
         }
         
         .brand svg {
-            width: 30px;
-            height: 30px;
+            width: 28px;
+            height: 28px;
             flex: none;
         }
         
         .brand span {
-            font: 600 18px/1 "Segoe UI Variable Display", "Segoe UI", sans-serif;
+            font: 600 17px/1 var(--display);
             letter-spacing: -.01em;
         }
         
         nav button {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
             width: 100%;
+            min-height: 36px;
             border: 0;
             background: none;
             color: var(--ink);
             font: inherit;
             text-align: left;
-            padding: 8px 12px;
+            padding: 7px 12px;
             border-radius: 6px;
             cursor: pointer;
             position: relative;
@@ -155,37 +187,45 @@
             background: var(--hover);
         }
         
+        nav button:active {
+            background: var(--press);
+        }
+
         nav button[aria-current="page"] {
             background: var(--panel);
             font-weight: 600;
-            box-shadow: 0 0 0 1px var(--line);
+            box-shadow: var(--shadow-1), 0 0 0 1px var(--line);
         }
         
         nav button[aria-current="page"]::before {
             content: "";
             position: absolute;
             left: 0;
-            top: 9px;
-            bottom: 9px;
+            top: 10px;
+            bottom: 10px;
             width: 3px;
             border-radius: 2px;
             background: var(--accent);
         }
         
+        nav button[aria-current="page"] svg {
+            color: var(--accent);
+        }
+
         .nav-group {
             display: flex;
             flex-direction: column;
-            gap: 1px;
+            gap: 2px;
         }
-
         /* Settings sits at the foot of the list; its pages replace the list. */
+
         .nav-foot {
             margin-top: auto;
         }
 
         nav button svg {
-            width: 16px;
-            height: 16px;
+            width: 18px;
+            height: 18px;
             flex: none;
             color: var(--muted);
         }
@@ -199,40 +239,163 @@
         }
 
         .nav-title {
-            font: 600 12px/1 "Segoe UI Variable Text", "Segoe UI", sans-serif;
+            font: 600 12px/1 var(--caption);
             color: var(--muted);
             padding: 14px 12px 8px;
         }
-        /* The gutter is always kept, so pages don't shift or misalign when one needs a scroll bar. */
+        /* The agent's status: a tile under the brand, on every page. The light
+           has a halo in its own colour; while syncing the halo breathes, so a
+           glance tells running from idle (still under reduced motion). */
+
+        #agent {
+            margin: 0 0 14px;
+            flex: none;
+        }
+
+        #st-btn {
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 11px;
+            width: 100%;
+            padding: 9px 10px 9px 13px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
+            background: var(--panel);
+            color: var(--ink);
+            font: inherit;
+            text-align: left;
+            cursor: pointer;
+            box-shadow: var(--shadow-1);
+        }
+
+        #st-btn:hover {
+            border-color: var(--line-strong);
+        }
+
+        #st-btn .st-words {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        #st-title {
+            font-weight: 600;
+            line-height: 1.25;
+        }
+
+        #st-sub {
+            font: 12px/1.3 var(--caption);
+            color: var(--muted);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        #st-sub:empty {
+            display: none;
+        }
+
+        #st-btn > svg {
+            width: 12px;
+            height: 12px;
+            color: var(--muted);
+            transform: rotate(90deg);
+        }
+
+        #st-dot {
+            width: 10px;
+            height: 10px;
+            box-shadow: 0 0 0 4px color-mix(in srgb, var(--off) 22%, transparent);
+        }
+
+        #st-dot.ok {
+            box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 20%, transparent);
+        }
+
+        #st-dot.wait {
+            box-shadow: 0 0 0 4px color-mix(in srgb, var(--wait) 22%, transparent);
+        }
+
+        #st-dot.bad {
+            box-shadow: 0 0 0 4px color-mix(in srgb, var(--bad) 22%, transparent);
+        }
+
+        #st-dot.busy {
+            animation: breathe 1.8s ease-in-out infinite;
+        }
+
+        @keyframes breathe {
+            0%,
+            100% {
+                box-shadow: 0 0 0 2px color-mix(in srgb, var(--busy) 30%, transparent);
+            }
+            50% {
+                box-shadow: 0 0 0 6px color-mix(in srgb, var(--busy) 10%, transparent);
+            }
+        }
+
+        #st-menu {
+            min-width: 260px;
+            max-width: 360px;
+        }
+
+        #st-menu .st-detail {
+            margin: 8px 12px 6px;
+            color: var(--muted);
+            font: 12px/1.45 var(--caption);
+        }
+
+        #st-menu .st-detail:empty {
+            display: none;
+        }
+
+        #st-menu button.danger {
+            color: var(--bad);
+        }
+        /* The content sheet. The gutter is always kept, so pages don't shift
+           or misalign when one needs a scroll bar. */
         
         main {
+            /* Anchor visually hidden table labels inside this scrollport. */
+            position: relative;
             flex: 1;
             min-width: 0;
+            min-height: 0;
             overflow-y: auto;
             scrollbar-gutter: stable;
-            padding: 17px 30px 44px;
+            padding: 22px 32px 48px;
+            background: var(--canvas);
+            border: 1px solid var(--line);
+            border-width: 1px 0 0 1px;
+            border-top-left-radius: 12px;
+            margin-top: 6px;
+            container: sheet / inline-size;
         }
+        /* The same gutters as every page, so switching to Files doesn't shift the title. */
         
-        /* The same gutters as every page, so switching to Files doesn't shift the header. */
         main.wide {
-            padding: 17px 30px 0;
+            padding: 22px 32px 0;
             overflow: hidden;
             display: flex;
             flex-direction: column;
         }
         
-        * {
-            scrollbar-width: thin;
-            scrollbar-color: var(--line-strong) transparent;
-        }
-        
         .page {
             display: none;
-            max-width: 780px;
+            max-width: 820px;
         }
         
         .page.on {
             display: block;
+            animation: page-in .18s ease-out;
+        }
+
+        @keyframes page-in {
+            from {
+                opacity: 0;
+                transform: translateY(4px);
+            }
         }
         
         #files.page.on {
@@ -242,24 +405,65 @@
             flex: 1;
             min-height: 0;
         }
-        
         /* Every page's title keeps the same 18px below it, whatever comes
-           next (a subtitle sits closer), so pages line up as you switch. */
+           next (a subtitle sits closer), so pages line up as you switch. A
+           page's own commands (Add, Refresh) sit on the title's line. */
+
         h2 {
-            font: 600 26px/1.2 "Segoe UI Variable Display", "Segoe UI", sans-serif;
+            font: 600 28px/1.2 var(--display);
             margin: 0 0 18px;
-            letter-spacing: -.01em;
+            letter-spacing: -.015em;
         }
         
         h2+p.lead {
-            margin: -14px 0 18px;
+            margin: -12px 0 20px;
         }
 
-        /* A problem the agent ran into, above every page while it lasts. */
+        .page-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 18px;
+            flex: none;
+        }
+
+        .page-head h2 {
+            margin: 0;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .page-head .btn svg {
+            width: 14px;
+            height: 14px;
+            vertical-align: -2px;
+            margin-right: 7px;
+        }
+        /* A problem the agent ran into, above every page while it lasts: an
+           InfoBar in the error colour, its actions on its own line. */
+
         #problem {
-            border-left: 3px solid var(--bad);
-            padding: 14px 18px;
-            margin: 0 0 18px;
+            display: grid;
+            grid-template-columns: auto minmax(0, 1fr);
+            column-gap: 12px;
+            background: var(--bad-soft);
+            border: 1px solid color-mix(in srgb, var(--bad) 35%, transparent);
+            border-radius: var(--radius);
+            padding: 14px 18px 14px 16px;
+            margin: 0 0 20px;
+        }
+
+        #problem>* {
+            grid-column: 2;
+        }
+
+        #problem .p-icon {
+            grid-column: 1;
+            grid-row: 1 / span 6;
+            width: 20px;
+            height: 20px;
+            color: var(--bad);
+            margin-top: 1px;
         }
 
         #problem .p-head {
@@ -270,7 +474,7 @@
         }
 
         #problem p {
-            margin: 6px 0 0;
+            margin: 4px 0 0;
         }
 
         #problem .actions {
@@ -284,6 +488,11 @@
         #problem summary {
             cursor: pointer;
             color: var(--muted);
+            width: fit-content;
+        }
+
+        #problem .out {
+            background: var(--panel);
         }
 
         #problem.flash {
@@ -297,21 +506,29 @@
         }
 
         h3 {
-            font-size: 14px;
-            font-weight: 600;
-            margin: 24px 0 8px;
+            font: 600 14px/1.3 "Segoe UI Variable Text", "Segoe UI", sans-serif;
+            margin: 30px 0 10px;
+        }
+
+        .page-head+h3,
+        h2+h3 {
+            margin-top: 6px;
         }
         
         .lead,
         .muted {
             color: var(--muted);
         }
-        /* Cards and rows (settings pages) */
+        /* Cards and rows. A card groups rows behind one border; on the
+           settings pages (and in .tiles) every row is a tile of its own with
+           a small gap, as in Windows 11's Settings, so each choice reads as
+           one control. */
         
         .card {
             background: var(--panel);
             border: 1px solid var(--line);
             border-radius: var(--radius);
+            box-shadow: var(--shadow-1);
         }
         
         .row {
@@ -319,7 +536,7 @@
             align-items: center;
             gap: 16px;
             padding: 12px 16px;
-            min-height: 58px;
+            min-height: 60px;
         }
         
         .row+.row {
@@ -330,6 +547,46 @@
             display: block;
         }
         
+        .page.settings .card,
+        .card.tiles {
+            background: none;
+            border: 0;
+            box-shadow: none;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .page.settings .card>div:not(.row),
+        .card.tiles>div:not(.row) {
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+
+        .page.settings .card>div:not(.row):empty,
+        .card.tiles>div:not(.row):empty {
+            display: none;
+        }
+
+        .page.settings .card .row,
+        .card.tiles .row {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: var(--radius-s);
+            box-shadow: var(--shadow-1);
+        }
+
+        .page.settings .card .row+.row,
+        .card.tiles .row+.row {
+            border-top: 1px solid var(--line);
+        }
+
+        .page.settings .card>.say,
+        .page.settings .card>.note {
+            padding: 4px 2px 0;
+        }
+
         .label {
             flex: 1;
             min-width: 0;
@@ -343,7 +600,8 @@
         .label small {
             display: block;
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1.4 var(--caption);
+            margin-top: 1px;
         }
         
         .status {
@@ -391,8 +649,8 @@
             overflow-wrap: anywhere;
             user-select: text;
         }
+        /* For screen readers only (a column of buttons' heading, the rail's labels). */
         
-        /* For screen readers only (a column of buttons' heading). */
         .sr-only {
             position: absolute;
             width: 1px;
@@ -404,20 +662,25 @@
 
         .note {
             color: var(--muted);
-            font-size: 12px;
-            margin: 6px 2px 0;
+            font: 12px/1.45 var(--caption);
+            margin: 8px 2px 0;
         }
-
         /* A page section that folds away: its heading is the toggle. */
+
         details.sect>summary {
             display: flex;
             align-items: center;
-            gap: 6px;
-            margin: 24px 0 8px;
+            gap: 8px;
+            margin: 30px 0 10px;
             list-style: none;
             cursor: pointer;
             width: fit-content;
             border-radius: 4px;
+            padding: 2px 6px 2px 2px;
+        }
+
+        details.sect>summary:hover {
+            background: var(--hover);
         }
 
         details.sect>summary::-webkit-details-marker {
@@ -439,25 +702,21 @@
             transform: rotate(90deg);
         }
 
-        details.sect>summary:hover h3 {
-            color: var(--accent);
-        }
-
         details.sect h4 {
             font-size: 13px;
             font-weight: 600;
             color: var(--muted);
-            margin: 18px 0 8px;
+            margin: 20px 0 8px;
         }
 
         details.sect>summary+h4 {
             margin-top: 4px;
         }
-
         /* A card's own message ("Nothing kept.") and footnote, inset like its rows. */
+
         .card>.say {
             margin: 0;
-            padding: 14px 16px;
+            padding: 16px;
             color: var(--muted);
         }
 
@@ -472,33 +731,48 @@
         }
         
         code {
-            font: 12.5px "Cascadia Mono", Consolas, monospace;
+            font: 12.5px var(--mono);
         }
-        /* Controls */
+        /* Controls, after Windows 11's: a light face with a slightly darker
+           bottom edge, 4-5 px corners, 32 px tall. */
         
         button.btn {
             font: inherit;
-            border-radius: 6px;
-            padding: 5px 14px;
+            min-height: 32px;
+            border-radius: var(--radius-s);
+            padding: 4px 14px;
             border: 1px solid var(--line-strong);
+            border-bottom-color: color-mix(in srgb, var(--line-strong) 70%, var(--ink) 30%);
             background: var(--panel);
             color: var(--ink);
             cursor: pointer;
             white-space: nowrap;
+            transition: background .1s, border-color .1s;
         }
         
         button.btn:hover {
-            background: var(--hover);
+            background: color-mix(in srgb, var(--panel) 92%, var(--ink) 8%);
+        }
+
+        button.btn:active {
+            background: var(--sunk);
+            color: var(--muted);
         }
         
         button.btn.primary {
             background: var(--accent);
             color: var(--accent-ink);
             border-color: var(--accent);
+            box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .2);
         }
         
         button.btn.primary:hover {
-            filter: brightness(1.06);
+            background: color-mix(in srgb, var(--accent) 90%, var(--canvas) 10%);
+        }
+
+        button.btn.primary:active {
+            background: color-mix(in srgb, var(--accent) 80%, var(--canvas) 20%);
+            color: var(--accent-ink);
         }
         
         button.btn.danger {
@@ -506,13 +780,20 @@
         }
         
         button.btn.small {
+            min-height: 26px;
             padding: 2px 10px;
             font-size: 13px;
         }
         
-        button.btn:disabled {
+        button.btn:disabled,
+        button.btn:disabled:hover {
             opacity: .5;
             cursor: default;
+            background: var(--panel);
+        }
+
+        button.btn.primary:disabled {
+            background: var(--accent);
         }
         
         button.link {
@@ -541,8 +822,21 @@
             color: var(--ink);
             background: var(--panel);
             border: 1px solid var(--field);
-            border-radius: 6px;
-            padding: 5px 9px;
+            border-radius: var(--radius-s);
+            padding: 5px 10px;
+            min-height: 32px;
+        }
+
+        input[type=text]:hover,
+        input[type=search]:hover,
+        input[type=number]:hover,
+        input[type=password]:hover,
+        select:hover {
+            background: color-mix(in srgb, var(--panel) 95%, var(--ink) 5%);
+        }
+
+        select {
+            cursor: pointer;
         }
         
         input:focus,
@@ -552,14 +846,23 @@
             outline-offset: -1px;
         }
         
+        input[type=checkbox],
+        input[type=radio] {
+            accent-color: var(--accent);
+        }
+
+        input::placeholder {
+            color: var(--faint);
+        }
+
         input[type=number] {
             width: 100px;
+            font-variant-numeric: tabular-nums;
         }
 
         input[type=date],
         input[type=time] {
             font-variant-numeric: tabular-nums;
-            min-height: 32px;
         }
 
         input[type=date]::-webkit-calendar-picker-indicator,
@@ -572,40 +875,16 @@
         input[type=time]::-webkit-calendar-picker-indicator:hover {
             opacity: 1;
         }
-
-        /* Recovery: the rewind's folder and moment. */
-        .rw-folder {
-            width: 320px;
-        }
-
-        .rw-at {
-            display: flex;
-            gap: 8px;
-        }
-
-        .rw-at input[type=date] {
-            width: 160px;
-        }
-
-        .rw-at input[type=time] {
-            width: 150px;
-        }
-
-        #rw-ago.bad {
-            color: var(--bad);
-        }
-
-        .rw-go {
-            margin-left: auto;
-        }
         
         textarea {
             width: 100%;
             min-height: 110px;
-            font: 13px "Cascadia Mono", Consolas, monospace;
+            font: 13px var(--mono);
             resize: vertical;
             user-select: text;
         }
+        /* On/off: Windows 11's switch. The knob grows a little under the
+           pointer, as the system one does. */
         
         .toggle {
             position: relative;
@@ -629,7 +908,8 @@
             inset: 0;
             border-radius: 10px;
             border: 1px solid var(--muted);
-            transition: .15s;
+            background: var(--panel);
+            transition: background .15s, border-color .15s;
         }
         
         .toggle span::after {
@@ -641,7 +921,14 @@
             background: var(--muted);
             top: 3px;
             left: 4px;
-            transition: .15s;
+            transition: left .15s, width .1s, height .1s, top .1s;
+        }
+
+        .toggle input:hover+span::after {
+            width: 14px;
+            height: 14px;
+            top: 2px;
+            left: 3px;
         }
         
         .toggle input:checked+span {
@@ -654,6 +941,10 @@
             left: 22px;
         }
         
+        .toggle input:checked:hover+span::after {
+            left: 21px;
+        }
+
         .toggle input:focus-visible+span {
             outline: 2px solid var(--accent);
             outline-offset: 2px;
@@ -682,6 +973,45 @@
             margin-bottom: 16px;
         }
         
+        /* Shared settings is one tile of its own (on General and in setup),
+           its title inside; the gaps around its action row stay 16 px. */
+
+        #shared-settings {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: var(--radius-s);
+            box-shadow: var(--shadow-1);
+            padding: 14px 16px 0;
+        }
+
+        #setup #shared-settings {
+            border: 0;
+            border-top: 1px solid var(--line);
+            border-radius: 0;
+            box-shadow: none;
+            padding: 16px 20px 0 64px;
+        }
+
+        #shared-settings>h3 {
+            margin: 0 0 2px;
+        }
+
+        #shared-settings>.note {
+            margin: 0;
+        }
+
+        #shared-settings>#shared-status {
+            margin: -4px 0 14px;
+        }
+
+        #shared-settings>#shared-status:empty {
+            display: none;
+        }
+
+        #shared-comparison {
+            margin-bottom: 14px;
+        }
+
         .field {
             display: flex;
             gap: 8px;
@@ -689,18 +1019,18 @@
             margin-top: 8px;
             flex-wrap: wrap;
         }
-        
+
         .field input[type=text],
         .field input[type=password] {
             flex: 1;
             min-width: 160px;
         }
 
-        .vault-field + .vault-field {
+        .vault-field+.vault-field {
             margin-top: 16px;
         }
 
-        .vault-field > label {
+        .vault-field>label {
             display: block;
             font-weight: 600;
         }
@@ -729,32 +1059,43 @@
             text-align: left;
             overflow-wrap: anywhere;
         }
+        /* Choices of one: a sunken track with the chosen one raised, in the
+           accent colour and bold, so the choice isn't told by colour alone.
+           A .pivot is a page's own list switcher: underlined, like tabs. */
         
         .seg {
             display: inline-flex;
-            border: 1px solid var(--line-strong);
-            border-radius: 6px;
-            overflow: hidden;
+            flex-wrap: wrap;
+            gap: 2px;
+            padding: 2px;
+            border: 1px solid var(--line);
+            border-radius: 7px;
+            background: var(--sunk);
         }
         
         .seg button {
-            border: 0;
-            background: var(--panel);
+            border: 1px solid transparent;
+            background: none;
             color: var(--ink);
             font: inherit;
             font-size: 13px;
-            padding: 4px 12px;
+            padding: 3px 12px;
+            min-height: 26px;
+            border-radius: var(--radius-s);
             cursor: pointer;
+            white-space: nowrap;
         }
         
-        .seg button+button {
-            border-left: 1px solid var(--line-strong);
+        .seg button:hover {
+            background: var(--hover);
         }
         
         .seg button[aria-pressed="true"] {
-            background: var(--accent-soft);
+            background: var(--panel);
+            border-color: var(--line-strong);
             color: var(--accent);
             font-weight: 600;
+            box-shadow: var(--shadow-1);
         }
         
         .seg button:disabled {
@@ -762,6 +1103,44 @@
             cursor: default;
         }
         
+        .seg.pivot {
+            padding: 0;
+            border: 0;
+            border-radius: 0;
+            background: none;
+            gap: 4px;
+        }
+
+        .seg.pivot button {
+            font-size: 14px;
+            padding: 6px 10px 8px;
+            border: 0;
+            border-radius: var(--radius-s);
+            color: var(--muted);
+            position: relative;
+        }
+
+        .seg.pivot button:hover {
+            color: var(--ink);
+        }
+
+        .seg.pivot button[aria-pressed="true"] {
+            background: none;
+            color: var(--ink);
+            box-shadow: none;
+        }
+
+        .seg.pivot button[aria-pressed="true"]::after {
+            content: "";
+            position: absolute;
+            left: 10px;
+            right: 10px;
+            bottom: 1px;
+            height: 3px;
+            border-radius: 2px;
+            background: var(--accent);
+        }
+
         fieldset {
             border: 0;
             padding: 0;
@@ -779,24 +1158,28 @@
             max-height: 260px;
             overflow: auto;
             user-select: text;
-            font: 12px/1.5 "Cascadia Mono", Consolas, monospace;
+            font: 12px/1.5 var(--mono);
             background: var(--sunk);
-            border-radius: 6px;
-            padding: 10px;
+            border: 1px solid var(--line);
+            border-radius: var(--radius-s);
+            padding: 10px 12px;
         }
+        /* The toast: bottom right, above everything, an accent edge (red
+           for an error) to tell it from the page. */
         
         #toast {
             position: fixed;
-            bottom: 18px;
+            bottom: 20px;
             right: 24px;
             background: var(--panel);
             border: 1px solid var(--line);
+            border-left: 4px solid var(--accent);
             border-radius: var(--radius);
-            padding: 10px 16px;
-            box-shadow: 0 8px 24px rgba(10, 14, 30, .18);
+            padding: 11px 16px;
+            box-shadow: var(--shadow-pop);
             opacity: 0;
             transform: translateY(8px);
-            transition: .2s;
+            transition: opacity .2s, transform .2s;
             pointer-events: none;
             max-width: 460px;
             z-index: 20;
@@ -808,11 +1191,11 @@
         }
         
         #toast.error {
-            border-left: 3px solid var(--bad);
+            border-left-color: var(--bad);
         }
-
         /* A viewport-fixed message can fall beyond a dialog's scrollport.
            Keep it inside that scrollport while the dialog is modal. */
+
         dialog #toast.show {
             position: sticky;
             right: auto;
@@ -820,6 +1203,7 @@
             max-width: none;
             margin: 0 12px 12px;
         }
+        /* Lists: a quiet header band, rows that light up under the pointer. */
         
         table.list {
             width: 100%;
@@ -828,18 +1212,36 @@
         
         table.list th {
             text-align: left;
-            font-weight: 600;
-            font-size: 12px;
+            font: 600 12px/1.3 var(--caption);
             color: var(--muted);
-            padding: 10px 16px 6px;
+            padding: 9px 16px 8px;
+            background: var(--sunk);
+            border-bottom: 1px solid var(--line);
+        }
+
+        .card>table.list:first-child thead th:first-child,
+        .card>.row+table.list thead th:first-child {
+            border-top-left-radius: calc(var(--radius) - 1px);
+        }
+
+        .card>table.list:first-child thead th:last-child {
+            border-top-right-radius: calc(var(--radius) - 1px);
         }
         
         table.list td {
-            padding: 7px 16px;
+            padding: 8px 16px;
             border-top: 1px solid var(--line);
             vertical-align: middle;
         }
         
+        table.list tbody tr:first-child td {
+            border-top: 0;
+        }
+
+        table.list tbody tr:hover td {
+            background: var(--hover);
+        }
+
         table.list td .actions {
             flex-wrap: nowrap;
             justify-content: flex-end;
@@ -855,20 +1257,54 @@
         table.list tr.clickable {
             cursor: pointer;
         }
-
-        table.list tr.clickable:hover td {
-            background: var(--hover, rgba(0, 0, 0, .04));
-        }
-
         /* Activity page: the lists the icon's menu opens here */
+
         #lists {
-            max-width: 1000px;
+            max-width: 1040px;
         }
+        /* Notices: a warning InfoBar that opens into its list. */
 
         #attn {
-            display: grid;
+            margin-bottom: 18px;
+            background: var(--wait-soft);
+            border-color: color-mix(in srgb, var(--wait) 35%, transparent);
+            box-shadow: none;
+        }
+
+        #attn>summary {
+            display: flex;
+            align-items: center;
             gap: 10px;
-            margin-bottom: 16px;
+            padding: 12px 16px;
+            cursor: pointer;
+            font-weight: 600;
+            list-style: none;
+        }
+
+        #attn>summary::-webkit-details-marker {
+            display: none;
+        }
+
+        #attn>summary::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            flex: none;
+            border-right: 2px solid var(--wait);
+            border-bottom: 2px solid var(--wait);
+            transform: rotate(-45deg);
+            transition: transform .15s;
+            margin: 0 2px 0 0;
+        }
+
+        #attn[open]>summary::before {
+            transform: rotate(45deg);
+        }
+
+        #attn-list {
+            background: var(--panel);
+            border-top: 1px solid color-mix(in srgb, var(--wait) 30%, transparent);
+            border-radius: 0 0 calc(var(--radius) - 1px) calc(var(--radius) - 1px);
         }
 
         #attn .row {
@@ -888,7 +1324,21 @@
             gap: 8px;
             align-items: center;
             flex-wrap: wrap;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
+        }
+
+        .ls-bar.under {
+            border-bottom: 1px solid var(--line);
+            padding-bottom: 2px;
+            margin-bottom: 14px;
+        }
+
+        .ls-bar.under .seg.pivot {
+            margin-bottom: -3px;
+        }
+
+        #ls-root {
+            margin-left: auto;
         }
 
         .ls-bar input[type=search] {
@@ -896,14 +1346,32 @@
             min-width: 180px;
         }
 
-        #ls-sum {
-            margin: 0 2px 10px;
+        #ls-sum,
+        #sg-sum {
+            margin: 0 2px 12px;
+        }
+
+        #ls-sum:empty,
+        #sg-sum:empty {
+            display: none;
         }
 
         #ls-table td.when {
             white-space: nowrap;
             color: var(--muted);
             font-variant-numeric: tabular-nums;
+            vertical-align: top;
+        }
+        /* Columns as wide as their content; the item takes the rest. */
+
+        #ls-table td.when,
+        #ls-table td.fit {
+            width: 1%;
+            white-space: nowrap;
+        }
+
+        #ls-table td.fit,
+        #ls-table td.fit+td.wrap {
             vertical-align: top;
         }
 
@@ -918,15 +1386,15 @@
         #recovery td small {
             display: block;
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1.4 var(--caption);
         }
 
         #ls-table tr.group td {
             background: var(--sunk);
             font-weight: 600;
         }
-
         /* Shared: one row per link, its buttons on one line */
+
         #sg-table td.when {
             white-space: nowrap;
             color: var(--muted);
@@ -938,13 +1406,13 @@
         }
 
         #sg-table td.item {
-            min-width: 160px;
+            min-width: 180px;
         }
 
         #sg-table td small {
             display: block;
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1.4 var(--caption);
         }
 
         #sg-table td.act {
@@ -955,29 +1423,45 @@
         #sg-table td.act .btn+.btn {
             margin-left: 6px;
         }
+        /* An outcome: a pill with a light in its colour, so it isn't told by
+           colour alone (the word is there too). */
 
         .tag {
-            display: inline-block;
-            font-size: 12px;
-            padding: 1px 8px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font: 600 12px/1.5 var(--caption);
+            padding: 1px 9px 1px 8px;
             border-radius: 10px;
             background: var(--sunk);
+            color: var(--muted);
             white-space: nowrap;
+        }
+
+        .tag::before {
+            content: "";
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
         }
 
         .tag.ok {
             color: var(--ok);
+            background: var(--ok-soft);
         }
 
         .tag.wait {
             color: var(--wait);
+            background: var(--wait-soft);
         }
 
         .tag.bad {
             color: var(--bad);
+            background: var(--bad-soft);
         }
-
         /* Sync failures: what can be done about each */
+
         #ls-table td.act {
             white-space: nowrap;
             text-align: right;
@@ -1035,12 +1519,14 @@
         }
 
         .seg .count {
-            margin-left: 6px;
+            margin-left: 7px;
             font-size: 11px;
+            font-weight: 600;
             padding: 0 6px;
             border-radius: 8px;
-            background: var(--sunk);
+            background: var(--line);
             color: var(--ink);
+            font-variant-numeric: tabular-nums;
         }
 
         .seg .count.bad {
@@ -1048,8 +1534,9 @@
             color: var(--bad-ink);
         }
 
-        #ls-more {
-            margin: 10px 2px 0;
+        #ls-more,
+        #sg-more {
+            margin: 12px 2px 0;
         }
 
         .app-file-list {
@@ -1100,12 +1587,20 @@
             cursor: pointer;
             font: inherit;
             padding: 0 4px;
+            border-radius: 4px;
         }
+
+        .chip button:hover {
+            background: var(--hover);
+            color: var(--ink);
+        }
+        /* First-run setup: numbered steps joined by a line, done ones green. */
         
         .step {
             display: flex;
-            gap: 14px;
-            padding: 16px 18px;
+            gap: 16px;
+            padding: 18px 20px;
+            position: relative;
         }
         
         .step+.step {
@@ -1113,16 +1608,19 @@
         }
         
         .step .num {
-            width: 26px;
-            height: 26px;
+            width: 28px;
+            height: 28px;
             border-radius: 50%;
-            border: 1px solid var(--muted);
+            border: 1.5px solid var(--muted);
+            background: var(--panel);
             flex: none;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 12px;
-            font-weight: 600;
+            font: 600 13px/1 var(--display);
+            font-variant-numeric: tabular-nums;
+            position: relative;
+            z-index: 1;
         }
         
         .step.done .num {
@@ -1139,29 +1637,30 @@
         .step .body>b {
             display: block;
             margin-bottom: 2px;
+            font: 600 15px/1.35 var(--display);
         }
         
         .swatch {
             display: inline-block;
             width: 10px;
             height: 10px;
-            border-radius: 2px;
+            border-radius: 3px;
             margin-right: 8px;
             vertical-align: -1px;
         }
         
         .legend {
             display: flex;
-            gap: 16px;
+            gap: 18px;
             flex-wrap: wrap;
-            padding: 12px 16px 0;
-            font-size: 12px;
+            padding: 14px 18px 0;
+            font: 12px/1.4 var(--caption);
             color: var(--muted);
         }
         
         .chart {
             position: relative;
-            padding: 8px 16px 14px;
+            padding: 8px 18px 16px;
         }
         
         .chart svg {
@@ -1186,10 +1685,10 @@
             pointer-events: none;
             background: var(--panel);
             border: 1px solid var(--line);
-            border-radius: 6px;
+            border-radius: var(--radius-s);
             padding: 8px 10px;
             font-size: 12px;
-            box-shadow: 0 6px 18px rgba(10, 14, 30, .18);
+            box-shadow: var(--shadow-pop);
             min-width: 160px;
             z-index: 2;
         }
@@ -1204,49 +1703,50 @@
             justify-content: space-between;
             gap: 14px;
         }
-        /* Files */
+        /* Apps: the chart and the table read as one panel. */
         
-        .files-head {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 16px;
+        #apps .card+.card {
+            margin-top: 12px;
         }
-        
-        .files-head h2 {
-            margin: 0;
-            flex: 1;
-        }
+        /* Files: the title with its commands, the folders as tabs, then one
+           command bar (the views, and search with its filters). */
         
         .roots {
             display: flex;
             gap: 6px;
             overflow-x: auto;
-            padding: 2px 1px 10px;
+            padding: 2px 2px 12px;
             flex: none;
         }
         
         .root-tab {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 9px;
             border: 1px solid var(--line);
-            background: var(--panel);
+            background: transparent;
             color: var(--ink);
-            border-radius: 8px;
-            padding: 6px 12px 6px 10px;
+            border-radius: var(--radius);
+            padding: 6px 14px 6px 11px;
+            min-height: 36px;
             font: inherit;
             cursor: pointer;
             white-space: nowrap;
         }
         
         .root-tab:hover {
+            background: var(--hover);
             border-color: var(--line-strong);
         }
         
+        /* The chosen folder: raised, bold, an accent edge along its foot.
+           Not a full accent outline, which would read as keyboard focus. */
+
         .root-tab[aria-selected="true"] {
-            border-color: var(--accent);
-            box-shadow: inset 0 0 0 1px var(--accent);
+            background: var(--panel);
+            border-color: var(--line-strong);
+            box-shadow: inset 0 -3px 0 var(--accent), var(--shadow-1);
+            font-weight: 600;
         }
         
         .root-tab svg {
@@ -1256,56 +1756,322 @@
             flex: none;
         }
         
+        .root-tab[aria-selected="true"] svg {
+            color: var(--accent);
+        }
+
         .root-tab small {
             color: var(--muted);
-            font-size: 12px;
+            font: 400 12px/1 var(--caption);
+            padding: 2px 6px;
+            border-radius: 8px;
+            background: var(--sunk);
         }
         
-        .toolbar {
+        #files-toolbar {
             display: flex;
-            align-items: center;
-            gap: 10px;
             flex: none;
-            margin-bottom: 8px;
+            align-items: stretch;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
         }
-        /* Search: an icon until pointed at or focused, then the full box. */
-        
+
+        .file-explorer {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            min-height: 0;
+            min-width: 0;
+        }
+
+        .search-tools {
+            display: flex;
+            align-items: stretch;
+            min-width: 0;
+            flex: none;
+            background: var(--panel);
+            border: 1px solid var(--field);
+            border-radius: 8px;
+        }
+
         .search {
             position: relative;
-            margin-left: auto;
-            flex: none;
-            width: 32px;
-            transition: width .18s ease;
+            flex: 1;
+            min-width: 0;
         }
-        
-        .search.open {
-            width: min(300px, 40vw);
-        }
-        
+
         .search input {
             width: 100%;
-            height: 32px;
-            padding-left: 30px;
-        }
-        
-        .search:not(.open) input {
-            border-color: transparent;
+            height: 34px;
+            padding-left: 32px;
+            border: 0;
             background: transparent;
-            color: transparent;
+        }
+
+        .search-tools button {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 0 9px;
+            border: 0;
+            border-inline-start: 1px solid var(--line);
+            border-radius: 0 7px 7px 0;
+            background: transparent;
+            color: var(--ink);
+            font: 600 12px/1 var(--caption);
             cursor: pointer;
         }
-        
-        .search:not(.open) input::placeholder {
-            color: transparent;
-        }
-        
-        .search:not(.open):hover input {
+
+        .search-tools button:hover {
             background: var(--hover);
         }
-        
+
+        .search-tools :focus-visible {
+            outline-offset: -2px;
+        }
+
+        .search-tools button svg {
+            width: 14px;
+            height: 14px;
+        }
+
+        #search-filters-toggle[data-active] {
+            color: var(--accent);
+            background: var(--accent-soft);
+        }
+
+        #search-filters {
+            position: fixed;
+            inset: auto;
+            margin: 0;
+            width: min(286px, calc(100vw - 16px));
+            max-height: calc(100vh - 16px);
+            overflow: auto;
+            padding: 12px 14px;
+            border: 1px solid var(--line-strong);
+            border-radius: var(--radius);
+            background: var(--panel);
+            color: var(--ink);
+            box-shadow: var(--shadow-1);
+        }
+
+        .search-filter-field {
+            display: grid;
+            gap: 4px;
+            margin-bottom: 10px;
+        }
+
+        .search-filter-field select {
+            width: 100%;
+        }
+
+        .search-regex-field {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding-top: 10px;
+            border-top: 1px solid var(--line);
+        }
+
+        #details-toggle {
+            min-height: 36px;
+            margin-inline-start: auto;
+            padding-inline: 14px;
+        }
+
+        #details-toggle[aria-pressed="true"] {
+            background: var(--accent-soft);
+            border-color: color-mix(in srgb, var(--accent) 40%, var(--line-strong));
+            color: var(--accent);
+        }
+
+        #files.memory-active> :is(#roots, #files-toolbar, #files-pane),
+        #files.memory-active :is(#add-btn, #memory-open) {
+            display: none;
+        }
+        /* Memory view: a treemap of what takes the space. */
+
+        #memory-view {
+            display: flex;
+            flex: 1;
+            flex-direction: column;
+            min-height: 0;
+            gap: 10px;
+            padding-bottom: 20px;
+            overflow-y: auto;
+        }
+
+        .memory-head,
+        .memory-meta,
+        #memory-path {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .memory-head h3 {
+            margin: 0 0 0 4px;
+            flex: 1;
+            font: 600 18px/1.3 var(--display);
+        }
+
+        #memory-back svg {
+            width: 12px;
+            height: 12px;
+            transform: scaleX(-1);
+            vertical-align: -1px;
+            margin-right: 6px;
+        }
+
+        #memory-path {
+            flex: 1;
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+
+        #memory-path span {
+            color: var(--faint);
+        }
+
+        .memory-meta {
+            color: var(--muted);
+        }
+
+        #memory-status {
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+            color: var(--ink);
+        }
+
+        #memory-basis {
+            margin: 0;
+            font: 12px/1.4 var(--caption);
+        }
+
+        #memory-map {
+            flex: 1;
+            min-height: 180px;
+            position: relative;
+            overflow: hidden;
+            isolation: isolate;
+            background: var(--sunk);
+            border: 1px solid var(--line-strong);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-1);
+        }
+
+        .memory-tile {
+            position: absolute;
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden;
+            border-radius: 4px;
+            background: var(--panel);
+        }
+
+        .memory-tile:focus-within {
+            z-index: 1;
+        }
+
+        .memory-open,
+        .memory-zoom {
+            border: 0;
+            font: inherit;
+            color: inherit;
+            cursor: pointer;
+        }
+
+        .memory-open {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            text-align: left;
+            padding: 5px 8px;
+            background: var(--memory-color);
+            background-image: linear-gradient(160deg, rgba(255, 255, 255, .1), rgba(0, 0, 0, .08));
+            background-color: var(--memory-color);
+            color: white;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .15);
+        }
+
+        .memory-open span {
+            display: block;
+            max-width: 100%;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            font-weight: 600;
+        }
+
+        .memory-open small {
+            color: inherit;
+            font-variant-numeric: tabular-nums;
+            opacity: .92;
+        }
+
+        .memory-open:hover,
+        .memory-zoom:hover {
+            filter: brightness(1.18);
+        }
+
+        .memory-open:focus-visible,
+        .memory-zoom:focus-visible {
+            outline: 2px solid white;
+            outline-offset: -3px;
+        }
+
+        .memory-folder .memory-open {
+            flex-direction: row;
+            align-items: flex-start;
+            gap: 7px;
+        }
+
+        .memory-folder .memory-open small {
+            flex: none;
+        }
+
+        .memory-folder.memory-expandable .memory-open {
+            padding-right: 30px;
+        }
+
+        .memory-zoom {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 26px;
+            height: 26px;
+            background: rgba(0, 0, 0, .28);
+            color: white;
+            font-size: 18px;
+            line-height: 1;
+            border-bottom-left-radius: 4px;
+        }
+
+        .memory-children {
+            position: absolute;
+            inset: 27px 1px 1px;
+            overflow: hidden;
+            background: var(--sunk);
+        }
+
+        .memory-other {
+            padding: 5px 8px;
+            background: var(--hover);
+            color: var(--muted);
+            overflow: hidden;
+        }
+
+        .pane.full-width {
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-rows: minmax(0, 1fr);
+        }
+
         .search svg {
             position: absolute;
-            left: 9px;
+            left: 10px;
             top: 50%;
             width: 14px;
             height: 14px;
@@ -1313,10 +2079,12 @@
             color: var(--muted);
             pointer-events: none;
         }
+        /* The views (and the pivots) are tabs: underlined, the chosen one bold. */
         
         .views {
             display: flex;
             gap: 2px;
+            flex: none;
         }
         
         .views button {
@@ -1324,8 +2092,9 @@
             background: none;
             color: var(--muted);
             font: inherit;
-            padding: 6px 10px;
-            border-radius: 6px;
+            padding: 6px 10px 8px;
+            min-height: 32px;
+            border-radius: var(--radius-s);
             cursor: pointer;
             position: relative;
         }
@@ -1345,9 +2114,9 @@
             position: absolute;
             left: 10px;
             right: 10px;
-            bottom: 0;
-            height: 2px;
-            border-radius: 1px;
+            bottom: 1px;
+            height: 3px;
+            border-radius: 2px;
             background: var(--accent);
         }
         
@@ -1356,26 +2125,30 @@
             min-height: 0;
             display: grid;
             grid-template-columns: minmax(340px, 1fr) 340px;
-            gap: 14px;
-            padding-bottom: 18px;
+            gap: 12px;
+            padding-bottom: 20px;
         }
         
         .browser {
+            flex: 1;
             background: var(--panel);
             border: 1px solid var(--line);
             border-radius: var(--radius);
+            box-shadow: var(--shadow-1);
             display: flex;
             flex-direction: column;
             min-height: 0;
+            overflow: hidden;
         }
         
         .cols {
             display: grid;
             grid-template-columns: 1fr 150px 74px;
             gap: 8px;
-            padding: 8px 14px 6px 14px;
-            font-size: 12px;
+            padding: 8px 14px 7px 14px;
+            font: 600 12px/1.3 var(--caption);
             color: var(--muted);
+            background: var(--sunk);
             border-bottom: 1px solid var(--line);
             flex: none;
         }
@@ -1399,7 +2172,6 @@
         
         .cols button.on {
             color: var(--ink);
-            font-weight: 600;
         }
         
         .cols .r {
@@ -1410,18 +2182,20 @@
         .tree {
             flex: 1;
             overflow-y: auto;
-            padding: 4px 0 8px;
+            padding: 4px 4px 8px;
         }
+        /* A tree row: selection is a tint with an accent edge, focus an outline. */
         
         .ti {
             display: grid;
             grid-template-columns: 1fr 150px 74px;
             gap: 8px;
             align-items: center;
-            height: 30px;
-            padding: 0 14px 0 6px;
+            height: 32px;
+            padding: 0 10px 0 2px;
             cursor: default;
             position: relative;
+            border-radius: var(--radius-s);
         }
         
         .ti:hover {
@@ -1432,6 +2206,17 @@
             background: var(--sel);
         }
         
+        .ti[aria-selected="true"]::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 8px;
+            bottom: 8px;
+            width: 3px;
+            border-radius: 2px;
+            background: var(--accent);
+        }
+
         .ti:focus-visible {
             outline: 2px solid var(--accent);
             outline-offset: -2px;
@@ -1483,8 +2268,8 @@
         .ti .tw.none {
             visibility: hidden;
         }
-
         /* Whether the item syncs: ticked, unticked, or partly (a rule inside). */
+
         .ti .inc {
             flex: none;
             width: 14px;
@@ -1517,7 +2302,7 @@
         .ti .sz {
             text-align: right;
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1 var(--caption);
             font-variant-numeric: tabular-nums;
         }
         
@@ -1525,7 +2310,7 @@
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            font-size: 12px;
+            font: 12px/1.3 var(--caption);
             color: var(--muted);
             white-space: nowrap;
             overflow: hidden;
@@ -1560,7 +2345,7 @@
             display: flex;
             align-items: center;
             gap: 10px;
-            padding: 8px 14px;
+            padding: 9px 14px;
             border-top: 1px solid var(--line);
         }
         
@@ -1568,6 +2353,10 @@
             border-top: 0;
         }
         
+        .fl:hover {
+            background: var(--hover);
+        }
+
         .fl .label b {
             font-weight: 400;
         }
@@ -1582,7 +2371,7 @@
         }
         
         .group {
-            padding: 12px 14px 4px;
+            padding: 14px 14px 4px;
             font-weight: 600;
             font-size: 13px;
         }
@@ -1590,32 +2379,38 @@
         .group+.fl {
             border-top: 0;
         }
-        /* Details panel */
+        /* Details panel: the item as a header (its icon on a tile), then
+           sections that open and close. */
         
         .details {
             background: var(--panel);
             border: 1px solid var(--line);
             border-radius: var(--radius);
+            box-shadow: var(--shadow-1);
             overflow-y: auto;
             min-height: 0;
         }
         
         .d-head {
-            padding: 16px 16px 12px;
+            padding: 18px 16px 14px;
             border-bottom: 1px solid var(--line);
         }
         
         .d-head .t {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
         }
         
-        .d-head .t svg {
-            width: 22px;
-            height: 22px;
+        .d-head .t>svg {
+            width: 40px;
+            height: 40px;
+            padding: 9px;
             flex: none;
             color: var(--muted);
+            background: var(--sunk);
+            border: 1px solid var(--line);
+            border-radius: var(--radius);
         }
         
         .d-head .t svg.folder {
@@ -1624,14 +2419,14 @@
         
         .d-head h4 {
             margin: 0;
-            font: 600 16px/1.3 "Segoe UI Variable Display", "Segoe UI", sans-serif;
+            font: 600 16px/1.3 var(--display);
             overflow-wrap: anywhere;
             user-select: text;
         }
         
         .d-head .where {
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1.4 var(--caption);
             margin-top: 2px;
             overflow-wrap: anywhere;
             user-select: text;
@@ -1700,7 +2495,7 @@
             display: flex;
             align-items: flex-start;
             gap: 12px;
-            padding: 8px 0;
+            padding: 9px 0;
         }
         
         .acc-body .opt+.opt {
@@ -1722,62 +2517,13 @@
             padding-right: 8px;
         }
         
+        .acc-body table.list th {
+            background: none;
+        }
+        
         .acc-body .say {
             margin: 4px 0 8px;
             color: var(--muted);
-        }
-        /* The agent's status, at the top of every page */
-        /* 32px tall, 17px down: its middle lines up with the logo's (nav padding 14 + brand margin 4 + half of 30). */
-        
-        #agent {
-            display: flex;
-            margin-bottom: 14px;
-            flex: none;
-        }
-        
-        #st-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 9px;
-            height: 32px;
-            padding: 0 10px 0 12px;
-            border: 1px solid var(--line);
-            border-radius: 16px;
-            background: var(--panel);
-            color: var(--ink);
-            font: inherit;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        
-        #st-btn:hover {
-            border-color: var(--line-strong);
-        }
-        
-        #st-btn svg {
-            width: 12px;
-            height: 12px;
-            color: var(--muted);
-            transform: rotate(90deg);
-        }
-        
-        #st-menu {
-            min-width: 260px;
-            max-width: 380px;
-        }
-        
-        #st-menu .st-detail {
-            margin: 6px 12px 6px;
-            color: var(--muted);
-            font-size: 12px;
-        }
-        
-        #st-menu .st-detail:empty {
-            display: none;
-        }
-        
-        #st-menu button.danger {
-            color: var(--bad);
         }
         /* Share, beside a file's name */
         
@@ -1816,10 +2562,10 @@
         .share .pop div {
             background: var(--panel);
             border: 1px solid var(--line);
-            border-radius: 8px;
+            border-radius: var(--radius);
             padding: 4px;
             min-width: 200px;
-            box-shadow: 0 10px 30px rgba(10, 14, 30, .2);
+            box-shadow: var(--shadow-pop);
         }
         
         .share .pop button {
@@ -1831,7 +2577,7 @@
             color: var(--ink);
             font: inherit;
             padding: 7px 10px;
-            border-radius: 6px;
+            border-radius: var(--radius-s);
             cursor: pointer;
             white-space: nowrap;
         }
@@ -1844,7 +2590,8 @@
             outline: 2px solid var(--accent);
             outline-offset: -2px;
         }
-        /* Menus and dialogs */
+        /* Menus and dialogs: menus drop in, dialogs carry their buttons on a
+           footer band, as Windows 11's own dialogs do. */
         
         .menu {
             position: fixed;
@@ -1853,13 +2600,24 @@
             color: var(--ink);
             background: var(--panel);
             border: 1px solid var(--line);
-            border-radius: 8px;
+            border-radius: var(--radius);
             padding: 4px;
-            box-shadow: 0 10px 30px rgba(10, 14, 30, .2);
+            box-shadow: var(--shadow-pop);
             z-index: 10;
             min-width: 260px;
         }
         
+        .menu:popover-open {
+            animation: menu-in .12s ease-out;
+        }
+
+        @keyframes menu-in {
+            from {
+                opacity: 0;
+                transform: translateY(-4px);
+            }
+        }
+
         .menu button {
             display: block;
             width: 100%;
@@ -1869,14 +2627,14 @@
             color: var(--ink);
             font: inherit;
             padding: 8px 12px;
-            border-radius: 6px;
+            border-radius: var(--radius-s);
             cursor: pointer;
         }
         
         .menu button small {
             display: block;
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1.4 var(--caption);
         }
         
         .menu button:hover {
@@ -1918,33 +2676,51 @@
             background: var(--panel);
             color: var(--ink);
             padding: 0;
-            width: min(520px, 92vw);
-            box-shadow: 0 20px 50px rgba(10, 14, 30, .3);
+            width: min(540px, 92vw);
+            box-shadow: 0 24px 60px rgba(10, 14, 30, .32), 0 2px 8px rgba(10, 14, 30, .12);
+        }
+
+        dialog[open] {
+            animation: dialog-in .16s ease-out;
+        }
+
+        @keyframes dialog-in {
+            from {
+                opacity: 0;
+                transform: scale(.98);
+            }
         }
         
         dialog::backdrop {
-            background: rgba(10, 14, 30, .35);
+            background: rgba(10, 14, 30, .38);
         }
         
         dialog .dh {
-            padding: 18px 20px 4px;
+            padding: 22px 24px 6px;
         }
         
         dialog .dh h3 {
             margin: 0;
-            font: 600 18px "Segoe UI Variable Display", "Segoe UI", sans-serif;
+            font: 600 20px/1.3 var(--display);
         }
         
         dialog .db {
-            padding: 4px 20px 8px;
+            padding: 4px 24px 18px;
         }
         
         dialog .df {
             display: flex;
             justify-content: flex-end;
             gap: 8px;
-            padding: 12px 20px 16px;
+            padding: 16px 24px;
             align-items: center;
+            background: var(--sunk);
+            border-top: 1px solid var(--line);
+            border-radius: 0 0 9px 9px;
+        }
+
+        dialog .df .btn {
+            min-width: 96px;
         }
         
         dialog .df .muted {
@@ -1954,23 +2730,167 @@
         
         dialog label.ck {
             display: flex;
-            gap: 8px;
+            gap: 10px;
             align-items: flex-start;
-            margin-top: 10px;
+            margin-top: 12px;
         }
         
         dialog label.ck input {
             margin-top: 3px;
         }
         
+        dialog .db>.opt {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 8px;
+            margin-top: 16px;
+            padding-top: 14px;
+            border-top: 1px solid var(--line);
+        }
+
+        dialog .db>.opt .label small {
+            margin-top: 2px;
+        }
+
         dialog label.ck small {
             display: block;
             color: var(--muted);
-            font-size: 12px;
+            font: 12px/1.4 var(--caption);
+        }
+        /* Recovery: each way back is a section with its own mark, so the
+           long page scans by what each one does. */
+
+        .sect-head {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 32px 0 10px;
+        }
+
+        .page-head+.sect-head {
+            margin-top: 4px;
+        }
+
+        .sect-head svg {
+            width: 28px;
+            height: 28px;
+            padding: 6px;
+            flex: none;
+            color: var(--accent);
+            background: var(--accent-soft);
+            border-radius: 7px;
+        }
+
+        .sect-head h3 {
+            margin: 0;
+            font: 600 16px/1.3 var(--display);
+        }
+
+        .rw-folder {
+            width: 320px;
+            max-width: 100%;
+        }
+
+        .rw-at {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .rw-at input[type=date] {
+            width: 160px;
+        }
+
+        .rw-at input[type=time] {
+            width: 150px;
+        }
+
+        #rw-ago.bad {
+            color: var(--bad);
+        }
+
+        .rw-go {
+            margin-left: auto;
+        }
+
+        #rw-quick+.rw-go {
+            align-self: center;
+        }
+
+        #rw-result {
+            background: var(--canvas);
+        }
+
+        #rw-groups {
+            margin-top: 0;
+        }
+
+        #cf-table td:first-child {
+            min-width: 180px;
+        }
+
+        #cf-table td:nth-child(2),
+        #cf-table td:nth-child(3) {
+            font-variant-numeric: tabular-nums;
+        }
+        /* The three answers stay on one line while the sheet has room (the
+           dates wrap first) and stack when it's narrow, rather than pushing
+           the table past the card. */
+
+        #cf-table th,
+        #cf-table td {
+            padding-left: 10px;
+            padding-right: 10px;
+        }
+
+        #cf-table th:first-child,
+        #cf-table td:first-child {
+            padding-left: 16px;
+        }
+
+        #cf-table th:last-child,
+        #cf-table td:last-child {
+            padding-right: 16px;
+        }
+
+        #cf-table td .actions {
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        @container sheet (min-width: 720px) {
+            #cf-table td .actions {
+                flex-wrap: nowrap;
+            }
+        }
+
+        #cf-batch {
+            min-height: 0;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--line);
+        }
+
+        #cf-pages .row,
+        #rc-kept .row.actions {
+            min-height: 0;
+            padding: 8px 16px;
+            justify-content: center;
+            border-top: 1px solid var(--line);
+        }
+        /* About: the mark large, the version as its title. */
+
+        #about .card:first-of-type .row:first-child svg {
+            width: 48px;
+            height: 48px;
+        }
+
+        #about-version {
+            font: 600 18px/1.3 var(--display) !important;
         }
         /* Accessibility */
-
         /* A program's name in the Apps table: a button, so the keyboard can open its files. */
+
         button.cell-btn {
             border: 0;
             background: none;
@@ -1980,70 +2900,142 @@
             cursor: pointer;
             text-align: left;
         }
+        /* When the sheet is too narrow for the tree beside the details (a
+           narrow window, or large zoom), the details go under the tree. Asked
+           of the sheet, not the window, so the navigation's width counts. */
 
-        /* Narrow windows (or large zoom): the details go under the tree. */
-        @media (max-width: 860px) {
+        @container sheet (max-width: 700px) {
             .pane {
                 grid-template-columns: 1fr;
                 grid-template-rows: minmax(220px, 1fr) minmax(220px, 1fr);
             }
         }
 
+        @media (max-width: 860px) {
+            main,
+            main.wide {
+                padding-left: 22px;
+                padding-right: 22px;
+            }
+        }
+        /* Narrower still (or 150-200 % zoom): the navigation becomes a rail
+           of icons. Each label stays in its button, hidden only from sight,
+           so screen readers and tooltips still name it. */
+
+        @media (max-width: 820px) {
+            nav {
+                width: 64px;
+                padding: 12px 8px;
+                align-items: stretch;
+            }
+            .brand {
+                margin: 2px 0 12px;
+                justify-content: center;
+            }
+            .brand span,
+            nav .nl,
+            .nav-title,
+            #st-btn .st-words,
+            #st-btn>svg {
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                overflow: hidden;
+                clip-path: inset(50%);
+                white-space: nowrap;
+            }
+            nav button {
+                justify-content: center;
+                padding: 9px 0;
+            }
+            #st-btn {
+                display: flex;
+                justify-content: center;
+                padding: 12px 0;
+            }
+            main,
+            main.wide {
+                padding-left: 18px;
+                padding-right: 18px;
+            }
+        }
         /* Windows' contrast themes: backgrounds and borders take the theme's
            colours, so what only a colour showed (the selection, a pressed
-           button, a switch that's on) is drawn with the theme's own. */
+           button, a switch that's on, a tile's edge) is drawn with the theme's own. */
+
         @media (forced-colors: active) {
+            .memory-open,
+            .memory-zoom {
+                border: 1px solid ButtonBorder;
+            }
+            .memory-open:focus-visible,
+            .memory-zoom:focus-visible {
+                outline-color: Highlight;
+            }
             .ti[aria-selected="true"],
             nav button[aria-current="page"],
             .seg button[aria-pressed="true"],
             .views button[aria-selected="true"],
-            .root-tab[aria-selected="true"] {
+            .root-tab[aria-selected="true"],
+            #details-toggle[aria-pressed="true"],
+            #search-filters-toggle[data-active] {
                 forced-color-adjust: none;
                 background: Highlight;
                 color: HighlightText;
             }
-
-            .ti[aria-selected="true"] * {
+            .ti[aria-selected="true"] *,
+            nav button[aria-current="page"] svg,
+            .root-tab[aria-selected="true"] svg {
                 color: HighlightText;
             }
-
+            .seg.pivot button[aria-pressed="true"]::after,
+            .views button[aria-selected="true"]::after,
+            nav button[aria-current="page"]::before,
+            .ti[aria-selected="true"]::before {
+                background: HighlightText;
+            }
             .toggle span {
                 forced-color-adjust: none;
                 border-color: CanvasText;
                 background: Canvas;
             }
-
             .toggle span::after {
                 background: CanvasText;
             }
-
             .toggle input:checked+span {
                 background: Highlight;
                 border-color: Highlight;
             }
-
             .toggle input:checked+span::after {
                 background: HighlightText;
             }
-
             .toggle input:disabled+span {
                 border-color: GrayText;
             }
-
             .toggle input:focus-visible+span {
                 outline-color: CanvasText;
             }
-
             .dot {
                 border: 1px solid CanvasText;
             }
-
+            #st-dot {
+                box-shadow: none;
+            }
+            main,
+            #st-btn,
+            #problem,
+            #attn,
+            .page.settings .card .row,
+            .card.tiles .row,
+            .seg,
+            .tag {
+                border: 1px solid CanvasText;
+            }
             .chart,
             .swatch {
                 forced-color-adjust: none;
             }
         }
-
         /* The removal preview lists every copy that goes. */
 
         #dp-facts {
@@ -2074,6 +3066,7 @@
     <symbol id="i-chev" viewBox="0 0 16 16"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.5 4.2c0-.6.5-1.2 1.2-1.2h3.5l1.5 1.6h5.6c.7 0 1.2.5 1.2 1.2v6.5c0 .6-.5 1.2-1.2 1.2H2.7c-.7 0-1.2-.5-1.2-1.2z" fill="currentColor" opacity=".9"/></symbol>
     <symbol id="i-file" viewBox="0 0 16 16"><path d="M4 1.5h5.2L12.5 4.8v9.2c0 .3-.2.5-.5.5H4c-.3 0-.5-.2-.5-.5V2c0-.3.2-.5.5-.5z M9 1.6V5h3.4" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 16 16"><path d="M2 4h12M4 8h8m-6 4h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
     <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m10.5 10.5 3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
     <symbol id="i-sync" viewBox="0 0 16 16"><path d="M2.5 6.5h9l-2.5-2.5M13.5 9.5h-9l2.5 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 13V3.5M4 7.2 8 3.2l4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
@@ -2081,38 +3074,59 @@
     <symbol id="i-share" viewBox="0 0 16 16"><circle cx="5" cy="8" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="4" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="11.5" cy="12" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="m6.8 7 3-1.8M6.8 9l3 1.8" stroke="currentColor" stroke-width="1.3"/></symbol>
     <symbol id="i-gear" viewBox="0 0 16 16"><path d="M13.01 6.26 L14.54 6.56 L14.54 9.44 L13.01 9.74 L12.77 10.31 L13.64 11.61 L11.61 13.64 L10.31 12.77 L9.74 13.01 L9.44 14.54 L6.56 14.54 L6.26 13.01 L5.69 12.77 L4.39 13.64 L2.36 11.61 L3.23 10.31 L2.99 9.74 L1.46 9.44 L1.46 6.56 L2.99 6.26 L3.23 5.69 L2.36 4.39 L4.39 2.36 L5.69 3.23 L6.26 2.99 L6.56 1.46 L9.44 1.46 L9.74 2.99 L10.31 3.23 L11.61 2.36 L13.64 4.39 L12.77 5.69Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><circle cx="8" cy="8" r="2.1" fill="none" stroke="currentColor" stroke-width="1.2"/></symbol>
     <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <!-- Navigation and section marks: one stroke weight, drawn on the same 16 px grid. -->
+    <symbol id="i-files" viewBox="0 0 16 16"><path d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h3.1l1.5 1.5h5.4c.7 0 1.25.55 1.25 1.25v6.5c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M1.75 6.5h12.5" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-apps" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2" y="2" width="5" height="5" rx="1.3"/><rect x="9" y="2" width="5" height="5" rx="1.3"/><rect x="2" y="9" width="5" height="5" rx="1.3"/><rect x="9" y="9" width="5" height="5" rx="1.3"/></g></symbol>
+    <symbol id="i-activity" viewBox="0 0 16 16"><path d="M1.5 8.5h2.8l1.9-4.8 3.4 8.6 1.9-3.8h3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-recovery" viewBox="0 0 16 16"><path d="M3.4 9.6A5 5 0 1 0 4 4.7" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M3.2 2.3v3.1h3.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 5.5V8l1.8 1.3" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-setup" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M6.6 5.4v5.2L10.6 8z" fill="currentColor"/></symbol>
+    <symbol id="i-general" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M2 4.5h12M2 11.5h12"/><circle cx="10" cy="4.5" r="1.7" style="fill:var(--panel)"/><circle cx="5.5" cy="11.5" r="1.7" style="fill:var(--panel)"/></g></symbol>
+    <symbol id="i-accounts" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="5.4" r="2.7"/><path d="M2.6 14c.5-2.8 2.7-4.4 5.4-4.4s4.9 1.6 5.4 4.4" stroke-linecap="round"/></g></symbol>
+    <symbol id="i-office" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.75h6l3 3v9.5h-9z"/><path d="M9.5 1.75v3h3M5.6 8h4.8M5.6 10.5h4.8" stroke-linecap="round"/></g></symbol>
+    <symbol id="i-safety" viewBox="0 0 16 16"><path d="M8 1.6 13.2 3.5v4c0 3.3-2.2 5.8-5.2 6.9-3-1.1-5.2-3.6-5.2-6.9v-4z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="m5.7 8 1.6 1.6 3-3.2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-network" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round"><path d="M1.6 6.2a9.2 9.2 0 0 1 12.8 0M3.9 8.7a6 6 0 0 1 8.2 0M6.2 11.1a2.7 2.7 0 0 1 3.6 0"/></g><circle cx="8" cy="13.2" r="1" fill="currentColor"/></symbol>
+    <symbol id="i-about" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2v4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="4.9" r=".9" fill="currentColor"/></symbol>
+    <symbol id="i-memory" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="1.75" y="2.25" width="12.5" height="11.5" rx="1.5"/><path d="M8.5 2.25v11.5M8.5 8h5.75M1.75 9.5H8.5M11.5 8v5.75"/></g></symbol>
+    <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 7.5A5 5 0 1 1 11.5 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12.2 1.8v2.9H9.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M8 4.4v4.4" style="stroke:var(--bad-soft)" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="11.3" r="1" style="fill:var(--bad-soft)"/></symbol>
+    <symbol id="i-conflict" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 3.5h5.5v8H2.5z"/><path d="M8 5.5h5.5v8H8z" style="fill:var(--accent-soft)"/></g></symbol>
+    <symbol id="i-kept" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="1.75" y="2.5" width="12.5" height="3.5" rx="1"/><path d="M2.75 6v6.5c0 .55.45 1 1 1h8.5c.55 0 1-.45 1-1V6M6.3 8.8h3.4" stroke-linecap="round"/></g></symbol>
+    <symbol id="i-versions" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 1.75h7.5v12.5H4.5z"/><path d="M2.5 4v10.25M7 5.5h3M7 8h3M7 10.5h2"/></g></symbol>
+    <symbol id="i-bin" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4.2h11M6.2 4.2V2.6h3.6v1.6M3.8 4.2l.7 9.3c0 .4.4.8.8.8h5.4c.4 0 .8-.4.8-.8l.7-9.3M6.6 7v4.4M9.4 7v4.4"/></g></symbol>
   </defs>
 </svg>
     <nav aria-label="Pages">
         <div class="brand"><svg role="img" aria-label="OneUpDrive"><use href="#mark"/></svg><span>OneUpDrive</span></div>
+        <!-- The background agent: what it's doing (and when it last synced), and its controls.
+             In the shell, not the page, so it stays put as pages change. -->
+        <header id="agent"><button id="st-btn" popovertarget="st-menu" aria-haspopup="menu" title="OneUpDrive status">
+    <span class="dot" id="st-dot"></span><span class="st-words"><span id="st-title" aria-live="polite">Connecting…</span><span id="st-sub"></span></span><svg aria-hidden="true"><use href="#i-chev"/></svg></button></header>
+        <!-- Each label is in a span, so the narrow rail can hide it from sight only. -->
         <div class="nav-group" id="nav-app">
-            <button data-page="setup" id="nav-setup" hidden>Set up</button>
-            <button data-page="files" aria-current="page">Files</button>
-            <button data-page="find">Search</button>
-            <button data-page="apps">Apps</button>
-            <button data-page="lists">Activity</button>
-            <button data-page="shared">Sharing</button>
-            <button data-page="recovery">Recovery</button>
+            <button data-page="setup" id="nav-setup" title="Set up" hidden><svg aria-hidden="true"><use href="#i-setup"/></svg><span class="nl">Set up</span></button>
+            <button data-page="files" title="Files" aria-current="page"><svg aria-hidden="true"><use href="#i-files"/></svg><span class="nl">Files</span></button>
+            <button data-page="apps" title="Apps"><svg aria-hidden="true"><use href="#i-apps"/></svg><span class="nl">Apps</span></button>
+            <button data-page="lists" title="Activity"><svg aria-hidden="true"><use href="#i-activity"/></svg><span class="nl">Activity</span></button>
+            <button data-page="shared" title="Sharing"><svg aria-hidden="true"><use href="#i-share"/></svg><span class="nl">Sharing</span></button>
+            <button data-page="recovery" title="Recovery"><svg aria-hidden="true"><use href="#i-recovery"/></svg><span class="nl">Recovery</span></button>
         </div>
         <div class="nav-group" id="nav-settings" role="group" aria-labelledby="nav-settings-title" hidden>
-            <button class="nav-back" id="nav-back"><svg aria-hidden="true"><use href="#i-chev"/></svg>Back</button>
+            <button class="nav-back" id="nav-back" title="Back"><svg aria-hidden="true"><use href="#i-chev"/></svg><span class="nl">Back</span></button>
             <div class="nav-title" id="nav-settings-title">Settings</div>
-            <button data-page="general">General</button>
-            <button data-page="accounts">Accounts</button>
-            <button data-page="office">Office</button>
-            <button data-page="safety">Safety</button>
-            <button data-page="network">Network</button>
-            <button data-page="about">About</button>
+            <button data-page="general" title="General"><svg aria-hidden="true"><use href="#i-general"/></svg><span class="nl">General</span></button>
+            <button data-page="accounts" title="Accounts"><svg aria-hidden="true"><use href="#i-accounts"/></svg><span class="nl">Accounts</span></button>
+            <button data-page="office" title="Office"><svg aria-hidden="true"><use href="#i-office"/></svg><span class="nl">Office</span></button>
+            <button data-page="safety" title="Safety"><svg aria-hidden="true"><use href="#i-safety"/></svg><span class="nl">Safety</span></button>
+            <button data-page="network" title="Network"><svg aria-hidden="true"><use href="#i-network"/></svg><span class="nl">Network</span></button>
+            <button data-page="about" title="About"><svg aria-hidden="true"><use href="#i-about"/></svg><span class="nl">About</span></button>
         </div>
-        <button class="nav-foot" id="nav-open-settings"><svg aria-hidden="true"><use href="#i-gear"/></svg>Settings</button>
+        <button class="nav-foot" id="nav-open-settings" title="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span class="nl">Settings</span></button>
     </nav>
     <main id="main">
-        <!-- The background agent: what it's doing, and its controls -->
-        <header id="agent"><button id="st-btn" popovertarget="st-menu" aria-haspopup="menu" title="OneUpDrive status">
-    <span class="dot" id="st-dot"></span><span id="st-title" aria-live="polite">Connecting…</span><svg aria-hidden="true"><use href="#i-chev"/></svg></button></header>
         <!-- A problem the agent ran into: on every page while it lasts -->
         <section class="card" id="problem" role="alert" hidden>
-            <div class="p-head"><span class="dot bad"></span><b id="pb-title"></b></div>
+            <svg class="p-icon" aria-hidden="true"><use href="#i-alert"/></svg>
+            <div class="p-head"><b id="pb-title"></b></div>
             <p id="pb-detail"></p>
             <p id="pb-action"></p>
             <p class="muted" id="pb-when"></p>
@@ -2227,53 +3241,75 @@
 
         <!-- Files: the tree, and everything about what syncs -->
         <section class="page on" id="files">
-            <div class="files-head">
+            <div class="files-head page-head">
                 <h2>Files</h2>
-                <button class="btn" id="add-btn" aria-haspopup="menu" popovertarget="add-menu"><svg width="12" height="12" style="vertical-align:-1px;margin-right:6px" aria-hidden="true"><use href="#i-plus"/></svg>Add</button></div>
+                <!-- The main folder's treemap; its tab's right-click menu opens it too. -->
+                <button class="btn" id="memory-open" hidden><svg aria-hidden="true"><use href="#i-memory"/></svg>Memory view</button>
+                <button class="btn" id="add-btn" aria-haspopup="menu" popovertarget="add-menu"><svg aria-hidden="true"><use href="#i-plus"/></svg>Add</button></div>
             <div class="roots" id="roots" role="tablist" aria-label="Synced folders"></div>
-            <div class="toolbar">
+            <div id="files-toolbar">
                 <div class="views" role="tablist" aria-label="View">
                     <button role="tab" data-view="all" aria-selected="true">All files</button>
                     <button role="tab" data-view="out">Exclude</button>
                     <button role="tab" data-view="dupes">Duplicates</button>
                 </div>
-                <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
+                <button class="btn" id="details-toggle" aria-controls="details" aria-pressed="true">Details</button>
             </div>
-            <div class="pane">
-                <div class="browser">
-                    <div class="cols" id="cols"></div>
-                    <div class="tree" id="tree" role="tree" aria-label="Files"></div>
+            <div class="pane" id="files-pane">
+                <div class="file-explorer">
+                    <div class="search-tools" id="search-tools">
+                        <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" aria-keyshortcuts="Control+F" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
+                        <button id="fd-go" hidden>Search</button>
+                        <button id="search-filters-toggle" popovertarget="search-filters" aria-controls="search-filters"><svg aria-hidden="true"><use href="#i-filter"/></svg>Filters</button>
+                        <div id="search-filters" popover role="group" aria-label="Search filters">
+                            <div class="search-filter-field">
+                                <label for="search-scope">Search scope</label>
+                                <select id="search-scope" autofocus>
+                                    <option value="root">Synced folder</option>
+                                    <option value="drive">OneDrive</option>
+                                </select>
+                            </div>
+                            <div class="search-filter-field">
+                                <label for="search-kind">Item type</label>
+                                <select id="search-kind">
+                                    <option value="">Files and folders</option>
+                                    <option value="files">Files only</option>
+                                    <option value="folders">Folders only</option>
+                                </select>
+                            </div>
+                            <label class="search-regex-field"><input type="checkbox" id="search-regex"> Regex</label>
+                        </div>
+                    </div>
+                    <div class="browser">
+                        <div class="cols" id="cols"></div>
+                        <div class="msg" id="fd-sum" role="status" hidden></div>
+                        <div class="tree" id="tree" role="tree" aria-label="Files"></div>
+                    </div>
                 </div>
                 <aside class="details" id="details" aria-label="Details"></aside>
             </div>
-        </section>
-
-        <!-- Search: every name in OneDrive, from the mirror (oneup_app::search) -->
-        <section class="page" id="find">
-            <h2>Search</h2>
-            <div class="ls-bar">
-                <input type="search" id="fd-q" placeholder="Name, or part of one" spellcheck="false" aria-label="Search OneDrive by name">
-                <button class="btn primary" id="fd-go">Search</button>
-            </div>
-            <p class="lead" id="fd-sum" role="status"></p>
-            <div class="card" id="fd-card" hidden>
-                <div class="flat" id="fd-list"></div>
-            </div>
-            <p class="muted" id="fd-note" hidden></p>
-            <h3>Settings</h3>
-            <div class="card">
-                <div class="row">
-                    <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
-                    <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
-                <div class="row">
-                    <div class="label"><b>Hotkey</b><small>Opens this page from any program. Like Ctrl+Alt+F</small></div><input type="text" id="fd-hotkey" placeholder="None" aria-label="Hotkey"></div>
-            </div>
+            <section id="memory-view" aria-labelledby="memory-title" hidden>
+                <div class="memory-head">
+                    <button class="btn small" id="memory-back"><svg aria-hidden="true"><use href="#i-chev"/></svg>Back</button>
+                    <h3 id="memory-title">Memory view</h3>
+                    <div class="seg" id="memory-scope" role="group" aria-label="Storage scope">
+                        <button type="button" data-scope="disk" aria-pressed="true">On disk</button>
+                        <button type="button" data-scope="drive" aria-pressed="false">Whole drive</button>
+                    </div>
+                </div>
+                <div class="memory-meta">
+                    <div id="memory-path" role="group" aria-label="Folder path"></div>
+                    <span id="memory-status" role="status"></span>
+                </div>
+                <div id="memory-map" role="group" aria-label="File and folder sizes"></div>
+                <p class="muted" id="memory-basis">Sizes of fully downloaded files</p>
+            </section>
         </section>
 
         <!-- Apps -->
         <section class="page" id="apps">
-            <h2>Apps</h2>
-            <div class="actions" style="margin-bottom:10px">
+            <div class="page-head">
+                <h2>Apps</h2>
                 <select id="apps-days" aria-label="Period"><option value="1">Last 24 hours</option><option value="7" selected>Last 7 days</option><option value="30">Last 30 days</option><option value="90">Last 90 days</option></select>
             </div>
             <div class="card">
@@ -2296,7 +3332,7 @@
                 </table>
             </div>
             <h3>Settings</h3>
-            <div class="card">
+            <div class="card tiles">
                 <div class="row">
                     <div class="label"><b>Track which programs use my files</b><small>Kept on this PC for 90 days</small></div>
                     <label class="toggle"><input type="checkbox" data-agent="track_apps" aria-label="Track which programs use my files"><span></span></label></div>
@@ -2305,11 +3341,17 @@
 
         <!-- Activity: what sync did, and the lists the icon's menu opens here -->
         <section class="page" id="lists">
-            <h2>Activity</h2>
+            <div class="page-head">
+                <h2>Activity</h2>
+                <button class="btn" id="ls-refresh"><svg aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+            </div>
             <!-- Everything that needs you, as `oneup problems` lists it -->
-            <div id="attn" hidden></div>
-            <div class="ls-bar">
-                <div class="seg" id="ls-tabs" role="group" aria-label="List">
+            <details id="attn" class="card" hidden>
+                <summary id="attn-summary"></summary>
+                <div id="attn-list"></div>
+            </details>
+            <div class="ls-bar under">
+                <div class="seg pivot" id="ls-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="log" aria-pressed="true">Recent</button>
                     <button type="button" data-tab="unsynced" aria-pressed="false">Sync failures</button>
                     <button type="button" data-tab="excluded" aria-pressed="false">Excluded in OneDrive</button>
@@ -2320,7 +3362,6 @@
             <div class="ls-bar">
                 <input type="search" id="ls-filter" placeholder="Filter" spellcheck="false" aria-label="Filter">
                 <select id="ls-outcome" aria-label="Show"><option value="">Everything</option><option value="problems">Problems only</option></select>
-                <button class="btn" id="ls-refresh">Refresh</button>
             </div>
             <p class="lead" id="ls-sum" role="status"></p>
             <div class="card" id="ls-card" hidden>
@@ -2334,13 +3375,15 @@
 
         <!-- Shared: what this account shares and who can open it; what others share with it -->
         <section class="page" id="shared">
-            <h2>Sharing</h2>
-            <div class="ls-bar">
-                <div class="seg" id="sg-tabs" role="group" aria-label="List">
+            <div class="page-head">
+                <h2>Sharing</h2>
+                <button class="btn" id="sg-refresh"><svg aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+            </div>
+            <div class="ls-bar under">
+                <div class="seg pivot" id="sg-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="by" aria-pressed="true">Shared by you</button>
                     <button type="button" data-tab="with" aria-pressed="false">Shared with you</button>
                 </div>
-                <button class="btn" id="sg-refresh">Refresh</button>
             </div>
             <p class="lead" id="sg-sum"></p>
             <div class="card" id="sg-card" hidden>
@@ -2355,7 +3398,7 @@
         <!-- Recovery: rewind a folder, kept copies, OneDrive versions and recycle bin, conflicts -->
         <section class="page" id="recovery">
             <h2>Recovery</h2>
-            <h3>Rewind a folder</h3>
+            <div class="sect-head"><svg aria-hidden="true"><use href="#i-recovery"/></svg><h3>Rewind a folder</h3></div>
             <div class="card">
                 <div class="row">
                     <div class="label"><b>Folder</b><small>/ for everything</small></div>
@@ -2382,29 +3425,31 @@
                 </div>
             </div>
             <p class="note" id="rw-since">Puts a folder back the way it was at a moment you choose. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.</p>
-            <h3>Conflicts</h3>
+            <div class="sect-head"><svg aria-hidden="true"><use href="#i-conflict"/></svg><h3>Conflicts</h3></div>
             <div class="card" id="cf-card">
                 <p class="say" id="cf-sum" role="status">Looking…</p>
+                <div class="row actions" id="cf-batch" aria-label="Resolve all listed conflicts" role="group" hidden></div>
+                <div id="cf-pages"></div>
                 <table class="list" id="cf-table" aria-label="Conflicts" hidden>
                     <thead><tr><th>File</th><th>Original</th><th>Conflict copy</th><th><span class="sr-only">Action</span></th></tr></thead>
                     <tbody></tbody>
                 </table>
             </div>
-            <h3>Kept on this PC</h3>
+            <div class="sect-head"><svg aria-hidden="true"><use href="#i-kept"/></svg><h3>Kept on this PC</h3></div>
             <div class="card" id="rc-kept"></div>
-            <h3>OneDrive versions</h3>
+            <div class="sect-head"><svg aria-hidden="true"><use href="#i-versions"/></svg><h3>OneDrive versions</h3></div>
             <div class="card">
                 <div class="row block">
                     <div class="field"><input type="text" id="rv-path" placeholder="A file in a synced folder, like C:\Users\you\OneUpDrive\report.docx" spellcheck="false" aria-label="File to show the versions of"><button class="btn" id="rv-show">Show</button></div>
                     <div id="rv-list"></div>
                 </div>
             </div>
-            <h3>Deleted from OneDrive</h3>
+            <div class="sect-head"><svg aria-hidden="true"><use href="#i-bin"/></svg><h3>Deleted from OneDrive</h3></div>
             <div class="card" id="rc-bin"></div>
         </section>
 
         <!-- Safety -->
-        <section class="page" id="safety">
+        <section class="page settings" id="safety">
             <h2>Safety</h2>
             <h3>Stop and ask when</h3>
             <div class="card">
@@ -2442,7 +3487,7 @@
         </section>
 
         <!-- Office -->
-        <section class="page" id="office">
+        <section class="page settings" id="office">
             <h2>Office</h2>
             <h3>Double-click with AutoSave</h3>
             <div class="card">
@@ -2478,7 +3523,7 @@
         </section>
 
         <!-- Network -->
-        <section class="page" id="network">
+        <section class="page settings" id="network">
             <h2>Network</h2>
             <h3>Speed limits</h3>
             <div class="card">
@@ -2561,7 +3606,7 @@
         </section>
 
         <!-- General -->
-        <section class="page" id="general">
+        <section class="page settings" id="general">
             <h2>General</h2>
             <div id="general-shared-slot"><div id="shared-settings">
                 <h3>Shared settings</h3>
@@ -2589,6 +3634,14 @@
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
             <p class="note">Memory and priority apply after a restart.</p>
+            <h3>Search</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
+                    <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Hotkey</b><small>Opens Files search from any program. Like Ctrl+Alt+F</small></div><input type="text" id="fd-hotkey" placeholder="None" aria-label="Hotkey"></div>
+            </div>
             <h3 id="shortcuts">Shortcuts</h3>
             <div class="card">
                 <div class="row">
@@ -2596,14 +3649,8 @@
                     <div class="actions"><button class="btn" id="sc-undo" hidden>Undo</button><button class="btn" id="sc-find">Search</button><button class="btn primary" id="sc-fix" hidden>Update</button></div></div>
                 <div id="sc-list"></div>
             </div>
-            <h3>Updates</h3>
+            <h3>Setup</h3>
             <div class="card">
-                <div class="row">
-                    <div class="label"><b>Install updates automatically</b><small>Only updates signed by the same publisher</small></div><label class="toggle"><input type="checkbox" id="upd-auto" aria-label="Install updates automatically"><span></span></label></div>
-                <div class="row">
-                    <div class="label"><b>Get previews</b><small>New features sooner, more bugs</small></div><label class="toggle"><input type="checkbox" id="upd-preview" aria-label="Get preview versions"><span></span></label></div>
-                <div class="row">
-                    <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
                 <div class="row">
                     <div class="label"><b>Run setup again</b></div><button class="btn" id="setup-rerun" aria-label="Open setup">Open</button></div>
             </div>
@@ -2631,7 +3678,7 @@
         </section>
 
         <!-- Accounts -->
-        <section class="page" id="accounts">
+        <section class="page settings" id="accounts">
             <h2>Accounts</h2>
             <p class="lead">Each account has its own folders, settings and icon.</p>
             <div class="card" id="account-list"></div>
@@ -2645,7 +3692,7 @@
         </section>
 
         <!-- About -->
-        <section class="page" id="about">
+        <section class="page settings" id="about">
             <h2>About</h2>
             <div class="card">
                 <div class="row"><svg width="40" height="40" aria-hidden="true"><use href="#mark"/></svg>
@@ -2655,6 +3702,15 @@
                     <div class="label"><b class="path" id="about-data">–</b><small>Data folder</small></div>
                     <div class="actions"><button class="btn" data-open="data">Open</button><button class="btn" data-open="log">Log</button></div>
                 </div>
+            </div>
+            <h3>Updates</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Install updates automatically</b><small>Only updates signed by the same publisher</small></div><label class="toggle"><input type="checkbox" id="upd-auto" aria-label="Install updates automatically"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Get previews</b><small>New features sooner, more bugs</small></div><label class="toggle"><input type="checkbox" id="upd-preview" aria-label="Get preview versions"><span></span></label></div>
+                <div class="row">
+                    <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
             </div>
         </section>
     </main>
@@ -3056,6 +4112,7 @@
         let snap = null;
 
         function call(op, args = {}) {
+            if (op === "sign_in" || op === "sign_out") clearSharing();
             return new Promise((resolve, reject) => {
                 const id = ++seq;
                 waiting.set(id, {
@@ -3105,7 +4162,7 @@
             // Opened again (from the icon's menu, or Explorer's commands
             // for a file) while open: the page, or the file, asked for.
             if (m.event === "goto") return startAt(m.page, m.item);
-            if (m.event === "search_build") return findBuilding(m.items);
+            if (m.event === "search_build" && m.request === FD.seq && F.view === "all") return findBuilding(m.items);
             const w = waiting.get(m.id);
             if (!w) return;
             waiting.delete(m.id);
@@ -3222,8 +4279,11 @@
             if (switcher) {
                 (inSettings ? $("#nav-back") : $("#nav-open-settings")).focus();
             }
+            const changed = $(".page.on")?.id !== page;
             $$(".page").forEach(p => p.classList.toggle("on", p.id === page));
-            $("#main").classList.toggle("wide", page === "files");
+            const main = $("#main");
+            main.classList.toggle("wide", page === "files");
+            if (changed) main.scrollTop = 0;
             $("#agent").hidden = page === "setup";
             $(page === "setup" ? "#setup-shared-slot" : "#general-shared-slot").append($("#shared-settings"));
             clearInterval(appsTimer);
@@ -3232,19 +4292,57 @@
                 loadApps();
                 appsTimer = setInterval(() => document.hidden || loadApps(true), 15000);
             }
-            if (page === "files") openFiles();
-            if (page === "find") openFind();
+            if (page !== "files") $("#search-filters").hidePopover();
+            if (page !== "files" && M.active) closeMemory(false);
+            if (page === "files" && !M.active) {
+                $("#fd-go").hidden = !$("#search-regex").checked && !($("#search-scope").value === "drive" && $("#fd-onedrive").checked);
+                openFiles();
+            }
             if (page === "accounts") loadAccounts();
             if (page === "general" && !scSearched) loadShortcuts();
             if (page === "general") loadHooks();
             if (page === "lists") loadList(true);
-            if (page === "lists") loadAttention();
+            if (page === "lists") {
+                $("#attn").open = false;
+                loadAttention();
+            }
             if (page === "shared") loadSharing();
             if (page === "recovery") loadRecovery();
         }
         $$("nav button[data-page]").forEach(b => b.onclick = () => show(b.dataset.page));
         $("#nav-open-settings").onclick = () => show(NAV.settings);
         $("#nav-back").onclick = () => show(NAV.app);
+        $("nav").addEventListener("keydown", e => {
+            if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+            const pages = $$("nav button:is([data-page], #nav-back, #nav-open-settings)")
+                .filter(button => button.getClientRects().length);
+            const i = pages.indexOf(e.target);
+            if (i < 0) return;
+            const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: pages.length - 1 }[e.key];
+            if (next === undefined) return;
+            e.preventDefault();
+            pages[(next + pages.length) % pages.length].focus();
+        });
+
+        document.addEventListener("keydown", e => {
+            if (e.defaultPrevented || e.isComposing || $("dialog:modal, [popover]:popover-open")) return;
+            if (e.key === "F6" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                const target = e.target.closest("nav") ?
+                    (M.active ? $("#memory-title") : $(".page.on h2")) :
+                    $('nav [aria-current="page"]');
+                if (!target) return;
+                e.preventDefault();
+                if (target.matches("h2, h3")) target.tabIndex = -1;
+                target.focus();
+            } else if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === "f" &&
+                $("#files").classList.contains("on")) {
+                e.preventDefault();
+                if (M.active) closeMemory(false);
+                setView("all");
+                $("#q").focus();
+                $("#q").select();
+            }
+        });
         document.addEventListener("click", e => {
             const g = e.target.closest("[data-goto]");
             if (g) show(g.dataset.goto);
@@ -3257,7 +4355,7 @@
             syncing: tr("Syncing"),
             paused: tr("Paused"),
             waitingforyou: tr("Waiting for you"),
-            retrying: tr("Retrying soon"),
+            retrying: tr("Catching up"),
             stopping: tr("Stopping")
         };
 
@@ -3281,9 +4379,11 @@
             showProblem(s ? s.problem : stopped, !s, s && s.version);
             const dot = $("#st-dot"),
                 title = $("#st-title"),
+                sub = $("#st-sub"),
                 detail = $("#st-detail"),
                 acts = $("#st-actions");
             acts.replaceChildren();
+            sub.textContent = "";
             const btn = (label, fn, cls = "") => acts.append(el("button", {
                 role: "menuitem",
                 className: cls.includes("danger") ? "danger" : "",
@@ -3296,6 +4396,7 @@
             if (!s) {
                 dot.className = stopped ? "dot bad" : "dot";
                 title.textContent = stopped ? tr("Stopped") : tr("Not running");
+                sub.textContent = stopped ? tr(stopped.title) : "";
                 detail.textContent = stopped ? tr("{what}.", {
                     what: tr(stopped.title)
                 }) : tr("Nothing syncs until it starts.");
@@ -3307,7 +4408,7 @@
             const stops = s.safety_stops || [];
             const attention = stops.length || (s.overflow && s.overflow.waiting);
             title.textContent = attention ? tr("Waiting for you") : s.problem ? tr("Problem") : paused || s.auto_pause ? tr("Paused") : (WORDS[a] || tr("Running"));
-            dot.className = "dot " + (attention || s.problem ? "bad" : paused || s.auto_pause ? "wait" : a === "syncing" || a === "starting" ? "busy" : "ok");
+            dot.className = "dot " + (attention || s.problem ? "bad" : paused || s.auto_pause ? "wait" : ["syncing", "starting", "retrying"].includes(a) ? "busy" : "ok");
             const bits = [];
             if (s.auto_pause) bits.push(tr("Paused: {why}.", {
                 why: tr(s.auto_pause, {
@@ -3330,11 +4431,23 @@
                     code: s.overflow.code
                 }));
             }
+            if (a === "retrying" && !attention && !s.problem && !paused && !s.auto_pause) {
+                bits.push(tr("Pending changes will sync automatically."));
+            }
             if (s.last && s.last.done) bits.push(tr("Last sync {when}: {n, plural, one {# change} other {# changes}}.", {
                 when: new Date(s.last.at_ms).toLocaleString(FMT),
                 n: s.last.done
             }));
             detail.textContent = bits.join(" ");
+            // The tile's second line: the one fact that matters most now (the
+            // problem, why it's paused, else when it last synced). The menu
+            // has the rest. A time alone for today, else the date with it.
+            const lastAt = s.last && s.last.at_ms;
+            const lastSaid = !lastAt ? "" : new Date(lastAt).toDateString() === new Date().toDateString() ?
+                new Date(lastAt).toLocaleTimeString(FMT, { hour: "numeric", minute: "2-digit" }) : when(lastAt);
+            sub.textContent = s.problem ? tr(s.problem.title) : s.auto_pause ? tr(s.auto_pause, {
+                hours: s.auto_pause_hours
+            }) : lastSaid ? tr("Last sync {time}", { time: lastSaid }) : "";
             // The stops' lists, each item and what would happen to it.
             if (stops.length) btn(tr("Review"), () => show("stops"));
             btn(tr("Sync now"), () => run(call("control", {
@@ -3442,6 +4555,8 @@
             $("#guard-on").checked = s.safety.content_guard > 0;
             $("#guard-n").value = s.safety.content_guard || 20;
             $("#guard-row").hidden = !(s.safety.content_guard > 0);
+            $("#fd-onedrive").checked = s.search.onedrive;
+            $("#fd-hotkey").value = s.search.hotkey || "";
             $("#upd-auto").checked = s.updates.auto;
             $("#upd-preview").checked = s.updates.channel === "preview";
             $("#about-version").textContent = (s.test_account ? tr("OneUpDrive {version} (test account)", {
@@ -3540,8 +4655,11 @@
             try {
                 const r = await call("problems");
                 if (seq !== attentionSeq) return;
-                box.replaceChildren(...r.problems.map(p => el("div", {
-                    className: "card row"
+                $("#attn-summary").textContent = tr("{n, plural, one {# sync notice} other {# sync notices}}", {
+                    n: r.problems.length
+                });
+                $("#attn-list").replaceChildren(...r.problems.map(p => el("div", {
+                    className: "row"
                 }, el("div", {
                     className: "label"
                 }, el("b", {
@@ -3563,6 +4681,7 @@
                     }
                 }) : null)));
                 box.hidden = !r.problems.length;
+                if (box.hidden) box.open = false;
             } catch {
                 if (seq !== attentionSeq) return;
                 box.hidden = true;
@@ -3813,66 +4932,78 @@
         // the following one starts); pages with nothing shared on its own
         // (a shared folder's contents) are passed over by themselves, up to
         // SG_SKIP of them, then **Show more** goes on.
-        const SG = {
-            tab: "by",
-            data: null,
-            items: [],
-            next: null,
-            checked: 0,
-            seq: 0
-        };
+        const SG = { tab: "by", account: null, current: null, cache: new Map(), seq: 0 };
         const SG_SKIP = 20;
-        // The most items the page holds: more than that is for
-        // `oneup shared` (which prints page after page, holding one).
+        // The most items each tab holds. The CLI can list every page.
         const SG_MAX = 500;
+        const SG_TTL = 2 * 60 * 1000;
+        function clearSharing() {
+            SG.seq++;
+            SG.cache.clear();
+            SG.current = null;
+        }
+
         $$("#sg-tabs button").forEach(b => b.onclick = () => {
             SG.tab = b.dataset.tab;
             loadSharing();
         });
-        $("#sg-refresh").onclick = () => loadSharing();
+        $("#sg-refresh").onclick = () => {
+            SG.cache.delete(SG.tab);
+            loadSharing();
+        };
 
         async function loadSharing(more = false) {
-            $$("#sg-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tab === SG.tab));
+            const tab = SG.tab;
+            $$("#sg-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tab === tab));
             const my = ++SG.seq;
-            if (!more) {
-                SG.items = [];
-                SG.next = null;
-                SG.checked = 0;
-                $("#sg-card").hidden = true;
-            }
+            if (!more) $("#sg-card").hidden = true;
             $("#sg-more").replaceChildren();
             $("#sg-sum").textContent = tr("Asking OneDrive…");
             try {
-                if (SG.tab === "with") {
-                    const r = await call("sharing_with_me", {
-                        room: SG_MAX
-                    });
-                    if (my !== SG.seq) return;
-                    SG.data = r;
+                const account = await call("sharing_account");
+                if (my !== SG.seq) return;
+                if (account !== SG.account) {
+                    SG.account = account;
+                    SG.cache.clear();
+                    SG.current = null;
+                    $("#sg-card").hidden = true;
+                }
+                const cached = SG.cache.get(tab);
+                if (!more && cached && Date.now() - cached.at < SG_TTL) {
+                    SG.current = cached;
+                    renderSharing();
+                    return;
+                }
+                const previous = more && SG.current?.tab === tab ? SG.current : null;
+                const page = previous ? { ...previous, items: [...previous.items] } :
+                    { tab, items: [], next: null, checked: 0, at: Date.now() };
+                if (tab === "with") {
+                    page.data = await call("sharing_with_me", { room: SG_MAX });
                 } else {
                     for (let n = 0; n < SG_SKIP; n++) {
-                        // Only as many as the page still has room for.
-                        const room = SG_MAX - SG.items.length;
+                        const room = SG_MAX - page.items.length;
                         if (room <= 0) break;
-                        const r = await call("sharing_list", more || n ? {
-                            after: SG.next,
-                            room
-                        } : {
-                            room
-                        });
+                        const r = await call("sharing_list", { after: page.next, room });
                         if (my !== SG.seq) return;
-                        SG.items.push(...r.items);
-                        SG.next = r.next;
-                        SG.checked += r.checked;
+                        page.items.push(...r.items);
+                        page.next = r.next;
+                        page.checked += r.checked;
                         if (r.items.length || !r.next) break;
                         $("#sg-sum").textContent = tr("Checking… {n, plural, one {# item} other {# items}} read.", {
-                            n: SG.checked
+                            n: page.checked
                         });
                     }
                 }
+                if (my !== SG.seq) return;
+                SG.current = page;
+                // A transient permission lookup error should be retried on revisit.
+                if (account && !page.items.some(i => i.error)) SG.cache.set(tab, page);
+                else SG.cache.delete(tab);
                 renderSharing();
             } catch (e) {
-                if (my === SG.seq) $("#sg-sum").textContent = e.message;
+                if (my !== SG.seq) return;
+                if (more && SG.current?.tab === tab) renderSharing();
+                $("#sg-sum").textContent = e.message;
             }
         }
 
@@ -3889,8 +5020,9 @@
         }
 
         function renderSharing() {
-            const r = SG.data;
-            if (SG.tab === "with") {
+            const page = SG.current;
+            if (page.tab === "with") {
+                const r = page.data;
                 sharingTable([tr("Item"), tr("Shared by"), tr("Shared")], r.items.map(i => el("tr", {},
                     cell(i.name, i.folder ? tr("Folder") : i.size != null ? size(i.size) : null, "wrap path"),
                     el("td", {
@@ -3907,7 +5039,7 @@
             }
             const rows = [];
             let open = 0;
-            const items = [...SG.items].sort((a, b) => a.path.localeCompare(b.path));
+            const items = [...page.items].sort((a, b) => a.path.localeCompare(b.path));
             for (const i of items) {
                 if (i.error) {
                     rows.push(el("tr", {}, cell(i.path, null, "wrap path"), el("td", {
@@ -3943,7 +5075,7 @@
                 });
             }
             sharingTable([tr("Item"), tr("Who"), tr("Access"), tr("Expires"), tr("Shared"), tr("Actions")], rows);
-            const shared = !items.length && !SG.next ? tr("Nothing found.") : SG.next ?
+            const shared = !items.length && !page.next ? tr("Nothing found.") : page.next ?
                 tr("{n, plural, one {# item} other {# items}} shared so far.", {
                     n: items.length
                 }) : tr("{n, plural, one {# item} other {# items}} shared.", {
@@ -3953,13 +5085,13 @@
                 text: shared,
                 n: open
             }) : shared;
-            if (SG.next && items.length >= SG_MAX) $("#sg-more").append(el("p", {
+            if (page.next && items.length >= SG_MAX) $("#sg-more").append(el("p", {
                 className: "muted",
                 textContent: tr("The first {n, number} are shown. oneup shared lists them all.", {
                     n: items.length
                 })
             }));
-            else if (SG.next) $("#sg-more").append(el("button", {
+            else if (page.next) $("#sg-more").append(el("button", {
                 className: "btn",
                 textContent: tr("Show more"),
                 onclick: () => loadSharing(true)
@@ -4003,6 +5135,7 @@
                     toast(e.message, true);
                     $("#dlg-sharing").close();
                 }
+                clearSharing();
                 loadSharing();
             };
             $("#dlg-sharing").showModal();
@@ -4186,17 +5319,21 @@
             const n = num;
             if (L.tab === "log") {
                 const problems = $("#ls-outcome").value === "problems";
-                const rows = r.filter(e => (!problems || ["failed", "skipped", "waiting"].includes(e.outcome)) && has(e.path, e.action, e.detail));
+                const rows = r.filter(e => (!problems || ["failed", "skipped", "waiting"].includes(e.outcome)) &&
+                    has(e.path, e.action, ACTION[e.action], e.detail));
                 setTable([tr("When"), "", tr("What"), tr("Item")], rows.map(e => {
                     const [word, cls] = OUTCOME[e.outcome] || [e.outcome, ""];
                     return el("tr", {}, el("td", {
                         className: "when",
                         textContent: when(e.at_ms)
-                    }), el("td", {}, el("span", {
+                    }), el("td", {
+                        className: "fit"
+                    }, el("span", {
                         className: "tag " + cls,
                         textContent: word
                     })), el("td", {
-                        textContent: e.action
+                        className: "fit",
+                        textContent: ACTION[e.action] || e.action
                     }), cell(e.path, e.detail, "wrap path"));
                 }));
                 sum.textContent = !r.length ? tr("Nothing yet.") : rows.length === r.length ? "" : tr("{shown} of {all} shown.", {
@@ -4447,9 +5584,7 @@
                 if (st.job) rewindUnderWay(st);
             }
             loadConflicts();
-            keptInto($("#rc-kept"), {
-                id: "main"
-            });
+            keptInto($("#rc-kept"), { id: "main" }, null, 0);
             loadBin();
         }
 
@@ -4654,61 +5789,107 @@
             });
         }
 
+        const RECOVERY_PAGE = 25;
+        let conflictPage = 0;
+        let conflictSeq = 0;
+        let resolvingConflicts = false;
+
+        function recoveryPager(page, length, showPage) {
+            const pages = Math.ceil(length / RECOVERY_PAGE);
+            if (pages < 2) return null;
+            const move = (label, direction, disabled) => {
+                const button = smallBtn(label, () => showPage(page + direction, direction));
+                button.disabled = disabled;
+                button.dataset.direction = direction;
+                return button;
+            };
+            return el("div", { className: "row actions" },
+                move(tr("Previous"), -1, page === 0),
+                el("span", { role: "status", textContent: tr("Page {page} of {pages}", { page: page + 1, pages }) }),
+                move(tr("Next"), 1, page === pages - 1));
+        }
+
+        function focusRecoveryPager(box, direction) {
+            if (direction) (box.querySelector('[data-direction="' + direction + '"]:enabled') ||
+                box.querySelector("[data-direction]:enabled"))?.focus();
+        }
+
         async function loadConflicts() {
-            const sum = $("#cf-sum"),
-                t = $("#cf-table");
+            const seq = ++conflictSeq;
+            const sum = $("#cf-sum");
+            const table = $("#cf-table");
+            const batch = $("#cf-batch");
+            const pager = $("#cf-pages");
             try {
                 const list = await call("conflicts");
-                sum.textContent = list.length ? "" : tr("No conflicts.");
+                if (seq !== conflictSeq) return;
+                sum.textContent = tr("No conflicts.");
                 sum.hidden = !!list.length;
-                t.hidden = !list.length;
+                table.hidden = batch.hidden = !list.length;
                 const side = (x, ms, newer) => cell(tr("{size}, saved {when}", {
-                    size: size(x.size),
-                    when: when(ms)
+                    size: size(x.size), when: when(ms)
                 }), newer ? tr("Newer") : null);
                 const button = (text, label, onclick) => {
                     const b = smallBtn(text, onclick);
                     b.setAttribute("aria-label", label);
                     return b;
                 };
-                $("#cf-table tbody").replaceChildren(...list.map(c => el("tr", {},
-                    cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
-                    side(c.original, c.original_ms, c.newer === "original"),
-                    side(c.copy, c.copy_ms, c.newer === "copy"),
-                    el("td", {}, el("div", {
-                            className: "actions"
-                        },
-                        button(tr("Keep original"), tr("Keep the original of {path}", {
-                            path: c.path
-                        }), () => keep(c, "original")),
-                        button(tr("Keep copy"), tr("Keep the conflict copy of {path}", {
-                            path: c.path
-                        }), () => keep(c, "copy")),
-                        button(tr("Keep both"), tr("Keep both copies of {path}", {
-                            path: c.path
-                        }), () => keep(c, "both")))))));
+                function renderPage(page, focus) {
+                    conflictPage = Math.max(0, Math.min(page, Math.ceil(list.length / RECOVERY_PAGE) - 1));
+                    const start = conflictPage * RECOVERY_PAGE;
+                    $("tbody", table).replaceChildren(...list.slice(start, start + RECOVERY_PAGE).map(c => el("tr", {},
+                        cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
+                        side(c.original, c.original_ms, c.newer === "original"),
+                        side(c.copy, c.copy_ms, c.newer === "copy"),
+                        el("td", {}, el("div", { className: "actions" },
+                            button(tr("Keep original"), tr("Keep the original of {path}", { path: c.path }), () => keepConflict(c, "original")),
+                            button(tr("Keep copy"), tr("Keep the conflict copy of {path}", { path: c.path }), () => keepConflict(c, "copy")),
+                            button(tr("Keep both"), tr("Keep both copies of {path}", { path: c.path }), () => keepConflict(c, "both")))))));
+                    pager.replaceChildren();
+                    const controls = recoveryPager(conflictPage, list.length, renderPage);
+                    if (controls) pager.append(controls);
+                    focusRecoveryPager(pager, focus);
+                }
+                batch.replaceChildren(
+                    smallBtn(tr("Keep all originals"), () => keepConflict(null, "original", list)),
+                    smallBtn(tr("Keep all conflict copies"), () => keepConflict(null, "copy", list)),
+                    smallBtn(tr("Keep both for all"), () => keepConflict(null, "both", list)));
+                renderPage(conflictPage);
             } catch (e) {
+                if (seq !== conflictSeq) return;
                 sum.textContent = e.message;
                 sum.hidden = false;
-                t.hidden = true;
+                table.hidden = batch.hidden = true;
+                pager.replaceChildren();
             }
-            async function keep(c, which) {
-                if (which === "both") {
-                    toast(tr("Both copies stay."));
-                    return;
-                }
-                const a = {
-                    path: c.path,
-                    other: which === "original" ? c.copy_path : c.path
-                };
-                const ask = which === "original" ? tr("Keep the original of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", a) :
-                    tr("Keep the conflict copy of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", a);
-                if (!confirm(ask)) return;
-                await run(call("conflict_keep", {
-                    conflict: c,
-                    keep: which
-                }), tr("Done with the next sync"));
+        }
+
+        async function keepConflict(c, which, list) {
+            if (resolvingConflicts) return;
+            if (which === "both") {
+                toast(tr("Both copies stay."));
+                return;
+            }
+            const original = which === "original";
+            const ask = c ? (original ?
+                tr("Keep the original of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", { path: c.path, other: c.copy_path }) :
+                tr("Keep the conflict copy of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", { path: c.path, other: c.path })) :
+                (original ?
+                    tr("Keep the originals in all {n} listed conflicts? The conflict copies go to kept copies on this PC and OneDrive's recycle bin.", { n: list.length }) :
+                    tr("Keep the conflict copies in all {n} listed conflicts? The originals go to kept copies on this PC and OneDrive's recycle bin.", { n: list.length }));
+            if (!confirm(ask)) return;
+            resolvingConflicts = true;
+            const source = document.activeElement;
+            source.setAttribute("aria-disabled", "true");
+            try {
+                await run(c ? call("conflict_keep", { conflict: c, keep: which }) :
+                    call("conflict_keep_batch", { conflicts: list, keep: which }), tr("Done with the next sync"));
                 setTimeout(loadConflicts, 2000);
+            } catch {
+                // Keep the reviewed rows visible so another choice is available.
+            } finally {
+                resolvingConflicts = false;
+                source.removeAttribute("aria-disabled");
             }
         }
 
@@ -5578,17 +6759,8 @@
             F.roots = roots;
             renderRoots();
             if (!F.roots.length) {
-                $("#tree").replaceChildren(el("div", {
-                        className: "msg"
-                    }, el("b", {
-                        textContent: tr("Nothing syncs yet")
-                    }),
-                    ...linked(tr("Set up your main folder, or {link}."), el("button", {
-                        className: "link",
-                        textContent: tr("add a folder"),
-                        onclick: () => $("#add-menu").showPopover()
-                    }))));
-                $("#details").replaceChildren();
+                F.root = null;
+                render();
                 return;
             }
             const want = F.want;
@@ -5613,6 +6785,7 @@
             const box = $("#roots");
             const had = box.contains(document.activeElement);
             box.replaceChildren();
+            $("#memory-open").hidden = !F.roots.some(r => r.kind === "main");
             for (const r of F.roots) {
                 const b = el("button", {
                         className: "root-tab",
@@ -5628,12 +6801,223 @@
                 b.setAttribute("aria-selected", String(!!F.root && F.root.id === r.id));
                 b.tabIndex = F.root && F.root.id === r.id ? 0 : -1;
                 b.title = r.local;
+                if (r.kind === "main") {
+                    b.dataset.main = "";
+                    b.setAttribute("aria-haspopup", "menu");
+                    b.oncontextmenu = e => {
+                        e.preventDefault();
+                        openMemoryMenu(b, e.clientX, e.clientY);
+                    };
+                    b.onkeydown = e => {
+                        if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+                        e.preventDefault();
+                        const at = b.getBoundingClientRect();
+                        openMemoryMenu(b, at.left, at.bottom);
+                    };
+                }
                 box.append(b);
             }
             const chosen = $("[aria-selected=true]", box) || box.firstElementChild;
             if (chosen) chosen.tabIndex = 0;
             if (had && chosen) chosen.focus();
         }
+        // ---- Memory view
+        const M = { active: false, scope: "disk", path: [], map: null, seq: 0 };
+
+        function openMemoryMenu(anchor, x, y) {
+            const menu = $("#ctx");
+            anchor.focus({ preventScroll: true });
+            menu.replaceChildren(el("button", {
+                role: "menuitem",
+                textContent: tr("Memory view"),
+                onclick: () => {
+                    menu.hidePopover();
+                    openMemory(null);
+                }
+            }));
+            showCtx(menu, x, y);
+        }
+
+        // From the main folder tab's menu or the button beside Add; the map
+        // is always of the main folder, whichever tab is chosen. Back gives
+        // focus to what opened it (the main tab for the menu).
+        function openMemory(from) {
+            $("#search-filters").hidePopover();
+            M.from = from;
+            M.active = true;
+            $("#files").classList.add("memory-active");
+            $("#memory-view").hidden = false;
+            $("#memory-back").focus();
+            loadMemory();
+        }
+        $("#memory-open").onclick = e => openMemory(e.currentTarget);
+
+        function closeMemory(focus = true) {
+            M.active = false;
+            M.seq++;
+            M.path = [];
+            M.map = null;
+            $("#memory-map").replaceChildren();
+            $("#memory-view").hidden = true;
+            $("#files").classList.remove("memory-active");
+            if (focus) (M.from && !M.from.hidden ? M.from : $("#roots [data-main]"))?.focus();
+            M.from = null;
+        }
+
+        $("#memory-back").onclick = () => closeMemory();
+        $$("#memory-scope button").forEach(b => b.onclick = () => {
+            if (M.scope === b.dataset.scope) return;
+            M.scope = b.dataset.scope;
+            M.path = [];
+            loadMemory();
+        });
+
+        async function loadMemory() {
+            const request = ++M.seq;
+            const disk = M.scope === "disk";
+            const folder = M.path.at(-1)?.id ?? null;
+            const status = $("#memory-status");
+            $$("#memory-scope button").forEach(b => b.setAttribute("aria-pressed", b.dataset.scope === M.scope));
+            $("#memory-basis").hidden = !disk;
+            M.map = null;
+            $("#memory-map").replaceChildren();
+            const path = [disk ? tr("Main folder") : tr("Whole drive"), ...M.path.map(p => p.name)];
+            $("#memory-path").replaceChildren(...path.flatMap((name, n) => {
+                const last = n === path.length - 1;
+                const crumb = last ? el("b", { textContent: name, "aria-current": "location" }) : el("button", {
+                    className: "link",
+                    textContent: name,
+                    onclick: () => {
+                        $("#memory-back").focus({ preventScroll: true });
+                        M.path = M.path.slice(0, n);
+                        loadMemory();
+                    }
+                });
+                return n ? [el("span", { "aria-hidden": "true", textContent: "/" }), crumb] : [crumb];
+            }));
+            status.textContent = tr("Loading…");
+            try {
+                const map = await call("memory_view", { on_disk: disk, folder });
+                if (request !== M.seq) return;
+                M.map = map;
+                status.textContent = map.bytes ? size(map.bytes) : tr("Nothing to show.");
+                drawMemory();
+            } catch (e) {
+                if (request === M.seq) status.textContent = e.message;
+            }
+        }
+
+        // Fit consecutive weights along the shorter side. End a strip when
+        // adding a tile would make its worst aspect ratio worse.
+        function memoryRects(tiles, width, height) {
+            const area = width * height / tiles.reduce((sum, item) => sum + item.bytes, 0);
+            const rects = [];
+            let x = 0, y = 0, i = 0;
+            while (i < tiles.length && width > 0 && height > 0) {
+                const side = Math.min(width, height);
+                const first = tiles[i].bytes * area;
+                let sum = first, end = i + 1;
+                const worst = (total, last) => Math.max(side ** 2 * first / total ** 2, total ** 2 / (side ** 2 * last));
+                let ratio = worst(sum, first);
+                for (; end < tiles.length; end++) {
+                    const next = tiles[end].bytes * area;
+                    const nextRatio = worst(sum + next, next);
+                    if (nextRatio > ratio) break;
+                    sum += next;
+                    ratio = nextRatio;
+                }
+                const strip = sum / side;
+                let offset = 0;
+                const column = width >= height;
+                for (; i < end; i++) {
+                    const span = tiles[i].bytes * area / strip;
+                    rects.push(column ? [x, y + offset, strip, span] : [x + offset, y, span, strip]);
+                    offset += span;
+                }
+                if (column) {
+                    x += strip;
+                    width -= strip;
+                } else {
+                    y += strip;
+                    height -= strip;
+                }
+            }
+            return rects;
+        }
+
+        const MEMORY_COLORS = ["#286084", "#386872", "#6a4c84", "#4f6839", "#875331", "#8b4660", "#4262a1"];
+
+        function drawMemory() {
+            if (!M.active || !M.map) return;
+            const box = $("#memory-map");
+            const focus = document.activeElement;
+            const focused = box.contains(focus) ? focus.dataset.memoryKey : null;
+            box.replaceChildren(...memoryTiles(M.map, box.clientWidth, box.clientHeight, M.path));
+            if (focused) $$("[data-memory-key]", box).find(b => b.dataset.memoryKey === focused)?.focus({ preventScroll: true });
+        }
+
+        function memoryTiles(map, width, height, path) {
+            if (!width || !height || !map.bytes) return [];
+            const items = map.other ? [...map.items, { bytes: map.other }] : [...map.items];
+            items.sort((a, b) => b.bytes - a.bytes);
+            return memoryRects(items, width, height).map(([x, y, w, h], i) => {
+                const item = items[i];
+                const tile = el("div", { className: "memory-tile" });
+                Object.assign(tile.style, {
+                    left: x + "px", top: y + "px", width: Math.max(0, w - 1) + "px", height: Math.max(0, h - 1) + "px"
+                });
+                const bytes = size(item.bytes);
+                if (item.id == null) {
+                    tile.classList.add("memory-other");
+                    tile.textContent = w > 74 && h > 25 ? tr("Other items") : "";
+                    tile.title = tr("Other items") + " · " + bytes;
+                    tile.setAttribute("aria-label", tile.title);
+                    tile.setAttribute("role", "img");
+                    return tile;
+                }
+                if (item.folder) tile.classList.add("memory-folder");
+                const ext = item.name.slice(item.name.lastIndexOf(".") + 1).toLowerCase();
+                const color = [...(item.folder ? item.name : ext)].reduce((n, char) => (n * 31 + char.codePointAt(0)) % MEMORY_COLORS.length, 0);
+                tile.style.setProperty("--memory-color", MEMORY_COLORS[color]);
+                const open = el("button", {
+                    className: "memory-open",
+                    "aria-label": tr("Show location of {name}, {size}", { name: item.name, size: bytes }),
+                    title: item.name + " · " + bytes,
+                    onclick: () => run(M.scope === "disk" ? call("reveal", { path: item.location }) :
+                        call("open_in_onedrive", { id: item.location }))
+                });
+                open.dataset.memoryKey = "item:" + item.id;
+                if (w > 44 && h > 21) open.append(el("span", { textContent: item.name }));
+                if (w > 100 && h > (item.folder ? 24 : 40)) open.append(el("small", { textContent: bytes }));
+                tile.append(open);
+                const next = [...path, { id: item.id, name: item.name }];
+                if (item.expandable && w > 55 && h > 28) {
+                    tile.classList.add("memory-expandable");
+                    const label = tr("Explore {name} in Memory view", { name: item.name });
+                    const zoom = el("button", {
+                        className: "memory-zoom",
+                        "aria-label": label,
+                        title: label,
+                        textContent: "›",
+                        onclick: () => {
+                            $("#memory-back").focus({ preventScroll: true });
+                            M.path = next;
+                            loadMemory();
+                        }
+                    });
+                    zoom.dataset.memoryKey = "folder:" + item.id;
+                    tile.append(zoom);
+                }
+                if (item.preview?.items.length && w > 105 && h > 68) {
+                    tile.append(el("div", { className: "memory-children" },
+                        ...memoryTiles(item.preview, w - 3, h - 29, next)));
+                }
+                return tile;
+            });
+        }
+
+        new ResizeObserver(drawMemory).observe($("#memory-map"));
+
         async function selectRoot(id, keep = false) {
             const r = F.roots.find(x => x.id === id);
             if (!r) return;
@@ -5652,6 +7036,7 @@
                     children: null
                 });
             }
+            if (!same && F.q && $("#search-scope").value === "root") queueFind();
             const nodes = F.nodes;
             await loadChildren("");
             if (F.root !== r || F.nodes !== nodes) return;
@@ -5760,7 +7145,7 @@
         function setView(v, quiet = false) {
             F.view = v;
             $$(".views button").forEach(b => {
-                b.setAttribute("aria-selected", String(b.dataset.view === v && !F.q));
+                b.setAttribute("aria-selected", String(b.dataset.view === v));
                 b.tabIndex = b.dataset.view === v ? 0 : -1;
             });
             render(quiet);
@@ -5786,15 +7171,34 @@
 
         function render() {
             const all = F.view === "all";
-            $(".search").hidden = !all;
+            $("#search-tools").hidden = !all;
+            if (!all) $("#search-filters").hidePopover();
+            $("#fd-sum").hidden = !all || !F.q || !$("#fd-sum").textContent;
+            const details = !!F.root && (!all || (!F.q && $("#details-toggle").getAttribute("aria-pressed") === "true"));
+            $("#details-toggle").hidden = !all || !!F.q;
+            $("#details").hidden = !details;
+            $(".pane").classList.toggle("full-width", !details);
             $("#cols").hidden = !all || !!F.q;
             renderCols();
             if (!all || F.q) $("#tree").setAttribute("role", "region");
             if (all && F.q) renderFound();
-            else if (F.view === "dupes") renderDupes(!D.page || D.root !== F.root.id || D.stale);
-            else if (!all) renderOut();
-            else renderTree();
-            renderDetails();
+            else if (F.root && F.view === "dupes") renderDupes(!D.page || D.root !== F.root.id || D.stale);
+            else if (F.root && !all) renderOut();
+            else if (F.root) renderTree();
+            else {
+                $("#tree").replaceChildren(el("div", {
+                        className: "msg"
+                    }, el("b", {
+                        textContent: tr("Nothing syncs yet")
+                    }),
+                    ...linked(tr("Set up your main folder, or {link}."), el("button", {
+                        className: "link",
+                        textContent: tr("add a folder"),
+                        onclick: () => $("#add-menu").showPopover()
+                    }))));
+                $("#details").replaceChildren();
+            }
+            if (details && F.root) renderDetails();
         }
         // Sorting: by name, status or size (folders by everything inside them).
         F.sort = {
@@ -5870,48 +7274,6 @@
                 }, b) : el("span", {}, b));
             }
         }
-        let qTimer = 0;
-        $("#q").addEventListener("input", () => {
-            clearTimeout(qTimer);
-            qTimer = setTimeout(async() => {
-                F.q = $("#q").value.trim();
-                if (F.q.length >= 2) F.found = await call("tree_find", {
-                    root: F.root.id,
-                    q: F.q
-                }).catch(e => {
-                    toast(e.message, true);
-                    return [];
-                });
-                else {
-                    F.q = "";
-                    F.found = null;
-                }
-                setView(F.view);
-            }, 220);
-        });
-        $("#q").addEventListener("keydown", e => {
-            if (e.key === "Escape") {
-                $("#q").value = "";
-                F.q = "";
-                setView(F.view);
-            }
-        });
-        // The search box opens while pointed at or focused, and folds back to its icon when left empty.
-        {
-            const s = $("#search"),
-                q = $("#q");
-            const fold = () => {
-                if (!q.value && document.activeElement !== q && !s.matches(":hover")) s.classList.remove("open");
-            };
-            s.addEventListener("mouseenter", () => s.classList.add("open"));
-            s.addEventListener("mouseleave", fold);
-            q.addEventListener("focus", () => s.classList.add("open"));
-            q.addEventListener("blur", () => {
-                if (!q.value) s.classList.remove("open");
-            });
-            q.addEventListener("search", fold);
-        }
-
         // ---- what syncs: the tree's checkboxes and the exclude preview
         const OUT_STATES = ["left_out", "paused", "separate", "onedrive_app", "never", "link"];
 
@@ -6238,7 +7600,7 @@
         async function reveal(rel, openSection) {
             // Expands the folders down to `rel` and selects it.
             $("#q").value = "";
-            F.q = "";
+            queueFind();
             F.view = "all";
             const parts = rel.split("/");
             let cur = "";
@@ -6259,6 +7621,21 @@
             });
         }
         $("#tree").addEventListener("keydown", e => {
+            if (F.view === "all" && F.q) {
+                const row = e.target.closest("[data-search-result]");
+                if (!row || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+                const results = $$("[data-search-result]", $("#tree"));
+                const i = results.indexOf(row);
+                const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: results.length - 1 }[e.key];
+                if (e.key === "Escape" || next < 0) {
+                    e.preventDefault();
+                    $("#q").focus();
+                } else if (next !== undefined) {
+                    e.preventDefault();
+                    if (results[next]) $("button", results[next]).focus();
+                }
+                return;
+            }
             const rows = $$("#tree .ti[data-rel]");
             if (!rows.length) return;
             const i = rows.findIndex(r => r === document.activeElement);
@@ -6391,12 +7768,27 @@
                 renderDetails();
             });
             if (m.lastChild && m.lastChild.tagName === "HR") m.lastChild.remove();
-            m.showPopover();
+            showCtx(m, x, y);
+        }
+
+        function showCtx(m, x, y) {
+            if (!m.matches(":popover-open")) m.showPopover();
             const r = m.getBoundingClientRect();
             m.style.left = Math.min(x, innerWidth - r.width - 8) + "px";
             m.style.top = Math.min(y, innerHeight - r.height - 8) + "px";
             $("button", m).focus();
         }
+        // The Add menu opens under its button, their right edges lined up
+        // (the "add a folder" link opens it there too). Without the button
+        // in view, the stylesheet's corner position stands.
+        $("#add-menu").addEventListener("toggle", e => {
+            if (e.newState !== "open") return;
+            const b = $("#add-btn").getBoundingClientRect(),
+                m = e.target;
+            if (!b.width) return;
+            m.style.top = (b.bottom + 6) + "px";
+            m.style.right = Math.max(8, innerWidth - b.right) + "px";
+        });
         // The status menu opens under its button.
         $("#st-menu").addEventListener("toggle", e => {
             if (e.newState !== "open") return;
@@ -6784,23 +8176,42 @@
         }
 
         function renderFound() {
-            const box = el("div", {
-                className: "flat"
-            });
-            const list = F.found || [];
-            if (!list.length) box.append(el("div", {
-                className: "msg"
-            }, el("b", {
-                textContent: tr("Nothing named like \"{text}\"", {
-                    text: F.q
-                })
-            })));
-            for (const f of list) box.append(flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel)));
-            if (list.length >= 100) box.append(el("div", {
-                className: "msg",
-                textContent: tr("First matches only. Type more to narrow it down.")
-            }));
+            const focused = document.activeElement;
+            const row = focused.closest("[data-search-result]");
+            const action = row ? $$("button", row).indexOf(focused) : -1;
+            const box = el("div", { className: "flat" });
+            if (F.found?.root) {
+                for (const f of F.found.root) {
+                    const result = flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel));
+                    result.dataset.searchResult = "folder:" + f.rel;
+                    box.append(result);
+                }
+                if (F.found.root.length >= 100) box.append(el("div", {
+                    className: "msg",
+                    textContent: tr("First matches only. Type more to narrow it down.")
+                }));
+            }
+            if (F.found?.names) {
+                const names = F.found.names;
+                findList(box, names, "name");
+                if (names.note) box.append(el("div", { className: "msg", textContent: tr(names.note) }));
+            }
+            if (F.found?.cloud) {
+                const cloud = F.found.cloud;
+                box.append(el("div", {
+                    className: "group",
+                    textContent: tr("Inside files (OneDrive's search)")
+                }));
+                if (cloud.error || !cloud.items.length) box.append(el("div", {
+                    className: "msg", textContent: cloud.error || tr("Nothing found.")
+                }));
+                else findList(box, cloud, "content");
+            }
             $("#tree").replaceChildren(box);
+            if (action >= 0) {
+                const result = $$("[data-search-result]", box).find(item => item.dataset.searchResult === row.dataset.searchResult);
+                (result && $$("button", result)[action] || $("#q")).focus({ preventScroll: true });
+            }
         }
         // Database files ([databases]): what counts as one, and what waits
         // now or is warned about (the agent's status, `st`).
@@ -7792,7 +9203,7 @@
             }
         }
         // Files sync removed or replaced here, kept in the folder's version store.
-        async function keptInto(b, r, subject = null) {
+        async function keptInto(b, r, subject = null, page = null) {
             try {
                 const all = await call("kept", {root: r.id});
                 const list = subject ? all.filter(x => historyMatches(x.origin, subject)) : all;
@@ -7800,48 +9211,57 @@
                     className: "say",
                     textContent: tr("Nothing kept.")
                 }));
-                const body = el("tbody");
-                for (const x of list) body.append(el("tr", {},
-                    el("td", {
-                        textContent: (x.origin || x.name) + (x.folder ? "\\" : ""),
-                        style: "overflow-wrap:anywhere"
-                    }),
-                    el("td", {
-                        className: "num",
-                        textContent: size(x.bytes)
-                    }),
-                    el("td", {
-                        textContent: when(x.at_ms),
-                        style: "white-space:nowrap"
-                    }),
-                    el("td", {}, el("button", {
-                        className: "btn small",
-                        textContent: tr("Restore"),
-                        onclick: async() => {
-                            const at = await run(call("kept_restore", {
-                                root: r.id,
-                                id: x.id
-                            }));
-                            toast(tr("Queued: {path}", {
-                                path: at.replace(/^\\\\\?\\/, "")
-                            }));
-                            keptInto(b, r, subject);
-                        }
-                    }))));
-                b.replaceChildren(el("table", {
-                        className: "list"
-                    }, el("thead", {}, el("tr", {}, el("th", {
-                        textContent: tr("Item")
-                    }), el("th", {
-                        className: "num",
-                        textContent: tr("Size")
-                    }), el("th", {
-                        textContent: tr("Kept")
-                    }), el("th", {}))), body),
-                    el("p", {
-                        className: "note",
-                        textContent: tr("Restore puts it back where it was. Copies older than 30 days may be removed when space is short.")
-                    }));
+                function renderPage(current, focus) {
+                    if (current !== null) current = Math.min(current, Math.ceil(list.length / RECOVERY_PAGE) - 1);
+                    const body = el("tbody");
+                    const start = current * RECOVERY_PAGE;
+                    const shown = current === null ? list : list.slice(start, start + RECOVERY_PAGE);
+                    for (const x of shown) body.append(el("tr", {},
+                        el("td", {
+                            textContent: (x.origin || x.name) + (x.folder ? "\\" : ""),
+                            style: "overflow-wrap:anywhere"
+                        }),
+                        el("td", {
+                            className: "num",
+                            textContent: size(x.bytes)
+                        }),
+                        el("td", {
+                            textContent: when(x.at_ms),
+                            style: "white-space:nowrap"
+                        }),
+                        el("td", {}, el("button", {
+                            className: "btn small",
+                            textContent: tr("Restore"),
+                            onclick: async() => {
+                                const at = await run(call("kept_restore", {
+                                    root: r.id,
+                                    id: x.id
+                                }));
+                                toast(tr("Queued: {path}", {
+                                    path: at.replace(/^\\\\\?\\/, "")
+                                }));
+                                keptInto(b, r, subject, current);
+                            }
+                        }))));
+                    b.replaceChildren(el("table", {
+                            className: "list"
+                        }, el("thead", {}, el("tr", {}, el("th", {
+                            textContent: tr("Item")
+                        }), el("th", {
+                            className: "num",
+                            textContent: tr("Size")
+                        }), el("th", {
+                            textContent: tr("Kept")
+                        }), el("th", {}))), body),
+                        el("p", {
+                            className: "note",
+                            textContent: tr("Restore puts it back where it was. Copies older than 30 days may be removed when space is short.")
+                        }));
+                    const controls = current === null ? null : recoveryPager(current, list.length, renderPage);
+                    if (controls) b.prepend(controls);
+                    focusRecoveryPager(b, focus);
+                }
+                renderPage(page);
             } catch (e) {
                 b.replaceChildren(el("div", {
                     className: "muted",
@@ -9330,17 +10750,8 @@
             "in OneDrive": tr("Stays in OneDrive")
         };
 
-        function openFind() {
-            const s = snap && snap.search;
-            if (s) {
-                $("#fd-onedrive").checked = s.onedrive;
-                $("#fd-hotkey").value = s.hotkey || "";
-            }
-            $("#fd-q").focus();
-            $("#fd-q").select();
-        }
-
         function findBuilding(n) {
+            $("#fd-sum").hidden = false;
             $("#fd-sum").textContent = tr("Building the search index (first search only): {n, plural, one {# item} other {# items}}", {
                 n
             });
@@ -9373,8 +10784,12 @@
             return flatRow(f.folder ? f.name + "/" : f.name, bits.join(" · "), ...acts);
         }
 
-        function findList(box, r) {
-            for (const f of r.items) box.append(findRow(f));
+        function findList(box, r, group) {
+            for (const f of r.items) {
+                const result = findRow(f);
+                if ($("button", result)) result.dataset.searchResult = group + ":" + f.id;
+                box.append(result);
+            }
             if (r.too_many) box.append(el("div", {
                 className: "msg",
                 textContent: tr(r.too_many)
@@ -9384,61 +10799,100 @@
                 textContent: tr("More found. Add to the search to narrow it.")
             }));
         }
-        async function runFind(inside) {
-            const q = $("#fd-q").value.trim();
-            const n = ++FD.seq;
+        function queueFind(submit = false) {
             clearTimeout(FD.timer);
-            if ([...q].length < 3) {
-                $("#fd-sum").textContent = q ? tr("Type at least 3 characters.") : "";
-                $("#fd-card").hidden = $("#fd-note").hidden = true;
-                return;
-            }
-            const withOneDrive = inside && $("#fd-onedrive").checked;
-            try {
-                const names = await call("search", {
-                    q
-                });
-                const cloud = withOneDrive ? await call("search_onedrive", {
-                    q
-                }).catch(e => ({
-                    error: e.message
-                })) : null;
-                if (n !== FD.seq) return;
-                const box = $("#fd-list");
-                box.replaceChildren();
-                findList(box, names);
-                if (cloud) {
-                    box.append(el("div", {
-                        className: "group",
-                        textContent: tr("Inside files (OneDrive's search)")
-                    }));
-                    if (cloud.error) box.append(el("div", {
-                        className: "msg",
-                        textContent: cloud.error
-                    }));
-                    else if (!cloud.items.length) box.append(el("div", {
-                        className: "msg",
-                        textContent: tr("Nothing found.")
-                    }));
-                    else findList(box, cloud);
+            const request = ++FD.seq;
+            const q = $("#q").value.trim();
+            const drive = $("#search-scope").value === "drive";
+            const regex = $("#search-regex").checked;
+            const kind = $("#search-kind").value;
+            const folder = kind ? kind === "folders" : null;
+            $("#search-filters-toggle").toggleAttribute("data-active", drive || !!kind || regex);
+            const input = $("#q");
+            input.placeholder = drive ? tr("Search OneDrive") : tr("Search by name");
+            input.setAttribute("aria-label", input.placeholder);
+            input.title = input.placeholder;
+            const root = F.root?.id;
+            $("#fd-go").hidden = !regex && !(drive && $("#fd-onedrive").checked);
+            F.q = q;
+            F.found = null;
+            const status = $("#fd-sum");
+            const min = drive ? 3 : 2;
+            const ready = q && (regex || [...q].length >= min) && (drive || root);
+            status.textContent = !q ? "" : !drive && !root ? tr("Choose a synced folder.") :
+                !ready ? tr("Type at least {n} characters.", { n: min }) :
+                regex && !submit ? tr("Press Enter to search with this pattern.") : tr("Searching…");
+            setView(F.view);
+            positionSearchFilters();
+            if (!ready || (regex && !submit)) return;
+            const search = async () => {
+                try {
+                    const args = { q, folder, regex, request };
+                    let title = "";
+                    if (drive) {
+                        const names = await call("search", args);
+                        if (request !== FD.seq) return;
+                        F.found = { names };
+                        title = names.items.length || names.too_many ? "" : tr("Nothing found.");
+                        if (submit && !regex && $("#fd-onedrive").checked) {
+                            status.textContent = "";
+                            render();
+                            const cloud = await call("search_onedrive", { q }).catch(e => ({ error: e.message }));
+                            if (request !== FD.seq) return;
+                            if (!cloud.error && folder !== null) cloud.items = cloud.items.filter(f => f.folder === folder);
+                            F.found.cloud = cloud;
+                            if (cloud.items?.length) title = "";
+                        }
+                    } else {
+                        const matches = await call("tree_find", { ...args, root });
+                        if (request !== FD.seq) return;
+                        F.found = { root: matches };
+                        if (!matches.length) title = tr("Nothing found.");
+                    }
+                    status.textContent = title;
+                } catch (e) {
+                    if (request !== FD.seq) return;
+                    status.textContent = e.message;
                 }
-                const found = names.items.length + (cloud && cloud.items ? cloud.items.length : 0);
-                $("#fd-sum").textContent = found ? "" : (names.too_many ? tr(names.too_many) : tr("Nothing found."));
-                $("#fd-card").hidden = !found && !cloud;
-                $("#fd-note").textContent = tr(names.note);
-                $("#fd-note").hidden = false;
-            } catch (e) {
-                if (n === FD.seq) $("#fd-sum").textContent = e.message;
-            }
+                render();
+            };
+            if (submit) search();
+            else FD.timer = setTimeout(search, 220);
         }
-        $("#fd-q").addEventListener("input", () => {
-            clearTimeout(FD.timer);
-            FD.timer = setTimeout(() => runFind(false), 150);
-        });
-        $("#fd-q").addEventListener("keydown", e => {
-            if (e.key === "Enter") runFind(true);
-        });
-        $("#fd-go").onclick = () => runFind(true);
+        function positionSearchFilters() {
+            const filters = $("#search-filters");
+            if (!filters.matches(":popover-open")) return;
+            const anchor = $("#search-filters-toggle").getBoundingClientRect();
+            const top = anchor.bottom + 6 + filters.offsetHeight <= innerHeight - 8 ?
+                anchor.bottom + 6 : anchor.top - filters.offsetHeight - 6;
+            filters.style.top = Math.max(8, top) + "px";
+            filters.style.left = Math.max(8, anchor.right - filters.offsetWidth) + "px";
+        }
+        $("#search-filters").addEventListener("toggle", positionSearchFilters);
+        window.addEventListener("resize", positionSearchFilters);
+        $("#q").oninput = () => queueFind();
+        $("#q").onkeydown = e => {
+            if (e.isComposing) return;
+            if (e.key === "Enter") queueFind(true);
+            if (e.key === "ArrowDown" && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+                const first = $("#tree [data-search-result] button");
+                if (first) {
+                    e.preventDefault();
+                    first.focus();
+                }
+            }
+            if (e.key === "Escape") {
+                e.preventDefault();
+                $("#q").value = "";
+                queueFind();
+            }
+        };
+        $("#search-scope").onchange = $("#search-kind").onchange = $("#search-regex").onchange = () => queueFind();
+        $("#fd-go").onclick = () => queueFind(true);
+        $("#details-toggle").onclick = e => {
+            e.currentTarget.setAttribute("aria-pressed", String(e.currentTarget.getAttribute("aria-pressed") !== "true"));
+            render();
+        };
         $("#fd-onedrive").onchange = e => run(call("save", {
             section: "search",
             value: {
@@ -9450,9 +10904,19 @@
             value: {
                 hotkey: e.target.value.trim()
             }
-        }), tr("Saved")).then(load).then(openFind).catch(() => load().then(openFind));
+        }), tr("Saved")).then(load).catch(load);
 
         function startAt(start, item) {
+            if (M.active && (start === "find" || item)) closeMemory(false);
+            if (start === "find") {
+                show("files");
+                $("#search-scope").value = "drive";
+                setView("all");
+                queueFind();
+                $("#q").focus();
+                $("#q").select();
+                return;
+            }
             const page = OLD[start] || start || "files";
             // Explorer's commands for a file: the section they're about.
             const section = {

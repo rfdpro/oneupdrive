@@ -37,7 +37,7 @@ oneup databases --wait off           # KeePass, Access and the rest sync while o
 ```
 
 ## Seeing what waits
-Databases can wait indefinitely while a program runs. These waits do not keep the agent in **Retrying soon**. Other files continue syncing. The database stays scheduled and is checked on the next change or normal OneDrive check. **Activity** lists the database, why it waits, and what you can do.
+Databases can wait indefinitely while a program runs. These waits do not keep the agent in **Catching up**. Other files continue syncing. The database stays scheduled and is checked on the next change or normal OneDrive check. **Activity** lists the database, why it waits, and what you can do.
 
 A database that waits says so, with the program that has it open:
 

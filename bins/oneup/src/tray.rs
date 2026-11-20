@@ -32,7 +32,7 @@ pub enum Look {
     Paused,
     /// Waiting for the user (a safety stop, a version-store decision).
     Attention,
-    /// Retrying after a problem.
+    /// An error the agent reported.
     Problem,
     /// The agent isn't running.
     Off,
@@ -66,10 +66,9 @@ pub fn look(v: &View) -> Look {
         return Look::Problem;
     }
     match s.activity {
-        Activity::Starting | Activity::Syncing => Look::Syncing,
+        Activity::Starting | Activity::Syncing | Activity::Retrying => Look::Syncing,
         Activity::Paused | Activity::Stopping => Look::Paused,
         Activity::WaitingForYou => Look::Attention,
-        Activity::Retrying => Look::Problem,
         Activity::Idle if s.paused.local || s.paused.remote || s.auto_pause.is_some() => Look::Paused,
         Activity::Idle => Look::UpToDate,
     }
@@ -128,7 +127,7 @@ fn headline(v: &View, failures: bool) -> String {
         Activity::WaitingForYou => t!("Needs your review"),
         Activity::Retrying => match &s.problem {
             Some(p) => t!("Problem: {what}", what = crate::problem::shown(p, current()).0),
-            None => t!("Retrying soon"),
+            None => t!("Catching up"),
         },
         // OneDrive full: up to date otherwise, but uploads wait.
         Activity::Idle if s.problem.is_some() => {
@@ -928,6 +927,15 @@ mod tests {
         assert_eq!(summary(&up(s.clone())), "Paused: on a metered connection");
         s.safety_stops.push(stop("a"));
         assert_eq!(look(&up(s)), Look::Attention);
+    }
+
+    #[test]
+    fn routine_retries_use_the_syncing_icon_and_catching_up_text() {
+        let v = up(status(Activity::Retrying));
+        assert_eq!(look(&v), Look::Syncing);
+        assert_eq!(tip(&v), "OneUpDrive: Catching up");
+        assert!(!ids(&menu_of(&v)).contains(&id::PROBLEM));
+        assert!(Notices::default().update(&v).is_empty());
     }
 
     #[test]
