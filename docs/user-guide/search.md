@@ -9,9 +9,9 @@ Open search in any of these ways:
 * a hotkey of your choice, like Ctrl+Alt+F (none until you set one; see below);
 * `oneup find` on the command line.
 
-Choose **Synced folder** to search the selected folder, including files that are still waiting to upload. Choose **OneDrive** to search the indexed drive, including files outside your synced folders. Filter either scope to **Files only** or **Folders only**. Search results use the full width. When browsing the tree, select **Details** to hide or show the right panel.
+Open **Filters** beside the search box and choose **Synced folder** to search the selected folder, including files that are still waiting to upload. Choose **OneDrive** to search the indexed drive, including files outside your synced folders. Filter either scope to **Files only** or **Folders only**. Search results use the full width. When browsing the tree, select **Details** to hide or show the right panel.
 
-Turn on **Regex** and press **Enter** to match names with a regular expression, such as `^report.*\.pdf$`. Regex searches can take longer on large drives.
+In **Filters**, turn on **Regex**. Enter a pattern in the search box and press **Enter** to match names with a regular expression, such as `^report.*\.pdf$`. Regex searches can take longer on large drives.
 
 In **OneDrive** scope, type at least 3 characters of a name, in any case: `port` finds *Report.docx* and *Passport scan.pdf*. Results appear as you type. Names that match exactly come first, then names that start with what you typed, then the rest. The first 50 are listed; when there are more, add to the search to narrow it. **Too many matches. Type more.** means what you typed is too common to search through: add a few characters.
 

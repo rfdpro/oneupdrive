@@ -246,11 +246,19 @@ const DRIVER: &str = r##"<script>
     searchBox.dispatchEvent(new Event("input")); await sleep(350);
     check("Files search finds items in the selected folder", tree.textContent.includes("inner.doc") &&
       document.querySelector("#details").hidden && HOST_CALLS.filter(m => m.op === "tree_find").at(-1)?.args.root === "main", tree.textContent);
+    const filterToggle = document.querySelector("#search-filters-toggle");
+    const filters = document.querySelector("#search-filters");
+    filterToggle.focus(); filterToggle.click(); await sleep(50);
+    const filterBounds = filters.getBoundingClientRect();
+    check("search filters open next to the field with the scope focused", filters.matches(":popover-open") &&
+      document.activeElement.id === "search-scope" && filterBounds.left >= 0 && filterBounds.right <= innerWidth, at());
     const searchType = document.querySelector("#search-kind");
     searchType.value = "files";
     searchType.dispatchEvent(new Event("change"));
     const regex = document.querySelector("#search-regex");
     regex.click();
+    check("the filters button marks active options", filterToggle.hasAttribute("data-active"), "");
+    filters.hidePopover();
     searchBox.focus(); key("Enter"); await sleep(100);
     const patternCall = HOST_CALLS.filter(m => m.op === "tree_find").at(-1);
     check("Files submits the regex and type filter together", patternCall?.args.regex && patternCall.args.folder === false, JSON.stringify(patternCall));
@@ -260,8 +268,9 @@ const DRIVER: &str = r##"<script>
     searchType.value = "";
     startAt("find", "");
     check("Search shortcut focuses Files in OneDrive scope", document.activeElement === searchBox &&
-      document.querySelector("#search-scope").value === "drive" && !document.querySelector('nav [data-page="find"]'), at());
+      document.querySelector("#search-scope").value === "drive" && searchBox.placeholder === "Search OneDrive" && !document.querySelector('nav [data-page="find"]'), at());
     document.querySelector("#search-scope").value = "root";
+    document.querySelector("#search-scope").dispatchEvent(new Event("change"));
     await sleep(300);
 
     // Memory view reads one scope and opens locations without opening files.
