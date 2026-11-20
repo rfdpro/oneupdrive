@@ -2377,6 +2377,8 @@
             <h3>Conflicts</h3>
             <div class="card" id="cf-card">
                 <p class="say" id="cf-sum" role="status">Looking…</p>
+                <div class="row actions" id="cf-batch" aria-label="Resolve all listed conflicts" role="group" hidden></div>
+                <div id="cf-pages"></div>
                 <table class="list" id="cf-table" aria-label="Conflicts" hidden>
                     <thead><tr><th>File</th><th>Original</th><th>Conflict copy</th><th><span class="sr-only">Action</span></th></tr></thead>
                     <tbody></tbody>
@@ -4464,9 +4466,7 @@
                 if (st.job) rewindUnderWay(st);
             }
             loadConflicts();
-            keptInto($("#rc-kept"), {
-                id: "main"
-            });
+            keptInto($("#rc-kept"), { id: "main" }, null, 0);
             loadBin();
         }
 
@@ -4671,61 +4671,107 @@
             });
         }
 
+        const RECOVERY_PAGE = 25;
+        let conflictPage = 0;
+        let conflictSeq = 0;
+        let resolvingConflicts = false;
+
+        function recoveryPager(page, length, showPage) {
+            const pages = Math.ceil(length / RECOVERY_PAGE);
+            if (pages < 2) return null;
+            const move = (label, direction, disabled) => {
+                const button = smallBtn(label, () => showPage(page + direction, direction));
+                button.disabled = disabled;
+                button.dataset.direction = direction;
+                return button;
+            };
+            return el("div", { className: "row actions" },
+                move(tr("Previous"), -1, page === 0),
+                el("span", { role: "status", textContent: tr("Page {page} of {pages}", { page: page + 1, pages }) }),
+                move(tr("Next"), 1, page === pages - 1));
+        }
+
+        function focusRecoveryPager(box, direction) {
+            if (direction) (box.querySelector('[data-direction="' + direction + '"]:enabled') ||
+                box.querySelector("[data-direction]:enabled"))?.focus();
+        }
+
         async function loadConflicts() {
-            const sum = $("#cf-sum"),
-                t = $("#cf-table");
+            const seq = ++conflictSeq;
+            const sum = $("#cf-sum");
+            const table = $("#cf-table");
+            const batch = $("#cf-batch");
+            const pager = $("#cf-pages");
             try {
                 const list = await call("conflicts");
-                sum.textContent = list.length ? "" : tr("No conflicts.");
+                if (seq !== conflictSeq) return;
+                sum.textContent = tr("No conflicts.");
                 sum.hidden = !!list.length;
-                t.hidden = !list.length;
+                table.hidden = batch.hidden = !list.length;
                 const side = (x, ms, newer) => cell(tr("{size}, saved {when}", {
-                    size: size(x.size),
-                    when: when(ms)
+                    size: size(x.size), when: when(ms)
                 }), newer ? tr("Newer") : null);
                 const button = (text, label, onclick) => {
                     const b = smallBtn(text, onclick);
                     b.setAttribute("aria-label", label);
                     return b;
                 };
-                $("#cf-table tbody").replaceChildren(...list.map(c => el("tr", {},
-                    cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
-                    side(c.original, c.original_ms, c.newer === "original"),
-                    side(c.copy, c.copy_ms, c.newer === "copy"),
-                    el("td", {}, el("div", {
-                            className: "actions"
-                        },
-                        button(tr("Keep original"), tr("Keep the original of {path}", {
-                            path: c.path
-                        }), () => keep(c, "original")),
-                        button(tr("Keep copy"), tr("Keep the conflict copy of {path}", {
-                            path: c.path
-                        }), () => keep(c, "copy")),
-                        button(tr("Keep both"), tr("Keep both copies of {path}", {
-                            path: c.path
-                        }), () => keep(c, "both")))))));
+                function renderPage(page, focus) {
+                    conflictPage = Math.max(0, Math.min(page, Math.ceil(list.length / RECOVERY_PAGE) - 1));
+                    const start = conflictPage * RECOVERY_PAGE;
+                    $("tbody", table).replaceChildren(...list.slice(start, start + RECOVERY_PAGE).map(c => el("tr", {},
+                        cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
+                        side(c.original, c.original_ms, c.newer === "original"),
+                        side(c.copy, c.copy_ms, c.newer === "copy"),
+                        el("td", {}, el("div", { className: "actions" },
+                            button(tr("Keep original"), tr("Keep the original of {path}", { path: c.path }), () => keepConflict(c, "original")),
+                            button(tr("Keep copy"), tr("Keep the conflict copy of {path}", { path: c.path }), () => keepConflict(c, "copy")),
+                            button(tr("Keep both"), tr("Keep both copies of {path}", { path: c.path }), () => keepConflict(c, "both")))))));
+                    pager.replaceChildren();
+                    const controls = recoveryPager(conflictPage, list.length, renderPage);
+                    if (controls) pager.append(controls);
+                    focusRecoveryPager(pager, focus);
+                }
+                batch.replaceChildren(
+                    smallBtn(tr("Keep all originals"), () => keepConflict(null, "original", list)),
+                    smallBtn(tr("Keep all conflict copies"), () => keepConflict(null, "copy", list)),
+                    smallBtn(tr("Keep both for all"), () => keepConflict(null, "both", list)));
+                renderPage(conflictPage);
             } catch (e) {
+                if (seq !== conflictSeq) return;
                 sum.textContent = e.message;
                 sum.hidden = false;
-                t.hidden = true;
+                table.hidden = batch.hidden = true;
+                pager.replaceChildren();
             }
-            async function keep(c, which) {
-                if (which === "both") {
-                    toast(tr("Both copies stay."));
-                    return;
-                }
-                const a = {
-                    path: c.path,
-                    other: which === "original" ? c.copy_path : c.path
-                };
-                const ask = which === "original" ? tr("Keep the original of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", a) :
-                    tr("Keep the conflict copy of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", a);
-                if (!confirm(ask)) return;
-                await run(call("conflict_keep", {
-                    conflict: c,
-                    keep: which
-                }), tr("Done with the next sync"));
+        }
+
+        async function keepConflict(c, which, list) {
+            if (resolvingConflicts) return;
+            if (which === "both") {
+                toast(tr("Both copies stay."));
+                return;
+            }
+            const original = which === "original";
+            const ask = c ? (original ?
+                tr("Keep the original of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", { path: c.path, other: c.copy_path }) :
+                tr("Keep the conflict copy of {path}? {other} goes to kept copies on this PC and to OneDrive's recycle bin.", { path: c.path, other: c.path })) :
+                (original ?
+                    tr("Keep the originals in all {n} listed conflicts? The conflict copies go to kept copies on this PC and OneDrive's recycle bin.", { n: list.length }) :
+                    tr("Keep the conflict copies in all {n} listed conflicts? The originals go to kept copies on this PC and OneDrive's recycle bin.", { n: list.length }));
+            if (!confirm(ask)) return;
+            resolvingConflicts = true;
+            const source = document.activeElement;
+            source.setAttribute("aria-disabled", "true");
+            try {
+                await run(c ? call("conflict_keep", { conflict: c, keep: which }) :
+                    call("conflict_keep_batch", { conflicts: list, keep: which }), tr("Done with the next sync"));
                 setTimeout(loadConflicts, 2000);
+            } catch {
+                // Keep the reviewed rows visible so another choice is available.
+            } finally {
+                resolvingConflicts = false;
+                source.removeAttribute("aria-disabled");
             }
         }
 
@@ -7785,7 +7831,7 @@
             }
         }
         // Files sync removed or replaced here, kept in the folder's version store.
-        async function keptInto(b, r, subject = null) {
+        async function keptInto(b, r, subject = null, page = null) {
             try {
                 const all = await call("kept", {root: r.id});
                 const list = subject ? all.filter(x => historyMatches(x.origin, subject)) : all;
@@ -7793,48 +7839,57 @@
                     className: "say",
                     textContent: tr("Nothing kept.")
                 }));
-                const body = el("tbody");
-                for (const x of list) body.append(el("tr", {},
-                    el("td", {
-                        textContent: (x.origin || x.name) + (x.folder ? "\\" : ""),
-                        style: "overflow-wrap:anywhere"
-                    }),
-                    el("td", {
-                        className: "num",
-                        textContent: size(x.bytes)
-                    }),
-                    el("td", {
-                        textContent: when(x.at_ms),
-                        style: "white-space:nowrap"
-                    }),
-                    el("td", {}, el("button", {
-                        className: "btn small",
-                        textContent: tr("Restore"),
-                        onclick: async() => {
-                            const at = await run(call("kept_restore", {
-                                root: r.id,
-                                id: x.id
-                            }));
-                            toast(tr("Queued: {path}", {
-                                path: at.replace(/^\\\\\?\\/, "")
-                            }));
-                            keptInto(b, r, subject);
-                        }
-                    }))));
-                b.replaceChildren(el("table", {
-                        className: "list"
-                    }, el("thead", {}, el("tr", {}, el("th", {
-                        textContent: tr("Item")
-                    }), el("th", {
-                        className: "num",
-                        textContent: tr("Size")
-                    }), el("th", {
-                        textContent: tr("Kept")
-                    }), el("th", {}))), body),
-                    el("p", {
-                        className: "note",
-                        textContent: tr("Restore puts it back where it was. Copies older than 30 days may be removed when space is short.")
-                    }));
+                function renderPage(current, focus) {
+                    if (current !== null) current = Math.min(current, Math.ceil(list.length / RECOVERY_PAGE) - 1);
+                    const body = el("tbody");
+                    const start = current * RECOVERY_PAGE;
+                    const shown = current === null ? list : list.slice(start, start + RECOVERY_PAGE);
+                    for (const x of shown) body.append(el("tr", {},
+                        el("td", {
+                            textContent: (x.origin || x.name) + (x.folder ? "\\" : ""),
+                            style: "overflow-wrap:anywhere"
+                        }),
+                        el("td", {
+                            className: "num",
+                            textContent: size(x.bytes)
+                        }),
+                        el("td", {
+                            textContent: when(x.at_ms),
+                            style: "white-space:nowrap"
+                        }),
+                        el("td", {}, el("button", {
+                            className: "btn small",
+                            textContent: tr("Restore"),
+                            onclick: async() => {
+                                const at = await run(call("kept_restore", {
+                                    root: r.id,
+                                    id: x.id
+                                }));
+                                toast(tr("Queued: {path}", {
+                                    path: at.replace(/^\\\\\?\\/, "")
+                                }));
+                                keptInto(b, r, subject, current);
+                            }
+                        }))));
+                    b.replaceChildren(el("table", {
+                            className: "list"
+                        }, el("thead", {}, el("tr", {}, el("th", {
+                            textContent: tr("Item")
+                        }), el("th", {
+                            className: "num",
+                            textContent: tr("Size")
+                        }), el("th", {
+                            textContent: tr("Kept")
+                        }), el("th", {}))), body),
+                        el("p", {
+                            className: "note",
+                            textContent: tr("Restore puts it back where it was. Copies older than 30 days may be removed when space is short.")
+                        }));
+                    const controls = current === null ? null : recoveryPager(current, list.length, renderPage);
+                    if (controls) b.prepend(controls);
+                    focusRecoveryPager(b, focus);
+                }
+                renderPage(page);
             } catch (e) {
                 b.replaceChildren(el("div", {
                     className: "muted",

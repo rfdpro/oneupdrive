@@ -845,6 +845,12 @@ mod win {
                 let _ = agent(dir, Call::SyncNow).await;
                 Ok(Value::Null)
             }
+            "conflict_keep_batch" => {
+                let (d, keep, listed) = (dir.to_path_buf(), text(args, "keep"), args["conflicts"].clone());
+                tokio::task::spawn_blocking(move || settingsapi::conflict_keep_batch(&d, &listed, &keep)).await??;
+                let _ = agent(dir, Call::SyncNow).await;
+                Ok(Value::Null)
+            }
             "cloud_bin" => {
                 let d = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || settingsapi::cloud_bin(&d)).await?

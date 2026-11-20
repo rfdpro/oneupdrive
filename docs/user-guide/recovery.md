@@ -50,6 +50,8 @@ When a file changed on both your PC and in OneDrive, you get both: the OneDrive 
 * **Keep copy** keeps the conflict copy, renamed to the file's name. The other goes the same way.
 * **Keep both** changes nothing.
 
+**Conflicts** and **Kept on this PC** show 25 entries per page. Use **Previous** and **Next** to move through them. The buttons at the top of Conflicts apply to all listed conflicts across every page. If several copies compete for the same original, choose which copy to keep individually. **Keep both for all** leaves both versions in place.
+
 From a terminal: `oneup conflicts` lists them; `oneup conflicts /docs/report.docx --keep copy` keeps one. If either copy changes before OneUpDrive gets to it, nothing is done and the activity log says so.
 
 ## Kept on this PC

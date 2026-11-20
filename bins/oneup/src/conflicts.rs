@@ -159,21 +159,47 @@ fn write_queue(o: &Ops<'_>, q: &[(Conflict, Keep)]) -> oneup_store::Result<()> {
 /// Queues the answer `keep` for conflict `c`, which must still be exactly as
 /// listed (both copies' sizes and times). The caller nudges the agent.
 pub fn answer(store: &mut Store, c: &Conflict, keep: Keep) -> Result<()> {
+    answer_batch(store, std::slice::from_ref(c), keep)
+}
+
+/// Queue exactly the reviewed set in one transaction. A shared original can
+/// be kept for several conflicts, but replacing it requires choosing one copy.
+pub fn answer_batch(store: &mut Store, listed: &[Conflict], keep: Keep) -> Result<()> {
+    if listed.is_empty() || listed.len() > MAX {
+        bail!("invalid conflict batch size");
+    }
+
     store.write(|o| {
-        if recover::conflict_ops(o, c, keep)?.is_none() {
-            return Ok(Err(anyhow::anyhow!("that conflict has changed since it was listed; look again")));
-        }
-        let mut q = read_queue(o)?;
-        if q.iter().any(|(x, _)| x == c) {
-            return Ok(Err(anyhow::anyhow!("that conflict is answered already")));
-        }
-        if q.len() >= MAX {
+        let mut queue = read_queue(o)?;
+        if queue.len() + listed.len() > MAX {
             return Ok(Err(anyhow::anyhow!("{MAX} answers wait already; let the agent catch up")));
         }
-        q.push((c.clone(), keep));
-        write_queue(o, &q)?;
+        let mut by_folder = std::collections::HashMap::new();
+        for c in listed {
+            if queue.iter().any(|(other, choice)| overlaps(c, keep, other, *choice)) {
+                return Ok(Err(anyhow::anyhow!(
+                    "Some conflicts overlap or already have answers. Resolve them individually or wait for sync."
+                )));
+            }
+            let conflicts = match by_folder.entry(c.folder) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(recover::conflicts_in(o, c.folder)?),
+            };
+            if !conflicts.contains(c) {
+                return Ok(Err(anyhow::anyhow!("A listed conflict changed. Review the list again.")));
+            }
+            queue.push((c.clone(), keep));
+        }
+        write_queue(o, &queue)?;
         Ok(Ok(()))
     })?
+}
+
+fn overlaps(a: &Conflict, keep_a: Keep, b: &Conflict, keep_b: Keep) -> bool {
+    a.copy.sid == b.copy.sid
+        || a.copy.sid == b.original.sid
+        || a.original.sid == b.copy.sid
+        || (a.original.sid == b.original.sid && (keep_a == Keep::Copy || keep_b == Keep::Copy))
 }
 
 /// The answers a round takes in ([`queued`]).
@@ -260,4 +286,60 @@ pub fn parse_keep(s: &str) -> Result<Option<Keep>> {
         "both" => None,
         _ => bail!("keep original, copy or both"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oneup_store::{LocalKind, LocalRow, Skip};
+    use oneup_sync::{Base, NodeKind, ROOT};
+
+    #[test]
+    fn a_stale_or_ambiguous_batch_does_not_queue_a_partial_answer() {
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .write(|o| {
+                for (sid, name) in [(ROOT, ""), (2, "a.txt"), (3, "a (conflict 1).txt"), (4, "a (conflict 2).txt")] {
+                    let root = sid == ROOT;
+                    o.local_put(&LocalRow {
+                        file_id: u128::from(sid),
+                        parent_id: (!root).then_some(u128::from(ROOT)),
+                        name: name.into(),
+                        name_lossy: false,
+                        kind: if root { LocalKind::Root } else { LocalKind::File },
+                        size: 12,
+                        mtime: 45,
+                        attributes: 0,
+                        reparse_tag: 0,
+                        skip: Skip::None,
+                    })?;
+                    o.synced_put(&Base {
+                        sid,
+                        parent: (!root).then_some(ROOT),
+                        name: name.into(),
+                        kind: if root { NodeKind::Folder } else { NodeKind::File },
+                        size: 12,
+                        hash: None,
+                        local: Some(LocalId(u128::from(sid))),
+                        local_mtime: 45,
+                        remote: None,
+                        remote_etag: String::new(),
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let listed = store.read(|o| recover::conflicts_in(o, ROOT)).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(answer_batch(&mut store, &listed, Keep::Copy).is_err());
+        let mut stale = listed.clone();
+        stale[1].copy.mtime += 1;
+        assert!(answer_batch(&mut store, &stale, Keep::Original).is_err());
+        assert!(store.read(read_queue).unwrap().is_empty());
+
+        answer_batch(&mut store, &listed, Keep::Original).unwrap();
+        let queued = store.read(read_queue).unwrap();
+        assert_eq!(queued, listed.into_iter().map(|c| (c, Keep::Original)).collect::<Vec<_>>());
+    }
 }

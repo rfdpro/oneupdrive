@@ -1118,6 +1118,17 @@ pub fn conflict_keep(dir: &Path, listed: &Value, keep: &str) -> Result<()> {
     crate::conflicts::answer(&mut store, &c, k)
 }
 
+/// Queue decisions for the conflicts shown across all Recovery pages.
+pub fn conflict_keep_batch(dir: &Path, listed: &Value, keep: &str) -> Result<()> {
+    let Some(keep) = crate::conflicts::parse_keep(keep)? else { return Ok(()) };
+    let listed =
+        listed.as_array().filter(|batch| batch.len() <= crate::conflicts::MAX).context("invalid conflict batch")?;
+    let conflicts =
+        listed.iter().map(crate::conflicts::from_json).collect::<Option<Vec<_>>>().context("not a conflict")?;
+    let mut store = crate::setup::open_store(dir, 1024)?;
+    crate::conflicts::answer_batch(&mut store, &conflicts, keep)
+}
+
 /// The Recovery page's items deleted from OneDrive (`crate::cloudbin`).
 pub fn cloud_bin(dir: &Path) -> Result<Value> {
     let store = crate::setup::open_store(dir, 1024)?;

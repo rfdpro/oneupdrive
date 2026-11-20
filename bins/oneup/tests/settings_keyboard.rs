@@ -417,6 +417,28 @@ const DRIVER: &str = r##"<script>
     tallRecovery.remove();
     show("recovery");
     await sleep(100);
+    HOST_ANSWERS.conflicts = Array.from({length: 26}, (_, i) => ({
+      path: "/conflict-" + i + ".txt", copy_path: "/copy-" + i + ".txt",
+      original: {size: 20}, copy: {size: 30}, original_ms: 1, copy_ms: 2
+    }));
+    HOST_ANSWERS.kept = Array.from({length: 26}, (_, i) => ({id: i, name: "kept-" + i, bytes: 20, at_ms: 1}));
+    await loadRecovery();
+    await sleep(100);
+    check("Recovery shows one page of conflicts and kept copies", document.querySelectorAll("#cf-table tbody tr").length === 25 &&
+      document.querySelectorAll("#rc-kept tbody tr").length === 25, "");
+    document.querySelector('#cf-pages [data-direction="1"]').click();
+    document.querySelector('#rc-kept [data-direction="1"]').click();
+    check("each Recovery list has its own last page", document.querySelector("#cf-table tbody").textContent.includes("conflict-25.txt") &&
+      document.querySelectorAll("#cf-table tbody tr").length === 1 &&
+      document.querySelector("#rc-kept tbody").textContent.includes("kept-25"), "");
+    document.querySelector("#cf-batch button").click();
+    await sleep(100);
+    const batch = HOST_CALLS.filter(m => m.op === "conflict_keep_batch").at(-1);
+    check("batch decisions include conflicts from every page", batch?.args.keep === "original" &&
+      batch.args.conflicts.length === 26 && batch.args.conflicts[0].path === "/conflict-0.txt", batch?.args.conflicts.length);
+    HOST_ANSWERS.conflicts = [];
+    HOST_ANSWERS.kept = [];
+    await loadRecovery();
     document.querySelector("#rw-date").value = "2026-01-01";
     document.querySelector("#rw-time").value = "10:00";
     document.querySelector("#rw-preview").focus();
