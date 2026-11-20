@@ -2598,14 +2598,8 @@
                     <div class="actions"><button class="btn" id="sc-undo" hidden>Undo</button><button class="btn" id="sc-find">Search</button><button class="btn primary" id="sc-fix" hidden>Update</button></div></div>
                 <div id="sc-list"></div>
             </div>
-            <h3>Updates</h3>
+            <h3>Setup</h3>
             <div class="card">
-                <div class="row">
-                    <div class="label"><b>Install updates automatically</b><small>Only updates signed by the same publisher</small></div><label class="toggle"><input type="checkbox" id="upd-auto" aria-label="Install updates automatically"><span></span></label></div>
-                <div class="row">
-                    <div class="label"><b>Get previews</b><small>New features sooner, more bugs</small></div><label class="toggle"><input type="checkbox" id="upd-preview" aria-label="Get preview versions"><span></span></label></div>
-                <div class="row">
-                    <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
                 <div class="row">
                     <div class="label"><b>Run setup again</b></div><button class="btn" id="setup-rerun" aria-label="Open setup">Open</button></div>
             </div>
@@ -2657,6 +2651,15 @@
                     <div class="label"><b class="path" id="about-data">–</b><small>Data folder</small></div>
                     <div class="actions"><button class="btn" data-open="data">Open</button><button class="btn" data-open="log">Log</button></div>
                 </div>
+            </div>
+            <h3>Updates</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Install updates automatically</b><small>Only updates signed by the same publisher</small></div><label class="toggle"><input type="checkbox" id="upd-auto" aria-label="Install updates automatically"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Get previews</b><small>New features sooner, more bugs</small></div><label class="toggle"><input type="checkbox" id="upd-preview" aria-label="Get preview versions"><span></span></label></div>
+                <div class="row">
+                    <div class="label" aria-live="polite"><b id="upd-state">Updates</b><small id="upd-detail"></small></div><button class="btn" id="upd-check">Check now</button></div>
             </div>
         </section>
     </main>

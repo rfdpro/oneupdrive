@@ -495,6 +495,9 @@ const DRIVER: &str = r##"<script>
     const sharedAutomatic = document.querySelector("#shared-settings>.ck").getBoundingClientRect();
     check("shared settings have space around their action row", sharedActions.top - sharedDescription.bottom >= 16
       && sharedAutomatic.top - sharedActions.bottom >= 16, "");
+    check("Updates are in About and setup stays in General", document.querySelector("#upd-auto").closest(".page").id === "about" &&
+      document.querySelector("#upd-check").closest(".page").id === "about" &&
+      document.querySelector("#setup-rerun").closest(".page").id === "general", "");
     const beforeSetupCalls = HOST_CALLS.length;
     document.querySelector("#setup-rerun").focus(); document.activeElement.click(); await sleep(100);
     check("Updates reopens setup and focuses the current local folder", document.querySelector("#setup").classList.contains("on")
