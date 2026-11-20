@@ -264,6 +264,47 @@ const DRIVER: &str = r##"<script>
     document.querySelector("#search-scope").value = "root";
     await sleep(300);
 
+    // Memory view reads one scope and opens locations without opening files.
+    const diskFile = {id:"11", name:"clip.mp4", bytes:800, location:"C:\\Sync\\Videos\\clip.mp4"};
+    const diskFolder = {id:"10", name:"Videos", bytes:900, folder:true, expandable:true,
+      location:"C:\\Sync\\Videos", preview:{bytes:900, other:100, items:[diskFile]}};
+    HOST_ANSWERS.memory_view = a => a.on_disk
+      ? a.folder ? diskFolder.preview : {bytes:1200, other:0, items:[diskFolder,
+          {id:"12", name:"notes.txt", bytes:300, location:"C:\\Sync\\notes.txt"}]}
+      : {bytes:5000, other:0, items:[{id:"drive-file", name:"cloud-only.bin", bytes:5000, location:"cloud-root"}]};
+    const mainTab = tabs()[0], map = document.querySelector("#memory-map");
+    mainTab.dispatchEvent(new MouseEvent("contextmenu", {bubbles:true, cancelable:true, clientX:200, clientY:100}));
+    check("Main folder context menu offers Memory view", document.activeElement.textContent === "Memory view", at());
+    document.activeElement.click(); await sleep(140);
+    check("Memory view replaces both panes and starts on disk", !document.querySelector("#memory-view").hidden &&
+      document.querySelector("#files-pane").getBoundingClientRect().width === 0 &&
+      document.querySelector('#memory-scope [data-scope="disk"]').getAttribute("aria-pressed") === "true", map.textContent);
+    const area = id => {
+      const rect = map.querySelector('[data-memory-key="item:' + id + '"]').parentElement.getBoundingClientRect();
+      return rect.width * rect.height;
+    };
+    const ratio = area("10") / area("12");
+    check("folder tiles are sized by bytes", Math.abs(ratio - 3) < .07, ratio);
+    check("large folders show nested file tiles", !!map.querySelector('.memory-children [data-memory-key="item:11"]'), map.textContent);
+    map.querySelector('[data-memory-key="item:11"]').click(); await sleep(30);
+    check("an on-disk tile reveals the file in Explorer", HOST_CALLS.filter(m => m.op === "reveal").at(-1)?.args.path === diskFile.location, "");
+    map.querySelector('[data-memory-key="folder:10"]').click(); await sleep(50);
+    check("folder zoom requests its own map", HOST_CALLS.filter(m => m.op === "memory_view").at(-1)?.args.folder === "10" &&
+      document.querySelector("#memory-path").textContent.includes("Videos"), map.textContent);
+    document.querySelector('#memory-scope [data-scope="drive"]').click(); await sleep(50);
+    const driveRequest = HOST_CALLS.filter(m => m.op === "memory_view").at(-1);
+    check("Whole drive switches scope and returns to its root", driveRequest?.args.on_disk === false &&
+      driveRequest.args.folder === null && map.textContent.includes("cloud-only.bin"), map.textContent);
+    map.querySelector(".memory-open").click(); await sleep(30);
+    check("OneDrive file tiles open the containing folder", HOST_CALLS.filter(m => m.op === "open_in_onedrive").at(-1)?.args.id === "cloud-root", "");
+    document.querySelector("#memory-back").click();
+    check("Memory view Back restores Files and its focus", document.querySelector("#memory-view").hidden &&
+      document.querySelector("#files-pane").getBoundingClientRect().width > 0 && document.activeElement === mainTab, at());
+    key("F10", {shiftKey:true});
+    check("keyboard opens the main folder context menu", document.activeElement.textContent === "Memory view", at());
+    document.querySelector("#ctx").hidePopover();
+    await sleep(50);
+
     showStatus({ activity: "Retrying", paused: {} });
     check("routine retries read as catching up", document.querySelector("#st-btn").textContent.includes("Catching up"), "");
     showStatus(null);

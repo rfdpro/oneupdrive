@@ -320,6 +320,13 @@ mod win {
                 let local = tokio::task::spawn_blocking(move || oneup_app::pairs::unpair(&d)).await??;
                 Ok(Value::from(local.to_string_lossy().into_owned()))
             }
+            "memory_view" => {
+                let d = dir.to_path_buf();
+                let folder = args["folder"].as_str().map(str::to_owned);
+                let on_disk = args["on_disk"].as_bool().context("Choose a Memory view scope.")?;
+                tokio::task::spawn_blocking(move || oneup_app::memory_view::read(&d, on_disk, folder.as_deref()))
+                    .await?
+            }
             "tree_sizes" => {
                 let (d, rel) = (dir.to_path_buf(), text(args, "rel"));
                 let steps = oneup_app::filetree::steps_from(&args["steps"])?;

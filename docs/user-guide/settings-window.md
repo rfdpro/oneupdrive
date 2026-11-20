@@ -32,6 +32,14 @@ On the right, the details of what you selected:
 
 With nothing selected, it shows the folder itself: where it is on this PC and in OneDrive, **Both ways** or **Backup**, **Files On-Demand**, **Free up space** automatically (after a week, a month… unused, or when the disk is nearly full; see [Files On-Demand](files-on-demand.md#freeing-space-by-itself)), **Start** and **Pause** for extra folders, and **Stop syncing…** (see [Stopping a folder's sync](folders.md#stopping-a-folders-sync)); **Kept on this PC**, the copies sync kept when it removed or replaced files here, each with **Restore**; and the folder's **Recent activity**. For a vault: **Unlock…**, **Lock**, **Unlock with Windows Hello**, **Recovery key…**, **Change password…** and **Stop syncing…**.
 
+### Memory view
+
+Right-click the **Main folder** tab in Files and choose **Memory view**. You can also focus that tab and press Shift+F10. Each tile's area represents its file size or the total size of its folder.
+
+Choose **On disk** to see fully downloaded files in the main sync folder, sized by their file lengths. **Whole drive** uses the sizes OneDrive reports, including online-only files and folders outside the sync folder. Large folders show a preview of their contents. **Other items** groups smaller items or contents OneDrive reports as part of a folder's size.
+
+Select a tile to show its location in File Explorer or OneDrive. Select the arrow on a folder tile to explore it in the map. The folder path takes you back up a level, and **Back** returns to Files.
+
 ## Apps
 Which programs changed and opened files in your synced folder, over the last day, week, month or 90 days: a chart per day (or hour), and a table per program with files changed, files downloaded on open and their size. **Click a program** to see the files it used lately, newest first. The page updates by itself while it's open; a change shows within about 20 seconds.
 

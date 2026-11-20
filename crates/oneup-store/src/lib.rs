@@ -59,6 +59,7 @@ pub mod retry;
 mod rulefile;
 pub mod search;
 pub mod shared;
+pub mod treemap;
 pub mod usage;
 pub use activity::{Entry as ActivityEntry, Outcome as ActivityOutcome};
 pub use dupes::{DupCursor, DupGroup, DupSummary};
