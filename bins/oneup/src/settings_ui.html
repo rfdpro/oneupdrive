@@ -206,8 +206,11 @@
         /* The gutter is always kept, so pages don't shift or misalign when one needs a scroll bar. */
         
         main {
+            /* Anchor visually hidden table labels inside this scrollport. */
+            position: relative;
             flex: 1;
             min-width: 0;
+            min-height: 0;
             overflow-y: auto;
             scrollbar-gutter: stable;
             padding: 17px 30px 44px;
@@ -3219,8 +3222,11 @@
             if (switcher) {
                 (inSettings ? $("#nav-back") : $("#nav-open-settings")).focus();
             }
+            const changed = $(".page.on")?.id !== page;
             $$(".page").forEach(p => p.classList.toggle("on", p.id === page));
-            $("#main").classList.toggle("wide", page === "files");
+            const main = $("#main");
+            main.classList.toggle("wide", page === "files");
+            if (changed) main.scrollTop = 0;
             $("#agent").hidden = page === "setup";
             $(page === "setup" ? "#setup-shared-slot" : "#general-shared-slot").append($("#shared-settings"));
             clearInterval(appsTimer);

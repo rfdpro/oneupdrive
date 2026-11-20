@@ -106,6 +106,7 @@ const DRIVER: &str = r##"<script>
   const out = [];
   const pre = document.createElement("pre");
   pre.id = "result";
+  pre.hidden = true;
   document.body.append(pre);
   const report = () => pre.textContent = JSON.stringify(out.concat([["no script errors", !ERRS.length, ERRS.join("; ")]]));
   const check = (name, ok, seen) => { out.push([name, !!ok, String(seen)]); report(); };
@@ -401,6 +402,21 @@ const DRIVER: &str = r##"<script>
     // Recovery: focus follows the rewind's list and answers.
     window.confirm = () => true;
     document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);
+    const recoveryScroll = document.querySelector("#main");
+    const recoveryBottom = document.querySelector("#rc-bin");
+    const tallRecovery = document.createElement("div");
+    tallRecovery.style.height = "2500px";
+    recoveryBottom.before(tallRecovery);
+    recoveryScroll.scrollTop = recoveryScroll.scrollHeight;
+    window.scrollTo(0, 300);
+    check("Recovery scrolls to its last card inside the main pane", recoveryScroll.scrollTop > 0 && window.scrollY === 0 &&
+      recoveryBottom.getBoundingClientRect().bottom <= recoveryScroll.getBoundingClientRect().bottom,
+      [recoveryScroll.scrollTop, window.scrollY]);
+    show("lists");
+    check("switching away from Recovery resets the main scroll", recoveryScroll.scrollTop === 0, recoveryScroll.scrollTop);
+    tallRecovery.remove();
+    show("recovery");
+    await sleep(100);
     document.querySelector("#rw-date").value = "2026-01-01";
     document.querySelector("#rw-time").value = "10:00";
     document.querySelector("#rw-preview").focus();
@@ -913,7 +929,7 @@ fn the_window_works_from_the_keyboard() {
         return;
     }
     let json = dom
-        .split("<pre id=\"result\">")
+        .split("<pre id=\"result\" hidden=\"\">")
         .nth(1)
         .and_then(|r| r.split("</pre>").next())
         .unwrap_or_else(|| panic!("no result from the page; Edge printed {} bytes", dom.len()));
