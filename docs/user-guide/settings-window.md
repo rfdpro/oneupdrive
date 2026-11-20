@@ -112,7 +112,9 @@ OneUpDrive is in English for now. When a translation for your Windows display la
 ## Keyboard, screen readers and contrast themes
 Everything in the window works from the keyboard. Tab moves between controls; the focused one has an outline.
 
-* **Tabs** (the folders along the top of Files, **All files** and **Exclude**): Tab reaches the chosen one; the left and right arrows (and Home, End) choose another.
+* **Pages**. In the sidebar, press Up or Down to move between pages and Enter to open one. Home and End go to the first and last entries. F6 or Shift+F6 moves between the sidebar and the current page.
+* **Files search**. Press Ctrl+F to focus the search box from anywhere in Files. Press Down to reach the results. Up, Down, Home and End move between results, and Tab reaches each result's actions. Esc from a result returns to the search box with the query intact. Esc in the box clears it.
+* **Tabs** (the folders along the top of Files, **All files**, **Exclude** and **Duplicates**): Tab reaches the chosen one; the left and right arrows (and Home, End) choose another.
 * **The file tree**: the up and down arrows move, right opens a folder (again: its first item), left closes it (again: its parent), Home and End go to the first and last item, a letter goes to the next item starting with it, Enter opens a file or folder, Space ticks or unticks, and the menu key or Shift+F10 opens the quick actions. Esc clears the selection, showing the folder's own settings.
 * **Menus** (the status under the OneUpDrive name, **Add**, the quick actions): the up and down arrows move, Enter chooses, Esc closes.
 * **Dialogs**: Esc closes them without changing anything; focus goes back where it was.

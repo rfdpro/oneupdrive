@@ -235,6 +235,20 @@ const DRIVER: &str = r##"<script>
     key("ArrowLeft"); await sleep(300);
     check("Left goes back to All files", document.activeElement.dataset.view === "all" && tree.getAttribute("role") === "tree", document.activeElement.dataset.view);
 
+    const filesNav = document.querySelector('nav [data-page="files"]');
+    filesNav.focus();
+    key("ArrowDown");
+    check("sidebar arrows move focus without switching pages", document.activeElement.dataset.page === "apps" &&
+      document.querySelector(".page.on").id === "files", at());
+    key("End");
+    check("sidebar End reaches Settings", document.activeElement.id === "nav-open-settings", at());
+    key("Home");
+    check("sidebar Home returns to Files", document.activeElement === filesNav, at());
+    key("F6");
+    check("F6 takes focus to the current page heading", document.activeElement === document.querySelector("#files h2"), at());
+    key("F6", {shiftKey: true});
+    check("Shift+F6 returns to the current page in the sidebar", document.activeElement === filesNav, at());
+
     // Search uses the selected Files scope and fills the space of the details panel.
     const searchBox = document.querySelector("#q");
     const detailsToggle = document.querySelector("#details-toggle");
@@ -249,11 +263,25 @@ const DRIVER: &str = r##"<script>
     detailsToggle.click();
     check("Details can be hidden while browsing", document.querySelector("#details").hidden, "");
     detailsToggle.click();
-    HOST_ANSWERS.tree_find = [{rel:"Docs/inner.doc",folder:false}];
+    document.querySelector('.views [data-view="out"]').focus();
+    document.activeElement.click();
+    key("f", {ctrlKey: true});
+    check("Ctrl+F opens Files search from another Files view", document.activeElement === searchBox &&
+      document.querySelector('.views [data-view="all"]').getAttribute("aria-selected") === "true", at());
+    HOST_ANSWERS.tree_find = [{rel:"Docs/inner.doc",folder:false}, {rel:"big.iso",folder:false}];
     searchBox.value = "inner";
     searchBox.dispatchEvent(new Event("input")); await sleep(350);
     check("Files search finds items in the selected folder", tree.textContent.includes("inner.doc") &&
       document.querySelector("#details").hidden && HOST_CALLS.filter(m => m.op === "tree_find").at(-1)?.args.root === "main", tree.textContent);
+    key("ArrowDown");
+    check("Down from search focuses the first result action", document.activeElement.closest(".fl")?.textContent.includes("inner.doc"), at());
+    key("ArrowDown");
+    check("Down moves to the next result", document.activeElement.closest(".fl")?.textContent.includes("big.iso"), at());
+    renderFound();
+    check("redrawing results preserves focus on the same item", document.activeElement.closest(".fl")?.textContent.includes("big.iso"), at());
+    key("Escape");
+    check("Escape from results returns to the search field with its query", document.activeElement === searchBox &&
+      searchBox.value === "inner", at());
     const filterToggle = document.querySelector("#search-filters-toggle");
     const filters = document.querySelector("#search-filters");
     filterToggle.focus(); filterToggle.click(); await sleep(50);

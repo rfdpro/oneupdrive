@@ -3258,7 +3258,7 @@
             <div class="pane" id="files-pane">
                 <div class="file-explorer">
                     <div class="search-tools" id="search-tools">
-                        <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
+                        <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" aria-keyshortcuts="Control+F" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
                         <button id="fd-go" hidden>Search</button>
                         <button id="search-filters-toggle" popovertarget="search-filters" aria-controls="search-filters"><svg aria-hidden="true"><use href="#i-filter"/></svg>Filters</button>
                         <div id="search-filters" popover role="group" aria-label="Search filters">
@@ -4312,6 +4312,37 @@
         $$("nav button[data-page]").forEach(b => b.onclick = () => show(b.dataset.page));
         $("#nav-open-settings").onclick = () => show(NAV.settings);
         $("#nav-back").onclick = () => show(NAV.app);
+        $("nav").addEventListener("keydown", e => {
+            if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+            const pages = $$("nav button:is([data-page], #nav-back, #nav-open-settings)")
+                .filter(button => button.getClientRects().length);
+            const i = pages.indexOf(e.target);
+            if (i < 0) return;
+            const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: pages.length - 1 }[e.key];
+            if (next === undefined) return;
+            e.preventDefault();
+            pages[(next + pages.length) % pages.length].focus();
+        });
+
+        document.addEventListener("keydown", e => {
+            if (e.defaultPrevented || e.isComposing || $("dialog:modal, [popover]:popover-open")) return;
+            if (e.key === "F6" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+                const target = e.target.closest("nav") ?
+                    (M.active ? $("#memory-title") : $(".page.on h2")) :
+                    $('nav [aria-current="page"]');
+                if (!target) return;
+                e.preventDefault();
+                if (target.matches("h2, h3")) target.tabIndex = -1;
+                target.focus();
+            } else if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === "f" &&
+                $("#files").classList.contains("on")) {
+                e.preventDefault();
+                if (M.active) closeMemory(false);
+                setView("all");
+                $("#q").focus();
+                $("#q").select();
+            }
+        });
         document.addEventListener("click", e => {
             const g = e.target.closest("[data-goto]");
             if (g) show(g.dataset.goto);
@@ -7590,6 +7621,21 @@
             });
         }
         $("#tree").addEventListener("keydown", e => {
+            if (F.view === "all" && F.q) {
+                const row = e.target.closest("[data-search-result]");
+                if (!row || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+                const results = $$("[data-search-result]", $("#tree"));
+                const i = results.indexOf(row);
+                const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: results.length - 1 }[e.key];
+                if (e.key === "Escape" || next < 0) {
+                    e.preventDefault();
+                    $("#q").focus();
+                } else if (next !== undefined) {
+                    e.preventDefault();
+                    if (results[next]) $("button", results[next]).focus();
+                }
+                return;
+            }
             const rows = $$("#tree .ti[data-rel]");
             if (!rows.length) return;
             const i = rows.findIndex(r => r === document.activeElement);
@@ -8130,9 +8176,16 @@
         }
 
         function renderFound() {
+            const focused = document.activeElement;
+            const row = focused.closest("[data-search-result]");
+            const action = row ? $$("button", row).indexOf(focused) : -1;
             const box = el("div", { className: "flat" });
             if (F.found?.root) {
-                for (const f of F.found.root) box.append(flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel)));
+                for (const f of F.found.root) {
+                    const result = flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel));
+                    result.dataset.searchResult = "folder:" + f.rel;
+                    box.append(result);
+                }
                 if (F.found.root.length >= 100) box.append(el("div", {
                     className: "msg",
                     textContent: tr("First matches only. Type more to narrow it down.")
@@ -8140,7 +8193,7 @@
             }
             if (F.found?.names) {
                 const names = F.found.names;
-                findList(box, names);
+                findList(box, names, "name");
                 if (names.note) box.append(el("div", { className: "msg", textContent: tr(names.note) }));
             }
             if (F.found?.cloud) {
@@ -8152,9 +8205,13 @@
                 if (cloud.error || !cloud.items.length) box.append(el("div", {
                     className: "msg", textContent: cloud.error || tr("Nothing found.")
                 }));
-                else findList(box, cloud);
+                else findList(box, cloud, "content");
             }
             $("#tree").replaceChildren(box);
+            if (action >= 0) {
+                const result = $$("[data-search-result]", box).find(item => item.dataset.searchResult === row.dataset.searchResult);
+                (result && $$("button", result)[action] || $("#q")).focus({ preventScroll: true });
+            }
         }
         // Database files ([databases]): what counts as one, and what waits
         // now or is warned about (the agent's status, `st`).
@@ -10727,8 +10784,12 @@
             return flatRow(f.folder ? f.name + "/" : f.name, bits.join(" · "), ...acts);
         }
 
-        function findList(box, r) {
-            for (const f of r.items) box.append(findRow(f));
+        function findList(box, r, group) {
+            for (const f of r.items) {
+                const result = findRow(f);
+                if ($("button", result)) result.dataset.searchResult = group + ":" + f.id;
+                box.append(result);
+            }
             if (r.too_many) box.append(el("div", {
                 className: "msg",
                 textContent: tr(r.too_many)
@@ -10811,7 +10872,15 @@
         window.addEventListener("resize", positionSearchFilters);
         $("#q").oninput = () => queueFind();
         $("#q").onkeydown = e => {
+            if (e.isComposing) return;
             if (e.key === "Enter") queueFind(true);
+            if (e.key === "ArrowDown" && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+                const first = $("#tree [data-search-result] button");
+                if (first) {
+                    e.preventDefault();
+                    first.focus();
+                }
+            }
             if (e.key === "Escape") {
                 e.preventDefault();
                 $("#q").value = "";
