@@ -399,6 +399,32 @@ const DRIVER: &str = r##"<script>
       check(sel + " takes focus", document.activeElement === e, at());
     }
     check("Work offline waits for the agent to run", document.querySelector("#net-offline").disabled, "");
+    // Sharing remembers each tab and retains the continuation it showed.
+    let sharingReads = 0;
+    let sharingAccount = "fixture-account-a";
+    HOST_ANSWERS.sharing_account = () => sharingAccount;
+    HOST_ANSWERS.sharing_list = a => {
+      sharingReads++;
+      return {items:[{path: a.after ? "/second.txt" : "/first.txt", error:"", links:[{
+        kind:"Anyone with the link", access:"Can view", who:[], id:"link", code:"fixture-code"
+      }]}], next: a.after ? null : "next", checked: 1};
+    };
+    HOST_ANSWERS.sharing_with_me = {items:[], more:false};
+    show("shared"); await sleep(100);
+    document.querySelector('#sg-tabs [data-tab="with"]').click(); await sleep(100);
+    document.querySelector('#sg-tabs [data-tab="by"]').click(); await sleep(100);
+    check("returning to a Sharing tab reuses recent results", sharingReads === 1 &&
+      document.querySelector("#sg-table").textContent.includes("first.txt"), sharingReads);
+    document.querySelector("#sg-more button").click(); await sleep(100);
+    check("a cached Sharing list can continue from the next page", sharingReads === 2 &&
+      document.querySelector("#sg-table").textContent.includes("second.txt"), sharingReads);
+    document.querySelector("#sg-refresh").click(); await sleep(100);
+    check("Sharing Refresh reads from OneDrive again", sharingReads === 3 &&
+      !document.querySelector("#sg-table").textContent.includes("second.txt"), sharingReads);
+    sharingAccount = "fixture-account-b";
+    await loadSharing();
+    check("another account never uses the previous Sharing results", sharingReads === 4, sharingReads);
+
     // Recovery: focus follows the rewind's list and answers.
     window.confirm = () => true;
     document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);

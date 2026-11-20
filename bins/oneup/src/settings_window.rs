@@ -1286,6 +1286,11 @@ mod win {
             // One bounded page; `after` is the previous page's `next`.
             // Both tabs go through `sharing::window_tab`, which settles what
             // an earlier change left unsettled when a tab opens.
+            "sharing_account" => {
+                let account = oneup_app::accounts::signed_in_as(dir)
+                    .filter(|_| oneup_graph::usable_sign_in(&dir.join("token.dpapi")));
+                Ok(json!(account.map(|a| a.drive)))
+            }
             "sharing_list" => {
                 let after = args.get("after").and_then(Value::as_str);
                 oneup_app::sharing::window_tab_for(dir, oneup_app::sharing::Tab::ByYou, after, room(args)).await

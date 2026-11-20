@@ -65,6 +65,8 @@ What you share in OneDrive, and who can open it. **Refresh** asks OneDrive again
 * **Shared by you**: each shared file or folder, with one line per link or person: **Who** (*Anyone with the link*, or *Specific people* and their names), **Access** (*Can view* or *Can edit*, and whether the link has a password), **Expires** and when it was **Shared**. The line above the list counts the links anyone can open that never expire. **Show more** reads further. **Stop sharing** removes that link (it stops working) or that access. With experimental options on, **Set expiry** sets the last day it works. See [Earlier versions and sharing](versions-and-sharing.md#what-you-share).
 * **Shared with you**: what other people share with your account, and who shared it.
 
+The window reuses recent Sharing results. Select **Refresh** to check OneDrive again.
+
 ## Recovery
 Every way to get something back, explained in [Getting things back](recovery.md):
 * **Rewind a folder**: pick a folder and a moment, **Preview** what would change, **Rewind**, then **Approve** (it waits for that, as a safety stop).
