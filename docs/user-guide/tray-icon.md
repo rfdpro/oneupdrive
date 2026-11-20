@@ -6,13 +6,15 @@ While OneUpDrive runs, its icon (a blue cloud lifted one step above its base) si
 | Icon | Means |
 |---|---|
 | Blue icon | Up to date |
-| Blue icon, dark blue badge with a ring | Syncing |
+| Blue icon, dark blue badge with a ring | Syncing or catching up |
 | Grey icon, pause badge | Paused, by you or by itself (on a metered connection, with battery saver on, during a game or presentation, in quiet hours, with a network's data budget used up, or waiting for the internet) |
 | Blue icon, yellow **!** | Needs your review: something waits for your decision |
 | Blue icon, red **!** | A problem: OneUpDrive retries by itself, or stopped (see [When something goes wrong](troubleshooting.md)) |
 | Faded grey icon | OneUpDrive isn't running |
 
 Point at the icon to see the same in words, for example "OneUpDrive: Paused: battery saver is on". Screen readers read the same words.
+
+**Catching up** means OneUpDrive will try pending changes again. This can happen while a file is open or still being edited.
 
 From the keyboard: Win+B goes to the taskbar corner, the arrow keys to the icon, and Enter, Space or the menu key opens its menu.
 
