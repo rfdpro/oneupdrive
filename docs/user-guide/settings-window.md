@@ -42,7 +42,7 @@ Which programs changed and opened files in your synced folder, over the last day
 ## Activity
 Warnings appear above the lists, with space between each notice and the list controls. **Check for an older edit in OneDrive** means an upload finished, but OneUpDrive could not check whether it overlapped another cloud edit. Syncing continues. On OneDrive, right-click the file and select **Version history**; save any older edit you need, then select **Dismiss**. Dismissal is remembered for that incident; a later incident appears again. Active sync waits and safety stops stay visible until resolved.
 
-At the top, while anything needs you: one line per item, with what to do (the same list as `oneup problems`, see [When something goes wrong](troubleshooting.md#everything-that-needs-you)).
+Expand **Sync notices** at the top of Activity to see what needs attention. For routine retries, the status reads **Catching up** and pending changes sync automatically.
 
 Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the box to show only the items whose name or folder matches; **Refresh** reads the list again (it also follows syncing by itself). With more than one synced folder, choose which one at the top right.
 

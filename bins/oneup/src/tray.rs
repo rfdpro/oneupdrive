@@ -128,7 +128,7 @@ fn headline(v: &View, failures: bool) -> String {
         Activity::WaitingForYou => t!("Needs your review"),
         Activity::Retrying => match &s.problem {
             Some(p) => t!("Problem: {what}", what = crate::problem::shown(p, current()).0),
-            None => t!("Retrying soon"),
+            None => t!("Catching up"),
         },
         // OneDrive full: up to date otherwise, but uploads wait.
         Activity::Idle if s.problem.is_some() => {

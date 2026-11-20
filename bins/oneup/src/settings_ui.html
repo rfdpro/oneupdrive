@@ -866,9 +866,13 @@
         }
 
         #attn {
-            display: grid;
-            gap: 10px;
             margin-bottom: 16px;
+        }
+
+        #attn > summary {
+            padding: 12px 16px;
+            cursor: pointer;
+            font-weight: 600;
         }
 
         #attn .row {
@@ -2289,7 +2293,10 @@
         <section class="page" id="lists">
             <h2>Activity</h2>
             <!-- Everything that needs you, as `oneup problems` lists it -->
-            <div id="attn" hidden></div>
+            <details id="attn" class="card" hidden>
+                <summary id="attn-summary"></summary>
+                <div id="attn-list"></div>
+            </details>
             <div class="ls-bar">
                 <div class="seg" id="ls-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="log" aria-pressed="true">Recent</button>
@@ -3230,7 +3237,10 @@
             if (page === "general" && !scSearched) loadShortcuts();
             if (page === "general") loadHooks();
             if (page === "lists") loadList(true);
-            if (page === "lists") loadAttention();
+            if (page === "lists") {
+                $("#attn").open = false;
+                loadAttention();
+            }
             if (page === "shared") loadSharing();
             if (page === "recovery") loadRecovery();
         }
@@ -3249,7 +3259,7 @@
             syncing: tr("Syncing"),
             paused: tr("Paused"),
             waitingforyou: tr("Waiting for you"),
-            retrying: tr("Retrying soon"),
+            retrying: tr("Catching up"),
             stopping: tr("Stopping")
         };
 
@@ -3299,7 +3309,7 @@
             const stops = s.safety_stops || [];
             const attention = stops.length || (s.overflow && s.overflow.waiting);
             title.textContent = attention ? tr("Waiting for you") : s.problem ? tr("Problem") : paused || s.auto_pause ? tr("Paused") : (WORDS[a] || tr("Running"));
-            dot.className = "dot " + (attention || s.problem ? "bad" : paused || s.auto_pause ? "wait" : a === "syncing" || a === "starting" ? "busy" : "ok");
+            dot.className = "dot " + (attention || s.problem ? "bad" : paused || s.auto_pause ? "wait" : ["syncing", "starting", "retrying"].includes(a) ? "busy" : "ok");
             const bits = [];
             if (s.auto_pause) bits.push(tr("Paused: {why}.", {
                 why: tr(s.auto_pause, {
@@ -3321,6 +3331,9 @@
                 if (s.overflow && s.overflow.waiting) bits.push(tr("Removed files don't fit in the space for kept copies. oneup keep {code} keeps copies over the limit; oneup discard {code} removes them without copies.", {
                     code: s.overflow.code
                 }));
+            }
+            if (a === "retrying" && !attention && !s.problem && !paused && !s.auto_pause) {
+                bits.push(tr("Pending changes will sync automatically."));
             }
             if (s.last && s.last.done) bits.push(tr("Last sync {when}: {n, plural, one {# change} other {# changes}}.", {
                 when: new Date(s.last.at_ms).toLocaleString(FMT),
@@ -3534,8 +3547,11 @@
             try {
                 const r = await call("problems");
                 if (seq !== attentionSeq) return;
-                box.replaceChildren(...r.problems.map(p => el("div", {
-                    className: "card row"
+                $("#attn-summary").textContent = tr("{n, plural, one {# sync notice} other {# sync notices}}", {
+                    n: r.problems.length
+                });
+                $("#attn-list").replaceChildren(...r.problems.map(p => el("div", {
+                    className: "row"
                 }, el("div", {
                     className: "label"
                 }, el("b", {
@@ -3557,6 +3573,7 @@
                     }
                 }) : null)));
                 box.hidden = !r.problems.length;
+                if (box.hidden) box.open = false;
             } catch {
                 if (seq !== attentionSeq) return;
                 box.hidden = true;

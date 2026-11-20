@@ -122,15 +122,19 @@ const DRIVER: &str = r##"<script>
       {kind:"edit_not_found", title:"Review cloud version history", detail:"An overlapping cloud edit could not be checked.", action:"Review versions, then dismiss.", data_dir:"C:\\Data", dismiss_code:"incident-1"}
     ]};
     show("lists"); await loadAttention();
-    const notices = document.querySelectorAll("#attn > .card");
+    const noticeGroup = document.querySelector("#attn");
     const activityTabs = document.querySelector("#ls-tabs");
-    check("notifications have separate cards and space before list controls", notices.length === 2 && notices[1].getBoundingClientRect().top - notices[0].getBoundingClientRect().bottom >= 9 && activityTabs.getBoundingClientRect().top - notices[1].getBoundingClientRect().bottom >= 15, notices.length);
+    check("Activity starts with one collapsed notice summary", !noticeGroup.open &&
+      noticeGroup.querySelector("summary").textContent === "2 sync notices" &&
+      activityTabs.getBoundingClientRect().top - noticeGroup.getBoundingClientRect().bottom >= 15, noticeGroup.textContent);
+    noticeGroup.querySelector("summary").click();
+    const notices = noticeGroup.querySelectorAll("#attn-list > .row");
     check("long notification paths stay inside their card", notices[0].querySelector(".label").scrollWidth <= notices[0].querySelector(".label").clientWidth + 1, notices[0].scrollWidth);
     check("only version-review notices have Dismiss", document.querySelectorAll("#attn button").length === 1, document.querySelectorAll("#attn button").length);
     HOST_ANSWERS.dismiss_problem = () => { HOST_ANSWERS.problems = {problems: [HOST_ANSWERS.problems.problems[0]]}; return null; };
     document.querySelector("#attn button").click(); await sleep(100);
     const dismissal = HOST_CALLS.filter(m => m.op === "dismiss_problem").pop();
-    check("Dismiss acknowledges exactly this incident and leaves active waits", dismissal?.args.code === "incident-1" && dismissal.args.data_dir === "C:\\Data" && document.querySelectorAll("#attn > .card").length === 1, JSON.stringify(dismissal));
+    check("Dismiss acknowledges exactly this incident and leaves active waits", dismissal?.args.code === "incident-1" && dismissal.args.data_dir === "C:\\Data" && document.querySelectorAll("#attn-list > .row").length === 1, JSON.stringify(dismissal));
     HOST_ANSWERS.problems = {problems: []};
     document.querySelector("#ls-refresh").click(); await sleep(100);
     check("Activity Refresh also refreshes notifications", document.querySelector("#attn").hidden, document.querySelector("#attn").textContent);
@@ -141,7 +145,7 @@ const DRIVER: &str = r##"<script>
     await loadAttention();
     oldAttention({problems: [{title:"Old notice", detail:"Dismissed", action:"Review"}]});
     await pendingAttention;
-    check("a stale reply cannot resurrect a dismissed notification", document.querySelector("#attn").hidden && !document.querySelector("#attn").children.length, document.querySelector("#attn").textContent);
+    check("a stale reply cannot resurrect a dismissed notification", document.querySelector("#attn").hidden && !document.querySelector("#attn-list").children.length, document.querySelector("#attn").textContent);
     HOST_ANSWERS.problems = savedProblems;
     show("files"); await sleep(200);
     const tree = document.querySelector("#tree");
@@ -258,6 +262,10 @@ const DRIVER: &str = r##"<script>
       document.querySelector("#search-scope").value === "drive" && !document.querySelector('nav [data-page="find"]'), at());
     document.querySelector("#search-scope").value = "root";
     await sleep(300);
+
+    showStatus({ activity: "Retrying", paused: {} });
+    check("routine retries read as catching up", document.querySelector("#st-btn").textContent.includes("Catching up"), "");
+    showStatus(null);
 
     // The status menu, opened by its button.
     document.querySelector("#st-btn").focus();
