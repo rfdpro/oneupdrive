@@ -539,11 +539,31 @@ impl Ops<'_> {
     /// the settings window's search. A scan of the names: fine for a search
     /// someone typed, not for anything that runs by itself.
     pub fn local_find(&self, needle: &str, limit: usize) -> Result<Vec<LocalRow>> {
+        self.local_find_matching(&crate::search::NameQuery::Text(needle), None, limit)
+    }
+
+    /// Search on demand with bounded result memory, including for regexes.
+    pub fn local_find_matching(
+        &self,
+        query: &crate::search::NameQuery<'_>,
+        folder: Option<bool>,
+        limit: usize,
+    ) -> Result<Vec<LocalRow>> {
         let mut st = self.c.prepare_cached(&format!(
-            "SELECT {LOCAL_COLS} FROM local_item WHERE kind != 2 AND name LIKE ?1 ESCAPE '\\' LIMIT ?2"
+            "SELECT {LOCAL_COLS} FROM local_item
+             WHERE kind != 2 AND (?1 IS NULL OR name LIKE ?1 ESCAPE '\\')
+             AND (?2 IS NULL OR (kind = 1) = ?2) LIMIT ?3"
         ))?;
-        let rows = st.query_map(rusqlite::params![like_pattern(needle), limit as i64], LocalRow::from_row)?;
-        rows.map(|r| fix_local(r?)).collect()
+        let (pattern, sql_limit) = query.sql_args(limit);
+        let mut rows = st.query(rusqlite::params![pattern, folder, sql_limit])?;
+        let mut found = Vec::new();
+        while found.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            if query.matches(row.get::<_, String>("name")?.as_str()) {
+                found.push(fix_local(LocalRow::from_row(row)?)?);
+            }
+        }
+        Ok(found)
     }
 
     /// Items set to always stay on this device (`FILE_ATTRIBUTE_PINNED`, as

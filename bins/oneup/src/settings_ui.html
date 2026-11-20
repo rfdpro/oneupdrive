@@ -1268,18 +1268,9 @@
             flex: none;
             margin-bottom: 8px;
         }
-        /* Search: an icon until pointed at or focused, then the full box. */
-        
         .search {
             position: relative;
-            margin-left: auto;
-            flex: none;
-            width: 32px;
-            transition: width .18s ease;
-        }
-        
-        .search.open {
-            width: min(300px, 40vw);
+            flex: 1 1 200px;
         }
         
         .search input {
@@ -1287,22 +1278,21 @@
             height: 32px;
             padding-left: 30px;
         }
-        
-        .search:not(.open) input {
-            border-color: transparent;
-            background: transparent;
-            color: transparent;
-            cursor: pointer;
+
+        .search-tools {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            flex: none;
+            margin-bottom: 8px;
         }
-        
-        .search:not(.open) input::placeholder {
-            color: transparent;
+
+        .pane.full-width {
+            grid-template-columns: minmax(0, 1fr);
+            grid-template-rows: minmax(0, 1fr);
         }
-        
-        .search:not(.open):hover input {
-            background: var(--hover);
-        }
-        
+
         .search svg {
             position: absolute;
             left: 9px;
@@ -2088,7 +2078,6 @@
         <div class="nav-group" id="nav-app">
             <button data-page="setup" id="nav-setup" hidden>Set up</button>
             <button data-page="files" aria-current="page">Files</button>
-            <button data-page="find">Search</button>
             <button data-page="apps">Apps</button>
             <button data-page="lists">Activity</button>
             <button data-page="shared">Sharing</button>
@@ -2237,36 +2226,29 @@
                     <button role="tab" data-view="out">Exclude</button>
                     <button role="tab" data-view="dupes">Duplicates</button>
                 </div>
+            </div>
+            <div class="search-tools" id="search-tools">
                 <div class="search" id="search"><svg aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="q" placeholder="Search by name" spellcheck="false" aria-label="Search by name" title="Search by name"></div>
+                <select id="search-scope" aria-label="Search scope">
+                    <option value="root">Synced folder</option>
+                    <option value="drive">OneDrive</option>
+                </select>
+                <select id="search-kind" aria-label="Item type">
+                    <option value="">Files and folders</option>
+                    <option value="files">Files only</option>
+                    <option value="folders">Folders only</option>
+                </select>
+                <label><input type="checkbox" id="search-regex"> Regex</label>
+                <button class="btn small" id="fd-go" hidden>Search</button>
+                <button class="btn small" id="details-toggle" aria-controls="details" aria-pressed="true">Details</button>
             </div>
             <div class="pane">
                 <div class="browser">
                     <div class="cols" id="cols"></div>
+                    <div class="msg" id="fd-sum" role="status" hidden></div>
                     <div class="tree" id="tree" role="tree" aria-label="Files"></div>
                 </div>
                 <aside class="details" id="details" aria-label="Details"></aside>
-            </div>
-        </section>
-
-        <!-- Search: every name in OneDrive, from the mirror (oneup_app::search) -->
-        <section class="page" id="find">
-            <h2>Search</h2>
-            <div class="ls-bar">
-                <input type="search" id="fd-q" placeholder="Name, or part of one" spellcheck="false" aria-label="Search OneDrive by name">
-                <button class="btn primary" id="fd-go">Search</button>
-            </div>
-            <p class="lead" id="fd-sum" role="status"></p>
-            <div class="card" id="fd-card" hidden>
-                <div class="flat" id="fd-list"></div>
-            </div>
-            <p class="muted" id="fd-note" hidden></p>
-            <h3>Settings</h3>
-            <div class="card">
-                <div class="row">
-                    <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
-                    <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
-                <div class="row">
-                    <div class="label"><b>Hotkey</b><small>Opens this page from any program. Like Ctrl+Alt+F</small></div><input type="text" id="fd-hotkey" placeholder="None" aria-label="Hotkey"></div>
             </div>
         </section>
 
@@ -2589,6 +2571,14 @@
                     <div class="label"><b>Give way to my programs</b><small>Background priority for CPU, disk and memory</small></div><label class="toggle"><input type="checkbox" data-agent="background" aria-label="Give way to my programs"><span></span></label></div>
             </div>
             <p class="note">Memory and priority apply after a restart.</p>
+            <h3>Search</h3>
+            <div class="card">
+                <div class="row">
+                    <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
+                    <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Hotkey</b><small>Opens Files search from any program. Like Ctrl+Alt+F</small></div><input type="text" id="fd-hotkey" placeholder="None" aria-label="Hotkey"></div>
+            </div>
             <h3 id="shortcuts">Shortcuts</h3>
             <div class="card">
                 <div class="row">
@@ -3105,7 +3095,7 @@
             // Opened again (from the icon's menu, or Explorer's commands
             // for a file) while open: the page, or the file, asked for.
             if (m.event === "goto") return startAt(m.page, m.item);
-            if (m.event === "search_build") return findBuilding(m.items);
+            if (m.event === "search_build" && m.request === FD.seq && F.view === "all") return findBuilding(m.items);
             const w = waiting.get(m.id);
             if (!w) return;
             waiting.delete(m.id);
@@ -3232,8 +3222,10 @@
                 loadApps();
                 appsTimer = setInterval(() => document.hidden || loadApps(true), 15000);
             }
-            if (page === "files") openFiles();
-            if (page === "find") openFind();
+            if (page === "files") {
+                $("#fd-go").hidden = !$("#search-regex").checked && !($("#search-scope").value === "drive" && $("#fd-onedrive").checked);
+                openFiles();
+            }
             if (page === "accounts") loadAccounts();
             if (page === "general" && !scSearched) loadShortcuts();
             if (page === "general") loadHooks();
@@ -3442,6 +3434,8 @@
             $("#guard-on").checked = s.safety.content_guard > 0;
             $("#guard-n").value = s.safety.content_guard || 20;
             $("#guard-row").hidden = !(s.safety.content_guard > 0);
+            $("#fd-onedrive").checked = s.search.onedrive;
+            $("#fd-hotkey").value = s.search.hotkey || "";
             $("#upd-auto").checked = s.updates.auto;
             $("#upd-preview").checked = s.updates.channel === "preview";
             $("#about-version").textContent = (s.test_account ? tr("OneUpDrive {version} (test account)", {
@@ -5578,17 +5572,8 @@
             F.roots = roots;
             renderRoots();
             if (!F.roots.length) {
-                $("#tree").replaceChildren(el("div", {
-                        className: "msg"
-                    }, el("b", {
-                        textContent: tr("Nothing syncs yet")
-                    }),
-                    ...linked(tr("Set up your main folder, or {link}."), el("button", {
-                        className: "link",
-                        textContent: tr("add a folder"),
-                        onclick: () => $("#add-menu").showPopover()
-                    }))));
-                $("#details").replaceChildren();
+                F.root = null;
+                render();
                 return;
             }
             const want = F.want;
@@ -5652,6 +5637,7 @@
                     children: null
                 });
             }
+            if (!same && F.q && $("#search-scope").value === "root") queueFind();
             const nodes = F.nodes;
             await loadChildren("");
             if (F.root !== r || F.nodes !== nodes) return;
@@ -5760,7 +5746,7 @@
         function setView(v, quiet = false) {
             F.view = v;
             $$(".views button").forEach(b => {
-                b.setAttribute("aria-selected", String(b.dataset.view === v && !F.q));
+                b.setAttribute("aria-selected", String(b.dataset.view === v));
                 b.tabIndex = b.dataset.view === v ? 0 : -1;
             });
             render(quiet);
@@ -5786,15 +5772,33 @@
 
         function render() {
             const all = F.view === "all";
-            $(".search").hidden = !all;
+            $("#search-tools").hidden = !all;
+            $("#fd-sum").hidden = !all || !F.q || !$("#fd-sum").textContent;
+            const details = !!F.root && (!all || (!F.q && $("#details-toggle").getAttribute("aria-pressed") === "true"));
+            $("#details-toggle").hidden = !!F.q;
+            $("#details").hidden = !details;
+            $(".pane").classList.toggle("full-width", !details);
             $("#cols").hidden = !all || !!F.q;
             renderCols();
             if (!all || F.q) $("#tree").setAttribute("role", "region");
             if (all && F.q) renderFound();
-            else if (F.view === "dupes") renderDupes(!D.page || D.root !== F.root.id || D.stale);
-            else if (!all) renderOut();
-            else renderTree();
-            renderDetails();
+            else if (F.root && F.view === "dupes") renderDupes(!D.page || D.root !== F.root.id || D.stale);
+            else if (F.root && !all) renderOut();
+            else if (F.root) renderTree();
+            else {
+                $("#tree").replaceChildren(el("div", {
+                        className: "msg"
+                    }, el("b", {
+                        textContent: tr("Nothing syncs yet")
+                    }),
+                    ...linked(tr("Set up your main folder, or {link}."), el("button", {
+                        className: "link",
+                        textContent: tr("add a folder"),
+                        onclick: () => $("#add-menu").showPopover()
+                    }))));
+                $("#details").replaceChildren();
+            }
+            if (details && F.root) renderDetails();
         }
         // Sorting: by name, status or size (folders by everything inside them).
         F.sort = {
@@ -5870,48 +5874,6 @@
                 }, b) : el("span", {}, b));
             }
         }
-        let qTimer = 0;
-        $("#q").addEventListener("input", () => {
-            clearTimeout(qTimer);
-            qTimer = setTimeout(async() => {
-                F.q = $("#q").value.trim();
-                if (F.q.length >= 2) F.found = await call("tree_find", {
-                    root: F.root.id,
-                    q: F.q
-                }).catch(e => {
-                    toast(e.message, true);
-                    return [];
-                });
-                else {
-                    F.q = "";
-                    F.found = null;
-                }
-                setView(F.view);
-            }, 220);
-        });
-        $("#q").addEventListener("keydown", e => {
-            if (e.key === "Escape") {
-                $("#q").value = "";
-                F.q = "";
-                setView(F.view);
-            }
-        });
-        // The search box opens while pointed at or focused, and folds back to its icon when left empty.
-        {
-            const s = $("#search"),
-                q = $("#q");
-            const fold = () => {
-                if (!q.value && document.activeElement !== q && !s.matches(":hover")) s.classList.remove("open");
-            };
-            s.addEventListener("mouseenter", () => s.classList.add("open"));
-            s.addEventListener("mouseleave", fold);
-            q.addEventListener("focus", () => s.classList.add("open"));
-            q.addEventListener("blur", () => {
-                if (!q.value) s.classList.remove("open");
-            });
-            q.addEventListener("search", fold);
-        }
-
         // ---- what syncs: the tree's checkboxes and the exclude preview
         const OUT_STATES = ["left_out", "paused", "separate", "onedrive_app", "never", "link"];
 
@@ -6238,7 +6200,7 @@
         async function reveal(rel, openSection) {
             // Expands the folders down to `rel` and selects it.
             $("#q").value = "";
-            F.q = "";
+            queueFind();
             F.view = "all";
             const parts = rel.split("/");
             let cur = "";
@@ -6784,22 +6746,30 @@
         }
 
         function renderFound() {
-            const box = el("div", {
-                className: "flat"
-            });
-            const list = F.found || [];
-            if (!list.length) box.append(el("div", {
-                className: "msg"
-            }, el("b", {
-                textContent: tr("Nothing named like \"{text}\"", {
-                    text: F.q
-                })
-            })));
-            for (const f of list) box.append(flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel)));
-            if (list.length >= 100) box.append(el("div", {
-                className: "msg",
-                textContent: tr("First matches only. Type more to narrow it down.")
-            }));
+            const box = el("div", { className: "flat" });
+            if (F.found?.root) {
+                for (const f of F.found.root) box.append(flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel)));
+                if (F.found.root.length >= 100) box.append(el("div", {
+                    className: "msg",
+                    textContent: tr("First matches only. Type more to narrow it down.")
+                }));
+            }
+            if (F.found?.names) {
+                const names = F.found.names;
+                findList(box, names);
+                if (names.note) box.append(el("div", { className: "msg", textContent: tr(names.note) }));
+            }
+            if (F.found?.cloud) {
+                const cloud = F.found.cloud;
+                box.append(el("div", {
+                    className: "group",
+                    textContent: tr("Inside files (OneDrive's search)")
+                }));
+                if (cloud.error || !cloud.items.length) box.append(el("div", {
+                    className: "msg", textContent: cloud.error || tr("Nothing found.")
+                }));
+                else findList(box, cloud);
+            }
             $("#tree").replaceChildren(box);
         }
         // Database files ([databases]): what counts as one, and what waits
@@ -9330,17 +9300,8 @@
             "in OneDrive": tr("Stays in OneDrive")
         };
 
-        function openFind() {
-            const s = snap && snap.search;
-            if (s) {
-                $("#fd-onedrive").checked = s.onedrive;
-                $("#fd-hotkey").value = s.hotkey || "";
-            }
-            $("#fd-q").focus();
-            $("#fd-q").select();
-        }
-
         function findBuilding(n) {
+            $("#fd-sum").hidden = false;
             $("#fd-sum").textContent = tr("Building the search index (first search only): {n, plural, one {# item} other {# items}}", {
                 n
             });
@@ -9384,61 +9345,75 @@
                 textContent: tr("More found. Add to the search to narrow it.")
             }));
         }
-        async function runFind(inside) {
-            const q = $("#fd-q").value.trim();
-            const n = ++FD.seq;
+        function queueFind(submit = false) {
             clearTimeout(FD.timer);
-            if ([...q].length < 3) {
-                $("#fd-sum").textContent = q ? tr("Type at least 3 characters.") : "";
-                $("#fd-card").hidden = $("#fd-note").hidden = true;
-                return;
-            }
-            const withOneDrive = inside && $("#fd-onedrive").checked;
-            try {
-                const names = await call("search", {
-                    q
-                });
-                const cloud = withOneDrive ? await call("search_onedrive", {
-                    q
-                }).catch(e => ({
-                    error: e.message
-                })) : null;
-                if (n !== FD.seq) return;
-                const box = $("#fd-list");
-                box.replaceChildren();
-                findList(box, names);
-                if (cloud) {
-                    box.append(el("div", {
-                        className: "group",
-                        textContent: tr("Inside files (OneDrive's search)")
-                    }));
-                    if (cloud.error) box.append(el("div", {
-                        className: "msg",
-                        textContent: cloud.error
-                    }));
-                    else if (!cloud.items.length) box.append(el("div", {
-                        className: "msg",
-                        textContent: tr("Nothing found.")
-                    }));
-                    else findList(box, cloud);
+            const request = ++FD.seq;
+            const q = $("#q").value.trim();
+            const drive = $("#search-scope").value === "drive";
+            const regex = $("#search-regex").checked;
+            const kind = $("#search-kind").value;
+            const folder = kind ? kind === "folders" : null;
+            const root = F.root?.id;
+            $("#fd-go").hidden = !regex && !(drive && $("#fd-onedrive").checked);
+            F.q = q;
+            F.found = null;
+            const status = $("#fd-sum");
+            const min = drive ? 3 : 2;
+            const ready = q && (regex || [...q].length >= min) && (drive || root);
+            status.textContent = !q ? "" : !drive && !root ? tr("Choose a synced folder.") :
+                !ready ? tr("Type at least {n} characters.", { n: min }) :
+                regex && !submit ? tr("Press Enter to search with this pattern.") : tr("Searching…");
+            setView(F.view);
+            if (!ready || (regex && !submit)) return;
+            const search = async () => {
+                try {
+                    const args = { q, folder, regex, request };
+                    let title = "";
+                    if (drive) {
+                        const names = await call("search", args);
+                        if (request !== FD.seq) return;
+                        F.found = { names };
+                        title = names.items.length || names.too_many ? "" : tr("Nothing found.");
+                        if (submit && !regex && $("#fd-onedrive").checked) {
+                            status.textContent = "";
+                            render();
+                            const cloud = await call("search_onedrive", { q }).catch(e => ({ error: e.message }));
+                            if (request !== FD.seq) return;
+                            if (!cloud.error && folder !== null) cloud.items = cloud.items.filter(f => f.folder === folder);
+                            F.found.cloud = cloud;
+                            if (cloud.items?.length) title = "";
+                        }
+                    } else {
+                        const matches = await call("tree_find", { ...args, root });
+                        if (request !== FD.seq) return;
+                        F.found = { root: matches };
+                        if (!matches.length) title = tr("Nothing found.");
+                    }
+                    status.textContent = title;
+                } catch (e) {
+                    if (request !== FD.seq) return;
+                    status.textContent = e.message;
                 }
-                const found = names.items.length + (cloud && cloud.items ? cloud.items.length : 0);
-                $("#fd-sum").textContent = found ? "" : (names.too_many ? tr(names.too_many) : tr("Nothing found."));
-                $("#fd-card").hidden = !found && !cloud;
-                $("#fd-note").textContent = tr(names.note);
-                $("#fd-note").hidden = false;
-            } catch (e) {
-                if (n === FD.seq) $("#fd-sum").textContent = e.message;
-            }
+                render();
+            };
+            if (submit) search();
+            else FD.timer = setTimeout(search, 220);
         }
-        $("#fd-q").addEventListener("input", () => {
-            clearTimeout(FD.timer);
-            FD.timer = setTimeout(() => runFind(false), 150);
-        });
-        $("#fd-q").addEventListener("keydown", e => {
-            if (e.key === "Enter") runFind(true);
-        });
-        $("#fd-go").onclick = () => runFind(true);
+        $("#q").oninput = () => queueFind();
+        $("#q").onkeydown = e => {
+            if (e.key === "Enter") queueFind(true);
+            if (e.key === "Escape") {
+                e.preventDefault();
+                $("#q").value = "";
+                queueFind();
+            }
+        };
+        $("#search-scope").onchange = $("#search-kind").onchange = $("#search-regex").onchange = () => queueFind();
+        $("#fd-go").onclick = () => queueFind(true);
+        $("#details-toggle").onclick = e => {
+            e.currentTarget.setAttribute("aria-pressed", String(e.currentTarget.getAttribute("aria-pressed") !== "true"));
+            render();
+        };
         $("#fd-onedrive").onchange = e => run(call("save", {
             section: "search",
             value: {
@@ -9450,9 +9425,18 @@
             value: {
                 hotkey: e.target.value.trim()
             }
-        }), tr("Saved")).then(load).then(openFind).catch(() => load().then(openFind));
+        }), tr("Saved")).then(load).catch(load);
 
         function startAt(start, item) {
+            if (start === "find") {
+                show("files");
+                $("#search-scope").value = "drive";
+                setView("all");
+                queueFind();
+                $("#q").focus();
+                $("#q").select();
+                return;
+            }
             const page = OLD[start] || start || "files";
             // Explorer's commands for a file: the section they're about.
             const section = {

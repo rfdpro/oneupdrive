@@ -1,6 +1,6 @@
 # Instant search
 
-`crates/oneup-store/src/search.rs` (the index), `bins/oneup/src/search.rs` (results and their placement), `oneup find`, the settings window's Search page, the tray's hotkey. User guide: [Finding files](../user-guide/search.md).
+`crates/oneup-store/src/search.rs` (the index), `bins/oneup/src/search.rs` (results and their placement), `oneup find`, the settings window's Files search, the tray's hotkey. User guide: [Finding files](../user-guide/search.md).
 
 The Remote tree already holds every name in OneDrive, kept current by the change feed ([remote-mirror.md](remote-mirror.md)). Search is an index over those names, so it needs no network, downloads nothing, and finds online-only files, which Windows Search can't without downloading them.
 
@@ -45,7 +45,7 @@ The needle must have three characters: the trigram tokenizer gives a shorter que
 Opt-in, because it sends the search text to Microsoft: Graph's documented `search(q='…')` below the drive's root, one page of up to 200 results. For an extra pair the client is scoped like the pair's agent (`oneup_app::search::graph`, `pairs::scoped`): the search covers the pair's OneDrive folder only, in another person's drive for a shared folder, and **Open in OneDrive** asks that drive for the item's page. The settings window calls it only on **Search** or Enter, and its handler refuses unless `[search] onedrive` is on; `oneup find --onedrive` is the person's choice for that one search. Results the mirror holds get their path and placement from it; the others (inside an excluded folder, or newer than the last check) are placed by the path OneDrive gives and the rules, like any other result (*not here yet* when OneDrive gives no path). The request is labelled: its errors and log lines name it "OneDrive search", never its URL (which holds the text), errors leave out OneDrive's reply (which may repeat it), and it isn't retried after a network error, whose log line would otherwise carry the URL.
 
 ## The hotkey
-`[search] hotkey` (none by default; `oneup search --hotkey`, the Search page). The tray holds it (`RegisterHotKey` on its hidden window, `oneup_sys::tray::Tray::set_hotkey`) and opens the settings window's Search page when it's pressed. Changing the setting raises a named event the tray waits on, so it takes up the new keys without polling. Keys another program holds are refused by Windows; the tray says so in a notification.
+`[search] hotkey` (none by default; `oneup search --hotkey`, the Files search). The tray holds it (`RegisterHotKey` on its hidden window, `oneup_sys::tray::Tray::set_hotkey`) and opens the settings window's Files search when it's pressed. Changing the setting raises a named event the tray waits on, so it takes up the new keys without polling. Keys another program holds are refused by Windows; the tray says so in a notification.
 
 ## Limits
 * **Excluded subtrees** are one opaque row in the mirror, never listed, so nothing inside them is found; every result list says so. The excluded folder itself is found.

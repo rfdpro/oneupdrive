@@ -230,6 +230,35 @@ const DRIVER: &str = r##"<script>
     key("ArrowLeft"); await sleep(300);
     check("Left goes back to All files", document.activeElement.dataset.view === "all" && tree.getAttribute("role") === "tree", document.activeElement.dataset.view);
 
+    // Search uses the selected Files scope and fills the space of the details panel.
+    const searchBox = document.querySelector("#q");
+    const detailsToggle = document.querySelector("#details-toggle");
+    detailsToggle.click();
+    check("Details can be hidden while browsing", document.querySelector("#details").hidden, "");
+    detailsToggle.click();
+    HOST_ANSWERS.tree_find = [{rel:"Docs/inner.doc",folder:false}];
+    searchBox.value = "inner";
+    searchBox.dispatchEvent(new Event("input")); await sleep(350);
+    check("Files search finds items in the selected folder", tree.textContent.includes("inner.doc") &&
+      document.querySelector("#details").hidden && HOST_CALLS.filter(m => m.op === "tree_find").at(-1)?.args.root === "main", tree.textContent);
+    const searchType = document.querySelector("#search-kind");
+    searchType.value = "files";
+    searchType.dispatchEvent(new Event("change"));
+    const regex = document.querySelector("#search-regex");
+    regex.click();
+    searchBox.focus(); key("Enter"); await sleep(100);
+    const patternCall = HOST_CALLS.filter(m => m.op === "tree_find").at(-1);
+    check("Files submits the regex and type filter together", patternCall?.args.regex && patternCall.args.folder === false, JSON.stringify(patternCall));
+    key("Escape");
+    check("Escape restores the tree and details", tree.getAttribute("role") === "tree" && !document.querySelector("#details").hidden, tree.getAttribute("role"));
+    regex.click();
+    searchType.value = "";
+    startAt("find", "");
+    check("Search shortcut focuses Files in OneDrive scope", document.activeElement === searchBox &&
+      document.querySelector("#search-scope").value === "drive" && !document.querySelector('nav [data-page="find"]'), at());
+    document.querySelector("#search-scope").value = "root";
+    await sleep(300);
+
     // The status menu, opened by its button.
     document.querySelector("#st-btn").focus();
     document.querySelector("#st-btn").click(); await sleep(150);

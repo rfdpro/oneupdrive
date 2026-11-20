@@ -1477,6 +1477,7 @@ name = "oneup-store"
 version = "0.1.0"
 dependencies = [
  "oneup-sync",
+ "regex",
  "rusqlite",
  "thiserror",
 ]

@@ -467,6 +467,15 @@ pub fn find(data_dir: &Path, needle: &str, limit: usize) -> Result<Value> {
     if needle.chars().count() < 2 {
         return Ok(Value::from(Vec::<Value>::new()));
     }
+    find_matching(data_dir, &oneup_store::search::NameQuery::Text(needle), None, limit)
+}
+
+pub fn find_matching(
+    data_dir: &Path,
+    query: &oneup_store::search::NameQuery<'_>,
+    folder: Option<bool>,
+    limit: usize,
+) -> Result<Value> {
     let store = crate::setup::open_store(data_dir, 4 * 1024)?;
     let root = store.read(|o| o.local_root())?.context("this folder hasn't been looked at yet")?;
     let base = store.read(|o| o.synced_by_local(root.root_file_id))?.and_then(|b| b.remote);
@@ -476,7 +485,7 @@ pub fn find(data_dir: &Path, needle: &str, limit: usize) -> Result<Value> {
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
-    for l in store.read(|o| o.local_find(needle, limit))? {
+    for l in store.read(|o| o.local_find_matching(query, folder, limit))? {
         if let Some(p) = store.read(|o| o.local_path_of(l.file_id))? {
             let rel = clean(&p);
             if rel.split('/').next().is_some_and(|f| oneup_sync::same_name(f, ENGINE_DIR)) {
@@ -487,7 +496,7 @@ pub fn find(data_dir: &Path, needle: &str, limit: usize) -> Result<Value> {
             }
         }
     }
-    for r in store.read(|o| o.remote_find(needle, limit))? {
+    for r in store.read(|o| o.remote_find_matching(query, folder, limit))? {
         let Some(p) = store.read(|o| o.path_of(&r.id))? else { continue };
         // Only what's inside this pair's OneDrive folder, cut by
         // characters as names fold (a cut in bytes could split one).

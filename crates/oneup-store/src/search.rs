@@ -49,6 +49,36 @@
 //! either.
 
 use rusqlite::OptionalExtension;
+
+/// Filename query shared by the two Files search scopes.
+pub enum NameQuery<'a> {
+    Text(&'a str),
+    Regex(regex::Regex),
+}
+
+impl<'a> NameQuery<'a> {
+    pub fn new(text: &'a str, regex: bool) -> std::result::Result<Self, regex::Error> {
+        if regex {
+            regex::RegexBuilder::new(text).case_insensitive(true).size_limit(1 << 20).build().map(Self::Regex)
+        } else {
+            Ok(Self::Text(text))
+        }
+    }
+
+    pub(crate) fn sql_args(&self, limit: usize) -> (Option<String>, i64) {
+        match self {
+            Self::Text(text) => (Some(crate::local::like_pattern(text)), limit as i64),
+            Self::Regex(_) => (None, -1),
+        }
+    }
+
+    pub(crate) fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Text(_) => true, // SQLite already matched it.
+            Self::Regex(re) => re.is_match(name),
+        }
+    }
+}
 use rusqlite::types::{Value, ValueRef};
 
 use crate::{ITEM_COLS, Ops, RemoteRow, Result, Store, fix_kind};
@@ -386,11 +416,15 @@ impl Ops<'_> {
     /// characters, else nothing), the drive's root aside. Cost: the index
     /// lookup, and one lookup by key per candidate.
     pub fn search_names(&self, needle: &str, limit: usize) -> Result<Found> {
-        self.search_names_within(needle, limit, MAX_CANDIDATES)
+        self.search_names_filtered(needle, limit, None)
+    }
+
+    pub fn search_names_filtered(&self, needle: &str, limit: usize, folder: Option<bool>) -> Result<Found> {
+        self.search_names_within(needle, limit, MAX_CANDIDATES, folder)
     }
 
     /// [`Ops::search_names`], reading at most `cap` candidates.
-    fn search_names_within(&self, needle: &str, limit: usize, cap: usize) -> Result<Found> {
+    fn search_names_within(&self, needle: &str, limit: usize, cap: usize, folder: Option<bool>) -> Result<Found> {
         let Some(anywhere) = match_expr(needle) else { return Ok(Found::default()) };
         let id_prefix = self.id_prefix()?;
         let folded = oneup_sync::fold(needle);
@@ -408,7 +442,8 @@ impl Ops<'_> {
         let mut taken_ids = std::collections::HashSet::new();
         let mut too_many = false;
         let mut st = self.c.prepare_cached(CANDIDATES)?;
-        let mut name_of = self.c.prepare_cached("SELECT name FROM remote_item WHERE id = ?1")?;
+        let mut name_of =
+            self.c.prepare_cached("SELECT name FROM remote_item WHERE id = ?1 AND (?2 IS NULL OR (kind = 1) = ?2)")?;
         for (expr, fits) in passes {
             let Some(expr) = expr else { continue };
             let mut rows = st.query([&expr])?;
@@ -424,7 +459,11 @@ impl Ops<'_> {
                 if taken_ids.contains(&id) {
                     continue;
                 }
-                let Some(name) = name_of.query_row([&id], |r| r.get::<_, String>(0)).optional()? else { continue };
+                let Some(name) =
+                    name_of.query_row(rusqlite::params![id, folder], |r| r.get::<_, String>(0)).optional()?
+                else {
+                    continue;
+                };
                 if fits(&oneup_sync::fold(&name), &folded) {
                     taken_ids.insert(id.clone());
                     taken.push(id);
@@ -623,6 +662,19 @@ mod tests {
         assert_eq!((one.hits.len(), one.more), (1, true));
     }
 
+    #[test]
+    fn filename_filters_apply_before_the_result_limit() {
+        let mut s = Store::open_in_memory().unwrap();
+        drive(&mut s);
+        let indexed = s.read(|o| o.search_names_filtered("report", 1, Some(true))).unwrap();
+        assert_eq!(indexed.hits[0].row.name, "Reports");
+        let pattern = NameQuery::new(r"^REPORT\.txt$", true).unwrap();
+        let matching = s.read(|o| o.remote_find_matching(&pattern, Some(false), 1)).unwrap();
+        assert_eq!(matching[0].name, "report.txt");
+        assert!(s.read(|o| o.remote_find_matching(&pattern, Some(true), 1)).unwrap().is_empty());
+        assert!(NameQuery::new("[", true).is_err());
+    }
+
     /// The executor's write that doesn't wait for the database applies
     /// the index's queue like the others: every write path ends in one
     /// commit.
@@ -657,9 +709,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let few = s.read(|o| o.search_names_within("abcd", 50, 5)).unwrap();
+        let few = s.read(|o| o.search_names_within("abcd", 50, 5, None)).unwrap();
         assert!(few.hits.is_empty() && few.too_many && few.more, "{few:?}");
-        let all = s.read(|o| o.search_names_within("abcd", 50, 100)).unwrap();
+        let all = s.read(|o| o.search_names_within("abcd", 50, 100, None)).unwrap();
         assert_eq!((all.hits.len(), all.too_many), (1, false));
     }
 
@@ -885,7 +937,7 @@ mod tests {
             TO_BUILD,
             "DELETE FROM search_queue WHERE seq <= ?1",
             "SELECT 1 FROM meta WHERE key = ?1",
-            "SELECT name FROM remote_item WHERE id = ?1",
+            "SELECT name FROM remote_item WHERE id = ?1 AND (?2 IS NULL OR (kind = 1) = ?2)",
             // The triggers' statements, with parameters for NEW and OLD.
             "UPDATE remote_item SET sk = ?1 WHERE id = ?2",
             "SELECT id, parent_id, name, kind, size, etag, qxh, mtime, is_excluded FROM remote_item WHERE id = ?1",

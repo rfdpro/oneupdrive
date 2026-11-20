@@ -14,6 +14,7 @@ authors.workspace = true
 oneup-sync = { path = "../oneup-sync" }
 rusqlite = { version = "0.41", features = ["bundled", "functions"] }
 thiserror = "2"
+regex = "1"
 
 [features]
 # Test support: `Store::log_statements` records what a connection runs, so

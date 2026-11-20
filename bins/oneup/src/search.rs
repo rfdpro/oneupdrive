@@ -1,5 +1,5 @@
 //! Instant search across the whole drive (`oneup find`, the settings
-//! window's Search page, the search hotkey): names from the store's index
+//! window's Files search, the search hotkey): names from the store's index
 //! (`oneup_store::search`), so online-only files are found without
 //! downloading anything and without asking OneDrive. Each result says where
 //! its content is. Optionally, and only when asked, OneDrive's own search
@@ -292,11 +292,36 @@ pub fn build_index(store: &mut Store, mut keep_going: impl FnMut() -> bool) -> R
 /// Items in OneDrive whose name contains `text` (any case), up to `limit`,
 /// best matches first, each with its placement.
 pub fn find(dir: &Path, store: &Store, text: &str, limit: usize) -> Result<Found> {
-    let text = pattern(text)?;
+    find_matching(dir, store, &oneup_store::search::NameQuery::Text(pattern(text)?), None, limit)
+}
+
+pub fn find_matching(
+    dir: &Path,
+    store: &Store,
+    query: &oneup_store::search::NameQuery<'_>,
+    folder: Option<bool>,
+    limit: usize,
+) -> Result<Found> {
+    use oneup_store::search::NameQuery;
     // Attributes as they are (AGENTS.md).
     oneup_cfapi::expose_placeholders()?;
     let pair = Pair::load(dir, store);
-    let found = store.read(|o| o.search_names(text, limit))?;
+    let found = match query {
+        NameQuery::Text(text) => store.read(|o| o.search_names_filtered(text, limit, folder))?,
+        NameQuery::Regex(_) => store.read(|o| {
+            let mut rows = o.remote_find_matching(query, folder, limit + 1)?;
+            let more = rows.len() > limit;
+            rows.truncate(limit);
+            let hits = rows
+                .into_iter()
+                .map(|row| {
+                    let excluded = o.item_state(&row.id)? == oneup_store::ItemState::Excluded;
+                    Ok(oneup_store::Hit { row, excluded })
+                })
+                .collect::<oneup_store::Result<_>>()?;
+            Ok(oneup_store::Found { hits, more, too_many: false })
+        })?,
+    };
     let mut items = Vec::with_capacity(found.hits.len());
     for h in found.hits {
         // An item whose parents aren't all stored yet has no path to show.
