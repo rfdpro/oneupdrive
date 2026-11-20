@@ -8,7 +8,7 @@ If a folder exists in OneDrive but is missing on this PC, run `oneup problems` a
 
 * **The icon** turns red. Its menu says "Problem: …" (or "Stopped: …" if the problem stopped OneUpDrive), with **Error details…**.
 * **A notification**, for a problem that needs you (sign-in, a full disk…) straight away, and for one that usually clears by itself (no connection, OneDrive errors) once it has lasted about 15 minutes.
-* **The settings window** shows a red card above every page: what happened, what to do, when OneUpDrive tries again, and:
+* **The settings window** turns its status light red (on the left, under the name) and shows a red bar above every page: what happened, what to do, when OneUpDrive tries again, and:
   * **Retry now** (or **Start**, if it stopped) tries again straight away;
   * **Open log** opens the log file (`oneupd.log` in the data folder, `%LOCALAPPDATA%\OneUpDrive`);
   * **Copy details** copies what's needed for a bug report;

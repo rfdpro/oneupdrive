@@ -7,7 +7,9 @@ If Windows refuses to launch Settings because of an Explorer integration error, 
 ## Set up
 Shown automatically until a folder is set up: sign in, choose the folders, what to exclude and Files On-Demand, look at the preview, **Start syncing**. Reopen it from **General > Setup > Run setup again > Open**. The wizard starts with your current folders, saved exclusions, Files On-Demand and start-up preferences. Opening it preserves your account and sync state; compare the folders again before starting. See [Getting started](getting-started.md#setting-up). On a PC with the OneDrive app, it first offers **Move over from the OneDrive app** (see the [glossary](glossary.md) for unfamiliar words): your OneDrive folder stays where it is, after a check and unlinking the app. See [Moving over from the OneDrive app](migrating-from-onedrive.md#in-the-settings-window).
 
-At the top of every page, a light and a word say whether OneUpDrive is running and what it's doing. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While a safety stop waits, **Review** opens its list (Activity, **Safety stops**). While there's a problem, a red card above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Apps**, **Activity**, **Sharing** and **Recovery**. **Settings**, at the bottom of the list, shows the settings pages instead: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**; **Back** returns to the page you were on.
+On the left, under the OneUpDrive name, a light and a word say whether OneUpDrive is running and what it's doing. The line under them says when it last synced, or what the problem is, or why it's paused. Select it for more detail and for **Sync now**, **Pause**/**Resume**, **Start** and **Stop**. While a safety stop waits, **Review** opens its list (Activity, **Safety stops**). While there's a problem, a red bar above every page says what happened, what to do and when OneUpDrive tries again, with **Retry now**, **Open log** and **Copy details** (see [When something goes wrong](troubleshooting.md)). The pages: **Files**, **Apps**, **Activity**, **Sharing** and **Recovery**. **Settings**, at the bottom of the list, shows the settings pages instead: **General**, **Accounts**, **Office**, **Safety**, **Network** and **About**; **Back** returns to the page you were on. A page's own buttons, like **Add** or **Refresh**, sit at the top right, beside its title.
+
+In a narrow window, the list on the left shows only icons. Point at an icon to see the page's name.
 
 ## Files
 Everything about what syncs, in one place.
@@ -34,7 +36,7 @@ With nothing selected, it shows the folder itself: where it is on this PC and in
 
 ### Memory view
 
-Right-click the **Main folder** tab in Files and choose **Memory view**. You can also focus that tab and press Shift+F10. Each tile's area represents its file size or the total size of its folder.
+Select **Memory view** beside **Add** at the top of Files. You can also right-click the **Main folder** tab and choose **Memory view**, or focus that tab and press Shift+F10. The map always shows the main folder. Each tile's area represents its file size or the total size of its folder.
 
 Choose **On disk** to see fully downloaded files in the main sync folder, sized by their file lengths. **Whole drive** uses the sizes OneDrive reports, including online-only files and folders outside the sync folder. Large folders show a preview of their contents. **Other items** groups smaller items or contents OneDrive reports as part of a folder's size.
 
@@ -52,9 +54,9 @@ Warnings appear above the lists, with space between each notice and the list con
 
 Expand **Sync notices** at the top of Activity to see what needs attention. For routine retries, the status reads **Catching up** and pending changes sync automatically.
 
-Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the box to show only the items whose name or folder matches; **Refresh** reads the list again (it also follows syncing by itself). With more than one synced folder, choose which one at the top right.
+Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the box to show only the items whose name or folder matches; **Refresh**, beside the page title, reads the list and the notices again (the list also follows syncing by itself). With more than one synced folder, choose which one at the right of the tabs.
 
-* **Recent**: what OneUpDrive did lately, newest first, with whether it went through (*Done*, *Skipped*, *Failed*, *Waiting*). **Problems only** hides the rest; **Show older** goes further back.
+* **Recent**: what OneUpDrive did lately, newest first: when, whether it went through (*Done*, *Skipped*, *Failed*, *Waiting*), what it did (*Upload*, *Download*, *Move*…) and to which item. **Problems only** hides the rest; **Show older** goes further back.
 * **Sync failures**: items that won't sync until you do something about them, grouped by why, with a button for each way to resolve one (see [Syncing in depth](syncing.md#resolving-what-cant-sync)): **Delete in OneDrive** or **Restore** for items gone from this PC, **Delete here** or **Upload** for items gone from OneDrive, **Rename** for a name OneDrive doesn't allow, **Exclude** for a file over 250 GB or a hard link, **Contents** for a folder that can't be deleted because it isn't empty. The heading of a group says why once and resolves all its items at once. Items inside a listed folder are shown under it: the folder's buttons cover them. You're asked before anything is deleted. **Show** opens an item in File Explorer. A choice shows as *Queued* until OneUpDrive carries it out, then the item leaves the list. Excluded items aren't listed.
 * **Excluded in OneDrive**: excluded items that OneDrive still has, their size and whether they're on this PC yet. Looking changes nothing; the OneUpDrive icon asks what to do with them.
 * **Safety stops**: every change a waiting safety stop holds back. Decide from the OneUpDrive icon's menu. For a ransomware stop, **Rewind** previews putting the folder back to just before it (see [Getting things back](recovery.md#after-a-ransomware-stop)). With the icon turned off (**General → Show the icon in the taskbar corner**), the list says how to answer each stop:
@@ -63,7 +65,7 @@ Below, the lists the OneUpDrive icon's menu points to, one tab each. Type in the
   * A rewind: **Approve** on the Recovery page.
   * Many deletions, overwrites or moves: `oneup approve CODE`, if you meant them.
 
-  With the icon off, removed files that don't fit in the space for kept copies are answered with `oneup keep CODE` (keep copies over the limit) or `oneup discard CODE` (remove them without copies); the status at the top shows the code.
+  With the icon off, removed files that don't fit in the space for kept copies are answered with `oneup keep CODE` (keep copies over the limit) or `oneup discard CODE` (remove them without copies); the status under the OneUpDrive name shows the code.
 
 The numbers on the tabs count sync failures and waiting safety stops.
 
@@ -112,8 +114,8 @@ Everything in the window works from the keyboard. Tab moves between controls; th
 
 * **Tabs** (the folders along the top of Files, **All files** and **Exclude**): Tab reaches the chosen one; the left and right arrows (and Home, End) choose another.
 * **The file tree**: the up and down arrows move, right opens a folder (again: its first item), left closes it (again: its parent), Home and End go to the first and last item, a letter goes to the next item starting with it, Enter opens a file or folder, Space ticks or unticks, and the menu key or Shift+F10 opens the quick actions. Esc clears the selection, showing the folder's own settings.
-* **Menus** (the status at the top, **Add**, the quick actions): the up and down arrows move, Enter chooses, Esc closes.
+* **Menus** (the status under the OneUpDrive name, **Add**, the quick actions): the up and down arrows move, Enter chooses, Esc closes.
 * **Dialogs**: Esc closes them without changing anything; focus goes back where it was.
 * **Share**, beside an item's name: Enter goes to its two links.
 
-Screen readers (Narrator, NVDA) read each control's name, each tree item's status, size and whether it's ticked, and say when the status, a list or a search result changes. Messages (like an error from a dialog) show on top of an open dialog, and are read out there. The window follows Windows' contrast themes (Settings > Accessibility > Contrast themes): the selection, the current page and switches that are on use the theme's highlight colour. With **Animation effects** off (Settings > Accessibility > Visual effects), nothing in the window moves. In a narrow window, or zoomed in (Ctrl and +), the details panel goes under the file tree.
+Screen readers (Narrator, NVDA) read each control's name, each tree item's status, size and whether it's ticked, and say when the status, a list or a search result changes. Messages (like an error from a dialog) show on top of an open dialog, and are read out there. The window follows Windows' contrast themes (Settings > Accessibility > Contrast themes): the selection, the current page and switches that are on use the theme's highlight colour. With **Animation effects** off (Settings > Accessibility > Visual effects), nothing in the window moves. In a narrow window, or zoomed in (Ctrl and +), the details panel goes under the file tree and the list of pages shows only icons; screen readers still read each page's name.

@@ -304,7 +304,20 @@ const DRIVER: &str = r##"<script>
     check("keyboard opens the main folder context menu", document.activeElement.textContent === "Memory view", at());
     document.querySelector("#ctx").hidePopover();
     await sleep(50);
+    // The button beside Add opens the same map, and Back gives focus to it.
+    const memoryButton = document.querySelector("#memory-open");
+    check("Files offers a visible Memory view button with a main folder", !memoryButton.hidden && memoryButton.textContent === "Memory view", memoryButton.hidden);
+    memoryButton.focus(); memoryButton.click(); await sleep(140);
+    check("the Memory view button opens the map and hides itself", !document.querySelector("#memory-view").hidden &&
+      memoryButton.getBoundingClientRect().width === 0 && document.activeElement.id === "memory-back", at());
+    document.querySelector("#memory-back").click();
+    check("Back from the button gives focus to the button", document.querySelector("#memory-view").hidden && document.activeElement === memoryButton, at());
 
+    showStatus({ activity: "Idle", paused: {}, last: {at_ms: Date.now(), done: 3} });
+    check("the status tile's second line says when it last synced", document.querySelector("#st-sub").textContent.startsWith("Last sync ")
+      && document.querySelector("#agent").closest("nav") !== null, document.querySelector("#st-sub").textContent);
+    showStatus({ activity: "Syncing", paused: {}, problem: {kind: "network", title: "Can't reach OneDrive", detail: "", action: "", since_ms: 1, attempts: 1, technical: ""} });
+    check("a problem takes the status tile's second line", document.querySelector("#st-sub").textContent === "Can't reach OneDrive", document.querySelector("#st-sub").textContent);
     showStatus({ activity: "Retrying", paused: {} });
     check("routine retries read as catching up", document.querySelector("#st-btn").textContent.includes("Catching up"), "");
     showStatus(null);
