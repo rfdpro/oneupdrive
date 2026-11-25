@@ -41,13 +41,6 @@ jobs:
           --skip on_demand_placeholders_follow_both_sides
           --skip control_pipes_admit_only_the_current_user
 
-      - name: Sign in to Azure (for Artifact Signing)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Signing settings
         shell: pwsh
         run: |
@@ -65,6 +58,14 @@ jobs:
             -Repo "${{ github.server_url }}/${{ github.repository }}" `
             -Publisher "${{ vars.SIGNING_SUBJECT }}" `
             -ClientId "${{ vars.ONEUP_CLIENT_ID }}"
+
+      # The federated assertion expires before a cold Windows build finishes.
+      - name: Sign in to Azure (for Artifact Signing)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       # Our programs and the identity package; vpk signs the installer
       # pieces it makes itself.
