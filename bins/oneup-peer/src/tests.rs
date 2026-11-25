@@ -1,0 +1,88 @@
+use std::{fs, time::Duration};
+
+use anyhow::{Result, ensure};
+use iroh::SecretKey;
+use iroh_blobs::{
+    protocol::{ChunkRangesSeq, GetRequest},
+    store::fs::FsStore,
+};
+
+use crate::{Network, Ticket, disk, ticket, transfer};
+
+#[test]
+fn filenames_cannot_escape_the_inbox_or_name_devices() {
+    for name in
+        ["..", "../escape", "a/b", "a\\b", "file:stream", "CON.txt", "lpt9.zip", "COM¹.log", "x.", "x ", "a\n.txt"]
+    {
+        assert!(ticket::file_name(name).is_err(), "{name:?}");
+    }
+    assert!(ticket::file_name("Report № 5.txt").is_ok());
+}
+
+#[tokio::test]
+async fn receive_resumes_with_the_same_identity_and_publishes_once() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(45), direct_transfer()).await?
+}
+
+async fn direct_transfer() -> Result<()> {
+    #[cfg(windows)]
+    oneup_cfapi::expose_placeholders()?;
+    let scratch = tempfile::tempdir()?;
+    let path = scratch.path();
+    let source = path.join("source");
+    let content: Vec<_> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    fs::write(&source, &content)?;
+    let send_store = FsStore::load(path.join("send-store")).await?;
+    #[cfg(windows)]
+    let (tag, _) = disk::import(&send_store, source.clone()).await?;
+    #[cfg(not(windows))]
+    let tag = send_store.blobs().add_slice(&content).temp_tag().await?;
+    // A later edit is irrelevant to the offered snapshot.
+    fs::write(&source, b"new version")?;
+    let (id, recipient) = disk::prepare(path)?;
+    let (router, blob) = transfer::offer(&send_store, tag.hash(), recipient, Network::Loopback, false).await?;
+    let ticket = Ticket { blob, name: "test.bin".to_owned(), size: content.len() as u64 };
+    let session = disk::Session::open(path, &id)?;
+    ensure!(disk::Session::open(path, &id).is_err(), "Concurrent receive obtained the session lock");
+    assert_eq!(session.ticket(|| Ok(ticket.clone()))?, ticket);
+    let recv_store = FsStore::load(session.blob_dir()?).await?;
+
+    let stranger = transfer::endpoint(Network::Loopback, SecretKey::generate()).await?;
+    assert!(transfer::fetch(&stranger, &recv_store, &ticket.blob, |_, _| {}).await.is_err());
+    stranger.close().await;
+    assert_eq!(recv_store.remote().local(ticket.blob.hash_and_format()).await?.local_bytes(), 0);
+
+    let endpoint = transfer::endpoint(Network::Loopback, session.key()?).await?;
+    let connection = endpoint.connect(ticket.blob.addr().clone(), iroh_blobs::ALPN).await?;
+    let request = GetRequest::new(ticket.blob.hash(), ChunkRangesSeq::verified_size());
+    recv_store.remote().execute_get(connection, request).complete().await?;
+    endpoint.close().await;
+    let cached = recv_store.remote().local(ticket.blob.hash_and_format()).await?.local_bytes();
+    assert!(cached > 0 && cached < content.len() as u64);
+    recv_store.shutdown().await?;
+    drop(session);
+
+    let session = disk::Session::open(path, &id)?;
+    let ticket = session.ticket(|| anyhow::bail!("The ticket should have been saved"))?;
+    let recv_store = FsStore::load(session.blob_dir()?).await?;
+    assert_eq!(recv_store.remote().local(ticket.blob.hash_and_format()).await?.local_bytes(), cached);
+    let endpoint = transfer::endpoint(Network::Loopback, session.key()?).await?;
+    let (stats, path_type) = transfer::fetch(&endpoint, &recv_store, &ticket.blob, |_, _| {}).await?;
+    assert_eq!(path_type, "direct");
+    assert_eq!(stats.payload_bytes_read + cached, content.len() as u64);
+    endpoint.close().await;
+    router.shutdown().await?;
+    send_store.shutdown().await?;
+
+    let dest = session.output()?.join("test.bin");
+    fs::write(&dest, b"existing file")?;
+    assert!(session.publish(&recv_store, &ticket).await.is_err());
+    assert_eq!(fs::read(&dest)?, b"existing file");
+    fs::rename(&dest, path.join(&id).join("original"))?;
+    assert_eq!(session.publish(&recv_store, &ticket).await?, dest);
+    assert_eq!(fs::read(&dest)?, content);
+    #[cfg(windows)]
+    assert_eq!(fs::read(dest.with_file_name("test.bin:Zone.Identifier"))?, b"[ZoneTransfer]\r\nZoneId=3\r\n");
+    recv_store.shutdown().await?;
+    Ok(())
+}

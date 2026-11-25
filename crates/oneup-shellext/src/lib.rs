@@ -54,12 +54,14 @@ enum Verb {
     Share,
     Office,
     History,
+    PeerShare,
 }
 
-const VERBS: [Verb; 8] = [
+const VERBS: [Verb; 9] = [
     Verb::Office,
     Verb::History,
     Verb::Share,
+    Verb::PeerShare,
     Verb::Versions,
     Verb::Online,
     Verb::First,
@@ -77,6 +79,7 @@ impl Verb {
             Verb::Online => "View online",
             Verb::Versions => "Version history",
             Verb::Share => "Copy share link…",
+            Verb::PeerShare => "P2P share…",
             Verb::Office => "Open with AutoSave",
         }
     }
@@ -89,6 +92,7 @@ impl Verb {
             Verb::Online => "online",
             Verb::Versions => "versions",
             Verb::Share => "share",
+            Verb::PeerShare => "peer-share",
             Verb::Office => "office",
         }
     }
@@ -217,11 +221,15 @@ impl IExplorerCommand_Impl for Command_Impl {
     fn GetCanonicalName(&self) -> Result<GUID> {
         Ok(self.0.guid())
     }
-    fn GetState(&self, _: Ref<IShellItemArray>, _: BOOL) -> Result<u32> {
+    fn GetState(&self, items: Ref<IShellItemArray>, _: BOOL) -> Result<u32> {
+        if self.0 == Verb::PeerShare && items.as_ref().is_none_or(|items| !single_file(items)) {
+            return Ok(windows::Win32::UI::Shell::ECS_HIDDEN.0 as u32);
+        }
         Ok(ECS_ENABLED.0 as u32)
     }
     fn Invoke(&self, items: Ref<IShellItemArray>, _: Ref<IBindCtx>) -> Result<()> {
         if let Some(items) = items.as_ref()
+            && (self.0 != Verb::PeerShare || single_file(items))
             && let Some(path) = first_path(items)
         {
             run(self.0, &path);
@@ -233,6 +241,18 @@ impl IExplorerCommand_Impl for Command_Impl {
     }
     fn EnumSubCommands(&self) -> Result<IEnumExplorerCommand> {
         Err(E_NOTIMPL.into())
+    }
+}
+
+fn single_file(items: &IShellItemArray) -> bool {
+    use windows::Win32::System::SystemServices::SFGAO_FOLDER;
+    // SAFETY: all calls borrow a live Explorer selection. Reading shell attributes does not open file data.
+    unsafe {
+        items.GetCount().is_ok_and(|count| count == 1)
+            && items
+                .GetItemAt(0)
+                .and_then(|item| item.GetAttributes(SFGAO_FOLDER))
+                .is_ok_and(|attributes| !attributes.contains(SFGAO_FOLDER))
     }
 }
 

@@ -23,6 +23,18 @@ use oneup_graph::{Aimd, Graph};
 
 pub async fn run(verb: &str, path: &Path) -> Result<()> {
     let result = async {
+        if verb == "peer-share" {
+            let dir = match oneup_app::datafolders::for_path(path) {
+                Some((dir, _)) => {
+                    if oneup_app::vaultpair::is_vault_dir(&dir) {
+                        bail!("P2P sharing is unavailable for vault files.");
+                    }
+                    dir
+                }
+                None => oneup_app::test_account::default_dir()?,
+            };
+            return item_page(&dir, path, "peersend");
+        }
         let (dir, rel) = oneup_app::datafolders::for_path(path)
             .with_context(|| format!("{} isn't in a folder OneUpDrive syncs", path.display()))?;
         match verb {

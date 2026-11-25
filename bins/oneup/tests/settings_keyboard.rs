@@ -25,6 +25,7 @@ const HOST_LISTENERS = [];
 const HOST_CALLS = [];
 const HOST_ANSWERS = {
   status: null, stopped: null,
+  peer_state: {send: {}, receive: {}}, sharing_list: {items: [], next: null},
   setup_items: a => ({items: a.side === "r" ? [{key:"r:old",path:"/cloud.txt",folder:false,selected:true}]
     : [{key:"l:1",path:"/local.txt",folder:false,selected:false}],next:null}),
   setup_select: null,
@@ -667,6 +668,29 @@ const DRIVER: &str = r##"<script>
     orderButtons[0].click(); orderButtons[1].click(); orderButtons[1].click();
     check("sync order can return to its original selection without reopening details", orders.join(",") === "first,normal"
       && orderButtons[1].getAttribute("aria-pressed") === "true", orders);
+    const shareControl = shareButton({path:"C:\\Sync\\big.iso", peer_shareable:true}, true);
+    [...shareControl.querySelectorAll(".pop button")].find(b => b.textContent === "P2P share").click();
+    check("the file Share button opens a recipient dialog", document.querySelector("#dlg-peer-send").open
+      && document.querySelector("#peer-send-file").textContent === "big.iso", "");
+    document.querySelector("#peer-send-cancel").click();
+    startAt("peersend", "C:\\Sync\\from-explorer.txt"); await sleep(25);
+    check("Explorer opens the same send dialog", document.querySelector("#dlg-peer-send").open
+      && document.querySelector("#peer-send-file").textContent === "from-explorer.txt", "");
+    document.querySelector("#peer-recipient").value = "fixture-recipient";
+    document.querySelector("#peer-send-form").requestSubmit(); await sleep(30);
+    check("the send dialog submits the selected file and code", HOST_CALLS.some(m => m.op === "peer_send"
+      && m.args.path.endsWith("from-explorer.txt") && m.args.recipient === "fixture-recipient"), "");
+    show("files"); document.querySelector("#add-menu").showPopover();
+    document.querySelector("#add-peer-receive").click(); await sleep(30);
+    check("Files Add opens and focuses the receive controls", document.querySelector("#shared").classList.contains("on")
+      && document.activeElement.id === "peer-recv-prepare", document.activeElement.id);
+    peerUpdate("receive", {phase:"receiving", running:true, bytes:512, total:1024, connections:1, route:"relay"});
+    check("live receive progress shows the route and offers Pause", document.querySelector("#peer-recv-progress").textContent.includes("Relay")
+      && !document.querySelector("#peer-recv-pause").hidden, "");
+    document.querySelector("#peer-recv-pause").click(); await sleep(20);
+    check("Pause addresses the incoming connection", HOST_CALLS.some(m => m.op === "peer_stop" && m.args.side === "receive"), "");
+    peerUpdate("receive", {});
+    show("files");
     // Vault credentials use masked fields, clear on close, and never send a cancelled action.
     const focusBack = document.createElement("button"); document.body.append(focusBack); focusBack.focus();
     const secretDialog = document.querySelector("#dlg-secret"), secretInput = document.querySelector("#secret-password");

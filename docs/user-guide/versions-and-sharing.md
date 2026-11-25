@@ -35,3 +35,29 @@ From a terminal:
 * Items you shared before this version of OneUpDrive appear once they change. `oneup shared --scan` lists all of OneDrive once to find them now; on a large OneDrive that takes a while.
 
 None of this works inside an [encrypted vault](vaults.md): OneDrive only has the encrypted files there.
+
+## Share a file directly
+
+1. Ask the recipient to open **Sharing → Peer-to-peer sharing** and select **Create recipient code**. They can also run OneUp Receive to get a code.
+2. Select a file in **Files** and choose **Share → P2P share**. In File Explorer, use **OneUpDrive → P2P share**.
+3. Enter the recipient code and select **Share**. When the offer is ready, select **Copy ticket** and send the ticket to the same person.
+4. Keep Settings open while the recipient downloads. Select **Stop** to close the offer early. Offers expire after 24 hours.
+
+Choose an ordinary file on this PC. Folders, vault files, and Files On-Demand placeholders are unavailable. The transfer does not use your OneDrive account. Use a private conversation to exchange the recipient code and ticket.
+
+**Peer-to-peer sharing** shows the open connections and whether they are direct or use a relay. OneUpDrive uses public Iroh relays when needed. To require a direct route, select **Direct connection only** when sending and receiving. Both devices must be able to reach each other over the network.
+
+## Receive a file
+
+1. Open **Sharing → Peer-to-peer sharing**, or select **Files → Add → Receive via P2P**.
+2. Select **Create recipient code**, then **Copy code**. Send the code to the sender in a private conversation.
+3. Paste the ticket the sender returns and select **Receive**. Use **Pause** and **Resume** to continue an interrupted transfer while the offer is open.
+4. When the file is received, select **Open folder**. OneUpDrive saves the verified file in its receive folder and preserves any file already there.
+
+### Receive with OneUp Receive
+
+On Windows, select **Show receiver app** in **Peer-to-peer sharing** to find `oneup-receive.exe`. You can copy this executable and the accompanying license notices to another Windows PC. The standalone app needs no OneUpDrive installation.
+
+Run `oneup-receive` in a terminal and send the displayed code to the sender. Paste the returned ticket. The app prints the path of the saved file. Press **Ctrl+C** to pause and use the printed `--session` command to resume. Add `--network direct` to require a direct connection.
+
+The [receiver build instructions](../../CONTRIBUTING.md#build-oneup-receive) cover Windows, Linux, and macOS.

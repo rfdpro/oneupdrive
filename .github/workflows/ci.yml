@@ -70,5 +70,6 @@ jobs:
           name: sbom
           path: |
             bins/oneup/oneup.cdx.json
+            bins/oneup-peer/oneup-peer.cdx.json
             crates/oneup-shellext/oneup-shellext.cdx.json
           if-no-files-found: error
