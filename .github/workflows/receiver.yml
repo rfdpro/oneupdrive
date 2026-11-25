@@ -15,7 +15,8 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             executable: oneup-receive.exe
-          - runner: ubuntu-latest
+          # Keep the published binary usable with glibc 2.35 (Ubuntu 22.04).
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             executable: oneup-receive
             archive: oneup-receive-linux-x64.tar.gz

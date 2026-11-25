@@ -59,7 +59,7 @@ Choose one file stored on this PC outside an encrypted vault. Use a private conv
 
 If the person receiving the file uses a Windows PC without OneUpDrive, open **They don't have OneUpDrive** when sending and select **Find Windows receiver**. Send them `oneup-receive.exe` and the accompanying license notices.
 
-For Linux x64 or a Mac with Apple silicon, select **Linux and Mac downloads**. Send the recipient the release page or the archive for their computer. They can extract the archive and run `./oneup-receive` from its folder in a terminal. [OneUpDrive releases](https://github.com/rfdpro/oneupdrive/releases)
+For Linux x64 or a Mac with Apple silicon, select **Linux and Mac downloads**. The Linux archive requires glibc 2.35 or later, as included in Ubuntu 22.04. Send the recipient the release page or the archive for their computer. They can extract the archive and run `./oneup-receive` from its folder in a terminal. [OneUpDrive releases](https://github.com/rfdpro/oneupdrive/releases)
 
 Run `oneup-receive` in a terminal and send your receive code to the sender. Paste the download code they send back. To choose where the file is saved, start the app with `--destination` followed by an existing folder's full path. Press **Ctrl+C** to pause and use the printed `--session` command to resume. The app prints the path of the saved file. Use `--network direct` to require a direct connection.
 
