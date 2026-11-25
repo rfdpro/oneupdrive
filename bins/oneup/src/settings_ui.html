@@ -1866,12 +1866,41 @@
             width: 100%;
         }
 
-        .search-regex-field {
+        .search-filter-field:last-child {
+            margin-bottom: 0;
+        }
+
+        .search-filter-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .search-filter-grid .search-filter-field {
+            margin: 0;
+        }
+
+        .search-filter-field input {
+            width: 100%;
+            min-width: 0;
+        }
+
+        .search-saved {
+            border-top: 1px solid var(--line);
+            padding-top: 10px;
+        }
+
+        .search-saved-actions, .search-folder, .search-result-actions {
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             gap: 8px;
-            padding-top: 10px;
-            border-top: 1px solid var(--line);
+        }
+
+        .search-folder {
+            font-size: 12px;
+            overflow-wrap: anywhere;
         }
 
         #details-toggle {
@@ -2359,6 +2388,24 @@
 
         .fl .label b {
             font-weight: 400;
+        }
+
+        .fl[data-opens-result] {
+            cursor: pointer;
+        }
+
+        .fl .search-result-name {
+            padding: 0;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            font: inherit;
+            text-align: start;
+            cursor: pointer;
+        }
+
+        .fl[data-opens-result]:hover .search-result-name {
+            text-decoration: underline;
         }
         
         .fl .label small {
@@ -3194,6 +3241,14 @@
                             <div style="display:flex;align-items:center;gap:16px;margin-top:14px">
                                 <div style="flex:1"><b style="display:block">Start with Windows</b></div>
                                 <label class="toggle"><input type="checkbox" id="setup-autostart" checked aria-label="Start with Windows"><span></span></label></div>
+                            <div style="display:flex;align-items:center;gap:16px;margin-top:14px">
+                                <div style="flex:1"><b style="display:block">Index local drives</b>
+                                    <span class="muted">Search file and folder names on fixed NTFS and ReFS drives.</span></div>
+                                <label class="toggle"><input type="checkbox" id="setup-drive-index" aria-label="Index local drives"><span></span></label></div>
+                            <div style="display:flex;align-items:center;gap:16px;margin-top:14px">
+                                <div style="flex:1"><b style="display:block">Index network shares</b>
+                                    <span class="muted">Search file and folder names on mapped network drives.</span></div>
+                                <label class="toggle"><input type="checkbox" id="setup-share-index" aria-label="Index network shares"><span></span></label></div>
                         </div>
                     </div>
                     <div id="setup-shared-slot"></div>
@@ -3267,6 +3322,9 @@
                                 <select id="search-scope" autofocus>
                                     <option value="root">Synced folder</option>
                                     <option value="drive">OneDrive</option>
+                                    <option value="pc" hidden>This PC</option>
+                                    <option value="shares" hidden>Network shares</option>
+                                    <option value="everywhere" hidden>Everywhere</option>
                                 </select>
                             </div>
                             <div class="search-filter-field">
@@ -3277,8 +3335,67 @@
                                     <option value="folders">Folders only</option>
                                 </select>
                             </div>
-                            <label class="search-regex-field"><input type="checkbox" id="search-regex"> Regex</label>
+                            <div class="search-filter-field">
+                                <label for="search-match">Match</label>
+                                <select id="search-match">
+                                    <option value="text">Contains text</option>
+                                    <option value="words">All words</option>
+                                    <option value="regex">Regex</option>
+                                    <option value="paths">Words in path</option>
+                                </select>
+                            </div>
+                            <div class="search-filter-grid">
+                                <div class="search-filter-field">
+                                    <label for="search-extension">Extension</label>
+                                    <input id="search-extension" type="text" maxlength="32" placeholder="pdf" spellcheck="false">
+                                </div>
+                                <div class="search-filter-field">
+                                    <label for="search-min-size">Minimum size (MB)</label>
+                                    <input id="search-min-size" type="number" min="0" max="9007199254" step="any">
+                                </div>
+                            </div>
+                            <div class="search-filter-field">
+                                <label for="search-after">Modified on or after</label>
+                                <input id="search-after" type="date">
+                            </div>
+                            <div class="search-filter-field">
+                                <label for="search-availability">Availability</label>
+                                <select id="search-availability">
+                                    <option value="any">Any availability</option>
+                                    <option value="offline">Available offline</option>
+                                    <option value="online_only">Online-only</option>
+                                    <option value="missing">Not on this PC</option>
+                                </select>
+                            </div>
+                            <div class="search-filter-field">
+                                <label for="search-sort">Sort by</label>
+                                <select id="search-sort">
+                                    <option value="relevance">Relevance</option>
+                                    <option value="newest">Newest</option>
+                                    <option value="largest">Largest</option>
+                                    <option value="path">Path A–Z</option>
+                                </select>
+                            </div>
+                            <details class="search-saved" id="search-saved">
+                                <summary>Saved searches</summary>
+                                <div class="search-filter-field">
+                                    <label for="search-presets">Saved search</label>
+                                    <select id="search-presets"><option value="">Choose a search</option></select>
+                                </div>
+                                <div class="search-saved-actions">
+                                    <button class="btn small" id="search-preset-run">Run</button>
+                                    <button class="btn small" id="search-preset-delete">Remove</button>
+                                </div>
+                                <div class="search-filter-field">
+                                    <label for="search-save-name">Search name</label>
+                                    <input id="search-save-name" type="text" maxlength="80">
+                                </div>
+                                <button class="btn small" id="search-preset-save">Save</button>
+                            </details>
                         </div>
+                    </div>
+                    <div class="search-folder" id="search-folder" hidden>
+                        <span id="search-folder-path"></span><button class="btn small" id="search-folder-clear">Clear folder</button>
                     </div>
                     <div class="browser">
                         <div class="cols" id="cols"></div>
@@ -3636,6 +3753,16 @@
             <p class="note">Memory and priority apply after a restart.</p>
             <h3>Search</h3>
             <div class="card">
+                <div class="row">
+                    <div class="label"><b>Index local drives</b><small>Search file and folder names on fixed NTFS and ReFS drives.</small></div>
+                    <label class="toggle"><input type="checkbox" id="fd-local-drives" aria-label="Index local drives"><span></span></label></div>
+                <div class="row">
+                    <div class="label"><b>Index network shares</b><small>Search file and folder names on mapped network drives.</small></div>
+                    <label class="toggle"><input type="checkbox" id="fd-network-shares" aria-label="Index network shares"><span></span></label></div>
+                <div class="row" id="fd-index-controls" hidden>
+                    <div class="label"><b>Pause indexing</b><small id="fd-index-status" role="status"></small></div>
+                    <button class="btn" id="fd-index-refresh">Refresh</button>
+                    <label class="toggle"><input type="checkbox" id="fd-index-paused" aria-label="Pause indexing"><span></span></label></div>
                 <div class="row">
                     <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
                     <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
@@ -4295,12 +4422,13 @@
             if (page !== "files") $("#search-filters").hidePopover();
             if (page !== "files" && M.active) closeMemory(false);
             if (page === "files" && !M.active) {
-                $("#fd-go").hidden = !$("#search-regex").checked && !($("#search-scope").value === "drive" && $("#fd-onedrive").checked);
+                updateSearchControls(searchForm());
                 openFiles();
             }
             if (page === "accounts") loadAccounts();
             if (page === "general" && !scSearched) loadShortcuts();
             if (page === "general") loadHooks();
+            if (page === "general" && !$("#fd-index-controls").hidden) refreshDriveIndex().catch(() => {});
             if (page === "lists") loadList(true);
             if (page === "lists") {
                 $("#attn").open = false;
@@ -4556,6 +4684,18 @@
             $("#guard-n").value = s.safety.content_guard || 20;
             $("#guard-row").hidden = !(s.safety.content_guard > 0);
             $("#fd-onedrive").checked = s.search.onedrive;
+            $("#fd-local-drives").checked = !!s.search.local_drives;
+            $("#fd-network-shares").checked = !!s.search.network_shares;
+            $("#fd-index-paused").checked = !!s.search.index_paused;
+            const anyIndex = s.search.local_drives || s.search.network_shares;
+            $("#fd-index-controls").hidden = !anyIndex;
+            $("#search-scope option[value=pc]").hidden = !s.search.local_drives;
+            $("#search-scope option[value=shares]").hidden = !s.search.network_shares;
+            $("#search-scope option[value=everywhere]").hidden = !anyIndex;
+            if ($("#search-scope").selectedOptions[0]?.hidden) {
+                $("#search-scope").value = "root";
+                clearFind();
+            }
             $("#fd-hotkey").value = s.search.hotkey || "";
             $("#upd-auto").checked = s.updates.auto;
             $("#upd-preview").checked = s.updates.channel === "preview";
@@ -6675,7 +6815,7 @@
             nodes: new Map(),
             sel: null,
             view: "all",
-            q: "",
+            searching: false,
             want: null,
             rs: null,
             found: null
@@ -7025,6 +7165,7 @@
             F.root = r;
             renderRoots();
             if (!same) {
+                if (FD.scope && FD.scope.root !== id) FD.scope = null;
                 F.nodes = new Map();
                 F.sel = null;
                 F.rs = null;
@@ -7036,7 +7177,8 @@
                     children: null
                 });
             }
-            if (!same && F.q && $("#search-scope").value === "root") queueFind();
+            if (!same && F.searching && $("#search-scope").value === "root") queueFind();
+            else updateSearchControls(searchForm());
             const nodes = F.nodes;
             await loadChildren("");
             if (F.root !== r || F.nodes !== nodes) return;
@@ -7112,7 +7254,7 @@
                     // This PC's copy where it has one, else OneDrive's.
                     cn.total = cn.local_id != null && t.local[cn.local_id] != null ? t.local[cn.local_id] : t.remote[cn.remote_id];
                 }
-                if (F.view === "all" && !F.q) renderTree();
+                if (F.view === "all" && !F.searching) renderTree();
             }).catch(() => {});
         }
         async function refreshNode(rel) {
@@ -7172,16 +7314,17 @@
         function render() {
             const all = F.view === "all";
             $("#search-tools").hidden = !all;
+            $("#search-folder").hidden = !all || !FD.scope || $("#search-scope").value !== "root";
             if (!all) $("#search-filters").hidePopover();
-            $("#fd-sum").hidden = !all || !F.q || !$("#fd-sum").textContent;
-            const details = !!F.root && (!all || (!F.q && $("#details-toggle").getAttribute("aria-pressed") === "true"));
-            $("#details-toggle").hidden = !all || !!F.q;
+            $("#fd-sum").hidden = !all || !F.searching || !$("#fd-sum").textContent;
+            const details = !!F.root && (!all || (!F.searching && $("#details-toggle").getAttribute("aria-pressed") === "true"));
+            $("#details-toggle").hidden = !all || F.searching;
             $("#details").hidden = !details;
             $(".pane").classList.toggle("full-width", !details);
-            $("#cols").hidden = !all || !!F.q;
+            $("#cols").hidden = !all || F.searching;
             renderCols();
-            if (!all || F.q) $("#tree").setAttribute("role", "region");
-            if (all && F.q) renderFound();
+            if (!all || F.searching) $("#tree").setAttribute("role", "region");
+            if (all && F.searching) renderFound();
             else if (F.root && F.view === "dupes") renderDupes(!D.page || D.root !== F.root.id || D.stale);
             else if (F.root && !all) renderOut();
             else if (F.root) renderTree();
@@ -7590,7 +7733,7 @@
         function select(rel, focus = true) {
             F.sel = rel;
             F.detailsFor = null;
-            if (F.view === "all" && !F.q) renderTree();
+            if (F.view === "all" && !F.searching) renderTree();
             renderDetails();
             if (focus) {
                 const r = $(`#tree [data-rel="${CSS.escape(rel)}"]`);
@@ -7599,8 +7742,7 @@
         }
         async function reveal(rel, openSection) {
             // Expands the folders down to `rel` and selects it.
-            $("#q").value = "";
-            queueFind();
+            clearFind();
             F.view = "all";
             const parts = rel.split("/");
             let cur = "";
@@ -7621,7 +7763,7 @@
             });
         }
         $("#tree").addEventListener("keydown", e => {
-            if (F.view === "all" && F.q) {
+            if (F.view === "all" && F.searching) {
                 const row = e.target.closest("[data-search-result]");
                 if (!row || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
                 const results = $$("[data-search-result]", $("#tree"));
@@ -7716,6 +7858,10 @@
                 item(tr("Show in File Explorer"), () => run(call("reveal", {
                     path: n.path
                 })));
+            }
+            if (n.folder && !n.untracked && ["synced", "to_upload", "to_download", "pending"].includes(n.state)
+                && (n.local_id || n.remote_id)) {
+                item(tr("Search within this folder"), () => searchFolder(n));
             }
             sep();
             const change = (args, op) => run(call(op, {
@@ -8175,21 +8321,38 @@
             });
         }
 
+        function searchRow(label, sub, open, ...actions) {
+            const result = flatRow(label, sub, ...actions);
+            if (open) {
+                result.dataset.opensResult = "";
+                $(".label b", result).replaceWith(el("button", {
+                    className: "path search-result-name",
+                    textContent: label,
+                    onclick: open
+                }));
+                result.onclick = e => { if (!e.target.closest("button")) open(); };
+            }
+            return result;
+        }
+
         function renderFound() {
             const focused = document.activeElement;
             const row = focused.closest("[data-search-result]");
             const action = row ? $$("button", row).indexOf(focused) : -1;
             const box = el("div", { className: "flat" });
             if (F.found?.root) {
-                for (const f of F.found.root) {
-                    const result = flatRow(f.rel.split("/").pop(), relPath(parentOf(f.rel)), showBtn(f.rel));
-                    result.dataset.searchResult = "folder:" + f.rel;
+                for (const f of F.found.root.items) {
+                    const bits = [relPath(parentOf(f.rel)), ...searchDetails(f)];
+                    const open = f.local ? () => run(call("open_path", { path: f.local })) :
+                        f.remote ? () => run(call("open_in_onedrive", { root: F.root.id, id: f.remote })) : null;
+                    const cloud = f.remote && !f.local ? el("button", {
+                        className: "btn small", textContent: tr("Open in OneDrive"), onclick: open
+                    }) : null;
+                    const result = searchRow(f.rel.split("/").pop(), bits.join(" · "), open, showBtn(f.rel), cloud);
+                    result.dataset.searchResult = "folder:" + (f.id || f.rel);
                     box.append(result);
                 }
-                if (F.found.root.length >= 100) box.append(el("div", {
-                    className: "msg",
-                    textContent: tr("First matches only. Type more to narrow it down.")
-                }));
+                if (F.found.root.note) box.append(el("div", { className: "msg", textContent: tr(F.found.root.note) }));
             }
             if (F.found?.names) {
                 const names = F.found.names;
@@ -8207,11 +8370,32 @@
                 }));
                 else findList(box, cloud, "content");
             }
+            const actions = el("div", { className: "search-result-actions" });
+            const suggestion = F.found?.suggestion;
+            if (suggestion) actions.append(el("button", {
+                className: "btn small", textContent: tr("Try {query}", { query: suggestion }),
+                onclick: () => {
+                    $("#q").value = suggestion;
+                    $("#q").focus();
+                    queueFind(true, false, false);
+                }
+            }));
+            if (F.found?.more) {
+                if (FD.limit < SEARCH_MAX) actions.append(el("button", {
+                    id: "search-more", className: "btn small", textContent: tr("Load more"),
+                    "aria-disabled": String(FD.loadingMore),
+                    onclick: () => { if (!FD.loadingMore) queueFind(true, true); }
+                }));
+                else actions.append(el("div", { className: "msg", textContent: tr("More found. Add to the search to narrow it.") }));
+            }
+            if (actions.childElementCount) box.append(actions);
             $("#tree").replaceChildren(box);
             if (action >= 0) {
                 const result = $$("[data-search-result]", box).find(item => item.dataset.searchResult === row.dataset.searchResult);
                 (result && $$("button", result)[action] || $("#q")).focus({ preventScroll: true });
             }
+            if (focused.id === "search-more") ($("#search-more") || $$("[data-search-result] button", box).at(-1) || $("#q"))
+                .focus({ preventScroll: true });
         }
         // Database files ([databases]): what counts as one, and what waits
         // now or is warned about (the agent's status, `st`).
@@ -10191,6 +10375,8 @@
                 $("#setup-preset").value = "imported";
                 $("#setup-ondemand").checked = !!snap.pair.on_demand;
                 $("#setup-autostart").checked = !!snap.autostart;
+                $("#setup-drive-index").checked = !!snap.search?.local_drives;
+                $("#setup-share-index").checked = !!snap.search?.network_shares;
             }
             stale();
             $("#preview-card").hidden = true;
@@ -10538,13 +10724,17 @@
             remote: "/",
             preset: $("#setup-preset").value,
             on_demand: $("#setup-ondemand").checked,
-            autostart: $("#setup-autostart").checked
+            autostart: $("#setup-autostart").checked,
+            local_drives: $("#setup-drive-index").checked,
+            network_shares: $("#setup-share-index").checked
         } : {
             local: $("#setup-local").value.trim(),
             remote: $("#setup-remote").value.trim(),
             preset: $("#setup-preset").value,
             on_demand: $("#setup-ondemand").checked,
-            autostart: $("#setup-autostart").checked
+            autostart: $("#setup-autostart").checked,
+            local_drives: $("#setup-drive-index").checked,
+            network_shares: $("#setup-share-index").checked
         };
 
         function stale() {
@@ -10737,12 +10927,23 @@
             START_ITEM = "{{START_ITEM}}";
         // ---- search: names from the index, as you type; OneDrive's search
         // inside files only on Search (it sends the text to Microsoft).
+        const SEARCH_PAGE = 50, SEARCH_MAX = 500;
+        const SEARCH_FIELDS = {
+            q: "#q", drive: "#search-scope", mode: "#search-match", kind: "#search-kind",
+            extension: "#search-extension", after: "#search-after", size: "#search-min-size",
+            availability: "#search-availability", sort: "#search-sort"
+        };
         const FD = {
             seq: 0,
-            timer: null
+            timer: null,
+            scope: null,
+            limit: SEARCH_PAGE,
+            loadingMore: false,
+            saved: []
         };
         const PLACES = {
             "here": tr("On this PC"),
+            "on network share": tr("On a network share"),
             "online-only": tr("Online-only"),
             "not here yet": tr("Not on this PC yet"),
             "excluded": tr("Excluded"),
@@ -10757,31 +10958,39 @@
             });
         }
 
+        function searchDetails(f) {
+            const bits = [];
+            if (f.placement) bits.push(PLACES[f.placement] || f.placement);
+            if (f.size != null) bits.push(size(f.size));
+            if (f.modified_ms != null) bits.push(day(f.modified_ms));
+            return bits;
+        }
+
         function findRow(f) {
             const parent = f.path.slice(0, f.path.lastIndexOf("/")) || "/";
-            const bits = [PLACES[f.placement] || f.placement, parent];
-            if (f.size != null) bits.push(size(f.size));
+            const bits = [parent, ...searchDetails(f)];
+            const targetRoot = f.pair || "main";
+            if (f.pair) bits.unshift(F.roots.find(root => root.id === targetRoot)?.name || tr("OneDrive"));
             const acts = [];
             const btn = (label, fn) => acts.push(el("button", {
                 className: "btn small",
                 textContent: label,
                 onclick: fn
             }));
-            const local = f.local && ["here", "online-only"].includes(f.placement);
-            if (local) btn(tr("Open"), () => run(call("open_path", {
-                path: f.local
-            })));
-            if (local) btn(tr("Show"), () => run(call("reveal", {
-                path: f.local
-            })));
+            const local = f.local && ["here", "online-only", "on network share"].includes(f.placement);
+            const inTree = f.rel && F.roots.some(root => root.id === targetRoot);
+            if (inTree) btn(tr("Show"), async () => {
+                if (F.root?.id !== targetRoot) await selectRoot(targetRoot);
+                await reveal(f.rel);
+            });
+            else if (local) btn(tr("Show"), () => run(call("reveal", { path: f.local })));
             if (f.rel && f.placement === "not here yet") btn(tr("Sync this first"), () => run(call("sync_first", {
-                rel: f.rel
+                root: targetRoot, rel: f.rel
             }), tr("It goes before anything else")));
-            // No copy on this PC to open: OneDrive's website has it.
-            if (!local && ["in OneDrive", "excluded", "not synced"].includes(f.placement)) btn(tr("Open in OneDrive"), () => run(call("open_in_onedrive", {
-                id: f.id
-            })));
-            return flatRow(f.folder ? f.name + "/" : f.name, bits.join(" · "), ...acts);
+            const open = local ? () => run(call("open_path", { path: f.local })) :
+                f.id ? () => run(call("open_in_onedrive", { root: targetRoot, id: f.id })) : null;
+            if (open && !local) btn(tr("Open in OneDrive"), open);
+            return searchRow(f.folder ? f.name + "/" : f.name, bits.join(" · "), open, ...acts);
         }
 
         function findList(box, r, group) {
@@ -10794,66 +11003,155 @@
                 className: "msg",
                 textContent: tr(r.too_many)
             }));
-            else if (r.more) box.append(el("div", {
+            else if (group === "content" && r.more) box.append(el("div", {
                 className: "msg",
                 textContent: tr("More found. Add to the search to narrow it.")
             }));
         }
-        function queueFind(submit = false) {
-            clearTimeout(FD.timer);
-            const request = ++FD.seq;
-            const q = $("#q").value.trim();
-            const drive = $("#search-scope").value === "drive";
-            const regex = $("#search-regex").checked;
-            const kind = $("#search-kind").value;
-            const folder = kind ? kind === "folders" : null;
-            $("#search-filters-toggle").toggleAttribute("data-active", drive || !!kind || regex);
+        function localSearchScope(scope) {
+            return scope === "pc" || scope === "shares" || scope === "everywhere";
+        }
+
+        function searchForm() {
+            const values = Object.fromEntries(Object.entries(SEARCH_FIELDS).map(([key, sel]) => [key, $(sel).value]));
+            if (localSearchScope(values.drive)) {
+                return { ...values, mode: values.mode === "words" ? "words" : "text", extension: "", after: "",
+                    size: "", availability: "any", sort: "relevance", root: null, scope: null };
+            }
+            return { ...values, root: values.drive === "root" ? F.root?.id : null, scope: values.drive === "root" ? FD.scope : null };
+        }
+
+        function hasSearchFilters(form) {
+            return !!(form.extension.trim() || form.after || form.size || form.availability !== "any");
+        }
+
+        function browseSearch(form) {
+            return hasSearchFilters(form) || form.sort !== "relevance" || form.mode === "paths" || !!form.scope
+                || (!form.q.trim() && !!form.kind);
+        }
+
+        function searchesContents(form) {
+            return form.drive === "drive" && form.mode === "text" && !browseSearch(form) && $("#fd-onedrive").checked;
+        }
+
+        function updateSearchControls(form) {
             const input = $("#q");
-            input.placeholder = drive ? tr("Search OneDrive") : tr("Search by name");
+            const pc = localSearchScope(form.drive);
+            for (const id of ["search-extension", "search-after", "search-min-size", "search-availability", "search-sort"]) {
+                $("#" + id).closest(".search-filter-field").hidden = pc;
+            }
+            $(".search-filter-grid", $("#search-filters")).hidden = pc;
+            for (const option of $$("#search-match option")) {
+                option.disabled = pc && ["regex", "paths"].includes(option.value);
+            }
+            if (pc) $("#search-match").value = form.mode;
+            input.placeholder = form.drive === "everywhere" ? tr("Search everywhere") :
+                pc ? tr("Search this PC") : form.mode === "paths" ? tr("Search by path") :
+                form.drive === "drive" ? tr("Search OneDrive") : tr("Search by name");
             input.setAttribute("aria-label", input.placeholder);
             input.title = input.placeholder;
-            const root = F.root?.id;
-            $("#fd-go").hidden = !regex && !(drive && $("#fd-onedrive").checked);
-            F.q = q;
+            $("#search-filters-toggle").toggleAttribute("data-active",
+                form.drive !== "root" || !!form.kind || form.mode !== "text" || browseSearch(form));
+            $("#fd-go").hidden = form.mode !== "regex" && !browseSearch(form) && !searchesContents(form);
+            $("#search-folder").hidden = F.view !== "all" || !form.scope;
+            $("#search-folder-path").textContent = form.scope ? tr("In {folder}", { folder: form.scope.rel }) : "";
+        }
+
+        function searchFolder(n) {
+            FD.scope = { root: F.root.id, rel: n.rel,
+                local_id: n.local_id == null ? null : String(n.local_id), remote_id: n.remote_id ?? null };
+            $("#search-scope").value = "root";
+            setView("all");
+            $("#q").focus();
+            queueFind(true);
+        }
+
+        function clearFind() {
+            clearTimeout(FD.timer);
+            FD.seq++;
+            FD.loadingMore = false;
+            $("#q").value = "";
+            $("#fd-sum").textContent = "";
+            F.searching = false;
             F.found = null;
+            updateSearchControls(searchForm());
+            setView(F.view);
+        }
+
+        function queueFind(submit = false, more = false, allowContents = true) {
+            clearTimeout(FD.timer);
+            const request = ++FD.seq;
+            const form = searchForm();
+            const q = form.q.trim();
+            const pc = localSearchScope(form.drive);
+            const drive = form.drive === "drive";
+            const mode = q ? (form.mode === "paths" ? "words" : form.mode) : "text";
+            const regex = mode === "regex";
+            const folder = form.kind ? form.kind === "folders" : null;
+            const advanced = !pc && browseSearch(form);
+            const root = form.root;
+            updateSearchControls(form);
+            F.searching = !!q || (!pc && (hasSearchFilters(form) || !!form.kind || form.sort !== "relevance"));
+            FD.limit = more ? Math.min(FD.limit + SEARCH_PAGE, SEARCH_MAX) : SEARCH_PAGE;
+            FD.loadingMore = more;
+            const previous = more ? F.found : null;
+            F.found = previous;
             const status = $("#fd-sum");
-            const min = drive ? 3 : 2;
-            const ready = q && (regex || [...q].length >= min) && (drive || root);
-            status.textContent = !q ? "" : !drive && !root ? tr("Choose a synced folder.") :
+            const min = drive || pc ? 3 : 2;
+            const shortWords = !advanced && (drive || pc) && mode === "words" && q.split(/\p{White_Space}+/u).every(word => [...word].length < min);
+            const ready = F.searching && !shortWords && (advanced || regex || [...q].length >= min) && (drive || pc || root);
+            const needsSubmit = regex || advanced;
+            status.textContent = !F.searching ? "" : !drive && !pc && !root ? tr("Choose a synced folder.") :
+                shortWords ? tr("Include a word with at least {n} characters.", { n: min }) :
                 !ready ? tr("Type at least {n} characters.", { n: min }) :
-                regex && !submit ? tr("Press Enter to search with this pattern.") : tr("Searching…");
+                needsSubmit && !submit ? tr("Press Enter to search.") : tr("Searching…");
             setView(F.view);
             positionSearchFilters();
-            if (!ready || (regex && !submit)) return;
+            if (!ready || (needsSubmit && !submit)) return;
+            const limit = FD.limit;
+            const suggest = !pc && submit && !more && !regex && /^[\p{L}]{4,32}$/u.test(q);
+            const filters = {
+                folder, extension: form.extension, availability: form.availability, sort: form.sort,
+                after_ms: form.after ? new Date(form.after + "T00:00:00").getTime() : null,
+                min_bytes: form.size ? Math.max(0, Math.round(Number(form.size) * 1e6)) : null
+            };
+            const args = { q, folder, mode, request, limit, root };
+            const browse = { ...args, drive, paths: form.mode === "paths", filters, scope: form.scope, suggest };
             const search = async () => {
                 try {
-                    const args = { q, folder, regex, request };
-                    let title = "";
-                    if (drive) {
-                        const names = await call("search", args);
+                    const op = form.drive === "everywhere" ? "search_everywhere" :
+                        form.drive === "shares" ? "search_shares" : pc ? "search_drives" : drive ? "search" : "tree_find";
+                    const found = await (advanced ? call("search_browse", browse) : call(op, args));
+                    if (request !== FD.seq) return;
+                    F.found = {
+                        [drive || pc ? "names" : "root"]: found,
+                        more: found.more && (!found.too_many || found.items.length === limit),
+                        suggestion: found.suggestion,
+                        cloud: previous?.cloud
+                    };
+                    let title = found.items.length || found.too_many || F.found.cloud?.items?.length ? "" : tr("Nothing found.");
+                    if (pc && !found.ready && !found.items.length) title = tr("No drive or network share index is ready.");
+                    status.textContent = title;
+                    render();
+                    if (submit && !more && allowContents && searchesContents(form)) {
+                        const cloud = await call("search_onedrive", { q }).catch(e => ({ error: e.message }));
                         if (request !== FD.seq) return;
-                        F.found = { names };
-                        title = names.items.length || names.too_many ? "" : tr("Nothing found.");
-                        if (submit && !regex && $("#fd-onedrive").checked) {
-                            status.textContent = "";
-                            render();
-                            const cloud = await call("search_onedrive", { q }).catch(e => ({ error: e.message }));
-                            if (request !== FD.seq) return;
-                            if (!cloud.error && folder !== null) cloud.items = cloud.items.filter(f => f.folder === folder);
-                            F.found.cloud = cloud;
-                            if (cloud.items?.length) title = "";
-                        }
-                    } else {
-                        const matches = await call("tree_find", { ...args, root });
+                        if (!cloud.error && folder !== null) cloud.items = cloud.items.filter(f => f.folder === folder);
+                        F.found.cloud = cloud;
+                        if (cloud.items?.length) title = "";
+                    }
+                    if (!advanced && suggest && !found.items.length && !found.too_many && !F.found.cloud?.items?.length) {
+                        const hint = await call("search_browse", { ...browse, suggest_only: true }).catch(() => null);
                         if (request !== FD.seq) return;
-                        F.found = { root: matches };
-                        if (!matches.length) title = tr("Nothing found.");
+                        F.found.suggestion = hint?.suggestion;
                     }
                     status.textContent = title;
                 } catch (e) {
                     if (request !== FD.seq) return;
+                    if (more) FD.limit -= SEARCH_PAGE;
                     status.textContent = e.message;
                 }
+                FD.loadingMore = false;
                 render();
             };
             if (submit) search();
@@ -10868,7 +11166,69 @@
             filters.style.top = Math.max(8, top) + "px";
             filters.style.left = Math.max(8, anchor.right - filters.offsetWidth) + "px";
         }
+        function showSaved(items, selected = "") {
+            FD.saved = Array.isArray(items) ? items : [];
+            const select = $("#search-presets");
+            select.replaceChildren(el("option", { value: "", textContent: tr("Choose a search") }),
+                ...FD.saved.map(item => el("option", { value: item.name, textContent: item.name })));
+            const name = FD.saved.find(item => item.name === selected)?.name || "";
+            select.value = name;
+            updateSavedButtons();
+        }
+
+        function updateSavedButtons() {
+            const selected = !!$("#search-presets").value;
+            $("#search-preset-run").disabled = $("#search-preset-delete").disabled = !selected;
+        }
+
+        $("#search-saved").addEventListener("toggle", () => {
+            positionSearchFilters();
+            if ($("#search-saved").open) run(call("search_saved")).then(items => showSaved(items, $("#search-presets").value)).catch(() => {});
+        });
+        $("#search-presets").onchange = updateSavedButtons;
+        updateSavedButtons();
+        $("#search-preset-save").onclick = () => {
+            const name = $("#search-save-name").value.trim();
+            const form = searchForm();
+            run(call("search_save", { name, form })).then(items => {
+                showSaved(items, name);
+                $("#search-save-name").value = "";
+            }).catch(() => {});
+        };
+        $("#search-preset-delete").onclick = () => {
+            run(call("search_save", { name: $("#search-presets").value })).then(items => showSaved(items)).catch(() => {});
+        };
+        $("#search-preset-run").onclick = async () => {
+            const item = FD.saved.find(item => item.name === $("#search-presets").value);
+            if (!item) return;
+            const form = item.form;
+            if (form.root && !F.roots.some(root => root.id === form.root)) {
+                toast(tr("The saved search folder is no longer listed."));
+                return;
+            }
+            if (form.root && F.root?.id !== form.root) await selectRoot(form.root);
+            for (const [key, sel] of Object.entries(SEARCH_FIELDS)) {
+                if (typeof form[key] === "string") $(sel).value = form[key];
+            }
+            FD.scope = form.scope || null;
+            $("#search-filters").hidePopover();
+            $("#q").focus();
+            queueFind(true, false, false);
+        };
+        $("#search-folder-clear").onclick = () => {
+            FD.scope = null;
+            $("#q").focus();
+            queueFind(true);
+        };
         $("#search-filters").addEventListener("toggle", positionSearchFilters);
+        $("#search-filters").addEventListener("keydown", e => {
+            if (e.key === "Enter" && !e.isComposing && e.target instanceof HTMLInputElement && e.target.id !== "search-save-name") {
+                e.preventDefault();
+                $("#search-filters").hidePopover();
+                $("#q").focus();
+                queueFind(true);
+            }
+        });
         window.addEventListener("resize", positionSearchFilters);
         $("#q").oninput = () => queueFind();
         $("#q").onkeydown = e => {
@@ -10883,12 +11243,25 @@
             }
             if (e.key === "Escape") {
                 e.preventDefault();
-                $("#q").value = "";
-                queueFind();
+                clearFind();
             }
         };
-        $("#search-scope").onchange = $("#search-kind").onchange = $("#search-regex").onchange = () => queueFind();
+        for (const sel of Object.values(SEARCH_FIELDS).filter(sel => sel !== "#q")) {
+            $(sel).onchange = () => queueFind();
+        }
         $("#fd-go").onclick = () => queueFind(true);
+        async function refreshDriveIndex() {
+            const state = await call("drive_index_status");
+            $("#fd-index-status").textContent = state.paused ? tr("Indexing paused") :
+                state.drives?.map(d => [d.drive, tr(d.status)].filter(Boolean).join(" ")).join(" · ") || tr("Indexing…");
+        }
+        $("#fd-index-refresh").onclick = () => run(refreshDriveIndex()).catch(() => {});
+        for (const [id, key] of Object.entries({
+            "fd-local-drives": "local_drives", "fd-network-shares": "network_shares", "fd-index-paused": "index_paused"
+        })) {
+            $("#" + id).onchange = e => run(call("save", { section: "search", value: { [key]: e.target.checked } }))
+                .then(load).then(() => !$("#fd-index-controls").hidden && refreshDriveIndex()).catch(load);
+        }
         $("#details-toggle").onclick = e => {
             e.currentTarget.setAttribute("aria-pressed", String(e.currentTarget.getAttribute("aria-pressed") !== "true"));
             render();
@@ -10910,6 +11283,7 @@
             if (M.active && (start === "find" || item)) closeMemory(false);
             if (start === "find") {
                 show("files");
+                FD.scope = null;
                 $("#search-scope").value = "drive";
                 setView("all");
                 queueFind();

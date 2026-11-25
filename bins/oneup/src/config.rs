@@ -986,6 +986,9 @@ pub struct Search {
     /// The key combination that opens search from anywhere (`Ctrl+Alt+F`);
     /// empty: none.
     pub hotkey: String,
+    pub local_drives: bool,
+    pub network_shares: bool,
+    pub index_paused: bool,
 }
 
 pub fn load_search(data_dir: &Path) -> Result<Search> {
@@ -1002,6 +1005,15 @@ pub fn load_search(data_dir: &Path) -> Result<Search> {
         }
         s.hotkey = h.to_string();
     }
+    if let Some(v) = t.get("local_drives") {
+        s.local_drives = v.as_bool().context("search.local_drives must be true or false")?;
+    }
+    if let Some(v) = t.get("network_shares") {
+        s.network_shares = v.as_bool().context("search.network_shares must be true or false")?;
+    }
+    if let Some(v) = t.get("index_paused") {
+        s.index_paused = v.as_bool().context("search.index_paused must be true or false")?;
+    }
     Ok(s)
 }
 
@@ -1012,7 +1024,13 @@ pub fn save_search(data_dir: &Path, s: &Search) -> Result<()> {
         "# Search: onedrive = true also asks OneDrive to search inside files (sends the search text to Microsoft);
          # hotkey = \"Ctrl+Alt+F\" opens search from anywhere (\"\" for none).
 ",
-        vec![("onedrive", value(s.onedrive)), ("hotkey", value(s.hotkey.as_str()))],
+        vec![
+            ("onedrive", value(s.onedrive)),
+            ("hotkey", value(s.hotkey.as_str())),
+            ("local_drives", value(s.local_drives)),
+            ("network_shares", value(s.network_shares)),
+            ("index_paused", value(s.index_paused)),
+        ],
     )
 }
 

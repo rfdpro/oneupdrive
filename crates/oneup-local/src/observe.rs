@@ -682,10 +682,22 @@ mod driver {
         /// Applies everything the journal recorded up to now, then lists
         /// the folders that entered the tree. Returns what changed.
         pub fn catch_up(&mut self) -> Result<Changes> {
+            self.catch_up_with(|| true, true)
+        }
+
+        /// Apply journal changes to a search catalog without accumulating its dirty folders.
+        pub fn catch_up_while(&mut self, keep_going: impl Fn() -> bool) -> Result<Changes> {
+            self.catch_up_with(keep_going, false)
+        }
+
+        fn catch_up_with(&mut self, keep_going: impl Fn() -> bool, retain_dirty: bool) -> Result<Changes> {
             let mut ch = Changes::default();
-            self.drain_queue()?;
+            self.drain_queue(&keep_going)?;
+            if !keep_going() {
+                return Ok(ch);
+            }
             let j = self.volume.query_journal()?;
-            if j.journal_id != self.journal_id {
+            if j.journal_id != self.journal_id || self.cursor > j.next_usn {
                 return Err(Error::NeedsRescan(Rescan::JournalReplaced));
             }
             let oldest = j.first_usn.max(j.lowest_valid_usn);
@@ -693,7 +705,7 @@ mod driver {
                 return Err(Error::NeedsRescan(Rescan::JournalWrapped));
             }
             let target = j.next_usn;
-            while self.cursor < target {
+            while self.cursor < target && keep_going() {
                 let read = self.volume.read_journal(self.journal_id, self.cursor, false, &mut self.jbuf);
                 let (next, records) = match read {
                     Ok((next, recs)) => (next, recs.collect::<std::result::Result<Vec<UsnRecord>, _>>()?),
@@ -701,7 +713,7 @@ mod driver {
                         // A read can fail because the journal wrapped or was
                         // reset meanwhile; say so rather than just failing.
                         let j = self.volume.query_journal()?;
-                        if j.journal_id != self.journal_id {
+                        if j.journal_id != self.journal_id || self.cursor > j.next_usn {
                             return Err(Error::NeedsRescan(Rescan::JournalReplaced));
                         }
                         if self.cursor < j.first_usn.max(j.lowest_valid_usn) {
@@ -726,15 +738,21 @@ mod driver {
                     Ok::<_, Error>(())
                 })?;
                 ch.opened_by_id += self.volume.opened_by_id() - by_id;
+                if !retain_dirty {
+                    ch.dirty.clear();
+                }
                 self.cursor = next;
-                self.drain_queue()?;
+                self.drain_queue(&keep_going)?;
             }
             tracing::debug!(records = ch.records, dirty = ch.dirty.len(), "local tree caught up");
             Ok(ch)
         }
 
-        fn drain_queue(&mut self) -> Result<()> {
-            while list_queued(&mut self.store, &self.volume, &self.cfg, &mut self.buf, &self.progress)? > 0 {}
+        fn drain_queue(&mut self, keep_going: &impl Fn() -> bool) -> Result<()> {
+            while keep_going()
+                && list_queued(&mut self.store, &self.volume, &self.cfg, &mut self.buf, &self.progress)? > 0
+            {
+            }
             Ok(())
         }
 

@@ -27,6 +27,8 @@ pub mod clipboard;
 #[cfg(windows)]
 pub mod contained;
 #[cfg(windows)]
+pub mod directory_watch;
+#[cfg(windows)]
 pub mod fs_links;
 #[cfg(windows)]
 pub mod hello;
@@ -155,6 +157,78 @@ pub mod metrics {
 pub mod disk {
     use super::Result;
     use std::path::Path;
+
+    /// Drive-letter roots of fixed NTFS and ReFS volumes.
+    #[cfg(windows)]
+    pub fn fixed_search_roots() -> Vec<std::path::PathBuf> {
+        use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+        use windows::core::HSTRING;
+        // SAFETY: no parameters.
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26)
+            .filter_map(|bit| {
+                if mask & (1 << bit) == 0 {
+                    return None;
+                }
+                let root = format!("{}:\\", char::from(b'A' + bit));
+                let wide = HSTRING::from(&root);
+                let mut fs = [0u16; 16];
+                // SAFETY: the root is NUL-terminated and lives through this call.
+                let fixed = unsafe { GetDriveTypeW(&wide) } == 3;
+                if !fixed {
+                    return None;
+                }
+                // SAFETY: the root is NUL-terminated and the filesystem buffer is writable.
+                let info = unsafe { GetVolumeInformationW(&wide, None, None, None, None, Some(&mut fs)) };
+                if info.is_err() {
+                    return None;
+                }
+                let end = fs.iter().position(|c| *c == 0).unwrap_or(fs.len());
+                matches!(String::from_utf16_lossy(&fs[..end]).as_str(), "NTFS" | "ReFS").then(|| root.into())
+            })
+            .collect()
+    }
+
+    /// The current user's connected drive letters and their UNC targets.
+    #[cfg(windows)]
+    pub fn mapped_search_roots() -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+        use windows::Win32::Foundation::{ERROR_MORE_DATA, NO_ERROR};
+        use windows::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+        use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+        use windows::core::{HSTRING, PWSTR};
+
+        // SAFETY: this call has no parameters.
+        let mask = unsafe { GetLogicalDrives() };
+        (0..26)
+            .filter(|bit| mask & (1 << bit) != 0)
+            .filter_map(|bit| {
+                let letter = char::from(b'A' + bit);
+                let device = HSTRING::from(format!("{letter}:"));
+                let mut target = vec![0u16; 1024];
+                let mut len = target.len() as u32;
+                // SAFETY: the device is NUL-terminated and the buffer holds len UTF-16 units.
+                let mut status = unsafe { WNetGetConnectionW(&device, Some(PWSTR(target.as_mut_ptr())), &mut len) };
+                if status == ERROR_MORE_DATA && len <= 32_768 {
+                    target.resize(len as usize, 0);
+                    // SAFETY: the resized buffer holds len UTF-16 units.
+                    status = unsafe { WNetGetConnectionW(&device, Some(PWSTR(target.as_mut_ptr())), &mut len) };
+                }
+                if status != NO_ERROR {
+                    return None;
+                }
+                let end = target.iter().position(|&unit| unit == 0)?;
+                let unc = String::from_utf16(&target[..end]).ok()?;
+                let unc = std::path::PathBuf::from(unc);
+                if !matches!(unc.components().next(), Some(std::path::Component::Prefix(p))
+                    if matches!(p.kind(), std::path::Prefix::UNC(..)))
+                    || unc.components().any(|c| c == std::path::Component::ParentDir)
+                {
+                    return None;
+                }
+                Some((format!("{letter}:\\").into(), unc))
+            })
+            .collect()
+    }
 
     /// Total size in bytes of the volume holding `path` (as seen by this
     /// user; disk quotas can make it smaller than the physical disk).

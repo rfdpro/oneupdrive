@@ -268,13 +268,29 @@ const DRIVER: &str = r##"<script>
     key("f", {ctrlKey: true});
     check("Ctrl+F opens Files search from another Files view", document.activeElement === searchBox &&
       document.querySelector('.views [data-view="all"]').getAttribute("aria-selected") === "true", at());
-    HOST_ANSWERS.tree_find = [{rel:"Docs/inner.doc",folder:false}, {rel:"big.iso",folder:false}];
+    HOST_ANSWERS.tree_find = {items:[
+      {rel:"Docs/inner.doc",folder:false,local:"C:\\Sync\\Docs\\inner.doc"},
+      {rel:"big.iso",folder:false,local:"C:\\Sync\\big.iso"},
+      {rel:"Docs",folder:true,local:"C:\\Sync\\Docs"},
+      {rel:"cloud.pdf",folder:false,remote:"online-id"}
+    ],more:false};
     searchBox.value = "inner";
     searchBox.dispatchEvent(new Event("input")); await sleep(350);
     check("Files search finds items in the selected folder", tree.textContent.includes("inner.doc") &&
       document.querySelector("#details").hidden && HOST_CALLS.filter(m => m.op === "tree_find").at(-1)?.args.root === "main", tree.textContent);
     key("ArrowDown");
-    check("Down from search focuses the first result action", document.activeElement.closest(".fl")?.textContent.includes("inner.doc"), at());
+    check("Down from search focuses the result's Open button", document.activeElement.matches("button.search-result-name") &&
+      document.activeElement.textContent === "inner.doc", at());
+    const opensBefore = HOST_CALLS.filter(m => m.op === "open_path").length;
+    document.activeElement.click();
+    const searchRows = tree.querySelectorAll("[data-search-result]");
+    searchRows[2].querySelector("small").click();
+    searchRows[3].querySelector(".search-result-name").click();
+    const opened = HOST_CALLS.filter(m => m.op === "open_path").slice(opensBefore).map(m => m.args.path);
+    check("Activating search opens a file and a folder directly", opened.join("|") === "C:\\Sync\\Docs\\inner.doc|C:\\Sync\\Docs", opened);
+    const cloudOpen = HOST_CALLS.filter(m => m.op === "open_in_onedrive").at(-1);
+    check("A scoped cloud-only result opens in its own OneDrive", cloudOpen?.args.id === "online-id" &&
+      cloudOpen.args.root === "main", JSON.stringify(cloudOpen));
     key("ArrowDown");
     check("Down moves to the next result", document.activeElement.closest(".fl")?.textContent.includes("big.iso"), at());
     renderFound();
@@ -282,6 +298,10 @@ const DRIVER: &str = r##"<script>
     key("Escape");
     check("Escape from results returns to the search field with its query", document.activeElement === searchBox &&
       searchBox.value === "inner", at());
+    tree.querySelector("[data-search-result] button.btn").click(); await sleep(100);
+    check("Show selects the file in the Files tree without opening it", at() === "Docs/inner.doc" &&
+      HOST_CALLS.filter(m => m.op === "open_path").length === opensBefore + 2, at());
+    searchBox.value = "inner";
     const filterToggle = document.querySelector("#search-filters-toggle");
     const filters = document.querySelector("#search-filters");
     filterToggle.focus(); filterToggle.click(); await sleep(50);
@@ -291,23 +311,174 @@ const DRIVER: &str = r##"<script>
     const searchType = document.querySelector("#search-kind");
     searchType.value = "files";
     searchType.dispatchEvent(new Event("change"));
-    const regex = document.querySelector("#search-regex");
-    regex.click();
+    const searchMatch = document.querySelector("#search-match");
+    searchMatch.value = "regex";
+    searchMatch.dispatchEvent(new Event("change"));
     check("the filters button marks active options", filterToggle.hasAttribute("data-active"), "");
     filters.hidePopover();
     searchBox.focus(); key("Enter"); await sleep(100);
     const patternCall = HOST_CALLS.filter(m => m.op === "tree_find").at(-1);
-    check("Files submits the regex and type filter together", patternCall?.args.regex && patternCall.args.folder === false, JSON.stringify(patternCall));
+    check("Files submits the regex and type filter together", patternCall?.args.mode === "regex" && patternCall.args.folder === false, JSON.stringify(patternCall));
     key("Escape");
     check("Escape restores the tree and details", tree.getAttribute("role") === "tree" && !document.querySelector("#details").hidden, tree.getAttribute("role"));
-    regex.click();
+    searchMatch.value = "text";
+    searchMatch.dispatchEvent(new Event("change"));
     searchType.value = "";
     startAt("find", "");
     check("Search shortcut focuses Files in OneDrive scope", document.activeElement === searchBox &&
       document.querySelector("#search-scope").value === "drive" && searchBox.placeholder === "Search OneDrive" && !document.querySelector('nav [data-page="find"]'), at());
+    searchMatch.value = "words";
+    searchMatch.dispatchEvent(new Event("change"));
+    searchBox.value = "q2 24";
+    searchBox.dispatchEvent(new Event("input")); await sleep(300);
+    check("OneDrive word matching asks for an indexable word", document.querySelector("#fd-sum").textContent.includes("at least 3 characters") &&
+      !HOST_CALLS.some(m => m.op === "search" && m.args.q === "q2 24"), document.querySelector("#fd-sum").textContent);
+    HOST_ANSWERS.search = {items:[{id:"report", name:"Budget-24.pdf", path:"/Budget-24.pdf", placement:"not synced"}]};
+    const insideFiles = document.querySelector("#fd-onedrive");
+    const insideSetting = insideFiles.checked;
+    insideFiles.checked = true;
+    searchBox.value = "pdf budget 24";
+    searchBox.dispatchEvent(new Event("input")); await sleep(350);
+    const wordsCall = HOST_CALLS.filter(m => m.op === "search").at(-1);
+    check("All words searches names as you type", wordsCall?.args.mode === "words" && tree.textContent.includes("Budget-24.pdf"), tree.textContent);
+    key("Enter"); await sleep(100);
+    check("All words stays local on Enter even with content search enabled", document.querySelector("#fd-go").hidden &&
+      !HOST_CALLS.some(m => m.op === "search_onedrive" && m.args.q === "pdf budget 24"), "");
+    insideFiles.checked = insideSetting;
+    key("Escape");
+    searchMatch.value = "text";
+    searchMatch.dispatchEvent(new Event("change"));
     document.querySelector("#search-scope").value = "root";
     document.querySelector("#search-scope").dispatchEvent(new Event("change"));
     await sleep(300);
+
+    // Folder scope, path words, filters, paging, suggestions, and presets.
+    HOST_ANSWERS.search_browse = a => a.suggest_only ? {items:[], more:false, suggestion:"invoice"} : {
+      items:a.limit > 50 ? [{rel:"Docs/invoice.pdf"},{rel:"Docs/receipt.pdf"}] : [{rel:"Docs/invoice.pdf"}],
+      more:a.limit === 50
+    };
+    row("Docs").dispatchEvent(new MouseEvent("contextmenu", {bubbles:true, cancelable:true, clientX:200, clientY:100}));
+    [...document.querySelectorAll("#ctx button")].find(b => b.textContent === "Search within this folder").click();
+    check("Search within a folder shows the selected path and focuses input",
+      !document.querySelector("#search-folder").hidden && document.querySelector("#search-folder-path").textContent.includes("Docs")
+      && document.activeElement === searchBox, at());
+    searchMatch.value = "paths";
+    document.querySelector("#search-extension").value = "pdf";
+    document.querySelector("#search-after").value = "2026-10-01";
+    document.querySelector("#search-min-size").value = "2";
+    document.querySelector("#search-availability").value = "offline";
+    document.querySelector("#search-sort").value = "newest";
+    searchBox.value = "docs invoice";
+    searchBox.dispatchEvent(new Event("input"));
+    await sleep(300);
+    check("Advanced search waits for submit", !HOST_CALLS.some(m => m.op === "search_browse" && m.args.q === "docs invoice"), "");
+    key("Enter"); await sleep(100);
+    const browseCall = HOST_CALLS.filter(m => m.op === "search_browse").at(-1)?.args;
+    check("Advanced search sends folder ID, path words, filters, and sort",
+      browseCall?.scope.local_id === "1" && browseCall.scope.rel === "Docs" && browseCall.paths && browseCall.mode === "words"
+      && browseCall.filters.extension === "pdf" && browseCall.filters.min_bytes === 2000000 && browseCall.filters.after_ms > 0
+      && browseCall.filters.availability === "offline" && browseCall.filters.sort === "newest"
+      && tree.textContent.includes("invoice.pdf"), JSON.stringify(browseCall));
+    document.querySelector("#search-more").focus();
+    document.activeElement.click(); await sleep(100);
+    check("Load more keeps previous results and adds the next page", tree.textContent.includes("receipt.pdf")
+      && tree.textContent.includes("invoice.pdf") && !document.querySelector("#search-more"), tree.textContent);
+
+    let savedQueries = [];
+    HOST_ANSWERS.search_saved = () => savedQueries;
+    HOST_ANSWERS.search_save = a => {
+      savedQueries = savedQueries.filter(item => item.name !== a.name);
+      if (a.form) savedQueries.push(a);
+      return savedQueries;
+    };
+    filterToggle.click();
+    document.querySelector("#search-saved").open = true; await sleep(100);
+    document.querySelector("#search-save-name").value = "Project PDFs";
+    document.querySelector("#search-preset-save").click(); await sleep(100);
+    check("Saved search stores text, sort, and folder", savedQueries[0]?.form.q === "docs invoice"
+      && savedQueries[0].form.scope.rel === "Docs" && savedQueries[0].form.sort === "newest", JSON.stringify(savedQueries));
+    searchBox.value = "other";
+    document.querySelector("#search-preset-run").click(); await sleep(100);
+    check("Running a saved search restores its inputs and results", searchBox.value === "docs invoice"
+      && tree.textContent.includes("invoice.pdf"), tree.textContent);
+    filterToggle.click();
+    document.querySelector("#search-preset-delete").click(); await sleep(100);
+    check("A saved search can be removed", savedQueries.length === 0 && document.querySelector("#search-preset-run").disabled, "");
+    filters.hidePopover();
+    for (const id of ["search-extension","search-after","search-min-size"]) document.getElementById(id).value = "";
+    searchMatch.value = "text";
+    document.querySelector("#search-availability").value = "any";
+    document.querySelector("#search-sort").value = "relevance";
+    searchBox.value = "";
+    document.querySelector("#search-folder-clear").click();
+    HOST_ANSWERS.tree_find = a => ({items: a.q === "invoice" ? [{rel:"Docs/invoice.pdf"}] : [], more:false});
+    searchBox.value = "invioce";
+    key("Enter"); await sleep(100);
+    [...tree.querySelectorAll("button")].find(b => b.textContent === "Try invoice").click(); await sleep(100);
+    check("A spelling suggestion reruns the corrected query", searchBox.value === "invoice" && tree.textContent.includes("invoice.pdf"), tree.textContent);
+    key("Escape");
+
+    // Drive and network share catalogs have independent controls and scopes.
+    check("Setup leaves local drive indexing off and passes the choice", !document.querySelector("#setup-drive-index").checked &&
+      setupArgs().local_drives === false, "");
+    document.querySelector("#setup-drive-index").checked = true;
+    check("Setup can opt in to local drive indexing", setupArgs().local_drives === true, "");
+    document.querySelector("#setup-drive-index").checked = false;
+    check("Setup leaves network share indexing off", !document.querySelector("#setup-share-index").checked &&
+      setupArgs().network_shares === false, "");
+    document.querySelector("#setup-share-index").checked = true;
+    check("Setup can opt in to network share indexing", setupArgs().network_shares === true, "");
+    document.querySelector("#setup-share-index").checked = false;
+    const snapshotBeforeIndex = HOST_ANSWERS.snapshot;
+    const saveBeforeIndex = HOST_ANSWERS.save;
+    let indexSettings = {local_drives:false, network_shares:false, index_paused:false};
+    HOST_ANSWERS.snapshot = a => {
+      const s = snapshotBeforeIndex(a);
+      return s.search ? {...s, search:{...s.search, ...indexSettings}} : s;
+    };
+    HOST_ANSWERS.save = a => {
+      if (a.section === "search") Object.assign(indexSettings, a.value);
+      return null;
+    };
+    HOST_ANSWERS.drive_index_status = () => ({enabled:indexSettings.local_drives, paused:indexSettings.index_paused,
+      drives:[{drive:"C:\\",status:"Ready"}]});
+    show("general"); await sleep(80);
+    document.querySelector("#fd-local-drives").click(); await sleep(140);
+    check("General enables the local index and shows per-drive status", indexSettings.local_drives &&
+      document.querySelector("#fd-index-status").textContent.includes("Ready"), document.querySelector("#fd-index-status").textContent);
+    document.querySelector("#fd-index-paused").click(); await sleep(140);
+    check("General can pause indexing", indexSettings.index_paused &&
+      document.querySelector("#fd-index-status").textContent.includes("paused"), document.querySelector("#fd-index-status").textContent);
+    document.querySelector("#fd-index-paused").click(); await sleep(140);
+    document.querySelector("#fd-network-shares").click(); await sleep(140);
+    check("General can enable network share indexing", indexSettings.network_shares, "");
+    show("files");
+    const diskHit = {id:"local-hit",name:"catalog.pdf",path:"C:/data/catalog.pdf",local:"C:\\data\\catalog.pdf",placement:"here"};
+    HOST_ANSWERS.search_drives = {items:[diskHit], ready:1, more:false};
+    HOST_ANSWERS.search_shares = {items:[{...diskHit,id:"network-hit",path:"Z:/catalog.pdf",local:"Z:\\catalog.pdf",
+      placement:"on network share"}],ready:1,more:false};
+    HOST_ANSWERS.search_everywhere = {items:[diskHit, {id:"shared-hit",name:"catalog shared.pdf",path:"/catalog shared.pdf",
+      pair:"pair:Photos",placement:"not synced"}],ready:1,more:false};
+    for (const [scope, op] of [["pc", "search_drives"],["shares","search_shares"],["everywhere","search_everywhere"]]) {
+      const scopeBox = document.querySelector("#search-scope");
+      check(scope + " is offered after enabling the index", !scopeBox.querySelector("option[value=" + scope + "]").hidden, "");
+      scopeBox.value = scope;
+      searchBox.value = "catalog";
+      searchBox.dispatchEvent(new Event("input")); await sleep(300);
+      check(scope + " searches without the selected sync root", tree.textContent.includes("catalog.pdf") &&
+        HOST_CALLS.filter(m => m.op === op).at(-1)?.args.root === null, tree.textContent);
+      if (scope === "shares") {
+        [...tree.querySelectorAll(".search-result-name")].find(b => b.textContent === "catalog.pdf").click();
+        check("A network result opens through its mapped drive", HOST_CALLS.filter(m => m.op === "open_path").at(-1)?.args.path === "Z:\\catalog.pdf", "");
+      }
+    }
+    [...tree.querySelectorAll(".search-result-name")].find(b => b.textContent === "catalog shared.pdf").click();
+    check("Everywhere opens a shared result in its own pair", HOST_CALLS.filter(m => m.op === "open_in_onedrive").at(-1)?.args.root === "pair:Photos", "");
+    HOST_ANSWERS.snapshot = snapshotBeforeIndex;
+    HOST_ANSWERS.save = saveBeforeIndex;
+    await load();
+    document.querySelector("#search-scope").value = "root";
+    searchBox.focus(); key("Escape");
 
     // Memory view reads one scope and opens locations without opening files.
     const diskFile = {id:"11", name:"clip.mp4", bytes:800, location:"C:\\Sync\\Videos\\clip.mp4"};

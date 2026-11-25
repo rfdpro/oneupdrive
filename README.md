@@ -31,7 +31,8 @@ Same OneDrive cloud with a lighter, faster, and more careful engine that syncs w
 
 ## ✨ Features
 
-- 🪶 **Lightweight.** Uses under 100 MB of RAM while delivering maximum search and sync speeds.
+- 🪶 **Lightweight.** Uses under 100 MB of RAM.
+- 🔍 **File search.** Find files and folders across OneDrive with intelligent filtering or REGEX. Opt in to search your entire system and networked drives with our blazing fast indexing.
 - 🔒 **Private.** No tracking, no telemetry, no data collection.
 - ⚡ **Fast sync.** Our own indexing follows the NTFS change journal, like [Everything](https://www.voidtools.com/), instead of rescanning your folders every minute. When nothing changes, nothing changes.
 - ☁️ **Files On-Demand.** Files available only when you need them. Free up files you haven't used lately or keep them on your computer ready for a flight.

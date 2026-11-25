@@ -231,6 +231,36 @@ pub(crate) fn like_pattern(needle: &str) -> String {
 }
 
 impl Ops<'_> {
+    /// Visit stored descendants with paths relative to the starting folder.
+    pub fn visit_local_search(
+        &self,
+        root: u128,
+        mut visit: impl FnMut(String, LocalRow) -> Result<bool>,
+    ) -> Result<()> {
+        let cols = LOCAL_COLS.split(", ").map(|c| format!("child.{c}")).collect::<Vec<_>>().join(", ");
+        let mut st = self.c.prepare_cached(&format!(
+            "WITH RECURSIVE folders(id, path, depth) AS (
+                 SELECT file_id, '', 0 FROM local_item WHERE file_id = ?1 AND kind IN (1, 2) AND skip = 0 AND name_lossy = 0
+                 UNION ALL
+                 SELECT child.file_id, folders.path || child.name || '/', folders.depth + 1
+                 FROM folders JOIN local_item child ON child.parent_id = folders.id
+                 WHERE child.file_id != ?1 AND child.kind = 1 AND child.skip = 0 AND child.name_lossy = 0
+                 AND folders.depth < 32767
+                 ORDER BY 3 DESC
+             )
+             SELECT {cols}, folders.path || child.name AS search_path
+             FROM folders CROSS JOIN local_item child ON child.parent_id = folders.id
+             WHERE child.file_id != ?1 AND child.kind != 2"
+        ))?;
+        let mut rows = st.query([blob(root)])?;
+        while let Some(row) = rows.next()? {
+            if !visit(row.get("search_path")?, fix_local(LocalRow::from_row(row)?)?)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// The current scan's root, if any scan has started.
     pub fn local_root(&self) -> Result<Option<LocalRoot>> {
         let row = self
@@ -623,27 +653,34 @@ impl Ops<'_> {
     /// Path of a stored entry relative to the scanned folder ("/" for the
     /// root, "/a/b.txt" below it), built from parent links.
     pub fn local_path_of(&self, file_id: u128) -> Result<Option<String>> {
+        Ok(self.local_named_path_of(file_id)?.map(|(path, _)| path))
+    }
+
+    /// The stored path and whether every component can be addressed by name.
+    pub fn local_named_path_of(&self, file_id: u128) -> Result<Option<(String, bool)>> {
         let mut parts = Vec::new();
         let mut cur = file_id;
+        let mut addressable = true;
         // Bounded walk: NTFS paths can't nest deeper than ~16k components, and
         // a cycle (impossible unless the DB is corrupt) must not hang us.
         for _ in 0..32_768 {
-            let row: Option<(Option<Vec<u8>>, String, i64)> = self
+            let row: Option<(Option<Vec<u8>>, String, i64, bool)> = self
                 .c
-                .prepare_cached("SELECT parent_id, name, kind FROM local_item WHERE file_id = ?1")?
-                .query_row([blob(cur)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .prepare_cached("SELECT parent_id, name, kind, name_lossy FROM local_item WHERE file_id = ?1")?
+                .query_row([blob(cur)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .optional()?;
             match row {
                 None => return Ok(None),
-                Some((_, _, k)) if k == LocalKind::Root as i64 => {
+                Some((_, _, k, _)) if k == LocalKind::Root as i64 => {
                     parts.reverse();
-                    return Ok(Some(format!("/{}", parts.join("/"))));
+                    return Ok(Some((format!("/{}", parts.join("/")), addressable)));
                 }
-                Some((Some(p), name, _)) => {
+                Some((Some(p), name, kind, lossy)) => {
+                    addressable &= !lossy && kind != LocalKind::Link as i64;
                     parts.push(name);
                     cur = id_from_blob(&p);
                 }
-                Some((None, _, _)) => return Ok(None),
+                Some((None, _, _, _)) => return Ok(None),
             }
         }
         Err(Error::Corrupt(format!("local parent chain of {file_id:#x} too deep or cyclic")))

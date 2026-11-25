@@ -11,8 +11,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use oneup_store::search::{NameQuery, WordQuery};
 use oneup_store::{Kind, Store};
 use serde_json::{Value, json};
+
+pub mod browse;
+pub mod drives;
+pub mod saved;
+#[cfg(windows)]
+pub mod shares;
 
 pub use oneup_store::search::MIN_CHARS;
 
@@ -246,6 +253,33 @@ pub fn pattern(text: &str) -> Result<&str> {
     Ok(t)
 }
 
+#[derive(Clone, Copy)]
+pub enum MatchMode {
+    Text,
+    Words,
+    Regex,
+}
+
+/// Compile a name query before opening the store or building the index.
+pub fn name_query(text: &str, mode: MatchMode, drive: bool) -> Result<NameQuery<'_>> {
+    match mode {
+        MatchMode::Text => Ok(NameQuery::Text(if drive { pattern(text)? } else { text.trim() })),
+        MatchMode::Words => {
+            let words = WordQuery::new(text);
+            if drive && !words.can_use_index() {
+                bail!("include a word with at least {MIN_CHARS} characters");
+            }
+            Ok(NameQuery::Words(words))
+        }
+        MatchMode::Regex => {
+            if text.is_empty() {
+                bail!("enter a search pattern");
+            }
+            Ok(NameQuery::regex(text)?)
+        }
+    }
+}
+
 /// Opens the data folder's database and makes sure the index holds every
 /// item: on the first search after an upgrade (unless the agent got there
 /// first) that adds the items stored before, calling `progress` with the
@@ -292,22 +326,22 @@ pub fn build_index(store: &mut Store, mut keep_going: impl FnMut() -> bool) -> R
 /// Items in OneDrive whose name contains `text` (any case), up to `limit`,
 /// best matches first, each with its placement.
 pub fn find(dir: &Path, store: &Store, text: &str, limit: usize) -> Result<Found> {
-    find_matching(dir, store, &oneup_store::search::NameQuery::Text(pattern(text)?), None, limit)
+    find_matching(dir, store, &NameQuery::Text(pattern(text)?), None, limit)
 }
 
 pub fn find_matching(
     dir: &Path,
     store: &Store,
-    query: &oneup_store::search::NameQuery<'_>,
+    query: &NameQuery<'_>,
     folder: Option<bool>,
     limit: usize,
 ) -> Result<Found> {
-    use oneup_store::search::NameQuery;
     // Attributes as they are (AGENTS.md).
     oneup_cfapi::expose_placeholders()?;
     let pair = Pair::load(dir, store);
     let found = match query {
         NameQuery::Text(text) => store.read(|o| o.search_names_filtered(text, limit, folder))?,
+        NameQuery::Words(words) => store.read(|o| o.search_words(words, limit, folder))?,
         NameQuery::Regex(_) => store.read(|o| {
             let mut rows = o.remote_find_matching(query, folder, limit + 1)?;
             let more = rows.len() > limit;
@@ -388,29 +422,27 @@ pub async fn open_in_onedrive(graph: &oneup_graph::Graph, id: &str) -> Result<()
 
 /// [`Found`] as the window and `oneup find --json` give it.
 pub fn to_json(f: &Found) -> Value {
-    let items: Vec<Value> = f
-        .items
-        .iter()
-        .map(|i| {
-            json!({
-                "id": i.id,
-                "path": i.path,
-                "name": i.name,
-                "folder": i.folder,
-                "size": i.size,
-                "modified_ms": i.modified_ms,
-                "placement": i.placement.name(),
-                "rel": i.rel,
-                "local": i.local.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                "onedrive": i.by_onedrive,
-            })
-        })
-        .collect();
+    let items: Vec<Value> = f.items.iter().map(item_json).collect();
     json!({
         "items": items,
         "more": f.more,
         "too_many": f.too_many.then_some(TOO_MANY),
         "note": LIMIT_NOTE,
+    })
+}
+
+fn item_json(i: &Item) -> Value {
+    json!({
+        "id": i.id,
+        "path": i.path,
+        "name": i.name,
+        "folder": i.folder,
+        "size": i.size,
+        "modified_ms": i.modified_ms,
+        "placement": i.placement.name(),
+        "rel": i.rel,
+        "local": i.local.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "onedrive": i.by_onedrive,
     })
 }
 

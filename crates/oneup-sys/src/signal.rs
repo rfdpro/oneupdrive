@@ -13,7 +13,7 @@ fn full(name: &str) -> HSTRING {
 }
 
 /// The waiting side.
-pub struct Signal(HANDLE);
+pub struct Signal(pub(crate) HANDLE);
 
 // SAFETY: an event handle may be used and closed from any thread.
 unsafe impl Send for Signal {}
@@ -59,6 +59,18 @@ pub fn raise(name: &str) -> std::io::Result<bool> {
         r
     };
     r.map(|()| true).map_err(|e| std::io::Error::other(format!("SetEvent: {e}")))
+}
+
+/// Check for a named event without creating or raising it.
+pub fn present(name: &str) -> bool {
+    // SAFETY: the name is NUL-terminated. The returned handle is closed once.
+    unsafe {
+        OpenEventW(EVENT_MODIFY_STATE, false, &full(name))
+            .map(|h| {
+                let _ = CloseHandle(h);
+            })
+            .is_ok()
+    }
 }
 
 #[cfg(test)]

@@ -49,39 +49,75 @@
 //! either.
 
 use rusqlite::OptionalExtension;
+use rusqlite::types::{Value, ValueRef};
+
+use crate::{ITEM_COLS, Kind, Ops, RemoteRow, Result, Store, fix_kind};
 
 /// Filename query shared by the two Files search scopes.
 pub enum NameQuery<'a> {
     Text(&'a str),
+    Words(WordQuery),
     Regex(regex::Regex),
 }
 
-impl<'a> NameQuery<'a> {
-    pub fn new(text: &'a str, regex: bool) -> std::result::Result<Self, regex::Error> {
-        if regex {
-            regex::RegexBuilder::new(text).case_insensitive(true).size_limit(1 << 20).build().map(Self::Regex)
-        } else {
-            Ok(Self::Text(text))
+/// Substrings that must all occur in one name, in any order.
+pub struct WordQuery {
+    folded: Vec<String>,
+    indexed: Option<String>,
+}
+
+impl WordQuery {
+    pub fn new(text: &str) -> Self {
+        let mut folded: Vec<_> = text.split_whitespace().map(oneup_sync::fold).collect();
+        folded.sort_unstable();
+        folded.dedup();
+        Self { folded, indexed: match_terms(text.split_whitespace()) }
+    }
+
+    pub fn can_use_index(&self) -> bool {
+        self.indexed.is_some()
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        let name = oneup_sync::fold(name);
+        !self.folded.is_empty() && self.folded.iter().all(|term| name.contains(term))
+    }
+}
+
+impl NameQuery<'_> {
+    pub fn regex(text: &str) -> std::result::Result<Self, regex::Error> {
+        regex::RegexBuilder::new(text).case_insensitive(true).size_limit(1 << 20).build().map(Self::Regex)
+    }
+
+    fn like_pattern(&self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(crate::local::like_pattern(text)),
+            _ => None,
         }
     }
 
     pub(crate) fn sql_args(&self, limit: usize) -> (Option<String>, i64) {
-        match self {
-            Self::Text(text) => (Some(crate::local::like_pattern(text)), limit as i64),
-            Self::Regex(_) => (None, -1),
-        }
+        let pattern = self.like_pattern();
+        let sql_limit = if pattern.is_some() { limit as i64 } else { -1 };
+        (pattern, sql_limit)
     }
 
     pub(crate) fn matches(&self, name: &str) -> bool {
         match self {
             Self::Text(_) => true, // SQLite already matched it.
+            Self::Words(words) => words.matches(name),
             Self::Regex(re) => re.is_match(name),
         }
     }
-}
-use rusqlite::types::{Value, ValueRef};
 
-use crate::{ITEM_COLS, Ops, RemoteRow, Result, Store, fix_kind};
+    /// Match a name or a path when no SQL name prefilter has been applied.
+    pub fn matches_text(&self, text: &str) -> bool {
+        match self {
+            Self::Text(needle) => oneup_sync::fold(text).contains(&oneup_sync::fold(needle)),
+            _ => self.matches(text),
+        }
+    }
+}
 
 /// v17 -> v18: the name index, its queue and the triggers that fill the
 /// queue. A store with no items yet has nothing to build.
@@ -234,9 +270,16 @@ pub(crate) fn unpack(v: ValueRef<'_>, prefix: &str) -> Option<String> {
 /// The index query for `needle`: every trigram of it (as FTS5 strings),
 /// all required. `None` if it has none (too short).
 pub(crate) fn match_expr(needle: &str) -> Option<String> {
-    let chars: Vec<char> = needle.chars().collect();
-    let mut grams: Vec<String> = chars.windows(MIN_CHARS).map(|w| w.iter().collect()).collect();
-    grams.sort();
+    match_terms([needle])
+}
+
+pub(crate) fn match_terms<'a>(terms: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut grams: Vec<String> = Vec::new();
+    for term in terms {
+        let chars: Vec<char> = term.chars().collect();
+        grams.extend(chars.windows(MIN_CHARS).map(|w| w.iter().collect::<String>()));
+    }
+    grams.sort_unstable();
     grams.dedup();
     if grams.is_empty() {
         return None;
@@ -255,9 +298,9 @@ pub struct Hit {
 /// What a search found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Found {
-    /// Exact names first, then names starting with the needle, then the
-    /// rest; the latest added to the index first within each. Every exact
-    /// name comes before the rest, however many others match.
+    /// In contains-text search, exact names rank first, then names starting
+    /// with the needle, then other matches. Within each group and for
+    /// all-words search, the latest index entries come first.
     pub hits: Vec<Hit>,
     /// More items match than were returned.
     pub more: bool,
@@ -279,7 +322,70 @@ pub enum IndexState {
     Broken,
 }
 
+const REMOTE_SEARCH_FOLDERS: &str = "
+    WITH RECURSIVE folders(id, path, depth) AS (
+        SELECT id, '', 0 FROM remote_item WHERE id = ?1 AND kind IN (1, 2) AND is_excluded = 0
+        UNION ALL
+        SELECT child.id, folders.path || child.name || '/', folders.depth + 1
+        FROM folders JOIN remote_item child ON child.parent_id = folders.id
+        WHERE child.id != ?1 AND child.kind = 1 AND child.is_excluded = 0 AND folders.depth < 4095
+        ORDER BY 3 DESC
+    )";
+
 impl Ops<'_> {
+    /// Visit descendants of a stored folder, with their paths relative to
+    /// it. Queue folders only, and use the parent index for both the walk
+    /// and its entries. The caller may stop without collecting the tree.
+    pub fn visit_remote_search(
+        &self,
+        root: &str,
+        mut visit: impl FnMut(String, RemoteRow, bool) -> Result<bool>,
+    ) -> Result<()> {
+        let cols = ITEM_COLS.split(", ").map(|c| format!("child.{c}")).collect::<Vec<_>>().join(", ");
+        let mut st = self.c.prepare_cached(&format!(
+            "{REMOTE_SEARCH_FOLDERS}
+             SELECT {cols}, child.is_excluded, folders.path || child.name AS search_path
+             FROM folders CROSS JOIN remote_item child ON child.parent_id = folders.id
+             WHERE child.id != ?1 AND child.kind != 2"
+        ))?;
+        let mut rows = st.query([root])?;
+        while let Some(row) = rows.next()? {
+            if !visit(row.get("search_path")?, fix_kind(RemoteRow::from_row(row)?)?, row.get("is_excluded")?)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Matches below one remote folder ID. Walk folders via the parent index
+    /// so matches elsewhere in the drive never count toward the limit.
+    pub fn remote_find_in(
+        &self,
+        root: &str,
+        query: &NameQuery<'_>,
+        folder: Option<bool>,
+        limit: usize,
+    ) -> Result<Vec<(String, Kind, String)>> {
+        let mut st = self.c.prepare_cached(&format!(
+            "{REMOTE_SEARCH_FOLDERS}
+             SELECT folders.path, child.name, child.kind, child.id
+             FROM folders CROSS JOIN remote_item child ON child.parent_id = folders.id
+             WHERE child.id != ?1 AND child.kind != 2 AND (?2 IS NULL OR child.name LIKE ?2 ESCAPE '\\')
+             AND (?3 IS NULL OR (child.kind = 1) = ?3)",
+        ))?;
+        let mut rows = st.query(rusqlite::params![root, query.like_pattern(), folder])?;
+        let mut found = Vec::new();
+        while found.len() < limit {
+            let Some(row) = rows.next()? else { break };
+            let name: String = row.get(1)?;
+            if query.matches(&name) {
+                let parent: String = row.get(0)?;
+                found.push((format!("{parent}{name}"), Kind::try_from(row.get::<_, i64>(2)?)?, row.get(3)?));
+            }
+        }
+        Ok(found)
+    }
+
     pub fn search_state(&self) -> Result<IndexState> {
         if self.meta_get(BROKEN)?.is_some() {
             return Ok(IndexState::Broken);
@@ -426,25 +532,45 @@ impl Ops<'_> {
     /// [`Ops::search_names`], reading at most `cap` candidates.
     fn search_names_within(&self, needle: &str, limit: usize, cap: usize, folder: Option<bool>) -> Result<Found> {
         let Some(anywhere) = match_expr(needle) else { return Ok(Found::default()) };
-        let id_prefix = self.id_prefix()?;
         let folded = oneup_sync::fold(needle);
         // Exact names, then names starting with the needle, then the rest,
         // each a query of its own (the start and end marks make the first
         // two selective), the latest entries first within each. Each stops
         // once enough are found, so a common needle costs what it lists.
-        type Fits = fn(&str, &str) -> bool;
-        let passes: [(Option<String>, Fits); 3] = [
-            (match_expr(&format!("{START}{needle}{END}")), |name, n| name == n),
-            (match_expr(&format!("{START}{needle}")), |name, n| name.starts_with(n)),
-            (Some(anywhere), |name, n| name.contains(n)),
-        ];
+        let exact = match_expr(&format!("{START}{needle}{END}"));
+        let prefix = match_expr(&format!("{START}{needle}"));
+        let passes = [exact.as_deref(), prefix.as_deref(), Some(&anywhere)];
+        self.search_candidates(passes, limit, cap, folder, |pass, name| {
+            let name = oneup_sync::fold(name);
+            match pass {
+                0 => name == folded,
+                1 => name.starts_with(&folded),
+                _ => name.contains(&folded),
+            }
+        })
+    }
+
+    /// Newest index entries whose name contains every term, in any order.
+    pub fn search_words(&self, words: &WordQuery, limit: usize, folder: Option<bool>) -> Result<Found> {
+        self.search_candidates([words.indexed.as_deref()], limit, MAX_CANDIDATES, folder, |_, name| words.matches(name))
+    }
+
+    fn search_candidates<'a>(
+        &self,
+        passes: impl IntoIterator<Item = Option<&'a str>>,
+        limit: usize,
+        cap: usize,
+        folder: Option<bool>,
+        fits: impl Fn(usize, &str) -> bool,
+    ) -> Result<Found> {
+        let id_prefix = self.id_prefix()?;
         let mut taken: Vec<String> = Vec::new();
         let mut taken_ids = std::collections::HashSet::new();
         let mut too_many = false;
         let mut st = self.c.prepare_cached(CANDIDATES)?;
         let mut name_of =
             self.c.prepare_cached("SELECT name FROM remote_item WHERE id = ?1 AND (?2 IS NULL OR (kind = 1) = ?2)")?;
-        for (expr, fits) in passes {
+        for (pass, expr) in passes.into_iter().enumerate() {
             let Some(expr) = expr else { continue };
             let mut rows = st.query([&expr])?;
             let mut read = 0;
@@ -464,7 +590,7 @@ impl Ops<'_> {
                 else {
                     continue;
                 };
-                if fits(&oneup_sync::fold(&name), &folded) {
+                if fits(pass, &name) {
                     taken_ids.insert(id.clone());
                     taken.push(id);
                 }
@@ -668,11 +794,30 @@ mod tests {
         drive(&mut s);
         let indexed = s.read(|o| o.search_names_filtered("report", 1, Some(true))).unwrap();
         assert_eq!(indexed.hits[0].row.name, "Reports");
-        let pattern = NameQuery::new(r"^REPORT\.txt$", true).unwrap();
+        let pattern = NameQuery::regex(r"^REPORT\.txt$").unwrap();
         let matching = s.read(|o| o.remote_find_matching(&pattern, Some(false), 1)).unwrap();
         assert_eq!(matching[0].name, "report.txt");
         assert!(s.read(|o| o.remote_find_matching(&pattern, Some(true), 1)).unwrap().is_empty());
-        assert!(NameQuery::new("[", true).is_err());
+        assert!(NameQuery::regex("[").is_err());
+    }
+
+    #[test]
+    fn all_words_match_in_any_order_and_verify_short_terms_and_trigram_candidates() {
+        let mut s = Store::open_in_memory().unwrap();
+        drive(&mut s);
+        put(&mut s, 8, 2, "Travel", Kind::Folder);
+        put(&mut s, 9, 8, "Budget-24.pdf", Kind::File);
+        put(&mut s, 10, 8, "Budget-23.pdf", Kind::File);
+        put(&mut s, 11, 8, "bud udg dge get-24.pdf", Kind::File);
+        put(&mut s, 12, 8, "Budget-24.pdf folder", Kind::Folder);
+
+        let words = WordQuery::new("  PDF  24\tbudget ");
+        let found = s.read(|o| o.search_words(&words, 1, Some(false))).unwrap();
+        assert_eq!(found.hits[0].row.name, "Budget-24.pdf");
+        assert!(!found.more);
+        let scoped = s.read(|o| o.remote_find_in(&id(2), &NameQuery::Words(words), Some(false), 1)).unwrap();
+        assert_eq!(scoped, [("Travel/Budget-24.pdf".into(), Kind::File, id(9))]);
+        assert!(!WordQuery::new("q2 24").can_use_index());
     }
 
     /// The executor's write that doesn't wait for the database applies

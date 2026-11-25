@@ -138,7 +138,7 @@ pub fn start_identity_move(tray_args: &[std::ffi::OsString]) -> Result<()> {
 /// COM helper, which Windows ends with everything in it: an agent or icon
 /// started from there must not go with it.
 #[cfg(windows)]
-fn spawn_outside_job(cmd: &mut std::process::Command, flags: u32) -> std::io::Result<std::process::Child> {
+pub(crate) fn spawn_outside_job(cmd: &mut std::process::Command, flags: u32) -> std::io::Result<std::process::Child> {
     use std::os::windows::process::CommandExt as _;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     match cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB).spawn() {

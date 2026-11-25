@@ -139,7 +139,11 @@ pub fn snapshot(dir: &Path) -> Result<Value> {
         "experimental": config::load_experimental(dir)?,
         "office_opener": { "registered": crate::officeopen::is_registered(), "defaults": crate::officeopen::defaults() },
         "priority": { "first": first, "last": last },
-        "search": { "onedrive": search.onedrive, "hotkey": search.hotkey },
+        "search": {
+            "onedrive": search.onedrive, "hotkey": search.hotkey,
+            "local_drives": search.local_drives, "network_shares": search.network_shares,
+            "index_paused": search.index_paused
+        },
         "databases": databases_json(dir)?,
         "sync": { "interval_minutes": interval.minutes, "keep_push": interval.keep_push },
         "network": network_json(dir, &a)?,
@@ -725,6 +729,15 @@ pub fn search_with(mut s: config::Search, v: &Value) -> Result<config::Search> {
             crate::search::Hotkey::parse(h)?.to_string()
         };
     }
+    if let Some(v) = get(v, "local_drives") {
+        s.local_drives = v.as_bool().context("local_drives: on or off")?;
+    }
+    if let Some(v) = get(v, "network_shares") {
+        s.network_shares = v.as_bool().context("network_shares: on or off")?;
+    }
+    if let Some(v) = get(v, "index_paused") {
+        s.index_paused = v.as_bool().context("index_paused: on or off")?;
+    }
     Ok(s)
 }
 
@@ -1165,10 +1178,17 @@ pub fn save(dir: &Path, section: &str, v: &Value) -> Result<()> {
             config::save_updates(dir, &u)
         }
         "search" => {
-            let s = search_with(config::load_search(dir)?, v)?;
+            let before = config::load_search(dir)?;
+            let s = search_with(before.clone(), v)?;
             config::save_search(dir, &s)?;
             // The icon in the notification area holds the hotkey.
             crate::tray::settings_changed(dir);
+            if s.local_drives != before.local_drives
+                || s.network_shares != before.network_shares
+                || s.index_paused != before.index_paused
+            {
+                crate::search::drives::wake(dir)?;
+            }
             Ok(())
         }
         "priority" => {

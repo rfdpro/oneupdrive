@@ -30,7 +30,7 @@ Applying is defensive, because a wrong removal is the one thing FTS5 punishes: r
 ## Building it once
 A store from before the index has items without a number. `Store::search_build` numbers and indexes them in steps of 20,000 items, each its own short transaction, walking `remote_item` by key from where the last step stopped (`meta` `search.build_after`), so other programs' writes wait a fraction of a second at most: 10 s for 1M items, 56 s for 3M. The agent does it when it starts, before its first round; before every step (the first included) it checks that it isn't paused in both directions or stopping, and stops there if it is; a search made before it's done finishes the build first (the window shows the count). Items added meanwhile are indexed by the triggers already.
 
-After that, nothing reads the whole tree: upkeep costs what changes, and a search costs the index lookup plus one lookup by key per candidate. `index_upkeep_and_search_never_scan_the_tree` checks the query plan of every statement the index runs; `once_built_upkeep_reads_no_whole_table` and the mirror's `an_update_reads_no_whole_table` record what runs and check none of it scans a table that grows with the drive.
+After the build, index upkeep reads only the changes. An indexed search uses the index and looks up each candidate by key. `index_upkeep_and_search_never_scan_the_tree` checks the query plans. `once_built_upkeep_reads_no_whole_table` and the mirror's `an_update_reads_no_whole_table` record the queries and check for scans of tables that grow with the drive.
 
 ## Results
 **Ranking** (`Ops::search_names`): exact names first, then names starting with the needle, then the rest, the latest added to the index first within each. Three queries in that order: the needle between both marks, after the start mark, and alone. The first two are selective (a name must start, and end, with the needle's letters), so every exact name comes first however many newer names merely contain the needle. Each query stops once enough are found (50 by default, and one more to know there are more), so a common needle costs what it lists. A query reads at most 20,000 candidates; one that stops there without enough says so ("Too many matches. Type more.") rather than "Nothing found", since later candidates may hold real matches. Reading every candidate and ranking the best instead took 100 to 130 ms for common needles at 3M items.
@@ -39,7 +39,17 @@ After that, nothing reads the whole tree: upkeep costs what changes, and a searc
 
 `oneup_app::search::find` turns hits into results: the item's path in OneDrive (`path_of`) and its **placement**: *in OneDrive* for a package (a OneNote notebook, the Personal Vault), which is never synced ([planner.md](planner.md)) and has only **Open in OneDrive** (its web page, `open_in_onedrive`); *excluded* for an excluded folder or a path the rules leave out; *not synced* outside the synced folder; otherwise from the item's attributes on this PC (*online-only* by the recall-on-data-access attribute, *here*, or *not here yet* when it's absent). Attributes only, after `expose_placeholders`, so looking never downloads a file. Items with no copy on this PC (in OneDrive, excluded, not synced) offer **Open in OneDrive**.
 
-The needle must have three characters: the trigram tokenizer gives a shorter query no terms, and a scan of every name would take about a second at 3M items, too slow to run as someone types.
+**All words** splits the query on whitespace. OneDrive scope intersects the trigrams from every term of at least three characters, then checks every term against each folded candidate name, including shorter terms. At least one term must supply trigrams. Matches follow index insertion order, newest first, with the same candidate cap as contains-text search. Regex search streams names on explicit submit and stops at the result limit.
+
+**Synced folder** combines matches from the selected pair's Local and Remote trees. The remote query starts at the paired folder's stored ID and follows the parent index. It applies the result limit to matches within that subtree. The result list merges matching relative paths from both trees and includes local files that are waiting to upload.
+
+### Path and metadata search
+
+`oneup_app::search::browse` handles folder scope, path words, metadata filters, and alternate sorts. These searches run on submit. A folder scope checks the listed IDs and their stored paths before walking the subtree. The walk reads the Local and Remote trees through their parent indexes in one SQLite snapshot. It uses the local row for duplicated paths in a synced pair. OneDrive scope keeps cloud metadata and uses the stored local row for availability filters. Search uses stored metadata and reads no file contents.
+
+The search retains the best requested results and one extra match in a bounded heap. **Load more** requests a longer prefix in steps of 50, with a 500-result limit. A submitted one-word search can suggest a filename word one edit away, including an adjacent transposition. It uses the same scope and metadata filters.
+
+Saved searches live in the window's state database under `ui.saved_searches`. Adding, replacing, and removing a preset each use one transaction. Running a saved search uses the current snapshot.
 
 ## OneDrive's search inside files
 Opt-in, because it sends the search text to Microsoft: Graph's documented `search(q='…')` below the drive's root, one page of up to 200 results. For an extra pair the client is scoped like the pair's agent (`oneup_app::search::graph`, `pairs::scoped`): the search covers the pair's OneDrive folder only, in another person's drive for a shared folder, and **Open in OneDrive** asks that drive for the item's page. The settings window calls it only on **Search** or Enter, and its handler refuses unless `[search] onedrive` is on; `oneup find --onedrive` is the person's choice for that one search. Results the mirror holds get their path and placement from it; the others (inside an excluded folder, or newer than the last check) are placed by the path OneDrive gives and the rules, like any other result (*not here yet* when OneDrive gives no path). The request is labelled: its errors and log lines name it "OneDrive search", never its URL (which holds the text), errors leave out OneDrive's reply (which may repeat it), and it isn't retried after a network error, whose log line would otherwise carry the URL.
@@ -49,7 +59,23 @@ Opt-in, because it sends the search text to Microsoft: Graph's documented `searc
 
 ## Limits
 * **Excluded subtrees** are one opaque row in the mirror, never listed, so nothing inside them is found; every result list says so. The excluded folder itself is found.
-* **Only the Remote tree** is indexed: a file on this PC that hasn't been uploaded yet isn't found.
+* **Synced folder** searches its Local tree directly. Files waiting to upload appear in Synced folder and in indexed local drive results.
 * **Folding:** FTS5 folds case its own way (Unicode lower case) and results are checked with `oneup_sync::fold` (simple upper case per character). Where they disagree (the Kelvin sign, say) a name may not be found; diacritics count (`cafe` doesn't find `café`).
 * **Order:** by how recently an item entered the index, not by when it changed: an upgraded store's existing items all count as newer than ones added before the build reached them.
 * Dropping a `contentless_unindexed` FTS5 table leaves its `_content` table behind; a schema change that removes the index must drop that too.
+
+## Local volume catalog
+
+The opt-in worker maintains a database for each fixed NTFS or ReFS drive with an accessible USN journal. A drive letter, volume serial, and root file ID identify the catalog. The database lives under the profile's drive-index directory and never supplies sync state.
+
+The metadata scanner takes a journal bookmark before its first pass. The observer applies later journal records in bounded batches. The worker waits on a settings-change event between minute-spaced catch-ups. Queries check the bookmark against the live journal before and after reading results. An unreadable journal, a changed journal ID, or a cursor outside the retained range hides the catalog. Lost journal history calls for a fresh scan. Search settings control pause, and the worker uses the configured agent priority.
+
+Triggers record changed file IDs in a durable queue. The worker uses set-based SQLite writes to apply bounded batches to a contentless trigram index, with a separate row-number mapping for 128-bit file IDs. Search verifies each indexed name against the current row and rechecks the live file identity and parent directory access before displaying a result. The scanner skips protected roots by ID and skips unpopulated Cloud Files folders. The query refuses catalogs built with an old protected-root set.
+
+## Mapped network shares
+
+A separate opt-in setting discovers the current Windows session's mapped UNC targets. Each mapping has its own name catalog under the profile's share-index directory. It is keyed by drive letter and UNC target. The worker opens a subtree notification watch before scanning and applies changes collected during the scan before marking the catalog available. A disk-backed queue bounds folder traversal. The worker handles changed names and security notifications by rechecking the named entry or subtree. The catalog stores paths and names. Results check folder access and read current file metadata from the share.
+
+Queries require a live watch-session marker for the current root identity. A disconnect, remap, pause, worker restart, or lost notification stream invalidates the session. Reconnecting starts a new snapshot because the share has no replayable journal. The scanner skips reparse points, recall-on-access entries, and protected local roots identified through the share. Servers must supply extended directory metadata, file IDs, and Windows subtree notifications. [Windows subtree notifications](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-readdirectorychangesw)
+
+Everywhere interleaves results from local volumes, mapped shares, and configured OneDrive mirrors. It collapses copies with the same local path and repeated remote IDs. Each OneDrive result retains the pair needed to open it.

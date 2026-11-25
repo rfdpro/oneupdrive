@@ -116,6 +116,7 @@ mod win {
                 }
             }
         }
+        let _ = oneup_app::search::drives::wake(&dir);
         let icon = Tray::new()?;
         let shared =
             Arc::new(Mutex::new(Shared { view: View::Connecting, failure: None, update: None, search_changed: false }));

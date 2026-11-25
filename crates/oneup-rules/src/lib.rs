@@ -49,6 +49,7 @@ pub struct ExcludeSet {
     folder_names: BTreeMap<String, String>,
     /// Wildcard patterns: folded, as shown, and compiled.
     globs: Vec<(String, String, NameGlob)>,
+    folder_ids: Vec<u128>,
 }
 
 impl ExcludeSet {
@@ -102,7 +103,19 @@ impl ExcludeSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.folder_names.is_empty() && self.globs.is_empty()
+        self.folder_names.is_empty() && self.globs.is_empty() && self.folder_ids.is_empty()
+    }
+
+    /// Root identities to skip in a local metadata catalog.
+    pub fn with_folder_ids(mut self, mut ids: Vec<u128>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        self.folder_ids = ids;
+        self
+    }
+
+    pub fn excludes_folder_id(&self, id: u128) -> bool {
+        self.folder_ids.binary_search(&id).is_ok()
     }
 
     /// The names and wildcards, lower-cased and sorted.
@@ -125,7 +138,8 @@ impl ExcludeSet {
         // skipped under v2 may now be listed, or the reverse. An empty set
         // matches nothing either way, so it keeps its v2 fingerprint: a data
         // folder without folder rules has nothing to re-evaluate.
-        if all.is_empty() { "v2:folders=".into() } else { format!("v3:folders={}", all.join("/")) }
+        let names = if all.is_empty() { "v2:folders=".into() } else { format!("v3:folders={}", all.join("/")) };
+        if self.folder_ids.is_empty() { names } else { format!("{names};ids={:?}", self.folder_ids) }
     }
 }
 

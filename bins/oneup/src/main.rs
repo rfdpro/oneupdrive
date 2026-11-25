@@ -321,21 +321,7 @@ enum Cmd {
     },
     /// Find files and folders in your OneDrive by name, online-only ones
     /// too, and show where each is
-    Find {
-        /// What the name contains, in any case (at least 3 characters)
-        #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
-        /// How many to list at most
-        #[arg(long, default_value_t = oneup_app::search::DEFAULT_LIMIT)]
-        limit: usize,
-        /// Also search inside files with OneDrive's search (sends the search
-        /// text to Microsoft)
-        #[arg(long)]
-        onedrive: bool,
-        /// Print the results as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Find(find::Options),
     /// Show or change search settings (config.toml [search]); to search,
     /// use `oneup find`
     Search {
@@ -346,7 +332,18 @@ enum Cmd {
         /// Keys that open search from anywhere (e.g. Ctrl+Alt+F), or `off`
         #[arg(long, value_name = "KEYS|off")]
         hotkey: Option<String>,
+        /// Index file and folder names on fixed local drives
+        #[arg(long, value_enum)]
+        local_drives: Option<Toggle>,
+        /// Index file and folder names on mapped network shares
+        #[arg(long, value_enum)]
+        network_shares: Option<Toggle>,
+        /// Pause or resume drive and network share indexing
+        #[arg(long, value_enum)]
+        pause_index: Option<Toggle>,
     },
+    #[command(hide = true)]
+    DriveIndexWorker,
     /// List files with the same content, most space saved first; or remove
     /// the copies you choose
     Duplicates {
@@ -2221,12 +2218,16 @@ async fn run() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Find { text, limit, onedrive, json } => {
-            find::run(&data_dir(&cli)?, cli.client_id.as_deref(), &text.join(" "), *limit, *onedrive, *json).await
-        }
-        Cmd::Search { onedrive, hotkey } => {
-            find::settings(&data_dir(&cli)?, onedrive.map(Toggle::on), hotkey.as_deref())
-        }
+        Cmd::Find(args) => find::run(&data_dir(&cli)?, cli.client_id.as_deref(), args).await,
+        Cmd::Search { onedrive, hotkey, local_drives, network_shares, pause_index } => find::settings(
+            &data_dir(&cli)?,
+            onedrive.map(Toggle::on),
+            hotkey.as_deref(),
+            local_drives.map(Toggle::on),
+            network_shares.map(Toggle::on),
+            pause_index.map(Toggle::on),
+        ),
+        Cmd::DriveIndexWorker => oneup_app::search::drives::worker(&data_dir(&cli)?),
         Cmd::Duplicates { cmd, json, count, after, hash_local, max_files } => {
             let dir = data_dir(&cli)?;
             let store = open_store(&cli, MemoryProfile::Balanced)?;
