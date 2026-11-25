@@ -245,9 +245,8 @@ fn done_detail(op: &Op) -> &'static str {
     }
 }
 
-/// After the round: a restore that ran is done; one skipped or failed is
-/// dropped and says why; one that didn't run (a safety stop, a pause)
-/// waits for the next round.
+/// A restore that didn't run or lost its connection keeps its original
+/// preconditions and waits. Other outcomes are recorded in Activity.
 pub fn ran(store: &mut Store, q: &Queued, report: &oneup_exec::Report) -> Result<()> {
     if q.asked.is_empty() {
         return Ok(());
@@ -274,6 +273,14 @@ pub fn ran(store: &mut Store, q: &Queued, report: &oneup_exec::Report) -> Result
                 let why = format!("not restored: {}", crate::sync::skip_label(*s));
                 log.push(entry(ActivityOutcome::Failed, a.path.clone(), why));
             } else if let Some((_, e)) = report.failed.iter().find(|(o, _)| *o == a.op) {
+                if e.connection {
+                    log.push(entry(
+                        ActivityOutcome::Waiting,
+                        a.path.clone(),
+                        "Restore will retry after reconnecting.".into(),
+                    ));
+                    continue;
+                }
                 log.push(entry(ActivityOutcome::Failed, a.path.clone(), format!("not restored: {e}")));
             } else {
                 continue;
@@ -290,6 +297,31 @@ pub fn ran(store: &mut Store, q: &Queued, report: &oneup_exec::Report) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disconnected_restore_waits_with_its_original_precondition() {
+        let mut store = Store::open_in_memory().unwrap();
+        let op = Op::rewind(
+            7,
+            Step::RevertTo {
+                remote: RemotePre { id: RemoteId("A!1".into()), etag: "e1".into() },
+                version: "3.0".into(),
+            },
+        );
+        let asked = Asked { op: op.clone(), path: "/a.txt".into() };
+        ask(&mut store, asked.clone()).unwrap();
+        let q = queued(&store).unwrap();
+        let report = oneup_exec::Report {
+            failed: vec![(op.clone(), oneup_exec::Failure { message: "connection lost".into(), connection: true })],
+            ..Default::default()
+        };
+        ran(&mut store, &q, &report).unwrap();
+        assert_eq!(store.read(waiting).unwrap(), [asked]);
+
+        let report = oneup_exec::Report { skipped: vec![(op, oneup_exec::Skip::Changed)], ..Default::default() };
+        ran(&mut store, &q, &report).unwrap();
+        assert!(store.read(waiting).unwrap().is_empty());
+    }
 
     #[test]
     fn a_queued_restore_reads_back_as_the_same_step() {

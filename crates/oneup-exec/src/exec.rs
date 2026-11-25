@@ -22,7 +22,7 @@ use oneup_sync::{
 };
 
 use crate::blocking::{Jobs, OffTask, Settle};
-use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Replaced, VersionMark};
+use crate::cloud::{Cloud, CloudError, Hashing, Meta, MetaDone, Replaced, Source, VersionMark};
 use crate::schedule::{Claims, Held, Node, Parallel};
 use crate::timing::Timings;
 
@@ -233,6 +233,15 @@ struct Rescue {
     tries: u32,
     /// When it was given up (Unix ms), after [`RESCUE_TRIES`] such rounds.
     given_up_ms: Option<i64>,
+}
+
+struct UploadTarget<'a> {
+    parent: Sid,
+    to: &'a RemoteId,
+    name: &'a str,
+    replace: Option<&'a RemotePre>,
+    size: i64,
+    modified_ms: Option<i64>,
 }
 
 fn mark_json(m: &VersionMark) -> serde_json::Value {
@@ -980,6 +989,73 @@ impl<C: Cloud> Executor<C> {
         &self.fs
     }
 
+    /// Records what a session may replace before it starts, then records
+    /// which version it committed so recovery can identify a concurrent edit.
+    async fn upload_with_rescue(
+        &self,
+        store: &Db<'_>,
+        target: UploadTarget<'_>,
+        src: &mut dyn Source,
+    ) -> Res<(RemoteRow, Option<Hash>, Option<Rescue>)> {
+        let UploadTarget { parent, to, name, replace, size, modified_ms } = target;
+        let mut rescue = None;
+        if let Some(pre) = replace
+            && let Some(mark) = self.cloud.version_mark(pre, size).await?
+        {
+            let r = Rescue {
+                id: pre.id.0.clone(),
+                mark,
+                theirs: None,
+                parent,
+                to: to.0.clone(),
+                name: name.to_string(),
+                etag: pre.etag.clone(),
+                ours_etag: None,
+                ours: None,
+                tries: 0,
+                given_up_ms: None,
+            };
+            store.write_ahead(|o| Ok::<_, Fail>(o.meta_set_ahead(&r.key(), &r.to_json())?)).await?;
+            self.crash_point()?;
+            rescue = Some(r);
+        }
+        let (row, sent) = match self.cloud.upload_at(to, name, replace, size, src, modified_ms).await {
+            Err(CloudError::Io(e)) if oneup_effects::ChangedMeanwhile::is(&e) => return Err(Fail::Skip(Skip::Changed)),
+            r => r?,
+        };
+        if let Some(r) = &mut rescue {
+            self.crash_point()?;
+            r.ours = match self.cloud.uploaded_version(&RemoteId(r.id.clone()), row.etag.as_deref()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "an upload's version couldn't be read");
+                    None
+                }
+            };
+            r.ours_etag.clone_from(&row.etag);
+            store.write_ahead(|o| Ok::<_, Fail>(o.meta_set_ahead(&r.key(), &r.to_json())?)).await?;
+        }
+        Ok((row, sent, rescue))
+    }
+
+    /// Called after recording the operation. The edit's rescue can wait
+    /// without making the original operation fail.
+    async fn finish_rescue(&self, store: &Db<'_>, rescue: Option<Rescue>, notes: &mut Notes) -> Res {
+        let Some(r) = rescue else { return Ok(()) };
+        self.crash_point()?;
+        match self.rescue_recorded(store, &r.key(), r).await {
+            RescueEnd::Kept(copy) => notes.theirs = Some(copy),
+            RescueEnd::Nothing => {}
+            RescueEnd::Waits(why) => {
+                notes.theirs_not_kept =
+                    Some(format!("{why}; kept as a new file once it can be, tried again next round"));
+            }
+            RescueEnd::GaveUp(name) => notes.given_up = Some(name),
+            RescueEnd::Halt(m) => notes.halt = Some(m),
+        }
+        Ok(())
+    }
+
     /// Keeps the edit an upload may have gone over (`r`, recorded under
     /// `key`): finds it, unless `r` already names it, and uploads it as a
     /// new file next to the file, named as conflict copies are (only a free
@@ -1134,7 +1210,8 @@ impl<C: Cloud> Executor<C> {
         // Free on both sides, so the copy comes here under the same name.
         // Each name is looked up on its own: listing the folder would load
         // every item in it, and a folder can hold millions.
-        let local = store.read(|o| Ok(o.synced_get(parent)?.and_then(|b| b.local)))?;
+        let local = store
+            .read(|o| Ok(o.synced_get(parent)?.filter(|b| b.remote.as_ref() == Some(to)).and_then(|b| b.local)))?;
         let free = |o: &Ops<'_>, copy: &str| -> oneup_store::Result<bool> {
             if !o.remote_named(&to.0, copy)?.is_empty() {
                 return Ok(false);
@@ -1949,76 +2026,23 @@ impl<C: Cloud> Executor<C> {
                     None => return Err(Fail::Skip(Skip::Changed)),
                 };
                 let copied = self.copy_instead(store, &mut src, size, to, name, replace.is_none()).await?;
-                let (row, sent, sent_len, mark) = match copied {
+                let (row, sent, sent_len, rescue) = match copied {
                     Some((row, hash)) => {
                         notes.copied = true;
                         (row, hash, u64::try_from(size).unwrap_or(0), None)
                     }
                     None => {
-                        // What the replacement goes over, to check afterwards.
-                        let mark = match replace {
-                            Some(pre) => self.cloud.version_mark(pre, size).await?,
-                            None => None,
+                        let target = UploadTarget {
+                            parent: *parent,
+                            to,
+                            name,
+                            replace: replace.as_ref(),
+                            size,
+                            modified_ms: Some(unix_ms(mtime)),
                         };
-                        // Written ahead, durably: whatever happens from here
-                        // (a failure, the process killed, a power cut), the
-                        // edit the upload may go over is looked for until
-                        // it's kept or shown not to be there.
-                        if let (Some(pre), Some(mark)) = (replace, &mark) {
-                            let r = Rescue {
-                                id: pre.id.0.clone(),
-                                mark: mark.clone(),
-                                theirs: None,
-                                parent: *parent,
-                                to: to.0.clone(),
-                                name: name.clone(),
-                                etag: pre.etag.clone(),
-                                ours_etag: None,
-                                ours: None,
-                                tries: 0,
-                                given_up_ms: None,
-                            };
-                            store.write_ahead(|o| Ok::<_, Fail>(o.meta_set_ahead(&r.key(), &r.to_json())?)).await?;
-                            self.crash_point()?;
-                        }
-                        let uploaded = self
-                            .cloud
-                            .upload_at(to, name, replace.as_ref(), size, &mut src, Some(unix_ms(mtime)))
-                            .await;
-                        let (row, sent) = match uploaded {
-                            Err(CloudError::Io(e)) if oneup_effects::ChangedMeanwhile::is(&e) => {
-                                return Err(Fail::Skip(Skip::Changed));
-                            }
-                            r => r?,
-                        };
-                        // The version the upload is, for the rescue record:
-                        // written durably before anything else, so whatever
-                        // happens next, the edit it may have gone over is told
-                        // apart from a later save. Not found: the record stays
-                        // without it (nothing is kept from a guess).
-                        if let (Some(pre), Some(m)) = (replace, &mark) {
-                            self.crash_point()?;
-                            let ours = match self.cloud.uploaded_version(&pre.id, row.etag.as_deref()).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "an upload's version couldn't be read");
-                                    None
-                                }
-                            };
-                            let key = format!("{}.{}.{}", Rescue::KEY, pre.id.0, m.id);
-                            store
-                                .write_ahead(|o| {
-                                    if let Some(mut r) = o.meta_get(&key)?.as_deref().and_then(Rescue::parse) {
-                                        r.ours_etag.clone_from(&row.etag);
-                                        r.ours = ours;
-                                        o.meta_set_ahead(&key, &r.to_json())?;
-                                    }
-                                    Ok::<_, Fail>(())
-                                })
-                                .await?;
-                        }
+                        let (row, sent, rescue) = self.upload_with_rescue(store, target, &mut src).await?;
                         // In the cloud's terms (see `cloud`): what it sent, if it transformed it.
-                        (row, sent.unwrap_or_else(|| src.hash.finalize()), src.hash.len(), mark)
+                        (row, sent.unwrap_or_else(|| src.hash.finalize()), src.hash.len(), rescue)
                     }
                 };
                 self.crash_point()?;
@@ -2063,32 +2087,7 @@ impl<C: Cloud> Executor<C> {
                         tracing::debug!(error = %e, "an uploaded file wasn't marked in sync");
                     }
                 }
-                // The upload is done and recorded from here on, whatever
-                // happens to the version it may have gone over: one that
-                // isn't kept is reported on its own (it's still in the
-                // file's version history), not as the upload failing, which
-                // would leave it out of what the round did.
-                if let (Some(pre), Some(mark)) = (replace, mark) {
-                    self.crash_point()?;
-                    let key = format!("{}.{}.{}", Rescue::KEY, pre.id.0, mark.id);
-                    // Unreadable now: the record stays, and the next round
-                    // tries it (the upload itself is done).
-                    let r = store.read(|o| o.meta_get(&key)).ok().flatten();
-                    match r.as_deref().and_then(Rescue::parse) {
-                        None => tracing::warn!("an upload's rescue record couldn't be read; tried next round"),
-                        Some(r) => match self.rescue_recorded(store, &key, r).await {
-                            RescueEnd::Kept(copy) => notes.theirs = Some(copy),
-                            RescueEnd::Nothing => {}
-                            RescueEnd::Waits(why) => {
-                                notes.theirs_not_kept =
-                                    Some(format!("{why}; kept as a new file once it can be, tried again next round"));
-                            }
-                            RescueEnd::GaveUp(name) => notes.given_up = Some(name),
-                            RescueEnd::Halt(m) => notes.halt = Some(m),
-                        },
-                    }
-                }
-                Ok(())
+                self.finish_rescue(store, rescue, notes).await
             }
             // Files On-Demand: a placeholder instead of the content (no
             // download, nothing written into the sync folder).
@@ -2652,7 +2651,7 @@ impl<C: Cloud> Executor<C> {
                     _ => Err(odd()),
                 }
             }
-            Op::Rewind { sid, step } => self.rewind(store, a, *sid, step).await,
+            Op::Rewind { sid, step } => self.rewind(store, a, *sid, step, notes).await,
             Op::Hold { .. } => Err(Fail::Failed("a held item can't be executed".into())),
         }
     }

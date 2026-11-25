@@ -525,9 +525,18 @@ const DRIVER: &str = r##"<script>
     await loadSharing();
     check("another account never uses the previous Sharing results", sharingReads === 4, sharingReads);
 
-    // Recovery: focus follows the rewind's list and answers.
+    // Recovery keeps independent tasks, with keyboard navigation and exact review codes.
     window.confirm = () => true;
-    document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);
+    const recoveryEntry = HOST_CALLS.length;
+    document.querySelector('nav [data-page="recovery"]').click(); await sleep(100);
+    check("Recovery opens kept copies and only loads the selected view",
+      document.querySelector("#rc-tab-kept").getAttribute("aria-selected") === "true" &&
+      HOST_CALLS.slice(recoveryEntry).filter(m => ["rewind_state", "conflicts", "cloud_bin", "kept"].includes(m.op))
+        .map(m => m.op).join(",") === "kept", "");
+    document.querySelector("#rc-tab-kept").focus(); key("ArrowRight"); await sleep(100);
+    check("Recovery arrows select the next tab and hide the previous panel",
+      document.activeElement.id === "rc-tab-deleted" && document.querySelector("#rc-panel-kept").hidden &&
+      !document.querySelector("#rc-panel-deleted").hidden, at());
     const recoveryScroll = document.querySelector("#main");
     const recoveryBottom = document.querySelector("#rc-bin");
     const tallRecovery = document.createElement("div");
@@ -535,59 +544,128 @@ const DRIVER: &str = r##"<script>
     recoveryBottom.before(tallRecovery);
     recoveryScroll.scrollTop = recoveryScroll.scrollHeight;
     window.scrollTo(0, 300);
-    check("Recovery scrolls to its last card inside the main pane", recoveryScroll.scrollTop > 0 && window.scrollY === 0 &&
+    check("Recovery scrolls its content inside the main pane", recoveryScroll.scrollTop > 0 && window.scrollY === 0 &&
       recoveryBottom.getBoundingClientRect().bottom <= recoveryScroll.getBoundingClientRect().bottom,
       [recoveryScroll.scrollTop, window.scrollY]);
     show("lists");
     check("switching away from Recovery resets the main scroll", recoveryScroll.scrollTop === 0, recoveryScroll.scrollTop);
     tallRecovery.remove();
-    show("recovery");
-    await sleep(100);
+    const restore = document.querySelector("#rc-bin button");
+    check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore?.outerHTML);
+    show("recovery"); await sleep(100);
+    const binRestore = document.querySelector("#rc-bin button");
+    binRestore.focus(); binRestore.click(); await sleep(100);
+    check("queuing a restore keeps focus and shows a lasting receipt",
+      document.activeElement === binRestore && binRestore.textContent === "Queued" &&
+      document.querySelector("#rc-message").textContent.includes("/Docs/gone.txt"), at());
+    const restoreCalls = HOST_CALLS.filter(m => m.op === "cloud_bin_restore").length;
+    binRestore.click();
+    check("a queued row cannot submit twice", HOST_CALLS.filter(m => m.op === "cloud_bin_restore").length === restoreCalls, "");
+    document.querySelector("#rc-activity").click();
+    check("the restore receipt links to recent Activity", document.querySelector("#lists").classList.contains("on") &&
+      document.querySelector('#ls-tabs [data-tab="log"]').getAttribute("aria-pressed") === "true", at());
+
     HOST_ANSWERS.conflicts = Array.from({length: 26}, (_, i) => ({
       path: "/conflict-" + i + ".txt", copy_path: "/copy-" + i + ".txt",
       original: {size: 20}, copy: {size: 30}, original_ms: 1, copy_ms: 2
     }));
     HOST_ANSWERS.kept = Array.from({length: 26}, (_, i) => ({id: i, name: "kept-" + i, bytes: 20, at_ms: 1}));
-    await loadRecovery();
-    await sleep(100);
-    check("Recovery shows one page of conflicts and kept copies", document.querySelectorAll("#cf-table tbody tr").length === 25 &&
-      document.querySelectorAll("#rc-kept tbody tr").length === 25, "");
-    document.querySelector('#cf-pages [data-direction="1"]').click();
+    show("recovery", "kept"); await sleep(100);
+    check("Recovery shows one page of kept copies", document.querySelectorAll("#rc-kept tbody tr").length === 25, "");
     document.querySelector('#rc-kept [data-direction="1"]').click();
-    check("each Recovery list has its own last page", document.querySelector("#cf-table tbody").textContent.includes("conflict-25.txt") &&
-      document.querySelectorAll("#cf-table tbody tr").length === 1 &&
-      document.querySelector("#rc-kept tbody").textContent.includes("kept-25"), "");
-    document.querySelector("#cf-batch button").click();
-    await sleep(100);
+    check("kept copies can reach their last page", document.querySelector("#rc-kept tbody").textContent.includes("kept-25"), "");
+    document.querySelector("#rc-tab-conflicts").click(); await sleep(100);
+    check("Recovery shows one page of conflicts", document.querySelectorAll("#cf-table tbody tr").length === 25, "");
+    document.querySelector('#cf-pages [data-direction="1"]').click();
+    check("conflicts can reach their last page", document.querySelector("#cf-table tbody").textContent.includes("conflict-25.txt") &&
+      document.querySelectorAll("#cf-table tbody tr").length === 1, "");
+    document.querySelector("#cf-batch button").click(); await sleep(100);
     const batch = HOST_CALLS.filter(m => m.op === "conflict_keep_batch").at(-1);
     check("batch decisions include conflicts from every page", batch?.args.keep === "original" &&
       batch.args.conflicts.length === 26 && batch.args.conflicts[0].path === "/conflict-0.txt", batch?.args.conflicts.length);
     HOST_ANSWERS.conflicts = [];
     HOST_ANSWERS.kept = [];
-    await loadRecovery();
+
+    show("recovery", "versions");
+    const savedVersions = HOST_ANSWERS.item_versions;
+    let finishVersions;
+    HOST_ANSWERS.item_versions = () => new Promise(resolve => { finishVersions = resolve; });
+    const versionPath = document.querySelector("#rv-path");
+    versionPath.value = "first.txt";
+    document.querySelector("#rv-form").requestSubmit();
+    versionPath.value = "second.txt";
+    versionPath.dispatchEvent(new Event("input"));
+    finishVersions(savedVersions);
+    await sleep(100);
+    check("editing the version path removes old results even when the lookup finishes late",
+      document.querySelector("#rv-list").children.length === 0, "");
+    HOST_ANSWERS.item_versions = savedVersions;
+    HOST_ANSWERS.pick_file = "C:\\Sync\\report.docx";
+    document.querySelector("#rv-browse").focus();
+    document.querySelector("#rv-browse").click(); await sleep(100);
+    check("Browse shows the selected file's versions without another click", document.activeElement.id === "rv-browse" &&
+      HOST_CALLS.filter(m => m.op === "item_versions").at(-1)?.args.path === HOST_ANSWERS.pick_file &&
+      !!document.querySelector("#rv-list tbody tr"), at());
+    delete HOST_ANSWERS.pick_file;
+
+    show("recovery", "rewind"); await sleep(100);
     document.querySelector("#rw-date").value = "2026-01-01";
     document.querySelector("#rw-time").value = "10:00";
+    const savedPreview = HOST_ANSWERS.rewind_preview;
+    let finishPreview;
+    HOST_ANSWERS.rewind_preview = () => new Promise(resolve => { finishPreview = resolve; });
+    document.querySelector("#rw-preview").click();
+    const folder = document.querySelector("#rw-folder");
+    folder.value = "/Other";
+    folder.dispatchEvent(new Event("input", {bubbles: true}));
+    finishPreview(savedPreview({})); await sleep(100);
+    check("a late preview cannot replace an edited folder",
+      document.querySelector("#rw-result").hidden && folder.value === "/Other", "");
+    HOST_ANSWERS.rewind_preview = savedPreview;
     document.querySelector("#rw-preview").focus();
-    document.querySelector("#rw-preview").click(); await sleep(300);
+    document.querySelector("#rw-preview").click(); await sleep(100);
     const more = document.querySelector("#rw-actions button");
-    check("a long list shows Show more, not Rewind", more && more.textContent === "Show more", more && more.textContent);
+    check("preview focuses its heading and names the target", document.activeElement.id === "rw-stage" &&
+      document.querySelector("#rw-target").textContent.includes("/Docs"), at());
+    check("a long preview starts with Show more", more?.textContent === "Show more", more?.textContent);
     more.focus(); more.click(); await sleep(100);
-    check("Show more gives focus to what replaces it", document.activeElement.textContent === "Rewind", at());
-    document.activeElement.click(); await sleep(300);
-    check("asking for the rewind gives focus to Approve", document.activeElement.textContent === "Approve", at());
-    document.activeElement.click(); await sleep(300);
-    check("a list that changed before the approval is shown again, from its start",
+    check("Show more gives focus to Continue", document.activeElement.textContent === "Continue", at());
+    document.activeElement.click(); await sleep(100);
+    check("continuing queues the reviewed code and focuses approval",
+      document.activeElement.textContent === "Approve" && document.querySelector("#rw-form").hidden &&
+      HOST_CALLS.filter(m => m.op === "rewind_start").at(-1)?.args.expect === "0123456789abcdef", at());
+    document.activeElement.click(); await sleep(100);
+    check("a list that changed before approval is shown again, from its start",
       document.activeElement.textContent === "Show more" && !document.querySelector("#rw-actions").textContent.includes("Approve"), at());
     document.activeElement.click(); await sleep(100);
-    check("the new list is offered for approval once all of it is shown",
-      document.activeElement.textContent === "Approve" && document.querySelector("#rw-actions").textContent.includes("fedcba9876543210"), at());
+    check("the new list is offered for approval once all of it is shown", document.activeElement.textContent === "Approve", at());
+    const savedApprove = HOST_ANSWERS.rewind_approve;
+    HOST_ANSWERS.rewind_approve = {approved: true};
+    document.activeElement.click(); await sleep(100);
+    check("approval submits the refreshed code and replaces the review controls",
+      HOST_CALLS.filter(m => m.op === "rewind_approve").at(-1)?.args.code === "fedcba9876543210" &&
+      document.querySelector("#rw-stage").textContent === "Approval submitted" &&
+      !document.querySelector("#rw-actions").textContent.includes("Approve"), at());
+    HOST_ANSWERS.rewind_approve = savedApprove;
     const cancel = [...document.querySelectorAll("#rw-actions button")].find(b => b.textContent === "Cancel");
-    cancel.focus(); cancel.click(); await sleep(300);
-    check("cancelling gives focus back to Preview", document.activeElement.id === "rw-preview", at());
-    const restore = document.querySelector("#rc-bin button");
-    check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore && restore.outerHTML);
-    restore.focus(); restore.click(); await sleep(300);
-    check("restoring keeps focus in the list as it reloads", document.querySelector("#rc-bin").contains(document.activeElement), at());
+    cancel.focus(); cancel.click(); await sleep(100);
+    check("cancelling returns focus to Preview", document.activeElement.id === "rw-preview", at());
+
+    const savedRewindState = HOST_ANSWERS.rewind_state;
+    HOST_ANSWERS.rewind_state = {since_ms: 1, job: {folder: "/Docs", at_ms: 5000, approved: false}, code: "unseen"};
+    document.querySelector("#rc-refresh").click(); await sleep(100);
+    check("a resumed job with a mismatched preview links to the current safety stop without an Approve button",
+      document.querySelector("#rw-actions button")?.textContent === "Safety stops" &&
+      !document.querySelector("#rw-actions").textContent.includes("Approve"), "");
+    HOST_ANSWERS.rewind_state = {since_ms: 1, job: {folder: "/Docs", at_ms: 5000, approved: true, ran: 3, left_alone: 0}, code: null};
+    document.querySelector("#rc-refresh").click(); await sleep(100);
+    check("refresh shows rewind progress", document.querySelector("#rw-stage").textContent === "Rewinding" &&
+      document.querySelector("#rw-note").textContent.includes("3 changes made"), "");
+    HOST_ANSWERS.rewind_state = savedRewindState;
+    document.querySelector("#rc-refresh").click(); await sleep(100);
+    check("when a rewind ends its result points to Activity",
+      document.querySelector("#rw-stage").textContent === "Rewind ended" &&
+      document.querySelector("#rw-actions button")?.textContent === "View activity", "");
     document.querySelector("#nav-open-settings").click();
     document.querySelector('nav button[data-page="general"]').click(); await sleep(300);
     const sharedDescription = document.querySelector("#shared-settings>.note").getBoundingClientRect();

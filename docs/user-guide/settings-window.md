@@ -78,8 +78,9 @@ What you share in OneDrive, and who can open it. **Refresh** asks OneDrive again
 The window reuses recent Sharing results. Select **Refresh** to check OneDrive again.
 
 ## Recovery
-Every way to get something back, explained in [Getting things back](recovery.md):
-* **Rewind a folder**: pick a folder and a moment, **Preview** what would change, **Rewind**, then **Approve** (it waits for that, as a safety stop).
+Choose the tab that matches what you want back. Details are in [Getting things back](recovery.md).
+
+* **Rewind a folder** uses **Preview**, **Continue**, and **Approve** to review and start a folder rewind. **Refresh** checks its progress.
 * **Conflicts**: files changed on both sides, kept as two copies, side by side with which is newer: **Keep original**, **Keep copy** or **Keep both**.
 * **Kept on this PC**: the version store, with **Restore**.
 * **OneDrive versions**: a file's versions in OneDrive, with **Open** and **Restore**.

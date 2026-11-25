@@ -6,6 +6,7 @@
 //! tree's agreed state: the next round sees OneDrive changed and brings
 //! this PC along, through the gate, as for any change made in OneDrive.
 
+use std::fs::File;
 use std::io::Seek as _;
 use std::sync::Arc;
 
@@ -13,9 +14,9 @@ use oneup_effects::Done;
 use oneup_gate::Approved;
 use oneup_store::{Kind, RemoteRow};
 use oneup_sync::rewind::{Mark, Spot, Step};
-use oneup_sync::{Hash, LocalPre, NodeKind, Op, RemoteId, Sid};
+use oneup_sync::{Hash, LocalPre, NodeKind, Op, ROOT, RemoteId, Sid};
 
-use super::{Db, Executor, Fail, Pending, Res, Skip, need, odd, pending_of, pre_of};
+use super::{Db, Executor, Fail, Notes, Pending, Res, Rescue, Skip, UploadTarget, need, odd, pending_of, pre_of};
 use crate::blocking::OffTask;
 use crate::cloud::{Cloud, CloudError, Hashing};
 
@@ -27,7 +28,14 @@ const VERSION_TRIES: usize = 1_000;
 
 impl<C: Cloud> Executor<C> {
     /// Runs one approved rewind step.
-    pub(super) async fn rewind(&self, store: &Db<'_>, a: &Arc<Approved>, sid: Sid, step: &Step) -> Res {
+    pub(super) async fn rewind(
+        &self,
+        store: &Db<'_>,
+        a: &Arc<Approved>,
+        sid: Sid,
+        step: &Step,
+        notes: &mut Notes,
+    ) -> Res {
         match step {
             Step::Restore { id, to, name, kind, content, gone } => {
                 // Back already (a folder restored with its contents, or the
@@ -98,16 +106,19 @@ impl<C: Cloud> Executor<C> {
                     // went into the recycle bin): an item someone else
                     // restored and changed is left as it is.
                     need(gone.is_some_and(|(s, h)| row.qxh == Some(h) && row.size == s))?;
-                    self.put_back(store, &row, *size, hash).await?;
+                    let (_, rescue) = self.put_back(store, &row, *size, hash).await?;
+                    self.finish_rescue(store, rescue, notes).await?;
                 }
                 Ok(())
             }
             Step::Reset { remote, place, content, .. } => {
                 let mut pre = remote.clone();
+                let mut rescue = None;
                 if let Some((size, hash)) = content {
                     let row = store.read(|o| o.get_item(&remote.id.0))?.ok_or(Fail::Skip(Skip::Changed))?;
                     need(row.etag.as_deref() == Some(remote.etag.as_str()))?;
-                    let row = self.put_back(store, &row, *size, hash).await?;
+                    let (row, pending) = self.put_back(store, &row, *size, hash).await?;
+                    rescue = pending;
                     pre = pre_of(&row);
                     self.crash_point()?;
                 }
@@ -116,7 +127,7 @@ impl<C: Cloud> Executor<C> {
                     self.crash_point()?;
                     store.write(|o| Ok::<_, Fail>(o.upsert_item(&row, false)?)).await?;
                 }
-                Ok(())
+                self.finish_rescue(store, rescue, notes).await
             }
             Step::Remove { remote, from, up } => {
                 // Only from where the approval saw it: its folder and name,
@@ -212,23 +223,14 @@ impl<C: Cloud> Executor<C> {
             Step::RevertTo { remote, version } => {
                 let row = store.read(|o| o.get_item(&remote.id.0))?.ok_or(Fail::Skip(Skip::Changed))?;
                 need(row.etag.as_deref() == Some(remote.etag.as_str()))?;
-                let parent = RemoteId(row.parent_id.clone().ok_or(Fail::Skip(Skip::Changed))?);
                 let mut staged = self.fs.stage()?;
                 let Some(file) = staged.file() else { return Err(odd()) };
                 let mut hashing = Hashing::new(&mut *file);
                 let len = self.cloud.download_version(&remote.id, version, &mut hashing).await?;
                 let hash = hashing.hash.finalize();
                 let size = i64::try_from(len).map_err(|e| Fail::Failed(e.to_string()))?;
-                file.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
-                let mut reader = OffTask::new(file.try_clone().map_err(|e| Fail::Failed(e.to_string()))?, &self.jobs);
-                let (sent_row, sent) = self.cloud.upload(&parent, &row.name, Some(remote), size, &mut reader).await?;
-                let sent = sent.unwrap_or_else(|| reader.hash.finalize());
-                self.crash_point()?;
-                store.write(|o| Ok::<_, Fail>(o.upsert_item(&sent_row, false)?)).await?;
-                if sent_row.qxh != Some(hash) || sent != hash || sent_row.size != size {
-                    return Err(Fail::Skip(Skip::ContentMismatch));
-                }
-                Ok(())
+                let (_, rescue) = self.upload_version(store, &row, file, size, &hash).await?;
+                self.finish_rescue(store, rescue, notes).await
             }
             Step::Forget => {
                 store
@@ -250,9 +252,14 @@ impl<C: Cloud> Executor<C> {
     /// `hash`, as a new version conditional on its eTag now: the version
     /// it replaces stays in the history. Each candidate is downloaded into
     /// the staging folder and checked by its hash before it's sent.
-    async fn put_back(&self, store: &Db<'_>, row: &RemoteRow, size: i64, hash: &Hash) -> Res<RemoteRow> {
+    async fn put_back(
+        &self,
+        store: &Db<'_>,
+        row: &RemoteRow,
+        size: i64,
+        hash: &Hash,
+    ) -> Res<(RemoteRow, Option<Rescue>)> {
         let pre = pre_of(row);
-        let parent = RemoteId(row.parent_id.clone().ok_or(Fail::Skip(Skip::Changed))?);
         let versions = self.cloud.versions(&pre.id).await?;
         // The first is the current version, which isn't the one sought.
         let candidates = versions.iter().skip(1).filter(|v| v.size.is_none_or(|s| s == size)).take(VERSION_TRIES);
@@ -268,17 +275,39 @@ impl<C: Cloud> Executor<C> {
             if hashing.hash.finalize() != *hash || i64::try_from(len).ok() != Some(size) {
                 continue;
             }
-            file.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
-            let mut reader = OffTask::new(file.try_clone().map_err(|e| Fail::Failed(e.to_string()))?, &self.jobs);
-            let (sent_row, sent) = self.cloud.upload(&parent, &row.name, Some(&pre), size, &mut reader).await?;
-            let sent = sent.unwrap_or_else(|| reader.hash.finalize());
-            store.write(|o| Ok::<_, Fail>(o.upsert_item(&sent_row, false)?)).await?;
-            if sent_row.qxh != Some(*hash) || sent != *hash || sent_row.size != size {
-                return Err(Fail::Skip(Skip::ContentMismatch));
-            }
-            return Ok(sent_row);
+            return self.upload_version(store, row, file, size, hash).await;
         }
         Err(Fail::Failed("that version is no longer in the file's version history in OneDrive".into()))
+    }
+
+    /// Sends a staged version under the approved eTag with the same
+    /// concurrent-edit recovery as an ordinary replacement.
+    async fn upload_version(
+        &self,
+        store: &Db<'_>,
+        row: &RemoteRow,
+        file: &mut File,
+        size: i64,
+        hash: &Hash,
+    ) -> Res<(RemoteRow, Option<Rescue>)> {
+        let pre = pre_of(row);
+        let to = RemoteId(row.parent_id.clone().ok_or(Fail::Skip(Skip::Changed))?);
+        let parent = store.read(|o| Ok(o.synced_by_remote(&to.0)?.map_or(ROOT, |b| b.sid)))?;
+        file.rewind().map_err(|e| Fail::Failed(e.to_string()))?;
+        let mut reader = OffTask::new(file.try_clone().map_err(|e| Fail::Failed(e.to_string()))?, &self.jobs);
+        let target = UploadTarget { parent, to: &to, name: &row.name, replace: Some(&pre), size, modified_ms: None };
+        let (sent_row, sent, rescue) = self.upload_with_rescue(store, target, &mut reader).await?;
+        let sent = sent.unwrap_or_else(|| reader.hash.finalize());
+        self.crash_point()?;
+        store.write(|o| Ok::<_, Fail>(o.upsert_item(&sent_row, false)?)).await?;
+        if sent_row.qxh != Some(*hash)
+            || sent != *hash
+            || i64::try_from(reader.hash.len()).ok() != Some(size)
+            || sent_row.size != size
+        {
+            return Err(Fail::Skip(Skip::ContentMismatch));
+        }
+        Ok((sent_row, rescue))
     }
 }
 
