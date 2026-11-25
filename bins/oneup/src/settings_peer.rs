@@ -75,6 +75,11 @@ impl Peer {
                     tokio::task::spawn_blocking(move || poster.pick_folder("Choose where to save the file")).await??;
                 Ok(chosen.map_or(Value::Null, |p| Value::from(p.to_string_lossy().into_owned())))
             }
+            "peer_pick_files" => {
+                let poster = poster.clone();
+                let paths = tokio::task::spawn_blocking(move || poster.pick_files("Choose files to send")).await??;
+                Ok(json!(paths))
+            }
             "peer_receive" => {
                 let mut slot = self.receive.lock().await;
                 let session =
@@ -97,10 +102,14 @@ impl Peer {
                 Ok(slot.snapshot())
             }
             "peer_send" => {
-                let path = Path::new(args["path"].as_str().context("Choose a file.")?);
-                ensure!(path.is_absolute(), "Choose a local file.");
-                if let Some((dir, _)) = oneup_app::datafolders::for_path(path) {
-                    ensure!(!oneup_app::vaultpair::is_vault_dir(&dir), "Files in a vault can't be sent this way.");
+                let paths =
+                    args["paths"].as_array().filter(|paths| !paths.is_empty()).context("Choose files to send.")?;
+                for path in paths {
+                    let path = Path::new(path.as_str().context("Choose a local file.")?);
+                    ensure!(path.is_absolute(), "Choose a local file.");
+                    if let Some((dir, _)) = oneup_app::datafolders::for_path(path) {
+                        ensure!(!oneup_app::vaultpair::is_vault_dir(&dir), "Files in a vault can't be sent this way.");
+                    }
                 }
                 let recipient = args["recipient"].as_str().context("Enter their receive code.")?.trim();
                 ensure!(!recipient.is_empty() && recipient.len() <= 128, "Check the receive code they sent you.");
@@ -108,7 +117,7 @@ impl Peer {
                 self.start(
                     &mut slot,
                     Side::Send,
-                    json!({"op": "send", "path": path, "recipient": recipient, "network": network(args)}),
+                    json!({"op": "send", "paths": paths, "recipient": recipient, "network": network(args)}),
                     true,
                     poster,
                 )?;
@@ -170,6 +179,7 @@ impl Peer {
             "Transfer storage must be outside synced folders."
         );
         request["root"] = json!(self.root);
+        ensure!(request.to_string().len() < 64 * 1024 - 1, "The transfer request is too long. Choose fewer files.");
         let child = tokio::process::Command::new(executable)
             .arg("--worker")
             .creation_flags(0x0800_0000)

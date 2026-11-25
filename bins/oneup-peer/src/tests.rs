@@ -19,6 +19,33 @@ fn filenames_cannot_escape_the_inbox_or_name_devices() {
     assert!(ticket::file_name("Report № 5.txt").is_ok());
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn bundle_preserves_both_files_when_their_names_collide() -> Result<()> {
+    use std::io::Read as _;
+
+    let temp = tempfile::tempdir()?;
+    let first = temp.path().join("report.txt");
+    let other = temp.path().join("other");
+    fs::create_dir(&other)?;
+    let second = other.join("Report.txt");
+    fs::write(&first, b"first report")?;
+    fs::write(&second, b"second report")?;
+    let store = FsStore::load(temp.path().join("blobs")).await?;
+    let (tag, size) = disk::import(&store, vec![first, second]).await?;
+    let output = temp.path().join("archive.zip");
+    assert_eq!(store.blobs().export(tag.hash(), &output).await?, size);
+    let mut archive = zip::ZipArchive::new(fs::File::open(output)?)?;
+    assert_eq!(archive.len(), 2);
+    for (name, expected) in [("1/report.txt", "first report"), ("2/Report.txt", "second report")] {
+        let mut contents = String::new();
+        archive.by_name(name)?.read_to_string(&mut contents)?;
+        assert_eq!(contents, expected);
+    }
+    store.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn receive_resumes_with_the_same_identity_and_publishes_once() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(45), direct_transfer()).await?
@@ -35,7 +62,7 @@ async fn direct_transfer() -> Result<()> {
     fs::write(&source, &content)?;
     let send_store = FsStore::load(path.join("send-store")).await?;
     #[cfg(windows)]
-    let (tag, _) = disk::import(&send_store, source.clone()).await?;
+    let (tag, _) = disk::import(&send_store, vec![source.clone()]).await?;
     #[cfg(not(windows))]
     let tag = send_store.blobs().add_slice(&content).temp_tag().await?;
     // A later edit is irrelevant to the offered snapshot.

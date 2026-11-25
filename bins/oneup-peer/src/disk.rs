@@ -276,9 +276,18 @@ fn write_owned(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub async fn import(store: &FsStore, source: PathBuf) -> Result<(TempTag, u64)> {
+pub async fn import(store: &FsStore, sources: Vec<PathBuf>) -> Result<(TempTag, u64)> {
     let (send, recv) = mpsc::channel(2);
-    let task = tokio::task::spawn_blocking(move || read_source(&source, send));
+    let task = tokio::task::spawn_blocking(move || {
+        let mut stream = io::BufWriter::with_capacity(CHUNK_BYTES, BlobStream { send, size: 0 });
+        match sources.as_slice() {
+            [] => anyhow::bail!("Choose files to send."),
+            [path] => read_source(path, &mut stream)?,
+            paths => write_bundle(paths, &mut stream)?,
+        }
+        stream.flush()?;
+        Ok::<_, anyhow::Error>(stream.get_ref().size)
+    });
     let imported = store.blobs().add_stream(ReceiverStream::new(recv)).await.temp_tag().await;
     // A completed import alone cannot prove the file remained unchanged. No offer
     // starts until the producer checks the final stamp and oplock.
@@ -287,8 +296,54 @@ pub async fn import(store: &FsStore, source: PathBuf) -> Result<(TempTag, u64)> 
 }
 
 #[cfg(windows)]
-fn read_source(path: &Path, send: mpsc::Sender<io::Result<Bytes>>) -> Result<u64> {
-    use std::io::Read as _;
+struct BlobStream {
+    send: mpsc::Sender<io::Result<Bytes>>,
+    size: u64,
+}
+
+#[cfg(windows)]
+impl Write for BlobStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let bytes = &bytes[..bytes.len().min(CHUNK_BYTES)];
+        self.send.blocking_send(Ok(Bytes::copy_from_slice(bytes))).map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.size += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub fn source_name(path: &Path) -> Result<&str> {
+    let name = path.file_name().and_then(|name| name.to_str()).context("Invalid source name.")?;
+    crate::ticket::file_name(name)?;
+    Ok(name)
+}
+
+#[cfg(windows)]
+fn write_bundle(paths: &[PathBuf], output: impl Write) -> Result<()> {
+    use std::collections::HashSet;
+
+    let names = paths.iter().map(|path| source_name(path)).collect::<Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    // Keep original names in separate directories if a flat archive would collide.
+    let numbered = names.iter().any(|name| !seen.insert(name.to_uppercase()));
+    let mut zip = zip::ZipWriter::new_stream(output);
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored).large_file(true);
+    for (index, (path, name)) in paths.iter().zip(names).enumerate() {
+        let entry = if numbered { format!("{}/{name}", index + 1) } else { name.to_owned() };
+        zip.start_file(entry, options)?;
+        read_source(path, &mut zip)?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_source(path: &Path, output: &mut impl Write) -> Result<()> {
     use std::os::windows::fs::MetadataExt as _;
 
     use oneup_ntfs::{dirent, win};
@@ -317,18 +372,7 @@ fn read_source(path: &Path, send: mpsc::Sender<io::Result<Bytes>>) -> Result<u64
         .context("Source file changed.")?
     };
     let before = stamp(&file)?;
-    let mut count = 0;
-    let mut buffer = vec![0; CHUNK_BYTES];
-    loop {
-        let len = file.read(&mut buffer)?;
-        if len == 0 {
-            break;
-        }
-        count += len as u64;
-        if send.blocking_send(Ok(Bytes::copy_from_slice(&buffer[..len]))).is_err() {
-            return Ok(count); // Cancelled or the blob store stopped receiving.
-        }
-    }
+    let count = io::copy(&mut file, output)?;
     ensure!(!file.broken() && before.0 == count && before == stamp(&file)?, "Source file changed.");
-    Ok(count)
+    Ok(())
 }

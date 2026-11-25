@@ -30,6 +30,7 @@ zeroize = "1"
 oneup-cfapi = { path = "../../crates/oneup-cfapi" }
 oneup-ntfs = { path = "../../crates/oneup-ntfs" }
 oneup-sys = { path = "../../crates/oneup-sys" }
+zip = { version = "9", default-features = false }
 
 [lints]
 workspace = true

@@ -39,13 +39,13 @@ None of this works inside an [encrypted vault](vaults.md): OneDrive only has the
 ## Send a file
 
 1. Ask the person receiving the file to send you their receive code. They can get it in OneUpDrive or with OneUp Receive.
-2. Select a file in **Files** and choose **Share → Send a file**. In File Explorer, choose **OneUpDrive → Send a file…**.
+2. Open **Sharing → File transfers** and select **Choose files**. To start with a specific file, use **Files → Share → Send a file** or **OneUpDrive → Send a file…** in File Explorer. Select **Add files** to include more files.
 3. Paste their receive code and select **Continue**. When the file is ready, select **Copy download code** and send it back to them.
 4. Keep Settings open until they finish downloading. Select **End sharing** to stop early. Download codes expire after 24 hours.
 
-Choose one file stored on this PC outside an encrypted vault. Use a private conversation to exchange codes. You can transfer files without signing in to OneDrive.
+Choose files stored on this PC outside encrypted vaults. The recipient gets one ZIP if you choose multiple files. Use a private conversation to exchange codes. You can transfer files without signing in to OneDrive.
 
-**Sharing → File transfers** shows download progress. Open **Connection details** to see whether the devices connected directly or through a relay. For a direct-only transfer, open **Connection options** and select **Require a direct connection** on both devices.
+Transfers are end-to-end encrypted. Devices connect directly when possible and stay encrypted when they need a relay. Open **Connection details** to see the route. For a direct-only transfer, open **Connection options** and select **Require a direct connection** on both devices.
 
 ## Receive a file
 
@@ -54,6 +54,8 @@ Choose one file stored on this PC outside an encrypted vault. Use a private conv
 3. Paste the download code they send back. To save the file elsewhere, select **Change folder** and choose a folder outside your synced folders.
 4. Select **Download**. To continue an interrupted transfer, select **Resume download** while the sender still has Settings open.
 5. Select **Open folder** to find your file. If a file with the same name already exists, choose another folder and resume.
+
+If you leave File transfers before downloading, select **Get my code** when you return. The same receive code is still valid.
 
 ### Receive with OneUp Receive
 

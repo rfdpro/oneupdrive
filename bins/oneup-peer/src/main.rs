@@ -59,7 +59,9 @@ enum Action {
     },
     #[cfg(windows)]
     Send {
-        path: PathBuf,
+        path: Option<PathBuf>,
+        #[serde(default)]
+        paths: Vec<PathBuf>,
         recipient: String,
     },
 }
@@ -155,11 +157,15 @@ async fn worker() -> Result<()> {
             receive(&session, &ticket, destination.as_deref(), request.network, true, parent_closed()).await?;
         }
         #[cfg(windows)]
-        Action::Send { path, recipient } => {
+        Action::Send { path, mut paths, recipient } => {
+            if let Some(path) = path {
+                ensure!(paths.is_empty(), "Choose files to send once.");
+                paths.push(path);
+            }
             let recipient = recipient
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Check the receive code they sent you and try again."))?;
-            send(&root, path, recipient, request.network, parent_closed()).await?;
+            send(&root, paths, recipient, request.network, parent_closed()).await?;
         }
     }
     Ok(())
@@ -181,12 +187,20 @@ fn parent_closed() -> impl Future<Output = ()> {
 #[cfg(windows)]
 async fn send(
     root: &Path,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     recipient: iroh::EndpointId,
     network: Network,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
-    let name = path.file_name().and_then(|n| n.to_str()).context("Invalid source name.")?.to_owned();
+    let first = paths.first().context("Choose files to send.")?;
+    let first_name = disk::source_name(first)?;
+    let name = if paths.len() == 1 {
+        first_name.to_owned()
+    } else {
+        let stem = first.file_stem().and_then(|stem| stem.to_str()).unwrap_or(first_name);
+        const SUFFIX: &str = " and more.zip";
+        format!("{}{SUFFIX}", &stem[..stem.floor_char_boundary((255 - SUFFIX.len()).min(stem.len()))])
+    };
     ticket::file_name(&name)?;
     let stage = tempfile::Builder::new().prefix("send-").tempdir_in(root)?;
     let store = FsStore::load(stage.path().join("blobs")).await?;
@@ -194,7 +208,7 @@ async fn send(
     emit(json!({"phase": "preparing", "name": name}));
     let result = async {
         let (tag, size) = tokio::select! {
-            result = disk::import(&store, path) => result?,
+            result = disk::import(&store, paths) => result?,
             () = &mut stop => return Ok("stopped"),
         };
         let (router, blob) = tokio::select! {

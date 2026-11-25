@@ -122,44 +122,62 @@ impl Poster {
     /// until it's closed (on a thread of its own: the dialog needs a
     /// single-threaded COM apartment).
     pub fn pick_folder(&self, title: &str) -> Result<Option<std::path::PathBuf>> {
-        self.pick(title, true)
+        self.pick(title, windows::Win32::UI::Shell::FOS_PICKFOLDERS).map(|paths| paths.into_iter().next())
     }
 
     /// Windows' file picker over the window; `None` if cancelled.
     pub fn pick_file(&self, title: &str) -> Result<Option<std::path::PathBuf>> {
-        self.pick(title, false)
+        self.pick(title, Default::default()).map(|paths| paths.into_iter().next())
     }
 
-    fn pick(&self, title: &str, folders: bool) -> Result<Option<std::path::PathBuf>> {
+    /// Windows' multi-select file picker. An empty list means it was cancelled.
+    pub fn pick_files(&self, title: &str) -> Result<Vec<std::path::PathBuf>> {
+        self.pick(title, windows::Win32::UI::Shell::FOS_ALLOWMULTISELECT)
+    }
+
+    fn pick(
+        &self,
+        title: &str,
+        kind: windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS,
+    ) -> Result<Vec<std::path::PathBuf>> {
         let (hwnd, title) = (self.hwnd, title.to_string());
-        std::thread::spawn(move || pick(hwnd, &title, folders)).join().unwrap_or_else(|_| {
+        std::thread::spawn(move || pick(hwnd, &title, kind)).join().unwrap_or_else(|_| {
             Err(win("folder picker", windows::core::Error::from_hresult(windows::core::HRESULT(-1))))
         })
     }
 }
 
-fn pick(owner: isize, title: &str, folders: bool) -> Result<Option<std::path::PathBuf>> {
+fn pick(
+    owner: isize,
+    title: &str,
+    kind: windows::Win32::UI::Shell::FILEOPENDIALOGOPTIONS,
+) -> Result<Vec<std::path::PathBuf>> {
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, CoUninitialize};
     use windows::Win32::UI::Shell::{
-        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
     };
     // SAFETY: a fresh thread joins a single-threaded apartment, left below.
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().map_err(|e| win("CoInitializeEx", e))?;
     // SAFETY: plain COM calls on interfaces this function owns; the path
     // string is copied, then freed with the allocator COM used.
     let picked = unsafe {
-        (|| -> windows::core::Result<Option<std::path::PathBuf>> {
+        (|| -> windows::core::Result<Vec<std::path::PathBuf>> {
             let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-            let kind = if folders { FOS_PICKFOLDERS } else { Default::default() };
             dialog.SetOptions(dialog.GetOptions()? | kind | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
             dialog.SetTitle(&HSTRING::from(title))?;
             if dialog.Show(Some(HWND(owner as *mut _))).is_err() {
-                return Ok(None); // cancelled
+                return Ok(Vec::new()); // cancelled
             }
-            let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
-            let path = name.to_string().map_err(|_| windows::core::Error::from_hresult(windows::core::HRESULT(-1)));
-            CoTaskMemFree(Some(name.0 as *const _));
-            Ok(Some(std::path::PathBuf::from(path?)))
+            let items = dialog.GetResults()?;
+            (0..items.GetCount()?)
+                .map(|index| {
+                    let name = items.GetItemAt(index)?.GetDisplayName(SIGDN_FILESYSPATH)?;
+                    let path =
+                        name.to_string().map_err(|_| windows::core::Error::from_hresult(windows::core::HRESULT(-1)));
+                    CoTaskMemFree(Some(name.0 as *const _));
+                    Ok(std::path::PathBuf::from(path?))
+                })
+                .collect()
         })()
     };
     // SAFETY: pairs with the CoInitializeEx above, on the same thread.
