@@ -56,6 +56,7 @@ mod win {
             webview::focus_existing(&start, &item);
             return Ok(());
         };
+        let _ = oneup_app::search::drives::wake(&dir);
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().context("runtime")?,
         );
@@ -278,6 +279,15 @@ mod win {
         args.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
     }
 
+    fn search_mode(args: &Value) -> oneup_app::search::MatchMode {
+        use oneup_app::search::MatchMode;
+        match args["mode"].as_str() {
+            Some("words") => MatchMode::Words,
+            Some("regex") => MatchMode::Regex,
+            _ => MatchMode::Text,
+        }
+    }
+
     async fn handle(dir: &Path, op: &str, args: &Value, poster: &Poster) -> Result<Value> {
         match op {
             "roots" => {
@@ -347,15 +357,15 @@ mod win {
             }
             "search" => {
                 let (d, q, p) = (dir.to_path_buf(), text(args, "q"), poster.clone());
-                let regex = args["regex"].as_bool().unwrap_or_default();
+                let mode = search_mode(args);
                 let folder = args["folder"].as_bool();
-                let limit = oneup_app::search::DEFAULT_LIMIT;
+                let limit =
+                    count(args, "limit", oneup_app::search::DEFAULT_LIMIT).min(oneup_app::search::browse::MAX_RESULTS);
                 let request = args["request"].clone();
                 tokio::task::spawn_blocking(move || -> Result<Value> {
                     use oneup_app::search;
-                    let text = if regex { &q } else { search::pattern(&q)? };
-                    let query = oneup_store::search::NameQuery::new(text, regex)?;
-                    let store = if regex {
+                    let query = search::name_query(&q, mode, true)?;
+                    let store = if matches!(mode, search::MatchMode::Regex) {
                         oneup_app::setup::open_store(&d, 1024)?
                     } else {
                         search::open(&d, |n| {
@@ -377,6 +387,59 @@ mod win {
                 let found = oneup_app::search::find_in_onedrive(dir, &g, &q, limit).await?;
                 Ok(oneup_app::search::to_json(&found))
             }
+            "search_browse" => {
+                let dir = dir.to_path_buf();
+                let mode = search_mode(args);
+                let request = serde_json::from_value(args.clone())?;
+                tokio::task::spawn_blocking(move || oneup_app::search::browse::find(&dir, request, mode)).await?
+            }
+            "search_drives" | "search_shares" => {
+                let shares = op == "search_shares";
+                let dir = dir.to_path_buf();
+                let q = text(args, "q");
+                let words = args["mode"].as_str() == Some("words");
+                let folder = args["folder"].as_bool();
+                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                tokio::task::spawn_blocking(move || {
+                    if shares {
+                        oneup_app::search::shares::find(&dir, &q, words, folder, limit)
+                    } else {
+                        oneup_app::search::drives::find(&dir, &q, words, folder, limit)
+                    }
+                })
+                .await?
+            }
+            "search_everywhere" => {
+                let (dir, q, poster) = (dir.to_path_buf(), text(args, "q"), poster.clone());
+                let request = args["request"].clone();
+                let words = args["mode"].as_str() == Some("words");
+                let folder = args["folder"].as_bool();
+                let limit = count(args, "limit", oneup_app::search::DEFAULT_LIMIT);
+                tokio::task::spawn_blocking(move || {
+                    oneup_app::search::drives::everywhere(&dir, &q, words, folder, limit, |n| {
+                        poster.post(json!({ "event": "search_build", "items": n, "request": request }).to_string());
+                    })
+                })
+                .await?
+            }
+            "drive_index_status" => {
+                let dir = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || oneup_app::search::drives::status(&dir)).await?
+            }
+            "search_saved" => {
+                let dir = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || Ok(serde_json::to_value(oneup_app::search::saved::list(&dir)?)?))
+                    .await?
+            }
+            "search_save" => {
+                let dir = dir.to_path_buf();
+                let name = text(args, "name");
+                let form = args.get("form").cloned();
+                tokio::task::spawn_blocking(move || {
+                    Ok(serde_json::to_value(oneup_app::search::saved::change(&dir, &name, form)?)?)
+                })
+                .await?
+            }
             "open_in_onedrive" => {
                 let g = oneup_app::search::graph(dir, None)?;
                 oneup_app::search::open_in_onedrive(&g, &text(args, "id")).await?;
@@ -384,11 +447,15 @@ mod win {
             }
             "tree_find" => {
                 let (d, q) = (dir.to_path_buf(), text(args, "q"));
-                let regex = args["regex"].as_bool().unwrap_or_default();
+                let mode = search_mode(args);
                 let folder = args["folder"].as_bool();
+                let limit = count(args, "limit", 100).min(oneup_app::search::browse::MAX_RESULTS);
                 tokio::task::spawn_blocking(move || {
-                    let query = oneup_store::search::NameQuery::new(&q, regex)?;
-                    oneup_app::filetree::find_matching(&d, &query, folder, 100)
+                    let query = oneup_app::search::name_query(&q, mode, false)?;
+                    let mut result = oneup_app::filetree::find_matching(&d, &query, folder, limit + 1)?;
+                    let more = result.len() > limit;
+                    result.truncate(limit);
+                    Ok(json!({ "items": result, "more": more }))
                 })
                 .await?
             }
@@ -1103,6 +1170,16 @@ mod win {
                 }
                 oneup_app::launch::start_agent(dir)?;
                 oneup_app::launch::start_tray_if_wanted(dir);
+                if args["local_drives"].is_boolean() || args["network_shares"].is_boolean() {
+                    settingsapi::save(
+                        dir,
+                        "search",
+                        &json!({
+                            "local_drives": args["local_drives"],
+                            "network_shares": args["network_shares"]
+                        }),
+                    )?;
+                }
                 Ok(Value::from(text))
             }
             "snapshot" => settingsapi::snapshot(dir),
@@ -1130,7 +1207,9 @@ mod win {
                 let section = args.get("section").and_then(Value::as_str).unwrap_or_default();
                 settingsapi::save(dir, section, args.get("value").unwrap_or(&Value::Null))?;
                 // The agent re-reads its settings when nudged.
-                let _ = agent(dir, Call::SyncNow).await;
+                if section != "search" {
+                    let _ = agent(dir, Call::SyncNow).await;
+                }
                 Ok(Value::Null)
             }
             "control" => {

@@ -19,6 +19,7 @@ fn main() {
         }
     }
     let Some(dir) = data_dir else { return };
+    let _ = oneup_app::search::drives::wake(&dir);
     let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
     let running = rt.block_on(async { oneup_ipc::connect(&dir).await.is_ok() });
     #[cfg(windows)]

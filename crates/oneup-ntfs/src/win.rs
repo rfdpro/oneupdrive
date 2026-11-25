@@ -272,6 +272,36 @@ pub fn open_path_for_attributes(path: &Path) -> Result<Handle> {
     )
 }
 
+/// Verify the identity of a search hit using a read-only attributes handle.
+pub fn search_identity(path: &Path) -> Result<(u64, FileId)> {
+    let handle = open_shared(
+        path,
+        FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )?;
+    file_id(&handle)
+}
+
+/// Check that the caller can list this ordinary directory without following
+/// its reparse point or enumerating any contents.
+pub fn search_listable(path: &Path) -> bool {
+    search_open_dir(path).and_then(|handle| attribute_tag(&handle)).is_ok_and(|(attrs, _)| {
+        attrs & (crate::dirent::FILE_ATTRIBUTE_DIRECTORY | crate::dirent::FILE_ATTRIBUTE_REPARSE_POINT)
+            == crate::dirent::FILE_ATTRIBUTE_DIRECTORY
+    })
+}
+
+/// Open a directory for search with access to its listing and attributes.
+pub fn search_open_dir(path: &Path) -> Result<Handle> {
+    open_shared(
+        path,
+        FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+    )
+}
+
 /// Opens one of OneUpDrive's own **dehydrated** placeholders with attribute
 /// and delete access only. Data access would make Windows download it
 /// (measured: even with `FILE_FLAG_OPEN_NO_RECALL`). Without data access,
@@ -942,23 +972,30 @@ pub fn list_dir(dir: &Handle, buf: &mut [u8], out: &mut Vec<DirEntry>) -> Result
 /// `false` if it stopped early, so a large folder costs at most `max`
 /// entries and a buffer's worth.
 pub fn list_dir_upto(dir: &Handle, buf: &mut [u8], out: &mut Vec<DirEntry>, max: usize) -> Result<bool> {
-    let mut class = FileIdExtdDirectoryRestartInfo;
-    loop {
-        if out.len() > max {
-            return Ok(false);
+    let mut restart = true;
+    while out.len() <= max {
+        let Some(batch) = list_dir_batch(dir, buf, restart)? else { return Ok(true) };
+        out.extend(batch);
+        restart = false;
+    }
+    Ok(false)
+}
+
+/// Read one buffer of entries from a directory handle. Restart the first
+/// call for a listing and keep the same handle until it returns None.
+pub fn list_dir_batch(dir: &Handle, buf: &mut [u8], restart: bool) -> Result<Option<Vec<DirEntry>>> {
+    let class = if restart { FileIdExtdDirectoryRestartInfo } else { FileIdExtdDirectoryInfo };
+    // SAFETY: `buf` is valid and writable for `buf.len()` bytes.
+    let r =
+        unsafe { GetFileInformationByHandleEx(dir.raw(), class, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32) };
+    match r {
+        Ok(()) => {
+            let mut entries = parse_dir_buffer(buf)?;
+            entries.retain(|e| !e.is_dot());
+            Ok(Some(entries))
         }
-        // SAFETY: `buf` is valid and writable for `buf.len()` bytes.
-        let r = unsafe {
-            GetFileInformationByHandleEx(dir.raw(), class, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32)
-        };
-        class = FileIdExtdDirectoryInfo;
-        match r {
-            Ok(()) => out.extend(parse_dir_buffer(buf)?.into_iter().filter(|e| !e.is_dot())),
-            Err(e) if e.code() == ERROR_NO_MORE_FILES.to_hresult() || e.code() == ERROR_HANDLE_EOF.to_hresult() => {
-                return Ok(true);
-            }
-            Err(source) => return Err(Error::Win32 { op: "GetFileInformationByHandleEx(dir)", source }),
-        }
+        Err(e) if e.code() == ERROR_NO_MORE_FILES.to_hresult() || e.code() == ERROR_HANDLE_EOF.to_hresult() => Ok(None),
+        Err(source) => Err(Error::Win32 { op: "GetFileInformationByHandleEx(dir)", source }),
     }
 }
 

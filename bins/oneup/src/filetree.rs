@@ -469,7 +469,16 @@ pub fn find(data_dir: &Path, needle: &str, limit: usize) -> Result<Value> {
     if needle.chars().count() < 2 {
         return Ok(Value::from(Vec::<Value>::new()));
     }
-    find_matching(data_dir, &oneup_store::search::NameQuery::Text(needle), None, limit)
+    let matches = find_matching(data_dir, &oneup_store::search::NameQuery::Text(needle), None, limit)?;
+    Ok(Value::Array(matches.into_iter().map(|item| json!({ "rel": item.rel, "folder": item.folder })).collect()))
+}
+
+#[derive(serde::Serialize)]
+pub struct SearchMatch {
+    rel: String,
+    folder: bool,
+    local: Option<String>,
+    remote: Option<String>,
 }
 
 pub fn find_matching(
@@ -477,45 +486,49 @@ pub fn find_matching(
     query: &oneup_store::search::NameQuery<'_>,
     folder: Option<bool>,
     limit: usize,
-) -> Result<Value> {
+) -> Result<Vec<SearchMatch>> {
     let store = crate::setup::open_store(data_dir, 4 * 1024)?;
     let root = store.read(|o| o.local_root())?.context("this folder hasn't been looked at yet")?;
     let base = store.read(|o| o.synced_by_local(root.root_file_id))?.and_then(|b| b.remote);
-    let base_path = match &base {
-        Some(id) => store.read(|o| o.path_of(&id.0))?.unwrap_or_default(),
-        None => String::new(),
-    };
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::new();
     for l in store.read(|o| o.local_find_matching(query, folder, limit))? {
-        if let Some(p) = store.read(|o| o.local_path_of(l.file_id))? {
+        if let Some((p, addressable)) = store.read(|o| o.local_named_path_of(l.file_id))? {
             let rel = clean(&p);
             if rel.split('/').next().is_some_and(|f| oneup_sync::same_name(f, ENGINE_DIR)) {
                 continue;
             }
             if seen.insert(oneup_sync::fold(&rel)) {
-                out.push(json!({ "rel": rel, "folder": l.kind != LocalKind::File }));
+                let local = addressable.then(|| search_local_path(&root.path, &rel)).flatten();
+                out.push(SearchMatch { rel, folder: l.kind != LocalKind::File, local, remote: None });
             }
         }
     }
-    for r in store.read(|o| o.remote_find_matching(query, folder, limit))? {
-        let Some(p) = store.read(|o| o.path_of(&r.id))? else { continue };
-        // Only what's inside this pair's OneDrive folder, cut by
-        // characters as names fold (a cut in bytes could split one).
-        let Some(rest) = base
-            .as_ref()
-            .and_then(|_| oneup_sync::strip_folded_prefix(&p, &base_path))
-            .filter(|rest| !rest.is_empty() && (base_path.ends_with('/') || rest.starts_with('/')))
-        else {
-            continue;
-        };
-        let rel = clean(rest);
-        if seen.insert(oneup_sync::fold(&rel)) {
-            out.push(json!({ "rel": rel, "folder": r.kind == Kind::Folder }));
+    if let Some(id) = base {
+        for (path, kind, id) in store.read(|o| o.remote_find_in(&id.0, query, folder, limit))? {
+            let rel = clean(&path);
+            if seen.insert(oneup_sync::fold(&rel)) {
+                out.push(SearchMatch { rel, folder: kind == Kind::Folder, local: None, remote: Some(id) });
+            }
         }
     }
-    out.sort_by_key(|v| v["rel"].as_str().map(str::to_lowercase));
-    Ok(Value::from(out))
+    out.sort_by_cached_key(|item| item.rel.to_lowercase());
+    Ok(out)
+}
+
+pub(crate) fn search_local_path(root: &str, rel: &str) -> Option<String> {
+    let path = Path::new(rel);
+    if !Path::new(root).is_absolute()
+        || rel.is_empty()
+        || rel.contains(':')
+        || !path.components().all(|part| {
+            matches!(part, std::path::Component::Normal(name)
+            if !name.to_string_lossy().ends_with(['.', ' ']))
+        })
+    {
+        return None;
+    }
+    Some(shown(&Path::new(root).join(rel.replace('/', "\\"))))
 }
 
 /// The folders holding a `.oneupignore` file (relative paths, `""` for the
@@ -1095,6 +1108,70 @@ mod tests {
         assert!(scan.run().unwrap().finished);
         drop(scan.into_store());
         d
+    }
+
+    #[test]
+    fn synced_folder_search_limits_only_matches_in_the_pair() {
+        use oneup_store::{Kind, RemoteRow};
+        use oneup_sync::{LocalId, NodeKind, ROOT, RemoteId};
+
+        let d = paired_dir("search-scope", &[("offline-report.txt", "waiting to upload")]);
+        let mut store = crate::setup::open_store(&d, 1024).unwrap();
+        store
+            .write(|o| {
+                let put = |id: &str, parent: Option<&str>, name: &str, kind| -> oneup_store::Result<()> {
+                    o.upsert_item(
+                        &RemoteRow {
+                            id: id.into(),
+                            parent_id: parent.map(Into::into),
+                            name: name.into(),
+                            kind,
+                            size: 0,
+                            etag: None,
+                            qxh: None,
+                            mtime_ms: None,
+                        },
+                        false,
+                    )?;
+                    Ok(())
+                };
+                put("root", None, "", Kind::Root)?;
+                put("other", Some("root"), "Other", Kind::Folder)?;
+                put("pair", Some("root"), "Docs", Kind::Folder)?;
+                put("a1", Some("other"), "other-report.txt", Kind::File)?;
+                put("a2", Some("other"), "another-report.txt", Kind::File)?;
+                put("z1", Some("pair"), "cloud-report.txt", Kind::File)?;
+                let root = o.local_root()?.unwrap();
+                o.synced_put(&oneup_sync::Base {
+                    sid: ROOT,
+                    parent: None,
+                    name: String::new(),
+                    kind: NodeKind::Folder,
+                    size: 0,
+                    hash: None,
+                    local: Some(LocalId(root.root_file_id)),
+                    local_mtime: 0,
+                    remote: Some(RemoteId("pair".into())),
+                    remote_etag: String::new(),
+                })
+            })
+            .unwrap();
+        drop(store);
+        let matches = super::find(&d, "report", 2).unwrap();
+        let words = oneup_store::search::NameQuery::Words(oneup_store::search::WordQuery::new("REPORT offline"));
+        let pending_upload = super::find_matching(&d, &words, Some(false), 2).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(
+            matches,
+            serde_json::json!([
+                { "rel": "cloud-report.txt", "folder": false },
+                { "rel": "offline-report.txt", "folder": false },
+            ])
+        );
+        assert_eq!(pending_upload.len(), 1);
+        assert_eq!(pending_upload[0].rel, "offline-report.txt");
+        assert!(!pending_upload[0].folder);
+        assert!(pending_upload[0].local.as_ref().unwrap().ends_with(r"\sync\offline-report.txt"));
     }
 
     /// The preview names what it showed; excluding with it (the window's

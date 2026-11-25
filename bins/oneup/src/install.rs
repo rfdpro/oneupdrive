@@ -470,13 +470,14 @@ fn uninstalling() {
 /// Asks every agent to stop, and waits (up to `limit`) until they have.
 pub async fn stop_agents(dirs: &[PathBuf], limit: Duration) {
     for d in dirs {
+        crate::search::drives::request_stop(d);
         if let Ok(mut c) = oneup_ipc::connect(d).await {
             let _ = c.call(&oneup_ipc::Call::Stop).await;
         }
     }
     let until = Instant::now() + limit;
     for d in dirs {
-        while Instant::now() < until && oneup_ipc::connect(d).await.is_ok() {
+        while Instant::now() < until && (oneup_ipc::connect(d).await.is_ok() || crate::search::drives::running(d)) {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }

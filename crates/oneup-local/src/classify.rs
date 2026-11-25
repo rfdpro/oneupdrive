@@ -66,7 +66,7 @@ pub fn to_row(e: &DirEntry, parent: u128, at_root: bool, rules: &ExcludeSet) -> 
     let kind = kind_of(e);
     let skip = match kind {
         LocalKind::Folder if at_root && oneup_rules::is_engine_dir(&e.name) => Skip::Excluded,
-        LocalKind::Folder if rules.excludes_folder(&e.name) => Skip::Excluded,
+        LocalKind::Folder if rules.excludes_folder(&e.name) || rules.excludes_folder_id(e.file_id.0) => Skip::Excluded,
         LocalKind::Folder if is_unpopulated(e.attributes, e.reparse_tag) => Skip::Unpopulated,
         _ => Skip::None,
     };
