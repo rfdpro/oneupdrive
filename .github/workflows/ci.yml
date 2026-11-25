@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   check:
+    name: windows-tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +55,18 @@ jobs:
           SIM_SEEDS: "10"
           SIM_STORE: "1"
         run: cargo test -p oneup-sync --no-fail-fast -- --test-threads 4
+
+  required-check:
+    name: check
+    needs: [check, sync-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both Windows jobs
+        env:
+          WINDOWS_RESULT: ${{ needs.check.result }}
+          SYNC_RESULT: ${{ needs.sync-tests.result }}
+        run: test "$WINDOWS_RESULT" = success && test "$SYNC_RESULT" = success
 
   supply-chain:
     # cargo-deny-action runs in a Linux container. deny.toml and the SBOM
