@@ -35,3 +35,34 @@ From a terminal:
 * Items you shared before this version of OneUpDrive appear once they change. `oneup shared --scan` lists all of OneDrive once to find them now; on a large OneDrive that takes a while.
 
 None of this works inside an [encrypted vault](vaults.md): OneDrive only has the encrypted files there.
+
+## Send a file
+
+1. Ask the person receiving the file to send you their receive code. They can get it in OneUpDrive or with OneUp Receive.
+2. Open **Sharing → File transfers** and select **Choose files**. To start with a specific file, use **Files → Share → Send a file** or **OneUpDrive → Send a file…** in File Explorer. Select **Add files** to include more files.
+3. Paste their receive code and select **Continue**. When the file is ready, select **Copy download code** and send it back to them.
+4. Keep Settings open until they finish downloading. Select **End sharing** to stop early. Download codes expire after 24 hours.
+
+Choose files stored on this PC outside encrypted vaults. The recipient gets one ZIP if you choose multiple files. Use a private conversation to exchange codes. You can transfer files without signing in to OneDrive.
+
+Transfers are end-to-end encrypted. Devices connect directly when possible and stay encrypted when they need a relay. Open **Connection details** to see the route. For a direct-only transfer, open **Connection options** and select **Require a direct connection** on both devices.
+
+## Receive a file
+
+1. Open **Sharing → File transfers**, or select **Files → Add → Receive a file**.
+2. Select **Get my code**, then **Copy my code**. Send it to the person sending the file.
+3. Paste the download code they send back. To save the file elsewhere, select **Change folder** and choose a folder outside your synced folders.
+4. Select **Download**. To continue an interrupted transfer, select **Resume download** while the sender still has Settings open.
+5. Select **Open folder** to find your file. If a file with the same name already exists, choose another folder and resume.
+
+If you leave File transfers before downloading, select **Get my code** when you return. The same receive code is still valid.
+
+### Receive with OneUp Receive
+
+If the person receiving the file uses a Windows PC without OneUpDrive, open **They don't have OneUpDrive** when sending and select **Find Windows receiver**. Send them `oneup-receive.exe` and the accompanying license notices.
+
+For Linux x64 or a Mac with Apple silicon, select **Linux and Mac downloads**. The Linux archive requires glibc 2.35 or later, as included in Ubuntu 22.04. Send the recipient the release page or the archive for their computer. They can extract the archive and run `./oneup-receive` from its folder in a terminal. [OneUpDrive releases](https://github.com/rfdpro/oneupdrive/releases)
+
+Run `oneup-receive` in a terminal and send your receive code to the sender. Paste the download code they send back. To choose where the file is saved, start the app with `--destination` followed by an existing folder's full path. Press **Ctrl+C** to pause and use the printed `--session` command to resume. The app prints the path of the saved file. Use `--network direct` to require a direct connection.
+
+The [receiver build instructions](../../CONTRIBUTING.md#build-oneup-receive) cover Windows, Linux, and macOS.

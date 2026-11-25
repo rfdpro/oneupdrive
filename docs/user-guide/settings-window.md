@@ -25,7 +25,7 @@ Switching synced folders shows only that folder's files and settings, even when 
 
 On the right, the details of what you selected:
 
-* **Share**, beside the name: point at it (or select it) for **Get link for viewers** or **Get link for editors** (the link is copied).
+* **Share**, beside the name, offers **Copy OneDrive view link** and **Copy OneDrive edit link** for items you've synced to OneDrive. For a file stored on this PC, it also offers **Send a file**. [Send a file](versions-and-sharing.md#send-a-file)
 * **Sync**: **Sync this file/folder** on or off (off excludes it: it stays where it is, here and in OneDrive, and nothing here is uploaded any more; changes made in OneDrive still come here; nothing is deleted), **Pause this folder** (changes wait until you resume it), and **Sync order** (first, normal or last when a lot is waiting).
 * **On this PC** (with Files On-Demand): **Always keep** or **Online-only**.
 * **Versions**: earlier versions in OneDrive, to **Open** a copy or **Restore** one. See [Earlier versions and sharing](versions-and-sharing.md).

@@ -9,6 +9,9 @@
 //! memory only while open.
 pub(crate) use win::run;
 
+#[path = "settings_peer.rs"]
+mod settings_peer;
+
 mod win {
     use std::os::windows::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -74,6 +77,7 @@ mod win {
             webview::Options { title: "OneUpDrive", width: 1140, height: 760, data_dir: &webdata, html: &page, dark };
         let mut watching = false;
         let d = dir.clone();
+        let peer = Arc::new(super::settings_peer::Peer::new(&dir));
         webview::run(&opts, move |text, poster| {
             if !watching {
                 watching = true;
@@ -84,7 +88,16 @@ mod win {
             let op = msg.get("op").and_then(Value::as_str).unwrap_or_default().to_string();
             let args = msg.get("args").cloned().unwrap_or(Value::Null);
             let (d, poster) = (d.clone(), poster.clone());
+            let peer = peer.clone();
             rt.spawn(async move {
+                if op.starts_with("peer_") {
+                    let reply = match peer.handle(&op, &args, &poster).await {
+                        Ok(value) => json!({"id": id, "ok": value}),
+                        Err(error) => json!({"id": id, "error": error.to_string()}),
+                    };
+                    poster.post(reply.to_string());
+                    return;
+                }
                 // A request about one root of the Files page (a folder pair
                 // or vault) works on that root's own data folder: `handle`
                 // gets it as `dir`, and must not look `root` up again (a

@@ -11,7 +11,10 @@ yanked = "deny"
 # Each entry names the advisory, why it doesn't reach OneUpDrive, and what
 # removes it. cargo-deny warns when an entry no longer matches anything;
 # delete it then.
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "Build-only genawaiter proc-macro dependency. Remove when iroh-blobs and bao-tree drop genawaiter-proc-macro." },
+    { id = "RUSTSEC-2026-0543", reason = "Maintenance advisory for chrono. The peer worker uses it transitively for blob metadata timestamps and Windows network discovery. Remove when iroh-blobs, netwatch and wmi migrate." },
+]
 
 [licenses]
 version = 2
