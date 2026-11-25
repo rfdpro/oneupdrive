@@ -393,6 +393,8 @@ pub fn list(data_dir: &Path, rel: &str, steps: &[Step]) -> Result<Value> {
             "size": size,
             "modified_ms": modified_ms,
             "here": l.is_some(),
+            "peer_shareable": l.as_ref().is_some_and(|l| l.kind == LocalKind::File
+                && l.attributes & oneup_ntfs::dirent::NOT_PLAIN == 0 && l.reparse_tag == 0),
             "cloud": r.is_some(),
             "state": state,
             "why": why,

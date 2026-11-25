@@ -5,11 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   check:
+    name: windows-tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,11 +37,36 @@ jobs:
           # The settings window's keyboard test (headless Edge) must run, not skip.
           ONEUP_REQUIRE_EDGE: "1"
         run: >-
-          cargo test --workspace --no-fail-fast --
+          cargo test --workspace --exclude oneup-sync --no-fail-fast --
           --skip data_access_hydrates_and_holds_refuse_fetches
           --skip what_downloads_an_online_only_file_from_the_providers_process
           --skip on_demand_placeholders_follow_both_sides
           --skip control_pipes_admit_only_the_current_user
+
+  sync-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The reconciliation tests use in-memory fixtures and can run in parallel.
+      - name: Test reconciliation
+        env:
+          SIM_SEEDS: "10"
+          SIM_STORE: "1"
+        run: cargo test -p oneup-sync --no-fail-fast -- --test-threads 4
+
+  required-check:
+    name: check
+    needs: [check, sync-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both Windows jobs
+        env:
+          WINDOWS_RESULT: ${{ needs.check.result }}
+          SYNC_RESULT: ${{ needs.sync-tests.result }}
+        run: test "$WINDOWS_RESULT" = success && test "$SYNC_RESULT" = success
 
   supply-chain:
     # cargo-deny-action runs in a Linux container. deny.toml and the SBOM
@@ -70,5 +100,6 @@ jobs:
           name: sbom
           path: |
             bins/oneup/oneup.cdx.json
+            bins/oneup-peer/oneup-peer.cdx.json
             crates/oneup-shellext/oneup-shellext.cdx.json
           if-no-files-found: error

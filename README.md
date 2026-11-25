@@ -42,8 +42,9 @@ Same OneDrive cloud with a lighter, faster, and more careful engine that syncs w
 
 **Also included:**
 
-- 🔐 **Vaults** (experimental). Encrypted folders, decrypted on demand and unlocked with Windows Hello or password. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
+- 📤 **Peer-to-peer sharing.** Send files anywhere over end-to-end encryption. No size limits. No middle-man.
 - 🕓 **Version history.** See what changed in any file, when, and which program changed it.
+- 🔐 **Vaults** (experimental). Encrypted folders, decrypted on demand and unlocked with Windows Hello or password. Only you hold the key: not the app, not Microsoft. Compatible with [Cryptomator](https://cryptomator.org/).
 
 ## ⚖️ How it compares
 

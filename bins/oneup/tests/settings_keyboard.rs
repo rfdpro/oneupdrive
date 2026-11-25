@@ -25,6 +25,7 @@ const HOST_LISTENERS = [];
 const HOST_CALLS = [];
 const HOST_ANSWERS = {
   status: null, stopped: null,
+  peer_state: {send: {}, receive: {}}, sharing_list: {items: [], next: null},
   setup_items: a => ({items: a.side === "r" ? [{key:"r:old",path:"/cloud.txt",folder:false,selected:true}]
     : [{key:"l:1",path:"/local.txt",folder:false,selected:false}],next:null}),
   setup_select: null,
@@ -695,9 +696,18 @@ const DRIVER: &str = r##"<script>
     await loadSharing();
     check("another account never uses the previous Sharing results", sharingReads === 4, sharingReads);
 
-    // Recovery: focus follows the rewind's list and answers.
+    // Recovery keeps independent tasks, with keyboard navigation and exact review codes.
     window.confirm = () => true;
-    document.querySelector('nav [data-page="recovery"]').click(); await sleep(300);
+    const recoveryEntry = HOST_CALLS.length;
+    document.querySelector('nav [data-page="recovery"]').click(); await sleep(100);
+    check("Recovery opens kept copies and only loads the selected view",
+      document.querySelector("#rc-tab-kept").getAttribute("aria-selected") === "true" &&
+      HOST_CALLS.slice(recoveryEntry).filter(m => ["rewind_state", "conflicts", "cloud_bin", "kept"].includes(m.op))
+        .map(m => m.op).join(",") === "kept", "");
+    document.querySelector("#rc-tab-kept").focus(); key("ArrowRight"); await sleep(100);
+    check("Recovery arrows select the next tab and hide the previous panel",
+      document.activeElement.id === "rc-tab-deleted" && document.querySelector("#rc-panel-kept").hidden &&
+      !document.querySelector("#rc-panel-deleted").hidden, at());
     const recoveryScroll = document.querySelector("#main");
     const recoveryBottom = document.querySelector("#rc-bin");
     const tallRecovery = document.createElement("div");
@@ -705,59 +715,128 @@ const DRIVER: &str = r##"<script>
     recoveryBottom.before(tallRecovery);
     recoveryScroll.scrollTop = recoveryScroll.scrollHeight;
     window.scrollTo(0, 300);
-    check("Recovery scrolls to its last card inside the main pane", recoveryScroll.scrollTop > 0 && window.scrollY === 0 &&
+    check("Recovery scrolls its content inside the main pane", recoveryScroll.scrollTop > 0 && window.scrollY === 0 &&
       recoveryBottom.getBoundingClientRect().bottom <= recoveryScroll.getBoundingClientRect().bottom,
       [recoveryScroll.scrollTop, window.scrollY]);
     show("lists");
     check("switching away from Recovery resets the main scroll", recoveryScroll.scrollTop === 0, recoveryScroll.scrollTop);
     tallRecovery.remove();
-    show("recovery");
-    await sleep(100);
+    const restore = document.querySelector("#rc-bin button");
+    check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore?.outerHTML);
+    show("recovery"); await sleep(100);
+    const binRestore = document.querySelector("#rc-bin button");
+    binRestore.focus(); binRestore.click(); await sleep(100);
+    check("queuing a restore keeps focus and shows a lasting receipt",
+      document.activeElement === binRestore && binRestore.textContent === "Queued" &&
+      document.querySelector("#rc-message").textContent.includes("/Docs/gone.txt"), at());
+    const restoreCalls = HOST_CALLS.filter(m => m.op === "cloud_bin_restore").length;
+    binRestore.click();
+    check("a queued row cannot submit twice", HOST_CALLS.filter(m => m.op === "cloud_bin_restore").length === restoreCalls, "");
+    document.querySelector("#rc-activity").click();
+    check("the restore receipt links to recent Activity", document.querySelector("#lists").classList.contains("on") &&
+      document.querySelector('#ls-tabs [data-tab="log"]').getAttribute("aria-pressed") === "true", at());
+
     HOST_ANSWERS.conflicts = Array.from({length: 26}, (_, i) => ({
       path: "/conflict-" + i + ".txt", copy_path: "/copy-" + i + ".txt",
       original: {size: 20}, copy: {size: 30}, original_ms: 1, copy_ms: 2
     }));
     HOST_ANSWERS.kept = Array.from({length: 26}, (_, i) => ({id: i, name: "kept-" + i, bytes: 20, at_ms: 1}));
-    await loadRecovery();
-    await sleep(100);
-    check("Recovery shows one page of conflicts and kept copies", document.querySelectorAll("#cf-table tbody tr").length === 25 &&
-      document.querySelectorAll("#rc-kept tbody tr").length === 25, "");
-    document.querySelector('#cf-pages [data-direction="1"]').click();
+    show("recovery", "kept"); await sleep(100);
+    check("Recovery shows one page of kept copies", document.querySelectorAll("#rc-kept tbody tr").length === 25, "");
     document.querySelector('#rc-kept [data-direction="1"]').click();
-    check("each Recovery list has its own last page", document.querySelector("#cf-table tbody").textContent.includes("conflict-25.txt") &&
-      document.querySelectorAll("#cf-table tbody tr").length === 1 &&
-      document.querySelector("#rc-kept tbody").textContent.includes("kept-25"), "");
-    document.querySelector("#cf-batch button").click();
-    await sleep(100);
+    check("kept copies can reach their last page", document.querySelector("#rc-kept tbody").textContent.includes("kept-25"), "");
+    document.querySelector("#rc-tab-conflicts").click(); await sleep(100);
+    check("Recovery shows one page of conflicts", document.querySelectorAll("#cf-table tbody tr").length === 25, "");
+    document.querySelector('#cf-pages [data-direction="1"]').click();
+    check("conflicts can reach their last page", document.querySelector("#cf-table tbody").textContent.includes("conflict-25.txt") &&
+      document.querySelectorAll("#cf-table tbody tr").length === 1, "");
+    document.querySelector("#cf-batch button").click(); await sleep(100);
     const batch = HOST_CALLS.filter(m => m.op === "conflict_keep_batch").at(-1);
     check("batch decisions include conflicts from every page", batch?.args.keep === "original" &&
       batch.args.conflicts.length === 26 && batch.args.conflicts[0].path === "/conflict-0.txt", batch?.args.conflicts.length);
     HOST_ANSWERS.conflicts = [];
     HOST_ANSWERS.kept = [];
-    await loadRecovery();
+
+    show("recovery", "versions");
+    const savedVersions = HOST_ANSWERS.item_versions;
+    let finishVersions;
+    HOST_ANSWERS.item_versions = () => new Promise(resolve => { finishVersions = resolve; });
+    const versionPath = document.querySelector("#rv-path");
+    versionPath.value = "first.txt";
+    document.querySelector("#rv-form").requestSubmit();
+    versionPath.value = "second.txt";
+    versionPath.dispatchEvent(new Event("input"));
+    finishVersions(savedVersions);
+    await sleep(100);
+    check("editing the version path removes old results even when the lookup finishes late",
+      document.querySelector("#rv-list").children.length === 0, "");
+    HOST_ANSWERS.item_versions = savedVersions;
+    HOST_ANSWERS.pick_file = "C:\\Sync\\report.docx";
+    document.querySelector("#rv-browse").focus();
+    document.querySelector("#rv-browse").click(); await sleep(100);
+    check("Browse shows the selected file's versions without another click", document.activeElement.id === "rv-browse" &&
+      HOST_CALLS.filter(m => m.op === "item_versions").at(-1)?.args.path === HOST_ANSWERS.pick_file &&
+      !!document.querySelector("#rv-list tbody tr"), at());
+    delete HOST_ANSWERS.pick_file;
+
+    show("recovery", "rewind"); await sleep(100);
     document.querySelector("#rw-date").value = "2026-01-01";
     document.querySelector("#rw-time").value = "10:00";
+    const savedPreview = HOST_ANSWERS.rewind_preview;
+    let finishPreview;
+    HOST_ANSWERS.rewind_preview = () => new Promise(resolve => { finishPreview = resolve; });
+    document.querySelector("#rw-preview").click();
+    const folder = document.querySelector("#rw-folder");
+    folder.value = "/Other";
+    folder.dispatchEvent(new Event("input", {bubbles: true}));
+    finishPreview(savedPreview({})); await sleep(100);
+    check("a late preview cannot replace an edited folder",
+      document.querySelector("#rw-result").hidden && folder.value === "/Other", "");
+    HOST_ANSWERS.rewind_preview = savedPreview;
     document.querySelector("#rw-preview").focus();
-    document.querySelector("#rw-preview").click(); await sleep(300);
+    document.querySelector("#rw-preview").click(); await sleep(100);
     const more = document.querySelector("#rw-actions button");
-    check("a long list shows Show more, not Rewind", more && more.textContent === "Show more", more && more.textContent);
+    check("preview focuses its heading and names the target", document.activeElement.id === "rw-stage" &&
+      document.querySelector("#rw-target").textContent.includes("/Docs"), at());
+    check("a long preview starts with Show more", more?.textContent === "Show more", more?.textContent);
     more.focus(); more.click(); await sleep(100);
-    check("Show more gives focus to what replaces it", document.activeElement.textContent === "Rewind", at());
-    document.activeElement.click(); await sleep(300);
-    check("asking for the rewind gives focus to Approve", document.activeElement.textContent === "Approve", at());
-    document.activeElement.click(); await sleep(300);
-    check("a list that changed before the approval is shown again, from its start",
+    check("Show more gives focus to Continue", document.activeElement.textContent === "Continue", at());
+    document.activeElement.click(); await sleep(100);
+    check("continuing queues the reviewed code and focuses approval",
+      document.activeElement.textContent === "Approve" && document.querySelector("#rw-form").hidden &&
+      HOST_CALLS.filter(m => m.op === "rewind_start").at(-1)?.args.expect === "0123456789abcdef", at());
+    document.activeElement.click(); await sleep(100);
+    check("a list that changed before approval is shown again, from its start",
       document.activeElement.textContent === "Show more" && !document.querySelector("#rw-actions").textContent.includes("Approve"), at());
     document.activeElement.click(); await sleep(100);
-    check("the new list is offered for approval once all of it is shown",
-      document.activeElement.textContent === "Approve" && document.querySelector("#rw-actions").textContent.includes("fedcba9876543210"), at());
+    check("the new list is offered for approval once all of it is shown", document.activeElement.textContent === "Approve", at());
+    const savedApprove = HOST_ANSWERS.rewind_approve;
+    HOST_ANSWERS.rewind_approve = {approved: true};
+    document.activeElement.click(); await sleep(100);
+    check("approval submits the refreshed code and replaces the review controls",
+      HOST_CALLS.filter(m => m.op === "rewind_approve").at(-1)?.args.code === "fedcba9876543210" &&
+      document.querySelector("#rw-stage").textContent === "Approval submitted" &&
+      !document.querySelector("#rw-actions").textContent.includes("Approve"), at());
+    HOST_ANSWERS.rewind_approve = savedApprove;
     const cancel = [...document.querySelectorAll("#rw-actions button")].find(b => b.textContent === "Cancel");
-    cancel.focus(); cancel.click(); await sleep(300);
-    check("cancelling gives focus back to Preview", document.activeElement.id === "rw-preview", at());
-    const restore = document.querySelector("#rc-bin button");
-    check("a deleted item's Restore names it", restore && restore.getAttribute("aria-label") === "Restore /Docs/gone.txt", restore && restore.outerHTML);
-    restore.focus(); restore.click(); await sleep(300);
-    check("restoring keeps focus in the list as it reloads", document.querySelector("#rc-bin").contains(document.activeElement), at());
+    cancel.focus(); cancel.click(); await sleep(100);
+    check("cancelling returns focus to Preview", document.activeElement.id === "rw-preview", at());
+
+    const savedRewindState = HOST_ANSWERS.rewind_state;
+    HOST_ANSWERS.rewind_state = {since_ms: 1, job: {folder: "/Docs", at_ms: 5000, approved: false}, code: "unseen"};
+    document.querySelector("#rc-refresh").click(); await sleep(100);
+    check("a resumed job with a mismatched preview links to the current safety stop without an Approve button",
+      document.querySelector("#rw-actions button")?.textContent === "Safety stops" &&
+      !document.querySelector("#rw-actions").textContent.includes("Approve"), "");
+    HOST_ANSWERS.rewind_state = {since_ms: 1, job: {folder: "/Docs", at_ms: 5000, approved: true, ran: 3, left_alone: 0}, code: null};
+    document.querySelector("#rc-refresh").click(); await sleep(100);
+    check("refresh shows rewind progress", document.querySelector("#rw-stage").textContent === "Rewinding" &&
+      document.querySelector("#rw-note").textContent.includes("3 changes made"), "");
+    HOST_ANSWERS.rewind_state = savedRewindState;
+    document.querySelector("#rc-refresh").click(); await sleep(100);
+    check("when a rewind ends its result points to Activity",
+      document.querySelector("#rw-stage").textContent === "Rewind ended" &&
+      document.querySelector("#rw-actions button")?.textContent === "View activity", "");
     document.querySelector("#nav-open-settings").click();
     document.querySelector('nav button[data-page="general"]').click(); await sleep(300);
     const sharedDescription = document.querySelector("#shared-settings>.note").getBoundingClientRect();
@@ -838,6 +917,116 @@ const DRIVER: &str = r##"<script>
     orderButtons[0].click(); orderButtons[1].click(); orderButtons[1].click();
     check("sync order can return to its original selection without reopening details", orders.join(",") === "first,normal"
       && orderButtons[1].getAttribute("aria-pressed") === "true", orders);
+    const shareControl = shareButton({path:"C:\\Sync\\big.iso", cloud:true, peer_shareable:true});
+    const shareActions = [...shareControl.querySelectorAll(".pop button")];
+    check("a synced local file offers both OneDrive links and a file transfer",
+      shareActions.map(b => b.textContent).join(",") === "Copy OneDrive view link,Copy OneDrive edit link,Send a file", "");
+    const cloudFolder = shareButton({path:"C:\\Sync\\Folder", cloud:true, folder:true});
+    check("a synced folder offers both OneDrive links", cloudFolder.querySelectorAll(".pop button").length === 2, "");
+    const localFile = shareButton({path:"C:\\Sync\\Local.txt", peer_shareable:true});
+    check("a local-only file offers the file transfer", localFile.querySelector(".pop").textContent === "Send a file", "");
+    shareActions[0].click(); await sleep(20);
+    check("the OneDrive view link still uses the cloud sharing action",
+      HOST_CALLS.some(m => m.op === "item_share" && m.args.path.endsWith("big.iso") && !m.args.edit), "");
+    [...shareControl.querySelectorAll(".pop button")].find(b => b.textContent === "Send a file").click();
+    check("the file Share button opens a recipient dialog", document.querySelector("#dlg-peer-send").open
+      && document.querySelector("#peer-send-file").textContent === "big.iso", "");
+    document.querySelector("#peer-send-cancel").click();
+    startAt("peersend", "C:\\Sync\\from-explorer.txt"); await sleep(25);
+    check("Explorer opens the same send dialog", document.querySelector("#dlg-peer-send").open
+      && document.querySelector("#peer-send-file").textContent === "from-explorer.txt", "");
+    const linuxAndMac = document.querySelector("#peer-companion-downloads");
+    linuxAndMac.closest("details").querySelector("summary").click();
+    linuxAndMac.click(); await sleep(20);
+    check("the receiver section opens the Linux and Mac download page", HOST_CALLS.some(m => m.op === "peer_receiver_downloads"), "");
+    document.querySelector("#peer-recipient").value = "fixture-recipient";
+    document.querySelector("#peer-send-form").requestSubmit(); await sleep(30);
+    check("the send dialog submits the selected file and code", HOST_CALLS.some(m => m.op === "peer_send"
+      && m.args.paths.length === 1 && m.args.paths[0].endsWith("from-explorer.txt") && m.args.recipient === "fixture-recipient"), "");
+    const filesToSend = ["C:\\Sync\\first.txt", "C:\\Sync\\second.txt"];
+    HOST_ANSWERS.peer_pick_files = filesToSend;
+    document.querySelector("#peer-send-choose").click(); await sleep(30);
+    check("multi-select previews the files in one ZIP", document.querySelector("#peer-send-file").textContent === "2 files in one ZIP"
+      && [...document.querySelectorAll("#peer-send-files li")].map(li => li.textContent).join(",") === "first.txt,second.txt", "");
+    document.querySelector("#peer-recipient").value = "fixture-bundle-recipient";
+    document.querySelector("#peer-send-form").requestSubmit(); await sleep(30);
+    check("the bundle uses one send request", HOST_CALLS.filter(m => m.op === "peer_send" && m.args.recipient === "fixture-bundle-recipient"
+      && m.args.paths.join() === filesToSend.join()).length === 1, "");
+    show("files"); document.querySelector("#add-menu").showPopover();
+    document.querySelector("#add-peer-receive").click(); await sleep(30);
+    check("Files Add opens and focuses the receive controls", document.querySelector("#shared").classList.contains("on")
+      && document.querySelector('#sg-tabs [data-tab="transfer"]').getAttribute("aria-pressed") === "true"
+      && document.activeElement.id === "peer-recv-prepare", document.activeElement.id);
+    check("the first receive step shows one action and hides the download form",
+      document.querySelector("#peer-recv-prepare").textContent === "Get my code"
+      && document.querySelector("#peer-recv-form").hidden, "");
+    const readyReceive = {phase:"ready", code:"fixture-receive-code", running:false};
+    HOST_ANSWERS.peer_state.receive = readyReceive;
+    peerUpdate("receive", readyReceive);
+    document.querySelector("#peer-recv-prepare").click();
+    check("the receive code unlocks a clearly labelled download form",
+      document.querySelector("#peer-recv-value").value === "fixture-receive-code"
+      && !document.querySelector("#peer-recv-form").hidden && !document.querySelector("#peer-recv-network").open, "");
+    const receiveNetwork = document.querySelector("#peer-recv-network");
+    receiveNetwork.open = true;
+    await sleep(20);
+    const connectionLabel = receiveNetwork.querySelector("label").getBoundingClientRect();
+    const connectionHelp = receiveNetwork.querySelector(".note").getBoundingClientRect();
+    check("connection help has its own line and spacing", connectionHelp.top - connectionLabel.bottom >= 4, "");
+    document.querySelector("#peer-ticket").dispatchEvent(new KeyboardEvent("keydown", {key:"Escape", bubbles:true}));
+    check("Escape collapses an unused receive form and returns focus", document.querySelector("#peer-recv-form").hidden
+      && document.activeElement.id === "peer-recv-prepare" && !receiveNetwork.open, "");
+    document.querySelector("#peer-recv-prepare").click();
+    document.querySelector('#sg-tabs [data-tab="by"]').click();
+    document.querySelector('#sg-tabs [data-tab="transfer"]').click(); await sleep(25);
+    check("leaving and returning to File transfers leaves an unused receive form collapsed", document.querySelector("#peer-recv-form").hidden, "");
+    document.querySelector("#peer-recv-prepare").click();
+    show("files"); show("shared"); await sleep(25);
+    check("leaving Sharing collapses the form and preserves the receive code", document.querySelector("#peer-recv-form").hidden
+      && PEER.receive.code === "fixture-receive-code", "");
+    document.querySelector("#peer-recv-prepare").click();
+    document.querySelector("#peer-recv-copy").click(); await sleep(20);
+    check("copying the receive code moves focus to the download code", document.activeElement.id === "peer-ticket", document.activeElement.id);
+    const destination = document.querySelector("#peer-recv-destination");
+    check("the receive form names the default folder", destination.textContent === "OneUpDrive receive folder", destination.textContent);
+    HOST_ANSWERS.peer_pick_folder = "D:\\Incoming files";
+    document.querySelector("#peer-recv-browse").click(); await sleep(20);
+    check("the selected folder is shown before download", destination.textContent === "D:\\Incoming files", destination.textContent);
+    HOST_ANSWERS.peer_pick_folder = null;
+    document.querySelector("#peer-recv-browse").click(); await sleep(20);
+    check("cancelling the folder picker keeps the selection", destination.textContent === "D:\\Incoming files", destination.textContent);
+    document.querySelector("#peer-ticket").value = "fixture-download-code";
+    document.querySelector("#peer-recv-start").click(); await sleep(20);
+    check("the download form submits the pasted code with automatic connection options", HOST_CALLS.some(m => m.op === "peer_receive"
+      && m.args.ticket === "fixture-download-code" && m.args.destination === "D:\\Incoming files" && !m.args.direct), "");
+    peerUpdate("receive", {phase:"receiving", running:true, bytes:512, total:1024, connections:1, route:"relay"});
+    check("download shows progress and Pause with the network route in the details", document.querySelector("#peer-recv-bar").position === 0.5
+      && document.querySelector("#peer-recv-route").textContent.includes("Via relay")
+      && !document.querySelector("#peer-recv-details").open && !document.querySelector("#peer-recv-pause").hidden, "");
+    document.querySelector("#peer-recv-pause").click(); await sleep(20);
+    check("Pause addresses the incoming connection", HOST_CALLS.some(m => m.op === "peer_stop" && m.args.side === "receive"), "");
+    peerUpdate("receive", {phase:"paused", code:"fixture-receive-code", has_ticket:true, running:false, bytes:512, total:1024});
+    document.querySelector("#peer-recv-start").dispatchEvent(new KeyboardEvent("keydown", {key:"Escape", bubbles:true}));
+    check("a paused download can resume without pasting the code again", document.querySelector("#peer-recv-input").hidden
+      && !document.querySelector("#peer-recv-start").hidden && document.querySelector("#peer-recv-start").textContent === "Resume download", "");
+    peerUpdate("receive", {phase:"complete", code:"fixture-receive-code", saved:"C:\\Inbox\\fixture.txt"});
+    check("a completed transfer offers the saved file and a new receive flow", !document.querySelector("#peer-recv-folder").hidden
+      && document.querySelector("#peer-recv-prepare").textContent === "Receive another file", "");
+    peerUpdate("send", {phase:"offered", name:"fixture.txt", ticket:"fixture-download-code", running:true});
+    check("a ready send points to the download code and end-sharing controls", !document.querySelector("#peer-send-ready").hidden
+      && !document.querySelector("#peer-send-copy").hidden && !document.querySelector("#peer-send-stop").hidden
+      && document.querySelector("#peer-send-choose").hidden, "");
+    peerUpdate("send", {...PEER.send, connections:1, route:"direct", network_bytes:1024});
+    check("an open transfer shows the recipient and sent bytes above connection details",
+      document.querySelector("#peer-send-state").textContent.includes("Recipient connected")
+      && !document.querySelector("#peer-send-bytes").hidden && !document.querySelector("#peer-send-details").open, "");
+    peerUpdate("send", {});
+    PEER.destination = null;
+    peerUpdate("receive", {phase:"paused", code:"fixture-receive-code", has_ticket:true, destination:"D:\\Previous folder"});
+    check("an interrupted session shows its saved destination", destination.textContent === "D:\\Previous folder", destination.textContent);
+    HOST_ANSWERS.peer_state.receive = {};
+    peerUpdate("receive", {});
+    show("files");
     // Vault credentials use masked fields, clear on close, and never send a cancelled action.
     const focusBack = document.createElement("button"); document.body.append(focusBack); focusBack.focus();
     const secretDialog = document.querySelector("#dlg-secret"), secretInput = document.querySelector("#secret-password");

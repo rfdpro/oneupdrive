@@ -1124,13 +1124,13 @@
             color: var(--ink);
         }
 
-        .seg.pivot button[aria-pressed="true"] {
+        .seg.pivot button:is([aria-pressed="true"], [aria-selected="true"]) {
             background: none;
             color: var(--ink);
             box-shadow: none;
         }
 
-        .seg.pivot button[aria-pressed="true"]::after {
+        .seg.pivot button:is([aria-pressed="true"], [aria-selected="true"])::after {
             content: "";
             position: absolute;
             left: 10px;
@@ -2572,6 +2572,92 @@
             margin: 4px 0 8px;
             color: var(--muted);
         }
+        .peer-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 285px), 1fr));
+            gap: 12px;
+            align-items: start;
+            margin-top: 12px;
+        }
+
+        .peer-card {
+            min-width: 0;
+            padding: 16px;
+        }
+
+        .peer-card h3, .peer-card p, .peer-options p {
+            margin: 0 0 8px;
+            overflow-wrap: anywhere;
+        }
+
+        .peer-card h3 {
+            margin-bottom: 12px;
+        }
+
+        .peer-card > .note {
+            padding: 0;
+        }
+
+        .peer-step, .peer-options {
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid var(--line);
+        }
+
+        .peer-options summary {
+            cursor: pointer;
+            color: var(--muted);
+        }
+
+        .peer-options[open] summary {
+            margin-bottom: 8px;
+        }
+
+        .peer-options .ck {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+        }
+
+        .peer-options .ck + .note {
+            margin: 4px 0 0 24px;
+        }
+
+        #peer-send-files {
+            max-height: 7em;
+            overflow: auto;
+            overflow-wrap: anywhere;
+            margin: 4px 0 12px;
+            padding-inline-start: 22px;
+        }
+
+        .peer-field {
+            display: grid;
+            gap: 6px;
+        }
+
+        .peer-field input, .peer-field textarea, .peer-card progress {
+            width: 100%;
+            min-width: 0;
+        }
+
+        .peer-field textarea {
+            min-height: 4em;
+            resize: vertical;
+        }
+
+        .peer-destination {
+            margin-top: 12px;
+        }
+
+        .peer-card > .actions {
+            margin-top: 8px;
+        }
+
+        .peer-card progress {
+            accent-color: var(--accent);
+        }
+
         /* Share, beside a file's name */
         
         .share {
@@ -2805,33 +2891,93 @@
             color: var(--muted);
             font: 12px/1.4 var(--caption);
         }
-        /* Recovery: each way back is a section with its own mark, so the
-           long page scans by what each one does. */
+        #rc-tabs {
+            display: flex;
+            margin-bottom: 16px;
+            border-bottom: 1px solid var(--line);
+        }
 
-        .sect-head {
+        #rc-tabs button {
+            white-space: normal;
+        }
+
+        #rv-form {
+            flex-wrap: wrap;
+        }
+
+        #rv-form input {
+            flex: 1 1 230px;
+            min-width: 0;
+        }
+
+        #recovery .rc-compact {
+            display: none;
+        }
+
+        @container sheet (max-width: 480px) {
+            #rw-form .row {
+                flex-wrap: wrap;
+                gap: 8px 12px;
+            }
+
+            #rw-form .label,
+            #rw-quick {
+                flex: 1 0 100%;
+            }
+
+            #rw-quick button {
+                white-space: normal;
+            }
+
+            #recovery .rc-compact {
+                display: block;
+            }
+
+            #recovery .rc-wide {
+                display: none;
+            }
+
+            #recovery #cf-table td:first-child {
+                min-width: 0;
+            }
+        }
+
+        #recovery .btn[aria-disabled="true"] {
+            color: var(--muted);
+            cursor: default;
+        }
+
+        #recovery [role="tabpanel"] .card {
+            overflow-x: auto;
+        }
+
+        #rc-notice,
+        #rw-context {
             display: flex;
             align-items: center;
-            gap: 10px;
-            margin: 32px 0 10px;
+            flex-wrap: wrap;
+            gap: 8px 12px;
+            overflow-wrap: anywhere;
         }
 
-        .page-head+.sect-head {
-            margin-top: 4px;
-        }
-
-        .sect-head svg {
-            width: 28px;
-            height: 28px;
-            padding: 6px;
-            flex: none;
-            color: var(--accent);
+        #rc-notice {
+            padding: 10px 14px;
+            margin-bottom: 12px;
             background: var(--accent-soft);
-            border-radius: 7px;
+            border-radius: var(--radius);
         }
 
-        .sect-head h3 {
+        #rw-context {
+            margin-bottom: 10px;
+        }
+
+        #rw-context h3,
+        #rw-context p {
             margin: 0;
-            font: 600 16px/1.3 var(--display);
+        }
+
+        #rw-context p {
+            color: var(--muted);
         }
 
         .rw-folder {
@@ -2866,11 +3012,18 @@
         }
 
         #rw-result {
+            margin-top: 12px;
             background: var(--canvas);
         }
 
         #rw-groups {
             margin-top: 0;
+        }
+
+        #rw-groups:empty,
+        #rw-note:empty,
+        #rw-target:empty {
+            display: none;
         }
 
         #cf-table td:first-child {
@@ -3035,7 +3188,7 @@
             .root-tab[aria-selected="true"] svg {
                 color: HighlightText;
             }
-            .seg.pivot button[aria-pressed="true"]::after,
+            .seg.pivot button:is([aria-pressed="true"], [aria-selected="true"])::after,
             .views button[aria-selected="true"]::after,
             nav button[aria-current="page"]::before,
             .ti[aria-selected="true"]::before {
@@ -3136,10 +3289,6 @@
     <symbol id="i-memory" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="1.75" y="2.25" width="12.5" height="11.5" rx="1.5"/><path d="M8.5 2.25v11.5M8.5 8h5.75M1.75 9.5H8.5M11.5 8v5.75"/></g></symbol>
     <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 7.5A5 5 0 1 1 11.5 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M12.2 1.8v2.9H9.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-alert" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M8 4.4v4.4" style="stroke:var(--bad-soft)" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="11.3" r="1" style="fill:var(--bad-soft)"/></symbol>
-    <symbol id="i-conflict" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 3.5h5.5v8H2.5z"/><path d="M8 5.5h5.5v8H8z" style="fill:var(--accent-soft)"/></g></symbol>
-    <symbol id="i-kept" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><rect x="1.75" y="2.5" width="12.5" height="3.5" rx="1"/><path d="M2.75 6v6.5c0 .55.45 1 1 1h8.5c.55 0 1-.45 1-1V6M6.3 8.8h3.4" stroke-linecap="round"/></g></symbol>
-    <symbol id="i-versions" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 1.75h7.5v12.5H4.5z"/><path d="M2.5 4v10.25M7 5.5h3M7 8h3M7 10.5h2"/></g></symbol>
-    <symbol id="i-bin" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4.2h11M6.2 4.2V2.6h3.6v1.6M3.8 4.2l.7 9.3c0 .4.4.8.8.8h5.4c.4 0 .8-.4.8-.8l.7-9.3M6.6 7v4.4M9.4 7v4.4"/></g></symbol>
   </defs>
 </svg>
     <nav aria-label="Pages">
@@ -3500,69 +3649,158 @@
                 <div class="seg pivot" id="sg-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="by" aria-pressed="true">Shared by you</button>
                     <button type="button" data-tab="with" aria-pressed="false">Shared with you</button>
+                    <button type="button" data-tab="transfer" aria-pressed="false" aria-controls="peer-panel">File transfers</button>
                 </div>
             </div>
-            <p class="lead" id="sg-sum"></p>
-            <div class="card" id="sg-card" hidden>
-                <table class="list" id="sg-table">
-                    <thead></thead>
-                    <tbody></tbody>
-                </table>
+            <div id="sg-drive">
+                <p class="lead" id="sg-sum"></p>
+                <div class="card" id="sg-card" hidden>
+                    <table class="list" id="sg-table">
+                        <thead></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="actions" id="sg-more"></div>
             </div>
-            <div class="actions" id="sg-more"></div>
+            <div class="peer-grid" id="peer-panel" hidden>
+                <section class="card peer-card" aria-labelledby="peer-send-heading">
+                    <h3 id="peer-send-heading" tabindex="-1">Send a file</h3>
+                    <p class="note" id="peer-send-intro">Ask the recipient for their receive code. Select multiple files to send them as one ZIP.</p>
+                    <p class="note">Transfers are peer-to-peer and end-to-end encrypted. Devices connect directly when possible and use an encrypted relay when needed.</p>
+                    <p id="peer-send-state" role="status" hidden></p>
+                    <div id="peer-send-ready" hidden>
+                        <p class="note">Send the download code to the person who gave you their receive code. Keep Settings open until they finish.</p>
+                    </div>
+                    <p class="note" id="peer-send-bytes" hidden></p>
+                    <div class="actions">
+                        <button class="btn primary" id="peer-send-choose">Choose files</button>
+                        <button class="btn primary" id="peer-send-copy" hidden>Copy download code</button>
+                        <button class="btn" id="peer-send-stop" hidden>End sharing</button>
+                    </div>
+                    <details class="peer-options" id="peer-send-details" hidden>
+                        <summary>Connection details</summary>
+                        <p class="note" id="peer-send-progress"></p>
+                    </details>
+                </section>
+                <section class="card peer-card" aria-labelledby="peer-recv-heading">
+                    <h3 id="peer-recv-heading" tabindex="-1">Receive a file</h3>
+                    <p class="note" id="peer-recv-intro">Get a receive code and give it to the person sending the file.</p>
+                    <p id="peer-recv-state" role="status" hidden></p>
+                    <div id="peer-recv-code" class="peer-field" hidden>
+                        <label for="peer-recv-value">My receive code</label>
+                        <input type="text" id="peer-recv-value" readonly spellcheck="false">
+                        <p class="note">Send this code to the sender. They'll send you a download code in return.</p>
+                        <div class="actions"><button class="btn primary" id="peer-recv-copy">Copy my code</button></div>
+                    </div>
+                    <form id="peer-recv-form" hidden>
+                        <div class="peer-step peer-field" id="peer-recv-input">
+                            <label for="peer-ticket">Download code from the sender</label>
+                            <textarea id="peer-ticket" rows="2" maxlength="8192" spellcheck="false" required></textarea>
+                        </div>
+                        <div class="peer-destination">
+                            <p><b>Save to</b></p>
+                            <p class="note" id="peer-recv-destination" role="status">OneUpDrive receive folder</p>
+                            <button type="button" class="btn" id="peer-recv-browse">Change folder</button>
+                        </div>
+                        <details class="peer-options" id="peer-recv-network">
+                            <summary>Connection options</summary>
+                            <label class="ck"><input type="checkbox" id="peer-recv-direct" aria-describedby="peer-recv-direct-help"><span>Require a direct connection</span></label>
+                            <p class="note" id="peer-recv-direct-help">Useful when both devices are on the same network.</p>
+                        </details>
+                    </form>
+                    <div id="peer-recv-meter" hidden>
+                        <progress id="peer-recv-bar" aria-label="Download progress"></progress>
+                        <p class="note" id="peer-recv-progress"></p>
+                    </div>
+                    <div class="actions">
+                        <button class="btn primary" id="peer-recv-start" type="submit" form="peer-recv-form" hidden>Download</button>
+                        <button class="btn primary" id="peer-recv-prepare">Get my code</button>
+                        <button class="btn primary" id="peer-recv-folder" hidden>Open folder</button>
+                        <button class="btn" id="peer-recv-pause" hidden>Pause</button>
+                    </div>
+                    <details class="peer-options" id="peer-recv-details" hidden>
+                        <summary>Connection details</summary>
+                        <p class="note" id="peer-recv-route"></p>
+                    </details>
+                </section>
+            </div>
         </section>
 
         <!-- Recovery: rewind a folder, kept copies, OneDrive versions and recycle bin, conflicts -->
         <section class="page" id="recovery">
-            <h2>Recovery</h2>
-            <div class="sect-head"><svg aria-hidden="true"><use href="#i-recovery"/></svg><h3>Rewind a folder</h3></div>
-            <div class="card">
-                <div class="row">
-                    <div class="label"><b>Folder</b><small>/ for everything</small></div>
-                    <input type="text" id="rw-folder" class="rw-folder" placeholder="/Documents" spellcheck="false" aria-label="Folder to rewind" aria-describedby="rw-since"></div>
-                <div class="row">
-                    <div class="label"><b>Rewind to</b><small id="rw-ago" aria-live="polite"></small></div>
-                    <div class="rw-at" role="group" aria-label="Moment to rewind to">
-                        <input type="date" id="rw-date" aria-label="Date to rewind to" aria-describedby="rw-ago">
-                        <input type="time" id="rw-time" step="60" aria-label="Time to rewind to" aria-describedby="rw-ago"></div>
+            <div class="page-head">
+                <h2 id="rc-title">Recovery</h2>
+                <button class="btn" id="rc-refresh"><svg aria-hidden="true"><use href="#i-refresh"/></svg>Refresh</button>
+            </div>
+            <div class="seg pivot" id="rc-tabs" role="tablist" aria-labelledby="rc-title">
+                <button type="button" id="rc-tab-kept" role="tab" aria-controls="rc-panel-kept" aria-selected="true">Kept on this PC</button>
+                <button type="button" id="rc-tab-deleted" role="tab" aria-controls="rc-panel-deleted" aria-selected="false" tabindex="-1">Deleted from OneDrive</button>
+                <button type="button" id="rc-tab-versions" role="tab" aria-controls="rc-panel-versions" aria-selected="false" tabindex="-1">OneDrive versions</button>
+                <button type="button" id="rc-tab-conflicts" role="tab" aria-controls="rc-panel-conflicts" aria-selected="false" tabindex="-1">Conflicts</button>
+                <button type="button" id="rc-tab-rewind" role="tab" aria-controls="rc-panel-rewind" aria-selected="false" tabindex="-1">Rewind a folder</button>
+            </div>
+            <div id="rc-notice" hidden><span id="rc-message" role="status"></span><button type="button" class="btn small" id="rc-activity">View activity</button></div>
+            <div id="rc-panel-kept" role="tabpanel" aria-labelledby="rc-tab-kept" tabindex="0">
+                <div class="card" id="rc-kept"><p class="say" role="status">Looking…</p></div>
+            </div>
+            <div id="rc-panel-deleted" role="tabpanel" aria-labelledby="rc-tab-deleted" tabindex="0" hidden>
+                <div class="card" id="rc-bin"><p class="say" role="status">Looking…</p></div>
+            </div>
+            <div id="rc-panel-versions" role="tabpanel" aria-labelledby="rc-tab-versions" tabindex="0" hidden>
+                <div class="card">
+                    <div class="row block">
+                        <form class="field" id="rv-form">
+                            <input type="text" id="rv-path" placeholder="Full file path" spellcheck="false" aria-label="File to show the versions of" required>
+                            <button type="button" class="btn" id="rv-browse">Browse</button>
+                            <button class="btn primary" id="rv-show">Show</button>
+                        </form>
+                        <div id="rv-list"></div>
+                    </div>
                 </div>
-                <div class="row">
-                    <div class="seg" id="rw-quick" role="group" aria-label="Rewind to">
-                        <button type="button" data-ago="900000" aria-pressed="false">15 minutes ago</button>
-                        <button type="button" data-ago="3600000" aria-pressed="false">1 hour ago</button>
-                        <button type="button" data-ago="today" aria-pressed="false">Start of today</button>
-                        <button type="button" data-ago="86400000" aria-pressed="false">This time yesterday</button></div>
-                    <button class="btn primary rw-go" id="rw-preview">Preview</button>
+            </div>
+            <div id="rc-panel-conflicts" role="tabpanel" aria-labelledby="rc-tab-conflicts" tabindex="0" hidden>
+                <div class="card" id="cf-card">
+                    <p class="say" id="cf-sum" role="status">Looking…</p>
+                    <div class="row actions" id="cf-batch" aria-label="Resolve all listed conflicts" role="group" hidden></div>
+                    <div id="cf-pages"></div>
+                    <table class="list" id="cf-table" aria-label="Conflicts" hidden>
+                        <thead><tr><th>File</th><th class="rc-wide">Original</th><th class="rc-wide">Conflict copy</th><th><span class="sr-only">Action</span></th></tr></thead>
+                        <tbody></tbody>
+                    </table>
                 </div>
-                <div class="row block" id="rw-result" hidden>
+            </div>
+            <div id="rc-panel-rewind" role="tabpanel" aria-labelledby="rc-tab-rewind" tabindex="0" hidden>
+                <form class="card" id="rw-form">
+                    <div class="row">
+                        <div class="label"><label for="rw-folder"><b>Folder</b></label><small>/ for everything</small></div>
+                        <input type="text" id="rw-folder" class="rw-folder" placeholder="/Documents" spellcheck="false" aria-label="Folder to rewind" aria-describedby="rw-since">
+                    </div>
+                    <div class="row">
+                        <div class="label"><b>Rewind to</b><small id="rw-ago" aria-live="polite"></small></div>
+                        <div class="rw-at" role="group" aria-label="Moment to rewind to">
+                            <input type="date" id="rw-date" aria-label="Date to rewind to" aria-describedby="rw-ago">
+                            <input type="time" id="rw-time" step="any" aria-label="Time to rewind to" aria-describedby="rw-ago">
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="seg" id="rw-quick" role="group" aria-label="Rewind to">
+                            <button type="button" data-ago="900000" aria-pressed="false">15 minutes ago</button>
+                            <button type="button" data-ago="3600000" aria-pressed="false">1 hour ago</button>
+                            <button type="button" data-ago="today" aria-pressed="false">Start of today</button>
+                            <button type="button" data-ago="86400000" aria-pressed="false">This time yesterday</button>
+                        </div>
+                        <button class="btn primary rw-go" id="rw-preview">Preview</button>
+                    </div>
+                </form>
+                <p class="note" id="rw-since"></p>
+                <div class="card row block" id="rw-result" hidden>
+                    <div id="rw-context"><h3 id="rw-stage" tabindex="-1"></h3><p id="rw-target"></p></div>
                     <ul class="facts" id="rw-groups"></ul>
                     <table class="list" id="rw-table" aria-label="What the rewind changes"><thead><tr><th>Change</th><th>Item</th><th class="num">Size</th></tr></thead><tbody></tbody></table>
                     <p class="note" id="rw-note" role="status"></p>
                     <div class="actions" id="rw-actions"></div>
                 </div>
             </div>
-            <p class="note" id="rw-since">Puts a folder back the way it was at a moment you choose. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.</p>
-            <div class="sect-head"><svg aria-hidden="true"><use href="#i-conflict"/></svg><h3>Conflicts</h3></div>
-            <div class="card" id="cf-card">
-                <p class="say" id="cf-sum" role="status">Looking…</p>
-                <div class="row actions" id="cf-batch" aria-label="Resolve all listed conflicts" role="group" hidden></div>
-                <div id="cf-pages"></div>
-                <table class="list" id="cf-table" aria-label="Conflicts" hidden>
-                    <thead><tr><th>File</th><th>Original</th><th>Conflict copy</th><th><span class="sr-only">Action</span></th></tr></thead>
-                    <tbody></tbody>
-                </table>
-            </div>
-            <div class="sect-head"><svg aria-hidden="true"><use href="#i-kept"/></svg><h3>Kept on this PC</h3></div>
-            <div class="card" id="rc-kept"></div>
-            <div class="sect-head"><svg aria-hidden="true"><use href="#i-versions"/></svg><h3>OneDrive versions</h3></div>
-            <div class="card">
-                <div class="row block">
-                    <div class="field"><input type="text" id="rv-path" placeholder="A file in a synced folder, like C:\Users\you\OneUpDrive\report.docx" spellcheck="false" aria-label="File to show the versions of"><button class="btn" id="rv-show">Show</button></div>
-                    <div id="rv-list"></div>
-                </div>
-            </div>
-            <div class="sect-head"><svg aria-hidden="true"><use href="#i-bin"/></svg><h3>Deleted from OneDrive</h3></div>
-            <div class="card" id="rc-bin"></div>
         </section>
 
         <!-- Safety -->
@@ -3847,9 +4085,39 @@
         <button role="menuitem" data-dlg="dlg-pair">Sync another folder<small>A PC folder with a OneDrive folder</small></button>
         <button role="menuitem" data-dlg="dlg-known">Back up a PC folder<small>Desktop, Documents, Pictures…</small></button>
         <button role="menuitem" data-dlg="dlg-shared">Sync a folder shared with you</button>
+        <button role="menuitem" id="add-peer-receive">Receive a file<small>Get a code for the sender</small></button>
         <button role="menuitem" data-dlg="dlg-vault-new">Create an encrypted vault<small>Encrypted before upload</small></button>
         <button role="menuitem" data-dlg="dlg-vault-add">Add an existing vault<small>A Cryptomator vault in OneDrive</small></button>
     </div>
+    <dialog id="dlg-peer-send" aria-labelledby="peer-send-title">
+        <form id="peer-send-form" method="dialog">
+            <div class="dh"><h3 id="peer-send-title">Send a file</h3></div>
+            <div class="db">
+                <p><strong id="peer-send-file"></strong></p>
+                <ul id="peer-send-files" aria-label="Files to send" hidden></ul>
+                <div class="actions"><button type="button" class="btn" id="peer-send-add">Add files</button></div>
+                <div class="peer-field">
+                    <label for="peer-recipient">Their receive code</label>
+                    <input type="text" id="peer-recipient" maxlength="128" required spellcheck="false" autocomplete="off" aria-describedby="peer-send-help" autofocus>
+                    <p class="note" id="peer-send-help">Ask them to open Sharing, choose File transfers, and select Get my code in OneUpDrive.</p>
+                </div>
+                <details class="peer-options">
+                    <summary>They don't have OneUpDrive</summary>
+                    <p class="note">OneUp Receive gives them a receive code. Share the included Windows app or send them the download page for Linux or Mac.</p>
+                    <div class="actions">
+                        <button type="button" class="btn" id="peer-companion">Find Windows receiver</button>
+                        <button type="button" class="btn" id="peer-companion-downloads">Linux and Mac downloads</button>
+                    </div>
+                </details>
+                <details class="peer-options">
+                    <summary>Connection options</summary>
+                    <label class="ck"><input type="checkbox" id="peer-send-direct" aria-describedby="peer-send-direct-help"><span>Require a direct connection</span></label>
+                    <p class="note" id="peer-send-direct-help">Useful when both devices are on the same network.</p>
+                </details>
+            </div>
+            <div class="df"><button type="button" class="btn" id="peer-send-cancel">Cancel</button><button class="btn primary" id="peer-send-submit">Continue</button></div>
+        </form>
+    </dialog>
     <dialog id="dlg-pair" aria-labelledby="dlg-pair-t">
         <form method="dialog">
             <div class="dh">
@@ -4289,6 +4557,7 @@
             // Opened again (from the icon's menu, or Explorer's commands
             // for a file) while open: the page, or the file, asked for.
             if (m.event === "goto") return startAt(m.page, m.item);
+            if (m.event === "peer") return peerUpdate(m.side, m.transfer);
             if (m.event === "search_build" && m.request === FD.seq && F.view === "all") return findBuilding(m.items);
             const w = waiting.get(m.id);
             if (!w) return;
@@ -4385,11 +4654,12 @@
             settings: "general"
         };
 
-        function show(page) {
+        function show(page, recoveryView) {
             if (LIST_PAGES[page]) {
                 L.tab = LIST_PAGES[page];
                 page = "lists";
             }
+            if (page !== "shared") collapsePeerReceive();
             $$("nav button[data-page]").forEach(x => x.toggleAttribute("aria-current", x.dataset.page === page));
             $$("nav button[data-page]").forEach(x => {
                 if (x.dataset.page === page) x.setAttribute("aria-current", "page");
@@ -4435,7 +4705,7 @@
                 loadAttention();
             }
             if (page === "shared") loadSharing();
-            if (page === "recovery") loadRecovery();
+            if (page === "recovery") selectRecovery(recoveryView || recoveryTab);
         }
         $$("nav button[data-page]").forEach(b => b.onclick = () => show(b.dataset.page));
         $("#nav-open-settings").onclick = () => show(NAV.settings);
@@ -4454,7 +4724,12 @@
 
         document.addEventListener("keydown", e => {
             if (e.defaultPrevented || e.isComposing || $("dialog:modal, [popover]:popover-open")) return;
-            if (e.key === "F6" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+            if (e.key === "Escape" && $("#shared").classList.contains("on") && !$("#peer-panel").hidden) {
+                if (collapsePeerReceive()) {
+                    $("#peer-recv-prepare").focus();
+                    e.preventDefault();
+                }
+            } else if (e.key === "F6" && !e.ctrlKey && !e.altKey && !e.metaKey) {
                 const target = e.target.closest("nav") ?
                     (M.active ? $("#memory-title") : $(".page.on h2")) :
                     $('nav [aria-current="page"]');
@@ -5064,6 +5339,218 @@
             n
         }));
 
+        const PEER = { send: {}, receive: {}, rev: {send: 0, receive: 0}, paths: [], destination: null,
+            focusCode: false, receiveExpanded: false, downloadPending: false };
+        const PEER_PHASES = {
+            starting: tr("Getting ready…"), preparing: tr("Preparing file…"),
+            offered: tr("Ready to share"), connected: tr("Recipient connected"), receiving: tr("Downloading…"),
+            paused: tr("Download paused."), verifying: tr("Checking the file…"),
+            complete: tr("File received."), stopped: tr("Sharing ended."), expired: tr("The download code expired."),
+            failed: tr("Transfer failed.")
+        };
+
+        function peerUpdate(side, transfer) {
+            PEER.rev[side]++;
+            PEER[side] = transfer;
+            renderPeer();
+            if (side !== "receive" || transfer.running || !PEER.focusCode) return;
+            PEER.focusCode = false;
+            if (transfer.phase === "ready" && !$("#peer-panel").hidden) $("#peer-recv-copy").focus();
+        }
+
+        async function loadPeer() {
+            const rev = {...PEER.rev};
+            try {
+                const state = await call("peer_state");
+                for (const side of ["send", "receive"]) {
+                    if (rev[side] === PEER.rev[side]) PEER[side] = state[side];
+                }
+                renderPeer();
+            } catch (e) { toast(e.message, true); }
+        }
+
+        function peerText(id, text) {
+            const element = $("#" + id);
+            if (element.textContent !== text) element.textContent = text;
+        }
+
+        function peerStatus(id, transfer) {
+            const text = [transfer.name, transfer.error || PEER_PHASES[transfer.phase]].filter(Boolean).join(" · ");
+            peerText(id, text);
+            $("#" + id).hidden = !text;
+        }
+
+        function peerConnection(transfer) {
+            const route = transfer.route === "relay" ? tr("Via relay") : transfer.route === "direct" ? tr("Direct connection") : "";
+            return [route, tr("{n, plural, one {# open connection} other {# open connections}}", {
+                n: transfer.connections || 0
+            })].filter(Boolean).join(" · ");
+        }
+
+        function renderPeer() {
+            const s = PEER.send, r = PEER.receive;
+            const active = document.activeElement;
+            const expanded = PEER.receiveExpanded || r.has_ticket || r.saved;
+            const canReceive = !!expanded && !!r.code && !r.running && r.phase !== "complete";
+            const needsCode = canReceive && !r.has_ticket;
+            const showMyCode = needsCode || (expanded && r.phase === "ready" && !!r.code);
+            const hasProgress = r.total != null && r.phase !== "complete";
+
+            peerStatus("peer-send-state", s.connections ? {...s, phase: "connected"} : s);
+            $("#peer-send-intro").hidden = !!s.phase;
+            $("#peer-send-ready").hidden = !s.ticket;
+            $("#peer-send-choose").hidden = !!s.running;
+            $("#peer-send-copy").hidden = !s.ticket || !s.running;
+            $("#peer-send-stop").hidden = !s.running;
+            $("#peer-send-bytes").hidden = s.network_bytes == null;
+            if (s.network_bytes != null) peerText("peer-send-bytes", tr("{size} sent over the network", {size: size(s.network_bytes)}));
+            $("#peer-send-details").hidden = !s.ticket && !s.route;
+            peerText("peer-send-progress", peerConnection(s));
+
+            peerStatus("peer-recv-state", expanded ? r : {});
+            $("#peer-recv-intro").hidden = !!expanded && (!!r.code || !!r.running);
+            $("#peer-recv-code").hidden = !showMyCode;
+            $("#peer-recv-value").value = r.code || "";
+            $("#peer-recv-prepare").hidden = !!r.running;
+            $("#peer-recv-prepare").classList.toggle("primary", !expanded || !r.code);
+            peerText("peer-recv-prepare", r.phase === "complete" ? tr("Receive another file") : expanded && r.code ? tr("Get a new code") : tr("Get my code"));
+            $("#peer-recv-form").hidden = !canReceive;
+            $("#peer-recv-start").hidden = !canReceive;
+            $("#peer-recv-input").hidden = !needsCode;
+            $("#peer-ticket").disabled = !needsCode;
+            peerText("peer-recv-destination", PEER.destination || r.destination || tr("OneUpDrive receive folder"));
+            peerText("peer-recv-start", r.has_ticket ? tr("Resume download") : tr("Download"));
+            $("#peer-recv-folder").hidden = !r.saved;
+            $("#peer-recv-pause").hidden = !r.running || r.phase !== "receiving";
+            $("#peer-recv-meter").hidden = !hasProgress;
+            const meter = $("#peer-recv-bar");
+            meter.max = Math.max(1, r.total || 0);
+            meter.value = r.bytes || 0;
+            peerText("peer-recv-progress", hasProgress ? tr("{done} of {total}", {done: size(r.bytes), total: size(r.total)}) : "");
+            $("#peer-recv-details").hidden = !r.route && !r.connections;
+            peerText("peer-recv-route", peerConnection(r));
+
+            if (!$("#peer-panel").hidden && active?.closest(".peer-card") && !active.getClientRects().length) {
+                const card = active.closest(".peer-card");
+                const next = [...card.querySelectorAll("button.primary, #peer-recv-pause")]
+                    .find(button => !button.disabled && button.getClientRects().length);
+                (next || card.querySelector("h3")).focus();
+            }
+        }
+
+        function collapsePeerReceive() {
+            if (!PEER.receiveExpanded || PEER.receive.has_ticket || PEER.receive.saved || PEER.downloadPending) return false;
+            PEER.receiveExpanded = PEER.focusCode = false;
+            $("#peer-recv-network").open = false;
+            renderPeer();
+            return true;
+        }
+
+        function peerAction(op, args = {}, success) {
+            return run(call(op, args), success).catch(() => null);
+        }
+
+        function showPeerTransfers(side) {
+            SG.tab = "transfer";
+            show("shared");
+            if (side === "send") $("#peer-send-heading").focus();
+            else if (PEER.receiveExpanded || PEER.receive.running || PEER.receive.has_ticket) $("#peer-recv-heading").focus();
+            else $("#peer-recv-prepare").focus();
+        }
+
+        function setPeerSendFiles(paths) {
+            PEER.paths = paths;
+            const names = paths.map(path => path.split(/[\\/]/).pop());
+            peerText("peer-send-file", paths.length === 1 ? names[0] : tr("{n, number} files in one ZIP", {n: paths.length}));
+            const list = $("#peer-send-files");
+            list.hidden = paths.length === 1;
+            list.replaceChildren(...(list.hidden ? [] : names.map(name => el("li", {textContent: name}))));
+        }
+
+        function askPeerSend(selection) {
+            if (PEER.send.running) {
+                showPeerTransfers("send");
+                return toast(tr("End the current share before sending another file."), true);
+            }
+            setPeerSendFiles(typeof selection === "string" ? [selection] : selection);
+            $("#peer-recipient").value = "";
+            $("#dlg-peer-send").querySelectorAll("details").forEach(details => details.open = false);
+            $("#dlg-peer-send").showModal();
+        }
+
+        $("#peer-send-choose").onclick = async () => {
+            const paths = await peerAction("peer_pick_files");
+            if (paths?.length) askPeerSend(paths);
+        };
+        $("#peer-send-add").onclick = async () => {
+            const paths = await peerAction("peer_pick_files");
+            if (paths?.length && $("#dlg-peer-send").open) setPeerSendFiles([...new Set([...PEER.paths, ...paths])]);
+        };
+        $("#peer-send-cancel").onclick = () => $("#dlg-peer-send").close();
+        $("#dlg-peer-send").addEventListener("cancel", e => {
+            if ($("#peer-send-submit").disabled) e.preventDefault();
+        });
+        $("#peer-send-form").onsubmit = async e => {
+            e.preventDefault();
+            const button = $("#peer-send-submit");
+            const cancel = $("#peer-send-cancel");
+            const add = $("#peer-send-add");
+            button.disabled = cancel.disabled = add.disabled = true;
+            const started = await peerAction("peer_send", { paths: PEER.paths, recipient: $("#peer-recipient").value.trim(), direct: $("#peer-send-direct").checked });
+            button.disabled = cancel.disabled = add.disabled = false;
+            if (started) {
+                $("#peer-recipient").value = "";
+                $("#dlg-peer-send").close();
+                showPeerTransfers("send");
+            }
+        };
+        $("#peer-send-copy").onclick = () => peerAction("peer_copy", {side: "send"}, tr("Download code copied"));
+        $("#peer-send-stop").onclick = () => peerAction("peer_stop", {side: "send"});
+        $("#peer-companion").onclick = () => peerAction("peer_show_receiver");
+        $("#peer-companion-downloads").onclick = () => peerAction("peer_receiver_downloads");
+        $("#peer-recv-prepare").onclick = async () => {
+            if (!PEER.receiveExpanded && PEER.receive.code && !PEER.receive.has_ticket && !PEER.receive.saved) {
+                PEER.receiveExpanded = true;
+                renderPeer();
+                $("#peer-recv-copy").focus();
+                return;
+            }
+            if (PEER.receive.has_ticket && PEER.receive.phase !== "complete" && !confirm(tr("Get a new code for a different download?"))) return;
+            PEER.receiveExpanded = true;
+            $("#peer-ticket").value = "";
+            PEER.focusCode = true;
+            const previous = PEER.destination;
+            PEER.destination = null;
+            if (!await peerAction("peer_prepare")) {
+                PEER.focusCode = false;
+                PEER.destination = previous;
+            }
+        };
+        $("#peer-recv-copy").onclick = async () => {
+            const copied = await run(call("peer_copy", {side: "receive"}), tr("Receive code copied")).then(() => true, () => false);
+            if (copied && !$("#peer-ticket").disabled && !$("#peer-panel").hidden) $("#peer-ticket").focus();
+        };
+        $("#peer-recv-browse").onclick = async () => {
+            const session = PEER.receive.session;
+            const path = await peerAction("peer_pick_folder");
+            if (path && session === PEER.receive.session && !PEER.receive.running) {
+                PEER.destination = path;
+                renderPeer();
+            }
+        };
+        $("#peer-recv-folder").onclick = () => peerAction("peer_open_folder");
+        $("#peer-recv-form").onsubmit = async e => {
+            e.preventDefault();
+            if (PEER.downloadPending) return;
+            PEER.downloadPending = true;
+            await peerAction("peer_receive", {
+                ticket: $("#peer-ticket").value.trim(), destination: PEER.destination,
+                direct: $("#peer-recv-direct").checked
+            });
+            PEER.downloadPending = false;
+        };
+        $("#peer-recv-pause").onclick = () => peerAction("peer_stop", {side: "receive"});
+
         // ---- shared: what this account shares (the list from OneUpDrive's
         // listing, who can open each item read from OneDrive when shown),
         // and what others share with it. Stop sharing and Set expiry run
@@ -5096,6 +5583,11 @@
             const tab = SG.tab;
             $$("#sg-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tab === tab));
             const my = ++SG.seq;
+            const transfers = tab === "transfer";
+            $("#sg-drive").hidden = $("#sg-refresh").hidden = transfers;
+            $("#peer-panel").hidden = !transfers;
+            if (transfers) return loadPeer();
+            collapsePeerReceive();
             if (!more) $("#sg-card").hidden = true;
             $("#sg-more").replaceChildren();
             $("#sg-sum").textContent = tr("Asking OneDrive…");
@@ -5642,8 +6134,59 @@
         // The rewind on show (its preview), and how far back the history goes.
         let RW = {
             preview: null,
-            since: 0
+            since: 0,
+            stage: "",
+            read: 0,
+            stateRead: 0,
+            busy: false
         };
+
+        const recoveryTabs = $$("#rc-tabs [role=tab]");
+        let recoveryTab = "kept";
+
+        function selectRecovery(view) {
+            recoveryTab = view;
+            for (const tab of recoveryTabs) {
+                const selected = tab.id === "rc-tab-" + view;
+                tab.setAttribute("aria-selected", String(selected));
+                tab.tabIndex = selected ? 0 : -1;
+                $("#" + tab.getAttribute("aria-controls")).hidden = !selected;
+            }
+            const main = $("#main");
+            main.scrollTop = 0;
+            return loadRecovery();
+        }
+
+        recoveryTabs.forEach(tab => {
+            tab.onclick = () => selectRecovery(tab.id.slice("rc-tab-".length));
+        });
+        $("#rc-refresh").onclick = loadRecovery;
+
+        function viewRecoveryActivity(page = "activity") {
+            L.root = "main";
+            $("#ls-filter").value = "";
+            $("#ls-outcome").value = "";
+            show(page);
+            $("#ls-filter").focus();
+        }
+
+        $("#rc-activity").onclick = () => viewRecoveryActivity();
+
+        function recoveryNotice(text) {
+            $("#rc-notice").hidden = false;
+            $("#rc-message").textContent = text;
+            toast(text);
+        }
+
+        function loadRecovery() {
+            switch (recoveryTab) {
+                case "rewind": return loadRewindState();
+                case "conflicts": return loadConflicts();
+                case "deleted": return loadBin();
+                case "versions": return showRecoveryVersions();
+                default: return keptInto($("#rc-kept"), { id: "main" }, null, 0);
+            }
+        }
 
         function localInput(ms) {
             const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60000);
@@ -5708,24 +6251,46 @@
             if (h < 48) return f.format(-h, "hour");
             return f.format(-Math.round(h / 24), "day");
         }
-        $("#rw-date").oninput = rewindAtShown;
-        $("#rw-time").oninput = rewindAtShown;
-        $$("#rw-quick button").forEach(b => b.onclick = () => setRewindAt(quickPick(b, Date.now())));
+        function clearRewindPreview() {
+            ++RW.read;
+            RW.preview = null;
+            RW.stage = "";
+            $("#rw-result").hidden = true;
+        }
 
-        async function loadRecovery() {
-            const st = await call("rewind_state").catch(() => null);
-            if (st) {
-                $("#rw-since").textContent = st.since_ms ? tr("Puts a folder back the way it was at a moment you choose, back to {when}. Nothing is destroyed: what it replaces or removes goes to kept copies and OneDrive's recycle bin, so a rewind can be rewound.", {
-                    when: when(st.since_ms)
-                }) : tr("Rewinding starts once the first sync has finished.");
-                RW.since = st.since_ms || 0;
+        $("#rw-form").oninput = () => {
+            clearRewindPreview();
+            rewindAtShown();
+        };
+        $$("#rw-quick button").forEach(b => b.onclick = () => {
+            clearRewindPreview();
+            setRewindAt(quickPick(b, Date.now()));
+        });
+
+        async function loadRewindState() {
+            if (RW.busy) return;
+            const seq = ++RW.stateRead;
+            const st = await call("rewind_state").catch(e => {
+                if (seq === RW.stateRead) $("#rw-since").textContent = e.message;
+                return null;
+            });
+            if (!st || seq !== RW.stateRead) return;
+            $("#rw-since").textContent = st.since_ms ? tr("History starts {when}.", { when: when(st.since_ms) }) :
+                tr("Rewinding starts once the first sync has finished.");
+            RW.since = st.since_ms || 0;
+            if (!st.job) {
+                if (["waiting", "submitted", "active"].includes(RW.stage)) {
+                    const target = RW.preview || { folder: $("#rw-folder").value, at_ms: rewindAt() };
+                    RW.preview = null;
+                    showRewindStatus("ended", tr("Rewind ended"), target, "",
+                        [smallBtn(tr("View activity"), () => viewRecoveryActivity())],
+                        $("#rw-result").contains(document.activeElement));
+                }
                 if (!rewindAt()) setRewindAt(Math.floor((Date.now() - 3600000) / 60000) * 60000);
                 else rewindAtShown();
-                if (st.job) rewindUnderWay(st);
+            } else {
+                await rewindUnderWay(st, seq);
             }
-            loadConflicts();
-            keptInto($("#rc-kept"), { id: "main" }, null, 0);
-            loadBin();
         }
 
         // A page of the preview's list: every change is shown, a page at a
@@ -5757,15 +6322,37 @@
             }), cell(s.path, RW_SKIP[s.why] || s.why, "wrap path"), el("td")));
         }
 
-        // `focus`: where focus goes once the list is shown (the actions'
-        // first button), as the button that was pressed goes away.
-        function showRewind(p, actions, focus = false) {
+        function focusRewind(target) {
+            if (recoveryTab === "rewind" && $("#recovery").classList.contains("on")) $(target)?.focus();
+        }
+
+        function rewindStage(stage, title, target) {
+            RW.stage = stage;
+            const active = ["waiting", "submitted", "active"].includes(stage);
+            $("#rw-form").hidden = active;
+            $("#rw-since").hidden = active;
+            $("#rw-stage").textContent = title;
+            $("#rw-target").textContent = target ? tr("{folder} at {when}", {
+                folder: target.folder || "/", when: when(target.at_ms)
+            }) : "";
+            $("#rw-result").hidden = false;
+        }
+
+        function showRewindStatus(stage, title, target, message, actions, focus = false) {
+            rewindStage(stage, title, target);
+            $("#rw-groups").replaceChildren();
+            $("#rw-table tbody").replaceChildren();
+            $("#rw-table").hidden = true;
+            $("#rw-note").textContent = message;
+            $("#rw-actions").replaceChildren(...actions);
+            if (focus) focusRewind("#rw-stage");
+        }
+
+        function showRewind(p, stage, title, actions, message = "", focus = false) {
+            rewindStage(stage, title, p);
             const groups = {};
             for (const c of p.changes) {
-                const g = groups[c.kind] || (groups[c.kind] = {
-                    n: 0,
-                    bytes: 0
-                });
+                const g = groups[c.kind] || (groups[c.kind] = { n: 0, bytes: 0 });
                 g.n++;
                 g.bytes += c.folder ? 0 : c.size;
             }
@@ -5779,154 +6366,163 @@
                 body.append(...rewindRows(p, shown, shown + RW_PAGE));
                 shown = Math.min(shown + RW_PAGE, total);
                 if (shown < total) {
-                    $("#rw-note").textContent = tr("{shown} of {all} listed. See them all to rewind.", {
-                        shown,
-                        all: total
-                    });
-                    $("#rw-actions").replaceChildren(smallBtn(tr("Show more"), () => page(true)));
+                    $("#rw-note").textContent = tr("{shown} of {all} listed. See them all to rewind.", { shown, all: total });
+                    $("#rw-actions").replaceChildren(smallBtn(tr("Show more"), () => page(true)),
+                        ...actions.filter(button => button.dataset.cancel === "rewind"));
                 } else {
                     body.append(...skippedRows(p));
-                    $("#rw-note").textContent = total ? "" : tr("Nothing to change: the folder is as it was then.");
+                    $("#rw-note").textContent = total ? message : tr("No changes to rewind.");
                     $("#rw-actions").replaceChildren(...actions);
                 }
-                if (moveFocus) $("#rw-actions button")?.focus();
+                if (moveFocus) focusRewind("#rw-actions button");
             };
             body.replaceChildren();
-            $("#rw-result").hidden = false;
+            $("#rw-table").hidden = !total && !p.skipped.length;
             page(focus);
         }
 
         async function rewindPreview(args) {
-            rewindShown(args, await run(call("rewind_preview", args)));
+            if (RW.busy || $("#rw-form").hidden) return;
+            const seq = ++RW.read;
+            RW.preview = null;
+            showRewindStatus("loading", tr("Preparing preview…"), null, "", []);
+            try {
+                const p = await call("rewind_preview", args);
+                if (seq !== RW.read) return;
+                $("#rw-folder").value = p.folder;
+                setRewindAt(p.at_ms);
+                rewindShown(args, p, true);
+            } catch (e) {
+                if (seq !== RW.read) return;
+                showRewindStatus("preview", tr("Preview unavailable"), null, e.message, []);
+            }
         }
 
-        // Starts only the list shown (its code); a list that changed
-        // meanwhile comes back and is shown instead, to be looked at again.
-        function rewindShown(args, p, focus = false) {
-            RW.preview = {
-                args,
-                p
-            };
-            const go = smallBtn(tr("Rewind"), async() => {
-                const a = {
-                    folder: p.folder,
-                    when: when(p.at_ms)
-                };
-                const ask = p.folder === "/" ? tr("Rewind everything to {when}? It waits for your approval next; meanwhile the rest keeps syncing, and a change in the folder gives a new list to approve.", a) :
-                    tr("Rewind {folder} to {when}? It waits for your approval next; meanwhile the rest keeps syncing, and a change in the folder gives a new list to approve.", a);
-                if (!confirm(ask)) return;
-                const s = await run(call("rewind_start", {
-                    ...args,
-                    expect: p.code
-                }));
+        async function rewindAction(action) {
+            if (RW.busy) return;
+            RW.busy = true;
+            ++RW.stateRead;
+            $("#rw-form").inert = true;
+            $("#rw-actions").setAttribute("aria-busy", "true");
+            try {
+                await action();
+            } catch (e) {
+                $("#rw-note").textContent = e.message;
+            } finally {
+                RW.busy = false;
+                $("#rw-form").inert = false;
+                $("#rw-actions").removeAttribute("aria-busy");
+            }
+        }
+
+        // The CLI checks the exact preview code at both start and approval.
+        function rewindShown(args, p, focus) {
+            RW.preview = p;
+            const next = smallBtn(tr("Continue"), () => rewindAction(async () => {
+                if (RW.preview !== p) return;
+                const s = await call("rewind_start", { ...args, expect: p.code });
                 if (!s.started) {
-                    toast(tr("The list changed. Here it is again."));
+                    toast(tr("The list changed. Review it again."));
                     rewindShown(args, s, true);
                     return;
                 }
-                RW.preview.p = s;
-                rewindWaiting(s.code, true);
-            }, "primary");
-            showRewind(p, p.changes.length ? [go] : [], focus);
+                RW.preview = s;
+                rewindStage("waiting", tr("Awaiting approval"), s);
+                $("#rw-note").textContent = "";
+                $("#rw-actions").replaceChildren(...waitingActions(s));
+                focusRewind("#rw-actions button");
+            }), "primary");
+            showRewind(p, "preview", tr("Preview changes"), p.changes.length ? [next] : [],
+                tr("Review the changes before continuing to approval."));
+            if (focus) focusRewind("#rw-stage");
         }
 
-        // Approve and Cancel for the list with `code`. The approval is
-        // checked against the list planned again: one that changed (the
-        // folder keeps syncing meanwhile) comes back and is shown instead.
-        function waitingActions(code) {
-            const approve = smallBtn(tr("Approve"), async() => {
-                const s = await run(call("rewind_approve", {
-                    code
-                }));
+        function rewindCancel() {
+            const button = smallBtn(tr("Cancel"), () => rewindAction(async () => {
+                await call("rewind_cancel");
+                clearRewindPreview();
+                $("#rw-form").hidden = $("#rw-since").hidden = false;
+                $("#rw-form").inert = false;
+                toast(tr("Cancelled"));
+                focusRewind("#rw-preview");
+            }));
+            button.dataset.cancel = "rewind";
+            return button;
+        }
+
+        function waitingActions(p) {
+            const approve = smallBtn(tr("Approve"), () => rewindAction(async () => {
+                const s = await call("rewind_approve", { code: p.code });
                 if (s.approved) {
-                    toast(tr("Approved"));
-                    setTimeout(loadRecovery, 2000);
+                    showRewindStatus("submitted", tr("Approval submitted"), p,
+                        tr("The next sync starts the rewind."), [rewindCancel()], true);
+                    setTimeout(() => {
+                        if (RW.stage === "submitted" && $("#recovery").classList.contains("on")) loadRewindState();
+                    }, 2000);
                     return;
                 }
-                toast(tr("The list changed before your approval. Here it is again."));
-                if (RW.preview) RW.preview.p = s;
-                showRewind(s, waitingActions(s.code), true);
-            }, "primary");
-            return [el("span", {
-                    className: "muted",
-                    textContent: tr("Waiting for your approval (code {code}). The rest keeps syncing.", {
-                        code
-                    })
-                }),
-                approve,
-                smallBtn(tr("Cancel"), async() => {
-                    await run(call("rewind_cancel"), tr("Cancelled"));
-                    $("#rw-result").hidden = true;
-                    $("#rw-preview").focus();
-                })
-            ];
+                toast(tr("The list changed. Review it again."));
+                showWaitingRewind(s, true);
+            }), "primary");
+            return [approve, rewindCancel()];
         }
 
-        function rewindWaiting(code, focus = false) {
-            $("#rw-actions").replaceChildren(...waitingActions(code));
-            if (focus) $("#rw-actions button")?.focus();
+        function showWaitingRewind(p, focus = false) {
+            RW.preview = p;
+            const actions = p.changes.length ? waitingActions(p) : [rewindCancel()];
+            showRewind(p, "waiting", tr("Awaiting approval"), actions, "", focus);
         }
 
-        function rewindUnderWay(st) {
+        async function rewindUnderWay(st, seq) {
             const j = st.job;
+            ++RW.read;
             $("#rw-folder").value = j.folder;
             setRewindAt(j.at_ms);
-            const a = {
-                folder: j.folder || "/",
-                when: when(j.at_ms),
-                n: j.ran,
-                m: j.left_alone
-            };
-            const say = !j.approved ? null : j.left_alone ?
-                tr("Rewinding {folder} to {when}: {n, plural, one {# change made} other {# changes made}}; {m, plural, one {# item changed since the preview left alone} other {# items changed since the preview left alone}}.", a) :
-                tr("Rewinding {folder} to {when}: {n, plural, one {# change made} other {# changes made}}.", a);
-            if (!j.approved && st.code) {
-                // Its list as it is now: approved only once all of it is shown.
-                const shown = p => p && p.code === st.code ? showRewind(p, waitingActions(st.code)) : (() => {
-                    $("#rw-groups").replaceChildren();
-                    $("#rw-table tbody").replaceChildren();
-                    $("#rw-note").textContent = tr("A rewind of {folder} to {when} waits for your approval. Its list is on the Activity page (Safety stops).", a);
-                    $("#rw-actions").replaceChildren(...waitingActions(st.code));
-                    $("#rw-result").hidden = false;
-                })();
-                if (RW.preview && RW.preview.p.code === st.code) shown(RW.preview.p);
-                else call("rewind_preview", {
-                    folder: j.folder || "/",
-                    at_ms: j.at_ms
-                }).then(shown, () => shown(null));
-            } else if (say) {
-                $("#rw-groups").replaceChildren();
-                $("#rw-table tbody").replaceChildren();
-                $("#rw-note").textContent = say;
-                $("#rw-actions").replaceChildren(smallBtn(tr("Cancel"), async() => {
-                    await run(call("rewind_cancel"), tr("Cancelled"));
-                    $("#rw-result").hidden = true;
-                    $("#rw-preview").focus();
-                }));
-                $("#rw-result").hidden = false;
+            if (j.approved) {
+                const focus = $("#rw-result").contains(document.activeElement);
+                RW.preview = null;
+                const a = { n: j.ran, m: j.left_alone };
+                const note = j.left_alone ?
+                    tr("{n, plural, one {# change made} other {# changes made}}. {m, plural, one {# item changed since preview and was skipped} other {# items changed since preview and were skipped}}.", a) :
+                    tr("{n, plural, one {# change made} other {# changes made}}.", a);
+                showRewindStatus("active", tr("Rewinding"), j, note, [rewindCancel()], focus);
+                return;
+            }
+            if (["waiting", "submitted"].includes(RW.stage) && RW.preview?.code === st.code &&
+                RW.preview?.folder === j.folder && RW.preview?.at_ms === j.at_ms) return;
+            const focus = $("#rw-result").contains(document.activeElement) || $("#rw-form").contains(document.activeElement);
+            showRewindStatus("waiting", tr("Awaiting approval"), j, tr("Looking…"), [rewindCancel()], focus);
+            const p = st.code && await call("rewind_preview", { folder: j.folder || "/", at_ms: j.at_ms }).catch(() => null);
+            if (seq !== RW.stateRead) return;
+            if (p && p.code === st.code) {
+                showWaitingRewind(p);
+            } else {
+                RW.preview = null;
+                const actions = [rewindCancel()];
+                if (st.code) actions.unshift(smallBtn(tr("Safety stops"), () => viewRecoveryActivity("stops")));
+                showRewindStatus("waiting", tr("Awaiting approval"), j, st.code ?
+                    tr("The current review is under Safety stops.") : tr("Refresh to check for the approval list."), actions);
             }
         }
 
-        $("#rw-preview").onclick = () => {
+        $("#rw-form").onsubmit = e => {
+            e.preventDefault();
             const at = rewindAt();
-            if (!at) {
-                toast(tr("Choose a moment"), true);
-                $($("#rw-date").value ? "#rw-time" : "#rw-date").focus();
+            if (!at || at > Date.now() || (RW.since && at < RW.since)) {
+                focusRewind(!$("#rw-date").value ? "#rw-date" : "#rw-time");
                 return;
             }
-            rewindPreview({
-                folder: $("#rw-folder").value.trim() || "/",
-                at_ms: at
-            });
+            rewindPreview({ folder: $("#rw-folder").value.trim() || "/", at_ms: at });
         };
 
-        // A content guard stop: rewind its folder to just before its batch.
         function rewindBeforeStop(code) {
-            show("recovery");
-            $("#rw-preview").focus();
-            rewindPreview({
-                before_stop: code
-            });
+            show("recovery", "rewind");
+            if ($("#rw-form").hidden || RW.busy) {
+                focusRewind("#rw-stage");
+            } else {
+                focusRewind("#rw-preview");
+                rewindPreview({ before_stop: code });
+            }
         }
 
         const RECOVERY_PAGE = 25;
@@ -5954,6 +6550,10 @@
                 box.querySelector("[data-direction]:enabled"))?.focus();
         }
 
+        function compactDetail(text) {
+            return el("small", { className: "rc-compact", textContent: text });
+        }
+
         async function loadConflicts() {
             const seq = ++conflictSeq;
             const sum = $("#cf-sum");
@@ -5966,9 +6566,9 @@
                 sum.textContent = tr("No conflicts.");
                 sum.hidden = !!list.length;
                 table.hidden = batch.hidden = !list.length;
-                const side = (x, ms, newer) => cell(tr("{size}, saved {when}", {
-                    size: size(x.size), when: when(ms)
-                }), newer ? tr("Newer") : null);
+                const side = (x, ms) => tr("{size}, saved {when}", { size: size(x.size), when: when(ms) });
+                const compact = (label, details, isNewer) => compactDetail(isNewer ?
+                    tr("{copy} ({details}, newer)", { copy: label, details }) : tr("{copy} ({details})", { copy: label, details }));
                 const button = (text, label, onclick) => {
                     const b = smallBtn(text, onclick);
                     b.setAttribute("aria-label", label);
@@ -5977,14 +6577,21 @@
                 function renderPage(page, focus) {
                     conflictPage = Math.max(0, Math.min(page, Math.ceil(list.length / RECOVERY_PAGE) - 1));
                     const start = conflictPage * RECOVERY_PAGE;
-                    $("tbody", table).replaceChildren(...list.slice(start, start + RECOVERY_PAGE).map(c => el("tr", {},
-                        cell(c.path, c.copy_path.split("/").pop(), "wrap path"),
-                        side(c.original, c.original_ms, c.newer === "original"),
-                        side(c.copy, c.copy_ms, c.newer === "copy"),
-                        el("td", {}, el("div", { className: "actions" },
+                    $("tbody", table).replaceChildren(...list.slice(start, start + RECOVERY_PAGE).map(c => {
+                        const original = side(c.original, c.original_ms);
+                        const copy = side(c.copy, c.copy_ms);
+                        const path = cell(c.path, c.copy_path.split("/").pop(), "wrap path");
+                        const originalNewer = c.newer === "original";
+                        const copyNewer = c.newer === "copy";
+                        path.append(compact(tr("Original"), original, originalNewer), compact(tr("Conflict copy"), copy, copyNewer));
+                        return el("tr", {}, path,
+                            cell(original, originalNewer ? tr("Newer") : null, "rc-wide"),
+                            cell(copy, copyNewer ? tr("Newer") : null, "rc-wide"),
+                            el("td", {}, el("div", { className: "actions" },
                             button(tr("Keep original"), tr("Keep the original of {path}", { path: c.path }), () => keepConflict(c, "original")),
                             button(tr("Keep copy"), tr("Keep the conflict copy of {path}", { path: c.path }), () => keepConflict(c, "copy")),
-                            button(tr("Keep both"), tr("Keep both copies of {path}", { path: c.path }), () => keepConflict(c, "both")))))));
+                            button(tr("Keep both"), tr("Keep both copies of {path}", { path: c.path }), () => keepConflict(c, "both")))));
+                    }));
                     pager.replaceChildren();
                     const controls = recoveryPager(conflictPage, list.length, renderPage);
                     if (controls) pager.append(controls);
@@ -6023,7 +6630,8 @@
             source.setAttribute("aria-disabled", "true");
             try {
                 await run(c ? call("conflict_keep", { conflict: c, keep: which }) :
-                    call("conflict_keep_batch", { conflicts: list, keep: which }), tr("Done with the next sync"));
+                    call("conflict_keep_batch", { conflicts: list, keep: which }));
+                recoveryNotice(tr("Conflict decision queued."));
                 setTimeout(loadConflicts, 2000);
             } catch {
                 // Keep the reviewed rows visible so another choice is available.
@@ -6033,17 +6641,50 @@
             }
         }
 
-        $("#rv-show").onclick = () => {
+        function showRecoveryVersions() {
             const path = $("#rv-path").value.trim().replace(/^"|"$/g, "");
-            if (path) versionsInto($("#rv-list"), {
-                path
-            });
+            if (path) return versionsInto($("#rv-list"), { path });
+        }
+
+        $("#rv-form").onsubmit = e => {
+            e.preventDefault();
+            showRecoveryVersions();
         };
+
+        $("#rv-browse").onclick = async() => {
+            const path = await run(call("pick_file")).catch(() => null);
+            if (!path) return;
+            $("#rv-path").value = path;
+            showRecoveryVersions();
+        };
+
+        $("#rv-path").oninput = () => {
+            const list = $("#rv-list");
+            list._versions = null;
+            list.replaceChildren();
+        };
+
+        async function queueRecovery(button, request, message) {
+            if (button.getAttribute("aria-disabled") === "true") return;
+            button.setAttribute("aria-disabled", "true");
+            try {
+                const result = await run(request());
+                button.textContent = tr("Queued");
+                button.setAttribute("aria-label", message(result));
+                recoveryNotice(message(result));
+            } catch {
+                button.removeAttribute("aria-disabled");
+            }
+        }
+
+        let binRead = 0;
 
         async function loadBin() {
             const b = $("#rc-bin");
+            const seq = ++binRead;
             try {
                 const list = await call("cloud_bin");
+                if (seq !== binRead) return;
                 const note = el("p", {
                     className: "note",
                     textContent: tr("Only items OneUpDrive saw deleted are listed: OneDrive's recycle bin can't be read in full. OneDrive's website shows all of it.")
@@ -6053,28 +6694,22 @@
                     textContent: tr("Nothing deleted.")
                 }), note);
                 const restore = x => {
-                    const btn = smallBtn(tr("Restore"), async() => {
-                        const at = await run(call("cloud_bin_restore", {
-                            seq: x.seq
-                        }));
-                        toast(tr("Queued: {path}", {
-                            path: at
-                        }));
-                        await loadBin();
-                        $("#rc-bin button")?.focus();
-                    });
+                    const btn = smallBtn(tr("Restore"), () => queueRecovery(btn,
+                        () => call("cloud_bin_restore", { seq: x.seq }), path => tr("Queued: {path}", { path })));
                     btn.setAttribute("aria-label", tr("Restore {path}", {
                         path: x.path
                     }));
                     return btn;
                 };
                 const body = el("tbody", {}, ...list.map(x => el("tr", {},
-                    cell(x.path + (x.folder ? "/" : ""), null, "wrap path"),
+                    el("td", { className: "wrap path" }, x.path + (x.folder ? "/" : ""), compactDetail(x.folder ?
+                        when(x.at_ms) : tr("{size}, {when}", { size: size(x.size), when: when(x.at_ms) }))),
                     el("td", {
-                        className: "num",
+                        className: "num rc-wide",
                         textContent: x.folder ? "" : size(x.size)
                     }),
                     el("td", {
+                        className: "rc-wide",
                         textContent: when(x.at_ms),
                         style: "white-space:nowrap"
                     }),
@@ -6088,15 +6723,17 @@
                 }, el("thead", {}, el("tr", {}, el("th", {
                     textContent: tr("Item")
                 }), el("th", {
-                    className: "num",
+                    className: "num rc-wide",
                     textContent: tr("Size")
                 }), el("th", {
+                    className: "rc-wide",
                     textContent: tr("Deleted")
                 }), el("th", {}, el("span", {
                     className: "sr-only",
                     textContent: tr("Action")
                 })))), body), note);
             } catch (e) {
+                if (seq !== binRead) return;
                 b.replaceChildren(el("div", {
                     className: "muted",
                     textContent: e.message
@@ -7894,9 +8531,12 @@
                 rel: n.rel
             }), tr("It goes before anything else")));
             sep();
-            if (n.path && n.cloud && F.root.kind !== "vault") {
-                item(tr("Get link for viewers"), () => shareLink(n, false));
-                item(tr("Get link for editors"), () => shareLink(n, true));
+            if (cloudShareable(n)) {
+                item(tr("Copy OneDrive view link"), () => shareLink(n, false));
+                item(tr("Copy OneDrive edit link"), () => shareLink(n, true));
+            }
+            if (peerShareable(n)) item(tr("Send a file"), () => askPeerSend(n.path));
+            if (cloudShareable(n)) {
                 if (!n.folder) item(tr("Version history"), () => {
                     F.openSection = "Versions";
                     F.detailsFor = null;
@@ -9009,7 +9649,7 @@
                     onclick: () => selectRoot(other.id)
                 }));
             }
-            const canShare = n.path && n.cloud && F.root.kind !== "vault";
+            const canShare = cloudShareable(n) || peerShareable(n);
             const head = el("div", {
                     className: "d-head"
                 },
@@ -9238,27 +9878,41 @@
                 } catch (e) { bin.textContent = e.message; }
             }
             if (n.folder && root.kind === "main") b.append(smallBtn(tr("Rewind"), () => {
-                show("recovery");
-                $("#rw-folder").value = "/" + n.rel;
-                $("#rw-at").focus();
+                show("recovery", "rewind");
+                if ($("#rw-form").hidden) {
+                    focusRewind("#rw-stage");
+                } else {
+                    clearRewindPreview();
+                    $("#rw-folder").value = "/" + n.rel;
+                    focusRewind("#rw-date");
+                }
             }));
         }
 
         async function versionsInto(b, n) {
+            const recovery = b.id === "rv-list";
+            const request = b._versions = Symbol();
+            if (recovery) b.replaceChildren(el("p", { className: "note", role: "status", textContent: tr("Looking…") }));
             try {
                 const v = await call("item_versions", {
                     path: n.path
                 });
+                if (b._versions !== request) return;
+                if (!v.versions.length) {
+                    b.replaceChildren(el("p", { className: "note", role: "status", textContent: tr("No versions found.") }));
+                    return;
+                }
                 const t = el("table", {
                     className: "list"
                 }, el("thead", {}, el("tr", {}, el("th", {
                     textContent: tr("Saved")
                 }), el("th", {
-                    className: "num",
+                    className: "num rc-wide",
                     textContent: tr("Size")
                 }), el("th", {}))));
                 const body = el("tbody");
                 for (const x of v.versions) {
+                    const bytes = x.size == null ? "–" : size(x.size);
                     const a = el("div", {
                         className: "actions"
                     }, el("button", {
@@ -9270,29 +9924,26 @@
                             label: when(x.modified_ms).replace(/[^0-9A-Za-z ]/g, "-")
                         }), tr("Opening a copy…"))
                     }));
-                    if (!x.current) a.append(el("button", {
-                        className: "btn small",
-                        textContent: tr("Restore"),
-                        onclick: () => {
-                            if (!confirm(tr("Restore the version from {when}? The current one stays in the history.", {
+                    if (!x.current) {
+                        const restore = smallBtn(tr("Restore"), () => {
+                            if (restore.getAttribute("aria-disabled") === "true" ||
+                                !confirm(tr("Restore the version from {when}? The current one stays in the history.", {
                                     when: when(x.modified_ms)
                                 }))) return;
-                            run(call("item_restore", {
-                                path: n.path,
-                                id: x.id
-                            }), tr("Queued")).then(() => versionsInto(b, n));
-                        }
-                    }));
+                            const send = () => call("item_restore", { path: n.path, id: x.id });
+                            if (recovery) queueRecovery(restore, send, () => tr("Queued: {path}", { path: n.path }));
+                            else run(send(), tr("Queued")).then(() => versionsInto(b, n)).catch(() => {});
+                        });
+                        a.append(restore);
+                    }
                     body.append(el("tr", {}, el("td", {
-                        textContent: x.current ? tr("{when} (current)", {
-                            when: when(x.modified_ms)
-                        }) : when(x.modified_ms),
                         title: x.by ? tr("By {name}", {
                             name: x.by
                         }) : ""
-                    }), el("td", {
-                        className: "num",
-                        textContent: x.size == null ? "–" : size(x.size)
+                    }, x.current ? tr("{when} (current)", { when: when(x.modified_ms) }) : when(x.modified_ms),
+                    recovery && x.size != null ? compactDetail(bytes) : null), el("td", {
+                        className: "num rc-wide",
+                        textContent: bytes
                     }), el("td", {}, a)));
                 }
                 t.append(body);
@@ -9301,8 +9952,10 @@
                     textContent: tr("Open saves a copy outside your synced folder.")
                 }));
             } catch (e) {
+                if (b._versions !== request) return;
                 b.replaceChildren(el("div", {
                     className: "muted",
+                    role: "status",
                     textContent: e.message
                 }));
             }
@@ -9316,7 +9969,16 @@
             }), edit ? tr("Link for editors copied") : tr("Link for viewers copied"));
         }
 
+        function peerShareable(n) {
+            return n.path && n.peer_shareable && F.root.kind !== "vault";
+        }
+
+        function cloudShareable(n) {
+            return n.path && n.cloud && F.root.kind !== "vault";
+        }
+
         function shareButton(n) {
+            const cloudShare = cloudShareable(n);
             return el("div", {
                     className: "share"
                 },
@@ -9333,14 +9995,18 @@
                         role: "group",
                         "aria-label": tr("Share")
                     },
-                    el("button", {
-                        textContent: tr("Get link for viewers"),
+                    cloudShare ? el("button", {
+                        textContent: tr("Copy OneDrive view link"),
                         onclick: () => shareLink(n, false)
-                    }),
-                    el("button", {
-                        textContent: tr("Get link for editors"),
+                    }) : null,
+                    cloudShare ? el("button", {
+                        textContent: tr("Copy OneDrive edit link"),
                         onclick: () => shareLink(n, true)
-                    }))));
+                    }) : null,
+                    peerShareable(n) ? el("button", {
+                        textContent: tr("Send a file"),
+                        onclick: () => askPeerSend(n.path)
+                    }) : null)));
         }
         // What sync did with an item (or, for "", the whole folder), newest first.
         const DID = {
@@ -9388,8 +10054,11 @@
         }
         // Files sync removed or replaced here, kept in the folder's version store.
         async function keptInto(b, r, subject = null, page = null) {
+            const recovery = b.id === "rc-kept";
+            const request = b._kept = Symbol();
             try {
                 const all = await call("kept", {root: r.id});
+                if (b._kept !== request) return;
                 const list = subject ? all.filter(x => historyMatches(x.origin, subject)) : all;
                 if (!list.length) return b.replaceChildren(el("p", {
                     className: "say",
@@ -9400,41 +10069,38 @@
                     const body = el("tbody");
                     const start = current * RECOVERY_PAGE;
                     const shown = current === null ? list : list.slice(start, start + RECOVERY_PAGE);
-                    for (const x of shown) body.append(el("tr", {},
-                        el("td", {
-                            textContent: (x.origin || x.name) + (x.folder ? "\\" : ""),
-                            style: "overflow-wrap:anywhere"
-                        }),
-                        el("td", {
-                            className: "num",
-                            textContent: size(x.bytes)
-                        }),
-                        el("td", {
-                            textContent: when(x.at_ms),
-                            style: "white-space:nowrap"
-                        }),
-                        el("td", {}, el("button", {
-                            className: "btn small",
-                            textContent: tr("Restore"),
-                            onclick: async() => {
-                                const at = await run(call("kept_restore", {
-                                    root: r.id,
-                                    id: x.id
-                                }));
-                                toast(tr("Queued: {path}", {
-                                    path: at.replace(/^\\\\\?\\/, "")
-                                }));
+                    for (const x of shown) {
+                        const send = () => call("kept_restore", { root: r.id, id: x.id });
+                        const message = at => tr("Queued: {path}", { path: at.replace(/^\\\\\?\\/, "") });
+                        const restore = smallBtn(tr("Restore"), async() => {
+                            if (recovery) return queueRecovery(restore, send, message);
+                            try {
+                                await run(send(), message);
                                 keptInto(b, r, subject, current);
+                            } catch {
+                                // The toast already shows why the restore could not be queued.
                             }
-                        }))));
+                        });
+                        restore.setAttribute("aria-label", tr("Restore {path}", { path: x.origin || x.name }));
+                        const name = (x.origin || x.name) + (x.folder ? "\\" : "");
+                        const bytes = size(x.bytes);
+                        const saved = when(x.at_ms);
+                        body.append(el("tr", {},
+                            el("td", { style: "overflow-wrap:anywhere" }, name, recovery ?
+                                compactDetail(tr("{size}, {when}", { size: bytes, when: saved })) : null),
+                            el("td", { className: "num rc-wide", textContent: bytes }),
+                            el("td", { className: "rc-wide", textContent: saved, style: "white-space:nowrap" }),
+                            el("td", {}, restore)));
+                    }
                     b.replaceChildren(el("table", {
                             className: "list"
                         }, el("thead", {}, el("tr", {}, el("th", {
                             textContent: tr("Item")
                         }), el("th", {
-                            className: "num",
+                            className: "num rc-wide",
                             textContent: tr("Size")
                         }), el("th", {
+                            className: "rc-wide",
                             textContent: tr("Kept")
                         }), el("th", {}))), body),
                         el("p", {
@@ -9447,6 +10113,7 @@
                 }
                 renderPage(page);
             } catch (e) {
+                if (b._kept !== request) return;
                 b.replaceChildren(el("div", {
                     className: "muted",
                     textContent: e.message
@@ -9910,6 +10577,10 @@
         });
         $$("#add-menu button").forEach(b => b.onclick = () => {
             $("#add-menu").hidePopover();
+            if (b.id === "add-peer-receive") {
+                showPeerTransfers("receive");
+                return;
+            }
             const d = $("#" + b.dataset.dlg);
             d.showModal();
             if (b.dataset.dlg === "dlg-vault-new") openVaultForm("vc");
@@ -11289,6 +11960,11 @@
                 queueFind();
                 $("#q").focus();
                 $("#q").select();
+                return;
+            }
+            if (start === "peersend" && item) {
+                showPeerTransfers("send");
+                askPeerSend(item);
                 return;
             }
             const page = OLD[start] || start || "files";

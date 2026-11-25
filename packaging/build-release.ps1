@@ -66,7 +66,7 @@ try {
     $env:ONEUP_UPDATE_REPO = $Repo
     $env:ONEUP_PUBLISHER = $Publisher
     if ($ClientId) { $env:ONEUP_CLIENT_ID = $ClientId } else { Write-Warning "No -ClientId: this build can't sign anyone in." }
-    cargo build --release -p oneup -p oneup-shellext
+    cargo build --release -p oneup -p oneup-peer -p oneup-shellext
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 } finally {
     [IO.File]::WriteAllText((Join-Path $root $manifest), $original)
@@ -76,7 +76,7 @@ try {
 # ---- what gets installed
 Remove-Item -Recurse -Force $app -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $app, $out | Out-Null
-foreach ($exe in "oneup", "oneupd", "oneupd-start", "oneup-tray", "oneup-settings", "oneup-open") {
+foreach ($exe in "oneup", "oneupd", "oneupd-start", "oneup-tray", "oneup-settings", "oneup-open", "oneup-receive") {
     Copy-Item "target\release\$exe.exe" $app
 }
 # Explorer's commands (loaded in a surrogate process; see docs/architecture/explorer.md).

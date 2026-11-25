@@ -16,11 +16,23 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-The tests run on temp folders and an in-memory OneDrive; nothing touches a real folder or account. A change in what people see happen to their files comes with an end-to-end `everyday_` test in `crates/oneup-exec/tests/sync.rs`; pure decisions (planner, gate, rules) are unit-tested next to the code. CI runs on GitHub's Windows Server runners, one test at a time, and skips a few tests that check how Windows behaves on a desktop PC (listed in `.github/workflows/ci.yml`), so run `cargo test --workspace` locally too.
+The tests run on temp folders and an in-memory OneDrive; nothing touches a real folder or account. A change in what people see happen to their files comes with an end-to-end `everyday_` test in `crates/oneup-exec/tests/sync.rs`; pure decisions (planner, gate, rules) are unit-tested next to the code.
+
+CI runs the `oneup-sync` tests concurrently in a separate Windows job. Each randomized sync scenario runs 10 seeds with the SQLite checks enabled. The other Windows job runs one test at a time because the Cloud Files driver on Windows Server refuses concurrent sync root registrations. Run `cargo test --workspace` locally to include the desktop tests listed under `--skip` in `.github/workflows/ci.yml`. The release workflow runs the default simulation seed counts before publishing.
 
 The settings window's tests read its page as text (`settings_a11y`, `l10n_strings`) and drive it from the keyboard in headless Microsoft Edge (`settings_keyboard`; node, where installed, checks its message formatter against the Rust one). Without Edge, or where it can't run headless (some sandboxed shells), the keyboard test says it's skipped; CI sets `ONEUP_REQUIRE_EDGE=1` so it must run there.
 
 The repo uses LF line endings (`.gitattributes`); if your editor writes CRLF, run `cargo fmt` and check `git diff`.
+
+### Build OneUp Receive
+
+Use Rust 1.91 or later and a native C compiler to build the standalone receiver on Windows, Linux, or macOS.
+
+```powershell
+cargo build --locked --release -p oneup-peer
+```
+
+Find `oneup-receive` in `target/release`. On Windows the file ends in `.exe`. The **Build OneUp Receive** workflow creates bundles for Windows x64, Linux x64, and Apple silicon. Each bundle includes licenses for its target. The release workflow attaches the Linux and macOS archives to the matching OneUpDrive release. On Windows, `cargo build -p oneup -p oneup-peer -p oneup-shellext` also builds Settings, the receiver worker, and the Explorer extension side by side.
 
 ### Nightly runs
 `.github/workflows/nightly.yml` runs every night (and by hand from the Actions tab) what is too long for CI: the sync simulation (`crates/oneup-sync/tests/sim.rs`) and the mirror simulation (`crates/oneup-remote/tests/mirror.rs`) over millions of seeds, and each fuzz target for half an hour. Each night takes the next window of seeds. A failure opens an issue titled *Nightly run failed* (or comments on the open one) with the failing seed or fuzz input and the command that replays it.

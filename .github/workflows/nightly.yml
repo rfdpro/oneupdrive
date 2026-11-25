@@ -52,6 +52,10 @@ jobs:
           - { name: backups, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 4000000, shard: 0, shards: 1, store: "0", db: "", procs: 4 }
           - { name: converge-store, package: oneup-sync, test: sim, fn: random_histories_converge_without_losing_edits, count: 20000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
           - { name: backups-store, package: oneup-sync, test: sim, fn: backups_send_this_pc_and_never_change_it, count: 20000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
+          - { name: one-sided-changes, package: oneup-sync, test: sim, fn: changes_on_one_side_never_make_a_conflict_name, count: 2000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
+          - { name: lagging-listing, package: oneup-sync, test: sim, fn: a_lagging_listing_converges_without_losing_edits, count: 500, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
+          - { name: journal-loss, package: oneup-sync, test: sim, fn: journal_losses_never_invent_or_lose_a_deletion, count: 500, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
+          - { name: rewind, package: oneup-sync, test: sim, fn: rewinding_a_folder_reproduces_it_and_a_rewind_can_be_rewound, count: 2000, shard: 0, shards: 1, store: "1", db: "", procs: 4 }
           - { name: mirror-memory-1, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 0, shards: 8, store: "", db: memory, procs: 4 }
           - { name: mirror-memory-2, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 1, shards: 8, store: "", db: memory, procs: 4 }
           - { name: mirror-memory-3, package: oneup-remote, test: mirror, fn: randomized_simulation_converges_every_round, count: 125000, shard: 2, shards: 8, store: "", db: memory, procs: 4 }
