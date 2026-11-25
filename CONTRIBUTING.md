@@ -30,7 +30,7 @@ Use Rust 1.91 or later and a native C compiler to build the standalone receiver 
 cargo build --locked --release -p oneup-peer
 ```
 
-Find `oneup-receive` in `target/release`. On Windows the file ends in `.exe`. The **Build OneUp Receive** workflow creates downloadable bundles for Windows x64, Linux x64, and Apple silicon. Each bundle includes licenses for its target. On Windows, `cargo build -p oneup -p oneup-peer -p oneup-shellext` also builds Settings, the receiver worker, and the Explorer extension side by side.
+Find `oneup-receive` in `target/release`. On Windows the file ends in `.exe`. The **Build OneUp Receive** workflow creates bundles for Windows x64, Linux x64, and Apple silicon. Each bundle includes licenses for its target. The release workflow attaches the Linux and macOS archives to the matching OneUpDrive release. On Windows, `cargo build -p oneup -p oneup-peer -p oneup-shellext` also builds Settings, the receiver worker, and the Explorer extension side by side.
 
 ### Nightly runs
 `.github/workflows/nightly.yml` runs every night (and by hand from the Actions tab) what is too long for CI: the sync simulation (`crates/oneup-sync/tests/sim.rs`) and the mirror simulation (`crates/oneup-remote/tests/mirror.rs`) over millions of seeds, and each fuzz target for half an hour. Each night takes the next window of seeds. A failure opens an issue titled *Nightly run failed* (or comments on the open one) with the failing seed or fuzz input and the command that replays it.

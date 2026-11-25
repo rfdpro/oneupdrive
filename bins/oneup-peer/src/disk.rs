@@ -155,11 +155,21 @@ impl Session {
         Ok(dir)
     }
 
+    pub fn destination(&self) -> Result<Option<PathBuf>> {
+        match fs::read(self.path.join("destination")) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn set_destination(&self, path: &Path) -> Result<()> {
+        self.check_destination(path)?;
+        write_owned(&self.path, "destination", &serde_json::to_vec(path)?)
+    }
+
     pub fn output(&self) -> Result<PathBuf> {
-        let output = self.path.join("received");
-        create_directory(&output)?;
-        outside_cloud(&output)?;
-        Ok(output)
+        Ok(self.destination()?.unwrap_or_else(|| self.path.join("received")))
     }
 
     pub fn saved(&self, ticket: &Ticket) -> Result<Option<PathBuf>> {
@@ -176,6 +186,12 @@ impl Session {
     pub async fn publish(&self, store: &FsStore, ticket: &Ticket) -> Result<PathBuf> {
         crate::ticket::file_name(&ticket.name)?;
         let output = self.output()?;
+        if output == self.path.join("received") {
+            create_directory(&output)?;
+            outside_cloud(&output)?;
+        } else {
+            self.check_destination(&output)?;
+        }
         let temp = NamedTempFile::new_in(&output)?.into_temp_path();
         let hash = ticket.blob.hash();
         let size = store.blobs().export(hash, &temp).await?;
@@ -184,6 +200,24 @@ impl Session {
         let saved = tokio::task::spawn_blocking(move || publish_verified(temp, hash, dest)).await??;
         write_owned(&self.path, "published", ticket.name.as_bytes())?;
         Ok(saved)
+    }
+    fn check_destination(&self, path: &Path) -> Result<()> {
+        ensure!(path.is_absolute(), "Choose an existing folder on this PC.");
+        #[cfg(windows)]
+        {
+            oneup_cfapi::expose_placeholders()?;
+            for directory in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
+                plain_directory(directory).context("Choose an ordinary folder on this PC.")?;
+            }
+        }
+        #[cfg(not(windows))]
+        plain_directory(path).context("Choose an ordinary folder on this PC.")?;
+        let scratch = self.path.parent().context("No transfer data folder.")?;
+        ensure!(
+            !path.canonicalize()?.starts_with(scratch.canonicalize()?),
+            "Choose a folder outside transfer storage."
+        );
+        outside_cloud(path)
     }
 }
 
@@ -196,7 +230,13 @@ fn publish_verified(temp: TempPath, hash: Hash, dest: PathBuf) -> Result<PathBuf
     drop(file);
 
     mark_download(&temp)?;
-    temp.persist_noclobber(&dest).context("Could not save the verified file.")?;
+    temp.persist_noclobber(&dest).map_err(|e| {
+        if e.error.kind() == io::ErrorKind::AlreadyExists {
+            anyhow::anyhow!("A file with this name already exists. Choose another folder.")
+        } else {
+            anyhow::Error::new(e).context("Could not save the verified file.")
+        }
+    })?;
     Ok(dest)
 }
 

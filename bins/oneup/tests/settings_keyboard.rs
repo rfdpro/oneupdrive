@@ -668,7 +668,17 @@ const DRIVER: &str = r##"<script>
     orderButtons[0].click(); orderButtons[1].click(); orderButtons[1].click();
     check("sync order can return to its original selection without reopening details", orders.join(",") === "first,normal"
       && orderButtons[1].getAttribute("aria-pressed") === "true", orders);
-    const shareControl = shareButton({path:"C:\\Sync\\big.iso", peer_shareable:true}, true);
+    const shareControl = shareButton({path:"C:\\Sync\\big.iso", cloud:true, peer_shareable:true});
+    const shareActions = [...shareControl.querySelectorAll(".pop button")];
+    check("a synced local file offers both OneDrive links and a file transfer",
+      shareActions.map(b => b.textContent).join(",") === "Copy OneDrive view link,Copy OneDrive edit link,Send a file", "");
+    const cloudFolder = shareButton({path:"C:\\Sync\\Folder", cloud:true, folder:true});
+    check("a synced folder offers both OneDrive links", cloudFolder.querySelectorAll(".pop button").length === 2, "");
+    const localFile = shareButton({path:"C:\\Sync\\Local.txt", peer_shareable:true});
+    check("a local-only file offers the file transfer", localFile.querySelector(".pop").textContent === "Send a file", "");
+    shareActions[0].click(); await sleep(20);
+    check("the OneDrive view link still uses the cloud sharing action",
+      HOST_CALLS.some(m => m.op === "item_share" && m.args.path.endsWith("big.iso") && !m.args.edit), "");
     [...shareControl.querySelectorAll(".pop button")].find(b => b.textContent === "Send a file").click();
     check("the file Share button opens a recipient dialog", document.querySelector("#dlg-peer-send").open
       && document.querySelector("#peer-send-file").textContent === "big.iso", "");
@@ -676,6 +686,10 @@ const DRIVER: &str = r##"<script>
     startAt("peersend", "C:\\Sync\\from-explorer.txt"); await sleep(25);
     check("Explorer opens the same send dialog", document.querySelector("#dlg-peer-send").open
       && document.querySelector("#peer-send-file").textContent === "from-explorer.txt", "");
+    const linuxAndMac = document.querySelector("#peer-companion-downloads");
+    linuxAndMac.closest("details").querySelector("summary").click();
+    linuxAndMac.click(); await sleep(20);
+    check("the receiver section opens the Linux and Mac download page", HOST_CALLS.some(m => m.op === "peer_receiver_downloads"), "");
     document.querySelector("#peer-recipient").value = "fixture-recipient";
     document.querySelector("#peer-send-form").requestSubmit(); await sleep(30);
     check("the send dialog submits the selected file and code", HOST_CALLS.some(m => m.op === "peer_send"
@@ -694,10 +708,18 @@ const DRIVER: &str = r##"<script>
       && !document.querySelector("#peer-recv-form").hidden && !document.querySelector("#peer-recv-network").open, "");
     document.querySelector("#peer-recv-copy").click(); await sleep(20);
     check("copying the receive code moves focus to the download code", document.activeElement.id === "peer-ticket", document.activeElement.id);
+    const destination = document.querySelector("#peer-recv-destination");
+    check("the receive form names the default folder", destination.textContent === "OneUpDrive receive folder", destination.textContent);
+    HOST_ANSWERS.peer_pick_folder = "D:\\Incoming files";
+    document.querySelector("#peer-recv-browse").click(); await sleep(20);
+    check("the selected folder is shown before download", destination.textContent === "D:\\Incoming files", destination.textContent);
+    HOST_ANSWERS.peer_pick_folder = null;
+    document.querySelector("#peer-recv-browse").click(); await sleep(20);
+    check("cancelling the folder picker keeps the selection", destination.textContent === "D:\\Incoming files", destination.textContent);
     document.querySelector("#peer-ticket").value = "fixture-download-code";
     document.querySelector("#peer-recv-start").click(); await sleep(20);
     check("the download form submits the pasted code with automatic connection options", HOST_CALLS.some(m => m.op === "peer_receive"
-      && m.args.ticket === "fixture-download-code" && !m.args.direct), "");
+      && m.args.ticket === "fixture-download-code" && m.args.destination === "D:\\Incoming files" && !m.args.direct), "");
     peerUpdate("receive", {phase:"receiving", running:true, bytes:512, total:1024, connections:1, route:"relay"});
     check("download shows progress and Pause with the network route in the details", document.querySelector("#peer-recv-bar").position === 0.5
       && document.querySelector("#peer-recv-route").textContent.includes("Via relay")
@@ -719,6 +741,9 @@ const DRIVER: &str = r##"<script>
       document.querySelector("#peer-send-state").textContent.includes("Recipient connected")
       && !document.querySelector("#peer-send-bytes").hidden && !document.querySelector("#peer-send-details").open, "");
     peerUpdate("send", {});
+    PEER.destination = null;
+    peerUpdate("receive", {phase:"paused", code:"fixture-receive-code", has_ticket:true, destination:"D:\\Previous folder"});
+    check("an interrupted session shows its saved destination", destination.textContent === "D:\\Previous folder", destination.textContent);
     peerUpdate("receive", {});
     show("files");
     // Vault credentials use masked fields, clear on close, and never send a cancelled action.

@@ -11,7 +11,13 @@ permissions:
   id-token: write   # sign in to Azure for code signing (no stored password)
 
 jobs:
+  receivers:
+    uses: ./.github/workflows/receiver.yml
+    permissions:
+      contents: read
+
   release:
+    needs: receivers
     runs-on: windows-latest
     environment: release   # holds the signing settings; can require approval
     steps:
@@ -82,3 +88,24 @@ jobs:
           ./packaging/build-release.ps1 -Version $version -Channel $channel -SkipBuild `
             -Repo "${{ github.server_url }}/${{ github.repository }}" `
             -AzureSignFile signing.json -Publish -Token "${{ secrets.GITHUB_TOKEN }}"
+
+  publish-receivers:
+    needs: [release, receivers]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: oneup-receive-*
+          path: target/receivers
+          merge-multiple: true
+      - name: Attach receivers to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release upload "$GITHUB_REF_NAME"
+          target/receivers/oneup-receive-linux-x64.tar.gz
+          target/receivers/oneup-receive-macos-arm64.tar.gz
+          --clobber

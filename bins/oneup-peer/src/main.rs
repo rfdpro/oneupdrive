@@ -29,6 +29,9 @@ struct Cli {
     /// Where to keep transfer sessions and received files
     #[arg(long)]
     data_dir: Option<PathBuf>,
+    /// Save the file in this existing folder
+    #[arg(long)]
+    destination: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "auto")]
     network: Network,
     #[arg(long, hide = true)]
@@ -52,6 +55,7 @@ enum Action {
     Receive {
         session: String,
         ticket: Option<String>,
+        destination: Option<PathBuf>,
     },
     #[cfg(windows)]
     Send {
@@ -87,7 +91,7 @@ async fn main() -> Result<()> {
         parse_download_code(&line(&mut io::stdin().lock(), LIMIT + 1)?)
     })?;
     println!("Receiving {} ({} bytes). Press Ctrl+C to pause.", ticket.name, ticket.size);
-    receive(&session, &ticket, cli.network, false, async {
+    receive(&session, &ticket, cli.destination.as_deref(), cli.network, false, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
@@ -141,13 +145,14 @@ async fn worker() -> Result<()> {
                 "ready"
             };
             emit(json!({"phase": phase, "session": session, "code": code, "saved": saved,
-                "has_ticket": ticket.is_some(), "name": ticket.map(|t| t.name)}));
+                "has_ticket": ticket.is_some(), "name": ticket.map(|t| t.name), "destination": opened.destination()?}));
         }
-        Action::Receive { session, ticket } => {
+        Action::Receive { session, ticket, destination } => {
             let session = disk::Session::open(&root, &session)?;
             let ticket =
                 session.ticket(|| parse_download_code(&ticket.context("Paste the download code from the sender.")?))?;
-            receive(&session, &ticket, request.network, true, parent_closed()).await?;
+            emit(json!({"has_ticket": true, "name": ticket.name}));
+            receive(&session, &ticket, destination.as_deref(), request.network, true, parent_closed()).await?;
         }
         #[cfg(windows)]
         Action::Send { path, recipient } => {
@@ -217,12 +222,19 @@ async fn send(
 async fn receive(
     session: &disk::Session,
     ticket: &Ticket,
+    destination: Option<&Path>,
     network: Network,
     managed: bool,
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
     if session.saved(ticket)?.is_some() {
         bail!("The destination already exists. Open the receive folder to review it.");
+    }
+    if let Some(path) = destination {
+        session.set_destination(path)?;
+    }
+    if managed {
+        emit(json!({"destination": session.destination()?}));
     }
     let store = FsStore::load(session.blob_dir()?).await?;
     let saved = download(session, &store, ticket, network, managed, stop).await;

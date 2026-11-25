@@ -69,13 +69,30 @@ impl Peer {
                 self.start(&mut slot, Side::Receive, json!({"op": "prepare"}), true, poster)?;
                 Ok(slot.snapshot())
             }
+            "peer_pick_folder" => {
+                let poster = poster.clone();
+                let chosen =
+                    tokio::task::spawn_blocking(move || poster.pick_folder("Choose where to save the file")).await??;
+                Ok(chosen.map_or(Value::Null, |p| Value::from(p.to_string_lossy().into_owned())))
+            }
             "peer_receive" => {
                 let mut slot = self.receive.lock().await;
                 let session =
                     slot.view.get("session").and_then(Value::as_str).context("Get your receive code first.")?;
                 let ticket = args["ticket"].as_str().map(str::trim).filter(|s| !s.is_empty());
                 ensure!(ticket.is_none_or(|s| s.len() <= 8192), "The download code is too long.");
-                let req = json!({"op": "receive", "session": session, "ticket": ticket, "network": network(args)});
+                let destination = args["destination"].as_str().map(Path::new);
+                if let Some(path) =
+                    destination.or_else(|| slot.view.get("destination").and_then(Value::as_str).map(Path::new))
+                {
+                    ensure!(path.is_absolute(), "Choose a folder on this PC.");
+                    ensure!(
+                        oneup_app::datafolders::for_path(path).is_none(),
+                        "Choose a folder outside your synced folders."
+                    );
+                }
+                let req = json!({"op": "receive", "session": session, "ticket": ticket,
+                    "destination": destination, "network": network(args)});
                 self.start(&mut slot, Side::Receive, req, false, poster)?;
                 Ok(slot.snapshot())
             }
@@ -127,6 +144,10 @@ impl Peer {
             "peer_show_receiver" => {
                 let executable = oneup_app::launch::sibling("oneup-receive.exe")?;
                 std::process::Command::new("explorer.exe").arg(format!("/select,{}", executable.display())).spawn()?;
+                Ok(Value::Null)
+            }
+            "peer_receiver_downloads" => {
+                oneup_sys::assoc::open("https://github.com/rfdpro/oneupdrive/releases")?;
                 Ok(Value::Null)
             }
             _ => bail!("Unknown P2P action."),

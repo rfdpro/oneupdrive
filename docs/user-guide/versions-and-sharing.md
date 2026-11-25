@@ -51,13 +51,16 @@ Choose one file stored on this PC outside an encrypted vault. Use a private conv
 
 1. Open **Sharing → File transfers**, or select **Files → Add → Receive a file**.
 2. Select **Get my code**, then **Copy my code**. Send it to the person sending the file.
-3. Paste the download code they send back and select **Download**. To continue an interrupted transfer, select **Resume download** while the sender still has Settings open.
-4. Select **Open folder** to find your file. OneUpDrive verifies the download and preserves any existing file at the destination.
+3. Paste the download code they send back. To save the file elsewhere, select **Change folder** and choose a folder outside your synced folders.
+4. Select **Download**. To continue an interrupted transfer, select **Resume download** while the sender still has Settings open.
+5. Select **Open folder** to find your file. If a file with the same name already exists, choose another folder and resume.
 
 ### Receive with OneUp Receive
 
 If the person receiving the file uses a Windows PC without OneUpDrive, open **They don't have OneUpDrive** when sending and select **Find Windows receiver**. Send them `oneup-receive.exe` and the accompanying license notices.
 
-Run `oneup-receive` in a terminal and send your receive code to the sender. Paste the download code they send back. The app prints the path of the saved file. Press **Ctrl+C** to pause and use the printed `--session` command to resume. Use `--network direct` to require a direct connection.
+For Linux x64 or a Mac with Apple silicon, select **Linux and Mac downloads**. Send the recipient the release page or the archive for their computer. They can extract the archive and run `./oneup-receive` from its folder in a terminal. [OneUpDrive releases](https://github.com/rfdpro/oneupdrive/releases)
+
+Run `oneup-receive` in a terminal and send your receive code to the sender. Paste the download code they send back. To choose where the file is saved, start the app with `--destination` followed by an existing folder's full path. Press **Ctrl+C** to pause and use the printed `--session` command to resume. The app prints the path of the saved file. Use `--network direct` to require a direct connection.
 
 The [receiver build instructions](../../CONTRIBUTING.md#build-oneup-receive) cover Windows, Linux, and macOS.

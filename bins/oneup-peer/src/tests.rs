@@ -28,7 +28,8 @@ async fn direct_transfer() -> Result<()> {
     #[cfg(windows)]
     oneup_cfapi::expose_placeholders()?;
     let scratch = tempfile::tempdir()?;
-    let path = scratch.path();
+    let transfer_root = scratch.path().join("transfers");
+    let path = disk::scratch_root(&transfer_root)?;
     let source = path.join("source");
     let content: Vec<_> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
     fs::write(&source, &content)?;
@@ -39,11 +40,16 @@ async fn direct_transfer() -> Result<()> {
     let tag = send_store.blobs().add_slice(&content).temp_tag().await?;
     // A later edit is irrelevant to the offered snapshot.
     fs::write(&source, b"new version")?;
-    let (id, recipient) = disk::prepare(path)?;
+    let (id, recipient) = disk::prepare(&path)?;
     let (router, blob) = transfer::offer(&send_store, tag.hash(), recipient, Network::Loopback, false).await?;
     let ticket = Ticket { blob, name: "test.bin".to_owned(), size: content.len() as u64 };
-    let session = disk::Session::open(path, &id)?;
-    ensure!(disk::Session::open(path, &id).is_err(), "Concurrent receive obtained the session lock");
+    let session = disk::Session::open(&path, &id)?;
+    ensure!(disk::Session::open(&path, &id).is_err(), "Concurrent receive obtained the session lock");
+    assert_eq!(session.output()?, path.join(&id).join("received"));
+    assert!(session.set_destination(&path).is_err());
+    let first_choice = scratch.path().join("first choice");
+    fs::create_dir(&first_choice)?;
+    session.set_destination(&first_choice)?;
     assert_eq!(session.ticket(|| Ok(ticket.clone()))?, ticket);
     let recv_store = FsStore::load(session.blob_dir()?).await?;
 
@@ -62,7 +68,8 @@ async fn direct_transfer() -> Result<()> {
     recv_store.shutdown().await?;
     drop(session);
 
-    let session = disk::Session::open(path, &id)?;
+    let session = disk::Session::open(&path, &id)?;
+    assert_eq!(session.output()?, first_choice);
     let ticket = session.ticket(|| anyhow::bail!("The ticket should have been saved"))?;
     let recv_store = FsStore::load(session.blob_dir()?).await?;
     assert_eq!(recv_store.remote().local(ticket.blob.hash_and_format()).await?.local_bytes(), cached);
@@ -74,15 +81,21 @@ async fn direct_transfer() -> Result<()> {
     router.shutdown().await?;
     send_store.shutdown().await?;
 
-    let dest = session.output()?.join("test.bin");
-    fs::write(&dest, b"existing file")?;
+    let existing = first_choice.join("test.bin");
+    fs::write(&existing, b"existing file")?;
     assert!(session.publish(&recv_store, &ticket).await.is_err());
-    assert_eq!(fs::read(&dest)?, b"existing file");
-    fs::rename(&dest, path.join(&id).join("original"))?;
+    assert_eq!(fs::read(&existing)?, b"existing file");
+    assert_eq!(session.saved(&ticket)?, None);
+    let second_choice = scratch.path().join("second choice");
+    fs::create_dir(&second_choice)?;
+    session.set_destination(&second_choice)?;
+    let dest = second_choice.join("test.bin");
     assert_eq!(session.publish(&recv_store, &ticket).await?, dest);
     assert_eq!(fs::read(&dest)?, content);
     #[cfg(windows)]
     assert_eq!(fs::read(dest.with_file_name("test.bin:Zone.Identifier"))?, b"[ZoneTransfer]\r\nZoneId=3\r\n");
     recv_store.shutdown().await?;
+    drop(session);
+    assert_eq!(disk::Session::open(&path, &id)?.saved(&ticket)?, Some(dest));
     Ok(())
 }

@@ -2581,6 +2581,10 @@
             resize: vertical;
         }
 
+        .peer-destination {
+            margin-top: 12px;
+        }
+
         .peer-card > .actions {
             margin-top: 8px;
         }
@@ -3494,6 +3498,11 @@
                             <label for="peer-ticket">Download code from the sender</label>
                             <textarea id="peer-ticket" rows="2" maxlength="8192" spellcheck="false" required></textarea>
                         </div>
+                        <div class="peer-destination">
+                            <p><b>Save to</b></p>
+                            <p class="note" id="peer-recv-destination" role="status">OneUpDrive receive folder</p>
+                            <button type="button" class="btn" id="peer-recv-browse">Change folder</button>
+                        </div>
                         <details class="peer-options" id="peer-recv-network">
                             <summary>Connection options</summary>
                             <label class="ck"><input type="checkbox" id="peer-recv-direct"><span>Require a direct connection<small>Useful when both devices are on the same network.</small></span></label>
@@ -3858,8 +3867,11 @@
                 </div>
                 <details class="peer-options">
                     <summary>They don't have OneUpDrive</summary>
-                    <p class="note">Send them the Windows receiver app. They'll get a receive code when they open it.</p>
-                    <button type="button" class="btn" id="peer-companion">Find Windows receiver</button>
+                    <p class="note">OneUp Receive gives them a receive code. Share the included Windows app or send them the download page for Linux or Mac.</p>
+                    <div class="actions">
+                        <button type="button" class="btn" id="peer-companion">Find Windows receiver</button>
+                        <button type="button" class="btn" id="peer-companion-downloads">Linux and Mac downloads</button>
+                    </div>
                 </details>
                 <details class="peer-options">
                     <summary>Connection options</summary>
@@ -5073,7 +5085,7 @@
             n
         }));
 
-        const PEER = { send: {}, receive: {}, rev: {send: 0, receive: 0}, file: "", focusCode: false };
+        const PEER = { send: {}, receive: {}, rev: {send: 0, receive: 0}, file: "", destination: null, focusCode: false };
         const PEER_PHASES = {
             starting: tr("Getting ready…"), preparing: tr("Preparing file…"),
             offered: tr("Ready to share"), connected: tr("Recipient connected"), receiving: tr("Downloading…"),
@@ -5150,6 +5162,7 @@
             $("#peer-recv-start").hidden = !canReceive;
             $("#peer-recv-input").hidden = !needsCode;
             $("#peer-ticket").disabled = !needsCode;
+            peerText("peer-recv-destination", PEER.destination || r.destination || tr("OneUpDrive receive folder"));
             peerText("peer-recv-start", r.has_ticket ? tr("Resume download") : tr("Download"));
             $("#peer-recv-folder").hidden = !r.saved;
             $("#peer-recv-pause").hidden = !r.running || r.phase !== "receiving";
@@ -5217,20 +5230,37 @@
         $("#peer-send-copy").onclick = () => peerAction("peer_copy", {side: "send"}, tr("Download code copied"));
         $("#peer-send-stop").onclick = () => peerAction("peer_stop", {side: "send"});
         $("#peer-companion").onclick = () => peerAction("peer_show_receiver");
+        $("#peer-companion-downloads").onclick = () => peerAction("peer_receiver_downloads");
         $("#peer-recv-prepare").onclick = async () => {
             if (PEER.receive.has_ticket && PEER.receive.phase !== "complete" && !confirm(tr("Get a new code for a different download?"))) return;
             $("#peer-ticket").value = "";
             PEER.focusCode = true;
-            if (!await peerAction("peer_prepare")) PEER.focusCode = false;
+            const previous = PEER.destination;
+            PEER.destination = null;
+            if (!await peerAction("peer_prepare")) {
+                PEER.focusCode = false;
+                PEER.destination = previous;
+            }
         };
         $("#peer-recv-copy").onclick = async () => {
             const copied = await run(call("peer_copy", {side: "receive"}), tr("Receive code copied")).then(() => true, () => false);
             if (copied && !$("#peer-ticket").disabled && !$("#peer-panel").hidden) $("#peer-ticket").focus();
         };
+        $("#peer-recv-browse").onclick = async () => {
+            const session = PEER.receive.session;
+            const path = await peerAction("peer_pick_folder");
+            if (path && session === PEER.receive.session && !PEER.receive.running) {
+                PEER.destination = path;
+                renderPeer();
+            }
+        };
         $("#peer-recv-folder").onclick = () => peerAction("peer_open_folder");
         $("#peer-recv-form").onsubmit = e => {
             e.preventDefault();
-            peerAction("peer_receive", {ticket: $("#peer-ticket").value.trim(), direct: $("#peer-recv-direct").checked});
+            peerAction("peer_receive", {
+                ticket: $("#peer-ticket").value.trim(), destination: PEER.destination,
+                direct: $("#peer-recv-direct").checked
+            });
         };
         $("#peer-recv-pause").onclick = () => peerAction("peer_stop", {side: "receive"});
 
@@ -8062,10 +8092,12 @@
                 rel: n.rel
             }), tr("It goes before anything else")));
             sep();
+            if (cloudShareable(n)) {
+                item(tr("Copy OneDrive view link"), () => shareLink(n, false));
+                item(tr("Copy OneDrive edit link"), () => shareLink(n, true));
+            }
             if (peerShareable(n)) item(tr("Send a file"), () => askPeerSend(n.path));
-            if (n.path && n.cloud && F.root.kind !== "vault") {
-                item(tr("Get link for viewers"), () => shareLink(n, false));
-                item(tr("Get link for editors"), () => shareLink(n, true));
+            if (cloudShareable(n)) {
                 if (!n.folder) item(tr("Version history"), () => {
                     F.openSection = "Versions";
                     F.detailsFor = null;
@@ -9140,8 +9172,7 @@
                     onclick: () => selectRoot(other.id)
                 }));
             }
-            const cloudShare = n.path && n.cloud && F.root.kind !== "vault";
-            const canShare = cloudShare || peerShareable(n);
+            const canShare = cloudShareable(n) || peerShareable(n);
             const head = el("div", {
                     className: "d-head"
                 },
@@ -9158,7 +9189,7 @@
                                 folder: (F.root.kind === "main" ? tr("Main folder") : F.root.name) + (parentOf(n.rel) ? " / " + parentOf(n.rel).replace(/\//g, " / ") : "")
                             })
                         })),
-                    canShare ? shareButton(n, cloudShare) : null),
+                    canShare ? shareButton(n) : null),
                 el("div", {
                     className: "state" + (cls === "ok" ? " ok" : ""),
                     style: "margin-top:10px"
@@ -9452,7 +9483,12 @@
             return n.path && n.peer_shareable && F.root.kind !== "vault";
         }
 
-        function shareButton(n, cloudShare) {
+        function cloudShareable(n) {
+            return n.path && n.cloud && F.root.kind !== "vault";
+        }
+
+        function shareButton(n) {
+            const cloudShare = cloudShareable(n);
             return el("div", {
                     className: "share"
                 },
@@ -9470,11 +9506,11 @@
                         "aria-label": tr("Share")
                     },
                     cloudShare ? el("button", {
-                        textContent: tr("Get link for viewers"),
+                        textContent: tr("Copy OneDrive view link"),
                         onclick: () => shareLink(n, false)
                     }) : null,
                     cloudShare ? el("button", {
-                        textContent: tr("Get link for editors"),
+                        textContent: tr("Copy OneDrive edit link"),
                         onclick: () => shareLink(n, true)
                     }) : null,
                     peerShareable(n) ? el("button", {
