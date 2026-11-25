@@ -16,7 +16,9 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-The tests run on temp folders and an in-memory OneDrive; nothing touches a real folder or account. A change in what people see happen to their files comes with an end-to-end `everyday_` test in `crates/oneup-exec/tests/sync.rs`; pure decisions (planner, gate, rules) are unit-tested next to the code. CI runs on GitHub's Windows Server runners, one test at a time, and skips a few tests that check how Windows behaves on a desktop PC (listed in `.github/workflows/ci.yml`), so run `cargo test --workspace` locally too.
+The tests run on temp folders and an in-memory OneDrive; nothing touches a real folder or account. A change in what people see happen to their files comes with an end-to-end `everyday_` test in `crates/oneup-exec/tests/sync.rs`; pure decisions (planner, gate, rules) are unit-tested next to the code.
+
+CI runs the `oneup-sync` tests concurrently in a separate Windows job. Each randomized sync scenario runs 10 seeds with the SQLite checks enabled. The other Windows job runs one test at a time because the Cloud Files driver on Windows Server refuses concurrent sync root registrations. Run `cargo test --workspace` locally to include the desktop tests listed under `--skip` in `.github/workflows/ci.yml`. The release workflow runs the default simulation seed counts before publishing.
 
 The settings window's tests read its page as text (`settings_a11y`, `l10n_strings`) and drive it from the keyboard in headless Microsoft Edge (`settings_keyboard`; node, where installed, checks its message formatter against the Rust one). Without Edge, or where it can't run headless (some sandboxed shells), the keyboard test says it's skipped; CI sets `ONEUP_REQUIRE_EDGE=1` so it must run there.
 
