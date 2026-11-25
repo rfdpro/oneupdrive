@@ -72,9 +72,9 @@ impl Peer {
             "peer_receive" => {
                 let mut slot = self.receive.lock().await;
                 let session =
-                    slot.view.get("session").and_then(Value::as_str).context("Create a recipient code first.")?;
+                    slot.view.get("session").and_then(Value::as_str).context("Get your receive code first.")?;
                 let ticket = args["ticket"].as_str().map(str::trim).filter(|s| !s.is_empty());
-                ensure!(ticket.is_none_or(|s| s.len() <= 8192), "The P2P ticket is too long.");
+                ensure!(ticket.is_none_or(|s| s.len() <= 8192), "The download code is too long.");
                 let req = json!({"op": "receive", "session": session, "ticket": ticket, "network": network(args)});
                 self.start(&mut slot, Side::Receive, req, false, poster)?;
                 Ok(slot.snapshot())
@@ -83,10 +83,10 @@ impl Peer {
                 let path = Path::new(args["path"].as_str().context("Choose a file.")?);
                 ensure!(path.is_absolute(), "Choose a local file.");
                 if let Some((dir, _)) = oneup_app::datafolders::for_path(path) {
-                    ensure!(!oneup_app::vaultpair::is_vault_dir(&dir), "P2P sharing is unavailable for vault files.");
+                    ensure!(!oneup_app::vaultpair::is_vault_dir(&dir), "Files in a vault can't be sent this way.");
                 }
-                let recipient = args["recipient"].as_str().context("Enter the recipient code.")?.trim();
-                ensure!(!recipient.is_empty() && recipient.len() <= 128, "Enter a valid recipient code.");
+                let recipient = args["recipient"].as_str().context("Enter their receive code.")?.trim();
+                ensure!(!recipient.is_empty() && recipient.len() <= 128, "Check the receive code they sent you.");
                 let mut slot = self.send.lock().await;
                 self.start(
                     &mut slot,

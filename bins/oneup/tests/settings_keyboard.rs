@@ -669,7 +669,7 @@ const DRIVER: &str = r##"<script>
     check("sync order can return to its original selection without reopening details", orders.join(",") === "first,normal"
       && orderButtons[1].getAttribute("aria-pressed") === "true", orders);
     const shareControl = shareButton({path:"C:\\Sync\\big.iso", peer_shareable:true}, true);
-    [...shareControl.querySelectorAll(".pop button")].find(b => b.textContent === "P2P share").click();
+    [...shareControl.querySelectorAll(".pop button")].find(b => b.textContent === "Send a file").click();
     check("the file Share button opens a recipient dialog", document.querySelector("#dlg-peer-send").open
       && document.querySelector("#peer-send-file").textContent === "big.iso", "");
     document.querySelector("#peer-send-cancel").click();
@@ -683,12 +683,42 @@ const DRIVER: &str = r##"<script>
     show("files"); document.querySelector("#add-menu").showPopover();
     document.querySelector("#add-peer-receive").click(); await sleep(30);
     check("Files Add opens and focuses the receive controls", document.querySelector("#shared").classList.contains("on")
+      && document.querySelector('#sg-tabs [data-tab="transfer"]').getAttribute("aria-pressed") === "true"
       && document.activeElement.id === "peer-recv-prepare", document.activeElement.id);
+    check("the first receive step shows one action and hides the download form",
+      document.querySelector("#peer-recv-prepare").textContent === "Get my code"
+      && document.querySelector("#peer-recv-form").hidden, "");
+    peerUpdate("receive", {phase:"ready", code:"fixture-receive-code", running:false});
+    check("the receive code unlocks a clearly labelled download form",
+      document.querySelector("#peer-recv-value").value === "fixture-receive-code"
+      && !document.querySelector("#peer-recv-form").hidden && !document.querySelector("#peer-recv-network").open, "");
+    document.querySelector("#peer-recv-copy").click(); await sleep(20);
+    check("copying the receive code moves focus to the download code", document.activeElement.id === "peer-ticket", document.activeElement.id);
+    document.querySelector("#peer-ticket").value = "fixture-download-code";
+    document.querySelector("#peer-recv-start").click(); await sleep(20);
+    check("the download form submits the pasted code with automatic connection options", HOST_CALLS.some(m => m.op === "peer_receive"
+      && m.args.ticket === "fixture-download-code" && !m.args.direct), "");
     peerUpdate("receive", {phase:"receiving", running:true, bytes:512, total:1024, connections:1, route:"relay"});
-    check("live receive progress shows the route and offers Pause", document.querySelector("#peer-recv-progress").textContent.includes("Relay")
-      && !document.querySelector("#peer-recv-pause").hidden, "");
+    check("download shows progress and Pause with the network route in the details", document.querySelector("#peer-recv-bar").position === 0.5
+      && document.querySelector("#peer-recv-route").textContent.includes("Via relay")
+      && !document.querySelector("#peer-recv-details").open && !document.querySelector("#peer-recv-pause").hidden, "");
     document.querySelector("#peer-recv-pause").click(); await sleep(20);
     check("Pause addresses the incoming connection", HOST_CALLS.some(m => m.op === "peer_stop" && m.args.side === "receive"), "");
+    peerUpdate("receive", {phase:"paused", code:"fixture-receive-code", has_ticket:true, running:false, bytes:512, total:1024});
+    check("a paused download can resume without pasting the code again", document.querySelector("#peer-recv-input").hidden
+      && document.querySelector("#peer-recv-start").textContent === "Resume download", "");
+    peerUpdate("receive", {phase:"complete", code:"fixture-receive-code", saved:"C:\\Inbox\\fixture.txt"});
+    check("a completed transfer offers the saved file and a new receive flow", !document.querySelector("#peer-recv-folder").hidden
+      && document.querySelector("#peer-recv-prepare").textContent === "Receive another file", "");
+    peerUpdate("send", {phase:"offered", name:"fixture.txt", ticket:"fixture-download-code", running:true});
+    check("a ready send points to the download code and end-sharing controls", !document.querySelector("#peer-send-ready").hidden
+      && !document.querySelector("#peer-send-copy").hidden && !document.querySelector("#peer-send-stop").hidden
+      && document.querySelector("#peer-send-choose").hidden, "");
+    peerUpdate("send", {...PEER.send, connections:1, route:"direct", network_bytes:1024});
+    check("an open transfer shows the recipient and sent bytes above connection details",
+      document.querySelector("#peer-send-state").textContent.includes("Recipient connected")
+      && !document.querySelector("#peer-send-bytes").hidden && !document.querySelector("#peer-send-details").open, "");
+    peerUpdate("send", {});
     peerUpdate("receive", {});
     show("files");
     // Vault credentials use masked fields, clear on close, and never send a cancelled action.

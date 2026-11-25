@@ -2525,6 +2525,70 @@
             margin: 4px 0 8px;
             color: var(--muted);
         }
+        .peer-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 285px), 1fr));
+            gap: 12px;
+            align-items: start;
+            margin-top: 12px;
+        }
+
+        .peer-card {
+            min-width: 0;
+            padding: 16px;
+        }
+
+        .peer-card h3, .peer-card p, .peer-options p {
+            margin: 0 0 8px;
+            overflow-wrap: anywhere;
+        }
+
+        .peer-card h3 {
+            margin-bottom: 12px;
+        }
+
+        .peer-card > .note {
+            padding: 0;
+        }
+
+        .peer-step, .peer-options {
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid var(--line);
+        }
+
+        .peer-options summary {
+            cursor: pointer;
+            color: var(--muted);
+        }
+
+        .peer-options[open] summary {
+            margin-bottom: 8px;
+        }
+
+        .peer-field {
+            display: grid;
+            gap: 6px;
+        }
+
+        .peer-field input, .peer-field textarea, .peer-card progress {
+            width: 100%;
+            min-width: 0;
+        }
+
+        .peer-field textarea {
+            min-height: 4em;
+            resize: vertical;
+        }
+
+        .peer-card > .actions {
+            margin-top: 8px;
+        }
+
+        .peer-card progress {
+            accent-color: var(--accent);
+        }
+
         /* Share, beside a file's name */
         
         .share {
@@ -3383,44 +3447,73 @@
                 <div class="seg pivot" id="sg-tabs" role="group" aria-label="List">
                     <button type="button" data-tab="by" aria-pressed="true">Shared by you</button>
                     <button type="button" data-tab="with" aria-pressed="false">Shared with you</button>
+                    <button type="button" data-tab="transfer" aria-pressed="false" aria-controls="peer-panel">File transfers</button>
                 </div>
             </div>
-            <p class="lead" id="sg-sum"></p>
-            <div class="card" id="sg-card" hidden>
-                <table class="list" id="sg-table">
-                    <thead></thead>
-                    <tbody></tbody>
-                </table>
+            <div id="sg-drive">
+                <p class="lead" id="sg-sum"></p>
+                <div class="card" id="sg-card" hidden>
+                    <table class="list" id="sg-table">
+                        <thead></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div class="actions" id="sg-more"></div>
             </div>
-            <div class="actions" id="sg-more"></div>
-            <h3 id="peer-heading" tabindex="-1">Peer-to-peer sharing</h3>
-            <div class="card" style="padding:14px">
-                <h4>Send a file</h4>
-                <p class="note" id="peer-send-state" role="status"></p>
-                <p class="note" id="peer-send-progress" hidden></p>
-                <div class="actions">
-                    <button class="btn" id="peer-send-choose">Choose file</button>
-                    <button class="btn" id="peer-send-copy" hidden>Copy ticket</button>
-                    <button class="btn" id="peer-send-stop" hidden>Stop</button>
-                    <button class="btn" id="peer-companion">Show receiver app</button>
-                </div>
-                <h4>Receive a file</h4>
-                <p class="note" id="peer-recv-state" role="status"></p>
-                <div class="actions">
-                    <button class="btn" id="peer-recv-prepare">Create recipient code</button>
-                    <button class="btn" id="peer-recv-copy" hidden>Copy code</button>
-                    <button class="btn" id="peer-recv-folder" hidden>Open folder</button>
-                </div>
-                <div id="peer-recv-input" hidden>
-                    <label for="peer-ticket">P2P ticket</label>
-                    <textarea id="peer-ticket" rows="3" maxlength="8192" spellcheck="false" autocomplete="off"></textarea>
-                </div>
-                <label class="ck" id="peer-recv-network" hidden><input type="checkbox" id="peer-recv-direct"><span>Direct connection only</span></label>
-                <p class="note" id="peer-recv-progress" hidden></p>
-                <div class="actions">
-                    <button class="btn" id="peer-recv-start" hidden>Receive</button>
-                    <button class="btn" id="peer-recv-pause" hidden>Pause</button>
-                </div>
+            <div class="peer-grid" id="peer-panel" hidden>
+                <section class="card peer-card" aria-labelledby="peer-send-heading">
+                    <h3 id="peer-send-heading" tabindex="-1">Send a file</h3>
+                    <p class="note" id="peer-send-intro">Choose a file. The person receiving it will give you a receive code.</p>
+                    <p id="peer-send-state" role="status" hidden></p>
+                    <div id="peer-send-ready" hidden>
+                        <p class="note">Send the download code to the person who gave you their receive code. Keep Settings open until they finish.</p>
+                    </div>
+                    <p class="note" id="peer-send-bytes" hidden></p>
+                    <div class="actions">
+                        <button class="btn primary" id="peer-send-choose">Choose file</button>
+                        <button class="btn primary" id="peer-send-copy" hidden>Copy download code</button>
+                        <button class="btn" id="peer-send-stop" hidden>End sharing</button>
+                    </div>
+                    <details class="peer-options" id="peer-send-details" hidden>
+                        <summary>Connection details</summary>
+                        <p class="note" id="peer-send-progress"></p>
+                    </details>
+                </section>
+                <section class="card peer-card" aria-labelledby="peer-recv-heading">
+                    <h3 id="peer-recv-heading" tabindex="-1">Receive a file</h3>
+                    <p class="note" id="peer-recv-intro">Get a receive code and give it to the person sending the file.</p>
+                    <p id="peer-recv-state" role="status" hidden></p>
+                    <div id="peer-recv-code" class="peer-field" hidden>
+                        <label for="peer-recv-value">My receive code</label>
+                        <input type="text" id="peer-recv-value" readonly spellcheck="false">
+                        <p class="note">Send this code to the sender. They'll send you a download code in return.</p>
+                        <div class="actions"><button class="btn primary" id="peer-recv-copy">Copy my code</button></div>
+                    </div>
+                    <form id="peer-recv-form" hidden>
+                        <div class="peer-step peer-field" id="peer-recv-input">
+                            <label for="peer-ticket">Download code from the sender</label>
+                            <textarea id="peer-ticket" rows="2" maxlength="8192" spellcheck="false" required></textarea>
+                        </div>
+                        <details class="peer-options" id="peer-recv-network">
+                            <summary>Connection options</summary>
+                            <label class="ck"><input type="checkbox" id="peer-recv-direct"><span>Require a direct connection<small>Useful when both devices are on the same network.</small></span></label>
+                        </details>
+                    </form>
+                    <div id="peer-recv-meter" hidden>
+                        <progress id="peer-recv-bar" aria-label="Download progress"></progress>
+                        <p class="note" id="peer-recv-progress"></p>
+                    </div>
+                    <div class="actions">
+                        <button class="btn primary" id="peer-recv-start" type="submit" form="peer-recv-form" hidden>Download</button>
+                        <button class="btn primary" id="peer-recv-prepare">Get my code</button>
+                        <button class="btn primary" id="peer-recv-folder" hidden>Open folder</button>
+                        <button class="btn" id="peer-recv-pause" hidden>Pause</button>
+                    </div>
+                    <details class="peer-options" id="peer-recv-details" hidden>
+                        <summary>Connection details</summary>
+                        <p class="note" id="peer-recv-route"></p>
+                    </details>
+                </section>
             </div>
         </section>
 
@@ -3749,21 +3842,31 @@
         <button role="menuitem" data-dlg="dlg-pair">Sync another folder<small>A PC folder with a OneDrive folder</small></button>
         <button role="menuitem" data-dlg="dlg-known">Back up a PC folder<small>Desktop, Documents, Pictures…</small></button>
         <button role="menuitem" data-dlg="dlg-shared">Sync a folder shared with you</button>
-        <button role="menuitem" id="add-peer-receive">Receive via P2P</button>
+        <button role="menuitem" id="add-peer-receive">Receive a file<small>Get a code for the sender</small></button>
         <button role="menuitem" data-dlg="dlg-vault-new">Create an encrypted vault<small>Encrypted before upload</small></button>
         <button role="menuitem" data-dlg="dlg-vault-add">Add an existing vault<small>A Cryptomator vault in OneDrive</small></button>
     </div>
     <dialog id="dlg-peer-send" aria-labelledby="peer-send-title">
         <form id="peer-send-form" method="dialog">
-            <div class="dh"><h3 id="peer-send-title">P2P share</h3></div>
+            <div class="dh"><h3 id="peer-send-title">Send a file</h3></div>
             <div class="db">
-                <p id="peer-send-file"></p>
-                <label for="peer-recipient">Recipient code</label>
-                <input id="peer-recipient" maxlength="128" required spellcheck="false" autocomplete="off" autofocus>
-                <p class="note">Ask the recipient to create a code in OneUpDrive or OneUp Receive.</p>
-                <label class="ck"><input type="checkbox" id="peer-send-direct"><span>Direct connection only</span></label>
+                <p><strong id="peer-send-file"></strong></p>
+                <div class="peer-field">
+                    <label for="peer-recipient">Their receive code</label>
+                    <input type="text" id="peer-recipient" maxlength="128" required spellcheck="false" autocomplete="off" aria-describedby="peer-send-help" autofocus>
+                    <p class="note" id="peer-send-help">Ask them to open Sharing, choose File transfers, and select Get my code in OneUpDrive.</p>
+                </div>
+                <details class="peer-options">
+                    <summary>They don't have OneUpDrive</summary>
+                    <p class="note">Send them the Windows receiver app. They'll get a receive code when they open it.</p>
+                    <button type="button" class="btn" id="peer-companion">Find Windows receiver</button>
+                </details>
+                <details class="peer-options">
+                    <summary>Connection options</summary>
+                    <label class="ck"><input type="checkbox" id="peer-send-direct"><span>Require a direct connection<small>Useful when both devices are on the same network.</small></span></label>
+                </details>
             </div>
-            <div class="actions"><button type="button" class="btn" id="peer-send-cancel">Cancel</button><button class="btn" id="peer-send-submit">Share</button></div>
+            <div class="df"><button type="button" class="btn" id="peer-send-cancel">Cancel</button><button class="btn primary" id="peer-send-submit">Continue</button></div>
         </form>
     </dialog>
     <dialog id="dlg-pair" aria-labelledby="dlg-pair-t">
@@ -4352,7 +4455,6 @@
             }
             if (page === "shared") {
                 loadSharing();
-                loadPeer();
             }
             if (page === "recovery") loadRecovery();
         }
@@ -4971,99 +5073,165 @@
             n
         }));
 
-        const PEER = { send: {}, receive: {}, revision: 0, file: "" };
+        const PEER = { send: {}, receive: {}, rev: {send: 0, receive: 0}, file: "", focusCode: false };
         const PEER_PHASES = {
-            starting: tr("Starting…"), preparing: tr("Preparing file…"),
-            offered: tr("Offer ready. Keep Settings open while sharing."),
-            ready: tr("Send the recipient code to the sender."), receiving: tr("Receiving…"),
-            paused: tr("Transfer paused."), verifying: tr("Verifying and saving…"),
-            complete: tr("File received."), stopped: tr("Offer stopped."), expired: tr("Offer expired."),
+            starting: tr("Getting ready…"), preparing: tr("Preparing file…"),
+            offered: tr("Ready to share"), connected: tr("Recipient connected"), receiving: tr("Downloading…"),
+            paused: tr("Download paused."), verifying: tr("Checking the file…"),
+            complete: tr("File received."), stopped: tr("Sharing ended."), expired: tr("The download code expired."),
             failed: tr("Transfer failed.")
         };
+
         function peerUpdate(side, transfer) {
-            PEER.revision++;
+            PEER.rev[side]++;
             PEER[side] = transfer;
             renderPeer();
+            if (side !== "receive" || transfer.running || !PEER.focusCode) return;
+            PEER.focusCode = false;
+            if (transfer.phase === "ready" && !$("#peer-panel").hidden) $("#peer-recv-copy").focus();
         }
+
         async function loadPeer() {
-            const revision = PEER.revision;
+            const rev = {...PEER.rev};
             try {
                 const state = await call("peer_state");
-                if (revision !== PEER.revision) return;
-                PEER.send = state.send;
-                PEER.receive = state.receive;
+                for (const side of ["send", "receive"]) {
+                    if (rev[side] === PEER.rev[side]) PEER[side] = state[side];
+                }
                 renderPeer();
             } catch (e) { toast(e.message, true); }
         }
-        function peerStatus(transfer) {
-            return [transfer.name, transfer.error || PEER_PHASES[transfer.phase]].filter(Boolean).join(" · ");
+
+        function peerText(id, text) {
+            const element = $("#" + id);
+            if (element.textContent !== text) element.textContent = text;
         }
-        function peerProgress(transfer, text) {
-            const connections = transfer.connections || 0;
-            const route = connections && (transfer.route === "relay" ? tr("Relay") : transfer.route === "direct" ? tr("Direct") : tr("Connecting…"));
-            return [text, tr("{n, plural, one {# open connection} other {# open connections}}", {n: connections}), route].filter(Boolean).join(" · ");
+
+        function peerStatus(id, transfer) {
+            const text = [transfer.name, transfer.error || PEER_PHASES[transfer.phase]].filter(Boolean).join(" · ");
+            peerText(id, text);
+            $("#" + id).hidden = !text;
         }
+
+        function peerConnection(transfer) {
+            const route = transfer.route === "relay" ? tr("Via relay") : transfer.route === "direct" ? tr("Direct connection") : "";
+            return [route, tr("{n, plural, one {# open connection} other {# open connections}}", {
+                n: transfer.connections || 0
+            })].filter(Boolean).join(" · ");
+        }
+
         function renderPeer() {
             const s = PEER.send, r = PEER.receive;
-            $("#peer-send-state").textContent = peerStatus(s);
-            $("#peer-send-progress").hidden = !s.running && s.network_bytes == null;
-            const sent = s.network_bytes == null ? "" : tr("{size} sent over the network", {size: size(s.network_bytes)});
-            $("#peer-send-progress").textContent = peerProgress(s, sent);
+            const active = document.activeElement;
+            const canReceive = !!r.code && !r.running && r.phase !== "complete";
+            const needsCode = canReceive && !r.has_ticket;
+            const showMyCode = needsCode || (r.phase === "ready" && !!r.code);
+            const hasProgress = r.total != null && r.phase !== "complete";
+
+            peerStatus("peer-send-state", s.connections ? {...s, phase: "connected"} : s);
+            $("#peer-send-intro").hidden = !!s.phase;
+            $("#peer-send-ready").hidden = !s.ticket;
+            $("#peer-send-choose").hidden = !!s.running;
             $("#peer-send-copy").hidden = !s.ticket || !s.running;
             $("#peer-send-stop").hidden = !s.running;
-            $("#peer-send-choose").disabled = !!s.running;
-            $("#peer-recv-state").textContent = peerStatus(r);
-            const canReceive = !!r.code && !r.running && r.phase !== "complete";
-            $("#peer-recv-prepare").disabled = !!r.running;
-            $("#peer-recv-prepare").textContent = r.code ? tr("New recipient code") : tr("Create recipient code");
-            $("#peer-recv-copy").hidden = !r.code || r.phase === "complete";
-            $("#peer-recv-input").hidden = !canReceive || !!r.has_ticket;
-            $("#peer-recv-network").hidden = !canReceive;
+            $("#peer-send-bytes").hidden = s.network_bytes == null;
+            if (s.network_bytes != null) peerText("peer-send-bytes", tr("{size} sent over the network", {size: size(s.network_bytes)}));
+            $("#peer-send-details").hidden = !s.ticket && !s.route;
+            peerText("peer-send-progress", peerConnection(s));
+
+            peerStatus("peer-recv-state", r);
+            $("#peer-recv-intro").hidden = !!r.code || !!r.running;
+            $("#peer-recv-code").hidden = !showMyCode;
+            $("#peer-recv-value").value = r.code || "";
+            $("#peer-recv-prepare").hidden = !!r.running;
+            $("#peer-recv-prepare").classList.toggle("primary", !r.code);
+            peerText("peer-recv-prepare", r.phase === "complete" ? tr("Receive another file") : r.code ? tr("Get a new code") : tr("Get my code"));
+            $("#peer-recv-form").hidden = !canReceive;
             $("#peer-recv-start").hidden = !canReceive;
-            $("#peer-recv-start").textContent = r.has_ticket ? tr("Resume") : tr("Receive");
+            $("#peer-recv-input").hidden = !needsCode;
+            $("#peer-ticket").disabled = !needsCode;
+            peerText("peer-recv-start", r.has_ticket ? tr("Resume download") : tr("Download"));
             $("#peer-recv-folder").hidden = !r.saved;
             $("#peer-recv-pause").hidden = !r.running || r.phase !== "receiving";
-            $("#peer-recv-progress").hidden = r.bytes == null;
-            $("#peer-recv-progress").textContent = peerProgress(r, r.bytes == null ? "" : tr("{done} of {total}", {done: size(r.bytes), total: size(r.total)}));
+            $("#peer-recv-meter").hidden = !hasProgress;
+            const meter = $("#peer-recv-bar");
+            meter.max = Math.max(1, r.total || 0);
+            meter.value = r.bytes || 0;
+            peerText("peer-recv-progress", hasProgress ? tr("{done} of {total}", {done: size(r.bytes), total: size(r.total)}) : "");
+            $("#peer-recv-details").hidden = !r.route && !r.connections;
+            peerText("peer-recv-route", peerConnection(r));
+
+            if (!$("#peer-panel").hidden && active?.closest(".peer-card") && !active.getClientRects().length) {
+                const card = active.closest(".peer-card");
+                const next = [...card.querySelectorAll("button.primary, #peer-recv-pause")]
+                    .find(button => !button.disabled && button.getClientRects().length);
+                (next || card.querySelector("h3")).focus();
+            }
         }
+
         function peerAction(op, args = {}, success) {
             return run(call(op, args), success).catch(() => null);
         }
+
+        function showPeerTransfers(side) {
+            SG.tab = "transfer";
+            show("shared");
+            if (side === "send") $("#peer-send-heading").focus();
+            else if (PEER.receive.code || PEER.receive.running) $("#peer-recv-heading").focus();
+            else $("#peer-recv-prepare").focus();
+        }
+
         function askPeerSend(path) {
-            if (PEER.send.running) return toast(tr("Stop the current P2P offer first."), true);
+            if (PEER.send.running) {
+                showPeerTransfers("send");
+                return toast(tr("End the current share before sending another file."), true);
+            }
             PEER.file = path;
             $("#peer-send-file").textContent = path.split(/[\\/]/).pop();
             $("#peer-recipient").value = "";
+            $("#dlg-peer-send").querySelectorAll("details").forEach(details => details.open = false);
             $("#dlg-peer-send").showModal();
         }
+
         $("#peer-send-choose").onclick = async () => {
             const path = await peerAction("pick_file");
             if (path) askPeerSend(path);
         };
         $("#peer-send-cancel").onclick = () => $("#dlg-peer-send").close();
+        $("#dlg-peer-send").addEventListener("cancel", e => {
+            if ($("#peer-send-submit").disabled) e.preventDefault();
+        });
         $("#peer-send-form").onsubmit = async e => {
             e.preventDefault();
             const button = $("#peer-send-submit");
-            button.disabled = true;
+            const cancel = $("#peer-send-cancel");
+            button.disabled = cancel.disabled = true;
             const started = await peerAction("peer_send", { path: PEER.file, recipient: $("#peer-recipient").value.trim(), direct: $("#peer-send-direct").checked });
-            button.disabled = false;
+            button.disabled = cancel.disabled = false;
             if (started) {
+                $("#peer-recipient").value = "";
                 $("#dlg-peer-send").close();
-                show("shared");
-                $("#peer-heading").focus();
+                showPeerTransfers("send");
             }
         };
-        $("#peer-send-copy").onclick = () => peerAction("peer_copy", {side: "send"}, tr("Ticket copied"));
+        $("#peer-send-copy").onclick = () => peerAction("peer_copy", {side: "send"}, tr("Download code copied"));
         $("#peer-send-stop").onclick = () => peerAction("peer_stop", {side: "send"});
         $("#peer-companion").onclick = () => peerAction("peer_show_receiver");
-        $("#peer-recv-prepare").onclick = () => {
-            if (PEER.receive.has_ticket && PEER.receive.phase !== "complete" && !confirm(tr("Start a new receive session?"))) return;
+        $("#peer-recv-prepare").onclick = async () => {
+            if (PEER.receive.has_ticket && PEER.receive.phase !== "complete" && !confirm(tr("Get a new code for a different download?"))) return;
             $("#peer-ticket").value = "";
-            peerAction("peer_prepare");
+            PEER.focusCode = true;
+            if (!await peerAction("peer_prepare")) PEER.focusCode = false;
         };
-        $("#peer-recv-copy").onclick = () => peerAction("peer_copy", {side: "receive"}, tr("Recipient code copied"));
+        $("#peer-recv-copy").onclick = async () => {
+            const copied = await run(call("peer_copy", {side: "receive"}), tr("Receive code copied")).then(() => true, () => false);
+            if (copied && !$("#peer-ticket").disabled && !$("#peer-panel").hidden) $("#peer-ticket").focus();
+        };
         $("#peer-recv-folder").onclick = () => peerAction("peer_open_folder");
-        $("#peer-recv-start").onclick = () => peerAction("peer_receive", {ticket: $("#peer-ticket").value.trim(), direct: $("#peer-recv-direct").checked});
+        $("#peer-recv-form").onsubmit = e => {
+            e.preventDefault();
+            peerAction("peer_receive", {ticket: $("#peer-ticket").value.trim(), direct: $("#peer-recv-direct").checked});
+        };
         $("#peer-recv-pause").onclick = () => peerAction("peer_stop", {side: "receive"});
 
         // ---- shared: what this account shares (the list from OneUpDrive's
@@ -5098,6 +5266,10 @@
             const tab = SG.tab;
             $$("#sg-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.tab === tab));
             const my = ++SG.seq;
+            const transfers = tab === "transfer";
+            $("#sg-drive").hidden = $("#sg-refresh").hidden = transfers;
+            $("#peer-panel").hidden = !transfers;
+            if (transfers) return loadPeer();
             if (!more) $("#sg-card").hidden = true;
             $("#sg-more").replaceChildren();
             $("#sg-sum").textContent = tr("Asking OneDrive…");
@@ -7890,7 +8062,7 @@
                 rel: n.rel
             }), tr("It goes before anything else")));
             sep();
-            if (peerShareable(n)) item(tr("P2P share"), () => askPeerSend(n.path));
+            if (peerShareable(n)) item(tr("Send a file"), () => askPeerSend(n.path));
             if (n.path && n.cloud && F.root.kind !== "vault") {
                 item(tr("Get link for viewers"), () => shareLink(n, false));
                 item(tr("Get link for editors"), () => shareLink(n, true));
@@ -9306,7 +9478,7 @@
                         onclick: () => shareLink(n, true)
                     }) : null,
                     peerShareable(n) ? el("button", {
-                        textContent: tr("P2P share"),
+                        textContent: tr("Send a file"),
                         onclick: () => askPeerSend(n.path)
                     }) : null)));
         }
@@ -9879,8 +10051,7 @@
         $$("#add-menu button").forEach(b => b.onclick = () => {
             $("#add-menu").hidePopover();
             if (b.id === "add-peer-receive") {
-                show("shared");
-                ($("#peer-recv-prepare").disabled ? $("#peer-heading") : $("#peer-recv-prepare")).focus();
+                showPeerTransfers("receive");
                 return;
             }
             const d = $("#" + b.dataset.dlg);
@@ -11075,7 +11246,7 @@
                 return;
             }
             if (start === "peersend" && item) {
-                show("shared");
+                showPeerTransfers("send");
                 askPeerSend(item);
                 return;
             }

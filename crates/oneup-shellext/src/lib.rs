@@ -79,7 +79,7 @@ impl Verb {
             Verb::Online => "View online",
             Verb::Versions => "Version history",
             Verb::Share => "Copy share link…",
-            Verb::PeerShare => "P2P share…",
+            Verb::PeerShare => "Send a file…",
             Verb::Office => "Open with AutoSave",
         }
     }

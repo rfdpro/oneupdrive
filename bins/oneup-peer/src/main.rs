@@ -56,7 +56,7 @@ enum Action {
     #[cfg(windows)]
     Send {
         path: PathBuf,
-        recipient: iroh::EndpointId,
+        recipient: String,
     },
 }
 
@@ -80,11 +80,11 @@ async fn main() -> Result<()> {
         None => disk::prepare(&root)?.0,
     };
     let session = disk::Session::open(&root, &id)?;
-    println!("Recipient code: {}", session.key()?.public());
-    println!("Share the code with the sender. To resume, run oneup-receive --session {id}.");
+    println!("Your receive code: {}", session.key()?.public());
+    println!("Send this code to the person sending the file. To resume later, run oneup-receive --session {id}.");
     let ticket = session.ticket(|| {
-        println!("Paste the sender's ticket and press Enter.");
-        line(&mut io::stdin().lock(), LIMIT + 1)?.parse()
+        println!("Paste the download code they send back, then press Enter.");
+        parse_download_code(&line(&mut io::stdin().lock(), LIMIT + 1)?)
     })?;
     println!("Receiving {} ({} bytes). Press Ctrl+C to pause.", ticket.name, ticket.size);
     receive(&session, &ticket, cli.network, false, async {
@@ -106,6 +106,10 @@ fn line(reader: &mut impl BufRead, max: usize) -> Result<String> {
     reader.take(max as u64).read_line(&mut text)?;
     ensure!(!text.is_empty() && text.len() < max, "Invalid transfer request.");
     Ok(text)
+}
+
+fn parse_download_code(text: &str) -> Result<Ticket> {
+    text.parse().map_err(|_| anyhow::anyhow!("Check the download code from the sender and try again."))
 }
 
 pub(crate) fn emit(value: Value) {
@@ -141,11 +145,17 @@ async fn worker() -> Result<()> {
         }
         Action::Receive { session, ticket } => {
             let session = disk::Session::open(&root, &session)?;
-            let ticket = session.ticket(|| ticket.context("Paste a P2P ticket.")?.parse())?;
+            let ticket =
+                session.ticket(|| parse_download_code(&ticket.context("Paste the download code from the sender.")?))?;
             receive(&session, &ticket, request.network, true, parent_closed()).await?;
         }
         #[cfg(windows)]
-        Action::Send { path, recipient } => send(&root, path, recipient, request.network, parent_closed()).await?,
+        Action::Send { path, recipient } => {
+            let recipient = recipient
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Check the receive code they sent you and try again."))?;
+            send(&root, path, recipient, request.network, parent_closed()).await?;
+        }
     }
     Ok(())
 }

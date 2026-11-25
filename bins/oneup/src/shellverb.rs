@@ -27,7 +27,7 @@ pub async fn run(verb: &str, path: &Path) -> Result<()> {
             let dir = match oneup_app::datafolders::for_path(path) {
                 Some((dir, _)) => {
                     if oneup_app::vaultpair::is_vault_dir(&dir) {
-                        bail!("P2P sharing is unavailable for vault files.");
+                        bail!("Files in a vault can't be sent this way.");
                     }
                     dir
                 }

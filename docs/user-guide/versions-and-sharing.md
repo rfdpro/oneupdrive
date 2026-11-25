@@ -36,28 +36,28 @@ From a terminal:
 
 None of this works inside an [encrypted vault](vaults.md): OneDrive only has the encrypted files there.
 
-## Share a file directly
+## Send a file
 
-1. Ask the recipient to open **Sharing → Peer-to-peer sharing** and select **Create recipient code**. They can also run OneUp Receive to get a code.
-2. Select a file in **Files** and choose **Share → P2P share**. In File Explorer, use **OneUpDrive → P2P share**.
-3. Enter the recipient code and select **Share**. When the offer is ready, select **Copy ticket** and send the ticket to the same person.
-4. Keep Settings open while the recipient downloads. Select **Stop** to close the offer early. Offers expire after 24 hours.
+1. Ask the person receiving the file to send you their receive code. They can get it in OneUpDrive or with OneUp Receive.
+2. Select a file in **Files** and choose **Share → Send a file**. In File Explorer, choose **OneUpDrive → Send a file…**.
+3. Paste their receive code and select **Continue**. When the file is ready, select **Copy download code** and send it back to them.
+4. Keep Settings open until they finish downloading. Select **End sharing** to stop early. Download codes expire after 24 hours.
 
-Choose an ordinary file on this PC. Folders, vault files, and Files On-Demand placeholders are unavailable. The transfer does not use your OneDrive account. Use a private conversation to exchange the recipient code and ticket.
+Choose one file stored on this PC outside an encrypted vault. Use a private conversation to exchange codes. You can transfer files without signing in to OneDrive.
 
-**Peer-to-peer sharing** shows the open connections and whether they are direct or use a relay. OneUpDrive uses public Iroh relays when needed. To require a direct route, select **Direct connection only** when sending and receiving. Both devices must be able to reach each other over the network.
+**Sharing → File transfers** shows download progress. Open **Connection details** to see whether the devices connected directly or through a relay. For a direct-only transfer, open **Connection options** and select **Require a direct connection** on both devices.
 
 ## Receive a file
 
-1. Open **Sharing → Peer-to-peer sharing**, or select **Files → Add → Receive via P2P**.
-2. Select **Create recipient code**, then **Copy code**. Send the code to the sender in a private conversation.
-3. Paste the ticket the sender returns and select **Receive**. Use **Pause** and **Resume** to continue an interrupted transfer while the offer is open.
-4. When the file is received, select **Open folder**. OneUpDrive saves the verified file in its receive folder and preserves any file already there.
+1. Open **Sharing → File transfers**, or select **Files → Add → Receive a file**.
+2. Select **Get my code**, then **Copy my code**. Send it to the person sending the file.
+3. Paste the download code they send back and select **Download**. To continue an interrupted transfer, select **Resume download** while the sender still has Settings open.
+4. Select **Open folder** to find your file. OneUpDrive verifies the download and preserves any existing file at the destination.
 
 ### Receive with OneUp Receive
 
-On Windows, select **Show receiver app** in **Peer-to-peer sharing** to find `oneup-receive.exe`. You can copy this executable and the accompanying license notices to another Windows PC. The standalone app needs no OneUpDrive installation.
+If the person receiving the file uses a Windows PC without OneUpDrive, open **They don't have OneUpDrive** when sending and select **Find Windows receiver**. Send them `oneup-receive.exe` and the accompanying license notices.
 
-Run `oneup-receive` in a terminal and send the displayed code to the sender. Paste the returned ticket. The app prints the path of the saved file. Press **Ctrl+C** to pause and use the printed `--session` command to resume. Add `--network direct` to require a direct connection.
+Run `oneup-receive` in a terminal and send your receive code to the sender. Paste the download code they send back. The app prints the path of the saved file. Press **Ctrl+C** to pause and use the printed `--session` command to resume. Use `--network direct` to require a direct connection.
 
 The [receiver build instructions](../../CONTRIBUTING.md#build-oneup-receive) cover Windows, Linux, and macOS.
