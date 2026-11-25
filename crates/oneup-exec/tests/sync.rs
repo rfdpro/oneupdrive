@@ -6837,6 +6837,56 @@ async fn everyday_restoring_a_onedrive_version_and_a_deleted_item() {
 }
 
 #[tokio::test]
+async fn a_recovery_upload_keeps_a_concurrent_onedrive_edit() {
+    for rewind in [false, true] {
+        let cloud = Fake::new();
+        let mut s = Sync::new("recovery-raced", cloud.clone());
+        write(&s.p("docs/a.txt"), b"version one");
+        s.settle().await;
+        write(&s.p("docs/a.txt"), b"version two");
+        s.settle().await;
+
+        let id = RemoteId(resolve(&cloud.0.lock().unwrap(), "docs/a.txt"));
+        let versions = cloud.versions(&id).await.unwrap();
+        let op = s
+            .obs
+            .store()
+            .read(|o| {
+                if !rewind {
+                    return oneup_exec::recover::version_op(o, &id, &versions[1].id);
+                }
+                let base = o.synced_by_remote(&id.0)?.unwrap();
+                let row = o.get_item(&id.0)?.unwrap();
+                Ok(Some(Op::rewind(
+                    base.sid,
+                    oneup_sync::rewind::Step::Reset {
+                        remote: RemotePre { id: id.clone(), etag: row.etag.unwrap() },
+                        from: oneup_sync::rewind::Spot {
+                            parent: RemoteId(row.parent_id.unwrap()),
+                            name: row.name,
+                            size: row.size,
+                            hash: row.qxh,
+                        },
+                        place: None,
+                        content: Some((11, qxh(b"version one"))),
+                        toward: None,
+                    },
+                )))
+            })
+            .unwrap()
+            .unwrap();
+        s.extra = vec![op.clone()];
+        cloud.0.lock().unwrap().race = Some(b"their edit".to_vec());
+        let report = s.round().await;
+        assert!(report.done.contains(&op), "{report:?}");
+        assert_eq!(report.kept_theirs, [(op, "a (conflict 1).txt".into())], "rewind={rewind}");
+        s.settle().await;
+        assert_eq!(std::fs::read(s.p("docs/a.txt")).unwrap(), b"version one");
+        assert_eq!(std::fs::read(s.p("docs/a (conflict 1).txt")).unwrap(), b"their edit");
+    }
+}
+
+#[tokio::test]
 async fn everyday_a_restore_asked_for_leaves_a_file_changed_since_alone() {
     let cloud = Fake::new();
     let mut s = Sync::new("everyday-restore-changed", cloud.clone());

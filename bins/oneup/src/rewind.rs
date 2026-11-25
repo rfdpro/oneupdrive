@@ -16,11 +16,11 @@
 //! with the rewind): what each does, and the state it starts from; a later
 //! round runs an item's steps only while it's as the preview showed it, or
 //! as the rewind's own last step left it, so what changed after the
-//! approval is left alone. It ends once nothing it
-//! approved is left to do, or after [`STALLS`] rounds in a row in which its
-//! steps all failed or were skipped.
+//! approval is left alone. It ends once nothing it approved is left to do,
+//! or after [`STALLS`] rounds with failed, skipped, or blocked steps and
+//! no progress. Pauses and connection failures leave that count unchanged.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context as _, Result, bail};
 use oneup_rules::RuleSet;
@@ -36,8 +36,7 @@ pub const KEY: &str = "rewind.job";
 /// item, with the rewind.
 pub const MAX: usize = 100_000;
 
-/// Rounds in a row in which every step failed or was skipped, after which
-/// a rewind ends with what it could do.
+/// Stalled rounds without a completed step before the rewind ends.
 pub const STALLS: u32 = 3;
 
 /// A rewind under way.
@@ -592,8 +591,8 @@ pub fn ran(
         return Ok(false);
     };
     // Its own steps only (a restore asked for meanwhile is a step too).
-    let mine = |op: &&Op| steps.ops.contains(op);
-    let done: Vec<&Op> = report.done.iter().filter(mine).collect();
+    let own: HashSet<&Op> = steps.ops.iter().collect();
+    let done: Vec<&Op> = report.done.iter().filter(|op| own.contains(op)).collect();
     for op in &done {
         approval.ran(op, oneup_exec::rewind_mark(o, op)?);
         let follows = oneup_exec::rewind_follows(o, op)?;
@@ -605,20 +604,16 @@ pub fn ran(
     }
     job.ran += done.len() as u64;
     job.left_alone = job.left_alone.max(steps.left_alone as u64);
-    job.failed += report.failed.iter().filter(|(op, _)| steps.ops.contains(op)).count() as u64;
-    let tried = !steps.ops.is_empty();
-    job.stalls = if tried && done.is_empty() { job.stalls + 1 } else { 0 };
-    // Waiting for this PC to catch up with its own steps (or a change
-    // there) isn't the end, but counts towards a stall.
-    if !tried && steps.waiting > 0 {
+    let failed = report.failed.iter().filter(|(op, error)| !error.connection && own.contains(op)).count() as u64;
+    job.failed += failed;
+    let tried = !own.is_empty();
+    let blocked = steps.waiting > 0 || !steps.later.is_empty();
+    if !done.is_empty() {
+        job.stalls = 0;
+    } else if failed > 0 || report.skipped.iter().any(|(op, _)| own.contains(op)) || (!tried && blocked) {
         job.stalls += 1;
     }
-    // Steps that wait (folders to empty, names to free) with nothing else
-    // to run: a stall too.
-    if !tried && steps.waiting == 0 && !steps.later.is_empty() {
-        job.stalls += 1;
-    }
-    let finished = (!tried && steps.later.is_empty() && steps.waiting == 0) || job.stalls >= STALLS;
+    let finished = (!tried && !blocked) || job.stalls >= STALLS;
     if !finished {
         save(o, job)?;
         return Ok(false);
@@ -867,6 +862,39 @@ mod tests {
             assert_eq!(ended, round == STALLS, "round {round}");
         }
         assert_eq!(job.failed, u64::from(STALLS));
+    }
+
+    #[test]
+    fn a_rewind_waits_through_paused_and_disconnected_rounds() {
+        let mut job = Job {
+            folder: "/".into(),
+            sid: ROOT,
+            at_ms: 0,
+            started_ms: 0,
+            approval: Some(oneup_sync::rewind::Job::default()),
+            stalls: STALLS - 1,
+            ran: 0,
+            left_alone: 0,
+            failed: 0,
+        };
+        let op = Op::rewind(1, core::Step::Forget);
+        let s = Steps { ops: vec![op.clone()], paths: vec!["/a".into()], ..Steps::default() };
+        let reports = [
+            oneup_exec::Report::default(),
+            oneup_exec::Report { not_run: vec![op.clone()], ..Default::default() },
+            oneup_exec::Report {
+                failed: vec![(op.clone(), oneup_exec::Failure { message: "connection lost".into(), connection: true })],
+                ..Default::default()
+            },
+        ];
+        let mut store = Store::open_in_memory().unwrap();
+        for report in &reports {
+            assert!(!store.write(|o| Ok(ran(o, &mut job, &s, report, &[], 0))).unwrap().unwrap());
+            assert_eq!(store.read(load).unwrap().unwrap().stalls, STALLS - 1);
+        }
+        let report = oneup_exec::Report { done: vec![op], ..Default::default() };
+        assert!(!store.write(|o| Ok(ran(o, &mut job, &s, &report, &[], 0))).unwrap().unwrap());
+        assert_eq!((job.stalls, job.ran, job.failed), (0, 1, 0));
     }
 
     /// A recycling that followed the rewind is done with once it ran: its

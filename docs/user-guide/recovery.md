@@ -1,6 +1,8 @@
 # Getting things back: rewind, versions, deleted files, conflicts
 
-The settings window's **Recovery** page gathers every way to get something back. Each has an `oneup` command too.
+Open **Recovery** from the settings window's sidebar. Choose **Kept on this PC** for a removed or replaced copy, **Deleted from OneDrive** for a deleted cloud item, or **OneDrive versions** for an earlier version of a file.
+
+When you queue a restore, **View activity** opens the log where the result appears. If the connection drops, OneUpDrive keeps the request and checks that it still applies before retrying.
 
 ## View an item's history
 Right-click a file or folder and choose **View history** (under **OneUpDrive** in File Explorer). The Files page opens **History** for that item.
@@ -12,11 +14,13 @@ For a folder in the main sync folder, **Rewind** opens Recovery with that folder
 ## Rewind a folder
 Puts a folder back the way it was at a moment you choose: files deleted since come back, edited files get their content of then, moved and renamed files go back where they were, and files created since are removed. It's the way back from ransomware, a script gone wrong, or a sync that did something you didn't want.
 
-1. Type the folder (`/Documents`, or `/` for everything) and pick the moment under **Rewind to**: a date and a time, or **15 minutes ago**, **1 hour ago**, **Start of today** or **This time yesterday**. Below it, how long ago that is. Then **Preview**. The list shows every change (a page at a time; **Rewind** appears once you've seen them all) the rewind would make, grouped (restore deleted, revert edited, move back, remove created since), with sizes and where each old version comes from: OneDrive's recycle bin or the file's version history in OneDrive.
-2. **Rewind**. Nothing in the rewind happens yet: it waits for your approval as a [safety stop](syncing.md#safety-stop). Everything else keeps syncing meanwhile, the folder included.
-3. **Approve**. If anything in the folder changed since you looked, the list changes with it: nothing is approved, and the new list is shown to look at again. Otherwise OneUpDrive carries it out in OneDrive, and your PC follows. A big folder takes a few rounds.
+1. On **Rewind a folder**, enter the folder (`/Documents`, or `/` for everything) and choose a date and time. Select **Preview**.
+2. Check the folder, time, and changes. Use **Show more** until **Continue** appears, then select it. Sync continues while the rewind waits for your approval.
+3. Select **Approve**. If the list changed, review the new list before approving. Select **Refresh** to check progress. When the rewind ends, **View activity** shows what ran or was skipped.
 
 Nothing is destroyed. What the rewind replaces stays in OneDrive's version history; what it removes goes to OneDrive's recycle bin and to kept copies on your PC (`.oneup\versions`). So a rewind can be rewound: pick a moment just before it.
+
+An approved rewind waits while sync is paused or its connection is interrupted. It resumes with the same approval.
 
 What it leaves alone:
 * **Anything that changes after you approve.** A change before **Approve** gives a new list to approve (above). If you (or anyone) edit, move or delete a file after **Approve**, before the rewind gets to it, that file is left as it is; the rest goes ahead. The activity log says how many were left alone.
@@ -26,7 +30,7 @@ What it leaves alone:
 * **What OneDrive can only put back elsewhere.** OneDrive brings a deleted item back where it was deleted, under the name it had. An item moved or renamed after the moment and then deleted (on this PC or on the web) can't come back to where it was then this way: it's listed with "Restore it from OneDrive's recycle bin on the web". One whose name something else has there now isn't brought back (OneDrive would rename that one); the activity log says so.
 * **What OneDrive no longer has.** OneDrive keeps deleted items in its recycle bin for a limited time (30 days for personal accounts, less if the bin is full) and a limited number of versions. What's gone from there can't come back; the rest of the rewind still runs, and the activity log says what couldn't be done.
 
-If the list changed between the preview and **Rewind** (something synced meanwhile), nothing starts: the new list is shown to look at again.
+If the list changes before you select **Continue**, review the new preview.
 
 A folder that's a [backup](folders.md) or an [encrypted vault](vaults.md) can't be rewound.
 
@@ -58,7 +62,9 @@ From a terminal: `oneup conflicts` lists them; `oneup conflicts /docs/report.doc
 Files sync removed from or replaced on your PC, kept in `.oneup\versions`. **Restore** puts one back where it was (never over anything: a taken name gets ` (restored 1)`). The same as `oneup versions` and `oneup restore`; see [Getting a file back](syncing.md#getting-a-file-back).
 
 ## OneDrive versions
-Type the full path of a file in your synced folder, then **Show**: the versions OneDrive keeps. **Open** saves a copy of one outside your synced folder; **Restore** makes it the current one, and the one it replaces stays in the history. The same as [Version history](versions-and-sharing.md#version-history) on the Files page.
+Use **Browse** to choose a file in a synced folder. You can also enter its full path and select **Show**. **Open** saves a copy outside the synced folder. **Restore** makes the selected version current and keeps the version it replaces in history. See [Version history](versions-and-sharing.md#version-history).
+
+If someone saves an edit in OneDrive just before a large restore or rewind upload finishes, OneUpDrive looks for that edit in the file's version history and keeps it as a conflict copy. Check **Activity** for the copy's name or the recovery status.
 
 ## Deleted from OneDrive
 Items deleted from OneDrive, newest first, with **Restore**: the next sync brings the item back from OneDrive's recycle bin to the folder it was in, under its name, and your PC gets it. If something has that name there now, it isn't restored (OneDrive would rename that one): rename or move it first, then ask again.
