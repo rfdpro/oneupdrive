@@ -488,6 +488,23 @@ fn put_section(
 /// folder was first scanned or synced (stored in the database) is the
 /// starting point, so existing data folders keep what they had.
 pub fn load_rules(data_dir: &Path, store: &Store) -> Result<Rules> {
+    load_rules_with(data_dir, || Ok(store.read(|o| o.meta_get(KEY_PRESET))?))
+}
+
+/// [`load_rules`] for another program than the agent (the drive index
+/// worker): the database is only read, never opened as a store, which would
+/// upgrade it under an agent of another version.
+pub fn load_rules_peeked(data_dir: &Path) -> Result<Rules> {
+    let db = data_dir.join("state.db");
+    load_rules_with(data_dir, || {
+        if !db.try_exists()? {
+            return Ok(None);
+        }
+        Ok(Store::peek_meta(&db, KEY_PRESET)?)
+    })
+}
+
+fn load_rules_with(data_dir: &Path, preset: impl Fn() -> Result<Option<String>>) -> Result<Rules> {
     let doc = read_doc(data_dir)?;
     let rules_table = doc.as_ref().map(|d| section(d, "rules")).transpose()?.flatten();
     let listed = match rules_table {
@@ -510,7 +527,7 @@ pub fn load_rules(data_dir: &Path, store: &Store) -> Result<Rules> {
         None => Vec::new(),
     };
     let stored = || -> Result<Vec<String>> {
-        Ok(match store.read(|o| o.meta_get(KEY_PRESET))?.as_deref() {
+        Ok(match preset()?.as_deref() {
             Some("dev") => vec!["dev".to_string()],
             _ => Vec::new(),
         })

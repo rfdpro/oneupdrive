@@ -99,15 +99,15 @@ pub struct LocalRow {
 }
 
 impl LocalRow {
-    pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, i64, Self)> {
+    pub(crate) fn from_row(keys: KeyOrder, r: &Row<'_>) -> rusqlite::Result<(i64, i64, Self)> {
         let id: Vec<u8> = r.get("file_id")?;
         let parent: Option<Vec<u8>> = r.get("parent_id")?;
         Ok((
             r.get("kind")?,
             r.get("skip")?,
             Self {
-                file_id: id_from_blob(&id),
-                parent_id: parent.as_deref().map(id_from_blob),
+                file_id: keys.id(&id),
+                parent_id: parent.as_deref().map(|p| keys.id(p)),
                 name: r.get("name")?,
                 name_lossy: r.get::<_, i64>("name_lossy")? != 0,
                 kind: LocalKind::File, // replaced by `fix_local` after validation
@@ -127,15 +127,49 @@ pub(crate) fn fix_local((kind, skip, mut row): (i64, i64, LocalRow)) -> Result<L
     Ok(row)
 }
 
-/// File IDs are stored as 16-byte little-endian BLOBs (the on-disk byte order
-/// of `FILE_ID_128`). Malformed blobs (never written by us) decode as 0, which
-/// matches no real entry, rather than panicking.
-pub(crate) fn id_from_blob(b: &[u8]) -> u128 {
-    <[u8; 16]>::try_from(b).map(u128::from_le_bytes).unwrap_or(0)
+/// How a database writes file IDs as 16-byte BLOB keys. A database keeps
+/// the one it was made with ([`crate::Store::use_ordered_keys`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KeyOrder {
+    /// `FILE_ID_128`'s bytes as Windows gives them (little-endian). Sync
+    /// databases, whose initial choices also name items by these bytes
+    /// (`initial::local_key`).
+    #[default]
+    Native,
+    /// Big-endian, an NTFS file reference's 48-bit record number ahead of
+    /// its 16-bit sequence number: keys sort as the MFT does. Neighbouring
+    /// records (files made together, often in one folder) land on the same
+    /// B-tree pages, where native keys sort by the record number's lowest
+    /// byte and spread every folder over the whole table. For the drive
+    /// catalogs, which a scan fills with millions of rows.
+    Ordered,
 }
 
-pub(crate) fn blob(id: u128) -> [u8; 16] {
-    id.to_le_bytes()
+impl KeyOrder {
+    pub(crate) fn blob(self, id: u128) -> [u8; 16] {
+        match self {
+            KeyOrder::Native => id.to_le_bytes(),
+            KeyOrder::Ordered => {
+                let mut b = [0u8; 16];
+                b[..8].copy_from_slice(&((id >> 64) as u64).to_be_bytes());
+                b[8..].copy_from_slice(&(id as u64).rotate_left(16).to_be_bytes());
+                b
+            }
+        }
+    }
+
+    /// Malformed blobs (never written by us) decode as 0, which matches no
+    /// real entry, rather than panicking.
+    pub(crate) fn id(self, b: &[u8]) -> u128 {
+        let Ok(b) = <[u8; 16]>::try_from(b) else { return 0 };
+        match self {
+            KeyOrder::Native => u128::from_le_bytes(b),
+            KeyOrder::Ordered => {
+                let [high, low] = [&b[..8], &b[8..]].map(|h| u64::from_be_bytes(h.try_into().unwrap_or_default()));
+                (u128::from(high) << 64) | u128::from(low.rotate_right(16))
+            }
+        }
+    }
 }
 
 /// The scanned folder and the circumstances of its scan.
@@ -252,9 +286,9 @@ impl Ops<'_> {
              FROM folders CROSS JOIN local_item child ON child.parent_id = folders.id
              WHERE child.file_id != ?1 AND child.kind != 2"
         ))?;
-        let mut rows = st.query([blob(root)])?;
+        let mut rows = st.query([self.keys.blob(root)])?;
         while let Some(row) = rows.next()? {
-            if !visit(row.get("search_path")?, fix_local(LocalRow::from_row(row)?)?)? {
+            if !visit(row.get("search_path")?, fix_local(LocalRow::from_row(self.keys, row)?)?)? {
                 break;
             }
         }
@@ -276,7 +310,7 @@ impl Ops<'_> {
                     Ok(LocalRoot {
                         path: r.get(0)?,
                         volume_serial: r.get::<_, i64>(1)? as u64,
-                        root_file_id: id_from_blob(&root),
+                        root_file_id: self.keys.id(&root),
                         rules: r.get(3)?,
                         journal: journal_id.zip(start_usn).map(|(j, u)| (j as u64, u)),
                         started_at_ms: r.get(6)?,
@@ -307,7 +341,7 @@ impl Ops<'_> {
             params![
                 root.path,
                 root.volume_serial as i64,
-                blob(root.root_file_id),
+                self.keys.blob(root.root_file_id),
                 root.rules,
                 root.journal.map(|(j, _)| j as i64),
                 root.journal.map(|(_, u)| u),
@@ -353,8 +387,8 @@ impl Ops<'_> {
                  WHERE local_item.parent_id IS excluded.parent_id AND local_item.name = excluded.name",
             )?
             .execute(params![
-                blob(row.file_id),
-                row.parent_id.map(blob),
+                self.keys.blob(row.file_id),
+                row.parent_id.map(|p| self.keys.blob(p)),
                 row.name,
                 row.name_lossy as i64,
                 row.kind as i64,
@@ -384,8 +418,8 @@ impl Ops<'_> {
                     attributes = excluded.attributes, reparse_tag = excluded.reparse_tag, skip = excluded.skip",
             )?
             .execute(params![
-                blob(row.file_id),
-                row.parent_id.map(blob),
+                self.keys.blob(row.file_id),
+                row.parent_id.map(|p| self.keys.blob(p)),
                 row.name,
                 row.name_lossy as i64,
                 row.kind as i64,
@@ -426,10 +460,10 @@ impl Ops<'_> {
                  UNION
                  SELECT c.file_id FROM local_item c JOIN s ON c.parent_id = s.id
              ) SELECT id FROM s",
-            [blob(file_id)],
+            [self.keys.blob(file_id)],
         )?;
         if !include_self {
-            self.c.execute("DELETE FROM t_local_sub WHERE id = ?1", [blob(file_id)])?;
+            self.c.execute("DELETE FROM t_local_sub WHERE id = ?1", [self.keys.blob(file_id)])?;
         }
         self.c.execute("DELETE FROM local_scan_queue WHERE file_id IN (SELECT id FROM t_local_sub)", [])?;
         Ok(self.c.execute("DELETE FROM local_item WHERE file_id IN (SELECT id FROM t_local_sub)", [])?)
@@ -457,8 +491,8 @@ impl Ops<'_> {
         let mut st = self.c.prepare("SELECT file_id, parent_id, name, skip FROM local_item WHERE kind = ?1")?;
         let mut rows = st.query([LocalKind::Folder as i64])?;
         while let Some(r) = rows.next()? {
-            let id = id_from_blob(&r.get::<_, Vec<u8>>(0)?);
-            let parent = r.get::<_, Option<Vec<u8>>>(1)?.map(|p| id_from_blob(&p));
+            let id = self.keys.id(&r.get::<_, Vec<u8>>(0)?);
+            let parent = r.get::<_, Option<Vec<u8>>>(1)?.map(|p| self.keys.id(&p));
             let name: String = r.get(2)?;
             f(id, parent, &name, Skip::try_from(r.get::<_, i64>(3)?)?);
         }
@@ -470,20 +504,30 @@ impl Ops<'_> {
     pub fn local_set_skip(&self, file_id: u128, skip: Skip) -> Result<()> {
         self.c
             .prepare_cached("UPDATE local_item SET skip = ?2 WHERE file_id = ?1")?
-            .execute(params![blob(file_id), skip as i64])?;
+            .execute(params![self.keys.blob(file_id), skip as i64])?;
         Ok(())
     }
 
     pub fn local_enqueue(&self, file_id: u128, depth: u32) -> Result<()> {
         self.c
             .prepare_cached("INSERT OR IGNORE INTO local_scan_queue (file_id, depth) VALUES (?1, ?2)")?
-            .execute(params![blob(file_id), depth])?;
+            .execute(params![self.keys.blob(file_id), depth])?;
         Ok(())
     }
 
     pub fn local_dequeue(&self, file_id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM local_scan_queue WHERE file_id = ?1")?.execute([blob(file_id)])?;
+        self.c.prepare_cached("DELETE FROM local_scan_queue WHERE file_id = ?1")?.execute([self.keys.blob(file_id)])?;
         Ok(())
+    }
+
+    /// Whether `file_id` waits in the scan queue to be listed.
+    pub fn local_is_queued(&self, file_id: u128) -> Result<bool> {
+        Ok(self
+            .c
+            .prepare_cached("SELECT 1 FROM local_scan_queue WHERE file_id = ?1")?
+            .query_row([self.keys.blob(file_id)], |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     /// Up to `limit` queued folders, deepest first. Deepest-first keeps the
@@ -493,7 +537,7 @@ impl Ops<'_> {
         let mut st =
             self.c.prepare_cached("SELECT file_id, depth FROM local_scan_queue ORDER BY depth DESC LIMIT ?1")?;
         let v = st
-            .query_map([limit as i64], |r| Ok((id_from_blob(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?
+            .query_map([limit as i64], |r| Ok((self.keys.id(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(v)
     }
@@ -502,7 +546,7 @@ impl Ops<'_> {
         let row = self
             .c
             .prepare_cached(&format!("SELECT {LOCAL_COLS} FROM local_item WHERE file_id = ?1"))?
-            .query_row([blob(file_id)], LocalRow::from_row)
+            .query_row([self.keys.blob(file_id)], |r| LocalRow::from_row(self.keys, r))
             .optional()?;
         row.map(fix_local).transpose()
     }
@@ -516,16 +560,17 @@ impl Ops<'_> {
             "SELECT {LOCAL_COLS} FROM local_item WHERE file_id > ?1 AND kind = 0 AND size > 0              AND (attributes & 4194304) = 0 ORDER BY file_id LIMIT ?2"
         ))?;
         // An empty blob sorts before every ID.
-        let from = after.map(|a| blob(a).to_vec()).unwrap_or_default();
-        let rows =
-            st.query_map(rusqlite::params![from, i64::try_from(limit).unwrap_or(i64::MAX)], LocalRow::from_row)?;
+        let from = after.map(|a| self.keys.blob(a).to_vec()).unwrap_or_default();
+        let rows = st.query_map(rusqlite::params![from, i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+            LocalRow::from_row(self.keys, r)
+        })?;
         rows.map(|r| fix_local(r?)).collect()
     }
 
     /// The stored children of a folder (unordered).
     pub fn local_children(&self, parent_id: u128) -> Result<Vec<LocalRow>> {
         let mut st = self.c.prepare_cached(&format!("SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1"))?;
-        let rows = st.query_map([blob(parent_id)], LocalRow::from_row)?;
+        let rows = st.query_map([self.keys.blob(parent_id)], |r| LocalRow::from_row(self.keys, r))?;
         rows.map(|r| fix_local(r?)).collect()
     }
 
@@ -535,7 +580,9 @@ impl Ops<'_> {
         let n: i64 = self
             .c
             .prepare_cached("SELECT count(*) FROM (SELECT 1 FROM local_item WHERE parent_id = ?1 LIMIT ?2)")?
-            .query_row(rusqlite::params![blob(parent_id), i64::try_from(limit).unwrap_or(i64::MAX)], |r| r.get(0))?;
+            .query_row(rusqlite::params![self.keys.blob(parent_id), i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
+                r.get(0)
+            })?;
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
@@ -546,11 +593,13 @@ impl Ops<'_> {
         let total: i64 = self
             .c
             .prepare_cached("SELECT count(*) FROM local_item WHERE parent_id = ?1")?
-            .query_row([blob(parent_id)], |r| r.get(0))?;
+            .query_row([self.keys.blob(parent_id)], |r| r.get(0))?;
         let mut st = self.c.prepare_cached(&format!(
             "SELECT {LOCAL_COLS} FROM local_item WHERE parent_id = ?1 ORDER BY name LIMIT ?2"
         ))?;
-        let rows = st.query_map(rusqlite::params![blob(parent_id), limit as i64], LocalRow::from_row)?;
+        let rows = st.query_map(rusqlite::params![self.keys.blob(parent_id), limit as i64], |r| {
+            LocalRow::from_row(self.keys, r)
+        })?;
         let rows = rows.map(|r| fix_local(r?)).collect::<Result<_>>()?;
         Ok((usize::try_from(total).unwrap_or(0), rows))
     }
@@ -560,8 +609,8 @@ impl Ops<'_> {
     /// parent index, loading only the matches (see `Ops::remote_named`).
     pub fn local_named(&self, parent_id: u128, name: &str) -> Result<Vec<LocalRow>> {
         let mut st = self.c.prepare_cached(&local_named_sql())?;
-        let params = rusqlite::params![blob(parent_id), crate::char_count(name), oneup_sync::fold(name)];
-        let rows = st.query_map(params, LocalRow::from_row)?;
+        let params = rusqlite::params![self.keys.blob(parent_id), crate::char_count(name), oneup_sync::fold(name)];
+        let rows = st.query_map(params, |r| LocalRow::from_row(self.keys, r))?;
         rows.map(|r| fix_local(r?)).collect()
     }
 
@@ -590,7 +639,7 @@ impl Ops<'_> {
         while found.len() < limit {
             let Some(row) = rows.next()? else { break };
             if query.matches(row.get::<_, String>("name")?.as_str()) {
-                found.push(fix_local(LocalRow::from_row(row)?)?);
+                found.push(fix_local(LocalRow::from_row(self.keys, row)?)?);
             }
         }
         Ok(found)
@@ -604,7 +653,7 @@ impl Ops<'_> {
              WHERE (c.attributes & 524288) != 0 AND c.kind != 2 AND (p.file_id IS NULL OR (p.attributes & 524288) = 0)",
         )?;
         let rows = st.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-        rows.map(|r| Ok(id_from_blob(&r?))).collect()
+        rows.map(|r| Ok(self.keys.id(&r?))).collect()
     }
 
     /// How many files were online-only when last looked at, and their
@@ -630,7 +679,8 @@ impl Ops<'_> {
              LEFT JOIN local_item f ON f.parent_id = t.id AND f.kind = 0
              GROUP BY t.top",
         )?;
-        let rows = st.query_map([blob(parent_id)], |r| Ok((id_from_blob(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
+        let rows =
+            st.query_map([self.keys.blob(parent_id)], |r| Ok((self.keys.id(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
@@ -645,7 +695,7 @@ impl Ops<'_> {
         ))?;
         let rows = st.query_map([], |r| {
             let id: Vec<u8> = r.get(0)?;
-            Ok((id_from_blob(&id), r.get::<_, i64>(1)? == LocalKind::Folder as i64, r.get(2)?))
+            Ok((self.keys.id(&id), r.get::<_, i64>(1)? == LocalKind::Folder as i64, r.get(2)?))
         })?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
@@ -667,7 +717,7 @@ impl Ops<'_> {
             let row: Option<(Option<Vec<u8>>, String, i64, bool)> = self
                 .c
                 .prepare_cached("SELECT parent_id, name, kind, name_lossy FROM local_item WHERE file_id = ?1")?
-                .query_row([blob(cur)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .query_row([self.keys.blob(cur)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
                 .optional()?;
             match row {
                 None => return Ok(None),
@@ -678,7 +728,7 @@ impl Ops<'_> {
                 Some((Some(p), name, kind, lossy)) => {
                     addressable &= !lossy && kind != LocalKind::Link as i64;
                     parts.push(name);
-                    cur = id_from_blob(&p);
+                    cur = self.keys.id(&p);
                 }
                 Some((None, _, _, _)) => return Ok(None),
             }
@@ -843,6 +893,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Sync databases keep the bytes Windows gives: changing them would
+    /// strand every stored row and every initial choice that names one.
+    #[test]
+    fn native_keys_are_the_file_ids_own_bytes() {
+        for id in [0, 5, u128::MAX - 3, (7u128 << 48) | 0x1234_5678_9abc] {
+            assert_eq!(KeyOrder::Native.blob(id), id.to_le_bytes());
+            assert_eq!(KeyOrder::Native.id(&id.to_le_bytes()), id);
+        }
+    }
+
+    #[test]
+    fn ordered_keys_round_trip_and_sort_ntfs_ids_by_record_number() {
+        let ntfs = |record: u64, seq: u16| (u128::from(seq) << 48) | u128::from(record);
+        for id in [0, 1, u128::MAX, u128::MAX - 3, ntfs(0xffff_ffff_ffff, u16::MAX), (9u128 << 64) | 77] {
+            assert_eq!(KeyOrder::Ordered.id(&KeyOrder::Ordered.blob(id)), id);
+        }
+        // Record 100 reused many times sorts before record 101 made once.
+        let mut ids = [ntfs(101, 1), ntfs(100, 900), ntfs(5, 3), ntfs(100, 2), ntfs(1 << 40, 1)];
+        let mut keys: Vec<[u8; 16]> = ids.iter().map(|&id| KeyOrder::Ordered.blob(id)).collect();
+        keys.sort();
+        ids.sort_by_key(|&id| ((id as u64) & 0xffff_ffff_ffff, (id as u64) >> 48));
+        assert_eq!(keys.iter().map(|k| KeyOrder::Ordered.id(k)).collect::<Vec<_>>(), ids);
+        assert_eq!(KeyOrder::Ordered.id(&[1, 2, 3]), 0, "malformed");
+    }
+
+    #[test]
+    fn an_empty_database_switches_to_ordered_keys_for_good_and_a_filled_one_refuses() {
+        let dir = std::env::temp_dir().join(format!("oneup-store-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("catalog.db");
+        let mut s = Store::open(&db, 256).unwrap();
+        assert_eq!(s.key_order(), KeyOrder::Native);
+        s.use_ordered_keys().unwrap();
+        scanned(&mut s);
+        let path = |s: &Store| s.read(|o| o.local_path_of(u128::MAX - 3)).unwrap();
+        assert_eq!(path(&s).as_deref(), Some("/a/f.txt"));
+        let raw: Vec<u8> = s
+            .read(|o| Ok(o.c.query_row("SELECT file_id FROM local_item WHERE name = 'a'", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(raw, KeyOrder::Ordered.blob(2), "stored in the new order");
+        drop(s);
+        let s = Store::open(&db, 256).unwrap();
+        assert_eq!(s.key_order(), KeyOrder::Ordered);
+        assert_eq!(path(&s).as_deref(), Some("/a/f.txt"));
+        drop(s);
+
+        let mut filled = Store::open_in_memory().unwrap();
+        scanned(&mut filled);
+        assert!(matches!(filled.use_ordered_keys(), Err(crate::Error::KeysInUse)));
+        assert_eq!(filled.key_order(), KeyOrder::Native);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// root(1) / a(2) / { f(3), node_modules(4, excluded) }, plus a link(5)
     /// at the top and a 128-bit id that needs all 16 bytes.
     fn scanned(s: &mut Store) {
@@ -978,7 +1081,7 @@ mod tests {
         s.write(|o| {
             // A child under an excluded folder, and a skipped file.
             o.local_put(&row(10, Some(4), "inside", LocalKind::File))?;
-            o.c.execute("UPDATE local_item SET skip = 3 WHERE file_id = ?1", [blob(5)])?;
+            o.c.execute("UPDATE local_item SET skip = 3 WHERE file_id = ?1", [o.keys.blob(5)])?;
             Ok(())
         })
         .unwrap();

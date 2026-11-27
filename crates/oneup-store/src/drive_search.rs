@@ -88,7 +88,7 @@ impl Ops<'_> {
             }
             let name = oneup_sync::fold(&row.get::<_, String>("name")?);
             if terms.iter().all(|term| name.contains(term))
-                && !visit(crate::local::fix_local(crate::LocalRow::from_row(row)?)?)?
+                && !visit(crate::local::fix_local(crate::LocalRow::from_row(self.keys, row)?)?)?
             {
                 break;
             }

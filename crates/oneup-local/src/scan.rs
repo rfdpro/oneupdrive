@@ -19,6 +19,8 @@
 //! A scan of a live folder is not an atomic snapshot: things can change
 //! while it runs. The change-journal position is recorded *before* the scan
 //! starts, so the observer can replay everything that happened during it.
+//! A scan that may outlast the journal's history (a whole drive) applies
+//! the journal between steps instead ([`Scan::follow_journal`]).
 //!
 //! ## Cost
 //! Memory is bounded by [`Config::flush_entries`] (plus the single largest
@@ -38,6 +40,7 @@ use oneup_store::{LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip, 
 
 use crate::classify;
 use crate::coexist::{self, OtherEngine};
+use crate::observe::{Changes, Reader, Tree};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -74,6 +77,18 @@ pub struct Config {
     pub flush_entries: usize,
     /// Listing buffer. 256 KiB is what the enumeration speed was measured with.
     pub buffer_bytes: usize,
+    /// The store's page cache while the scan runs, put back when it hands
+    /// the store back. `None`: [`scan_cache_kib`] of the cache it has.
+    pub cache_kib: Option<u32>,
+}
+
+/// The page cache a scan raises the store's to: 8 times what the memory
+/// profile gave it (4, 16 or 64 MiB), from 32 MiB to 512 MiB. A scan writes
+/// every row of a tree that can outgrow any cache: measured with
+/// `oneup-store`'s `scan_order_cost`, 5 million rows took 383 s with 128 MiB
+/// and 4,096-folder steps against 657 s with 4 MiB and 256-folder steps.
+pub fn scan_cache_kib(normal_kib: u32) -> u32 {
+    normal_kib.saturating_mul(8).clamp(32 << 10, 512 << 10)
 }
 
 impl Config {
@@ -83,7 +98,7 @@ impl Config {
     /// faster than 256. A step still takes well under a second, which is all
     /// an interruption can lose.
     pub fn new(rules: ExcludeSet) -> Self {
-        Self { rules, batch_dirs: 4096, flush_entries: 32_768, buffer_bytes: 256 * 1024 }
+        Self { rules, batch_dirs: 4096, flush_entries: 32_768, buffer_bytes: 256 * 1024, cache_kib: None }
     }
 }
 
@@ -122,6 +137,10 @@ pub enum Replaced {
     /// doesn't now, or the other way round (an unlinking happened between):
     /// the half already listed doesn't describe the folder, so it starts over.
     ManagerChanged,
+    /// The change journal lost records the unfinished scan still had to
+    /// apply (it wrapped or was reset while the scan ran or waited), so what
+    /// was listed can't be brought up to date ([`Scan::restart`]).
+    JournalLost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +176,21 @@ pub struct Scan {
     buf: Vec<u8>,
     progress: Arc<Progress>,
     cancel: Arc<AtomicBool>,
+    /// The journal position applied up to, once [`Scan::follow_journal`] runs.
+    reader: Option<Reader>,
+    /// The store's page cache before the scan raised it ([`Config::cache_kib`]).
+    normal_cache_kib: u32,
+}
+
+/// How [`Scan::open_with`] treats a stored scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    /// Resume or replace it, whatever folder it was of.
+    Any,
+    /// Only the same folder's, which it resumes or replaces.
+    Existing,
+    /// Only the same folder's, which it replaces.
+    Restart,
 }
 
 fn now_ms() -> i64 {
@@ -167,16 +201,25 @@ impl Scan {
     /// Opens `path` for scanning: resumes a matching unfinished scan, or
     /// starts a new one (discarding whatever was stored before).
     pub fn open(store: Store, path: &Path, cfg: Config) -> Result<Self> {
-        Self::open_with(store, path, cfg, false)
+        Self::open_with(store, path, cfg, Opening::Any)
     }
 
     /// Like [`Self::open`], but refuses a different root before changing
     /// the stored tree. Automatic recovery must never adopt another folder.
     pub fn open_existing(store: Store, path: &Path, cfg: Config) -> Result<Self> {
-        Self::open_with(store, path, cfg, true)
+        Self::open_with(store, path, cfg, Opening::Existing)
     }
 
-    fn open_with(mut store: Store, path: &Path, cfg: Config, existing: bool) -> Result<Self> {
+    /// Starts this scan over, from a new journal bookmark: after
+    /// [`Scan::follow_journal`] found that the journal lost records. Refuses
+    /// a different folder at the stored path, as [`Self::open_existing`] does.
+    pub fn restart(self) -> Result<Self> {
+        let path = PathBuf::from(&self.root.path);
+        let cfg = self.cfg.clone();
+        Self::open_with(self.into_store(), &path, cfg, Opening::Restart)
+    }
+
+    fn open_with(mut store: Store, path: &Path, cfg: Config, opening: Opening) -> Result<Self> {
         // Before anything is looked at: otherwise Windows may disguise cloud
         // placeholders as ordinary files, in listings and on handles alike.
         oneup_cfapi::expose_placeholders()?;
@@ -208,7 +251,8 @@ impl Scan {
 
         let rules = cfg.rules.fingerprint();
         let previous = store.read(|o| o.local_root())?;
-        if existing && previous.as_ref().is_none_or(|p| p.volume_serial != volume_serial || p.root_file_id != root_id.0)
+        if opening != Opening::Any
+            && previous.as_ref().is_none_or(|p| p.volume_serial != volume_serial || p.root_file_id != root_id.0)
         {
             return Err(Error::RootChanged);
         }
@@ -217,6 +261,7 @@ impl Scan {
             Some(p) if p.volume_serial != volume_serial || p.root_file_id != root_id.0 => {
                 Start::Replaced(Replaced::OtherFolder)
             }
+            Some(_) if opening == Opening::Restart => Start::Replaced(Replaced::JournalLost),
             Some(p) if p.rules != rules => Start::Replaced(Replaced::RulesChanged),
             Some(_) if !store.read(|o| o.local_scan_is_current())? => Start::Replaced(Replaced::OlderScanner),
             Some(p)
@@ -271,6 +316,11 @@ impl Scan {
         };
         tracing::info!(?start, "local scan opened");
         tracing::debug!(path = %root.path, "local scan root");
+        let normal_cache_kib = store.cache_kib()?;
+        let scan_cache = cfg.cache_kib.unwrap_or_else(|| scan_cache_kib(normal_cache_kib));
+        if scan_cache != normal_cache_kib {
+            store.set_cache_kib(scan_cache)?;
+        }
 
         Ok(Self {
             store,
@@ -282,6 +332,8 @@ impl Scan {
             other_engine,
             progress: Arc::default(),
             cancel: Arc::default(),
+            reader: None,
+            normal_cache_kib,
         })
     }
 
@@ -318,6 +370,30 @@ impl Scan {
         Ok(true)
     }
 
+    /// Applies what the change journal recorded since the scan's bookmark to
+    /// the folders listed so far, and moves the bookmark up. Folders still
+    /// queued are left to the scan ([`crate::observe`] § While a scan runs).
+    /// Called between steps, it keeps the bookmark inside the history the
+    /// journal keeps, however long the scan takes, so the observer can carry
+    /// on from it once the scan ends. `NeedsRescan` when the journal lost
+    /// records meanwhile: only [`Scan::restart`] helps then. A scan without
+    /// a journal has nothing to follow.
+    pub fn follow_journal(&mut self, keep_going: impl Fn() -> bool) -> crate::observe::Result<Changes> {
+        let mut ch = Changes::default();
+        let Some(bookmark) = self.root.journal else { return Ok(ch) };
+        let reader = self.reader.get_or_insert_with(|| Reader::new(bookmark));
+        let target = reader.end(&self.volume)?;
+        while reader.cursor < target && keep_going() {
+            let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: true };
+            if !reader.apply_next(&mut self.store, &self.volume, tree, &mut self.buf, &mut ch)? {
+                break;
+            }
+            ch.dirty.clear();
+        }
+        self.root.journal = Some((reader.journal_id, reader.cursor));
+        Ok(ch)
+    }
+
     /// Runs steps until the scan finishes or the cancel flag is set.
     pub fn run(&mut self) -> Result<Summary> {
         let started = Instant::now();
@@ -339,8 +415,13 @@ impl Scan {
         })
     }
 
-    /// Gives the store back (e.g. to inspect it after a run in tests).
+    /// Gives the store back (e.g. to inspect it after a run in tests), with
+    /// its page cache as it was before the scan.
     pub fn into_store(self) -> Store {
+        // Only the cache's size: a failure leaves it larger, never wrong.
+        if let Err(e) = self.store.set_cache_kib(self.normal_cache_kib) {
+            tracing::debug!(error = %e, "scan cache not put back");
+        }
         self.store
     }
 }

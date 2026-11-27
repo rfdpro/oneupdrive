@@ -112,7 +112,7 @@ impl Ops<'_> {
             .c
             .execute("UPDATE initial_choice SET selected=?2 WHERE key=?1 AND selected<>?2", params![key, selected])?;
         if let Some(id) = local_id(key) {
-            let bytes = crate::local::blob(id);
+            let bytes = self.keys.blob(id);
             if folder {
                 changed += self.c.execute(
                     "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION

@@ -309,6 +309,71 @@ fn cancelled_run_stops_and_resumes() {
     assert!(s.run().unwrap().finished);
 }
 
+/// Runs `command` in `dir` with cmd.exe: another program, so the change is
+/// the journal's like any user's.
+fn cmd(dir: &Path, command: &str) {
+    let status = Command::new("cmd").current_dir(dir).args(["/d", "/c", command]).status().unwrap();
+    assert!(status.success(), "{command}");
+}
+
+/// A whole drive can take longer to list than its journal keeps history.
+/// Following the journal between steps keeps the scan's bookmark current,
+/// so the observer can continue from it however long the scan took.
+#[test]
+fn a_scan_that_follows_the_journal_keeps_its_bookmark_current() {
+    let t = Tmp::new("follow");
+    wide_tree(&t);
+    let db_dir = Tmp::new("follow-db");
+    let cfg = Config { batch_dirs: 1, ..Config::new(ExcludeSet::none()) };
+    let mut s = Scan::open(Store::open(&db_dir.path.join("state.db"), 1024).unwrap(), &t.path, cfg).unwrap();
+    let start = s.root().journal.unwrap();
+    assert!(s.step().unwrap(), "the root is listed, its folders queued");
+    // Changes while the scan runs: in the listed root, and in a queued folder.
+    cmd(&t.path, "echo x> new-in-root.txt");
+    cmd(&t.path, r"ren d0\top.txt moved.txt");
+    s.follow_journal(|| true).unwrap();
+    let followed = s.root().journal.unwrap();
+    assert_eq!(followed.0, start.0);
+    assert!(followed.1 > start.1, "the bookmark moved up with the journal");
+    while s.step().unwrap() {}
+    let store = s.into_store();
+    assert_eq!(store.read(|o| o.local_root()).unwrap().unwrap().journal, Some(followed));
+    let found = names(&store);
+    assert!(found.contains("/new-in-root.txt"));
+    assert!(found.contains("/d0/moved.txt") && !found.contains("/d0/top.txt"));
+    let (reference, _) = scan(Store::open_in_memory().unwrap(), &t.path, ExcludeSet::none());
+    assert_eq!(dump(&store), dump(&reference.into_store()));
+    invariants(&store);
+}
+
+#[test]
+fn a_scan_whose_journal_lost_records_starts_over() {
+    let t = Tmp::new("lost");
+    wide_tree(&t);
+    let (reference, _) = scan(Store::open_in_memory().unwrap(), &t.path, ExcludeSet::none());
+    let reference = dump(&reference.into_store());
+    let db_dir = Tmp::new("lost-db");
+    let db = db_dir.path.join("state.db");
+    let cfg = Config { batch_dirs: 1, ..Config::new(ExcludeSet::none()) };
+    let mut s = Scan::open(Store::open(&db, 1024).unwrap(), &t.path, cfg.clone()).unwrap();
+    assert!(s.step().unwrap());
+    assert!(s.step().unwrap());
+    // The journal no longer reaches the bookmark: here a position past its
+    // end, as after the journal was reset.
+    let mut store = s.into_store();
+    store.write(|o| o.local_set_journal_cursor(i64::MAX)).unwrap();
+    let mut s = Scan::open(store, &t.path, cfg).unwrap();
+    assert_eq!(s.start(), Start::Resumed);
+    assert!(matches!(s.follow_journal(|| true), Err(oneup_local::observe::Error::NeedsRescan(_))));
+    let mut s = s.restart().unwrap();
+    assert_eq!(s.start(), Start::Replaced(Replaced::JournalLost));
+    s.follow_journal(|| true).unwrap();
+    assert!(s.run().unwrap().finished);
+    let store = s.into_store();
+    assert_eq!(dump(&store), reference);
+    invariants(&store);
+}
+
 #[test]
 fn automatic_recovery_refuses_another_folder_without_changing_the_scan() {
     let original = Tmp::new("recovery-original");

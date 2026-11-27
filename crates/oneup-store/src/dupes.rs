@@ -17,7 +17,6 @@
 use oneup_sync::Hash;
 use rusqlite::{OptionalExtension as _, params};
 
-use crate::local::{blob, id_from_blob};
 use crate::{COPY_MIN, ITEM_COLS, LocalRow, Ops, RemoteRow, Result, fix_kind};
 
 /// v19 -> v20: hashes of files on this PC that aren't in OneDrive, made on
@@ -220,7 +219,7 @@ impl Ops<'_> {
             .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.local_get(id_from_blob(&id))? {
+            if let Some(row) = self.local_get(self.keys.id(&id))? {
                 out.push(row);
             }
         }
@@ -233,7 +232,7 @@ impl Ops<'_> {
         let v: Option<Vec<u8>> = self
             .c
             .prepare_cached("SELECT qxh FROM local_only_hash WHERE file_id = ?1 AND size = ?2 AND mtime = ?3")?
-            .query_row(params![blob(id), size, mtime], |r| r.get(0))
+            .query_row(params![self.keys.blob(id), size, mtime], |r| r.get(0))
             .optional()?;
         Ok(v.and_then(hash_of))
     }
@@ -242,7 +241,8 @@ impl Ops<'_> {
     /// last-write time. Returns `false`, recording nothing, once
     /// [`LOCAL_ONLY_MAX`] are kept.
     pub fn local_only_hash_put(&self, id: u128, size: i64, mtime: i64, hash: &Hash) -> Result<bool> {
-        let known = self.c.prepare_cached("SELECT 1 FROM local_only_hash WHERE file_id = ?1")?.exists([blob(id)])?;
+        let known =
+            self.c.prepare_cached("SELECT 1 FROM local_only_hash WHERE file_id = ?1")?.exists([self.keys.blob(id)])?;
         if !known && self.local_only_hash_count()? >= LOCAL_ONLY_MAX {
             return Ok(false);
         }
@@ -251,14 +251,14 @@ impl Ops<'_> {
                 "INSERT INTO local_only_hash(file_id, size, mtime, qxh) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(file_id) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, qxh = excluded.qxh",
             )?
-            .execute(params![blob(id), size, mtime, hash.to_vec()])?;
+            .execute(params![self.keys.blob(id), size, mtime, hash.to_vec()])?;
         Ok(true)
     }
 
     /// Forgets the local-only hash of file `id`: its data was written
     /// (the change journal says so), whatever its size and time are now.
     pub fn local_only_hash_forget(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM local_only_hash WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM local_only_hash WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -291,11 +291,11 @@ impl Ops<'_> {
         let ids: Vec<Vec<u8>> = self
             .c
             .prepare_cached(LOCAL_FILES_FROM)?
-            .query_map(params![blob(after), min_size, limit as i64], |r| r.get(0))?
+            .query_map(params![self.keys.blob(after), min_size, limit as i64], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.local_get(id_from_blob(&id))? {
+            if let Some(row) = self.local_get(self.keys.id(&id))? {
                 out.push(row);
             }
         }
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(count(&s), 2);
         // Gone, and another file under the same ID with the same stamp.
         s.write(|o| {
-            o.c.execute("DELETE FROM local_item WHERE file_id = ?1", [blob(11)])?;
+            o.c.execute("DELETE FROM local_item WHERE file_id = ?1", [o.keys.blob(11)])?;
             o.local_put(&local(11, 9 * MIB, 100)).map(|_| ())
         })
         .unwrap();

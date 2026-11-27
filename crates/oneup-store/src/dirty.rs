@@ -270,7 +270,7 @@ impl Ops<'_> {
              ON CONFLICT(side, id) DO NOTHING",
         )?;
         for l in local {
-            let id = crate::local::blob(l.0);
+            let id = self.keys.blob(l.0);
             let parent: Option<Vec<u8>> = self
                 .c
                 .prepare_cached("SELECT parent_id FROM local_item WHERE file_id = ?1")?

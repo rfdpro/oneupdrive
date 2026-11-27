@@ -426,6 +426,10 @@ mod win {
                 let dir = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || oneup_app::search::drives::status(&dir)).await?
             }
+            "drive_index_compact" => {
+                let dir = dir.to_path_buf();
+                tokio::task::spawn_blocking(move || oneup_app::search::drives::compact(&dir)).await?
+            }
             "search_saved" => {
                 let dir = dir.to_path_buf();
                 tokio::task::spawn_blocking(move || Ok(serde_json::to_value(oneup_app::search::saved::list(&dir)?)?))

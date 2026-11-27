@@ -44,7 +44,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavio
 
 pub mod initial;
 pub mod local;
-pub use local::{LOCAL_SCAN_FORMAT, LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip};
+pub use local::{KeyOrder, LOCAL_SCAN_FORMAT, LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip};
 pub mod synced;
 pub use synced::SyncedStats;
 pub mod dirty;
@@ -83,6 +83,9 @@ pub enum Error {
     /// refused before anything is committed.
     #[error("a write ahead of an effect outside a durable transaction")]
     NotDurable,
+    /// [`Store::use_ordered_keys`] on a database that holds file IDs already.
+    #[error("file ID keys can only change in an empty Local tree")]
+    KeysInUse,
 }
 
 impl Error {
@@ -139,8 +142,9 @@ const MIGRATE_V2: &str = "ALTER TABLE remote_orphan ADD COLUMN catch_up INTEGER 
 ///   root file ID, `data-safety.md` invariant 4), the rules it was scanned with,
 ///   and the change-journal position taken *before* the scan started, so a
 ///   later observer can replay everything that changed during the scan.
-/// * `local_item`: one row per entry, keyed by the 128-bit file ID
-///   (little-endian BLOB). Folders whose contents were not listed say why in
+/// * `local_item`: one row per entry, keyed by the 128-bit file ID (a
+///   16-byte BLOB, little-endian in sync databases, MFT order in drive
+///   catalogs: [`KeyOrder`]). Folders whose contents were not listed say why in
 ///   `skip` (excluded, unpopulated placeholder, unreadable).
 /// * `local_scan_queue`: folders still to be listed; a scan resumes from it.
 const MIGRATE_V3: &str = "
@@ -352,6 +356,7 @@ pub struct Stats {
 
 pub struct Store {
     conn: Connection,
+    keys: KeyOrder,
 }
 
 /// Free pages [`Space::worth_compacting`] leaves alone: compacting costs a
@@ -486,6 +491,13 @@ fn table_of<'a>(sql: &'a str, name: &'a str) -> &'a str {
     name
 }
 
+fn space_of(conn: &Connection) -> Result<Space> {
+    let pages =
+        |sql: &str| -> Result<u64> { Ok(u64::try_from(conn.query_row(sql, [], |r| r.get::<_, i64>(0))?).unwrap_or(0)) };
+    let size = pages("PRAGMA page_size")?;
+    Ok(Space { total: pages("PRAGMA page_count")? * size, free: pages("PRAGMA freelist_count")? * size })
+}
+
 /// A read-only connection to the database at `path`, which must exist:
 /// never upgraded, never written.
 fn peek(path: &Path) -> Result<Connection> {
@@ -521,6 +533,13 @@ impl Store {
     /// folder another data folder syncs.
     pub fn peek_meta(path: &Path, key: &str) -> Result<Option<String>> {
         Ok(peek(path)?.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// How the pages of the database at `path` are used ([`Store::space`]),
+    /// read as [`Store::peek_meta`] reads: for showing what compacting
+    /// another program's database would free.
+    pub fn peek_space(path: &Path) -> Result<Space> {
+        space_of(&peek(path)?)
     }
 
     /// Another connection to the same database file, for a reader on
@@ -569,7 +588,52 @@ impl Store {
             "CREATE TEMP TABLE IF NOT EXISTS t_sub (id TEXT PRIMARY KEY) WITHOUT ROWID;
              CREATE TEMP TABLE IF NOT EXISTS t_local_sub (id BLOB PRIMARY KEY) WITHOUT ROWID;",
         )?;
-        Ok(Self { conn })
+        let ordered = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [KEY_ORDER], |r| r.get::<_, String>(0))
+            .optional()?
+            .is_some_and(|v| v == "ordered");
+        Ok(Self { conn, keys: if ordered { KeyOrder::Ordered } else { KeyOrder::Native } })
+    }
+
+    /// How this database writes file IDs.
+    pub fn key_order(&self) -> KeyOrder {
+        self.keys
+    }
+
+    /// Makes this database write file IDs as [`KeyOrder::Ordered`] keys, for
+    /// good. Only an empty Local tree can switch: rows written the other way
+    /// would no longer be found.
+    pub fn use_ordered_keys(&mut self) -> Result<()> {
+        if self.keys == KeyOrder::Ordered {
+            return Ok(());
+        }
+        let rows: i64 = self.conn.query_row(
+            "SELECT (SELECT count(*) FROM local_item) + (SELECT count(*) FROM local_root)",
+            [],
+            |r| r.get(0),
+        )?;
+        if rows != 0 {
+            return Err(Error::KeysInUse);
+        }
+        self.write(|o| o.meta_set(KEY_ORDER, "ordered"))?;
+        self.keys = KeyOrder::Ordered;
+        Ok(())
+    }
+
+    /// Sets this connection's page cache from now on: a scan raises it while
+    /// it fills the tree, then puts it back.
+    pub fn set_cache_kib(&self, cache_kib: u32) -> Result<()> {
+        self.conn.execute_batch(&format!("PRAGMA cache_size = -{cache_kib};"))?;
+        Ok(())
+    }
+
+    /// This connection's page cache, in KiB.
+    pub fn cache_kib(&self) -> Result<u32> {
+        let size: i64 = self.conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
+        let page: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        // Negative: KiB; positive: pages.
+        let kib = if size < 0 { -size } else { size * page / 1024 };
+        Ok(u32::try_from(kib).unwrap_or(u32::MAX))
     }
 
     /// Runs `f` in one transaction; commits only if it returns `Ok`.
@@ -585,7 +649,7 @@ impl Store {
     /// before the commit.
     pub fn write<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let out = f(&Ops { c: &tx })?;
+        let out = f(&Ops { c: &tx, keys: self.keys })?;
         commit(tx)?;
         Ok(out)
     }
@@ -597,7 +661,7 @@ impl Store {
         f: impl FnOnce(&Ops<'_>) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(Error::from)?;
-        let out = f(&Ops { c: &tx })?;
+        let out = f(&Ops { c: &tx, keys: self.keys })?;
         commit(tx)?;
         Ok(out)
     }
@@ -640,10 +704,10 @@ impl Store {
             }
             (Ok(_), Err(e)) => return Ok(Err(Error::from(e).into())),
         };
-        if durable && let Err(e) = (Ops { c: &tx }).count_durable() {
+        if durable && let Err(e) = (Ops { c: &tx, keys: self.keys }).count_durable() {
             return Ok(Err(e.into()));
         }
-        let out = match f(&Ops { c: &tx }) {
+        let out = match f(&Ops { c: &tx, keys: self.keys }) {
             Ok(out) => out,
             Err(e) => return Ok(Err(e)),
         };
@@ -705,11 +769,7 @@ impl Store {
 
     /// How the file's pages are used.
     pub fn space(&self) -> Result<Space> {
-        let pages = |sql: &str| -> Result<u64> {
-            Ok(u64::try_from(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))?).unwrap_or(0))
-        };
-        let size = pages("PRAGMA page_size")?;
-        Ok(Space { total: pages("PRAGMA page_count")? * size, free: pages("PRAGMA freelist_count")? * size })
+        space_of(&self.conn)
     }
 
     /// Rewrites the database without its free pages, and returns the file's
@@ -745,14 +805,14 @@ impl Store {
     /// of the database, whatever other connections write meanwhile.
     pub fn snapshot<T>(&mut self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-        let out = f(&Ops { c: &tx })?;
+        let out = f(&Ops { c: &tx, keys: self.keys })?;
         tx.rollback()?;
         Ok(out)
     }
 
     /// Read-only access outside an explicit transaction.
     pub fn read<T>(&self, f: impl FnOnce(&Ops<'_>) -> Result<T>) -> Result<T> {
-        f(&Ops { c: &self.conn })
+        f(&Ops { c: &self.conn, keys: self.keys })
     }
 }
 
@@ -760,7 +820,7 @@ impl Store {
 /// the Remote tree always reach the name index ([`search`]) before the
 /// commit, whichever way the transaction was opened.
 fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
-    Ops { c: &tx }.search_apply()?;
+    Ops { c: &tx, keys: KeyOrder::Native }.search_apply()?;
     tx.commit()?;
     Ok(())
 }
@@ -902,7 +962,7 @@ fn settle_v23(tx: &Connection) -> Result<()> {
         tx.execute_batch(&missing(&sql))?;
     }
     if earlier || objects(tx)? != before {
-        Ops { c: tx }.history_stop()?;
+        Ops { c: tx, keys: KeyOrder::Native }.history_stop()?;
     }
     Ok(())
 }
@@ -910,7 +970,12 @@ fn settle_v23(tx: &Connection) -> Result<()> {
 /// Operations on an open connection or transaction.
 pub struct Ops<'a> {
     c: &'a Connection,
+    /// How this database writes file IDs.
+    keys: KeyOrder,
 }
+
+/// In `meta`: `ordered` once the database writes [`KeyOrder::Ordered`] keys.
+const KEY_ORDER: &str = "store.key_order";
 
 /// In `meta`: the number of durable commits ([`Store::write_durable`]).
 const DURABLE_COMMITS: &str = "store.durable_commits";
