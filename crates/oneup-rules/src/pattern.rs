@@ -90,6 +90,19 @@ impl Rule {
         }
     }
 
+    /// For every prefix of a path at once, whether the rule matches it as a
+    /// folder: entry `i` is [`Rule::matches`] of the first `i + 1` parts,
+    /// given folded (`crate::glob::folded`), with `is_dir`. One
+    /// pass over the path, where asking each prefix in turn costs the
+    /// path's depth squared: a rule set's verdict on an item asks every
+    /// folder above it too.
+    pub(crate) fn prefix_matches(&self, folded: &[Vec<char>]) -> Vec<bool> {
+        match &self.shape {
+            Shape::Name(g) => folded.iter().map(|f| g.matches_folded(f)).collect(),
+            Shape::Anchored(segs) => anchored_prefixes(segs, folded),
+        }
+    }
+
     /// The folder name this rule excludes wherever it appears, if that can
     /// be told from the name alone (an unanchored, non-negated folder rule):
     /// what enumeration may skip without listing.
@@ -191,6 +204,47 @@ fn anchored_table(segs: &[Seg], path: &[&str]) -> bool {
         };
     }
     next[0]
+}
+
+/// [`anchored`] of every prefix of a path (its parts `folded`), in one pass. `at[k]`: the first
+/// `k` segments have matched the parts read so far. A `**` may match no
+/// part (move on without reading one), except at the end, where it needs
+/// at least one; reading a part keeps a `**` where it is.
+fn anchored_prefixes(segs: &[Seg], folded: &[Vec<char>]) -> Vec<bool> {
+    let last = segs.len();
+    let close = |at: &mut Vec<bool>| {
+        for k in 0..last.saturating_sub(1) {
+            if at[k] && matches!(segs[k], Seg::Deep) {
+                at[k + 1] = true;
+            }
+        }
+    };
+    let mut at = vec![false; last + 1];
+    at[0] = true;
+    close(&mut at);
+    let mut out = Vec::with_capacity(folded.len());
+    for part in folded {
+        let mut next = vec![false; last + 1];
+        for k in (0..last).filter(|&k| at[k]) {
+            match &segs[k] {
+                Seg::Deep => {
+                    next[k] = true;
+                    if k + 1 == last {
+                        next[last] = true;
+                    }
+                }
+                Seg::Name(g) => {
+                    if g.matches_folded(part) {
+                        next[k + 1] = true;
+                    }
+                }
+            }
+        }
+        close(&mut next);
+        out.push(next[last]);
+        at = next;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -301,6 +355,46 @@ mod tests {
                 rule.iter().map(|s| if *s == "**" { Seg::Deep } else { Seg::Name(NameGlob::new(s)) }).collect();
             for path in &paths {
                 assert_eq!(anchored_table(&segs, path), anchored_one_deep(&segs, path), "{rule:?} vs {path:?}");
+            }
+        }
+    }
+
+    /// One pass over a path answers for each of its prefixes what matching
+    /// that prefix alone answers, for every rule and path built from a few
+    /// parts (names, wildcards and `**`, folders only or not).
+    #[test]
+    fn prefix_matches_agree_with_matching_each_prefix() {
+        let parts = ["**", "a", "B", "*", "a*"];
+        let mut bodies = vec![Vec::new()];
+        for _ in 0..4 {
+            let longer: Vec<Vec<&str>> = bodies
+                .iter()
+                .flat_map(|r: &Vec<&str>| parts.iter().map(move |p| [r.clone(), vec![*p]].concat()))
+                .collect();
+            bodies.extend(longer);
+        }
+        bodies.sort();
+        bodies.dedup();
+        let mut paths = vec![Vec::new()];
+        for _ in 0..4 {
+            let longer: Vec<Vec<&str>> = paths
+                .iter()
+                .flat_map(|p: &Vec<&str>| ["a", "b", "ab"].map(|x| [p.clone(), vec![x]].concat()))
+                .collect();
+            paths.extend(longer);
+        }
+        paths.retain(|p| !p.is_empty());
+        for body in bodies.iter().filter(|b| !b.is_empty()) {
+            let joined = body.join("/");
+            for line in [joined.clone(), format!("{joined}/"), format!("/{joined}"), format!("!{joined}")] {
+                let Some(rule) = Rule::parse(&line) else { continue };
+                for path in &paths {
+                    let folded: Vec<Vec<char>> = path.iter().map(|s| crate::glob::folded(s)).collect();
+                    let all = rule.prefix_matches(&folded);
+                    for (i, hit) in all.iter().enumerate() {
+                        assert_eq!(*hit, rule.matches(&path[..=i], true), "{line:?} vs {:?}", &path[..=i]);
+                    }
+                }
             }
         }
     }
