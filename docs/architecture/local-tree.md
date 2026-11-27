@@ -38,7 +38,7 @@ Two sync engines on one folder fight and can destroy data. The scan checks wheth
 | Table | Contents |
 |---|---|
 | `local_root` | The one scanned folder: path, identity, rules fingerprint, journal bookmark, start/finish times, other sync engine |
-| `local_item` | One row per entry, keyed by the 128-bit file ID (16-byte little-endian BLOB); `parent_id`, `name`, `name_lossy`, `kind`, `size`, `mtime` (FILETIME), `attributes`, `reparse_tag`, `skip` |
+| `local_item` | One row per entry, keyed by the 128-bit file ID (16-byte BLOB: little-endian in sync databases; in the drive catalogs big-endian with an NTFS reference's record number ahead of its sequence number, so keys sort as the MFT does, `KeyOrder`); `parent_id`, `name`, `name_lossy`, `kind`, `size`, `mtime` (FILETIME), `attributes`, `reparse_tag`, `skip` |
 | `local_scan_queue` | Folders still to be listed, with their depth |
 
 A new scan **replaces** the stored one when the folder's identity or the exclusion rules differ, or when the stored scan is complete. An unfinished scan of the same folder with the same rules is resumed. `oneup mirror --rebuild` clears only the Remote tree, so a scan survives it.
@@ -78,7 +78,7 @@ File Explorer deletes by moving into the Recycle Bin, which the journal records 
 Measured on `C:\Windows` (~367k entries, 155k folders): **18 s warm, peak memory 42 MiB** (28 MiB with `--memory-profile minimal`). On a real OneDrive folder (299k files, 57k folders, `dev` exclusions): **17 s, 35 MiB**. The database is the first bottleneck: per-commit WAL work and checkpoints made 256-folder steps 6.5× slower than 4,096-folder steps, so steps are large.
 
 ## Limits
-* A scan of a live folder is not an atomic snapshot. The journal bookmark makes that recoverable: what changed during and after the scan is replayed.
+* A scan of a live folder is not an atomic snapshot. The journal bookmark makes that recoverable: what changed during and after the scan is replayed. A scan that can outlast the journal's history (a whole drive, for the search catalogs) applies the journal between steps instead, to folders it has listed only, and starts over at once if the journal loses records ([search.md § Local volume catalog](search.md#local-volume-catalog)).
 * Whether the *root* folder itself is unpopulated is judged from its handle's attributes, which may not carry the recall flags that listings do. In practice providers keep their root folders populated.
 * Listing is single-threaded. Parallel listing could roughly halve warm scan time, at a CPU cost; not needed at the target scale.
 * Only local NTFS/ReFS volumes (file IDs, open-by-ID) are supported.

@@ -31,8 +31,7 @@
 use oneup_sync::{Base, Hash, LocalId, LocalNode, NodeKind, ROOT, RemoteId, RemoteNode, Seen, Sid, Trees};
 use rusqlite::{OptionalExtension, Row, params};
 
-use crate::local::{blob, id_from_blob};
-use crate::{Error, Ops, Result};
+use crate::{Error, KeyOrder, Ops, Result};
 
 /// v3 -> v4: the Synced tree and its evidence (see the module docs).
 ///
@@ -195,7 +194,7 @@ pub(crate) fn sid_in(s: Sid) -> i64 {
     s as i64
 }
 
-fn base_from_row(r: &Row<'_>) -> rusqlite::Result<(i64, Base)> {
+fn base_from_row(keys: KeyOrder, r: &Row<'_>) -> rusqlite::Result<(i64, Base)> {
     let local: Option<Vec<u8>> = r.get("local_id")?;
     Ok((
         r.get("kind")?,
@@ -206,7 +205,7 @@ fn base_from_row(r: &Row<'_>) -> rusqlite::Result<(i64, Base)> {
             kind: NodeKind::File, // replaced by `fix_base` after validation
             size: r.get("size")?,
             hash: hash_of(r.get("qxh")?),
-            local: local.as_deref().map(|b| LocalId(id_from_blob(b))),
+            local: local.as_deref().map(|b| LocalId(keys.id(b))),
             local_mtime: r.get("local_mtime")?,
             remote: r.get::<_, Option<String>>("remote_id")?.map(RemoteId),
             remote_etag: r.get("remote_etag")?,
@@ -237,15 +236,15 @@ const STAND_IN: &str = "(i.kind = 0 AND (i.name LIKE '%.url' OR i.name LIKE '%.l
        WHERE s.local_id = i.parent_id AND r.kind = 3
          AND oneup_fold(r.name) = oneup_fold(substr(i.name, 1, length(i.name) - 4))))";
 
-fn local_node(r: &Row<'_>) -> rusqlite::Result<LocalNode> {
+fn local_node(keys: KeyOrder, r: &Row<'_>) -> rusqlite::Result<LocalNode> {
     let id: Vec<u8> = r.get(0)?;
     let parent: Option<Vec<u8>> = r.get(1)?;
     let file = r.get::<_, i64>(3)? == 0;
     // Folder sizes and times carry no meaning for sync (a folder's mtime
     // changes whenever a child does), so they're zeroed rather than compared.
     Ok(LocalNode {
-        id: LocalId(id_from_blob(&id)),
-        parent: parent.as_deref().map(|p| LocalId(id_from_blob(p))),
+        id: LocalId(keys.id(&id)),
+        parent: parent.as_deref().map(|p| LocalId(keys.id(p))),
         name: r.get(2)?,
         kind: if file { NodeKind::File } else { NodeKind::Folder },
         size: if file { r.get(4)? } else { 0 },
@@ -322,7 +321,7 @@ impl Ops<'_> {
         let row = self
             .c
             .prepare_cached(&format!("SELECT {BASE_COLS} FROM synced_item WHERE sid = ?1"))?
-            .query_row([sid_in(sid)], base_from_row)
+            .query_row([sid_in(sid)], |r| base_from_row(self.keys, r))
             .optional()?;
         row.map(fix_base).transpose()
     }
@@ -330,7 +329,7 @@ impl Ops<'_> {
     /// Rows whose agreed parent is `sid` (unordered).
     pub fn synced_children(&self, sid: Sid) -> Result<Vec<Base>> {
         let mut st = self.c.prepare_cached(&base_children_sql())?;
-        let rows = st.query_map([sid_in(sid)], base_from_row)?;
+        let rows = st.query_map([sid_in(sid)], |r| base_from_row(self.keys, r))?;
         rows.map(|r| fix_base(r?)).collect()
     }
 
@@ -352,7 +351,7 @@ impl Ops<'_> {
                AND (l.reparse_tag & 4294905855) != 2415919130
              ORDER BY s.sid LIMIT ?2"
         ))?;
-        let rows = st.query_map(rusqlite::params![sid_in(after), limit as i64], base_from_row)?;
+        let rows = st.query_map(rusqlite::params![sid_in(after), limit as i64], |r| base_from_row(self.keys, r))?;
         rows.map(|r| fix_base(r?)).collect()
     }
 
@@ -360,7 +359,7 @@ impl Ops<'_> {
         let row = self
             .c
             .prepare_cached(&format!("SELECT {BASE_COLS} FROM synced_item WHERE local_id = ?1"))?
-            .query_row([blob(id)], base_from_row)
+            .query_row([self.keys.blob(id)], |r| base_from_row(self.keys, r))
             .optional()?;
         row.map(fix_base).transpose()
     }
@@ -370,7 +369,8 @@ impl Ops<'_> {
     /// link indexes.
     pub fn local_children_links(&self, parent: u128) -> Result<Vec<(u128, Option<String>)>> {
         let mut st = self.c.prepare_cached(LOCAL_CHILDREN_LINKS)?;
-        let rows = st.query_map([blob(parent)], |r| Ok((id_from_blob(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
+        let rows =
+            st.query_map([self.keys.blob(parent)], |r| Ok((self.keys.id(&r.get::<_, Vec<u8>>(0)?), r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
@@ -386,7 +386,7 @@ impl Ops<'_> {
         let row = self
             .c
             .prepare_cached(&format!("SELECT {BASE_COLS} FROM synced_item WHERE remote_id = ?1"))?
-            .query_row([id], base_from_row)
+            .query_row([id], |r| base_from_row(self.keys, r))
             .optional()?;
         row.map(fix_base).transpose()
     }
@@ -417,7 +417,7 @@ impl Ops<'_> {
                 kind_code(b.kind),
                 b.size,
                 b.hash.map(|h| h.to_vec()),
-                b.local.map(|l| blob(l.0)),
+                b.local.map(|l| self.keys.blob(l.0)),
                 b.local_mtime,
                 b.remote.as_ref().map(|r| r.0.as_str()),
                 b.remote_etag,
@@ -476,7 +476,7 @@ impl Ops<'_> {
     /// longer does: nothing else can ask about them (invariant 3).
     fn drop_evidence(&self, old: &Base, new: Option<&Base>) -> Result<()> {
         if let Some(l) = old.local.filter(|l| new.is_none_or(|n| n.local != Some(*l))) {
-            self.c.prepare_cached("DELETE FROM local_gone WHERE file_id = ?1")?.execute([blob(l.0)])?;
+            self.c.prepare_cached("DELETE FROM local_gone WHERE file_id = ?1")?.execute([self.keys.blob(l.0)])?;
         }
         if let Some(r) = old.remote.as_ref().filter(|r| new.is_none_or(|n| n.remote.as_ref() != Some(*r))) {
             self.c.prepare_cached("DELETE FROM remote_gone WHERE id = ?1")?.execute([r.0.as_str()])?;
@@ -494,7 +494,7 @@ impl Ops<'_> {
                 "INSERT OR IGNORE INTO local_gone(file_id)
                  SELECT local_id FROM synced_item WHERE local_id = ?1",
             )?
-            .execute([blob(id)])?
+            .execute([self.keys.blob(id)])?
             > 0;
         // A POSIX deletion can first move the item outside the tree. Its
         // later delete record changes no Local row, but must re-plan the
@@ -511,7 +511,7 @@ impl Ops<'_> {
     /// evidence") and withdraws it when the effect didn't happen and the
     /// item is still there.
     pub fn unnote_local_deleted(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM local_gone WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM local_gone WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -602,7 +602,7 @@ impl Ops<'_> {
                 "INSERT INTO local_hash(file_id, size, mtime, qxh) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(file_id) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, qxh = excluded.qxh",
             )?
-            .execute(params![blob(id), size, mtime, hash.to_vec()])?;
+            .execute(params![self.keys.blob(id), size, mtime, hash.to_vec()])?;
         Ok(())
     }
 
@@ -612,7 +612,7 @@ impl Ops<'_> {
         let v: Option<Vec<u8>> = self
             .c
             .prepare_cached("SELECT qxh FROM local_hash WHERE file_id = ?1 AND size = ?2 AND mtime = ?3")?
-            .query_row(params![blob(id), size, mtime], |r| r.get(0))
+            .query_row(params![self.keys.blob(id), size, mtime], |r| r.get(0))
             .optional()?;
         Ok(v.and_then(|b| b.try_into().ok()))
     }
@@ -625,7 +625,7 @@ impl Ops<'_> {
                 "INSERT INTO content_mac(file_id, size, mtime, mac) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(file_id) DO UPDATE SET size = excluded.size, mtime = excluded.mtime, mac = excluded.mac",
             )?
-            .execute(params![blob(id), size, mtime, mac.to_vec()])?;
+            .execute(params![self.keys.blob(id), size, mtime, mac.to_vec()])?;
         Ok(())
     }
 
@@ -635,7 +635,7 @@ impl Ops<'_> {
         let v: Option<Vec<u8>> = self
             .c
             .prepare_cached("SELECT mac FROM content_mac WHERE file_id = ?1 AND size = ?2 AND mtime = ?3")?
-            .query_row(params![blob(id), size, mtime], |r| r.get(0))
+            .query_row(params![self.keys.blob(id), size, mtime], |r| r.get(0))
             .optional()?;
         Ok(v.and_then(|b| b.try_into().ok()))
     }
@@ -738,11 +738,13 @@ impl Trees for Ops<'_> {
     fn base_named(&self, parent: Sid, name: &str) -> Result<Vec<Base>> {
         let mut out = Vec::new();
         let mut st = self.c.prepare_cached(&named_sql())?;
-        for r in st.query_map(rusqlite::params![sid_in(parent), name], base_from_row)? {
+        for r in st.query_map(rusqlite::params![sid_in(parent), name], |r| base_from_row(self.keys, r))? {
             out.push(fix_base(r?)?);
         }
         let mut st = self.c.prepare_cached(&folded_sql())?;
-        for r in st.query_map(rusqlite::params![sid_in(parent), oneup_sync::fold(name)], base_from_row)? {
+        for r in
+            st.query_map(rusqlite::params![sid_in(parent), oneup_sync::fold(name)], |r| base_from_row(self.keys, r))?
+        {
             let b = fix_base(r?)?;
             if !out.iter().any(|x: &Base| x.sid == b.sid) {
                 out.push(b);
@@ -764,16 +766,17 @@ impl Trees for Ops<'_> {
         let node = self
             .c
             .prepare_cached(&format!("{LOCAL_NODE} WHERE i.file_id = ?1 AND i.kind IN (0, 1, 2) AND {LOCAL_SYNCABLE}"))?
-            .query_row([blob(id.0)], local_node)
+            .query_row([self.keys.blob(id.0)], |r| local_node(self.keys, r))
             .optional()?;
         if let Some(n) = node {
             return Ok(Seen::Present(n));
         }
         // Stored but filtered out (a link, an excluded folder...): there,
         // but not syncable, so Missing. Only an absent item can be Deleted.
-        let stored = self.c.prepare_cached("SELECT 1 FROM local_item WHERE file_id = ?1")?.exists([blob(id.0)])?;
-        let gone =
-            !stored && self.c.prepare_cached("SELECT 1 FROM local_gone WHERE file_id = ?1")?.exists([blob(id.0)])?;
+        let stored =
+            self.c.prepare_cached("SELECT 1 FROM local_item WHERE file_id = ?1")?.exists([self.keys.blob(id.0)])?;
+        let gone = !stored
+            && self.c.prepare_cached("SELECT 1 FROM local_gone WHERE file_id = ?1")?.exists([self.keys.blob(id.0)])?;
         Ok(if gone { Seen::Deleted } else { Seen::Missing })
     }
 
@@ -794,7 +797,7 @@ impl Trees for Ops<'_> {
 
     fn local_children(&self, id: LocalId) -> Result<Vec<LocalNode>> {
         let mut st = self.c.prepare_cached(&local_children_sql())?;
-        let v = st.query_map([blob(id.0)], local_node)?.collect::<rusqlite::Result<_>>()?;
+        let v = st.query_map([self.keys.blob(id.0)], |r| local_node(self.keys, r))?.collect::<rusqlite::Result<_>>()?;
         Ok(v)
     }
 
@@ -811,7 +814,7 @@ impl Trees for Ops<'_> {
         let mut st = self.c.prepare_cached(&base_children_sql())?;
         let mut rows = st.query([sid_in(sid)])?;
         while let Some(r) = rows.next()? {
-            if f(&fix_base(base_from_row(r)?)?)? {
+            if f(&fix_base(base_from_row(self.keys, r)?)?)? {
                 return Ok(true);
             }
         }
@@ -820,9 +823,9 @@ impl Trees for Ops<'_> {
 
     fn any_local_child(&self, id: LocalId, f: &mut dyn FnMut(&LocalNode) -> Result<bool>) -> Result<bool> {
         let mut st = self.c.prepare_cached(&local_children_sql())?;
-        let mut rows = st.query([blob(id.0)])?;
+        let mut rows = st.query([self.keys.blob(id.0)])?;
         while let Some(r) = rows.next()? {
-            if f(&local_node(r)?)? {
+            if f(&local_node(self.keys, r)?)? {
                 return Ok(true);
             }
         }
@@ -1091,7 +1094,7 @@ pub(crate) mod tests {
         s.write(|o| {
             let deep = o.synced_insert(&base(0, Some(2), "node_modules", NodeKind::Folder, 4, "nm"))?;
             o.synced_insert(&base(0, Some(deep), "dep.js", NodeKind::File, 5, "dep"))?;
-            o.c.execute("INSERT INTO local_gone(file_id) VALUES (?1)", [blob(5)])?;
+            o.c.execute("INSERT INTO local_gone(file_id) VALUES (?1)", [o.keys.blob(5)])?;
             assert!(o.synced_remove(2)?);
             assert_eq!(o.synced_children(ROOT)?.len(), 1, "only f is left");
             assert!(o.synced_by_local(5)?.is_none() && o.synced_by_remote("nm")?.is_none());
@@ -1170,7 +1173,7 @@ pub(crate) mod tests {
         synced(&mut s);
         s.write(|o| {
             // The file is gone on both sides with evidence; "x" was never synced.
-            o.c.execute("DELETE FROM local_item WHERE file_id = ?1", [blob(2)])?;
+            o.c.execute("DELETE FROM local_item WHERE file_id = ?1", [o.keys.blob(2)])?;
             o.c.execute("DELETE FROM remote_item WHERE id = 'f'", [])?;
             assert!(o.note_local_deleted(2)?);
             assert!(o.note_remote_deleted("f")?);

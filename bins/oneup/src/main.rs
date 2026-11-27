@@ -341,6 +341,9 @@ enum Cmd {
         /// Pause or resume drive and network share indexing
         #[arg(long, value_enum)]
         pause_index: Option<Toggle>,
+        /// Compact the local drive indexes (rewrites them without free space)
+        #[arg(long)]
+        compact_index: bool,
     },
     #[command(hide = true)]
     DriveIndexWorker,
@@ -2219,13 +2222,14 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Cmd::Find(args) => find::run(&data_dir(&cli)?, cli.client_id.as_deref(), args).await,
-        Cmd::Search { onedrive, hotkey, local_drives, network_shares, pause_index } => find::settings(
+        Cmd::Search { onedrive, hotkey, local_drives, network_shares, pause_index, compact_index } => find::settings(
             &data_dir(&cli)?,
             onedrive.map(Toggle::on),
             hotkey.as_deref(),
             local_drives.map(Toggle::on),
             network_shares.map(Toggle::on),
             pause_index.map(Toggle::on),
+            *compact_index,
         ),
         Cmd::DriveIndexWorker => oneup_app::search::drives::worker(&data_dir(&cli)?),
         Cmd::Duplicates { cmd, json, count, after, hash_local, max_files } => {
@@ -3427,6 +3431,7 @@ async fn scan(cli: &Cli, args: &ScanArgs) -> Result<()> {
                 Replaced::ManagerChanged => {
                     "another sync app started or stopped managing the folder since; starting over"
                 }
+                Replaced::JournalLost => "the drive's change journal lost changes during the scan; starting over",
             };
             println!("Scanning {} (read-only; {why})…", scan.root().path);
         }

@@ -13,7 +13,6 @@
 //!   up from the rule files (`local_rule_file`) by the primary key, as far
 //!   as the listed folder, never down through the folders' contents.
 
-use crate::local::{blob, id_from_blob};
 use crate::{ITEM_COLS, Ops, RemoteRow, Result, fix_kind};
 
 pub(crate) const MIGRATE_V19: &str = "
@@ -115,9 +114,9 @@ impl Ops<'_> {
         let ids: Vec<Vec<u8>> = self
             .c
             .prepare_cached(CHILDREN_WITH_RULE_FILES)?
-            .query_map([blob(parent)], |r| r.get(0))?
+            .query_map([self.keys.blob(parent)], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(ids.iter().map(|b| id_from_blob(b)).collect())
+        Ok(ids.iter().map(|b| self.keys.id(b)).collect())
     }
 
     /// Everything inside the local folder `folder`, at any depth. One pass
@@ -135,7 +134,7 @@ impl Ops<'_> {
                     COALESCE(SUM(CASE WHEN f.kind = 0 AND (f.attributes & 4194304) != 0 THEN f.size END), 0),
                     COALESCE(SUM(f.kind = 1 AND f.skip != 0), 0)
              FROM t JOIN local_item f ON f.parent_id = t.id",
-            [blob(folder)],
+            [self.keys.blob(folder)],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);

@@ -175,6 +175,7 @@ pub fn settings(
     local_drives: Option<bool>,
     network_shares: Option<bool>,
     pause_index: Option<bool>,
+    compact_index: bool,
 ) -> Result<()> {
     let mut s = oneup_app::config::load_search(dir)?;
     let before = s.clone();
@@ -205,6 +206,12 @@ pub fn settings(
     if local_drives.is_some() || network_shares.is_some() || pause_index.is_some() {
         search::drives::wake(dir)?;
     }
+    if compact_index {
+        let status = search::drives::compact(dir)?;
+        if status["compacting"] == true {
+            println!("{}", t!("Compacting the drive indexes after the current update."));
+        }
+    }
     println!(
         "{}",
         if !s.local_drives {
@@ -233,6 +240,17 @@ pub fn settings(
                 drive["drive"].as_str().unwrap_or_default(),
                 oneup_app::l10n::message(drive["status"].as_str().unwrap_or_default(), &[])
             );
+        }
+        let bytes = status["index_bytes"].as_u64().unwrap_or(0);
+        let free = status["free_bytes"].as_u64().unwrap_or(0);
+        if bytes > 0 && free > 0 {
+            let (size, frees) = (oneup_app::versions::size(bytes), oneup_app::versions::size(free));
+            println!(
+                "  {}",
+                t!("Index size: {size} (--compact-index frees at least {frees})", size = size, frees = frees)
+            );
+        } else if bytes > 0 {
+            println!("  {}", t!("Index size: {size}", size = oneup_app::versions::size(bytes)));
         }
     }
     println!(

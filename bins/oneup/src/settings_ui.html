@@ -4001,6 +4001,9 @@
                     <div class="label"><b>Pause indexing</b><small id="fd-index-status" role="status"></small></div>
                     <button class="btn" id="fd-index-refresh">Refresh</button>
                     <label class="toggle"><input type="checkbox" id="fd-index-paused" aria-label="Pause indexing"><span></span></label></div>
+                <div class="row" id="fd-index-space" hidden>
+                    <div class="label"><b>Index size</b><small id="fd-index-size" role="status"></small></div>
+                    <button class="btn" id="fd-index-compact">Compact</button></div>
                 <div class="row">
                     <div class="label"><b>Search inside files with OneDrive</b><small>Sends the search text to Microsoft when you press Search</small></div>
                     <label class="toggle"><input type="checkbox" id="fd-onedrive" aria-label="Search inside files with OneDrive"><span></span></label></div>
@@ -11921,8 +11924,21 @@
             $(sel).onchange = () => queueFind();
         }
         $("#fd-go").onclick = () => queueFind(true);
+        function showIndexSpace(state) {
+            $("#fd-index-space").hidden = !state.index_bytes;
+            $("#fd-index-size").textContent = state.compacting ? tr("Compacting…") : [
+                size(state.index_bytes),
+                state.free_bytes ? tr("Compact frees at least {size}", { size: size(state.free_bytes) }) : ""
+            ].filter(Boolean).join(" · ");
+            $("#fd-index-compact").disabled = !!state.compacting;
+        }
+        $("#fd-index-compact").onclick = () => {
+            showIndexSpace({ index_bytes: 1, compacting: true });
+            run(call("drive_index_compact")).then(showIndexSpace).then(() => refreshDriveIndex()).catch(() => refreshDriveIndex());
+        };
         async function refreshDriveIndex() {
             const state = await call("drive_index_status");
+            showIndexSpace(state);
             $("#fd-index-status").textContent = state.paused ? tr("Indexing paused") :
                 state.drives?.map(d => [d.drive, tr(d.status)].filter(Boolean).join(" ")).join(" · ") || tr("Indexing…");
         }

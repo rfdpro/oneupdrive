@@ -2,7 +2,6 @@
 
 use rusqlite::{Row, params};
 
-use crate::local::{blob, id_from_blob};
 use crate::{Ops, Result};
 
 /// The names and sizes the map can display, with the total including smaller items.
@@ -46,8 +45,8 @@ impl Ops<'_> {
              SELECT id, name, kind, bytes, kind = 1, SUM(bytes) OVER ()
              FROM weights WHERE bytes > 0 ORDER BY bytes DESC, id LIMIT ?2",
         )?;
-        let mut rows = query.query(params![blob(parent), limit as i64, RECALL])?;
-        to_level(&mut rows, |row| Ok(id_from_blob(&row.get::<_, Vec<u8>>(0)?)))
+        let mut rows = query.query(params![self.keys.blob(parent), limit as i64, RECALL])?;
+        to_level(&mut rows, |row| Ok(self.keys.id(&row.get::<_, Vec<u8>>(0)?)))
     }
 
     /// OneDrive stores a folder's reported size on its row. Use it directly,

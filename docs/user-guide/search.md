@@ -38,7 +38,11 @@ Turn on **Index local drives** in **Set Up** or **General → Search**. When a d
 
 The local index covers accessible folders on fixed NTFS and ReFS drives that have a Windows change journal. These scopes support **Contains text**, **All words**, and the file and folder filter. Name queries stay on this PC. The index stores file names and metadata, and skips configured vault folders, disallowed locations, and files inside unpopulated cloud folders.
 
-In **General → Search**, select **Refresh** to see which drive indexes are ready. A drive needs its change journal to appear in results. If Windows resets the journal or discards the changes the index still needs, the drive returns to results after a fresh scan. **Pause indexing** leaves local catalogs searchable while their journals are available. Turning off **Index local drives** hides **This PC** and keeps the catalogs for later use.
+The index follows your exclusions (**Rules**, or `[rules]` in `config.toml`) on every drive: the presets you turned on, such as `dev` for `node_modules` and `.git`, and your own rules that name things anywhere, such as `*.iso` or `build/`. A rule for a place inside your synced folder, such as `/Documents/drafts/`, applies to the synced folder only. When you change your exclusions, the index updates in place, without scanning the drive again.
+
+Next to the drive status, **Index size** shows how much disk space the indexes take and how much **Compact** frees at least. A drive's index is compacted once by itself after its first scan. An update that changes how the index is stored scans your drives again by itself; until a drive's scan ends, it shows **Indexing…** and isn't in **This PC** results.
+
+In **General → Search**, select **Refresh** to see which drive indexes are ready. A drive shows **Indexing…** while it's scanned; the first scan of a large drive can take hours. A drive needs its change journal to appear in results. If a drive shows **Index unavailable**, `drive-index.log` in the data folder (`%LOCALAPPDATA%\OneUpDrive`) says why. If Windows resets the journal or discards the changes the index still needs, the drive returns to results after a fresh scan. **Pause indexing** leaves local catalogs searchable while their journals are available. Turning off **Index local drives** hides **This PC** and keeps the catalogs for later use.
 
 ### Search network shares
 
@@ -104,5 +108,7 @@ oneup search --hotkey off
 oneup search --local-drives on
 oneup search --network-shares on
 oneup search --pause-index on
+oneup search --compact-index
 ```
+`--compact-index` compacts the local drive indexes. With indexing running, they're compacted once the update under way ends.
 `oneup search` shows or changes the search settings: whether the settings window also asks OneDrive to search inside files, and the hotkey. They're saved in the `[search]` section of `config.toml` in the data folder.

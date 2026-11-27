@@ -14,7 +14,6 @@
 
 use rusqlite::{OptionalExtension as _, params};
 
-use crate::local::{blob, id_from_blob};
 use crate::{ITEM_COLS, LocalRow, Ops, RemoteRow, Result, fix_kind};
 
 pub(crate) const MIGRATE_V10: &str = "
@@ -204,7 +203,7 @@ impl Ops<'_> {
                 "INSERT INTO local_used (file_id, at_ms) VALUES (?1, ?2)
                  ON CONFLICT (file_id) DO UPDATE SET at_ms = max(at_ms, ?2)",
             )?
-            .execute(params![blob(file_id).as_slice(), at_ms])?;
+            .execute(params![self.keys.blob(file_id).as_slice(), at_ms])?;
         Ok(())
     }
 
@@ -213,7 +212,7 @@ impl Ops<'_> {
         Ok(self
             .c
             .prepare_cached("SELECT at_ms FROM local_used WHERE file_id = ?1")?
-            .query_row([blob(file_id).as_slice()], |r| r.get(0))
+            .query_row([self.keys.blob(file_id).as_slice()], |r| r.get(0))
             .optional()?)
     }
 
@@ -236,7 +235,7 @@ impl Ops<'_> {
     /// files have nothing to free (and freeing one is always refused: it
     /// looks freed already), so they're left out.
     pub fn local_by_age(&self, before_mtime: i64, after: Option<(i64, u128)>, limit: usize) -> Result<Vec<LocalRow>> {
-        let (am, aid) = after.map_or((i64::MIN, Vec::new()), |(m, id)| (m, blob(id).to_vec()));
+        let (am, aid) = after.map_or((i64::MIN, Vec::new()), |(m, id)| (m, self.keys.blob(id).to_vec()));
         let ids: Vec<Vec<u8>> = self
             .c
             .prepare_cached(&format!(
@@ -248,7 +247,7 @@ impl Ops<'_> {
             .collect::<rusqlite::Result<_>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.local_get(id_from_blob(&id))? {
+            if let Some(row) = self.local_get(self.keys.id(&id))? {
                 out.push(row);
             }
         }

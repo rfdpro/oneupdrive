@@ -4,7 +4,6 @@
 //! observer, executor), as for the dirty marks (`dirty.rs`). The list holds
 //! candidates; readers check each row's current name and kind.
 
-use crate::local::{blob, id_from_blob};
 use crate::{LocalKind, LocalRow, Ops, Result};
 
 /// v6 -> v7. `lower()` folds ASCII only, which is all the name needs.
@@ -84,8 +83,8 @@ impl Ops<'_> {
             )?
             .query_map(
                 rusqlite::params![
-                    after.map_or(Vec::new(), |a| blob(a).to_vec()),
-                    upto.map(|u| blob(u).to_vec()),
+                    after.map_or(Vec::new(), |a| self.keys.blob(a).to_vec()),
+                    upto.map(|u| self.keys.blob(u).to_vec()),
                     limit as i64
                 ],
                 |r| r.get(0),
@@ -93,7 +92,7 @@ impl Ops<'_> {
             .collect::<std::result::Result<_, _>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.local_get(id_from_blob(&id))? {
+            if let Some(row) = self.local_get(self.keys.id(&id))? {
                 out.push(row);
             }
         }
@@ -119,7 +118,7 @@ impl Ops<'_> {
             .prepare_cached("SELECT file_id FROM local_item WHERE kind = 0 AND (attributes & 4194304) != 0 LIMIT ?1")?
             .query_map([limit as i64], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?;
-        Ok(ids.iter().map(|b| id_from_blob(b)).collect())
+        Ok(ids.iter().map(|b| self.keys.id(b)).collect())
     }
 
     /// SQLite's query plan for `sql` (tests prove index use with it).
@@ -138,7 +137,7 @@ impl Ops<'_> {
             .collect::<std::result::Result<_, _>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.local_get(id_from_blob(&id))? {
+            if let Some(row) = self.local_get(self.keys.id(&id))? {
                 out.push(row);
             }
         }
@@ -155,7 +154,7 @@ impl Ops<'_> {
             .collect::<std::result::Result<_, _>>()?;
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(row) = self.local_get(id_from_blob(&id))?
+            if let Some(row) = self.local_get(self.keys.id(&id))?
                 && row.kind == LocalKind::File
                 && row.name.eq_ignore_ascii_case(".oneupignore")
             {
@@ -167,7 +166,10 @@ impl Ops<'_> {
 
     /// Whether `file_id` is listed (for tests).
     pub fn is_rule_file(&self, file_id: u128) -> Result<bool> {
-        Ok(self.c.prepare_cached("SELECT 1 FROM local_rule_file WHERE file_id = ?1")?.exists([blob(file_id)])?)
+        Ok(self
+            .c
+            .prepare_cached("SELECT 1 FROM local_rule_file WHERE file_id = ?1")?
+            .exists([self.keys.blob(file_id)])?)
     }
 }
 

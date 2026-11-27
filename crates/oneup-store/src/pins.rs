@@ -52,7 +52,7 @@
 //! parent index's own order (a walk never holds a whole folder), and the
 //! activity log after a given entry.
 
-use crate::local::{LOCAL_COLS, blob, fix_local, id_from_blob};
+use crate::local::{KeyOrder, LOCAL_COLS, fix_local};
 use crate::{LocalRow, Ops, Result};
 
 /// `FILE_ATTRIBUTE_PINNED`.
@@ -169,17 +169,19 @@ fn children_page_sql() -> String {
 const DONE_AFTER: &str = "SELECT seq, path, detail FROM activity WHERE seq > ?1 AND outcome = 0 AND path != ''
      ORDER BY seq LIMIT ?2";
 
-fn ids(rows: Vec<Vec<u8>>) -> Vec<u128> {
-    rows.iter().map(|b| id_from_blob(b)).collect()
+fn ids(keys: KeyOrder, rows: Vec<Vec<u8>>) -> Vec<u128> {
+    rows.iter().map(|b| keys.id(b)).collect()
 }
 
 impl Ops<'_> {
     /// Up to `limit` children of `parent` after the child `after` (`None`:
     /// from the first), in the parent index's order.
     pub fn local_children_page(&self, parent: u128, after: Option<u128>, limit: usize) -> Result<Vec<LocalRow>> {
-        let after: Vec<u8> = after.map(|a| blob(a).to_vec()).unwrap_or_default();
+        let after: Vec<u8> = after.map(|a| self.keys.blob(a).to_vec()).unwrap_or_default();
         let mut st = self.c.prepare_cached(&children_page_sql())?;
-        let rows = st.query_map(rusqlite::params![blob(parent), after, limit as i64], LocalRow::from_row)?;
+        let rows = st.query_map(rusqlite::params![self.keys.blob(parent), after, limit as i64], |r| {
+            LocalRow::from_row(self.keys, r)
+        })?;
         rows.map(|r| fix_local(r?)).collect()
     }
 
@@ -213,7 +215,7 @@ impl Ops<'_> {
                  SELECT file_id, ?2, ?3 FROM local_item WHERE file_id = ?1
                   AND NOT EXISTS (SELECT 1 FROM pin_user WHERE file_id = ?1)",
             )?
-            .execute(rusqlite::params![blob(id), created, at_seq])?;
+            .execute(rusqlite::params![self.keys.blob(id), created, at_seq])?;
         Ok(n > 0)
     }
 
@@ -223,7 +225,7 @@ impl Ops<'_> {
         Ok(self
             .c
             .prepare_cached("SELECT created FROM pin_owned WHERE file_id = ?1")?
-            .query_row([blob(id)], |r| r.get(0))
+            .query_row([self.keys.blob(id)], |r| r.get(0))
             .optional()?)
     }
 
@@ -237,7 +239,7 @@ impl Ops<'_> {
     }
 
     pub fn pin_owned_remove(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM pin_owned WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM pin_owned WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -252,26 +254,27 @@ impl Ops<'_> {
         Ok(self
             .c
             .prepare_cached("SELECT at_seq FROM pin_owned WHERE file_id = ?1")?
-            .query_row([blob(id)], |r| r.get(0))
+            .query_row([self.keys.blob(id)], |r| r.get(0))
             .optional()?)
     }
 
     /// Up to `limit` items a pin rule pinned, after `after`, by ID.
     pub fn pin_owned_page(&self, after: Option<u128>, limit: usize) -> Result<Vec<u128>> {
-        let after: Vec<u8> = after.map(|a| blob(a).to_vec()).unwrap_or_default();
+        let after: Vec<u8> = after.map(|a| self.keys.blob(a).to_vec()).unwrap_or_default();
         let rows: Vec<Vec<u8>> = self
             .c
             .prepare_cached("SELECT file_id FROM pin_owned WHERE file_id > ?1 ORDER BY file_id LIMIT ?2")?
             .query_map(rusqlite::params![after, limit as i64], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(ids(rows))
+        Ok(ids(self.keys, rows))
     }
 
     /// Item `id` waits for `op` to be tried again at `next_ms` (its
     /// `tries`th failure). `false` if [`PIN_RETRY_MAX`] items wait already
     /// (and this one isn't among them), or it isn't in the Local tree.
     pub fn pin_retry_put(&self, id: u128, op: PinOp, tries: u32, next_ms: i64) -> Result<bool> {
-        let there = self.c.prepare_cached("SELECT 1 FROM pin_retry WHERE file_id = ?1")?.exists([blob(id)])?;
+        let there =
+            self.c.prepare_cached("SELECT 1 FROM pin_retry WHERE file_id = ?1")?.exists([self.keys.blob(id)])?;
         if !there && self.pin_retry_count()? >= PIN_RETRY_MAX {
             return Ok(false);
         }
@@ -281,7 +284,7 @@ impl Ops<'_> {
                 "INSERT OR REPLACE INTO pin_retry(file_id, op, tries, next_ms)
                  SELECT file_id, ?2, ?3, ?4 FROM local_item WHERE file_id = ?1",
             )?
-            .execute(rusqlite::params![blob(id), op.code(), tries, next_ms])?;
+            .execute(rusqlite::params![self.keys.blob(id), op.code(), tries, next_ms])?;
         Ok(n > 0)
     }
 
@@ -292,11 +295,11 @@ impl Ops<'_> {
             .prepare_cached("SELECT file_id, op, tries FROM pin_retry WHERE next_ms <= ?1 ORDER BY next_ms LIMIT ?2")?
             .query_map(rusqlite::params![now_ms, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(rows.into_iter().map(|(b, op, t)| (id_from_blob(&b), PinOp::from_code(op), t)).collect())
+        Ok(rows.into_iter().map(|(b, op, t)| (self.keys.id(&b), PinOp::from_code(op), t)).collect())
     }
 
     pub fn pin_retry_remove(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM pin_retry WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM pin_retry WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -315,7 +318,7 @@ impl Ops<'_> {
             .prepare_cached("SELECT file_id FROM pin_changed LIMIT ?1")?
             .query_map([limit as i64], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(ids(rows))
+        Ok(ids(self.keys, rows))
     }
 
     /// Item `id` was pinned again, or handed to `pin_retry`, or needs
@@ -323,17 +326,20 @@ impl Ops<'_> {
     /// Whether queued item `id` was looked at once already and left
     /// queued ([`Ops::pin_changed_seen_mark`]).
     pub fn pin_changed_seen(&self, id: u128) -> Result<bool> {
-        Ok(self.c.prepare_cached("SELECT 1 FROM pin_changed WHERE file_id = ?1 AND seen != 0")?.exists([blob(id)])?)
+        Ok(self
+            .c
+            .prepare_cached("SELECT 1 FROM pin_changed WHERE file_id = ?1 AND seen != 0")?
+            .exists([self.keys.blob(id)])?)
     }
 
     /// Queued item `id` was looked at and left queued for a later pass.
     pub fn pin_changed_seen_mark(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("UPDATE pin_changed SET seen = 1 WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("UPDATE pin_changed SET seen = 1 WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
     pub fn pin_changed_done(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM pin_changed WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM pin_changed WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -344,7 +350,7 @@ impl Ops<'_> {
             .prepare_cached(
                 "INSERT OR IGNORE INTO pin_subtree(file_id) SELECT file_id FROM local_item WHERE file_id = ?1",
             )?
-            .execute([blob(id)])?;
+            .execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -355,11 +361,11 @@ impl Ops<'_> {
             .prepare_cached("SELECT file_id FROM pin_subtree LIMIT 1")?
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(ids(rows).pop())
+        Ok(ids(self.keys, rows).pop())
     }
 
     pub fn pin_subtree_has(&self, id: u128) -> Result<bool> {
-        Ok(self.c.prepare_cached("SELECT 1 FROM pin_subtree WHERE file_id = ?1")?.exists([blob(id)])?)
+        Ok(self.c.prepare_cached("SELECT 1 FROM pin_subtree WHERE file_id = ?1")?.exists([self.keys.blob(id)])?)
     }
 
     /// File `id` was freed on request by name: no pin rule keeps it until
@@ -369,16 +375,16 @@ impl Ops<'_> {
             .prepare_cached(
                 "INSERT OR IGNORE INTO pin_released(file_id) SELECT file_id FROM local_item WHERE file_id = ?1",
             )?
-            .execute([blob(id)])?;
+            .execute([self.keys.blob(id)])?;
         self.pin_owned_remove(id)
     }
 
     pub fn pin_released_has(&self, id: u128) -> Result<bool> {
-        Ok(self.c.prepare_cached("SELECT 1 FROM pin_released WHERE file_id = ?1")?.exists([blob(id)])?)
+        Ok(self.c.prepare_cached("SELECT 1 FROM pin_released WHERE file_id = ?1")?.exists([self.keys.blob(id)])?)
     }
 
     pub fn pin_released_remove(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM pin_released WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM pin_released WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -388,12 +394,12 @@ impl Ops<'_> {
             .prepare_cached(
                 "INSERT OR IGNORE INTO pin_user(file_id) SELECT file_id FROM local_item WHERE file_id = ?1",
             )?
-            .execute([blob(id)])?;
+            .execute([self.keys.blob(id)])?;
         Ok(())
     }
 
     pub fn pin_user_remove(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM pin_user WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM pin_user WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 
@@ -404,7 +410,7 @@ impl Ops<'_> {
         Ok(self
             .c
             .prepare_cached("SELECT created FROM pin_user WHERE file_id = ?1")?
-            .query_row([blob(id)], |r| r.get::<_, Option<i64>>(0))
+            .query_row([self.keys.blob(id)], |r| r.get::<_, Option<i64>>(0))
             .optional()?
             .flatten())
     }
@@ -413,16 +419,16 @@ impl Ops<'_> {
     pub fn pin_user_set_created(&self, id: u128, created: i64) -> Result<()> {
         self.c
             .prepare_cached("UPDATE pin_user SET created = ?2 WHERE file_id = ?1")?
-            .execute(rusqlite::params![blob(id), created])?;
+            .execute(rusqlite::params![self.keys.blob(id), created])?;
         Ok(())
     }
 
     pub fn pin_user_has(&self, id: u128) -> Result<bool> {
-        Ok(self.c.prepare_cached("SELECT 1 FROM pin_user WHERE file_id = ?1")?.exists([blob(id)])?)
+        Ok(self.c.prepare_cached("SELECT 1 FROM pin_user WHERE file_id = ?1")?.exists([self.keys.blob(id)])?)
     }
 
     pub fn pin_subtree_done(&self, id: u128) -> Result<()> {
-        self.c.prepare_cached("DELETE FROM pin_subtree WHERE file_id = ?1")?.execute([blob(id)])?;
+        self.c.prepare_cached("DELETE FROM pin_subtree WHERE file_id = ?1")?.execute([self.keys.blob(id)])?;
         Ok(())
     }
 

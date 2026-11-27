@@ -45,6 +45,16 @@
 //! rebuild the tree. A rescan records **no** evidence: whatever disappeared
 //! meanwhile reads as Missing (`data-safety.md` invariant 3).
 //!
+//! ## While a scan runs ([`crate::Scan::follow_journal`])
+//! Listing a whole drive can take longer than its journal keeps history (32
+//! MiB by default: a few hours on a quiet system drive, minutes during a
+//! build). A scan that only replays the journal once it ends would then
+//! always find it wrapped and start over. A scan can instead apply the
+//! journal as it lists, so its bookmark stays recent. Records then only
+//! touch folders already listed: a folder still queued counts as outside the
+//! tree, since the scan stores what it holds when it lists it. An item moved
+//! into a queued folder leaves the tree until that listing finds it again.
+//!
 //! ## Delete records read ahead ([`SeenDeletes`])
 //! The agent's journal watcher reads every record as it's written, while
 //! the observer only runs between rounds. A long round on a busy disk (a
@@ -203,6 +213,12 @@ fn listed_folder(o: &Ops<'_>, id: u128) -> Result<bool> {
     Ok(o.local_get(id)?.is_some_and(|r| matches!(r.kind, LocalKind::Folder | LocalKind::Root) && r.skip == Skip::None))
 }
 
+/// Whether records for children of `id` apply: a [`listed_folder`], and
+/// while a scan runs one it has listed already (see the module docs).
+fn in_tree(o: &Ops<'_>, id: u128, scanning: bool) -> Result<bool> {
+    Ok(listed_folder(o, id)? && !(scanning && o.local_is_queued(id)?))
+}
+
 /// What [`reapply_rules`] changed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Reapplied {
@@ -212,8 +228,8 @@ pub struct Reapplied {
     pub included: usize,
 }
 
-/// Brings a finished scan in line with changed name-only folder rules,
-/// without a rescan (`docs/architecture/rules.md`): a folder that is now
+/// Brings a finished scan in line with changed folder rules, by name or by
+/// folder ID, without a rescan (`docs/architecture/rules.md`): a folder that is now
 /// excluded keeps its own row, marked excluded, and loses what was stored
 /// below it; one that no longer is gets unmarked and queued, and the
 /// observer lists it at its next catch-up. Database only. Dropping rows is
@@ -230,7 +246,11 @@ pub fn reapply_rules(o: &Ops<'_>, rules: &ExcludeSet) -> oneup_store::Result<Opt
     let top = root.root_file_id;
     let mut flip = Vec::new();
     o.for_each_local_folder(|id, parent, name, skip| {
-        let want = (parent == Some(top) && oneup_rules::is_engine_dir(name)) || rules.excludes_folder(name);
+        // By ID as well (a drive catalog's vaults and data folders): a
+        // folder left out by ID must not come back for its name.
+        let want = (parent == Some(top) && oneup_rules::is_engine_dir(name))
+            || rules.excludes_folder(name)
+            || rules.excludes_folder_id(id);
         match (skip, want) {
             (Skip::None, true) => flip.push((id, true)),
             (Skip::Excluded, false) => flip.push((id, false)),
@@ -268,6 +288,25 @@ pub fn apply_records(
     o: &Ops<'_>,
     root_id: u128,
     rules: &ExcludeSet,
+    records: &[UsnRecord],
+    stat: &mut dyn FnMut(&Lookup) -> Stat,
+    ch: &mut Changes,
+) -> Result<()> {
+    apply(o, Tree { root_id, rules, scanning: false }, records, stat, ch)
+}
+
+/// The tree a batch of records is applied to.
+#[derive(Clone, Copy)]
+pub(crate) struct Tree<'a> {
+    pub(crate) root_id: u128,
+    pub(crate) rules: &'a ExcludeSet,
+    /// A scan is still listing it (see the module docs).
+    pub(crate) scanning: bool,
+}
+
+fn apply(
+    o: &Ops<'_>,
+    Tree { root_id, rules, scanning }: Tree<'_>,
     records: &[UsnRecord],
     stat: &mut dyn FnMut(&Lookup) -> Stat,
     ch: &mut Changes,
@@ -336,7 +375,7 @@ pub fn apply_records(
         }
 
         let parent = r.parent_id.0;
-        if !listed_folder(o, parent)? {
+        if !in_tree(o, parent, scanning)? {
             if let Some(old) = known {
                 ch.dirty.extend(old.parent_id);
                 ch.left += o.local_remove_subtree(id)? as u64;
@@ -393,7 +432,13 @@ pub fn apply_records(
             }
         };
         o.local_update(&row)?;
-        if row.kind == LocalKind::Folder && row.skip == Skip::None && !was_listed {
+        let listable = row.kind == LocalKind::Folder && row.skip == Skip::None;
+        if scanning && row.kind == LocalKind::Folder && !listable {
+            // A queued folder renamed to an excluded name: the scan must not
+            // list it.
+            o.local_dequeue(id)?;
+        }
+        if listable && !was_listed {
             o.local_enqueue(id, 1)?;
             ch.folders_queued += 1;
             ch.dirty.insert(id);
@@ -605,6 +650,8 @@ pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::
 #[cfg(windows)]
 pub use driver::Observer;
 #[cfg(windows)]
+pub(crate) use driver::Reader;
+#[cfg(windows)]
 pub use driver::{JournalTail, Tailed};
 
 #[cfg(windows)]
@@ -617,10 +664,74 @@ mod driver {
     use oneup_ntfs::win::{self, Volume};
     use oneup_store::{LocalRoot, Store};
 
-    use super::{Changes, Error, LIST_WHOLE_MAX, Lookup, Rescan, Result, Stat, apply_records};
+    use super::{Changes, Error, LIST_WHOLE_MAX, Lookup, Rescan, Result, Stat, Tree, apply};
     use crate::classify;
     use crate::scan::{Config, Progress, list_queued};
     use std::collections::HashMap;
+
+    /// A journal position, read from and applied to a tree: the observer's,
+    /// and a scan's that follows the journal ([`crate::Scan::follow_journal`]).
+    pub(crate) struct Reader {
+        pub(crate) journal_id: u64,
+        pub(crate) cursor: i64,
+        /// Journal read buffer. 64 KiB holds several hundred records.
+        jbuf: Vec<u8>,
+    }
+
+    impl Reader {
+        pub(crate) fn new((journal_id, cursor): (u64, i64)) -> Self {
+            Self { journal_id, cursor, jbuf: vec![0u8; 64 * 1024] }
+        }
+
+        /// Where the journal ends now. A rescan is needed if it was replaced
+        /// or no longer reaches back to the position.
+        pub(crate) fn end(&self, volume: &Volume) -> Result<i64> {
+            let j = volume.query_journal()?;
+            if j.journal_id != self.journal_id || self.cursor > j.next_usn {
+                return Err(Error::NeedsRescan(Rescan::JournalReplaced));
+            }
+            if self.cursor < oldest(&j) {
+                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+            }
+            Ok(j.next_usn)
+        }
+
+        /// Reads one batch from the position and applies it to `tree` in
+        /// `store`, in one transaction with the new position. Returns `false`
+        /// when there was nothing more to read.
+        pub(crate) fn apply_next(
+            &mut self,
+            store: &mut Store,
+            volume: &Volume,
+            tree: Tree<'_>,
+            buf: &mut [u8],
+            ch: &mut Changes,
+        ) -> Result<bool> {
+            let (next, records) = match volume.read_journal(self.journal_id, self.cursor, false, &mut self.jbuf) {
+                Ok((next, recs)) => (next, recs.collect::<std::result::Result<Vec<UsnRecord>, _>>()?),
+                // A read can fail because the journal wrapped or was reset
+                // meanwhile; say so rather than just failing.
+                Err(e) => {
+                    self.end(volume)?;
+                    return Err(e.into());
+                }
+            };
+            if next <= self.cursor {
+                return Ok(false);
+            }
+            ch.records += records.len() as u64;
+            // Whole listings, per folder, for this batch only.
+            let mut listings: HashMap<u128, Option<Vec<DirEntry>>> = HashMap::new();
+            let mut stat = |l: &Lookup| read_item(volume, l, &mut listings, buf);
+            store.try_write(|o| {
+                apply(o, tree, &records, &mut stat, ch)?;
+                o.local_set_journal_cursor(next)?;
+                Ok::<_, Error>(())
+            })?;
+            self.cursor = next;
+            Ok(true)
+        }
+    }
 
     /// Brings a finished scan up to date from the change journal.
     pub struct Observer {
@@ -628,12 +739,9 @@ mod driver {
         volume: Volume,
         cfg: Config,
         root: LocalRoot,
-        journal_id: u64,
-        cursor: i64,
+        reader: Reader,
         /// Directory-listing buffer (for folders entering the tree).
         buf: Vec<u8>,
-        /// Journal read buffer. 64 KiB holds several hundred records.
-        jbuf: Vec<u8>,
         progress: Progress,
     }
 
@@ -654,7 +762,7 @@ mod driver {
             if root.rules != cfg.rules.fingerprint() {
                 return Err(Error::NeedsRescan(Rescan::RulesChanged));
             }
-            let (journal_id, cursor) = root.journal.ok_or(Error::NeedsRescan(Rescan::NoJournal))?;
+            let bookmark = root.journal.ok_or(Error::NeedsRescan(Rescan::NoJournal))?;
             // The folder may have been renamed since (it's tracked by ID), but
             // its volume is found through the stored path.
             let volume =
@@ -672,9 +780,7 @@ mod driver {
                 buf: vec![0u8; cfg.buffer_bytes.max(4096)],
                 cfg,
                 root,
-                journal_id,
-                cursor,
-                jbuf: vec![0u8; 64 * 1024],
+                reader: Reader::new(bookmark),
                 progress: Progress::default(),
             })
         }
@@ -696,52 +802,17 @@ mod driver {
             if !keep_going() {
                 return Ok(ch);
             }
-            let j = self.volume.query_journal()?;
-            if j.journal_id != self.journal_id || self.cursor > j.next_usn {
-                return Err(Error::NeedsRescan(Rescan::JournalReplaced));
-            }
-            let oldest = j.first_usn.max(j.lowest_valid_usn);
-            if self.cursor < oldest {
-                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
-            }
-            let target = j.next_usn;
-            while self.cursor < target && keep_going() {
-                let read = self.volume.read_journal(self.journal_id, self.cursor, false, &mut self.jbuf);
-                let (next, records) = match read {
-                    Ok((next, recs)) => (next, recs.collect::<std::result::Result<Vec<UsnRecord>, _>>()?),
-                    Err(e) => {
-                        // A read can fail because the journal wrapped or was
-                        // reset meanwhile; say so rather than just failing.
-                        let j = self.volume.query_journal()?;
-                        if j.journal_id != self.journal_id || self.cursor > j.next_usn {
-                            return Err(Error::NeedsRescan(Rescan::JournalReplaced));
-                        }
-                        if self.cursor < j.first_usn.max(j.lowest_valid_usn) {
-                            return Err(Error::NeedsRescan(Rescan::JournalWrapped));
-                        }
-                        return Err(e.into());
-                    }
-                };
-                if next <= self.cursor {
+            let target = self.reader.end(&self.volume)?;
+            while self.reader.cursor < target && keep_going() {
+                let by_id = self.volume.opened_by_id();
+                let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: false };
+                if !self.reader.apply_next(&mut self.store, &self.volume, tree, &mut self.buf, &mut ch)? {
                     break;
                 }
-                ch.records += records.len() as u64;
-                let (volume, rules, root_id) = (&self.volume, &self.cfg.rules, self.root.root_file_id);
-                let by_id = volume.opened_by_id();
-                // Whole listings, per folder, for this batch only.
-                let mut listings: HashMap<u128, Option<Vec<DirEntry>>> = HashMap::new();
-                let buf = &mut self.buf;
-                let mut stat = |l: &Lookup| read_item(volume, l, &mut listings, buf);
-                self.store.try_write(|o| {
-                    apply_records(o, root_id, rules, &records, &mut stat, &mut ch)?;
-                    o.local_set_journal_cursor(next)?;
-                    Ok::<_, Error>(())
-                })?;
                 ch.opened_by_id += self.volume.opened_by_id() - by_id;
                 if !retain_dirty {
                     ch.dirty.clear();
                 }
-                self.cursor = next;
                 self.drain_queue(&keep_going)?;
             }
             tracing::debug!(records = ch.records, dirty = ch.dirty.len(), "local tree caught up");
@@ -758,7 +829,7 @@ mod driver {
 
         /// The journal (id, USN) the tree is current up to.
         pub fn position(&self) -> (u64, i64) {
-            (self.journal_id, self.cursor)
+            (self.reader.journal_id, self.reader.cursor)
         }
 
         pub fn store(&self) -> &Store {
@@ -1348,6 +1419,87 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ch.left, 1);
+    }
+
+    /// A drive catalog leaves vaults and data folders out by ID. Changed
+    /// name rules must not bring one back, and a folder that becomes
+    /// protected leaves the tree without a rescan.
+    #[test]
+    fn reapplied_rules_keep_folders_left_out_by_id() {
+        let mut s = Store::open_in_memory().unwrap();
+        let root = oneup_store::LocalRoot {
+            path: r"\\?\T:\".into(),
+            volume_serial: 1,
+            root_file_id: ROOT_ID,
+            rules: ExcludeSet::none().with_folder_ids(vec![2]).fingerprint(),
+            journal: Some((1, 0)),
+            started_at_ms: 0,
+            finished_at_ms: None,
+            sync_root_provider: None,
+        };
+        s.write(|o| {
+            o.local_begin(&root, &row(ROOT_ID, 0, "", LocalKind::Root))?;
+            o.local_update(&LocalRow { skip: Skip::Excluded, ..row(2, ROOT_ID, "Vault", LocalKind::Folder) })?;
+            o.local_update(&row(5, ROOT_ID, "Work", LocalKind::Folder))?;
+            o.local_update(&row(6, 5, "plan.txt", LocalKind::File))?;
+            o.local_dequeue(ROOT_ID)?;
+            o.local_finish(1)
+        })
+        .unwrap();
+        // Another name rule, the vault still protected, and Work newly so.
+        let rules = ExcludeSet::from_names(["node_modules"]).with_folder_ids(vec![2, 5]);
+        let done = s.write(|o| reapply_rules(o, &rules)).unwrap().unwrap();
+        assert_eq!((done.excluded, done.included), (1, 0));
+        s.read(|o| {
+            assert_eq!(o.local_get(2)?.map(|r| r.skip), Some(Skip::Excluded));
+            assert_eq!(o.local_get(5)?.map(|r| r.skip), Some(Skip::Excluded));
+            assert!(o.local_get(6)?.is_none(), "what was below a protected folder goes");
+            assert!(!o.local_is_queued(2)?);
+            assert_eq!(o.local_root()?.map(|r| r.rules), Some(rules.fingerprint()));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// [`apply`] while a scan runs that still has `queued` to list.
+    fn apply_scanning(s: &mut Store, queued: &[u128], records: &[UsnRecord], live: &[DirEntry]) -> Changes {
+        s.write(|o| queued.iter().try_for_each(|&id| o.local_enqueue(id, 1))).unwrap();
+        let mut ch = Changes::default();
+        let mut stat = |l: &Lookup| live.iter().find(|e| e.file_id == l.id).cloned().map_or(Stat::Gone, Stat::Found);
+        let tree = Tree { root_id: ROOT_ID, rules: &ExcludeSet::dev(), scanning: true };
+        s.try_write(|o| super::apply(o, tree, records, &mut stat, &mut ch)).unwrap();
+        assert!(s.read(|o| o.check_invariants()).unwrap().is_empty());
+        ch
+    }
+
+    #[test]
+    fn while_scanning_records_change_only_folders_already_listed() {
+        let mut s = tree();
+        // docs is still queued. Created in it: new.txt. Moved into it from
+        // the listed root: b.txt. Created in the root: c.txt.
+        let ch = apply_scanning(
+            &mut s,
+            &[2],
+            &[rec(5, 2, reason::FILE_CREATE), rec(4, 2, reason::RENAME_NEW_NAME), rec(6, ROOT_ID, reason::FILE_CREATE)],
+            &[entry(5, "new.txt", 0, 1), entry(4, "b.txt", 0, 0), entry(6, "c.txt", 0, 1)],
+        );
+        assert_eq!(path(&s, 5), None, "the scan stores it when it lists docs");
+        assert_eq!(path(&s, 4), None, "out of the listed part until the scan lists docs");
+        assert_eq!(path(&s, 6).as_deref(), Some("/c.txt"));
+        assert_eq!((ch.created, ch.left, ch.evidence), (1, 1, 0));
+        assert!(s.read(|o| o.local_is_queued(2)).unwrap(), "docs is still the scan's to list");
+    }
+
+    #[test]
+    fn while_scanning_a_queued_folder_renamed_to_an_excluded_name_is_not_listed() {
+        let mut s = tree();
+        apply_scanning(&mut s, &[2], &[rec(2, ROOT_ID, reason::RENAME_NEW_NAME)], &[entry(2, "node_modules", DIR, 0)]);
+        s.read(|o| {
+            assert_eq!(o.local_get(2)?.map(|r| r.skip), Some(Skip::Excluded));
+            assert!(!o.local_is_queued(2)?);
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
