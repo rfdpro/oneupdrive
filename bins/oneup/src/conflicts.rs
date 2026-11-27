@@ -67,17 +67,37 @@ fn slashed(p: &str) -> String {
     if p.starts_with('/') { p } else { format!("/{p}") }
 }
 
+/// The stamps an answer is bound to go out as strings: a FILETIME (about
+/// 1.3e17) is past JavaScript's 2^53, so the window would hand back a
+/// rounded time and every answer would look stale.
 fn copy_json(c: &Copy) -> Value {
-    json!({ "sid": c.sid, "name": c.name, "local": format!("{:x}", c.local.0), "size": c.size, "mtime": c.mtime })
+    json!({
+        "sid": c.sid.to_string(),
+        "name": c.name,
+        "local": format!("{:x}", c.local.0),
+        "size": c.size,
+        "mtime": c.mtime.to_string(),
+    })
+}
+
+/// A string, or a number from an answer queued before stamps were strings.
+fn int_of<T: std::str::FromStr + TryFrom<i64> + TryFrom<u64>>(v: &Value) -> Option<T> {
+    match v {
+        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => {
+            n.as_i64().and_then(|i| T::try_from(i).ok()).or_else(|| n.as_u64().and_then(|u| T::try_from(u).ok()))
+        }
+        _ => None,
+    }
 }
 
 fn copy_of(v: &Value) -> Option<Copy> {
     Some(Copy {
-        sid: v.get("sid")?.as_u64()?,
+        sid: int_of(v.get("sid")?)?,
         name: v.get("name")?.as_str()?.to_string(),
         local: LocalId(u128::from_str_radix(v.get("local")?.as_str()?, 16).ok()?),
-        size: v.get("size")?.as_i64()?,
-        mtime: v.get("mtime")?.as_i64()?,
+        size: int_of(v.get("size")?)?,
+        mtime: int_of(v.get("mtime")?)?,
     })
 }
 
@@ -341,5 +361,32 @@ mod tests {
         answer_batch(&mut store, &listed, Keep::Original).unwrap();
         let queued = store.read(read_queue).unwrap();
         assert_eq!(queued, listed.into_iter().map(|c| (c, Keep::Original)).collect::<Vec<_>>());
+    }
+
+    /// The window is JavaScript: every number in what it hands back has been
+    /// through an f64. A real FILETIME must survive that.
+    #[test]
+    fn a_conflict_survives_the_windows_number_rounding() {
+        let ft = 134_073_259_200_000_001_i64; // a 2025 FILETIME, odd so rounding shows
+        let mk =
+            |sid, name: &str| Copy { sid, name: name.into(), local: LocalId(u128::from(sid)), size: 12, mtime: ft };
+        let c = Conflict { folder: ROOT, original: mk(2, "a.txt"), copy: mk(3, "a (conflict 1).txt") };
+        let listed = Listed { conflict: c.clone(), path: "/a.txt".into(), copy_path: "/a (conflict 1).txt".into() };
+
+        // What JSON.parse then JSON.stringify does: every number to f64,
+        // written back without a fraction when it is whole.
+        fn through_js(v: &Value) -> Value {
+            match v {
+                Value::Number(n) => json!(n.as_f64().unwrap() as i64),
+                Value::Array(a) => Value::Array(a.iter().map(through_js).collect()),
+                Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), through_js(v))).collect()),
+                other => other.clone(),
+            }
+        }
+        assert_eq!(from_json(&through_js(&to_json(&listed))), Some(c.clone()));
+
+        // An answer queued with number stamps still reads.
+        let old = json!({ "sid": 2, "name": "a.txt", "local": "2", "size": 12, "mtime": ft });
+        assert_eq!(copy_of(&old), Some(c.original));
     }
 }
