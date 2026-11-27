@@ -923,6 +923,40 @@ mod tests {
         assert_eq!(names_in(&db, "report"), ["Report-app.log", "Report-keep.txt", "Report-plan.txt"]);
     }
 
+    /// A file renamed while the scan runs, in a folder already listed: the
+    /// journal renames a row still waiting for the name index. That failed
+    /// the scan ("UNIQUE constraint failed: drive_dirty.file_id").
+    #[test]
+    fn a_rename_during_the_scan_reaches_the_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("files");
+        let profile = temp.path().join("profile");
+        for folder in ["a", "b", "c"] {
+            std::fs::create_dir_all(root.join(folder)).unwrap();
+        }
+        std::fs::write(root.join("Report-draft.txt"), "fixture").unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let drive = Drive::open(root.clone()).unwrap();
+        let cfg = oneup_local::Config { batch_dirs: 1, ..drive.config(&[], &no_exclusions()) };
+        let calls = std::cell::Cell::new(0);
+        let keep_going = || {
+            calls.set(calls.get() + 1);
+            // After the root's step: its files are stored, its folders queued.
+            if calls.get() == 4 {
+                let status = Command::new("cmd")
+                    .current_dir(&root)
+                    .args(["/d", "/c", "ren Report-draft.txt Report-final.txt"])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            true
+        };
+        assert_eq!(update_drive(&profile, &drive, cfg, 1024, keep_going, || Ok(())).unwrap(), Updated::Ready);
+        assert!(calls.get() > 4, "the rename happened during the scan");
+        assert_eq!(names_in(&drive.db(&profile), "report"), ["Report-final.txt"]);
+    }
+
     #[test]
     fn catalogs_of_the_old_format_are_told_apart_by_name() {
         let old = "C-e49050c590509fba-00000000000000000005000000000005.db";

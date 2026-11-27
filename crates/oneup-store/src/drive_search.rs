@@ -4,18 +4,31 @@ use rusqlite::params;
 
 use crate::{Ops, Result, Store};
 
+/// The triggers queue a changed row only if it isn't queued already, rather
+/// than `INSERT OR IGNORE`: SQLite lets the outer statement's conflict
+/// handling override a trigger's, and the Local tree's upserts (`ON
+/// CONFLICT DO UPDATE`) turned the ignore into a constraint error whenever
+/// a queued row changed again before the queue was flushed (a rename the
+/// journal reports during a scan). They're made again each time a catalog
+/// is opened, so catalogs made with the earlier triggers get these.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS drive_dirty(file_id BLOB PRIMARY KEY) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS drive_key(seq INTEGER PRIMARY KEY, file_id BLOB UNIQUE NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS drive_name USING fts5(name, content='', contentless_delete=1, detail=none, tokenize='trigram');
-CREATE TRIGGER IF NOT EXISTS drive_insert AFTER INSERT ON local_item WHEN NEW.kind IN (0, 1)
-BEGIN INSERT OR IGNORE INTO drive_dirty VALUES (NEW.file_id); END;
-CREATE TRIGGER IF NOT EXISTS drive_rename AFTER UPDATE OF name,kind,name_lossy,skip ON local_item
+DROP TRIGGER IF EXISTS drive_insert;
+DROP TRIGGER IF EXISTS drive_rename;
+DROP TRIGGER IF EXISTS drive_delete;
+CREATE TRIGGER drive_insert AFTER INSERT ON local_item WHEN NEW.kind IN (0, 1)
+BEGIN INSERT INTO drive_dirty SELECT NEW.file_id
+    WHERE NOT EXISTS (SELECT 1 FROM drive_dirty WHERE file_id = NEW.file_id); END;
+CREATE TRIGGER drive_rename AFTER UPDATE OF name,kind,name_lossy,skip ON local_item
 WHEN OLD.name IS NOT NEW.name OR OLD.kind IS NOT NEW.kind OR OLD.name_lossy IS NOT NEW.name_lossy
     OR OLD.skip IS NOT NEW.skip
-BEGIN INSERT OR IGNORE INTO drive_dirty VALUES (NEW.file_id); END;
-CREATE TRIGGER IF NOT EXISTS drive_delete AFTER DELETE ON local_item WHEN OLD.kind IN (0, 1)
-BEGIN INSERT OR IGNORE INTO drive_dirty VALUES (OLD.file_id); END;";
+BEGIN INSERT INTO drive_dirty SELECT NEW.file_id
+    WHERE NOT EXISTS (SELECT 1 FROM drive_dirty WHERE file_id = NEW.file_id); END;
+CREATE TRIGGER drive_delete AFTER DELETE ON local_item WHEN OLD.kind IN (0, 1)
+BEGIN INSERT INTO drive_dirty SELECT OLD.file_id
+    WHERE NOT EXISTS (SELECT 1 FROM drive_dirty WHERE file_id = OLD.file_id); END;";
 
 impl Store {
     /// Install the catalog before scanning. Ordinary sync stores never use these triggers.
@@ -158,5 +171,46 @@ mod tests {
         assert!(query(&store, "receipt", false).is_empty());
         assert_eq!(store.flush_drive_search(2).unwrap(), 0);
         assert!(store.read(|o| o.remote_root()).unwrap().is_none());
+    }
+
+    /// A row the queue holds already can change again before a flush: a
+    /// scan queues every row it lists, and following the journal renames
+    /// some of them. The upserts must not turn that into a constraint error.
+    #[test]
+    fn a_queued_row_changes_again_before_the_flush() {
+        let mut store = Store::open_in_memory().unwrap();
+        // As made by an earlier build: installing replaces its triggers.
+        store
+            .write(|o| {
+                o.c.execute_batch(
+                    "CREATE TABLE drive_dirty(file_id BLOB PRIMARY KEY) WITHOUT ROWID;
+                     CREATE TRIGGER drive_rename AFTER UPDATE OF name ON local_item
+                     BEGIN INSERT OR IGNORE INTO drive_dirty VALUES (NEW.file_id); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        store.install_drive_search().unwrap();
+        let mut row = LocalRow {
+            file_id: 7,
+            parent_id: Some(1),
+            name: "Draft.txt".into(),
+            name_lossy: false,
+            kind: LocalKind::File,
+            size: 0,
+            mtime: 0,
+            attributes: 0,
+            reparse_tag: 0,
+            skip: Skip::None,
+        };
+        store.write(|o| o.local_put(&row).map(|_| ())).unwrap();
+        for name in ["Report.txt", "Final report.txt"] {
+            row.name = name.into();
+            store.write(|o| o.local_put(&row).map(|_| ()).and_then(|()| o.local_update(&row))).unwrap();
+        }
+        store.write(|o| o.local_remove_subtree(7).map(|_| ())).unwrap();
+        row.name = "Back.txt".into();
+        store.write(|o| o.local_update(&row)).unwrap();
+        assert_eq!(store.flush_drive_search(8).unwrap(), 1, "one queued row, whatever happened to it");
     }
 }
