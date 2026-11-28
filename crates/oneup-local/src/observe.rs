@@ -789,6 +789,10 @@ mod driver {
     /// after its pump is gone. Dropping the pump wakes the thread at once.
     const PUMP_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
+    /// The longest an observer's catch-up from a [`JournalPump`] waits for
+    /// the pump to read up to the journal's end.
+    const PUMP_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// The most records a scan or an observer applies in one transaction
     /// from a [`JournalPump`].
     const PUMP_CHUNK: usize = 4096;
@@ -896,6 +900,19 @@ mod driver {
             Ok(())
         }
 
+        /// Waits until the thread has read the journal up to `usn` (its end
+        /// when asked, say), lost records or failed, for at most `limit`.
+        /// Wakes the thread if it's idle.
+        pub fn read_up_to(&self, usn: i64, limit: std::time::Duration) {
+            let deadline = std::time::Instant::now() + limit;
+            let mut q = self.queue();
+            self.shared.1.notify_all();
+            while q.next < usn && !q.lost && q.failed.is_none() && !self.thread.is_finished() {
+                let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else { break };
+                q = self.shared.1.wait_timeout(q, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            }
+        }
+
         /// How many records are read and not yet applied.
         pub fn waiting(&self) -> usize {
             self.queue().records.len()
@@ -926,7 +943,7 @@ mod driver {
                 q.records.shrink_to(PUMP_CHUNK);
             }
             drop(q);
-            self.shared.1.notify_one();
+            self.shared.1.notify_all();
             Ok(Some(Pumped { records, start, next }))
         }
     }
@@ -955,12 +972,15 @@ mod driver {
                     q.lost |= t.lost;
                     q.records.extend(t.records);
                     q.next = tail.position().1;
+                    // For an owner waiting until it has read far enough.
+                    wake.notify_all();
                     if idle && !q.closed {
                         drop(wake.wait_timeout(q, PUMP_IDLE).unwrap_or_else(std::sync::PoisonError::into_inner));
                     }
                 }
                 Err(e) => {
                     q.failed = Some(e);
+                    wake.notify_all();
                     return;
                 }
             }
@@ -1064,12 +1084,17 @@ mod driver {
         }
 
         /// Applies what `pump` has read (started at this observer's
-        /// position), without asking the journal: a catch-up after a long
-        /// stop, such as a compaction, whose records the journal may no
-        /// longer hold. Then lists the folders that entered the tree.
+        /// position), up to the journal's end as it is when called, without
+        /// reading the journal itself: a catch-up after a long stop, such as
+        /// a compaction, whose records the journal may no longer hold. Then
+        /// lists the folders that entered the tree.
         pub fn catch_up_pumped(&mut self, pump: &JournalPump, keep_going: impl Fn() -> bool) -> Result<Changes> {
             let mut ch = Changes::default();
             self.drain_queue(&keep_going)?;
+            // Up to the journal's end as it is now, as `catch_up` reads:
+            // the pump reads on its own time, and may not have yet.
+            let end = self.volume.query_journal()?.next_usn;
+            pump.read_up_to(end, PUMP_CATCH_UP);
             let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: false };
             let (volume, cfg, progress) = (&self.volume, &self.cfg, &self.progress);
             apply_pumped(
