@@ -25,6 +25,10 @@ mod win {
     use serde_json::{Value, json};
 
     const PAGE: &str = include_str!("settings_ui.html");
+    /// The page's `--shell` colour in each theme: the window shows it while
+    /// WebView2 starts, so the page appears on its own background.
+    const SHELL_LIGHT: [u8; 3] = [0xe9, 0xed, 0xf5];
+    const SHELL_DARK: [u8; 3] = [0x0f, 0x12, 0x1a];
 
     #[derive(Parser)]
     #[command(name = "oneup-settings", version, about = "OneUpDrive settings")]
@@ -74,8 +78,15 @@ mod win {
             .replace("\"{{START_ITEM}}\"", &Value::from(item).to_string().replace('<', "\\u003c"))
             // The language's translations and the regional format (`oneup_app::l10n`).
             .replace("\"{{L10N}}\"", &oneup_app::l10n::current().page_json());
-        let opts =
-            webview::Options { title: "OneUpDrive", width: 1140, height: 760, data_dir: &webdata, html: &page, dark };
+        let opts = webview::Options {
+            title: "OneUpDrive",
+            width: 1140,
+            height: 760,
+            data_dir: &webdata,
+            html: &page,
+            dark,
+            background: if dark { SHELL_DARK } else { SHELL_LIGHT },
+        };
         let mut watching = false;
         let d = dir.clone();
         let peer = Arc::new(super::settings_peer::Peer::new(&dir));
@@ -1535,6 +1546,16 @@ mod win {
     mod tests {
         #![allow(clippy::unwrap_used)]
         use super::*;
+
+        /// The window's colour while WebView2 starts is the page's own, or
+        /// the page would appear with a change of colour.
+        #[test]
+        fn the_window_starts_in_the_pages_shell_colour() {
+            let css = |[r, g, b]: [u8; 3]| format!("--shell: #{r:02x}{g:02x}{b:02x};");
+            let dark = PAGE.find("@media (prefers-color-scheme: dark)").unwrap();
+            assert!(PAGE[..dark].contains(&css(SHELL_LIGHT)), "light --shell changed");
+            assert!(PAGE[dark..].contains(&css(SHELL_DARK)), "dark --shell changed");
+        }
 
         #[test]
         fn recovery_preserves_dates_and_history_ids() {

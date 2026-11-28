@@ -80,6 +80,11 @@ pub struct Config {
     /// The store's page cache while the scan runs, put back when it hands
     /// the store back. `None`: [`scan_cache_kib`] of the cache it has.
     pub cache_kib: Option<u32>,
+    /// A step stops listing after this long, whatever it has listed: a scan
+    /// that follows the journal between steps ([`Scan::follow_journal`])
+    /// then reads it at least this often, even on a slow or busy disk.
+    /// `None`: no limit.
+    pub list_budget: Option<Duration>,
 }
 
 /// The page cache a scan raises the store's to: 8 times what the memory
@@ -98,7 +103,14 @@ impl Config {
     /// faster than 256. A step still takes well under a second, which is all
     /// an interruption can lose.
     pub fn new(rules: ExcludeSet) -> Self {
-        Self { rules, batch_dirs: 4096, flush_entries: 32_768, buffer_bytes: 256 * 1024, cache_kib: None }
+        Self {
+            rules,
+            batch_dirs: 4096,
+            flush_entries: 32_768,
+            buffer_bytes: 256 * 1024,
+            cache_kib: None,
+            list_budget: None,
+        }
     }
 }
 
@@ -461,7 +473,7 @@ pub(crate) fn list_queued(
                 listed.push((id, depth, None));
             }
         }
-        if pending >= cfg.flush_entries {
+        if pending >= cfg.flush_entries || cfg.list_budget.is_some_and(|budget| t_list.elapsed() >= budget) {
             break;
         }
     }

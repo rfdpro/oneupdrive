@@ -451,22 +451,26 @@ impl Ops<'_> {
     fn remove_below(&self, file_id: u128, include_self: bool) -> Result<usize> {
         // The subtree is collected once into a temp table, then removed from
         // both tables. Recursion follows parent links, so it's proportional
-        // to the subtree's size.
-        self.c.execute("DELETE FROM t_local_sub", [])?;
-        self.c.execute(
-            "INSERT INTO t_local_sub(id)
-             WITH RECURSIVE s(id) AS (
-                 SELECT ?1
-                 UNION
-                 SELECT c.file_id FROM local_item c JOIN s ON c.parent_id = s.id
-             ) SELECT id FROM s",
-            [self.keys.blob(file_id)],
-        )?;
+        // to the subtree's size. The change journal's observer runs this for
+        // every delete record of a stored item: the statements are prepared once.
+        self.c.prepare_cached("DELETE FROM t_local_sub")?.execute([])?;
+        self.c
+            .prepare_cached(
+                "INSERT INTO t_local_sub(id)
+                 WITH RECURSIVE s(id) AS (
+                     SELECT ?1
+                     UNION
+                     SELECT c.file_id FROM local_item c JOIN s ON c.parent_id = s.id
+                 ) SELECT id FROM s",
+            )?
+            .execute([self.keys.blob(file_id)])?;
         if !include_self {
-            self.c.execute("DELETE FROM t_local_sub WHERE id = ?1", [self.keys.blob(file_id)])?;
+            self.c.prepare_cached("DELETE FROM t_local_sub WHERE id = ?1")?.execute([self.keys.blob(file_id)])?;
         }
-        self.c.execute("DELETE FROM local_scan_queue WHERE file_id IN (SELECT id FROM t_local_sub)", [])?;
-        Ok(self.c.execute("DELETE FROM local_item WHERE file_id IN (SELECT id FROM t_local_sub)", [])?)
+        self.c
+            .prepare_cached("DELETE FROM local_scan_queue WHERE file_id IN (SELECT id FROM t_local_sub)")?
+            .execute([])?;
+        Ok(self.c.prepare_cached("DELETE FROM local_item WHERE file_id IN (SELECT id FROM t_local_sub)")?.execute([])?)
     }
 
     /// Moves the journal position up to which the Local tree is current.

@@ -544,7 +544,8 @@ pub mod priority {
 
     /// `on`: background mode (lower CPU, disk and memory priority, so the
     /// user's programs come first) and EcoQoS (Windows may run it on
-    /// efficient cores at lower clock speeds). `off`: normal again.
+    /// efficient cores at lower clock speeds), without the hard cap on
+    /// memory the mode adds ([`soften_working_set`]). `off`: normal again.
     pub fn set_background(on: bool) -> std::io::Result<()> {
         let mode = if on { PROCESS_MODE_BACKGROUND_BEGIN } else { PROCESS_MODE_BACKGROUND_END };
         let state = PROCESS_POWER_THROTTLING_STATE {
@@ -565,6 +566,10 @@ pub mod priority {
             {
                 return Err(std::io::Error::other(e));
             }
+            if on {
+                // Best effort: without it the process is slower, not wrong.
+                let _ = soften_working_set();
+            }
             SetProcessInformation(
                 me,
                 ProcessPowerThrottling,
@@ -573,6 +578,43 @@ pub mod priority {
             )
             .map_err(std::io::Error::other)
         }
+    }
+
+    /// Background mode also makes the working set's maximum a hard 32 MiB
+    /// (undocumented; measured on Windows 11). Memory the process already
+    /// holds then faults back in on every touch: a pass over 256 MiB took
+    /// 120 times as long, and a drive catalog's scan 15% longer. The same
+    /// limits made soft again keep the mode's intent, since Windows trims a
+    /// process over its soft maximum first when memory runs short.
+    fn soften_working_set() -> std::io::Result<()> {
+        use windows::Win32::System::Memory::{
+            GetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_DISABLE, QUOTA_LIMITS_HARDWS_MAX_ENABLE,
+            QUOTA_LIMITS_HARDWS_MIN_DISABLE, SETPROCESSWORKINGSETSIZEEX_FLAGS, SetProcessWorkingSetSizeEx,
+        };
+        let (mut min, mut max, mut flags) = (0usize, 0usize, 0u32);
+        // SAFETY: the current process's pseudo-handle; the outputs are
+        // locals that outlive the call.
+        unsafe {
+            let me = GetCurrentProcess();
+            GetProcessWorkingSetSizeEx(me, &mut min, &mut max, &mut flags).ok().map_err(std::io::Error::other)?;
+            if flags & QUOTA_LIMITS_HARDWS_MAX_ENABLE.0 == 0 {
+                return Ok(());
+            }
+            let soft =
+                SETPROCESSWORKINGSETSIZEEX_FLAGS(QUOTA_LIMITS_HARDWS_MIN_DISABLE.0 | QUOTA_LIMITS_HARDWS_MAX_DISABLE.0);
+            // The same sizes: never above the current ones, so no privilege is needed.
+            SetProcessWorkingSetSizeEx(me, min, max, soft).map_err(std::io::Error::other)
+        }
+    }
+
+    /// Whether the working set's maximum is a hard limit.
+    #[cfg(test)]
+    pub(crate) fn working_set_capped() -> bool {
+        use windows::Win32::System::Memory::{GetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MAX_ENABLE};
+        let (mut min, mut max, mut flags) = (0usize, 0usize, 0u32);
+        // SAFETY: as in `soften_working_set`.
+        let read = unsafe { GetProcessWorkingSetSizeEx(GetCurrentProcess(), &mut min, &mut max, &mut flags) };
+        read.as_bool() && flags & QUOTA_LIMITS_HARDWS_MAX_ENABLE.0 != 0
     }
 
     /// Background mode for the calling thread alone (lower CPU, disk and
@@ -1071,9 +1113,13 @@ mod tests {
 
     #[test]
     fn background_mode_switches_on_and_off_twice() {
-        // Twice each way: asking for the current mode isn't an error.
+        // Twice each way: asking for the current mode isn't an error. On,
+        // it leaves no hard cap on the working set (the mode sets one).
         for on in [true, true, false, false] {
             super::priority::set_background(on).unwrap();
+            if on {
+                assert!(!super::priority::working_set_capped(), "background mode left the 32 MiB cap");
+            }
         }
     }
 

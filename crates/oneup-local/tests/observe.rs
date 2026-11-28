@@ -369,11 +369,12 @@ fn saves_by_rename_go_through_while_the_observer_reads() {
 }
 
 /// An item with a new name in a folder too large to list whole is the one
-/// case read by opening it by ID; the tree still comes out right.
+/// case read by opening it by ID; the tree still comes out right. (Too
+/// large for the two changed items' shared listing as well.)
 #[test]
 fn a_new_name_in_a_large_folder_is_read_by_id() {
     let t = Tmp::new("large");
-    for i in 0..=oneup_local::observe::LIST_WHOLE_MAX {
+    for i in 0..=2 * oneup_local::observe::LIST_WHOLE_MAX {
         t.file(&format!("big/f{i:05}"), b"");
     }
     let store = scan(&t.0);
@@ -395,10 +396,11 @@ fn a_new_name_in_a_large_folder_is_read_by_id() {
 }
 
 /// A folder the store has as small but that has filled since (thousands
-/// of files at once) isn't listed whole: the listing stops past the bound,
-/// and its new items are read one by one, as in any large folder.
+/// of files at once, as a build writes them): each batch lists it once for
+/// all of its new items, rather than opening each by ID. (A listing still
+/// stops past its bound: `a_listing_stops_past_its_bound`.)
 #[test]
-fn a_folder_that_filled_since_its_scan_is_not_listed_whole() {
+fn a_folder_that_filled_since_its_scan_is_listed_once_per_batch() {
     let t = Tmp::new("filled");
     std::fs::create_dir_all(t.at("grow")).unwrap();
     let store = scan(&t.0);
@@ -418,7 +420,7 @@ fn a_folder_that_filled_since_its_scan_is_not_listed_whole() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(observed, expected);
-    assert_eq!(by_id, n as u64, "none found by listing the whole folder");
+    assert_eq!(by_id, 0, "all found by listing the whole folder");
 }
 
 /// A file a program keeps open for writing across a catch-up: its folder's
