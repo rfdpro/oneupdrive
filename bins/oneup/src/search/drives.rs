@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use oneup_local::observe::{Error as ObserveError, Observer};
+use oneup_local::observe::{Error as ObserveError, Observer, Rescan};
 use oneup_ntfs::win::{Volume, search_identity, search_listable};
 use oneup_rules::{ExcludeSet, RuleSet};
 use oneup_store::Store;
@@ -25,6 +25,11 @@ const ALWAYS_EXCLUDED: [&str; 3] = [".oneup", "$Recycle.Bin", "System Volume Inf
 /// In the data folder: Settings or `oneup search --compact-index` asked the
 /// worker to compact the catalogs.
 const COMPACT_REQUEST: &str = "drive-index-compact";
+/// The longest a scan step lists folders before it writes them and follows
+/// the journal again. Listing at background priority on a busy disk can be
+/// slow, and a build can write a 32 MiB journal's worth of changes in a few
+/// minutes: a step must not outlast that.
+const STEP_LISTING: Duration = Duration::from_secs(10);
 
 /// The user's exclusion rules that mean the same on every drive: the
 /// presets and the unanchored lines of `[rules] exclude` (`*.iso`,
@@ -103,7 +108,10 @@ impl Drive {
 
     fn config(&self, protected: &[(u64, u128)], exclusions: &Exclusions) -> oneup_local::Config {
         let excluded = protected.iter().filter(|(serial, _)| *serial == self.serial).map(|(_, id)| *id).collect();
-        oneup_local::Config::new(exclusions.folders().with_folder_ids(excluded))
+        oneup_local::Config {
+            list_budget: Some(STEP_LISTING),
+            ..oneup_local::Config::new(exclusions.folders().with_folder_ids(excluded))
+        }
     }
 
     fn matches_root(&self, root: &oneup_store::LocalRoot) -> bool {
@@ -316,7 +324,8 @@ fn update(
     let compact = dir.join(COMPACT_REQUEST).exists();
     note_error(errors, "", None);
     let mut status = Vec::new();
-    for drive in drives() {
+    let all = drives();
+    for (i, drive) in all.iter().enumerate() {
         if !running() {
             break;
         }
@@ -333,15 +342,18 @@ fn update(
             };
             let scanning = || show(&interim(&status, &name, last, crate::t_key!("Indexing…")));
             let cfg = drive.config(&protected, &exclusions);
-            let result = update_drive(dir, &drive, cfg, cache_kib, keep_going, scanning).and_then(|updated| {
-                // A catalog still being scanned is compacted when its scan ends.
-                if compact && updated == Updated::Ready && running() {
-                    show(&interim(&status, &name, last, crate::t_key!("Compacting…")))?;
-                    let db = drive.db(dir);
-                    compact_catalog(&Store::open(&db, cache_kib)?, &db, &drive.root)?;
-                }
-                Ok(updated)
-            });
+            let mut others = Others::new(dir, &all, i, &protected, &exclusions, cache_kib);
+            let between_steps = || others.follow(&keep_going);
+            let result =
+                update_drive(dir, drive, cfg, cache_kib, keep_going, scanning, between_steps).and_then(|updated| {
+                    // A catalog still being scanned is compacted when its scan ends.
+                    if compact && updated == Updated::Ready && running() {
+                        show(&interim(&status, &name, last, crate::t_key!("Compacting…")))?;
+                        let db = drive.db(dir);
+                        compact_catalog(&Store::open(&db, cache_kib)?, &db, &drive.root)?;
+                    }
+                    Ok(updated)
+                });
             note_error(errors, &name, result.as_ref().err());
             match result {
                 Ok(Updated::Ready) => crate::t_key!("Ready"),
@@ -419,7 +431,8 @@ enum Updated {
 }
 
 /// Brings a drive's catalog up to date: from the journal, or else by a
-/// scan, after which it's compacted. `scanning` runs before a scan starts.
+/// scan, after which it's compacted. `scanning` runs before a scan starts,
+/// `between_steps` after each of its steps.
 fn update_drive(
     dir: &Path,
     drive: &Drive,
@@ -427,24 +440,19 @@ fn update_drive(
     cache_kib: u32,
     keep_going: impl Fn() -> bool,
     scanning: impl FnOnce() -> Result<()>,
+    mut between_steps: impl FnMut(),
 ) -> Result<Updated> {
     if !keep_going() {
         return Ok(Updated::Stopped);
     }
     let db = drive.db(dir);
     std::fs::create_dir_all(db.parent().context("catalog parent")?)?;
-    let mut store = Store::open(&db, cache_kib)?;
-    match store.read(|o| o.local_root())? {
-        Some(root) if !drive.matches_root(&root) => bail!("The volume identity changed"),
-        Some(_) => {}
-        // A new catalog: file IDs sorted as the MFT is, so a scan's rows land
-        // on few B-tree pages (`KeyOrder::Ordered`).
-        None => match store.use_ordered_keys() {
-            Ok(()) | Err(oneup_store::Error::KeysInUse) => {}
-            Err(e) => return Err(e.into()),
-        },
+    let mut store = open_catalog(&db, cache_kib)?;
+    if let Some(root) = store.read(|o| o.local_root())?
+        && !drive.matches_root(&root)
+    {
+        bail!("The volume identity changed");
     }
-    store.install_drive_search()?;
     // Changed exclusions (or vaults) adjust the finished tree in place.
     if let Some(r) = store.write(|o| oneup_local::observe::reapply_rules(o, &cfg.rules))? {
         tracing::info!(
@@ -457,31 +465,55 @@ fn update_drive(
             Ok(_) => return finish(observer.store_mut(), &keep_going),
             Err(ObserveError::NeedsRescan(why)) => {
                 tracing::info!(drive = %drive.root.display(), %why, "drive index scans again");
-                observer.into_store()
+                if journal_lost(why) {
+                    drop(observer);
+                    start_over(&db, cache_kib)?.0
+                } else {
+                    observer.into_store()
+                }
             }
             Err(err) => return Err(err.into()),
         },
-        Err(ObserveError::NeedsRescan(_)) => Store::open(&db, cache_kib)?,
+        Err(ObserveError::NeedsRescan(Rescan::OlderScanner | Rescan::RulesChanged)) => start_over(&db, cache_kib)?.0,
+        // Nothing scanned yet, a scan to carry on, or a volume that may be
+        // readable again later: the scan decides, and keeps the catalog
+        // until it can start.
+        Err(ObserveError::NeedsRescan(_)) => open_catalog(&db, cache_kib)?,
         Err(err) => return Err(err.into()),
     };
     scanning()?;
     let mut store = needs_scan;
     store.write(|o| o.meta_set(READY, "0"))?;
     let mut scan = oneup_local::Scan::open(store, &drive.root, cfg.clone())?;
+    same_volume(drive, &scan)?;
+    let mut log = ScanLog::new(&drive.root, &scan);
     while keep_going() {
         // A whole drive can take longer to list than its journal keeps
         // history. Replaying the journal only after the scan would then find
         // it wrapped, and the next update would start over, without end.
+        let following = Instant::now();
         match scan.follow_journal(&keep_going) {
-            Ok(_) => {}
+            Ok(ch) => log.followed(ch.records, following.elapsed()),
             Err(ObserveError::NeedsRescan(why)) => {
                 tracing::info!(drive = %drive.root.display(), %why, "drive index scan starts over");
-                scan = scan.restart()?;
+                scan = if journal_lost(why) {
+                    drop(scan);
+                    let (store, fresh) = start_over(&db, cache_kib)?;
+                    let scan = oneup_local::Scan::open(store, &drive.root, cfg.clone())?;
+                    if fresh { scan } else { scan.restart()? }
+                } else {
+                    scan.restart()?
+                };
+                same_volume(drive, &scan)?;
+                log = ScanLog::new(&drive.root, &scan);
                 continue;
             }
             Err(err) => return Err(err.into()),
         }
-        if !scan.step()? {
+        let more = scan.step()?;
+        log.note(&scan, !more);
+        between_steps();
+        if !more {
             let mut observer = Observer::open(scan.into_store(), cfg)?;
             return match observer.catch_up_while(&keep_going) {
                 Ok(_) => {
@@ -504,6 +536,222 @@ fn update_drive(
         }
     }
     Ok(Updated::Stopped)
+}
+
+/// The journal no longer has the records a catalog needs: only a scan from
+/// scratch brings it back.
+fn journal_lost(why: Rescan) -> bool {
+    matches!(why, Rescan::JournalWrapped | Rescan::JournalReplaced)
+}
+
+/// A scan opened on a new catalog takes whatever volume is at the drive's
+/// root: it must be the one this catalog is named for.
+fn same_volume(drive: &Drive, scan: &oneup_local::Scan) -> Result<()> {
+    if !drive.matches_root(scan.root()) {
+        bail!("The volume identity changed");
+    }
+    Ok(())
+}
+
+/// Opens a drive's catalog, made if there's none: file IDs sorted as the
+/// MFT is, so a scan's rows land on few B-tree pages (`KeyOrder::Ordered`).
+fn open_catalog(db: &Path, cache_kib: u32) -> Result<Store> {
+    let mut store = Store::open(db, cache_kib)?;
+    if store.read(|o| o.local_root())?.is_none() {
+        match store.use_ordered_keys() {
+            Ok(()) | Err(oneup_store::Error::KeysInUse) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    store.install_drive_search()?;
+    Ok(store)
+}
+
+/// A new, empty catalog in place of the one at `db`, for a scan from
+/// scratch: emptying the old one row by row took 8 to 15 minutes for a
+/// large drive (every row firing the catalog's triggers) and wrote the
+/// whole table out again through the WAL. The caller has closed its own
+/// connection. Also says whether the file is new: it isn't while the old
+/// one is still open elsewhere (a search), and the scan empties it then.
+fn start_over(db: &Path, cache_kib: u32) -> Result<(Store, bool)> {
+    // Our own files in the data folder. Windows refuses the rename while
+    // anyone has the database open; only once it's moved are its -wal and
+    // -shm free to go, and a new database must never meet the old WAL. The
+    // -shm (an index SQLite rebuilds) goes first: if the WAL then can't,
+    // the old database is put back with its WAL, which may hold commits
+    // its file doesn't have yet.
+    let old = db.with_extension("old");
+    let _ = std::fs::remove_file(&old);
+    let sibling = |suffix: &str| {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    let gone = |path: PathBuf| match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let fresh = std::fs::rename(db, &old).is_ok() && {
+        let cleared = gone(sibling("-shm")) && gone(sibling("-wal"));
+        if !cleared {
+            let _ = std::fs::rename(&old, db);
+        }
+        cleared
+    };
+    if fresh {
+        let _ = std::fs::remove_file(&old);
+    } else {
+        tracing::info!("drive index in use: emptied in place");
+    }
+    Ok((open_catalog(db, cache_kib)?, fresh))
+}
+
+/// How often a running scan says how it goes, in the worker's log.
+const SCAN_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// A scan's progress for the log: how fast it lists, where its time goes
+/// (listing folders, writing the catalog, following the journal) and how
+/// much of the journal it followed. A drive only by its root.
+struct ScanLog {
+    drive: String,
+    progress: std::sync::Arc<oneup_local::Progress>,
+    started: Instant,
+    logged: Instant,
+    entries_logged: u64,
+    follow: Duration,
+    records: u64,
+}
+
+impl ScanLog {
+    fn new(drive: &Path, scan: &oneup_local::Scan) -> Self {
+        let now = Instant::now();
+        Self {
+            drive: drive.display().to_string(),
+            progress: scan.progress(),
+            started: now,
+            logged: now,
+            entries_logged: 0,
+            follow: Duration::ZERO,
+            records: 0,
+        }
+    }
+
+    fn followed(&mut self, records: u64, took: Duration) {
+        self.records += records;
+        self.follow += took;
+    }
+
+    /// After a step; `done`: the scan's last.
+    fn note(&mut self, scan: &oneup_local::Scan, done: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !done && self.logged.elapsed() < SCAN_LOG_EVERY {
+            return;
+        }
+        let p = &self.progress;
+        let entries = p.entries.load(Relaxed);
+        let secs = self.logged.elapsed().as_secs_f64().max(0.001);
+        tracing::info!(
+            drive = %self.drive,
+            start = ?scan.start(),
+            entries,
+            folders = p.folders_listed.load(Relaxed),
+            per_second = ((entries - self.entries_logged) as f64 / secs).round(),
+            minutes = (self.started.elapsed().as_secs_f64() / 60.0).round(),
+            listing_s = p.list_us.load(Relaxed) / 1_000_000,
+            writing_s = p.store_us.load(Relaxed) / 1_000_000,
+            journal_s = self.follow.as_secs(),
+            journal_records = self.records,
+            "{}",
+            if done { "drive index scan done" } else { "drive index scanning" }
+        );
+        self.logged = Instant::now();
+        self.entries_logged = entries;
+    }
+}
+
+/// How often a scan stops to catch up the other drives' catalogs.
+const FOLLOW_OTHERS: Duration = Duration::from_secs(30);
+/// The longest one such stop takes: the scanned drive's own journal waits
+/// meanwhile. A catalog not caught up by then goes on at the next stop.
+const FOLLOW_OTHERS_FOR: Duration = Duration::from_secs(10);
+
+/// The other drives' ready catalogs, kept current from their journals while
+/// one drive is scanned. A first scan can take hours, and a system drive can
+/// turn its 32 MiB journal over in minutes (measured: 70 to 170 KiB of
+/// records a second with a browser and a build running): a catalog left that
+/// long would need a scan of its own once its turn came. Opened when the
+/// scan first asks, so a pass that scans nothing opens nothing. One that
+/// can't be followed (not ready, or its journal lost records) is left for
+/// its turn.
+struct Others<'a> {
+    dir: &'a Path,
+    drives: Vec<(&'a Drive, oneup_local::Config)>,
+    cache_kib: u32,
+    observers: Option<Vec<(String, Observer)>>,
+    next: Instant,
+    every: Duration,
+}
+
+impl<'a> Others<'a> {
+    fn new(
+        dir: &'a Path,
+        all: &'a [Drive],
+        scanned: usize,
+        protected: &[(u64, u128)],
+        exclusions: &Exclusions,
+        cache_kib: u32,
+    ) -> Self {
+        let drives = all
+            .iter()
+            .enumerate()
+            .filter(|&(i, d)| i != scanned && !protected.contains(&(d.serial, d.id)))
+            .map(|(_, d)| (d, d.config(protected, exclusions)))
+            .collect();
+        Self { dir, drives, cache_kib, observers: None, next: Instant::now(), every: FOLLOW_OTHERS }
+    }
+
+    fn follow(&mut self, keep_going: &impl Fn() -> bool) {
+        if Instant::now() < self.next || !keep_going() {
+            return;
+        }
+        let (dir, cache_kib) = (self.dir, self.cache_kib);
+        let observers = self.observers.get_or_insert_with(|| {
+            self.drives.iter().filter_map(|(drive, cfg)| Self::open(dir, drive, cfg.clone(), cache_kib)).collect()
+        });
+        let started = Instant::now();
+        let in_time = || keep_going() && started.elapsed() < FOLLOW_OTHERS_FOR;
+        observers.retain_mut(|(name, observer)| {
+            let caught = observer
+                .catch_up_while(in_time)
+                .map_err(anyhow::Error::from)
+                .and_then(|_| flush(observer.store_mut(), &in_time));
+            caught
+                .inspect_err(
+                    |e| tracing::info!(drive = %name, error = %format!("{e:#}"), "drive index left for its turn"),
+                )
+                .is_ok()
+        });
+        // A different drive first next time, so a long backlog can't keep
+        // the others waiting.
+        if !observers.is_empty() {
+            observers.rotate_left(1);
+        }
+        self.next = Instant::now() + self.every;
+    }
+
+    /// A drive's catalog, if it has a finished scan of this drive to follow.
+    fn open(dir: &Path, drive: &Drive, cfg: oneup_local::Config, cache_kib: u32) -> Option<(String, Observer)> {
+        let db = drive.db(dir);
+        if !db.exists() {
+            return None;
+        }
+        let store = Store::open(&db, cache_kib).ok()?;
+        if !store.read(|o| o.local_root()).ok()?.is_some_and(|root| drive.matches_root(&root)) {
+            return None;
+        }
+        let observer = Observer::open(store, cfg).ok()?;
+        Some((drive.root.display().to_string(), observer))
+    }
 }
 
 fn finish(store: &mut Store, keep_going: &impl Fn() -> bool) -> Result<Updated> {
@@ -779,9 +1027,15 @@ mod tests {
         let drive = Drive::open(root.clone()).unwrap();
         let (serial, protected) = search_identity(&root.join("protected")).unwrap();
         let cfg = drive.config(&[(serial, protected.0)], &no_exclusions());
-        assert_eq!(update_drive(&profile, &drive, cfg.clone(), 1024, || false, || Ok(())).unwrap(), Updated::Stopped);
+        assert_eq!(
+            update_drive(&profile, &drive, cfg.clone(), 1024, || false, || Ok(()), || {}).unwrap(),
+            Updated::Stopped
+        );
         assert!(!drive.db(&profile).exists());
-        assert_eq!(update_drive(&profile, &drive, cfg.clone(), 1024, || true, || Ok(())).unwrap(), Updated::Ready);
+        assert_eq!(
+            update_drive(&profile, &drive, cfg.clone(), 1024, || true, || Ok(()), || {}).unwrap(),
+            Updated::Ready
+        );
         let find = |text: &str| {
             let store = Store::open(&drive.db(&profile), 1024).unwrap();
             let mut names = Vec::new();
@@ -803,7 +1057,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, || Ok(())).unwrap(), Updated::Ready);
+        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, || Ok(()), || {}).unwrap(), Updated::Ready);
         assert!(find("invoice").is_empty());
         assert_eq!(find("receipt"), ["Receipt-2026.pdf"]);
     }
@@ -837,7 +1091,10 @@ mod tests {
             // Enough for the root's step and at most one more.
             calls.get() < 4
         };
-        assert_eq!(update_drive(&profile, &drive, cfg.clone(), 1024, stop_soon, scanning).unwrap(), Updated::Stopped);
+        assert_eq!(
+            update_drive(&profile, &drive, cfg.clone(), 1024, stop_soon, scanning, || {}).unwrap(),
+            Updated::Stopped
+        );
         let mut store = Store::open(&drive.db(&profile), 64).unwrap();
         let stats = store.read(|o| o.local_stats()).unwrap();
         assert!(stats.queued > 0, "stopped part way: {stats:?}");
@@ -845,7 +1102,7 @@ mod tests {
         // the journal was reset.
         store.write(|o| o.local_set_journal_cursor(i64::MAX)).unwrap();
         drop(store);
-        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, scanning).unwrap(), Updated::Ready);
+        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, scanning, || {}).unwrap(), Updated::Ready);
         assert_eq!(scans.get(), 2, "the status says indexing before each scan");
         let store = Store::open(&drive.db(&profile), 64).unwrap();
         let mut names = Vec::new();
@@ -859,6 +1116,27 @@ mod tests {
             .unwrap();
         names.sort();
         assert_eq!(names, ["Report-a.txt", "Report-b.txt", "Report-c.txt"]);
+    }
+
+    /// A scan from scratch gets a new catalog file rather than deleting the
+    /// old one's rows one by one; one a search still has open is kept (and
+    /// its -wal with it), for the scan to empty.
+    #[test]
+    fn a_catalog_starts_over_as_a_new_file_unless_it_is_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("C-0000000000000001-00000000000000000000000000000005.v2.db");
+        let marked = |store: &Store| store.read(|o| o.meta_get("test.mark")).unwrap().is_some();
+        let mut store = open_catalog(&db, 64).unwrap();
+        store.write(|o| o.meta_set("test.mark", "old")).unwrap();
+        let search = Store::open(&db, 64).unwrap();
+        drop(store);
+        let (store, fresh) = start_over(&db, 64).unwrap();
+        assert!(!fresh && marked(&store), "open elsewhere: kept");
+        drop((store, search));
+        let (store, fresh) = start_over(&db, 64).unwrap();
+        assert!(fresh && !marked(&store), "a new file");
+        assert_eq!(store.key_order(), oneup_store::KeyOrder::Ordered);
+        assert!(!db.with_extension("old").exists());
     }
 
     /// Names in a catalog, as search finds them before checking the files.
@@ -906,7 +1184,7 @@ mod tests {
 
         let first = rules(r#""*.log", "Secret/", "/Report-keep.txt", "Sub/Report-keep.txt""#);
         let cfg = drive.config(&[], &first);
-        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, scanning).unwrap(), Updated::Ready);
+        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, scanning, || {}).unwrap(), Updated::Ready);
         assert_eq!(Store::open(&db, 64).unwrap().key_order(), oneup_store::KeyOrder::Ordered);
         // Folders left out by the scan; the log file's name is stored and
         // hidden when results are shown; anchored lines don't apply.
@@ -918,7 +1196,7 @@ mod tests {
         // Secret/ no longer excluded: listed in place, without a new scan.
         let second = rules(r#""*.log""#);
         let cfg = drive.config(&[], &second);
-        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, scanning).unwrap(), Updated::Ready);
+        assert_eq!(update_drive(&profile, &drive, cfg, 1024, || true, scanning, || {}).unwrap(), Updated::Ready);
         assert_eq!(scans.get(), 1, "one scan, at the start");
         assert_eq!(names_in(&db, "report"), ["Report-app.log", "Report-keep.txt", "Report-plan.txt"]);
     }
@@ -952,9 +1230,48 @@ mod tests {
             }
             true
         };
-        assert_eq!(update_drive(&profile, &drive, cfg, 1024, keep_going, || Ok(())).unwrap(), Updated::Ready);
+        assert_eq!(update_drive(&profile, &drive, cfg, 1024, keep_going, || Ok(()), || {}).unwrap(), Updated::Ready);
         assert!(calls.get() > 4, "the rename happened during the scan");
         assert_eq!(names_in(&drive.db(&profile), "report"), ["Report-final.txt"]);
+    }
+
+    /// While one drive is scanned, a ready catalog of another follows its
+    /// own journal: a rename there reaches its index before its turn comes.
+    #[test]
+    fn a_ready_catalog_follows_its_journal_while_another_drive_is_scanned() {
+        let temp = tempfile::tempdir().unwrap();
+        let (a, b) = (temp.path().join("a"), temp.path().join("b"));
+        let profile = temp.path().join("profile");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("Invoice-2026.pdf"), "fixture").unwrap();
+        for folder in ["x", "y", "z"] {
+            std::fs::create_dir_all(b.join(folder)).unwrap();
+        }
+        std::fs::create_dir_all(&profile).unwrap();
+        let all = [Drive::open(a.clone()).unwrap(), Drive::open(b).unwrap()];
+        let cfg = |drive: &Drive| oneup_local::Config { batch_dirs: 1, ..drive.config(&[], &no_exclusions()) };
+        let update = |drive: &Drive, between: &mut dyn FnMut()| {
+            update_drive(&profile, drive, cfg(drive), 1024, || true, || Ok(()), between).unwrap()
+        };
+        assert_eq!(update(&all[0], &mut || {}), Updated::Ready);
+        let mut others = Others::new(&profile, &all, 1, &[], &no_exclusions(), 1024);
+        others.every = Duration::ZERO;
+        let mut steps = 0;
+        let mut between = || {
+            steps += 1;
+            if steps == 1 {
+                let status = Command::new("cmd")
+                    .current_dir(&a)
+                    .args(["/d", "/c", "ren Invoice-2026.pdf Receipt-2026.pdf"])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            others.follow(&|| true);
+        };
+        assert_eq!(update(&all[1], &mut between), Updated::Ready);
+        assert!(steps > 1, "several steps");
+        assert_eq!(names_in(&all[0].db(&profile), "2026"), ["Receipt-2026.pdf"]);
     }
 
     #[test]

@@ -14,13 +14,17 @@
 //!   record, but unprivileged records carry no names (measured), so the
 //!   item is read from its parent's listing without being opened ([`Lookup`]:
 //!   while a file is open, some programs can't save it by renaming another
-//!   file over it, see `win::Volume`). It's looked up there under its
-//!   stored name, then under names other items of that folder gave up in
-//!   the same batch (a save by rename leaves the new file with the old
-//!   one's name), each one lookup in the folder's index; failing those, a
-//!   folder of at most [`LIST_WHOLE_MAX`] entries is listed whole, once per
-//!   batch (stopping past that many: the folder may have filled since). Only
-//!   an item with a new name in a larger folder is opened, by file ID
+//!   file over it, see `win::Volume`). The lone changed item of a folder is
+//!   looked up there under its stored name, then under names other items of
+//!   that folder gave up in the same batch (a save by rename leaves the new
+//!   file with the old one's name), each one lookup in the folder's index;
+//!   failing those, a folder of at most [`LIST_WHOLE_MAX`] entries is
+//!   listed whole, once per batch (stopping past that many: the folder may
+//!   have filled since). A folder with several changed items is listed
+//!   whole once for all of them, up to [`LIST_WHOLE_MAX`] entries per item,
+//!   and each is found there by ID; their names are tried only if the
+//!   listing stopped past that bound. Only an item with a new name in a
+//!   larger folder is opened, by file ID
 //!   ([`Volume::stat_in`]), and only if still in the record's folder. Not
 //!   in the record's folder any more: it moved or went since, it's left as
 //!   it was (never taken for deleted), and its later record says so. Then:
@@ -70,9 +74,9 @@
 //! ## Cost
 //! Proportional to the journal's records, not the tree: a few indexed
 //! lookups per mentioned ID, and per item inside the tree a lookup or two
-//! in its folder's index (or a share of one whole listing of a folder of at
-//! most [`LIST_WHOLE_MAX`] entries per batch). Folders are listed only when
-//! they enter the tree or for such a lookup. The journal is volume-wide, so
+//! in its folder's index (or a share of one whole listing of its folder per
+//! batch, of at most [`LIST_WHOLE_MAX`] entries per item read there).
+//! Folders are listed only when they enter the tree or for such a lookup. The journal is volume-wide, so
 //! activity elsewhere on the disk costs a lookup per record and nothing more.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -190,17 +194,28 @@ pub struct Lookup {
     /// that renames a new file over the old one, or moves the old one
     /// aside first, leaves the new file with the old one's name).
     pub names: Vec<String>,
-    /// Whether `parent` is small enough to list whole when no name finds
-    /// the item ([`LIST_WHOLE_MAX`]).
-    pub list_whole: bool,
+    /// The most entries `parent` may hold to be listed whole when no name
+    /// finds the item; 0: it isn't listed ([`LIST_WHOLE_MAX`]).
+    pub list_upto: usize,
+    /// `parent`'s listing serves several items of the batch: it's read
+    /// first, and finds each of them by ID. Its names are tried only if the
+    /// folder outgrew the bound since the store counted it.
+    pub listing_first: bool,
 }
 
-/// The most entries a folder may hold to be listed whole for an item none
-/// of whose [`Lookup::names`] finds it (a new name). Listed once per batch,
-/// for all of its items that need it. The live listing stops past this many
-/// entries as well (the store's count can be behind). A larger folder's item is opened by
-/// ID instead: listing it per batch would cost more than the folder's
-/// changes, and that open is brief.
+/// The most entries a folder may hold, per item of a batch read in it, to
+/// be listed whole: once per batch, for all of them. One listing call
+/// returns a couple of thousand entries, about what one lookup by name
+/// costs, and an item with a new name costs up to [`NAMES_MAX`] lookups
+/// before it's opened. A lone item first tries its names. Several items
+/// are read from the listing alone: a build that writes each output anew
+/// next to the old one and deletes that one costs a whole listing per batch
+/// rather than eight failed lookups per output (measured on 5,000 outputs
+/// in one folder: 9.5 s to follow by names, 0.3 s from shared listings;
+/// 5,000 edits there, 0.7 s and 0.2 s). The live listing stops past the
+/// bound too (the store's count can be behind). A larger folder's item is opened by ID instead:
+/// listing it per batch would cost more than its changes, and that open is
+/// brief.
 pub const LIST_WHOLE_MAX: usize = 4096;
 
 /// At most this many [`Lookup::names`] are tried: each is one lookup in the
@@ -321,7 +336,16 @@ fn apply(
     let mut order: Vec<usize> = last.into_values().collect();
     order.sort_unstable();
     let freed = freed_names(o, records)?;
-    let mut small: HashMap<u128, bool> = HashMap::new();
+    // Items each folder's listing may serve: the ones read below (all but
+    // deletes and the scanned folder itself), counted before any is read.
+    let mut to_read: HashMap<u128, usize> = HashMap::new();
+    for r in order.iter().map(|&i| &records[i]) {
+        if r.file_id.0 != root_id && !r.has(reason::FILE_DELETE) {
+            *to_read.entry(r.parent_id.0).or_default() += 1;
+        }
+    }
+    // How large each folder may be to be listed whole, once per batch.
+    let mut list_upto: HashMap<u128, usize> = HashMap::new();
     // A write to a file's data: a hash of it made for finding duplicates no
     // longer stands, even if the write kept its size and put its time back.
     let data = reason::DATA_OVERWRITE | reason::DATA_EXTEND | reason::DATA_TRUNCATION;
@@ -382,6 +406,17 @@ fn apply(
             }
             continue;
         }
+        // Counted once per folder and batch, and never past the bound.
+        let sharing = to_read.get(&parent).copied().unwrap_or(1).max(1);
+        let upto = match list_upto.get(&parent) {
+            Some(&u) => u,
+            None => {
+                let bound = LIST_WHOLE_MAX.saturating_mul(sharing);
+                let u = if o.local_child_count_upto(parent, bound.saturating_add(1))? <= bound { bound } else { 0 };
+                list_upto.insert(parent, u);
+                u
+            }
+        };
         let mut names: Vec<String> = known.iter().map(|k| k.name.clone()).collect();
         for n in freed.get(&parent).into_iter().flatten().rev() {
             if names.len() >= NAMES_MAX {
@@ -391,16 +426,9 @@ fn apply(
                 names.push(n.clone());
             }
         }
-        // Counted once per folder and batch, and never past the bound.
-        let list_whole = match small.get(&parent) {
-            Some(&s) => s,
-            None => {
-                let s = o.local_child_count_upto(parent, LIST_WHOLE_MAX + 1)? <= LIST_WHOLE_MAX;
-                small.insert(parent, s);
-                s
-            }
-        };
-        let entry = match stat(&Lookup { id: r.file_id, parent: r.parent_id, names, list_whole }) {
+        let listing_first = sharing > 1 && upto > 0;
+        let lookup = Lookup { id: r.file_id, parent: r.parent_id, names, list_upto: upto, listing_first };
+        let entry = match stat(&lookup) {
             Stat::Found(e) if !e.name.is_empty() => e,
             Stat::Found(_) | Stat::Unreadable => {
                 ch.unreadable += 1;
@@ -664,7 +692,7 @@ mod driver {
     use oneup_ntfs::win::{self, Volume};
     use oneup_store::{LocalRoot, Store};
 
-    use super::{Changes, Error, LIST_WHOLE_MAX, Lookup, Rescan, Result, Stat, Tree, apply};
+    use super::{Changes, Error, Lookup, Rescan, Result, Stat, Tree, apply};
     use crate::classify;
     use crate::scan::{Config, Progress, list_queued};
     use std::collections::HashMap;
@@ -951,6 +979,11 @@ mod driver {
         listings: &mut HashMap<u128, Option<Vec<DirEntry>>>,
         buf: &mut [u8],
     ) -> Stat {
+        if l.listing_first
+            && let Some(read) = from_listing(volume, l, listings, buf)
+        {
+            return read;
+        }
         for name in &l.names {
             match volume.listed_in(l.parent, name, l.id) {
                 Ok(Some(e)) => return Stat::Found(e),
@@ -963,27 +996,10 @@ mod driver {
                 }
             }
         }
-        if l.list_whole {
-            // The store's count can be behind the folder (filled since):
-            // the listing stops past the bound too, and the folder then
-            // counts as large for the rest of the batch.
-            let listed = listings.entry(l.parent.0).or_insert_with(|| {
-                let mut out = Vec::new();
-                match volume
-                    .open_dir_by_id(l.parent)
-                    .and_then(|h| win::list_dir_upto(&h, buf, &mut out, LIST_WHOLE_MAX))
-                {
-                    Ok(true) => Some(out),
-                    Ok(false) => None,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "a changed item's folder could not be listed");
-                        None
-                    }
-                }
-            });
-            if let Some(entries) = listed {
-                return entries.iter().find(|e| e.file_id == l.id).map_or(Stat::Gone, |e| Stat::Found(e.clone()));
-            }
+        if !l.listing_first
+            && let Some(read) = from_listing(volume, l, listings, buf)
+        {
+            return read;
         }
         // Only if it's still in the record's folder: one that moved since
         // has a later record, which places it; stored here, it would be
@@ -996,6 +1012,35 @@ mod driver {
                 Stat::Unreadable
             }
         }
+    }
+
+    /// The item as `l.parent`'s whole listing has it, listed once per batch
+    /// (in `listings`); `None` when the folder isn't to be listed, or its
+    /// listing stopped past `l.list_upto` entries: the store's count can be
+    /// behind the folder (filled since), and the folder then counts as large
+    /// for the rest of the batch.
+    fn from_listing(
+        volume: &Volume,
+        l: &Lookup,
+        listings: &mut HashMap<u128, Option<Vec<DirEntry>>>,
+        buf: &mut [u8],
+    ) -> Option<Stat> {
+        if l.list_upto == 0 {
+            return None;
+        }
+        let listed = listings.entry(l.parent.0).or_insert_with(|| {
+            let mut out = Vec::new();
+            match volume.open_dir_by_id(l.parent).and_then(|h| win::list_dir_upto(&h, buf, &mut out, l.list_upto)) {
+                Ok(true) => Some(out),
+                Ok(false) => None,
+                Err(e) => {
+                    tracing::debug!(error = %e, "a changed item's folder could not be listed");
+                    None
+                }
+            }
+        });
+        let entries = listed.as_ref()?;
+        Some(entries.iter().find(|e| e.file_id == l.id).map_or(Stat::Gone, |e| Stat::Found(e.clone())))
     }
 
     /// A cloud placeholder folder read by ID, with the attributes its
@@ -1110,7 +1155,7 @@ mod driver {
             let (a, b) = (FileId(file_id(&dir.join("a"))), FileId(file_id(&dir.join("b"))));
             let id = FileId(file_id(&dir.join("b").join("new.txt")));
             let read = |parent| {
-                let l = Lookup { id, parent, names: Vec::new(), list_whole: false };
+                let l = Lookup { id, parent, names: Vec::new(), list_upto: 0, listing_first: false };
                 read_item(&volume, &l, &mut HashMap::new(), &mut vec![0u8; 64 * 1024])
             };
             // The record said `a`; it's in `b` now. Opened by ID, it's
@@ -1119,6 +1164,32 @@ mod driver {
             assert_eq!(read(a), Stat::Gone);
             assert!(matches!(read(b), Stat::Found(e) if e.name == "new.txt"));
             assert_eq!(volume.opened_by_id(), 3);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A folder that holds more than a lookup's bound (it filled since
+        /// the store last counted it) isn't read from a listing: the listing
+        /// stops past the bound, then the item's names are tried, and only
+        /// an item none of them finds is opened by ID.
+        #[test]
+        fn a_listing_stops_past_its_bound() {
+            let dir = temp("bound");
+            for i in 0..10 {
+                std::fs::write(dir.join(format!("f{i}")), b"x").unwrap();
+            }
+            let volume = Volume::open_containing(&dir).unwrap();
+            let (parent, id) = (FileId(file_id(&dir)), FileId(file_id(&dir.join("f3"))));
+            let read = |list_upto, names: &[&str]| {
+                let names = names.iter().map(|n| n.to_string()).collect();
+                let l = Lookup { id, parent, names, list_upto, listing_first: true };
+                read_item(&volume, &l, &mut HashMap::new(), &mut vec![0u8; 64 * 1024])
+            };
+            assert!(matches!(read(64, &[]), Stat::Found(e) if e.name == "f3"));
+            assert_eq!(volume.opened_by_id(), 0, "found in the listing");
+            assert!(matches!(read(2, &["f3"]), Stat::Found(e) if e.name == "f3"));
+            assert_eq!(volume.opened_by_id(), 0, "past the bound: found by its name");
+            assert!(matches!(read(2, &[]), Stat::Found(e) if e.name == "f3"));
+            assert_eq!(volume.opened_by_id(), 1, "past the bound, no name: opened by ID");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1313,30 +1384,82 @@ mod tests {
     #[test]
     fn items_are_looked_up_under_their_stored_and_freed_names() {
         let mut s = tree();
-        // An edit; a save that renamed new file 6 over b.txt (4); a save
-        // that moved a.txt (3) aside to `~old` first, then renamed 7 in.
+        let names = |asked: &[Lookup], id: u128| asked.iter().find(|l| l.id.0 == id).map(|l| l.names.clone()).unwrap();
+        // One item to read per folder in each batch: its names come first.
+        // An edit:
+        let (_, asked) = apply_seen(&mut s, &[rec(2, ROOT_ID, reason::BASIC_INFO_CHANGE)], &[entry(2, "docs", DIR, 0)]);
+        assert_eq!(names(&asked, 2)[0], "docs", "its stored name first");
+        // A save that renamed new file 6 over b.txt (4):
         let (_, asked) = apply_seen(
             &mut s,
             &[
-                rec(2, ROOT_ID, reason::BASIC_INFO_CHANGE),
                 rec(6, ROOT_ID, reason::FILE_CREATE),
                 rec(4, ROOT_ID, reason::FILE_DELETE),
                 rec(6, ROOT_ID, reason::RENAME_NEW_NAME),
+            ],
+            &[entry(2, "docs", DIR, 0), entry(6, "b.txt", 0, 2)],
+        );
+        assert_eq!(names(&asked, 6), ["b.txt"], "the name b.txt gave up");
+        // A save that moved a.txt (3) aside to `~old` first, then renamed 7 in:
+        let (_, asked) = apply_seen(
+            &mut s,
+            &[
                 rec(3, 2, reason::RENAME_OLD_NAME),
                 rec(3, 2, reason::RENAME_NEW_NAME),
                 rec(7, 2, reason::RENAME_NEW_NAME),
                 rec(3, 2, reason::FILE_DELETE),
-                rec(8, ROOT_ID, reason::FILE_CREATE),
             ],
-            &[entry(2, "docs", DIR, 0), entry(6, "b.txt", 0, 2), entry(7, "a.txt", 0, 3), entry(8, "new.txt", 0, 1)],
+            &[entry(2, "docs", DIR, 0), entry(6, "b.txt", 0, 2), entry(7, "a.txt", 0, 3)],
         );
-        let names = |id: u128| asked.iter().find(|l| l.id.0 == id).map(|l| l.names.clone()).unwrap();
-        assert_eq!(names(2)[0], "docs", "its stored name first");
-        assert_eq!(names(6), ["b.txt"], "the name b.txt gave up");
-        assert_eq!(names(7), ["a.txt"]);
-        assert!(names(8).contains(&"b.txt".to_string()) && asked.iter().all(|l| l.list_whole));
+        assert_eq!(names(&asked, 7), ["a.txt"]);
+        assert!(asked.iter().all(|l| l.list_upto == LIST_WHOLE_MAX && !l.listing_first));
         assert_eq!(path(&s, 6).as_deref(), Some("/b.txt"));
         assert_eq!(path(&s, 7).as_deref(), Some("/docs/a.txt"));
+    }
+
+    /// A build writes each output anew beside the old one and deletes that
+    /// one: the folder's listing serves all its new items, by ID, rather
+    /// than each trying the names the old outputs gave up.
+    #[test]
+    fn several_items_of_a_folder_are_read_from_one_listing() {
+        let mut s = tree();
+        s.write(|o| {
+            for i in 0..3 {
+                o.local_update(&row(100 + i, 2, &format!("old{i}.rlib"), LocalKind::File))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut records = Vec::new();
+        for i in 0..3 {
+            records.push(rec(200 + i, 2, reason::FILE_CREATE | reason::DATA_EXTEND | reason::CLOSE));
+            records.push(rec(100 + i, 2, reason::FILE_DELETE | reason::CLOSE));
+        }
+        let live: Vec<DirEntry> = (0..3).map(|i| entry(200 + i, &format!("new{i}.rlib"), 0, 1)).collect();
+        let (ch, asked) = apply_seen(&mut s, &records, &live);
+        assert_eq!(asked.len(), 3);
+        assert!(asked.iter().all(|l| l.listing_first && l.list_upto == 3 * LIST_WHOLE_MAX), "{asked:?}");
+        assert_eq!((ch.created, ch.deleted), (3, 3));
+        assert_eq!(path(&s, 202).as_deref(), Some("/docs/new2.rlib"));
+    }
+
+    /// A folder too large for one item's listing is listed for several.
+    #[test]
+    fn a_large_folder_with_several_changes_is_listed_once() {
+        let mut s = tree();
+        s.write(|o| {
+            for i in 0..=LIST_WHOLE_MAX as u128 {
+                o.local_update(&row(1000 + i, 2, &format!("f{i}"), LocalKind::File))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let (_, asked) = apply_seen(
+            &mut s,
+            &[rec(9, 2, reason::FILE_CREATE), rec(10, 2, reason::FILE_CREATE)],
+            &[entry(9, "n9", 0, 1), entry(10, "n10", 0, 1)],
+        );
+        assert!(asked.iter().all(|l| l.listing_first && l.list_upto == 2 * LIST_WHOLE_MAX), "{asked:?}");
     }
 
     #[test]
@@ -1354,7 +1477,7 @@ mod tests {
             &[rec(9, 2, reason::FILE_CREATE), rec(10, ROOT_ID, reason::FILE_CREATE)],
             &[entry(9, "n9", 0, 1), entry(10, "n10", 0, 1)],
         );
-        assert_eq!(asked.iter().map(|l| (l.id.0, l.list_whole)).collect::<Vec<_>>(), [(9, false), (10, true)]);
+        assert_eq!(asked.iter().map(|l| (l.id.0, l.list_upto)).collect::<Vec<_>>(), [(9, 0), (10, LIST_WHOLE_MAX)]);
     }
 
     #[test]

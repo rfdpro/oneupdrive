@@ -20,18 +20,19 @@ use webview2_com::{
     CoTaskMemPWSTR, CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
     WebMessageReceivedEventHandler,
 };
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow};
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, LoadIconW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_COPYDATA, WM_DESTROY, WM_SIZE, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, IDC_ARROW,
+    LoadCursorW, LoadIconW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER,
+    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_COPYDATA, WM_DESTROY,
+    WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -99,8 +100,12 @@ pub struct Options<'a> {
     pub data_dir: &'a Path,
     /// The whole page.
     pub html: &'a str,
-    /// The page's background while it loads, and the title bar's theme.
+    /// The title bar's theme.
     pub dark: bool,
+    /// The page's own background (red, green, blue). The window shows it
+    /// from its first frame and the browser control until the page draws:
+    /// WebView2 takes a second or more to start, which otherwise shows white.
+    pub background: [u8; 3],
 }
 
 /// Sends messages (JSON) to the page from any thread.
@@ -326,12 +331,63 @@ fn own_taskbar_button(hwnd: HWND) {
     }
 }
 
+/// WebView2's colour for a control's first frames, as AARRGGBB in hex.
+const BACKGROUND_VARIABLE: &str = "WEBVIEW2_DEFAULT_BACKGROUND_COLOR";
+
+/// Starts the runtime (its files in `data_dir`), then makes the browser
+/// control in `hwnd`. Both finish asynchronously; this pumps the thread's
+/// messages until they do, so the window keeps painting meanwhile.
+fn browser_control(hwnd: HWND, data_dir: &Path) -> Result<(ICoreWebView2Environment, ICoreWebView2Controller)> {
+    let data = HSTRING::from(data_dir.as_os_str());
+    let (tx, rx) = std::sync::mpsc::channel();
+    CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| {
+            // SAFETY: the folder string outlives the call; the handler is
+            // a live COM object.
+            unsafe { CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &data, None, &handler) }
+                .map_err(webview2_com::Error::WindowsError)
+        }),
+        Box::new(move |code, env| {
+            code?;
+            let _ = tx.send(env);
+            Ok(())
+        }),
+    )
+    .map_err(|e| wv("CreateCoreWebView2Environment", e))?;
+    let env: ICoreWebView2Environment = rx
+        .recv()
+        .ok()
+        .flatten()
+        .ok_or_else(|| win("CreateCoreWebView2Environment", windows::core::Error::from_thread()))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let env2 = env.clone();
+    CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| {
+            // SAFETY: a live window and handler.
+            unsafe { env2.CreateCoreWebView2Controller(hwnd, &handler) }.map_err(webview2_com::Error::WindowsError)
+        }),
+        Box::new(move |code, controller| {
+            code?;
+            let _ = tx.send(controller);
+            Ok(())
+        }),
+    )
+    .map_err(|e| wv("CreateCoreWebView2Controller", e))?;
+    let controller = rx
+        .recv()
+        .ok()
+        .flatten()
+        .ok_or_else(|| win("CreateCoreWebView2Controller", windows::core::Error::from_thread()))?;
+    Ok((env, controller))
+}
+
 /// Shows the window and runs it until it's closed. `on_message` gets each
 /// message the page sends (its JSON text) on the window's thread; it
 /// should hand slow work elsewhere and answer through the [`Poster`].
 pub fn run(opts: &Options<'_>, mut on_message: impl FnMut(String, &Poster) + 'static) -> Result<()> {
+    let [red, green, blue] = opts.background;
     // SAFETY: plain calls with static wide strings; the window procedure
-    // lives for the whole program.
+    // lives for the whole program, and so does the class's brush.
     let hwnd = unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().map_err(|e| win("CoInitializeEx", e))?;
@@ -341,10 +397,14 @@ pub fn run(opts: &Options<'_>, mut on_message: impl FnMut(String, &Poster) + 'st
         // the title bar and the taskbar.
         // MAKEINTRESOURCE(1): the resource number in the pointer's place.
         let icon = LoadIconW(Some(instance.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default();
+        // COLORREF is 0x00BBGGRR.
+        let brush = CreateSolidBrush(COLORREF(u32::from(red) | u32::from(green) << 8 | u32::from(blue) << 16));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hIcon: icon,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            hbrBackground: brush,
             lpszClassName: class,
             ..Default::default()
         };
@@ -384,64 +444,33 @@ pub fn run(opts: &Options<'_>, mut on_message: impl FnMut(String, &Poster) + 'st
         // window forward.
         own_taskbar_button(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Painted now, in the page's colour, rather than when the runtime's
+        // start lets the message loop run.
+        let _ = UpdateWindow(hwnd);
         let _ = SetForegroundWindow(hwnd);
     }
 
     // ---- the runtime, then the browser control in the window
-    let data = HSTRING::from(opts.data_dir.as_os_str());
-    let (tx, rx) = std::sync::mpsc::channel();
-    CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
-        Box::new(move |handler| {
-            // SAFETY: the folder string outlives the call; the handler is
-            // a live COM object.
-            unsafe { CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &data, None, &handler) }
-                .map_err(webview2_com::Error::WindowsError)
-        }),
-        Box::new(move |code, env| {
-            code?;
-            let _ = tx.send(env);
-            Ok(())
-        }),
-    )
-    .map_err(|e| wv("CreateCoreWebView2Environment", e))?;
-    let env: ICoreWebView2Environment = rx
-        .recv()
-        .ok()
-        .flatten()
-        .ok_or_else(|| win("CreateCoreWebView2Environment", windows::core::Error::from_thread()))?;
-    let (tx, rx) = std::sync::mpsc::channel();
-    let env2 = env.clone();
-    CreateCoreWebView2ControllerCompletedHandler::wait_for_async_operation(
-        Box::new(move |handler| {
-            // SAFETY: a live window and handler.
-            unsafe { env2.CreateCoreWebView2Controller(hwnd, &handler) }.map_err(webview2_com::Error::WindowsError)
-        }),
-        Box::new(move |code, controller| {
-            code?;
-            let _ = tx.send(controller);
-            Ok(())
-        }),
-    )
-    .map_err(|e| wv("CreateCoreWebView2Controller", e))?;
-    let controller: ICoreWebView2Controller = rx
-        .recv()
-        .ok()
-        .flatten()
-        .ok_or_else(|| win("CreateCoreWebView2Controller", windows::core::Error::from_thread()))?;
+    // Set through the API alone, the colour can come a frame late, after a
+    // white one (Microsoft documents the variable as the fix). It is read
+    // when the control is made, and removed after, so no program this one
+    // starts inherits it.
+    // SAFETY: always sound on Windows, where the system serialises access
+    // to the process's environment (as `std::env::set_var` documents).
+    unsafe { std::env::set_var(BACKGROUND_VARIABLE, format!("FF{red:02X}{green:02X}{blue:02X}")) };
+    let made = browser_control(hwnd, opts.data_dir);
+    // SAFETY: as for setting it above.
+    unsafe { std::env::remove_var(BACKGROUND_VARIABLE) };
+    let (env, controller) = made?;
 
     let queue = Arc::new(Mutex::new(VecDeque::new()));
     let poster = Poster { hwnd: hwnd.0 as isize, queue: Arc::clone(&queue) };
     // SAFETY: COM calls on live objects owned by this thread; strings
     // outlive the calls.
     let webview = unsafe {
-        // No flash of white in dark mode while the page loads.
+        // The page's colour until it draws (as the variable above set it).
         if let Ok(c2) = windows::core::Interface::cast::<ICoreWebView2Controller2>(&controller) {
-            let bg = if opts.dark {
-                COREWEBVIEW2_COLOR { A: 255, R: 32, G: 32, B: 32 }
-            } else {
-                COREWEBVIEW2_COLOR { A: 255, R: 243, G: 243, B: 243 }
-            };
-            let _ = c2.SetDefaultBackgroundColor(bg);
+            let _ = c2.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR { A: 255, R: red, G: green, B: blue });
         }
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
