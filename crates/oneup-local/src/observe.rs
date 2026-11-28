@@ -782,10 +782,12 @@ mod driver {
         }
     }
 
-    /// How long a [`JournalPump`]'s thread waits for records, or for room,
-    /// before it checks it's still wanted: a dropped pump's thread ends
-    /// within this.
-    const PUMP_WAIT_SECS: u64 = 5;
+    /// How long a [`JournalPump`]'s thread waits after a read found no new
+    /// record. It reads without blocking: a read that blocks in the kernel
+    /// waits for the next record however long that takes (its time limit
+    /// doesn't apply when none comes, measured), holding the volume open
+    /// after its pump is gone. Dropping the pump wakes the thread at once.
+    const PUMP_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// The most records a scan or an observer applies in one transaction
     /// from a [`JournalPump`].
@@ -812,6 +814,8 @@ mod driver {
         lost: bool,
         /// The thread couldn't read on.
         failed: Option<win::Error>,
+        /// The pump was dropped: the thread ends.
+        closed: bool,
     }
 
     type Shared = std::sync::Arc<(std::sync::Mutex<Queue>, std::sync::Condvar)>;
@@ -828,10 +832,19 @@ mod driver {
     /// records (a blocking read returns as soon as one exists, so reads are
     /// often small), capped at the number the owner gives (about 100 bytes
     /// of memory each), past which the thread waits for room. Journal loss
-    /// shows only as the thread finding records gone. Dropped, the pump's
-    /// thread ends within [`PUMP_WAIT_SECS`].
+    /// shows only as the thread finding records gone, or its failing as an
+    /// error, both reported before anything more is applied. Dropped, the
+    /// pump's thread ends at once.
     pub struct JournalPump {
         shared: Shared,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Drop for JournalPump {
+        fn drop(&mut self) {
+            self.queue().closed = true;
+            self.shared.1.notify_all();
+        }
     }
 
     impl JournalPump {
@@ -847,15 +860,40 @@ mod driver {
             if at.1 != from.1 {
                 return Err(Error::NeedsRescan(Rescan::JournalWrapped));
             }
-            let queue = Queue { records: VecDeque::new(), start: from.1, next: from.1, lost: false, failed: None };
+            let queue = Queue {
+                records: VecDeque::new(),
+                start: from.1,
+                next: from.1,
+                lost: false,
+                failed: None,
+                closed: false,
+            };
             let shared: Shared = std::sync::Arc::new((std::sync::Mutex::new(queue), std::sync::Condvar::new()));
             let theirs = std::sync::Arc::clone(&shared);
             let max_records = max_records.max(PUMP_CHUNK);
-            std::thread::Builder::new()
+            let thread = std::thread::Builder::new()
                 .name("journal-pump".into())
                 .spawn(move || pump(&theirs, &mut tail, max_records))
                 .map_err(Error::Thread)?;
-            Ok(Self { shared })
+            Ok(Self { shared, thread })
+        }
+
+        /// Whether the thread lost records or stopped: reported before
+        /// anything more is applied, whatever is still queued.
+        fn check(&self) -> Result<()> {
+            let mut q = self.queue();
+            if q.lost {
+                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+            }
+            if let Some(e) = q.failed.take() {
+                q.lost = true;
+                return Err(e.into());
+            }
+            if self.thread.is_finished() {
+                q.lost = true;
+                return Err(Error::Thread(std::io::Error::other("the change journal's reader stopped")));
+            }
+            Ok(())
         }
 
         /// How many records are read and not yet applied.
@@ -871,15 +909,10 @@ mod driver {
         /// position they start at and the one after them. `None` when none
         /// is queued. `NeedsRescan` once records were lost.
         pub(crate) fn take(&self, max: usize) -> Result<Option<Pumped>> {
+            self.check()?;
             let mut q = self.queue();
-            if q.lost {
-                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
-            }
             if q.records.is_empty() {
-                return match q.failed.take() {
-                    Some(e) => Err(e.into()),
-                    None => Ok(None),
-                };
+                return Ok(None);
             }
             let n = max.max(1).min(q.records.len());
             let records: Vec<UsnRecord> = q.records.drain(..n).collect();
@@ -888,40 +921,43 @@ mod driver {
             // the next one starts.
             let next = q.records.front().map_or(q.next, |r| r.usn);
             q.start = next;
+            // A burst's queue gives its memory back once applied.
+            if q.records.is_empty() && q.records.capacity() > 4 * PUMP_CHUNK {
+                q.records.shrink_to(PUMP_CHUNK);
+            }
             drop(q);
             self.shared.1.notify_one();
             Ok(Some(Pumped { records, start, next }))
         }
     }
 
-    /// A [`JournalPump`]'s thread: reads until the pump is dropped (its
-    /// owner holds the only other reference) or a read fails.
+    /// A [`JournalPump`]'s thread: reads until the pump is dropped or a
+    /// read fails, waiting [`PUMP_IDLE`] when there's nothing new and for
+    /// room when the queue is full.
     fn pump(shared: &Shared, tail: &mut JournalTail, max_records: usize) {
-        let (lock, room) = &**shared;
+        let (lock, wake) = &**shared;
         let lock_queue = || lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             {
                 let mut q = lock_queue();
-                while q.records.len() >= max_records {
-                    if std::sync::Arc::strong_count(shared) == 1 {
-                        return;
-                    }
-                    q = room
-                        .wait_timeout(q, std::time::Duration::from_secs(PUMP_WAIT_SECS))
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .0;
+                while q.records.len() >= max_records && !q.closed {
+                    q = wake.wait_timeout(q, PUMP_IDLE).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                }
+                if q.closed {
+                    return;
                 }
             }
-            if std::sync::Arc::strong_count(shared) == 1 {
-                return;
-            }
-            let read = tail.next_within(PUMP_WAIT_SECS);
+            let read = tail.next(false);
             let mut q = lock_queue();
             match read {
                 Ok(t) => {
+                    let idle = t.records.is_empty() && !t.lost;
                     q.lost |= t.lost;
                     q.records.extend(t.records);
                     q.next = tail.position().1;
+                    if idle && !q.closed {
+                        drop(wake.wait_timeout(q, PUMP_IDLE).unwrap_or_else(std::sync::PoisonError::into_inner));
+                    }
                 }
                 Err(e) => {
                     q.failed = Some(e);
@@ -948,6 +984,7 @@ mod driver {
         keep_going: &impl Fn() -> bool,
         mut after_each: impl FnMut(&mut Store, &mut [u8]) -> Result<()>,
     ) -> Result<()> {
+        pump.check()?;
         let mut budget = pump.waiting();
         while budget > 0 && keep_going() {
             let Some(batch) = pump.take(budget.min(PUMP_CHUNK))? else { break };
@@ -1158,18 +1195,6 @@ mod driver {
         /// The next records, up to a buffer's worth. With `wait`, blocks in
         /// the kernel until there's at least one.
         pub fn next(&mut self, wait: bool) -> win::Result<Tailed> {
-            self.next_for(if wait { Some(0) } else { None })
-        }
-
-        /// Like [`JournalTail::next`] waiting, but for at most `secs`
-        /// seconds: then it returns no records.
-        pub fn next_within(&mut self, secs: u64) -> win::Result<Tailed> {
-            self.next_for(Some(secs.max(1)))
-        }
-
-        /// `wait`: `None` doesn't wait, `Some(0)` waits without end,
-        /// `Some(secs)` for at most that long.
-        fn next_for(&mut self, wait: Option<u64>) -> win::Result<Tailed> {
             // Checked first as well: a read from before the oldest record
             // fails, but one from position 0 reads from the start silently.
             let j = self.volume.query_journal()?;
@@ -1179,12 +1204,7 @@ mod driver {
             }
             let mut retried = false;
             let (next, records) = loop {
-                let read = match wait {
-                    None => self.volume.read_journal(self.journal_id, self.cursor, false, &mut self.buf),
-                    Some(0) => self.volume.read_journal(self.journal_id, self.cursor, true, &mut self.buf),
-                    Some(secs) => self.volume.read_journal_within(self.journal_id, self.cursor, secs, &mut self.buf),
-                };
-                match read {
+                match self.volume.read_journal(self.journal_id, self.cursor, wait, &mut self.buf) {
                     // A record that doesn't parse stops the read (and the
                     // position) there, as it does the observer's.
                     Ok((next, records)) => {
