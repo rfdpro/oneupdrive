@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
+use oneup_local::observe::JournalPump;
 use oneup_local::{Config, Error, Replaced, Scan, Start};
 use oneup_rules::ExcludeSet;
 use oneup_store::{LocalKind, Skip, Store};
@@ -343,6 +344,72 @@ fn a_scan_that_follows_the_journal_keeps_its_bookmark_current() {
     assert!(found.contains("/d0/moved.txt") && !found.contains("/d0/top.txt"));
     let (reference, _) = scan(Store::open_in_memory().unwrap(), &t.path, ExcludeSet::none());
     assert_eq!(dump(&store), dump(&reference.into_store()));
+    invariants(&store);
+}
+
+/// With a [`JournalPump`], a thread reads the journal as its records are
+/// written, while steps run: records are read before the scan asks, and the
+/// tree comes out as a fresh scan's.
+#[test]
+fn a_scan_that_pumps_the_journal_reads_it_while_steps_run() {
+    let t = Tmp::new("pump");
+    wide_tree(&t);
+    let db_dir = Tmp::new("pump-db");
+    let cfg = Config { batch_dirs: 1, ..Config::new(ExcludeSet::none()) };
+    let mut s = Scan::open(Store::open(&db_dir.path.join("state.db"), 1024).unwrap(), &t.path, cfg).unwrap();
+    let start = s.root().journal.unwrap();
+    let pump = JournalPump::start(&t.path, start).unwrap();
+    s.follow_pumped(&pump, || true).unwrap();
+    assert!(s.step().unwrap(), "the root is listed, its folders queued");
+    cmd(&t.path, "echo x> new-in-root.txt");
+    cmd(&t.path, r"ren d0\top.txt moved.txt");
+    // Read by the thread, with no call from the scan.
+    let waited = std::time::Instant::now();
+    while pump.waiting() == 0 {
+        assert!(waited.elapsed() < std::time::Duration::from_secs(20), "the thread read nothing");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    s.follow_pumped(&pump, || true).unwrap();
+    let followed = s.root().journal.unwrap();
+    assert_eq!(followed.0, start.0);
+    assert!(followed.1 > start.1, "the bookmark moved up with the journal");
+    while s.step().unwrap() {
+        s.follow_pumped(&pump, || true).unwrap();
+    }
+    let store = s.into_store();
+    let found = names(&store);
+    assert!(found.contains("/new-in-root.txt"));
+    assert!(found.contains("/d0/moved.txt") && !found.contains("/d0/top.txt"));
+    let (reference, _) = scan(Store::open_in_memory().unwrap(), &t.path, ExcludeSet::none());
+    assert_eq!(dump(&store), dump(&reference.into_store()));
+    invariants(&store);
+}
+
+/// A pump started at a bookmark the journal no longer reaches says so, as
+/// an unpumped scan does.
+#[test]
+fn a_pumped_scan_whose_journal_lost_records_starts_over() {
+    let t = Tmp::new("pump-lost");
+    wide_tree(&t);
+    let (reference, _) = scan(Store::open_in_memory().unwrap(), &t.path, ExcludeSet::none());
+    let reference = dump(&reference.into_store());
+    let db_dir = Tmp::new("pump-lost-db");
+    let cfg = Config { batch_dirs: 1, ..Config::new(ExcludeSet::none()) };
+    let mut s = Scan::open(Store::open(&db_dir.path.join("state.db"), 1024).unwrap(), &t.path, cfg.clone()).unwrap();
+    assert!(s.step().unwrap());
+    let mut store = s.into_store();
+    store.write(|o| o.local_set_journal_cursor(i64::MAX)).unwrap();
+    let s = Scan::open(store, &t.path, cfg).unwrap();
+    let bookmark = s.root().journal.unwrap();
+    assert!(matches!(JournalPump::start(&t.path, bookmark), Err(oneup_local::observe::Error::NeedsRescan(_))));
+    let mut s = s.restart().unwrap();
+    let pump = JournalPump::start(&t.path, s.root().journal.unwrap()).unwrap();
+    s.follow_pumped(&pump, || true).unwrap();
+    while s.step().unwrap() {
+        s.follow_pumped(&pump, || true).unwrap();
+    }
+    let store = s.into_store();
+    assert_eq!(dump(&store), reference);
     invariants(&store);
 }
 

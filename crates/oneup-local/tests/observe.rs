@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use oneup_local::observe::{Changes, Observer};
+use oneup_local::observe::{Changes, JournalPump, Observer};
 use oneup_local::{Config, Scan};
 use oneup_rules::ExcludeSet;
 use oneup_store::{LocalKind, Skip, Store};
@@ -473,4 +473,31 @@ fn a_file_written_across_a_catch_up_is_right_after_its_writer_closes_it() {
     eprintln!("size stored while the writer had it open: {during}");
     assert_eq!(observed, expected, "as a fresh scan sees it");
     assert!(dirty, "the folder is planned again after the close");
+}
+
+/// What a pump read while the observer did nothing (a compaction, say) is
+/// applied from the pump alone, and the tree comes out as a fresh scan's.
+#[test]
+fn a_catch_up_from_a_pump_leaves_the_tree_a_fresh_scan_would() {
+    let t = Tmp::new("pumped");
+    t.file("docs/a.txt", b"a");
+    t.file("docs/b.txt", b"b");
+    let mut obs = Observer::open(scan(&t.0), Config::new(ExcludeSet::dev())).unwrap();
+    let pump = JournalPump::start(&t.0, obs.position()).unwrap();
+    t.file("docs/new.txt", b"n");
+    std::fs::rename(t.at("docs/a.txt"), t.at("moved.txt")).unwrap();
+    std::fs::remove_file(t.at("docs/b.txt")).unwrap();
+    t.file("sub/deep/c.txt", b"c");
+    let expected = view(&scan(&t.0));
+    let mut observed = View::new();
+    for _ in 0..100 {
+        obs.catch_up_pumped(&pump, || true).unwrap();
+        observed = view(obs.store());
+        if observed == expected {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(observed, expected);
+    assert!(obs.position().1 > 0);
 }

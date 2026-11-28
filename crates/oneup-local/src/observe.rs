@@ -139,6 +139,9 @@ pub enum Error {
     Scan(#[from] crate::scan::Error),
     #[error("scan again ({0}): `oneup scan <folder>`")]
     NeedsRescan(Rescan),
+    /// The thread that reads the journal for a scan couldn't start.
+    #[error("the change journal's reader couldn't start: {0}")]
+    Thread(std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -680,7 +683,7 @@ pub use driver::Observer;
 #[cfg(windows)]
 pub(crate) use driver::Reader;
 #[cfg(windows)]
-pub use driver::{JournalTail, Tailed};
+pub use driver::{JournalPump, JournalTail, Tailed};
 
 #[cfg(windows)]
 mod driver {
@@ -747,17 +750,129 @@ mod driver {
             if next <= self.cursor {
                 return Ok(false);
             }
+            self.apply_batch(store, volume, tree, buf, ch, &records, next)?;
+            Ok(true)
+        }
+
+        /// Applies `records`, read up to `next`, to `tree` in `store`, in one
+        /// transaction with the new position.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn apply_batch(
+            &mut self,
+            store: &mut Store,
+            volume: &Volume,
+            tree: Tree<'_>,
+            buf: &mut [u8],
+            ch: &mut Changes,
+            records: &[UsnRecord],
+            next: i64,
+        ) -> Result<()> {
             ch.records += records.len() as u64;
             // Whole listings, per folder, for this batch only.
             let mut listings: HashMap<u128, Option<Vec<DirEntry>>> = HashMap::new();
             let mut stat = |l: &Lookup| read_item(volume, l, &mut listings, buf);
             store.try_write(|o| {
-                apply(o, tree, &records, &mut stat, ch)?;
+                apply(o, tree, records, &mut stat, ch)?;
                 o.local_set_journal_cursor(next)?;
                 Ok::<_, Error>(())
             })?;
             self.cursor = next;
-            Ok(true)
+            Ok(())
+        }
+    }
+
+    /// The most batches a [`JournalPump`] holds for its owner: about a buffer's
+    /// worth of records each (64 KiB of journal, several hundred records),
+    /// so some 60 MiB of memory at most. Past that the pump waits, and the
+    /// journal may then turn over before it reads on, as without a pump.
+    const PUMP_BATCHES: usize = 1024;
+
+    /// One read of a [`JournalPump`]: records, and the position after them.
+    pub(crate) struct Pumped {
+        pub(crate) records: Vec<UsnRecord>,
+        pub(crate) next: i64,
+        /// Records were lost before these (the journal turned over first).
+        pub(crate) lost: bool,
+    }
+
+    /// Reads a volume's change journal on a thread of its own, from a
+    /// position on, as its records are written, and holds them until a scan
+    /// or an observer applies them ([`crate::Scan::follow_pumped`],
+    /// [`Observer::catch_up_pumped`]), which must have their position where
+    /// the pump started. Applying waits for a scan's steps (a minute or more
+    /// each on a large catalog) or a compaction, while a burst of changes (a
+    /// Python environment being installed: 300,000 records in a minute,
+    /// measured) can turn a 32 MiB journal over in about that long. Reading
+    /// keeps up with any such burst. Journal loss then shows only as the
+    /// thread finding records gone.
+    pub struct JournalPump {
+        batches: std::sync::mpsc::Receiver<win::Result<Pumped>>,
+        /// Batches read and not yet taken.
+        waiting: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// The thread holds only a weak reference: it can't be interrupted
+        /// while blocked in the kernel, so once the pump is dropped it ends
+        /// at its next wake-up.
+        _alive: std::sync::Arc<()>,
+    }
+
+    impl JournalPump {
+        /// Starts reading at `from`, on the volume holding `path`.
+        /// `NeedsRescan` if the journal no longer reaches back that far, or
+        /// was replaced.
+        pub fn start(path: &Path, from: (u64, i64)) -> Result<Self> {
+            let mut tail = JournalTail::open(path, Some(from))?;
+            let at = tail.position();
+            if at.0 != from.0 {
+                return Err(Error::NeedsRescan(Rescan::JournalReplaced));
+            }
+            if at.1 != from.1 {
+                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            let alive = std::sync::Arc::new(());
+            let weak = std::sync::Arc::downgrade(&alive);
+            let waiting = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = std::sync::Arc::clone(&waiting);
+            let (tx, batches) = std::sync::mpsc::sync_channel(PUMP_BATCHES);
+            std::thread::Builder::new()
+                .name("journal-pump".into())
+                .spawn(move || {
+                    while weak.strong_count() > 0 {
+                        let read = tail.next(true).map(|t| Pumped {
+                            records: t.records,
+                            next: tail.position().1,
+                            lost: t.lost,
+                        });
+                        let failed = read.is_err();
+                        counted.fetch_add(1, Relaxed);
+                        if tx.send(read).is_err() || failed {
+                            return;
+                        }
+                    }
+                })
+                .map_err(Error::Thread)?;
+            Ok(Self { batches, waiting, _alive: alive })
+        }
+
+        /// How many batches are read and not yet applied.
+        pub fn waiting(&self) -> usize {
+            self.waiting.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// The next batch read, if there's one waiting.
+        pub(crate) fn try_next(&self) -> Option<Result<Pumped>> {
+            match self.batches.try_recv() {
+                Ok(read) => {
+                    self.waiting.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(read.map_err(Error::from))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                // The thread ended without saying why: only after an error
+                // it sent, already received.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(Error::NeedsRescan(Rescan::JournalWrapped)))
+                }
+            }
         }
     }
 
@@ -822,6 +937,35 @@ mod driver {
         /// Apply journal changes to a search catalog without accumulating its dirty folders.
         pub fn catch_up_while(&mut self, keep_going: impl Fn() -> bool) -> Result<Changes> {
             self.catch_up_with(keep_going, false)
+        }
+
+        /// Applies what `pump` has read (started at this observer's
+        /// position), without asking the journal: a catch-up after a long
+        /// stop, such as a compaction, whose records the journal may no
+        /// longer hold. Then lists the folders that entered the tree.
+        pub fn catch_up_pumped(&mut self, pump: &JournalPump, keep_going: impl Fn() -> bool) -> Result<Changes> {
+            let mut ch = Changes::default();
+            self.drain_queue(&keep_going)?;
+            while keep_going() {
+                let Some(read) = pump.try_next() else { break };
+                let batch = read?;
+                if batch.lost {
+                    return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+                }
+                let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: false };
+                self.reader.apply_batch(
+                    &mut self.store,
+                    &self.volume,
+                    tree,
+                    &mut self.buf,
+                    &mut ch,
+                    &batch.records,
+                    batch.next,
+                )?;
+                ch.dirty.clear();
+                self.drain_queue(&keep_going)?;
+            }
+            Ok(ch)
         }
 
         fn catch_up_with(&mut self, keep_going: impl Fn() -> bool, retain_dirty: bool) -> Result<Changes> {
