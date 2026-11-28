@@ -139,6 +139,9 @@ pub enum Error {
     Scan(#[from] crate::scan::Error),
     #[error("scan again ({0}): `oneup scan <folder>`")]
     NeedsRescan(Rescan),
+    /// The thread that reads the journal for a scan couldn't start.
+    #[error("the change journal's reader couldn't start: {0}")]
+    Thread(std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -678,12 +681,13 @@ pub fn note_seen_deletes(store: &mut Store, seen: &SeenDeletes) -> oneup_store::
 #[cfg(windows)]
 pub use driver::Observer;
 #[cfg(windows)]
-pub(crate) use driver::Reader;
+pub use driver::{JournalPump, JournalTail, Tailed};
 #[cfg(windows)]
-pub use driver::{JournalTail, Tailed};
+pub(crate) use driver::{Reader, apply_pumped};
 
 #[cfg(windows)]
 mod driver {
+    use std::collections::VecDeque;
     use std::path::Path;
 
     use oneup_ntfs::FileId;
@@ -747,18 +751,273 @@ mod driver {
             if next <= self.cursor {
                 return Ok(false);
             }
+            self.apply_batch(store, volume, tree, buf, ch, &records, next)?;
+            Ok(true)
+        }
+
+        /// Applies `records`, read up to `next`, to `tree` in `store`, in one
+        /// transaction with the new position.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn apply_batch(
+            &mut self,
+            store: &mut Store,
+            volume: &Volume,
+            tree: Tree<'_>,
+            buf: &mut [u8],
+            ch: &mut Changes,
+            records: &[UsnRecord],
+            next: i64,
+        ) -> Result<()> {
             ch.records += records.len() as u64;
             // Whole listings, per folder, for this batch only.
             let mut listings: HashMap<u128, Option<Vec<DirEntry>>> = HashMap::new();
             let mut stat = |l: &Lookup| read_item(volume, l, &mut listings, buf);
             store.try_write(|o| {
-                apply(o, tree, &records, &mut stat, ch)?;
+                apply(o, tree, records, &mut stat, ch)?;
                 o.local_set_journal_cursor(next)?;
                 Ok::<_, Error>(())
             })?;
             self.cursor = next;
-            Ok(true)
+            Ok(())
         }
+    }
+
+    /// How long a [`JournalPump`]'s thread waits after a read found no new
+    /// record. It reads without blocking: a read that blocks in the kernel
+    /// waits for the next record however long that takes (its time limit
+    /// doesn't apply when none comes, measured), holding the volume open
+    /// after its pump is gone. Dropping the pump wakes the thread at once.
+    const PUMP_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// The longest an observer's catch-up from a [`JournalPump`] waits for
+    /// the pump to read up to the journal's end.
+    const PUMP_CATCH_UP: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The most records a scan or an observer applies in one transaction
+    /// from a [`JournalPump`].
+    const PUMP_CHUNK: usize = 4096;
+
+    /// Some records of a [`JournalPump`]: where they start, and the
+    /// position after them.
+    pub(crate) struct Pumped {
+        pub(crate) records: Vec<UsnRecord>,
+        pub(crate) start: i64,
+        pub(crate) next: i64,
+    }
+
+    /// What a [`JournalPump`]'s thread has read and its owner not yet taken.
+    struct Queue {
+        records: VecDeque<UsnRecord>,
+        /// The position of the first queued record (of the next read's,
+        /// when none is queued).
+        start: i64,
+        /// The position after the last queued record.
+        next: i64,
+        /// Records were lost: the journal turned over before they were read,
+        /// or was replaced.
+        lost: bool,
+        /// The thread couldn't read on.
+        failed: Option<win::Error>,
+        /// The pump was dropped: the thread ends.
+        closed: bool,
+    }
+
+    type Shared = std::sync::Arc<(std::sync::Mutex<Queue>, std::sync::Condvar)>;
+
+    /// Reads a volume's change journal on a thread of its own, from a
+    /// position on, as its records are written, and queues them until a scan
+    /// or an observer applies them ([`crate::Scan::follow_pumped`],
+    /// [`Observer::catch_up_pumped`]), which must have their position where
+    /// the pump started. Applying waits for a scan's steps (a minute or more
+    /// each on a large catalog) or a compaction, while a burst of changes (a
+    /// Python environment being installed: 300,000 records in a minute,
+    /// measured) can turn a 32 MiB journal over in about that long. Reading
+    /// keeps up with any such burst. Every read goes to one queue of
+    /// records (a blocking read returns as soon as one exists, so reads are
+    /// often small), capped at the number the owner gives (about 100 bytes
+    /// of memory each), past which the thread waits for room. Journal loss
+    /// shows only as the thread finding records gone, or its failing as an
+    /// error, both reported before anything more is applied. Dropped, the
+    /// pump's thread ends at once.
+    pub struct JournalPump {
+        shared: Shared,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Drop for JournalPump {
+        fn drop(&mut self) {
+            self.queue().closed = true;
+            self.shared.1.notify_all();
+        }
+    }
+
+    impl JournalPump {
+        /// Starts reading at `from`, on the volume holding `path`, queueing
+        /// at most `max_records`. `NeedsRescan` if the journal no longer
+        /// reaches back that far, or was replaced.
+        pub fn start(path: &Path, from: (u64, i64), max_records: usize) -> Result<Self> {
+            let mut tail = JournalTail::open(path, Some(from))?;
+            let at = tail.position();
+            if at.0 != from.0 {
+                return Err(Error::NeedsRescan(Rescan::JournalReplaced));
+            }
+            if at.1 != from.1 {
+                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+            }
+            let queue = Queue {
+                records: VecDeque::new(),
+                start: from.1,
+                next: from.1,
+                lost: false,
+                failed: None,
+                closed: false,
+            };
+            let shared: Shared = std::sync::Arc::new((std::sync::Mutex::new(queue), std::sync::Condvar::new()));
+            let theirs = std::sync::Arc::clone(&shared);
+            let max_records = max_records.max(PUMP_CHUNK);
+            let thread = std::thread::Builder::new()
+                .name("journal-pump".into())
+                .spawn(move || pump(&theirs, &mut tail, max_records))
+                .map_err(Error::Thread)?;
+            Ok(Self { shared, thread })
+        }
+
+        /// Whether the thread lost records or stopped: reported before
+        /// anything more is applied, whatever is still queued.
+        fn check(&self) -> Result<()> {
+            let mut q = self.queue();
+            if q.lost {
+                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+            }
+            if let Some(e) = q.failed.take() {
+                q.lost = true;
+                return Err(e.into());
+            }
+            if self.thread.is_finished() {
+                q.lost = true;
+                return Err(Error::Thread(std::io::Error::other("the change journal's reader stopped")));
+            }
+            Ok(())
+        }
+
+        /// Waits until the thread has read the journal up to `usn` (its end
+        /// when asked, say), lost records or failed, for at most `limit`.
+        /// Wakes the thread if it's idle.
+        pub fn read_up_to(&self, usn: i64, limit: std::time::Duration) {
+            let deadline = std::time::Instant::now() + limit;
+            let mut q = self.queue();
+            self.shared.1.notify_all();
+            while q.next < usn && !q.lost && q.failed.is_none() && !self.thread.is_finished() {
+                let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else { break };
+                q = self.shared.1.wait_timeout(q, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+            }
+        }
+
+        /// How many records are read and not yet applied.
+        pub fn waiting(&self) -> usize {
+            self.queue().records.len()
+        }
+
+        fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+            self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Takes up to `max` records from the front of the queue, with the
+        /// position they start at and the one after them. `None` when none
+        /// is queued. `NeedsRescan` once records were lost.
+        pub(crate) fn take(&self, max: usize) -> Result<Option<Pumped>> {
+            self.check()?;
+            let mut q = self.queue();
+            if q.records.is_empty() {
+                return Ok(None);
+            }
+            let n = max.max(1).min(q.records.len());
+            let records: Vec<UsnRecord> = q.records.drain(..n).collect();
+            let start = q.start;
+            // Records follow each other: the position after these is where
+            // the next one starts.
+            let next = q.records.front().map_or(q.next, |r| r.usn);
+            q.start = next;
+            // A burst's queue gives its memory back once applied.
+            if q.records.is_empty() && q.records.capacity() > 4 * PUMP_CHUNK {
+                q.records.shrink_to(PUMP_CHUNK);
+            }
+            drop(q);
+            self.shared.1.notify_all();
+            Ok(Some(Pumped { records, start, next }))
+        }
+    }
+
+    /// A [`JournalPump`]'s thread: reads until the pump is dropped or a
+    /// read fails, waiting [`PUMP_IDLE`] when there's nothing new and for
+    /// room when the queue is full.
+    fn pump(shared: &Shared, tail: &mut JournalTail, max_records: usize) {
+        let (lock, wake) = &**shared;
+        let lock_queue = || lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            {
+                let mut q = lock_queue();
+                while q.records.len() >= max_records && !q.closed {
+                    q = wake.wait_timeout(q, PUMP_IDLE).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+                }
+                if q.closed {
+                    return;
+                }
+            }
+            let read = tail.next(false);
+            let mut q = lock_queue();
+            match read {
+                Ok(t) => {
+                    let idle = t.records.is_empty() && !t.lost;
+                    q.lost |= t.lost;
+                    q.records.extend(t.records);
+                    q.next = tail.position().1;
+                    // For an owner waiting until it has read far enough.
+                    wake.notify_all();
+                    if idle && !q.closed {
+                        drop(wake.wait_timeout(q, PUMP_IDLE).unwrap_or_else(std::sync::PoisonError::into_inner));
+                    }
+                }
+                Err(e) => {
+                    q.failed = Some(e);
+                    wake.notify_all();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Applies, from `pump`, at most the records queued when it's called
+    /// (so a drive that stays busy can't keep the caller here), in chunks of
+    /// [`PUMP_CHUNK`], each in one transaction with the new position, and
+    /// `after_each` after each. The pump must have started where `reader`
+    /// is, and every chunk must start there too.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_pumped(
+        pump: &JournalPump,
+        reader: &mut Reader,
+        store: &mut Store,
+        volume: &Volume,
+        tree: Tree<'_>,
+        buf: &mut [u8],
+        ch: &mut Changes,
+        keep_going: &impl Fn() -> bool,
+        mut after_each: impl FnMut(&mut Store, &mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        pump.check()?;
+        let mut budget = pump.waiting();
+        while budget > 0 && keep_going() {
+            let Some(batch) = pump.take(budget.min(PUMP_CHUNK))? else { break };
+            if batch.start != reader.cursor {
+                // Not where this tree is: what lies between would be missed.
+                return Err(Error::NeedsRescan(Rescan::JournalWrapped));
+            }
+            budget = budget.saturating_sub(batch.records.len());
+            reader.apply_batch(store, volume, tree, buf, ch, &batch.records, batch.next)?;
+            ch.dirty.clear();
+            after_each(store, buf)?;
+        }
+        Ok(())
     }
 
     /// Brings a finished scan up to date from the change journal.
@@ -822,6 +1081,38 @@ mod driver {
         /// Apply journal changes to a search catalog without accumulating its dirty folders.
         pub fn catch_up_while(&mut self, keep_going: impl Fn() -> bool) -> Result<Changes> {
             self.catch_up_with(keep_going, false)
+        }
+
+        /// Applies what `pump` has read (started at this observer's
+        /// position), up to the journal's end as it is when called, without
+        /// reading the journal itself: a catch-up after a long stop, such as
+        /// a compaction, whose records the journal may no longer hold. Then
+        /// lists the folders that entered the tree.
+        pub fn catch_up_pumped(&mut self, pump: &JournalPump, keep_going: impl Fn() -> bool) -> Result<Changes> {
+            let mut ch = Changes::default();
+            self.drain_queue(&keep_going)?;
+            // Up to the journal's end as it is now, as `catch_up` reads:
+            // the pump reads on its own time, and may not have yet.
+            let end = self.volume.query_journal()?.next_usn;
+            pump.read_up_to(end, PUMP_CATCH_UP);
+            let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: false };
+            let (volume, cfg, progress) = (&self.volume, &self.cfg, &self.progress);
+            apply_pumped(
+                pump,
+                &mut self.reader,
+                &mut self.store,
+                volume,
+                tree,
+                &mut self.buf,
+                &mut ch,
+                &keep_going,
+                |store, buf| {
+                    // Folders that entered the tree, listed as a catch-up does.
+                    while keep_going() && list_queued(store, volume, cfg, buf, progress)? > 0 {}
+                    Ok(())
+                },
+            )?;
+            Ok(ch)
         }
 
         fn catch_up_with(&mut self, keep_going: impl Fn() -> bool, retain_dirty: bool) -> Result<Changes> {

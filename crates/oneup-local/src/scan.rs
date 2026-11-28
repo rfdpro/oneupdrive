@@ -40,7 +40,7 @@ use oneup_store::{LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip, 
 
 use crate::classify;
 use crate::coexist::{self, OtherEngine};
-use crate::observe::{Changes, Reader, Tree};
+use crate::observe::{Changes, JournalPump, Reader, Tree, apply_pumped};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -404,6 +404,37 @@ impl Scan {
         }
         self.root.journal = Some((reader.journal_id, reader.cursor));
         Ok(ch)
+    }
+
+    /// Like [`Scan::follow_journal`], but applies what `pump` has read,
+    /// without asking the journal: `pump` reads it on a thread of its own as
+    /// its records are written, started at this scan's bookmark
+    /// ([`Scan::root`]'s `journal`), so a step can take longer than a burst
+    /// of changes needs to turn the journal over. Journal loss then shows
+    /// only as the pump finding records gone. For a scan that may run for
+    /// hours on a busy drive (the search catalogs).
+    pub fn follow_pumped(
+        &mut self,
+        pump: &JournalPump,
+        keep_going: impl Fn() -> bool,
+    ) -> crate::observe::Result<Changes> {
+        let mut ch = Changes::default();
+        let Some(bookmark) = self.root.journal else { return Ok(ch) };
+        let reader = self.reader.get_or_insert_with(|| Reader::new(bookmark));
+        let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: true };
+        let applied = apply_pumped(
+            pump,
+            reader,
+            &mut self.store,
+            &self.volume,
+            tree,
+            &mut self.buf,
+            &mut ch,
+            &keep_going,
+            |_, _| Ok(()),
+        );
+        self.root.journal = Some((reader.journal_id, reader.cursor));
+        applied.map(|()| ch)
     }
 
     /// Runs steps until the scan finishes or the cancel flag is set.

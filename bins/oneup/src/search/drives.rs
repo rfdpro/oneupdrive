@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use oneup_local::observe::{Error as ObserveError, Observer, Rescan};
+use oneup_local::observe::{Error as ObserveError, JournalPump, Observer, Rescan};
 use oneup_ntfs::win::{Volume, search_identity, search_listable};
 use oneup_rules::{ExcludeSet, RuleSet};
 use oneup_store::Store;
@@ -364,7 +364,7 @@ fn update(
                         show(&interim(&status, &name, last, crate::t_key!("Compacting…")))?;
                         let db = drive.db(dir);
                         let mut follow = || others.follow(&keep_going);
-                        compact_following(Store::open(&db, cache_kib)?, &db, &drive.root, &mut follow)?;
+                        drop(compact_following(Store::open(&db, cache_kib)?, &db, &drive.root, &mut follow)?);
                     }
                     Ok(updated)
                 });
@@ -421,17 +421,24 @@ fn compact_catalog(store: &Store, db: &Path, drive: &Path) -> Result<()> {
 
 /// [`compact_catalog`] on a thread of its own, while `between` follows the
 /// other drives' journals: compacting a large catalog takes minutes, longer
-/// than a busy drive's journal may keep its records.
-fn compact_following(store: Store, db: &Path, drive: &Path, between: &mut impl FnMut()) -> Result<()> {
+/// than a busy drive's journal may keep its records. Gives the store back;
+/// a compaction that fails is logged, and the catalog stays as it was.
+fn compact_following(store: Store, db: &Path, drive: &Path, between: &mut impl FnMut()) -> Result<Store> {
     use std::sync::mpsc::RecvTimeoutError;
     std::thread::scope(|scope| {
         let (tx, rx) = std::sync::mpsc::channel();
         scope.spawn(move || {
-            let _ = tx.send(compact_catalog(&store, db, drive));
+            let compacted = compact_catalog(&store, db, drive);
+            let _ = tx.send((store, compacted));
         });
         loop {
             match rx.recv_timeout(SHORTEST_WAIT) {
-                Ok(done) => return done,
+                Ok((store, compacted)) => {
+                    if let Err(e) = compacted {
+                        tracing::warn!(drive = %drive.display(), error = %e, "drive index not compacted");
+                    }
+                    return Ok(store);
+                }
                 Err(RecvTimeoutError::Timeout) => between(),
                 Err(RecvTimeoutError::Disconnected) => bail!("the drive index's compaction stopped"),
             }
@@ -537,7 +544,7 @@ fn update_drive(
     let needs_scan = match Observer::open(store, cfg.clone()) {
         Ok(mut observer) => match observer
             .catch_up_while(&keep_going)
-            .and_then(|_| finish(&mut observer, &keep_going, &mut between_steps))
+            .and_then(|_| finish(&mut observer, &keep_going, &mut between_steps, None))
         {
             Ok(updated) => return Ok(updated),
             Err(ObserveError::NeedsRescan(why)) => {
@@ -564,15 +571,33 @@ fn update_drive(
     let mut scan = oneup_local::Scan::open(store, &drive.root, cfg.clone())?;
     same_volume(drive, &scan)?;
     let mut log = ScanLog::new(&drive.root, &scan);
+    // A whole drive can take longer to list than its journal keeps history,
+    // and a burst of changes (a Python environment installed: 300,000
+    // records in a minute, measured) can turn the journal over between two
+    // steps. A thread reads it for the scan, its name index and its
+    // compaction (`JournalPump`), from the scan's bookmark; what it read is
+    // applied between steps.
+    let mut pump: Option<JournalPump> = None;
     while keep_going() {
-        // A whole drive can take longer to list than its journal keeps
-        // history. Replaying the journal only after the scan would then find
-        // it wrapped, and the next update would start over, without end.
         let following = Instant::now();
-        match scan.follow_journal(&keep_going) {
+        let followed = match &pump {
+            Some(pump) => scan.follow_pumped(pump, &keep_going),
+            None => match scan
+                .root()
+                .journal
+                .map(|from| JournalPump::start(&drive.root, from, pump_records(cache_kib)))
+                .transpose()
+            {
+                Ok(Some(started)) => scan.follow_pumped(pump.insert(started), &keep_going),
+                Ok(None) => scan.follow_journal(&keep_going),
+                Err(e) => Err(e),
+            },
+        };
+        match followed {
             Ok(ch) => log.followed(ch.records, following.elapsed()),
             Err(ObserveError::NeedsRescan(why)) => {
                 tracing::info!(drive = %drive.root.display(), %why, "drive index scan starts over");
+                pump = None;
                 scan = if journal_lost(why) {
                     drop(scan);
                     let (store, fresh) = start_over(&db, cache_kib)?;
@@ -591,21 +616,35 @@ fn update_drive(
         log.note(&scan, !more);
         between_steps();
         if !more {
-            let mut observer = Observer::open(scan.into_store(), cfg)?;
-            return match observer
-                .catch_up_while(&keep_going)
-                .and_then(|_| finish(&mut observer, &keep_going, &mut between_steps))
-            {
-                Ok(updated) => {
-                    // Pages a scan fills in no order are part empty: the
-                    // rewrite packs them.
-                    if updated == Updated::Ready
-                        && let Err(e) = compact_following(observer.into_store(), &db, &drive.root, &mut between_steps)
-                    {
-                        tracing::warn!(drive = %drive.root.display(), error = %e, "drive index not compacted");
-                    }
-                    Ok(updated)
+            // The pump goes on for the observer, from where the scan's
+            // position is: what it read and the scan didn't apply comes next.
+            let mut observer = Observer::open(scan.into_store(), cfg.clone())?;
+            let caught = match &pump {
+                Some(pump) => observer.catch_up_pumped(pump, &keep_going),
+                None => observer.catch_up_while(&keep_going),
+            };
+            let finished = caught.and_then(|_| finish(&mut observer, &keep_going, &mut between_steps, pump.as_ref()));
+            let updated = match finished {
+                Ok(updated) => updated,
+                Err(ObserveError::NeedsRescan(why)) => {
+                    tracing::info!(drive = %drive.root.display(), %why, "drive index scans again");
+                    return Ok(Updated::Rescan);
                 }
+                Err(err) => return Err(err.into()),
+            };
+            if updated != Updated::Ready {
+                return Ok(updated);
+            }
+            // Pages a scan fills in no order are part empty: the rewrite
+            // packs them. Then what the journal recorded meanwhile.
+            let store = compact_following(observer.into_store(), &db, &drive.root, &mut between_steps)?;
+            let Some(pump) = &pump else { return Ok(updated) };
+            let mut observer = Observer::open(store, cfg)?;
+            return match observer
+                .catch_up_pumped(pump, &keep_going)
+                .and_then(|_| finish(&mut observer, &keep_going, &mut between_steps, Some(pump)))
+            {
+                Ok(updated) => Ok(updated),
                 Err(ObserveError::NeedsRescan(why)) => {
                     tracing::info!(drive = %drive.root.display(), %why, "drive index scans again");
                     Ok(Updated::Rescan)
@@ -615,6 +654,13 @@ fn update_drive(
         }
     }
     Ok(Updated::Stopped)
+}
+
+/// The most journal records a drive's pump holds unapplied (about 100 bytes
+/// of memory each, so 26 to 400 MiB), from the memory profile's page cache:
+/// a burst of 300,000 records in a minute must fit while a scan step writes.
+fn pump_records(cache_kib: u32) -> usize {
+    (cache_kib as usize * 1024 / 100).clamp(1 << 18, 1 << 22)
 }
 
 /// The journal no longer has the records a catalog needs: only a scan from
@@ -837,20 +883,24 @@ impl<'a> Others<'a> {
 
 /// Brings the name index up to date and marks the catalog ready. Its first
 /// build after a scan adds millions of names, minutes of work: it stops
-/// every [`CATCH_UP_EVERY`] to read the drive's journal, which a busy system
-/// drive can turn over in a minute or two, and lets `between` follow the
-/// other drives'.
+/// every [`CATCH_UP_EVERY`] to read the drive's journal (from `pump`, when
+/// one reads it), which a busy system drive can turn over in a minute or
+/// two, and lets `between` follow the other drives'.
 fn finish(
     observer: &mut Observer,
     keep_going: &impl Fn() -> bool,
     between: &mut impl FnMut(),
+    pump: Option<&JournalPump>,
 ) -> oneup_local::observe::Result<Updated> {
     let mut caught = Instant::now();
     while keep_going() && observer.store_mut().flush_drive_search(BATCH)? == BATCH {
         // The other drives' journals too (`Others`: no more often than they need).
         between();
         if caught.elapsed() >= CATCH_UP_EVERY {
-            observer.catch_up_while(keep_going)?;
+            match pump {
+                Some(pump) => observer.catch_up_pumped(pump, keep_going)?,
+                None => observer.catch_up_while(keep_going)?,
+            };
             caught = Instant::now();
         }
     }
