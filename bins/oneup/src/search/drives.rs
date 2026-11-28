@@ -578,6 +578,8 @@ fn update_drive(
     // compaction (`JournalPump`), from the scan's bookmark; what it read is
     // applied between steps.
     let mut pump: Option<JournalPump> = None;
+    // The other drives' pumps start now, near their catalogs' last catch-up.
+    between_steps();
     while keep_going() {
         let following = Instant::now();
         let followed = match &pump {
@@ -813,9 +815,18 @@ struct Others<'a> {
     dir: &'a Path,
     drives: Vec<(&'a Drive, oneup_local::Config)>,
     cache_kib: u32,
-    observers: Option<Vec<(String, Observer)>>,
+    observers: Option<Vec<Followed>>,
     next: Instant,
     every: Duration,
+}
+
+/// Another drive's ready catalog, and a thread reading its journal: a step
+/// of the scanned drive can take longer than a busy drive's journal keeps
+/// its records (measured: C:'s turned over during one of D:'s steps).
+struct Followed {
+    name: String,
+    observer: Observer,
+    pump: JournalPump,
 }
 
 impl<'a> Others<'a> {
@@ -846,14 +857,15 @@ impl<'a> Others<'a> {
         });
         let started = Instant::now();
         let in_time = || keep_going() && started.elapsed() < FOLLOW_OTHERS_FOR;
-        observers.retain_mut(|(name, observer)| {
-            let caught = observer
-                .catch_up_while(in_time)
+        observers.retain_mut(|f| {
+            let caught = f
+                .observer
+                .catch_up_pumped(&f.pump, in_time)
                 .map_err(anyhow::Error::from)
-                .and_then(|_| flush(observer.store_mut(), &in_time));
+                .and_then(|_| flush(f.observer.store_mut(), &in_time));
             caught
                 .inspect_err(
-                    |e| tracing::info!(drive = %name, error = %format!("{e:#}"), "drive index left for its turn"),
+                    |e| tracing::info!(drive = %f.name, error = %format!("{e:#}"), "drive index left for its turn"),
                 )
                 .is_ok()
         });
@@ -862,12 +874,13 @@ impl<'a> Others<'a> {
         if !observers.is_empty() {
             observers.rotate_left(1);
         }
-        let every = pass_wait(observers.iter().filter_map(|(name, _)| journal_history(Path::new(name))));
+        let every = pass_wait(observers.iter().filter_map(|f| journal_history(Path::new(&f.name))));
         self.next = Instant::now() + self.every.min(every);
     }
 
-    /// A drive's catalog, if it has a finished scan of this drive to follow.
-    fn open(dir: &Path, drive: &Drive, cfg: oneup_local::Config, cache_kib: u32) -> Option<(String, Observer)> {
+    /// A drive's catalog, if it has a finished scan of this drive to follow,
+    /// with a pump reading its journal from the catalog's position.
+    fn open(dir: &Path, drive: &Drive, cfg: oneup_local::Config, cache_kib: u32) -> Option<Followed> {
         let db = drive.db(dir);
         if !db.exists() {
             return None;
@@ -877,7 +890,14 @@ impl<'a> Others<'a> {
             return None;
         }
         let observer = Observer::open(store, cfg).ok()?;
-        Some((drive.root.display().to_string(), observer))
+        let name = drive.root.display().to_string();
+        match JournalPump::start(&drive.root, observer.position(), pump_records(cache_kib)) {
+            Ok(pump) => Some(Followed { name, observer, pump }),
+            Err(e) => {
+                tracing::info!(drive = %name, error = %format!("{e:#}"), "drive index left for its turn");
+                None
+            }
+        }
     }
 }
 
