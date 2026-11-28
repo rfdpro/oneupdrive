@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use oneup_local::observe::{Error as ObserveError, Observer, Rescan};
@@ -15,6 +15,14 @@ use serde_json::{Value, json};
 
 const READY: &str = "drive_search.ready";
 const PERIOD: Duration = Duration::from_secs(60);
+/// The shortest wait between passes ([`pass_wait`]).
+const SHORTEST_WAIT: Duration = Duration::from_secs(5);
+/// A catalog is compacted only on a drive whose journal reaches back at
+/// least this far: compacting rewrites the whole catalog (minutes for a
+/// gigabyte) without reading the journal.
+const COMPACT_HISTORY: Duration = Duration::from_secs(30 * 60);
+/// How often building the name index stops to read the drive's journal.
+const CATCH_UP_EVERY: Duration = Duration::from_secs(10);
 const BATCH: usize = 8_192;
 /// In a catalog's file name: its format. `v2` writes file IDs as
 /// `KeyOrder::Ordered` keys; a catalog without it is an earlier one, which
@@ -296,7 +304,12 @@ pub fn worker(dir: &Path) -> Result<()> {
         if running() {
             show(&status)?;
             last = status;
-            event.wait(PERIOD);
+            let wait = if settings.local_drives {
+                pass_wait(drives().iter().filter_map(|d| journal_history(&d.root)))
+            } else {
+                PERIOD
+            };
+            event.wait(wait);
         }
     }
     Ok(())
@@ -350,7 +363,8 @@ fn update(
                     if compact && updated == Updated::Ready && running() {
                         show(&interim(&status, &name, last, crate::t_key!("Compacting…")))?;
                         let db = drive.db(dir);
-                        compact_catalog(&Store::open(&db, cache_kib)?, &db, &drive.root)?;
+                        let mut follow = || others.follow(&keep_going);
+                        compact_following(Store::open(&db, cache_kib)?, &db, &drive.root, &mut follow)?;
                     }
                     Ok(updated)
                 });
@@ -384,6 +398,15 @@ fn catalog_cache_kib(dir: &Path) -> u32 {
 /// rewrite in the WAL). Too little room is no failure: it's logged, and the
 /// catalog is left as it is.
 fn compact_catalog(store: &Store, db: &Path, drive: &Path) -> Result<()> {
+    let history = journal_history(drive);
+    if !compaction_fits(history) {
+        tracing::info!(
+            drive = %drive.display(),
+            journal_minutes = history.map_or(0, |h| h.as_secs() / 60),
+            "drive index not compacted: its journal doesn't reach back long enough"
+        );
+        return Ok(());
+    }
     let space = store.space()?;
     let need = store.files_size().max(space.total).saturating_mul(2);
     let room = oneup_sys::disk::free_bytes(db.parent().unwrap_or(db)).unwrap_or(0);
@@ -394,6 +417,57 @@ fn compact_catalog(store: &Store, db: &Path, drive: &Path) -> Result<()> {
     let c = store.compact()?;
     tracing::info!(drive = %drive.display(), before = c.before, after = c.after, pending = c.pending, "drive index compacted");
     Ok(())
+}
+
+/// [`compact_catalog`] on a thread of its own, while `between` follows the
+/// other drives' journals: compacting a large catalog takes minutes, longer
+/// than a busy drive's journal may keep its records.
+fn compact_following(store: Store, db: &Path, drive: &Path, between: &mut impl FnMut()) -> Result<()> {
+    use std::sync::mpsc::RecvTimeoutError;
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = tx.send(compact_catalog(&store, db, drive));
+        });
+        loop {
+            match rx.recv_timeout(SHORTEST_WAIT) {
+                Ok(done) => return done,
+                Err(RecvTimeoutError::Timeout) => between(),
+                Err(RecvTimeoutError::Disconnected) => bail!("the drive index's compaction stopped"),
+            }
+        }
+    })
+}
+
+/// Whether a catalog can be compacted without its drive's journal turning
+/// over meanwhile: compacting doesn't read the journal, and a catalog whose
+/// journal lost records must be scanned again. Unknown: as before.
+fn compaction_fits(history: Option<Duration>) -> bool {
+    history.is_none_or(|h| h >= COMPACT_HISTORY)
+}
+
+/// How far back a drive's change journal reaches: the age of its oldest
+/// record. A system drive's 32 MiB can hold as little as a minute or two
+/// (measured: test runs in its temp folder writing 3,800 records a second).
+/// `None` if the journal can't be read.
+fn journal_history(root: &Path) -> Option<Duration> {
+    let volume = Volume::open_containing(root).ok()?;
+    let j = volume.query_journal().ok()?;
+    let mut buf = vec![0u8; 4096];
+    let (_, mut records) =
+        volume.read_journal(j.journal_id, j.first_usn.max(j.lowest_valid_usn), false, &mut buf).ok()?;
+    let oldest = records.next()?.ok()?.timestamp;
+    // FILETIME: 100 ns ticks since 1601.
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos() / 100 + 116_444_736_000_000_000;
+    let ticks = u64::try_from(i128::try_from(now).ok()? - i128::from(oldest)).ok()?;
+    Some(Duration::from_nanos(ticks.saturating_mul(100)))
+}
+
+/// The wait between passes: a quarter of the shortest reach of the drives'
+/// journals, so each is read well before it turns over, from
+/// [`SHORTEST_WAIT`] to [`PERIOD`].
+fn pass_wait(histories: impl IntoIterator<Item = Duration>) -> Duration {
+    histories.into_iter().min().map_or(PERIOD, |h| (h / 4).clamp(SHORTEST_WAIT, PERIOD))
 }
 
 /// `done`, then `drive` as `state`, then the drives after it as `last` had them.
@@ -461,8 +535,11 @@ fn update_drive(
         );
     }
     let needs_scan = match Observer::open(store, cfg.clone()) {
-        Ok(mut observer) => match observer.catch_up_while(&keep_going) {
-            Ok(_) => return finish(observer.store_mut(), &keep_going),
+        Ok(mut observer) => match observer
+            .catch_up_while(&keep_going)
+            .and_then(|_| finish(&mut observer, &keep_going, &mut between_steps))
+        {
+            Ok(updated) => return Ok(updated),
             Err(ObserveError::NeedsRescan(why)) => {
                 tracing::info!(drive = %drive.root.display(), %why, "drive index scans again");
                 if journal_lost(why) {
@@ -515,13 +592,15 @@ fn update_drive(
         between_steps();
         if !more {
             let mut observer = Observer::open(scan.into_store(), cfg)?;
-            return match observer.catch_up_while(&keep_going) {
-                Ok(_) => {
-                    let updated = finish(observer.store_mut(), &keep_going)?;
+            return match observer
+                .catch_up_while(&keep_going)
+                .and_then(|_| finish(&mut observer, &keep_going, &mut between_steps))
+            {
+                Ok(updated) => {
                     // Pages a scan fills in no order are part empty: the
                     // rewrite packs them.
                     if updated == Updated::Ready
-                        && let Err(e) = compact_catalog(observer.store(), &db, &drive.root)
+                        && let Err(e) = compact_following(observer.into_store(), &db, &drive.root, &mut between_steps)
                     {
                         tracing::warn!(drive = %drive.root.display(), error = %e, "drive index not compacted");
                     }
@@ -669,7 +748,8 @@ impl ScanLog {
     }
 }
 
-/// How often a scan stops to catch up the other drives' catalogs.
+/// How often a scan stops to catch up the other drives' catalogs, at most:
+/// more often when one's journal turns over fast ([`pass_wait`]).
 const FOLLOW_OTHERS: Duration = Duration::from_secs(30);
 /// The longest one such stop takes: the scanned drive's own journal waits
 /// meanwhile. A catalog not caught up by then goes on at the next stop.
@@ -736,7 +816,8 @@ impl<'a> Others<'a> {
         if !observers.is_empty() {
             observers.rotate_left(1);
         }
-        self.next = Instant::now() + self.every;
+        let every = pass_wait(observers.iter().filter_map(|(name, _)| journal_history(Path::new(name))));
+        self.next = Instant::now() + self.every.min(every);
     }
 
     /// A drive's catalog, if it has a finished scan of this drive to follow.
@@ -754,21 +835,34 @@ impl<'a> Others<'a> {
     }
 }
 
-fn finish(store: &mut Store, keep_going: &impl Fn() -> bool) -> Result<Updated> {
-    flush(store, keep_going)?;
-    publish(store, keep_going)?;
+/// Brings the name index up to date and marks the catalog ready. Its first
+/// build after a scan adds millions of names, minutes of work: it stops
+/// every [`CATCH_UP_EVERY`] to read the drive's journal, which a busy system
+/// drive can turn over in a minute or two, and lets `between` follow the
+/// other drives'.
+fn finish(
+    observer: &mut Observer,
+    keep_going: &impl Fn() -> bool,
+    between: &mut impl FnMut(),
+) -> oneup_local::observe::Result<Updated> {
+    let mut caught = Instant::now();
+    while keep_going() && observer.store_mut().flush_drive_search(BATCH)? == BATCH {
+        // The other drives' journals too (`Others`: no more often than they need).
+        between();
+        if caught.elapsed() >= CATCH_UP_EVERY {
+            observer.catch_up_while(keep_going)?;
+            caught = Instant::now();
+        }
+    }
+    let store = observer.store_mut();
+    if keep_going() && store.read(|o| o.meta_get(READY))?.as_deref() != Some("1") {
+        store.write(|o| o.meta_set(READY, "1"))?;
+    }
     Ok(if keep_going() { Updated::Ready } else { Updated::Stopped })
 }
 
 fn flush(store: &mut Store, keep_going: &impl Fn() -> bool) -> Result<()> {
     while keep_going() && store.flush_drive_search(BATCH)? == BATCH {}
-    Ok(())
-}
-
-fn publish(store: &mut Store, keep_going: &impl Fn() -> bool) -> Result<()> {
-    if keep_going() && store.read(|o| o.meta_get(READY))?.as_deref() != Some("1") {
-        store.write(|o| o.meta_set(READY, "1"))?;
-    }
     Ok(())
 }
 
@@ -1272,6 +1366,23 @@ mod tests {
         assert_eq!(update(&all[1], &mut between), Updated::Ready);
         assert!(steps > 1, "several steps");
         assert_eq!(names_in(&all[0].db(&profile), "2026"), ["Receipt-2026.pdf"]);
+    }
+
+    /// A drive whose journal turns over in minutes is read more often than
+    /// once a minute, and its catalog isn't compacted: that would lose the
+    /// journal's place and scan the drive again.
+    #[test]
+    fn a_short_journal_is_read_often_and_not_compacted_over() {
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(pass_wait([minutes(90), Duration::from_secs(90)]), Duration::from_millis(22_500));
+        assert_eq!(pass_wait([Duration::from_secs(8)]), SHORTEST_WAIT);
+        assert_eq!(pass_wait([minutes(600)]), PERIOD);
+        assert_eq!(pass_wait([]), PERIOD);
+        assert!(!compaction_fits(Some(Duration::from_secs(90))));
+        assert!(compaction_fits(Some(minutes(45))) && compaction_fits(None));
+        let temp = tempfile::tempdir().unwrap();
+        let history = journal_history(temp.path()).expect("the temp folder's volume has a journal");
+        assert!(history > Duration::ZERO && history < Duration::from_secs(10 * 365 * 24 * 3600), "{history:?}");
     }
 
     #[test]
