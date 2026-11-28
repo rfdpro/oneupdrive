@@ -22,7 +22,8 @@
 //!   listed whole, once per batch (stopping past that many: the folder may
 //!   have filled since). A folder with several changed items is listed
 //!   whole once for all of them, up to [`LIST_WHOLE_MAX`] entries per item,
-//!   and each is found there by ID. Only an item with a new name in a
+//!   and each is found there by ID; their names are tried only if the
+//!   listing stopped past that bound. Only an item with a new name in a
 //!   larger folder is opened, by file ID
 //!   ([`Volume::stat_in`]), and only if still in the record's folder. Not
 //!   in the record's folder any more: it moved or went since, it's left as
@@ -191,13 +192,15 @@ pub struct Lookup {
     /// Names to look up in `parent`, most likely first: its stored name,
     /// then names that items of `parent` gave up in the same batch (a save
     /// that renames a new file over the old one, or moves the old one
-    /// aside first, leaves the new file with the old one's name). Empty
-    /// when `parent`'s listing serves several items of the batch: it finds
-    /// each of them by ID.
+    /// aside first, leaves the new file with the old one's name).
     pub names: Vec<String>,
     /// The most entries `parent` may hold to be listed whole when no name
     /// finds the item; 0: it isn't listed ([`LIST_WHOLE_MAX`]).
     pub list_upto: usize,
+    /// `parent`'s listing serves several items of the batch: it's read
+    /// first, and finds each of them by ID. Its names are tried only if the
+    /// folder outgrew the bound since the store counted it.
+    pub listing_first: bool,
 }
 
 /// The most entries a folder may hold, per item of a batch read in it, to
@@ -414,19 +417,18 @@ fn apply(
                 u
             }
         };
-        let mut names: Vec<String> = Vec::new();
-        if sharing == 1 || upto == 0 {
-            names.extend(known.iter().map(|k| k.name.clone()));
-            for n in freed.get(&parent).into_iter().flatten().rev() {
-                if names.len() >= NAMES_MAX {
-                    break;
-                }
-                if !names.contains(n) {
-                    names.push(n.clone());
-                }
+        let mut names: Vec<String> = known.iter().map(|k| k.name.clone()).collect();
+        for n in freed.get(&parent).into_iter().flatten().rev() {
+            if names.len() >= NAMES_MAX {
+                break;
+            }
+            if !names.contains(n) {
+                names.push(n.clone());
             }
         }
-        let entry = match stat(&Lookup { id: r.file_id, parent: r.parent_id, names, list_upto: upto }) {
+        let listing_first = sharing > 1 && upto > 0;
+        let lookup = Lookup { id: r.file_id, parent: r.parent_id, names, list_upto: upto, listing_first };
+        let entry = match stat(&lookup) {
             Stat::Found(e) if !e.name.is_empty() => e,
             Stat::Found(_) | Stat::Unreadable => {
                 ch.unreadable += 1;
@@ -977,6 +979,11 @@ mod driver {
         listings: &mut HashMap<u128, Option<Vec<DirEntry>>>,
         buf: &mut [u8],
     ) -> Stat {
+        if l.listing_first
+            && let Some(read) = from_listing(volume, l, listings, buf)
+        {
+            return read;
+        }
         for name in &l.names {
             match volume.listed_in(l.parent, name, l.id) {
                 Ok(Some(e)) => return Stat::Found(e),
@@ -989,24 +996,10 @@ mod driver {
                 }
             }
         }
-        if l.list_upto > 0 {
-            // The store's count can be behind the folder (filled since):
-            // the listing stops past the bound too, and the folder then
-            // counts as large for the rest of the batch.
-            let listed = listings.entry(l.parent.0).or_insert_with(|| {
-                let mut out = Vec::new();
-                match volume.open_dir_by_id(l.parent).and_then(|h| win::list_dir_upto(&h, buf, &mut out, l.list_upto)) {
-                    Ok(true) => Some(out),
-                    Ok(false) => None,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "a changed item's folder could not be listed");
-                        None
-                    }
-                }
-            });
-            if let Some(entries) = listed {
-                return entries.iter().find(|e| e.file_id == l.id).map_or(Stat::Gone, |e| Stat::Found(e.clone()));
-            }
+        if !l.listing_first
+            && let Some(read) = from_listing(volume, l, listings, buf)
+        {
+            return read;
         }
         // Only if it's still in the record's folder: one that moved since
         // has a later record, which places it; stored here, it would be
@@ -1019,6 +1012,35 @@ mod driver {
                 Stat::Unreadable
             }
         }
+    }
+
+    /// The item as `l.parent`'s whole listing has it, listed once per batch
+    /// (in `listings`); `None` when the folder isn't to be listed, or its
+    /// listing stopped past `l.list_upto` entries: the store's count can be
+    /// behind the folder (filled since), and the folder then counts as large
+    /// for the rest of the batch.
+    fn from_listing(
+        volume: &Volume,
+        l: &Lookup,
+        listings: &mut HashMap<u128, Option<Vec<DirEntry>>>,
+        buf: &mut [u8],
+    ) -> Option<Stat> {
+        if l.list_upto == 0 {
+            return None;
+        }
+        let listed = listings.entry(l.parent.0).or_insert_with(|| {
+            let mut out = Vec::new();
+            match volume.open_dir_by_id(l.parent).and_then(|h| win::list_dir_upto(&h, buf, &mut out, l.list_upto)) {
+                Ok(true) => Some(out),
+                Ok(false) => None,
+                Err(e) => {
+                    tracing::debug!(error = %e, "a changed item's folder could not be listed");
+                    None
+                }
+            }
+        });
+        let entries = listed.as_ref()?;
+        Some(entries.iter().find(|e| e.file_id == l.id).map_or(Stat::Gone, |e| Stat::Found(e.clone())))
     }
 
     /// A cloud placeholder folder read by ID, with the attributes its
@@ -1133,7 +1155,7 @@ mod driver {
             let (a, b) = (FileId(file_id(&dir.join("a"))), FileId(file_id(&dir.join("b"))));
             let id = FileId(file_id(&dir.join("b").join("new.txt")));
             let read = |parent| {
-                let l = Lookup { id, parent, names: Vec::new(), list_upto: 0 };
+                let l = Lookup { id, parent, names: Vec::new(), list_upto: 0, listing_first: false };
                 read_item(&volume, &l, &mut HashMap::new(), &mut vec![0u8; 64 * 1024])
             };
             // The record said `a`; it's in `b` now. Opened by ID, it's
@@ -1147,7 +1169,8 @@ mod driver {
 
         /// A folder that holds more than a lookup's bound (it filled since
         /// the store last counted it) isn't read from a listing: the listing
-        /// stops past the bound, and the item is opened by ID.
+        /// stops past the bound, then the item's names are tried, and only
+        /// an item none of them finds is opened by ID.
         #[test]
         fn a_listing_stops_past_its_bound() {
             let dir = temp("bound");
@@ -1156,14 +1179,17 @@ mod driver {
             }
             let volume = Volume::open_containing(&dir).unwrap();
             let (parent, id) = (FileId(file_id(&dir)), FileId(file_id(&dir.join("f3"))));
-            let read = |list_upto| {
-                let l = Lookup { id, parent, names: Vec::new(), list_upto };
+            let read = |list_upto, names: &[&str]| {
+                let names = names.iter().map(|n| n.to_string()).collect();
+                let l = Lookup { id, parent, names, list_upto, listing_first: true };
                 read_item(&volume, &l, &mut HashMap::new(), &mut vec![0u8; 64 * 1024])
             };
-            assert!(matches!(read(64), Stat::Found(e) if e.name == "f3"));
+            assert!(matches!(read(64, &[]), Stat::Found(e) if e.name == "f3"));
             assert_eq!(volume.opened_by_id(), 0, "found in the listing");
-            assert!(matches!(read(2), Stat::Found(e) if e.name == "f3"));
-            assert_eq!(volume.opened_by_id(), 1, "past the bound: opened by ID");
+            assert!(matches!(read(2, &["f3"]), Stat::Found(e) if e.name == "f3"));
+            assert_eq!(volume.opened_by_id(), 0, "past the bound: found by its name");
+            assert!(matches!(read(2, &[]), Stat::Found(e) if e.name == "f3"));
+            assert_eq!(volume.opened_by_id(), 1, "past the bound, no name: opened by ID");
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -1386,7 +1412,7 @@ mod tests {
             &[entry(2, "docs", DIR, 0), entry(6, "b.txt", 0, 2), entry(7, "a.txt", 0, 3)],
         );
         assert_eq!(names(&asked, 7), ["a.txt"]);
-        assert!(asked.iter().all(|l| l.list_upto == LIST_WHOLE_MAX));
+        assert!(asked.iter().all(|l| l.list_upto == LIST_WHOLE_MAX && !l.listing_first));
         assert_eq!(path(&s, 6).as_deref(), Some("/b.txt"));
         assert_eq!(path(&s, 7).as_deref(), Some("/docs/a.txt"));
     }
@@ -1412,7 +1438,7 @@ mod tests {
         let live: Vec<DirEntry> = (0..3).map(|i| entry(200 + i, &format!("new{i}.rlib"), 0, 1)).collect();
         let (ch, asked) = apply_seen(&mut s, &records, &live);
         assert_eq!(asked.len(), 3);
-        assert!(asked.iter().all(|l| l.names.is_empty() && l.list_upto == 3 * LIST_WHOLE_MAX), "{asked:?}");
+        assert!(asked.iter().all(|l| l.listing_first && l.list_upto == 3 * LIST_WHOLE_MAX), "{asked:?}");
         assert_eq!((ch.created, ch.deleted), (3, 3));
         assert_eq!(path(&s, 202).as_deref(), Some("/docs/new2.rlib"));
     }
@@ -1433,7 +1459,7 @@ mod tests {
             &[rec(9, 2, reason::FILE_CREATE), rec(10, 2, reason::FILE_CREATE)],
             &[entry(9, "n9", 0, 1), entry(10, "n10", 0, 1)],
         );
-        assert!(asked.iter().all(|l| l.names.is_empty() && l.list_upto == 2 * LIST_WHOLE_MAX), "{asked:?}");
+        assert!(asked.iter().all(|l| l.listing_first && l.list_upto == 2 * LIST_WHOLE_MAX), "{asked:?}");
     }
 
     #[test]

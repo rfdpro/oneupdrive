@@ -465,20 +465,27 @@ fn update_drive(
             Ok(_) => return finish(observer.store_mut(), &keep_going),
             Err(ObserveError::NeedsRescan(why)) => {
                 tracing::info!(drive = %drive.root.display(), %why, "drive index scans again");
-                drop(observer);
-                start_over(&db, cache_kib)?.0
+                if journal_lost(why) {
+                    drop(observer);
+                    start_over(&db, cache_kib)?.0
+                } else {
+                    observer.into_store()
+                }
             }
             Err(err) => return Err(err.into()),
         },
-        // Nothing scanned yet, or a scan to carry on.
-        Err(ObserveError::NeedsRescan(Rescan::NoScan | Rescan::ScanUnfinished)) => open_catalog(&db, cache_kib)?,
-        Err(ObserveError::NeedsRescan(_)) => start_over(&db, cache_kib)?.0,
+        Err(ObserveError::NeedsRescan(Rescan::OlderScanner | Rescan::RulesChanged)) => start_over(&db, cache_kib)?.0,
+        // Nothing scanned yet, a scan to carry on, or a volume that may be
+        // readable again later: the scan decides, and keeps the catalog
+        // until it can start.
+        Err(ObserveError::NeedsRescan(_)) => open_catalog(&db, cache_kib)?,
         Err(err) => return Err(err.into()),
     };
     scanning()?;
     let mut store = needs_scan;
     store.write(|o| o.meta_set(READY, "0"))?;
     let mut scan = oneup_local::Scan::open(store, &drive.root, cfg.clone())?;
+    same_volume(drive, &scan)?;
     let mut log = ScanLog::new(&drive.root, &scan);
     while keep_going() {
         // A whole drive can take longer to list than its journal keeps
@@ -489,12 +496,15 @@ fn update_drive(
             Ok(ch) => log.followed(ch.records, following.elapsed()),
             Err(ObserveError::NeedsRescan(why)) => {
                 tracing::info!(drive = %drive.root.display(), %why, "drive index scan starts over");
-                drop(scan);
-                let (store, fresh) = start_over(&db, cache_kib)?;
-                scan = oneup_local::Scan::open(store, &drive.root, cfg.clone())?;
-                if !fresh {
-                    scan = scan.restart()?;
-                }
+                scan = if journal_lost(why) {
+                    drop(scan);
+                    let (store, fresh) = start_over(&db, cache_kib)?;
+                    let scan = oneup_local::Scan::open(store, &drive.root, cfg.clone())?;
+                    if fresh { scan } else { scan.restart()? }
+                } else {
+                    scan.restart()?
+                };
+                same_volume(drive, &scan)?;
                 log = ScanLog::new(&drive.root, &scan);
                 continue;
             }
@@ -528,6 +538,21 @@ fn update_drive(
     Ok(Updated::Stopped)
 }
 
+/// The journal no longer has the records a catalog needs: only a scan from
+/// scratch brings it back.
+fn journal_lost(why: Rescan) -> bool {
+    matches!(why, Rescan::JournalWrapped | Rescan::JournalReplaced)
+}
+
+/// A scan opened on a new catalog takes whatever volume is at the drive's
+/// root: it must be the one this catalog is named for.
+fn same_volume(drive: &Drive, scan: &oneup_local::Scan) -> Result<()> {
+    if !drive.matches_root(scan.root()) {
+        bail!("The volume identity changed");
+    }
+    Ok(())
+}
+
 /// Opens a drive's catalog, made if there's none: file IDs sorted as the
 /// MFT is, so a scan's rows land on few B-tree pages (`KeyOrder::Ordered`).
 fn open_catalog(db: &Path, cache_kib: u32) -> Result<Store> {
@@ -551,7 +576,10 @@ fn open_catalog(db: &Path, cache_kib: u32) -> Result<Store> {
 fn start_over(db: &Path, cache_kib: u32) -> Result<(Store, bool)> {
     // Our own files in the data folder. Windows refuses the rename while
     // anyone has the database open; only once it's moved are its -wal and
-    // -shm free to go, and a new database must never meet the old WAL.
+    // -shm free to go, and a new database must never meet the old WAL. The
+    // -shm (an index SQLite rebuilds) goes first: if the WAL then can't,
+    // the old database is put back with its WAL, which may hold commits
+    // its file doesn't have yet.
     let old = db.with_extension("old");
     let _ = std::fs::remove_file(&old);
     let sibling = |suffix: &str| {
@@ -564,7 +592,7 @@ fn start_over(db: &Path, cache_kib: u32) -> Result<(Store, bool)> {
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     };
     let fresh = std::fs::rename(db, &old).is_ok() && {
-        let cleared = gone(sibling("-wal")) && gone(sibling("-shm"));
+        let cleared = gone(sibling("-shm")) && gone(sibling("-wal"));
         if !cleared {
             let _ = std::fs::rename(&old, db);
         }
@@ -643,6 +671,9 @@ impl ScanLog {
 
 /// How often a scan stops to catch up the other drives' catalogs.
 const FOLLOW_OTHERS: Duration = Duration::from_secs(30);
+/// The longest one such stop takes: the scanned drive's own journal waits
+/// meanwhile. A catalog not caught up by then goes on at the next stop.
+const FOLLOW_OTHERS_FOR: Duration = Duration::from_secs(10);
 
 /// The other drives' ready catalogs, kept current from their journals while
 /// one drive is scanned. A first scan can take hours, and a system drive can
@@ -687,17 +718,24 @@ impl<'a> Others<'a> {
         let observers = self.observers.get_or_insert_with(|| {
             self.drives.iter().filter_map(|(drive, cfg)| Self::open(dir, drive, cfg.clone(), cache_kib)).collect()
         });
+        let started = Instant::now();
+        let in_time = || keep_going() && started.elapsed() < FOLLOW_OTHERS_FOR;
         observers.retain_mut(|(name, observer)| {
             let caught = observer
-                .catch_up_while(keep_going)
+                .catch_up_while(in_time)
                 .map_err(anyhow::Error::from)
-                .and_then(|_| flush(observer.store_mut(), keep_going));
+                .and_then(|_| flush(observer.store_mut(), &in_time));
             caught
                 .inspect_err(
                     |e| tracing::info!(drive = %name, error = %format!("{e:#}"), "drive index left for its turn"),
                 )
                 .is_ok()
         });
+        // A different drive first next time, so a long backlog can't keep
+        // the others waiting.
+        if !observers.is_empty() {
+            observers.rotate_left(1);
+        }
         self.next = Instant::now() + self.every;
     }
 
