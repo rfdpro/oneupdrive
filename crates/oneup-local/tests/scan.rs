@@ -358,7 +358,7 @@ fn a_scan_that_pumps_the_journal_reads_it_while_steps_run() {
     let cfg = Config { batch_dirs: 1, ..Config::new(ExcludeSet::none()) };
     let mut s = Scan::open(Store::open(&db_dir.path.join("state.db"), 1024).unwrap(), &t.path, cfg).unwrap();
     let start = s.root().journal.unwrap();
-    let pump = JournalPump::start(&t.path, start).unwrap();
+    let pump = JournalPump::start(&t.path, start, 1 << 20).unwrap();
     s.follow_pumped(&pump, || true).unwrap();
     assert!(s.step().unwrap(), "the root is listed, its folders queued");
     cmd(&t.path, "echo x> new-in-root.txt");
@@ -401,9 +401,9 @@ fn a_pumped_scan_whose_journal_lost_records_starts_over() {
     store.write(|o| o.local_set_journal_cursor(i64::MAX)).unwrap();
     let s = Scan::open(store, &t.path, cfg).unwrap();
     let bookmark = s.root().journal.unwrap();
-    assert!(matches!(JournalPump::start(&t.path, bookmark), Err(oneup_local::observe::Error::NeedsRescan(_))));
+    assert!(matches!(JournalPump::start(&t.path, bookmark, 1 << 20), Err(oneup_local::observe::Error::NeedsRescan(_))));
     let mut s = s.restart().unwrap();
-    let pump = JournalPump::start(&t.path, s.root().journal.unwrap()).unwrap();
+    let pump = JournalPump::start(&t.path, s.root().journal.unwrap(), 1 << 20).unwrap();
     s.follow_pumped(&pump, || true).unwrap();
     while s.step().unwrap() {
         s.follow_pumped(&pump, || true).unwrap();

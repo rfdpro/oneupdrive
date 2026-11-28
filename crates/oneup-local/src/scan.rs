@@ -40,7 +40,7 @@ use oneup_store::{LocalKind, LocalRoot, LocalRow, LocalStats, PutOutcome, Skip, 
 
 use crate::classify;
 use crate::coexist::{self, OtherEngine};
-use crate::observe::{Changes, JournalPump, Reader, Tree};
+use crate::observe::{Changes, JournalPump, Reader, Tree, apply_pumped};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -422,25 +422,19 @@ impl Scan {
         let Some(bookmark) = self.root.journal else { return Ok(ch) };
         let reader = self.reader.get_or_insert_with(|| Reader::new(bookmark));
         let tree = Tree { root_id: self.root.root_file_id, rules: &self.cfg.rules, scanning: true };
-        while keep_going() {
-            let Some(read) = pump.try_next() else { break };
-            let batch = read?;
-            if batch.lost {
-                return Err(crate::observe::Error::NeedsRescan(crate::observe::Rescan::JournalWrapped));
-            }
-            reader.apply_batch(
-                &mut self.store,
-                &self.volume,
-                tree,
-                &mut self.buf,
-                &mut ch,
-                &batch.records,
-                batch.next,
-            )?;
-            ch.dirty.clear();
-        }
+        let applied = apply_pumped(
+            pump,
+            reader,
+            &mut self.store,
+            &self.volume,
+            tree,
+            &mut self.buf,
+            &mut ch,
+            &keep_going,
+            |_, _| Ok(()),
+        );
         self.root.journal = Some((reader.journal_id, reader.cursor));
-        Ok(ch)
+        applied.map(|()| ch)
     }
 
     /// Runs steps until the scan finishes or the cancel flag is set.

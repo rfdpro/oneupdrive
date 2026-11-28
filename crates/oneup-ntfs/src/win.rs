@@ -428,12 +428,37 @@ impl Volume {
         wait: bool,
         buf: &'b mut [u8],
     ) -> Result<(i64, Records<'b>)> {
+        self.read_journal_for(journal_id, start, u64::from(wait), 0, buf)
+    }
+
+    /// Like [`Volume::read_journal`] waiting, but for at most `secs`
+    /// seconds: then it returns with no records, so a thread that reads can
+    /// notice it's no longer wanted.
+    pub fn read_journal_within<'b>(
+        &self,
+        journal_id: u64,
+        start: i64,
+        secs: u64,
+        buf: &'b mut [u8],
+    ) -> Result<(i64, Records<'b>)> {
+        self.read_journal_for(journal_id, start, 1, secs.max(1), buf)
+    }
+
+    /// `bytes_to_wait` 0 doesn't wait; `timeout` 0 waits without end.
+    fn read_journal_for<'b>(
+        &self,
+        journal_id: u64,
+        start: i64,
+        bytes_to_wait: u64,
+        timeout: u64,
+        buf: &'b mut [u8],
+    ) -> Result<(i64, Records<'b>)> {
         let input = READ_USN_JOURNAL_DATA_V1 {
             StartUsn: start,
             ReasonMask: u32::MAX,
             ReturnOnlyOnClose: 0,
-            Timeout: 0,
-            BytesToWaitFor: u64::from(wait),
+            Timeout: timeout,
+            BytesToWaitFor: bytes_to_wait,
             UsnJournalID: journal_id,
             MinMajorVersion: 2,
             MaxMajorVersion: 3,

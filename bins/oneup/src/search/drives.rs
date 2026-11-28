@@ -582,7 +582,12 @@ fn update_drive(
         let following = Instant::now();
         let followed = match &pump {
             Some(pump) => scan.follow_pumped(pump, &keep_going),
-            None => match scan.root().journal.map(|from| JournalPump::start(&drive.root, from)).transpose() {
+            None => match scan
+                .root()
+                .journal
+                .map(|from| JournalPump::start(&drive.root, from, pump_records(cache_kib)))
+                .transpose()
+            {
                 Ok(Some(started)) => scan.follow_pumped(pump.insert(started), &keep_going),
                 Ok(None) => scan.follow_journal(&keep_going),
                 Err(e) => Err(e),
@@ -649,6 +654,13 @@ fn update_drive(
         }
     }
     Ok(Updated::Stopped)
+}
+
+/// The most journal records a drive's pump holds unapplied (about 100 bytes
+/// of memory each, so 26 to 400 MiB), from the memory profile's page cache:
+/// a burst of 300,000 records in a minute must fit while a scan step writes.
+fn pump_records(cache_kib: u32) -> usize {
+    (cache_kib as usize * 1024 / 100).clamp(1 << 18, 1 << 22)
 }
 
 /// The journal no longer has the records a catalog needs: only a scan from
