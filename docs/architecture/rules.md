@@ -23,7 +23,7 @@ Semantics are git's:
 * **The last matching rule wins.** Rules from a deeper `.oneupignore` come after those from higher up, so they win.
 * **Nothing inside an excluded folder can be re-included.** `node_modules/` followed by `!node_modules/keep.js` keeps nothing. This is what lets enumeration skip excluded folders without listing them (below), and it's git's documented behaviour.
 
-**No rule can make matching slow.** `.oneupignore` files sync from OneDrive, so their text is untrusted: a rule with several `**` is matched in time proportional to its parts times the path's depth (`oneup-rules/src/pattern.rs`), not by trying every way to split the path, which grows exponentially with the number of `**`. Names match in linear time ([`NameGlob`](../../crates/oneup-rules/src/glob.rs)). The `rules` fuzz target checks this nightly.
+**No rule can make matching slow.** `.oneupignore` files sync from OneDrive, so their text is untrusted: a rule with several `**` is matched in time proportional to its parts times the path's depth (`oneup-rules/src/pattern.rs`), not by trying every way to split the path, which grows exponentially with the number of `**`. An item's verdict also asks about every folder above it: one pass over the path answers for all of them at once (`Rule::prefix_matches`, `RuleSet::decide_prefixes`), where asking each folder in turn cost the depth squared (a 600-part path timed out the fuzzer). Names match in linear time ([`NameGlob`](../../crates/oneup-rules/src/glob.rs)). The `rules` fuzz target checks this nightly.
 
 ### Where rules come from (lowest precedence first)
 1. **Presets** the user turned on, in a fixed order. Offered, never imposed: nothing is on unless the user chose it.

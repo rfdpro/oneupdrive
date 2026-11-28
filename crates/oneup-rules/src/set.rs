@@ -97,6 +97,14 @@ impl Layer {
         let inside = self.base.iter().zip(path).all(|(b, p)| p.chars().map(fold).eq(b.chars()));
         inside.then(|| &path[self.base.len()..])
     }
+
+    /// Whether a rule of this layer (not a `!` one) matches `path` or a
+    /// folder above it: what holds a vault's or the OneDrive app's folder.
+    fn holds(&self, path: &[&str]) -> bool {
+        let Some(rel) = self.relative(path) else { return false };
+        let folded: Vec<Vec<char>> = rel.iter().map(|s| crate::glob::folded(s)).collect();
+        self.rules.iter().any(|(_, r)| !r.negated && r.prefix_matches(&folded).contains(&true))
+    }
 }
 
 /// Rules matching exactly the item at `path` (relative to the synced
@@ -222,12 +230,7 @@ impl RuleSet {
         if self.app_top_files && p.len() == 1 && !is_dir {
             return true;
         }
-        let Some(layer) = &self.app else { return false };
-        (1..=p.len()).any(|i| {
-            layer
-                .relative(&p[..i])
-                .is_some_and(|rel| layer.rules.iter().any(|(_, r)| !r.negated && r.matches(rel, true)))
-        })
+        self.app.as_ref().is_some_and(|layer| layer.holds(&p))
     }
 
     /// Whether the item at `path` (relative to the synced folder) is a vault
@@ -235,13 +238,8 @@ impl RuleSet {
     /// item isn't junk the user excluded: it belongs to another pair, and
     /// nothing may ever offer to remove it from OneDrive.
     pub fn is_vault(&self, path: &str) -> bool {
-        let Some(layer) = &self.vaults else { return false };
         let p: Vec<&str> = parts(path).collect();
-        (1..=p.len()).any(|i| {
-            layer
-                .relative(&p[..i])
-                .is_some_and(|rel| layer.rules.iter().any(|(_, r)| !r.negated && r.matches(rel, true)))
-        })
+        self.vaults.as_ref().is_some_and(|layer| layer.holds(&p))
     }
 
     /// Adds the `.oneupignore` of folder `dir` (relative to the synced
@@ -347,15 +345,58 @@ impl RuleSet {
         if p.is_empty() {
             return Verdict::Included(None); // the synced folder itself
         }
-        for i in 1..p.len() {
-            if let Some(m) = self.decide(&p[..i], true).filter(|m| !m.negated) {
-                return Verdict::InsideExcluded { folder: p[..i].join("/"), by: m };
+        let mut decided = self.decide_prefixes(&p, is_dir);
+        let own = decided.pop().flatten();
+        for (i, m) in decided.into_iter().enumerate() {
+            if let Some(m) = m.filter(|m| !m.negated) {
+                return Verdict::InsideExcluded { folder: p[..=i].join("/"), by: m };
             }
         }
-        match self.decide(&p, is_dir) {
+        match own {
             Some(m) if !m.negated => Verdict::Excluded(m),
             m => Verdict::Included(m),
         }
+    }
+
+    /// [`RuleSet::decide`] for every prefix of `path` at once: entry `i`
+    /// for `path[..=i]`, the folders above the item as folders and the item
+    /// itself as `is_dir`. One pass over the path per rule
+    /// ([`Rule::prefix_matches`]): asking each prefix in turn cost the
+    /// path's depth squared, which a deep enough path (a fuzzed one had
+    /// 600 parts) made slow.
+    fn decide_prefixes(&self, path: &[&str], is_dir: bool) -> Vec<Option<Match>> {
+        let n = path.len();
+        let folded: Vec<Vec<char>> = path.iter().map(|s| crate::glob::folded(s)).collect();
+        let mut out: Vec<Option<Match>> = vec![None; n];
+        for layer in self.layers() {
+            // Only prefixes longer than the layer's folder, and inside it.
+            let b = layer.base.len();
+            if layer.relative(path).is_none() {
+                continue;
+            }
+            for (line, rule) in &layer.rules {
+                for (k, hit) in rule.prefix_matches(&folded[b..]).into_iter().enumerate() {
+                    let i = b + k;
+                    if hit && (i + 1 < n || is_dir || !rule.dir_only) {
+                        out[i] = Some(Match {
+                            source: layer.source.clone(),
+                            line: *line,
+                            rule: rule.text.clone(),
+                            negated: rule.negated,
+                        });
+                    }
+                }
+            }
+        }
+        if self.app_top_files && n == 1 && !is_dir {
+            out[0] = Some(Match {
+                source: Source::OneDriveApp,
+                line: 0,
+                rule: "files at the top of your OneDrive".into(),
+                negated: false,
+            });
+        }
+        out
     }
 
     /// Whether the folder `parent` (known *not* excluded, with everything
@@ -480,6 +521,117 @@ mod tests {
 
     fn set(presets: &[&str], config: &[&str]) -> RuleSet {
         RuleSet::new(presets, config).unwrap()
+    }
+
+    /// The verdict as it was found before [`RuleSet::decide_prefixes`]:
+    /// each folder above the item decided on its own, then the item.
+    fn verdict_one_prefix_at_a_time(s: &RuleSet, path: &str, is_dir: bool) -> Verdict {
+        let p: Vec<&str> = parts(path).collect();
+        if p.is_empty() {
+            return Verdict::Included(None);
+        }
+        for i in 1..p.len() {
+            if let Some(m) = s.decide(&p[..i], true).filter(|m| !m.negated) {
+                return Verdict::InsideExcluded { folder: p[..i].join("/"), by: m };
+            }
+        }
+        match s.decide(&p, is_dir) {
+            Some(m) if !m.negated => Verdict::Excluded(m),
+            m => Verdict::Included(m),
+        }
+    }
+
+    /// [`Layer::holds`] as it was found before: each prefix matched alone.
+    fn holds_one_prefix_at_a_time(layer: &Layer, p: &[&str]) -> bool {
+        (1..=p.len()).any(|i| {
+            layer
+                .relative(&p[..i])
+                .is_some_and(|rel| layer.rules.iter().any(|(_, r)| !r.negated && r.matches(rel, true)))
+        })
+    }
+
+    /// Deciding every folder above an item in one pass gives the verdict
+    /// deciding them one at a time gives, rule for rule: for rule sets of
+    /// every source (presets, config, `.oneupignore` files at two depths,
+    /// paused folders, vaults, folders left to the OneDrive app) and every
+    /// path of up to four parts, as a file and as a folder.
+    #[test]
+    fn deciding_every_prefix_at_once_gives_the_same_verdicts() {
+        let lines = [
+            "a",
+            "a/",
+            "!a",
+            "/a",
+            "/a/",
+            "b/a",
+            "**/b",
+            "a/**",
+            "**/a/**/b",
+            "!a/b/",
+            "*",
+            "!*/",
+            "A*",
+            "/b/**/a",
+            "**/**/a",
+            "B/",
+        ];
+        let mut sets = Vec::new();
+        for (i, x) in lines.iter().enumerate() {
+            for y in lines.iter().skip(i) {
+                let mut s = set(&[], &[x, y]);
+                s.add_ignore_file("a", y);
+                sets.push(s);
+                let mut s = set(&["dev"], &[y]);
+                s.add_ignore_file("a/b", x);
+                s.set_paused(&["b/a"]);
+                s.set_vaults(&["a/b/b"]);
+                s.set_onedrive_app(&["b/b"], true);
+                sets.push(s);
+            }
+        }
+        let mut paths = vec![String::new()];
+        for _ in 0..4 {
+            let longer: Vec<String> = paths
+                .iter()
+                .flat_map(|p| {
+                    ["a", "b", "A", "node_modules"]
+                        .map(|x| if p.is_empty() { x.to_string() } else { format!("{p}/{x}") })
+                })
+                .collect();
+            paths.extend(longer);
+        }
+        paths.sort();
+        paths.dedup();
+        for s in &sets {
+            for path in &paths {
+                for is_dir in [true, false] {
+                    assert_eq!(
+                        s.verdict(path, is_dir),
+                        verdict_one_prefix_at_a_time(s, path, is_dir),
+                        "{path:?} {is_dir}"
+                    );
+                }
+                let p: Vec<&str> = parts(path).collect();
+                for layer in s.vaults.iter().chain(&s.app) {
+                    assert_eq!(layer.holds(&p), holds_one_prefix_at_a_time(layer, &p), "{path:?}");
+                }
+            }
+        }
+    }
+
+    /// The fuzzed inputs that timed out (issue #79): 30 `**`s against a
+    /// 562-part path, asked about every folder above the item.
+    #[test]
+    fn a_verdict_on_a_deep_path_is_quick() {
+        let rule = format!("{}x", "**/a/".repeat(30));
+        let mut s = set(&[], &[&rule]);
+        s.add_ignore_file("sub", &rule);
+        let deep = vec!["a"; 600].join("/");
+        let t = std::time::Instant::now();
+        for is_dir in [true, false] {
+            assert!(!s.excludes(&deep, is_dir));
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "took {:?}", t.elapsed());
     }
 
     #[test]
